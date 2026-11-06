@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.{StoreMoved, StoreOffline}
@@ -34,7 +35,7 @@ private class RecordingRebuildFactory extends StoreRebuildFactory:
       created += r
     r
 
-class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness:
+class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
 
   private def rebuilding(storeId: StoreId): (StoreId, StorageDeviceState.StoreEntry) =
     storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None)
@@ -48,8 +49,8 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
 
-    val armed = host.armLookup(deviceA)
-    host.testingOnlyCheckAllDevices()
+    val armed = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
     armed.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     yieldUntil(factory.created.nonEmpty).map: _ =>
@@ -62,17 +63,17 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
 
-    val first = host.armLookup(deviceA)
-    host.testingOnlyCheckAllDevices()
+    val first = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
     first.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     for
       _ <- yieldUntil(factory.created.size == 1)
       // A second check of the same device sees the same Rebuilding entry.
-      second = host.armLookup(deviceA)
-      _ = host.testingOnlyCheckAllDevices()
+      second = recorded(host).armLookup(deviceA)
+      _ = host.control.reconciler.checkAll()
       _ = second.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
-      _ <- yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA))
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
     yield
       factory.created.size should be(1)
 
@@ -82,14 +83,14 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
 
-    val armed = host.armLookup(deviceA)
-    host.testingOnlyCheckAllDevices()
+    val armed = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
     armed.success(deviceState(deviceA,
       Map(rebuilding(storeN(0)), rebuilding(storeN(1)), rebuilding(storeN(2)))))
 
     for
       _ <- yieldUntil(factory.created.size == 2)
-      _ <- yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA))
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
     yield
       // Three entries, a bound of two: the third waits. A rebuild reads a whole store's worth
       // of data through the client, so an eight-store device must not start eight at once.
@@ -101,17 +102,17 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
 
-    val first = host.armLookup(deviceA)
-    host.testingOnlyCheckAllDevices()
+    val first = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
     val twoRebuilding = deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1))))
     first.success(twoRebuilding)
 
     for
       _ <- yieldUntil(factory.created.size == 1)
-      _ <- yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA))
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
       // The first rebuild will complete and trigger a device check. Arm a second lookup
       // that returns a state where store 0 is now Active and store 1 is still Rebuilding.
-      second = host.armLookup(deviceA)
+      second = recorded(host).armLookup(deviceA)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
       active = (storeN(0), StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
@@ -127,8 +128,8 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
 
-    val first = host.armLookup(deviceA)
-    host.testingOnlyCheckAllDevices()
+    val first = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
     first.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     for
@@ -137,14 +138,14 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       // the slot has just been freed, so a re-check of this device here would start the same
       // rebuild again -- and a rebuild that fails in under a millisecond would then spin forever
       // with no backoff and no give-up.
-      second = host.armLookup(deviceA)
+      second = recorded(host).armLookup(deviceA)
       _ = second.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
       _ = factory.created.head.promise.failure(new Exception("disk on fire"))
       _ <- yieldUntil(factory.created.size == 2, 20)
       restartedImmediately = factory.created.size
       // The ordinary periodic check is what resumes it. The staging checkpoint survives the
       // failure, so that check resumes rather than restarting from the beginning.
-      _ = host.testingOnlyCheckAllDevices()
+      _ = host.control.reconciler.checkAll()
       _ <- yieldUntil(factory.created.size == 2)
     yield
       restartedImmediately should be(1)
@@ -158,18 +159,18 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
 
     // deviceB's store is queued behind the single slot deviceA's rebuild holds.
-    val firstA = host.armLookup(deviceA)
-    val firstB = host.armLookup(deviceB)
-    host.testingOnlyCheckAllDevices()
+    val firstA = recorded(host).armLookup(deviceA)
+    val firstB = recorded(host).armLookup(deviceB)
+    host.control.reconciler.checkAll()
     firstA.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
     firstB.success(deviceState(deviceB, Map(rebuilding(storeN(1)))))
 
     for
       _ <- yieldUntil(factory.created.size == 1)
-      _ <- yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceB))
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceB))
       // Pre-completed: the failure path issues this lookup itself, so there is no moment
       // between the check starting and the test completing it.
-      _ = host.armLookup(deviceB).success(deviceState(deviceB, Map(rebuilding(storeN(1)))))
+      _ = recorded(host).armLookup(deviceB).success(deviceState(deviceB, Map(rebuilding(storeN(1)))))
       _ = factory.created.head.promise.failure(new Exception("disk on fire"))
       // rebuildingStores is host-wide, so the freed slot is what deviceB was waiting on. Without
       // this re-check it would wait for the hourly sweep with data under-replicated.
@@ -204,16 +205,16 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
           tx.update(ptr, None, None, reqs, ops)
       _ <- waitForTransactionsToComplete()
       // Inject the device as loaded and trigger reconciliation
-      _ = host.injectLoadedDevice(new Host.LocalStorageDeviceState(
+      _ = injectLoadedDevice(host, new LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename))
-      armed = host.armLookup(realDeviceId)
-      _ = host.testingOnlyCheckAllDevices()
+      armed = recorded(host).armLookup(realDeviceId)
+      _ = host.control.reconciler.checkAll()
       readState = deviceState(realDeviceId, Map(rebuilding(rebuilt)))
       _ = armed.success(readState)
       _ <- yieldUntil(factory.created.nonEmpty)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
-      _ <- yieldUntil(host.loadStoreByIdRequests.contains((realDeviceId, rebuilt)))
+      _ <- yieldUntil(recorded(host).loadStoreByIdRequests.contains((realDeviceId, rebuilt)))
       // Verify the entry was flipped to Active
       finalKvos <- client.read(ptr)
       finalState = StorageDeviceState(finalKvos)
@@ -222,7 +223,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
         case _ => false)
       (poolState, poolTimestamp) <- client.getStoragePoolStateAndTimestamp(rebuilt.poolId)
     yield
-      host.loadStoreByIdRequests should contain((realDeviceId, rebuilt))
+      recorded(host).loadStoreByIdRequests should contain((realDeviceId, rebuilt))
       finalState.stores.get(rebuilt).map(_.status) should be(
         Some(StorageDeviceState.StoreStatus.Active))
       // The pool's current host for the store, as of the pool config's timestamp, and online
@@ -260,11 +261,11 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       // neither set, so the offline entry is made by hand.
       _ = os.makeDir.all(storeDir)
       _ = os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
-      local = new Host.LocalStorageDeviceState(
+      local = new LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename)
       _ = local.offlineStores = Set(lost)
-      _ = host.injectLoadedDevice(local)
-      _ = host.testingOnlyCheckAllDevices()
+      _ = injectLoadedDevice(host, local)
+      _ = host.control.reconciler.checkAll()
       _ <- completeRebuildsStarted(factory)
       finalState <- client.getStorageDeviceState(realDeviceId)
     yield
@@ -326,10 +327,10 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       _ = os.makeDir.all(storePath)
       _ = os.write(storePath / "marker.txt", "rebuilt store")
       // Inject device and trigger rebuild
-      _ = host.injectLoadedDevice(new Host.LocalStorageDeviceState(
+      _ = injectLoadedDevice(host, new LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename))
-      armed = host.armLookup(realDeviceId)
-      _ = host.testingOnlyCheckAllDevices()
+      armed = recorded(host).armLookup(realDeviceId)
+      _ = host.control.reconciler.checkAll()
       readState = deviceState(realDeviceId, Map(rebuilding(storeN(0))))
       _ = armed.success(readState)
       _ <- yieldUntil(factory.created.nonEmpty)
@@ -338,7 +339,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       _ <- yieldUntil(!os.exists(storePath), 200)
     yield
       // Store should NOT be loaded (no loadStoreById call for the real device)
-      host.loadStoreByIdRequests.exists(_._1 == realDeviceId) should be(false)
+      recorded(host).loadStoreByIdRequests.exists(_._1 == realDeviceId) should be(false)
       // Store directory should be discarded
       os.exists(storePath) should be(false)
 
@@ -359,19 +360,19 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
     // This exercises the Failure(t) branch in markRebuiltStoreActive's onComplete
 
     // Inject both devices manually (no writeDevice, so auto-scan won't find them)
-    host.injectLoadedDevice(new Host.LocalStorageDeviceState(
+    injectLoadedDevice(host, new LocalStorageDeviceState(
       syntheticA, deviceDir, deviceDir / "dummy.file"))
-    host.injectLoadedDevice(new Host.LocalStorageDeviceState(
+    injectLoadedDevice(host, new LocalStorageDeviceState(
       syntheticB, deviceDir2, deviceDir2 / "dummy.file"))
 
-    val first = host.armLookup(syntheticA)
-    host.testingOnlyCheckAllDevices()
+    val first = recorded(host).armLookup(syntheticA)
+    host.control.reconciler.checkAll()
     first.success(deviceState(syntheticA, Map(rebuilding(storeN(0)))))
 
     for
       _ <- yieldUntil(factory.created.size == 1)
       // Arm a second lookup for syntheticB before completing the first rebuild
-      second = host.armLookup(syntheticB)
+      second = recorded(host).armLookup(syntheticB)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
       // The flip transaction will fail with NoSuchElementException (syntheticA not in tree)
@@ -380,6 +381,6 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       _ <- yieldUntil(factory.created.size == 2, 200)
     yield
       // Store 0 should NOT be loaded (the flip failed)
-      host.loadStoreByIdRequests.exists(_._1 == syntheticA) should be(false)
+      recorded(host).loadStoreByIdRequests.exists(_._1 == syntheticA) should be(false)
       // Store 1 should eventually be created (slot was released)
       factory.created.map(_.storeId).toSet should contain(storeN(1))

@@ -31,8 +31,7 @@ import scala.concurrent.duration.Duration
  *  `currentView` is the one piece of control state other threads may read: an immutable HostStoreView, republished
  *  by `publishView` after every change to what it reflects.
  *
- *  The function-valued parameters from `loadStore` on are adapters that call the overridable methods on Host, so the
- *  test subclasses that replace them still take effect when a component calls them. */
+ *  The function-valued parameters from `loadStore` on are the callbacks a test replaces through Host.Seams. */
 final class DeviceControl(val metadata: DeviceMetadata,
                           val scheduler: ControlScheduler,
                           val backends: BackendOpener,

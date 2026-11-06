@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.Host.AdoptOutcome
+import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
 import org.aspen_ddp.aspen.server.{DeviceMarkers, Host, StorageDeviceConfig, StorageDeviceManager}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore

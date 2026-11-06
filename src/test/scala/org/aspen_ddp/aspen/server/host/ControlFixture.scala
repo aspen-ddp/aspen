@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig, StorageDeviceManager}
-import org.aspen_ddp.aspen.server.Host.{AdoptOutcome, RebuildOutcome, ShutdownOutcome, TransferOutcome}
+import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome, TransferOutcome}
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
@@ -254,6 +254,18 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
           shutdownOutcomes += outcome
         outcome
 
+  /** Every shutdown-work timeout a shutdown has scheduled, by device, in order. Recorded rather than timed: nothing
+   *  fires them by itself, so a test fires them with `fireShutdownWorkTimeouts`. */
+  val shutdownWorkTimeouts = mutable.ListBuffer[(StorageDeviceId, () => Unit)]()
+
+  /** Runs every recorded shutdown-work timeout, as if shutdownWorkTimeout had elapsed. */
+  def fireShutdownWorkTimeouts(): Unit =
+    synchronized(shutdownWorkTimeouts.toList).foreach(_._2())
+
+  private def scheduleShutdownWorkTimeout(storageDeviceId: StorageDeviceId, fn: () => Unit): Unit =
+    synchronized:
+      shutdownWorkTimeouts += ((storageDeviceId, fn))
+
   /** Records the call; does nothing else. A failure owed by `failFirstStoreLoad` is thrown before recording. */
   private def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path, onServed: Option[() => Unit]): Unit =
     synchronized:
@@ -309,7 +321,8 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
       closeForShutdown = Some(closeForShutdown),
       loadStore = Some(loadStore),
       tryLoadStore = Some(tryLoadStore),
-      loadStoreById = Some(loadStoreById))
+      loadStoreById = Some(loadStoreById),
+      scheduleShutdownWorkTimeout = Some(scheduleShutdownWorkTimeout))
 
 /** Shared test fixture for the Host's components: builds Hosts with LockstepThreading, a ManualControlScheduler and
  *  RecordingSeams, plus helpers for writing device configs and waiting on async conditions. Temp directory cleanup is
@@ -486,6 +499,32 @@ trait ControlFixture:
    *  acted on). */
   protected def queuedMarkerResolutions(host: Host): Int =
     host.control.discovery.pendingMarkerResolutions.size
+
+  /** Runs every transfer-in retry waiting out its delay, then drains the events they post. */
+  protected def retryTransferIns(host: Host): Unit =
+    scheduler(host).runWhere(_ == StoreTransfers.TransferInRetryDelay)
+    host.testingOnlyHandleEvents()
+
+  /** Runs every device re-check waiting out its delay, then drains the events they post. */
+  protected def runDeviceRechecks(host: Host): Unit =
+    scheduler(host).runWhere(_ == Host.TransferOutRecheckDelay)
+    host.testingOnlyHandleEvents()
+
+  private def isMarkerResolution(task: Runnable): Boolean = task match
+    case t: Host.EventTask => t.event.isInstanceOf[Host.ShutdownMarkerResolved]
+    case _ => false
+
+  private def lockstep(host: Host): LockstepThreading = host.threading match
+    case t: LockstepThreading => t
+    case other => throw new IllegalStateException(s"Needs LockstepThreading, not ${other.getClass.getSimpleName}")
+
+  /** How many ShutdownMarkerResolved events are queued. */
+  protected def queuedMarkerEvents(host: Host): Int =
+    lockstep(host).queuedItems.count(isMarkerResolution)
+
+  /** Removes the queued ShutdownMarkerResolved events and handles them, leaving every other event queued. */
+  protected def handleMarkerEvents(host: Host): Unit =
+    lockstep(host).removeQueued(isMarkerResolution).foreach(_.run())
 
   protected val deviceA = StorageDeviceId(UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001"))
   protected val deviceB = StorageDeviceId(UUID.fromString("bbbbbbbb-0000-0000-0000-000000000002"))

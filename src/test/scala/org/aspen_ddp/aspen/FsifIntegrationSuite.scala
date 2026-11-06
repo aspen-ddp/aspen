@@ -9,8 +9,8 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.{Host, HostTestHarness, StoreConfig}
-import org.aspen_ddp.aspen.server.host.LockstepThreading
+import org.aspen_ddp.aspen.server.{Host, StoreConfig}
+import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler, FsifConfig}
 import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifRecovery}
@@ -25,44 +25,31 @@ import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, DurationInt, FiniteDuration, SECONDS}
 import scala.util.Random
 
-/** A real Host serving FSIF stores inside the TestNetwork.
+/** Builds the real Hosts that serve FSIF stores inside the TestNetwork.
   *
-  * Its object cache is disabled, so every read is served by the FSIF backends. Every backend it loads reports its
-  * completions through a handler that also schedules `network.handleEvents()` on the test's execution context: FSIF
-  * completes I/O on its own threads, and nothing else would drain the events they queue. Constructor parameters are
-  * named apart from Host's members, as RecordingHost's are.
+  * Each host's object cache is disabled, so every read is served by the FSIF backends. Every backend it loads reports
+  * its completions through a handler that also schedules `network.handleEvents()` on the test's execution context:
+  * FSIF completes I/O on its own threads, and nothing else would drain the events they queue.
   */
-private class FsifTestHost(network: TestNetwork,
-                           mgrClient: AspenClient,
-                           hid: HostId,
-                           systemId: UUID,
-                           hostRootDir: os.Path,
-                           execCtx: ExecutionContext)
-  extends Host(mgrClient, hid, systemId, hostRootDir, execCtx, new LockstepThreading(execCtx), _ => ObjectCache.NoCache, network,
-    BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL, network.FinalizerFactory,
-    TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
-    StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2):
+private object FsifTestHost:
+  def apply(network: TestNetwork,
+            client: AspenClient,
+            hostId: HostId,
+            systemId: UUID,
+            hostRoot: os.Path,
+            ec: ExecutionContext): Host =
+    val seams = Host.Seams(wrapIoHandler = Some: queue =>
+      new CompletionHandler:
+        override def complete(op: Completion): Unit =
+          queue.complete(op)
+          ec.execute(() => network.handleEvents()))
+    new Host(client, hostId, systemId, hostRoot, ec, new LockstepThreading(ec), _ => ObjectCache.NoCache, network,
+      BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL, network.FinalizerFactory,
+      TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
+      StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = seams)
 
-  // Lazy: Host's constructor loads the stores already on disk, before this subclass's fields are initialized
-  private lazy val pumpingHandler: CompletionHandler =
-    val queue = new Host.IOHandler(this)
-    new CompletionHandler:
-      override def complete(op: Completion): Unit =
-        queue.complete(op)
-        execCtx.execute(() => network.handleEvents())
-
-  /** Replaces the handler the LoadStore event installs. Parasitic, so it runs inside that event, before the store
-    * can start any I/O.
-    */
-  override def loadStore(storageDeviceId: StorageDeviceId,
-                         backend: org.aspen_ddp.aspen.server.store.backend.Backend,
-                         maxSliceSize: Option[Long]): Future[Unit] =
-    val loaded = super.loadStore(storageDeviceId, backend, maxSliceSize)
-    loaded.foreach(_ => backend.setCompletionHandler(pumpingHandler))(using ExecutionContext.parasitic)
-    loaded
-
-  def fsifBackends: List[FsifBackend] = synchronized:
-    stores.values.toList.map(_.backend).collect { case b: FsifBackend => b }
+  def fsifBackends(host: Host): List[FsifBackend] =
+    host.control.router.loaded.values.toList.map(_.backend).collect { case b: FsifBackend => b }
 
 object FsifIntegrationSuite:
   private val timer: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor: r =>
@@ -80,10 +67,10 @@ object FsifIntegrationSuite:
   * writes, a crash-only host restart and a rebuild of one store.
   *
   * The bootstrap pool stays on the TestNetwork's in-memory host. The FSIF pool's five stores live on one device of a
-  * real Host (FsifTestHost) with its own HostId, device set and directory tree; TestNetwork routes the pool's
+  * real Host (built by FsifTestHost) with its own HostId, device set and directory tree; TestNetwork routes the pool's
   * messages to it. Pointers come from the pool's FsifIndexAllocationStrategy, installed at creation.
   */
-class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
+class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
   import FsifIntegrationSuite.delay
 
   /** The IDA of the RARS integration suites. The bootstrap pool uses it too: the test client resolves every
@@ -99,7 +86,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
   private def ida: IDA = net.ida
   private def fsifConfig: FsifConfig = FsifConfig.forObjectSize(ida, 64 * 1024, segmentCount)
 
-  private var host: FsifTestHost = scala.compiletime.uninitialized
+  private var host: Host = scala.compiletime.uninitialized
   private var hostRoot: os.Path = scala.compiletime.uninitialized
   private var deviceDir: os.Path = scala.compiletime.uninitialized
   private var deviceId: StorageDeviceId = scala.compiletime.uninitialized
@@ -108,7 +95,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
   override def subFixtureTeardown(): Unit =
     if host != null then
       // Parasitic: this blocks the test's serial execution context, which could otherwise never combine them
-      val closes = Future.sequence(host.fsifBackends.map(_.close()))(using implicitly, ExecutionContext.parasitic)
+      val closes = Future.sequence(FsifTestHost.fsifBackends(host).map(_.close()))(using implicitly, ExecutionContext.parasitic)
       try Await.ready(closes, Duration(10, SECONDS))
       catch case _: Throwable => ()
       host = null
@@ -160,8 +147,8 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
 
   // ---- Setup ------------------------------------------------------------------------------------------------
 
-  private def newFsifHost(): FsifTestHost =
-    new FsifTestHost(net, client, fsifHostId, systemId, hostRoot, executionContext)
+  private def newFsifHost(): Host =
+    FsifTestHost(net, client, fsifHostId, systemId, hostRoot, executionContext)
 
   /** The FSIF host, its device and the pool, with every store created and served */
   private def setUp(): Future[Unit] =
@@ -177,7 +164,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
       pid <- client.createNewStoragePool("fsif-pool", ida, None, fsifConfig, setId, 0L)
       _ = poolId = pid
       _ = net.poolHosts += poolId -> host
-      _ = host.testingOnlyCheckAllDevices()
+      _ = host.control.reconciler.checkAll()
       _ <- awaitStoresServed()
     yield ()
 
@@ -191,7 +178,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
   private def crashAndRestart(whileDown: () => Unit = () => ()): Future[Unit] =
     for
       _ <- waitForTransactionsToComplete()
-      _ <- Future.sequence(host.fsifBackends.map(_.close()))
+      _ <- Future.sequence(FsifTestHost.fsifBackends(host).map(_.close()))
     yield
       whileDown()
       host = newFsifHost()

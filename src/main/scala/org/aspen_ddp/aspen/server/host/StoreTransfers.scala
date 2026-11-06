@@ -7,7 +7,8 @@ import org.aspen_ddp.aspen.common.network.{StartStoreTransfer, StoreOffline}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.server.Host.{StoreFailedOnClose, TransferOutcome}
+import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
+import org.aspen_ddp.aspen.server.host.DeviceMetadata.TransferOutcome
 import org.aspen_ddp.aspen.server.DurableFiles
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
@@ -490,7 +491,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           ctx.client.sendHostMessage(msg)
 
   /** Returns the request's handling, which fails when the request is refused. Only tests look at
-   *  it (testingOnlyStartStoreTransferOut); the control thread drops it, as a refusal is answered by
+   *  it (they call this directly); the control thread drops it, as a refusal is answered by
    *  the receiver's retransmit. */
   def startOut(m: StartStoreTransfer): Future[Unit] =
     def err(msg: String): Nothing =

@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState}
@@ -9,7 +10,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.network.{StartStoreTransfer, StoreMoved, StoreOffline}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.Host.ShutdownOutcome
+import org.aspen_ddp.aspen.server.host.DeviceMetadata.ShutdownOutcome
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -38,7 +39,7 @@ private class CancellableRebuildFactory extends StoreRebuildFactory:
     created += r
     r
 
-class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
+class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
   import StorageDeviceState.{DeviceStatus, StoreEntry, StoreStatus}
 
   private def storeN(n: Int): StoreId =
@@ -91,17 +92,17 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
 
   /** A host with deviceA registered, written to disk and loaded, carrying `stores` in the tree. The
    *  stores in `loaded` are given directories and recorded as open on the device, as tryLoadStore
-   *  would have done. RecordingHost never opens a backend, so that is done by hand. */
+   *  would have done. Host never opens a backend, so that is done by hand. */
   private def setUp(stores: Map[StoreId, StoreEntry],
                     loaded: Set[StoreId] = Set(),
                     transfers: StagedTransferService = new StagedTransferService,
-                    rebuilds: StoreRebuildFactory = StoreRebuildFactory.Filesystem): Future[(RecordingHost, os.Path)] =
+                    rebuilds: StoreRebuildFactory = StoreRebuildFactory.Filesystem): Future[(Host, os.Path)] =
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newHost(hostRoot, transferService = transfers, storeRebuildFactory = rebuilds)
     loaded.foreach(s => os.makeDir.all(deviceDir / s.directoryName))
-    val local = host.loadedDevices(deviceA)
+    val local = loadedDevices(host)(deviceA)
     local.loadedStores = local.loadedStores ++ loaded
     for
       _ <- net.createDevice(deviceA)
@@ -110,13 +111,13 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     yield (host, deviceDir)
 
   /** Requests the shutdown, runs one check and waits for the device to be unloaded. */
-  private def shutDown(host: RecordingHost): Future[Unit] =
+  private def shutDown(host: Host): Future[Unit] =
     given ExecutionContext = executionContext
     for
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(!host.loadedDevices.contains(deviceA))
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
     yield ()
 
   atest("a ShuttingDown device has its stores closed, marked and announced, then is Shutdown"):
@@ -129,33 +130,33 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       st <- state(deviceA)
       hostState <- client.getHostState(HostId.BootstrapHostId)
     yield
-      host.shutdownCloses.toSet should be(Set(s0, s1))
-      host.shutdownCloses.size should be(2)
+      recorded(host).shutdownCloses.toSet should be(Set(s0, s1))
+      recorded(host).shutdownCloses.size should be(2)
       os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
       os.exists(deviceDir / s1.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
       DeviceMarkers.readShutdownState(deviceDir) should be(Some(HostId.BootstrapHostId))
       st.status should be(DeviceStatus.Shutdown)
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Offline))
       net.takeCapturedGossip().collect { case g: StoreOffline => g.storeId }.toSet should be(Set(s0, s1))
-      host.loadedDevices.contains(deviceA) should be(false)
-      host.testingOnlyLoadedDeviceDirs.values.toSet should not contain deviceA
+      loadedDevices(host).contains(deviceA) should be(false)
+      host.control.discovery.loadedDeviceDirs.values.toSet should not contain deviceA
       hostState.storageDevices should contain(deviceA)
-      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
+      recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
 
   atest("a store whose backend fails during its shutdown close gets no transfer-out marker"):
     given ExecutionContext = executionContext
     for
       (host, deviceDir) <- setUp(Map(s0 -> active, s1 -> active), loaded = Set(s0, s1))
       _ <- addToBootstrapHost(deviceA)
-      _ = host.failingShutdownCloses.set(Set(s0))
+      _ = recorded(host).failingShutdownCloses.set(Set(s0))
       _ <- shutDown(host)
       st <- state(deviceA)
     yield
-      host.shutdownCloses.toSet should be(Set(s0, s1))
+      recorded(host).shutdownCloses.toSet should be(Set(s0, s1))
       os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(false)
       os.exists(deviceDir / s1.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
       st.status should be(DeviceStatus.Shutdown)
-      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
+      recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
 
   atest("shutdown cancels a running rebuild and does not restart it"):
     given ExecutionContext = executionContext
@@ -163,12 +164,12 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     val rebuilding = StoreEntry(StoreStatus.Rebuilding, None)
     for
       (host, _) <- setUp(Map(s0 -> rebuilding), rebuilds = rebuilds)
-      _ = host.testingOnlyCheckAllDevices()
+      _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(rebuilds.created.nonEmpty)
       _ <- shutDown(host)
       // A check after the shutdown must not start the rebuild again either.
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(host.control.reconciler.activeDeviceChecks.isEmpty)
       st <- state(deviceA)
     yield
       rebuilds.created.size should be(1)
@@ -186,7 +187,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- net.createDevice(deviceB)
       (host, _) <- setUp(Map(s0 -> inEntry, s1 -> outEntry), transfers = transfers)
       _ = transfers.markSending(s1)
-      _ = host.testingOnlyCheckAllDevices()
+      _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(transfers.startedTransfersIn.nonEmpty)
       _ <- shutDown(host)
       st <- state(deviceA)
@@ -194,7 +195,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       transfers.startedTransfersIn should be(Set(s0))
       transfers.cancelledTransfersIn.map(_._1) should be(Vector(s0))
       transfers.cancelledTransfersOut should be(Vector(s1))
-      host.testingOnlyTransferringIn should be(Set())
+      host.control.transfers.transferringIn.keySet should be(Set())
       st.stores should be(Map(s0 -> inEntry, s1 -> outEntry))
       st.status should be(DeviceStatus.Shutdown)
 
@@ -204,16 +205,16 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       (host, deviceDir) <- setUp(Map(s0 -> active), loaded = Set(s0))
       // Between the stores closing and the Shutdown commit, a late rebuild completion flips s1 to
       // Active and loads it.
-      _ = host.beforeNextShutdownCommit: () =>
+      _ = recorded(host).beforeNextShutdownCommit: () =>
             os.makeDir.all(deviceDir / s1.directoryName)
-            val local = host.loadedDevices(deviceA)
+            val local = loadedDevices(host)(deviceA)
             local.loadedStores = local.loadedStores + s1
             setDeviceState(deviceA)(_.setStoreEntry(s1, StoreStatus.Active, None))
       _ <- shutDown(host)
       st <- state(deviceA)
     yield
-      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.StoresReactivated, ShutdownOutcome.Completed))
-      host.shutdownCloses.toList should be(List(s0, s1))
+      recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.StoresReactivated, ShutdownOutcome.Completed))
+      recorded(host).shutdownCloses.toList should be(List(s0, s1))
       os.exists(deviceDir / s1.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Offline))
       st.status should be(DeviceStatus.Shutdown)
@@ -222,48 +223,48 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     given ExecutionContext = executionContext
     for
       (host, _) <- setUp(Map(s0 -> active, s1 -> active), loaded = Set(s0, s1))
-      gate = host.holdShutdownCloses()
+      gate = recorded(host).holdShutdownCloses()
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.shutdownCloses.nonEmpty && host.testingOnlyActiveDeviceChecks.isEmpty)
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.testingOnlyActiveDeviceChecks.isEmpty)
-      closesWhileHeld = host.shutdownCloses.toList
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(host.control.reconciler.activeDeviceChecks.isEmpty)
+      closesWhileHeld = recorded(host).shutdownCloses.toList
       _ = gate.success(())
-      _ <- pumpUntil(!host.loadedDevices.contains(deviceA))
+      _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
       st <- state(deviceA)
     yield
       closesWhileHeld.size should be(1)
-      host.shutdownCloses.toList.sortBy(_.poolIndex) should be(List(s0, s1))
-      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
+      recorded(host).shutdownCloses.toList.sortBy(_.poolIndex) should be(List(s0, s1))
+      recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
       st.status should be(DeviceStatus.Shutdown)
 
   atest("restart during shutdown cancels it"):
     given ExecutionContext = executionContext
     for
       (host, deviceDir) <- setUp(Map(s0 -> active, s1 -> active), loaded = Set(s0, s1))
-      gate = host.holdShutdownCloses()
+      gate = recorded(host).holdShutdownCloses()
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.shutdownCloses.nonEmpty && host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- client.restartStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = gate.success(())
       markers = List(s0, s1).map(s => deviceDir / s.directoryName / StoreTransfer.TransferOutMarkerFile)
-      _ <- pumpUntil(host.shutdownOutcomes.nonEmpty && host.testingOnlyActiveDeviceChecks.isEmpty &&
+      _ <- pumpUntil(recorded(host).shutdownOutcomes.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty &&
                      markers.forall(m => !os.exists(m)))
       st <- state(deviceA)
     yield
-      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Cancelled))
+      recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Cancelled))
       st.status should be(DeviceStatus.Operational)
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Active))
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
-      host.loadedDevices.contains(deviceA) should be(true)
+      loadedDevices(host).contains(deviceA) should be(true)
       // The reconcile's abandoned-transfer-out pass brought both stores back.
       markers.exists(os.exists) should be(false)
-      host.storeLoadAttempts.map(_._2).toSet should contain allOf(deviceDir / s0.directoryName,
+      recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(deviceDir / s0.directoryName,
                                                                   deviceDir / s1.directoryName)
 
   atest("an Initializing store is not created while the device is ShuttingDown"):
@@ -297,7 +298,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- waitForTransactionsToComplete()
       _ <- setDeviceState(sourceId)(_.copy(status = DeviceStatus.ShuttingDown))
       _ <- waitForTransactionsToComplete()
-      refused <- host.testingOnlyStartStoreTransferOut(StartStoreTransfer(host.hostId, client.clientId,
+      refused <- host.control.transfers.startOut(StartStoreTransfer(host.hostId, client.clientId,
                    sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID())).failed
     yield
       refused.getMessage should include("ShuttingDown")
@@ -312,18 +313,18 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- net.createDevice(deviceB)
       _ <- setDeviceState(deviceB)(_.copy(status = DeviceStatus.Shutdown))
       (host, _) <- setUp(Map(s0 -> inEntry), transfers = transfers)
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.transferSourceReads.contains(deviceB))
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host).transferSourceReads.contains(deviceB))
       // The record precedes Host's continuation on the serial ExecutionContext; these yields let
       // that continuation run before the assertion's snapshot.
       _ <- yieldUntil(false, 10)
       startedWhileShutdown = transfers.startedTransfersIn
       // Positive control: the same check starts the transfer once the source is back.
       _ <- setDeviceState(deviceB)(_.copy(status = DeviceStatus.Operational))
-      _ = host.testingOnlyCheckAllDevices()
+      _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(transfers.startedTransfersIn.nonEmpty)
     yield
-      host.transferSourceReads.toList should be(List(deviceB, deviceB))
+      recorded(host).transferSourceReads.toList should be(List(deviceB, deviceB))
       startedWhileShutdown should be(Set())
       transfers.startedTransfersIn should be(Set(s0))
 
@@ -342,29 +343,29 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(movingStore, destId)
       _ <- waitForTransactionsToComplete()
-      _ = host.testingOnlyCheckAllDevices()
+      _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       // Hold the pool update between promotion and its transaction, then request the shutdown.
-      gate = host.holdTransferOutcomes()
+      gate = recorded(host).holdTransferOutcomes()
       _ = transfers.finishTransferIn(movingStore)
       _ <- pumpUntil(os.exists(arrived / StoreTransfer.TransferredInMarkerFile))
       _ <- client.shutdownStorageDevice(destId)
       _ <- waitForTransactionsToComplete()
       _ = gate.success(())
-      _ <- pumpUntil(host.transferOutcomes.contains(movingStore))
+      _ <- pumpUntil(recorded(host).transferOutcomes.contains(movingStore))
       entryAfterUpdate <- state(destId).map(_.stores.get(movingStore))
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(!host.loadedDevices.contains(destId))
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(!loadedDevices(host).contains(destId))
       st <- state(destId)
       pool <- client.getStoragePoolState(PoolId.BootstrapPoolId)
     yield
-      host.transferOutcomes(movingStore) should be(Host.TransferOutcome.PoolRepointedOffline)
+      recorded(host).transferOutcomes(movingStore) should be(DeviceMetadata.TransferOutcome.PoolRepointedOffline)
       entryAfterUpdate.map(_.status) should be(Some(StoreStatus.Offline))
       pool.stores(movingStore.poolIndex).storageDeviceId should be(destId)
-      host.loadStoreByIdRequests.toList should be(Nil)
+      recorded(host).loadStoreByIdRequests.toList should be(Nil)
       // Kept as it arrived, behind its transferred-in marker, and not served.
       os.exists(arrived / StoreTransfer.TransferredInMarkerFile) should be(true)
-      host.testingOnlyOfflineStores should contain(movingStore)
+      host.control.router.offlineStores should contain(movingStore)
       st.stores(movingStore).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
 
@@ -374,25 +375,25 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     val rebuilds = new RecordingRebuildFactory
     for
       (host, deviceDir) <- setUp(Map(s0 -> StoreEntry(StoreStatus.Rebuilding, None)), rebuilds = rebuilds)
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(rebuilds.created.nonEmpty && host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(rebuilds.created.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       // The rebuilt store lands at its final path, as the walk leaves it.
       _ = os.makeDir.all(deviceDir / s0.directoryName)
       _ = rebuilds.created.head.promise.success(())
-      _ <- pumpUntil(host.rebuildFlipSeq.contains((deviceA, s0)))
+      _ <- pumpUntil(recorded(host).rebuildFlipSeq.contains((deviceA, s0)))
       entryAfterFlip <- state(deviceA).map(_.stores.get(s0))
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(!host.loadedDevices.contains(deviceA))
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
       st <- state(deviceA)
     yield
       entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
-      host.loadStoreByIdRequests.toList should be(Nil)
+      recorded(host).loadStoreByIdRequests.toList should be(Nil)
       os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
       // Empty, as a fresh rebuild has no transaction state, but present so an adopter accepts it.
       os.exists(Backend.crlSaveFile(deviceDir / s0.directoryName)) should be(true)
-      host.testingOnlyOfflineStores should contain(s0)
+      host.control.router.offlineStores should contain(s0)
       st.stores(s0).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
 
@@ -402,22 +403,22 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     val creating = StoreId(PoolId.BootstrapPoolId, 0)
     for
       (host, deviceDir) <- setUp(Map(creating -> StoreEntry(StoreStatus.Initializing, None)))
-      gate = host.holdStoreLoads()
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.loadStoreRequests.nonEmpty)
+      gate = recorded(host).holdStoreLoads()
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host).loadStoreRequests.nonEmpty)
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       // The load completes and the flip runs against the ShuttingDown device.
       _ = gate.success(())
       _ <- pumpUntilEntry(deviceA, creating)(!_.exists(_.status == StoreStatus.Initializing))
       entryAfterFlip <- state(deviceA).map(_.stores.get(creating))
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(!host.loadedDevices.contains(deviceA))
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
       st <- state(deviceA)
     yield
-      host.loadStoreRequests.toList should be(List((deviceA, creating)))
+      recorded(host).loadStoreRequests.toList should be(List((deviceA, creating)))
       entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
-      host.shutdownCloses.toList should be(List(creating))
+      recorded(host).shutdownCloses.toList should be(List(creating))
       os.exists(deviceDir / creating.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
       st.stores(creating).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
@@ -429,12 +430,12 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     val initializing = StoreEntry(StoreStatus.Initializing, None)
     for
       (host, _) <- setUp(Map(creating -> initializing))
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- shutDown(host)
       st <- state(deviceA)
     yield
-      host.loadedDevices.contains(deviceA) should be(false)
+      loadedDevices(host).contains(deviceA) should be(false)
       st.stores(creating) should be(initializing)
       st.status should be(DeviceStatus.Shutdown)
 
@@ -458,13 +459,14 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       srcBefore <- state(net.storageDeviceId)
       dstBefore <- state(destId)
       _ = net.takeCapturedGossip()
-      outcome <- host.testingOnlyUpdateStateForTransferredStore(movingStore, net.storageDeviceId, destId)
+      outcome <- host.control.metadata.updateStateForTransferredStore(movingStore, net.storageDeviceId, destId,
+                    host.gossipRetransmitter)
       _ <- waitForTransactionsToComplete()
       poolAfter <- client.getStoragePoolState(PoolId.BootstrapPoolId)
       srcAfter <- state(net.storageDeviceId)
       dstAfter <- state(destId)
     yield
-      outcome should be(Host.TransferOutcome.NotOwned)
+      outcome should be(DeviceMetadata.TransferOutcome.NotOwned)
       poolAfter.stores.toList should be(poolBefore.stores.toList)
       srcAfter should be(srcBefore)
       dstAfter should be(dstBefore)
@@ -475,18 +477,18 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     val rebuilds = new RecordingRebuildFactory
     for
       (host, deviceDir) <- setUp(Map(s0 -> rebuilding), rebuilds = rebuilds)
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(rebuilds.created.nonEmpty && host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(rebuilds.created.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- setDeviceState(deviceA)(_.copy(hostId = otherHostId))
       _ = os.makeDir.all(deviceDir / s0.directoryName)
       _ = rebuilds.created.head.promise.success(())
-      _ <- pumpUntil(host.rebuildOutcomes.contains((deviceA, s0)))
+      _ <- pumpUntil(recorded(host).rebuildOutcomes.contains((deviceA, s0)))
       st <- state(deviceA)
     yield
-      host.rebuildOutcomes((deviceA, s0)) should be(Host.RebuildOutcome.NotOwned)
+      recorded(host).rebuildOutcomes((deviceA, s0)) should be(DeviceMetadata.RebuildOutcome.NotOwned)
       st.stores(s0) should be(rebuilding)
       st.hostId should be(otherHostId)
-      host.loadStoreByIdRequests.toList should be(Nil)
+      recorded(host).loadStoreByIdRequests.toList should be(Nil)
       // Left for the owner, whose rebuild finds the store in place and only flips it.
       os.exists(deviceDir / s0.directoryName) should be(true)
       os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(false)
@@ -494,37 +496,37 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
   /** setUp with s0 Rebuilding under a RecordedRebuild, which ignores cancel() as a rebuild whose
    *  walk is still reading does, and s1 Active and open. The shutdown is requested and checked,
    *  and has reached its wait for the rebuild. */
-  private def shutDownDuringRebuild(): Future[(RecordingHost, os.Path, RecordingRebuildFactory)] =
+  private def shutDownDuringRebuild(): Future[(Host, os.Path, RecordingRebuildFactory)] =
     given ExecutionContext = executionContext
     val rebuilds = new RecordingRebuildFactory
     for
       (host, deviceDir) <- setUp(Map(s0 -> rebuilding, s1 -> active), loaded = Set(s1), rebuilds = rebuilds)
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(rebuilds.created.nonEmpty && host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(rebuilds.created.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.shutdownWorkTimeouts.nonEmpty)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host).shutdownWorkTimeouts.nonEmpty)
     yield (host, deviceDir, rebuilds)
 
   atest("shutdown waits for a cancelled rebuild to stop before closing the device's stores"):
     given ExecutionContext = executionContext
     for
       (host, deviceDir, rebuilds) <- shutDownDuringRebuild()
-      closesWhileWaiting = host.shutdownCloses.toList
-      outcomesWhileWaiting = host.shutdownOutcomes.toList
+      closesWhileWaiting = recorded(host).shutdownCloses.toList
+      outcomesWhileWaiting = recorded(host).shutdownOutcomes.toList
       // The walk ends and the rebuilt store lands, after the shutdown request.
       _ = os.makeDir.all(deviceDir / s0.directoryName)
       _ = rebuilds.created.head.promise.success(())
-      _ <- pumpUntil(!host.loadedDevices.contains(deviceA))
+      _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
       st <- state(deviceA)
     yield
-      host.shutdownWorkTimeouts.map(_._1).toList should be(List(deviceA))
+      recorded(host).shutdownWorkTimeouts.map(_._1).toList should be(List(deviceA))
       rebuilds.created.head.cancelled should be(true)
       closesWhileWaiting should be(Nil)
       outcomesWhileWaiting should be(Nil)
-      host.shutdownCloses.toList should be(List(s1))
-      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
+      recorded(host).shutdownCloses.toList should be(List(s1))
+      recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
       // Kept offline as the shutdown's own closes are, before Shutdown committed.
       os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
       st.stores(s0).status should be(StoreStatus.Offline)
@@ -534,15 +536,15 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     given ExecutionContext = executionContext
     for
       (host, _, rebuilds) <- shutDownDuringRebuild()
-      closesWhileWaiting = host.shutdownCloses.toList
-      _ = host.fireShutdownWorkTimeouts()
-      _ <- pumpUntil(!host.loadedDevices.contains(deviceA))
+      closesWhileWaiting = recorded(host).shutdownCloses.toList
+      _ = recorded(host).fireShutdownWorkTimeouts()
+      _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
       st <- state(deviceA)
     yield
       closesWhileWaiting should be(Nil)
       rebuilds.created.head.promise.isCompleted should be(false)
-      host.shutdownCloses.toList should be(List(s1))
-      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
+      recorded(host).shutdownCloses.toList should be(List(s1))
+      recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
       // Left as a crash leaves it, for the rebuild to resume after a restart or adoption.
       st.stores(s0) should be(rebuilding)
       st.status should be(DeviceStatus.Shutdown)
@@ -561,23 +563,23 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(movingStore, destId)
       _ <- waitForTransactionsToComplete()
-      _ = host.testingOnlyCheckAllDevices()
+      _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
-      gate = host.holdTransferOutcomes()
+      gate = recorded(host).holdTransferOutcomes()
       _ = transfers.finishTransferIn(movingStore)
       _ <- pumpUntil(os.exists(deviceDir / movingStore.directoryName / StoreTransfer.TransferredInMarkerFile))
       _ <- client.shutdownStorageDevice(destId)
       _ <- waitForTransactionsToComplete()
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.shutdownWorkTimeouts.nonEmpty)
-      outcomesWhileWaiting = host.shutdownOutcomes.toList
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host).shutdownWorkTimeouts.nonEmpty)
+      outcomesWhileWaiting = recorded(host).shutdownOutcomes.toList
       _ = gate.success(())
-      _ <- pumpUntil(!host.loadedDevices.contains(destId))
+      _ <- pumpUntil(!loadedDevices(host).contains(destId))
       st <- state(destId)
     yield
       outcomesWhileWaiting should be(Nil)
-      host.transferOutcomes(movingStore) should be(Host.TransferOutcome.PoolRepointedOffline)
-      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
+      recorded(host).transferOutcomes(movingStore) should be(DeviceMetadata.TransferOutcome.PoolRepointedOffline)
+      recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
       st.stores(movingStore).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
 
@@ -592,9 +594,9 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
     val storeDir = deviceDir / movingStore.directoryName
     os.makeDir.all(storeDir)
-    val local = host.loadedDevices(sourceId)
+    val local = loadedDevices(host)(sourceId)
     local.loadedStores = local.loadedStores + movingStore
-    def ask() = host.testingOnlyStartStoreTransferOut(StartStoreTransfer(host.hostId, client.clientId,
+    def ask() = host.control.transfers.startOut(StartStoreTransfer(host.hostId, client.clientId,
       sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
 
     for
@@ -603,12 +605,12 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- client.transferStore(movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
       // The close fails as ShutdownStore's does for a backend that failed-stop: marked, offline, unloaded
-      _ = host.failNextTransferOutClose.set(Some(() =>
+      _ = recorded(host).failNextTransferOutClose.set(Some(() =>
             os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
             local.loadedStores = local.loadedStores - movingStore
             local.offlineStores = local.offlineStores + movingStore))
       _ <- ask()
-      _ <- pumpUntil(host.lostTransferAborts.nonEmpty)
+      _ <- pumpUntil(recorded(host).lostTransferAborts.nonEmpty)
       // A retransmit meanwhile is refused before anything is closed, written or sent
       retransmit <- ask().failed
       _ <- pumpUntil(false, rounds = 5)
@@ -619,7 +621,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     yield
       retransmit.getMessage should include("rebuild-required")
       sends.transfersOut should be(Vector())
-      host.transferOutCloses.toList should be(List(movingStore))
+      recorded(host).transferOutCloses.toList should be(List(movingStore))
       os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
       st.stores(movingStore).status should be(StoreStatus.Rebuilding)
       dest.stores.get(movingStore) should be(None)
@@ -634,7 +636,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     val host = newHost(hostRoot, transferService = sends)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
     os.makeDir.all(deviceDir / movingStore.directoryName)
-    val local = host.loadedDevices(sourceId)
+    val local = loadedDevices(host)(sourceId)
     local.loadedStores = local.loadedStores + movingStore
 
     for
@@ -643,23 +645,23 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- client.transferStore(movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
       // The request passes every check and starts closing the store, which is held open.
-      transferGate = host.holdTransferOutCloses()
-      _ <- host.testingOnlyStartStoreTransferOut(StartStoreTransfer(host.hostId, client.clientId,
+      transferGate = recorded(host).holdTransferOutCloses()
+      _ <- host.control.transfers.startOut(StartStoreTransfer(host.hostId, client.clientId,
              sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
-      closesRequested = host.transferOutCloses.toList
+      closesRequested = recorded(host).transferOutCloses.toList
       // The device's shutdown begins meanwhile and is held in its own close of the store. The
       // bootstrap device holds the whole bootstrap pool, so the real request would refuse.
-      shutdownGate = host.holdShutdownCloses()
+      shutdownGate = recorded(host).holdShutdownCloses()
       _ <- forceShuttingDown(sourceId)
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.shutdownCloses.nonEmpty)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty)
       // The transfer's close finishes while the shutdown runs. Its continuation is queued on the
       // serial ExecutionContext ahead of these yields.
       _ = transferGate.success(())
       _ <- yieldUntil(false, 10)
       sendsWhileShuttingDown = sends.transfersOut
       _ = shutdownGate.success(())
-      _ <- pumpUntil(!host.loadedDevices.contains(sourceId))
+      _ <- pumpUntil(!loadedDevices(host).contains(sourceId))
       st <- state(sourceId)
     yield
       closesRequested should be(List(movingStore))

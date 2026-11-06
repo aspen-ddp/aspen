@@ -11,14 +11,14 @@ import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.server.Host.{AdoptOutcome, RebuildOutcome, ShutdownOutcome, TransferOutcome}
+import DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome, TransferOutcome}
 import scribe.Logging
 
 import scala.concurrent.Future
 
 /** The reads and transactions a Host performs against the storage-device, storage-pool and host metadata. Each
- *  method is a seam: Host passes an adapter that calls its own protected methods so that test subclasses can
- *  override them. Where a body needs Host state, that state is a parameter of the method.
+ *  method is a seam: a test replaces or wraps the metadata through Host.Seams. Where a body needs Host state, that
+ *  state is a parameter of the method.
  *  See ClientDeviceMetadata for what each method does. */
 trait DeviceMetadata:
   def updateStateForTransferredStore(storeId: StoreId,
@@ -47,12 +47,114 @@ trait DeviceMetadata:
 
   def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome]
 
+/** What the metadata methods decide, returned rather than acted on so that the caller can do the local disk work. */
+object DeviceMetadata:
+  /** What updateStateForTransferredStore decided about a transfer that has finished shipping
+   *  bytes, so its caller knows whether the destination is allowed to keep the copy that just
+   *  arrived.
+   *
+   *  Returned rather than acted on inside that method because the two halves live on opposite
+   *  sides of the boundary: the decision is metadata and belongs in the transaction, while
+   *  loading or discarding a store directory is local disk work that only the event loop does.
+   */
+  private[aspen] enum TransferOutcome:
+    /** The pool now names the destination, which therefore owns the arrived copy. */
+    case PoolRepointed
+
+    /** As PoolRepointed, but the destination is shutting down or shut down, so its entry was
+     *  written Offline rather than Active. The arrived copy is ours but must not be served: it
+     *  stays unloaded behind its transferred-in marker until a restart or adoption makes the
+     *  entry Active, when the reconcile's completed-transfers-in pass loads it. */
+    case PoolRepointedOffline
+
+    /** The destination was declared failed mid-flight, so the source was put back to Active and
+     *  the pool left naming it. The arrived copy belongs to nobody. */
+    case SourceRestored
+
+    /** The transfer was aborted (AspenClient.abortStoreTransfer) before its bytes were recorded:
+     *  the source's entry is no longer TransferringOut to the destination. The pool still names
+     *  the source, which kept its copy, so the arrived copy belongs to nobody.
+     *
+     *  Also the outcome when the source was tombstoned and drained first: the store was rebuilt on
+     *  another device, the pool names that one, and the destination's stale entry is removed. */
+    case Aborted
+
+    /** The destination device now names another host: it was shut down and adopted while this
+     *  host's pool update was still in flight. Nothing was written. The arrived copy is left as
+     *  it is, behind its transferred-in marker, for the owner's reconcile to finish: its
+     *  TransferringIn pass finds the promoted copy and runs this update itself. */
+    case NotOwned
+
+  /** What markRebuiltStoreActive decided about a rebuilt store, so its caller knows whether the
+   *  device is allowed to adopt the copy the rebuild placed.
+   *
+   *  Returned rather than acted on inside that method because the two halves live on opposite
+   *  sides of the boundary: the decision is metadata and belongs in the transaction, while
+   *  loading or discarding a store directory is local disk work that only the event loop does.
+   */
+  private[aspen] enum RebuildOutcome:
+    /** The device entry was flipped to Active (or was already Active), so the store should be
+     *  loaded. */
+    case Adopt
+
+    /** The device is shutting down or shut down, so the entry was written Offline rather than
+     *  Active (or was found Offline already). The rebuilt store is the device's, but must not be
+     *  served: it is kept offline behind a transfer-out marker, like every other store the
+     *  shutdown closed, until a restart or adoption brings it back. */
+    case AdoptOffline
+
+    /** The tree does not say this device owns a rebuilt store: the device was tombstoned,
+     *  the entry vanished, or the entry has a status other than Rebuilding/Active. The rebuilt
+     *  store belongs to nobody and must be discarded. */
+    case Discard
+
+    /** The device now names another host: it was shut down and adopted while the rebuild was
+     *  finishing. Nothing was written and the rebuilt copy is left in place. The owner's
+     *  reconcile restarts the rebuild, which finds the store already at its final path and only
+     *  flips the entry. */
+    case NotOwned
+
+  /** What completeDeviceShutdown decided, so shutDownDevice knows whether to unload the device,
+   *  go round again, or undo its own on-disk work.
+   *
+   *  Returned rather than acted on inside that method for the same reason as TransferOutcome:
+   *  the decision is metadata, while unloading and marker files are local work.
+   */
+  private[aspen] enum ShutdownOutcome:
+    /** The device is Shutdown and has no Active entry. It may be unloaded. */
+    case Completed
+
+    /** Some entry was Active although the shutdown request had committed -- defence in depth,
+     *  as every writer of an Active entry writes Offline on a shutting-down device -- and has
+     *  been flipped to Offline instead of committing Shutdown. Its store may be open, so the
+     *  shutdown goes round again to close it. */
+    case StoresReactivated
+
+    /** The device is no longer ShuttingDown: a restart arrived (or the device was declared
+     *  failed). Nothing was written. */
+    case Cancelled
+
+
+  /** What adoptDevice decided, from the device state it re-read inside its transaction. */
+  private[aspen] enum AdoptOutcome:
+    /** Committed. `state` is exactly what was written, for the post-commit steps to act on. */
+    case Adopted(state: StorageDeviceState)
+
+    /** The device is no longer Shutdown and owned by the previous host. Nothing was written. */
+    case Changed
+
+    /** These Offline stores were not closed cleanly on disk (adoptionClass). Nothing was
+     *  written. */
+    case Unclean(stores: List[StoreId])
+
 /** Runs only on the control thread. See HostThreading.scala.
  *
  *  The real metadata reads and transactions. Its Future callbacks, including the functions passed in
  *  (`uncleanStores`, `crlLostStores`, `markRebuildRequired`, `gossipStoreOnline`), run on the control context it
  *  imports from `ctx`. */
-class ClientDeviceMetadata(ctx: DeviceControl) extends DeviceMetadata with Logging:
+class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata with Logging:
+  // By name: Host builds this before the DeviceControl that holds it, which only calls it once constructed.
+  private lazy val ctx: DeviceControl = control
   import ctx.given
 
   private def client: AspenClient = ctx.client

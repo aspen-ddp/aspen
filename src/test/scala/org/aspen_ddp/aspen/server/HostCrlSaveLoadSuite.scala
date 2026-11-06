@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
-import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
@@ -15,12 +14,10 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
   TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
-import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
-import org.aspen_ddp.aspen.server.host.LockstepThreading
+import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading}
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
-import org.aspen_ddp.aspen.server.store.cache.ObjectCache
-import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
+import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
@@ -48,24 +45,10 @@ private class RecordingCRL extends CrashRecoveryLog:
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = synchronized:
     states += storeId -> (states.getOrElse(storeId, Map()) - txid)
 
-private class CrlSaveHost(mgrClient: AspenClient,
-                          systemId: UUID,
-                          hostRootDir: os.Path,
-                          execCtx: ExecutionContext,
-                          cacheFactory: StoreId => ObjectCache,
-                          messenger: ServerMessenger,
-                          finalizers: TransactionFinalizer.Factory,
-                          crl: CrashRecoveryLog)
-  extends Host(mgrClient, HostId.BootstrapHostId, systemId, hostRootDir, execCtx, new LockstepThreading(execCtx), cacheFactory, messenger,
-    BackgroundTaskManager.NoBackgroundTaskManager, new CrashRecoveryLogFactory { def createCRL() = crl }, finalizers,
-    TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS)):
-
-  def storeOf(storeId: StoreId): Option[Store] = stores.get(storeId)
-
-class HostCrlSaveLoadSuite extends IntegrationTestSuite with HostTestHarness:
+class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
 
   private val poolId = PoolId(new UUID(7, 1))
-  private val storeId = StoreId(poolId, 0)
+  private val crlStoreId = StoreId(poolId, 0)
   private val oid = ObjectId(new UUID(7, 2))
   private val ptr = DataObjectPointer(oid, poolId, Array[Byte]())
   private val rev0 = ObjectRevision(TransactionId(new UUID(7, 3)))
@@ -78,15 +61,15 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with HostTestHarness:
     tempRoots += root
     val storeDir = root / "store"
     os.makeDir.all(storeDir)
-    val backend = new MapBackend(storeId):
+    val backend = new MapBackend(crlStoreId):
       override def path: os.Path = storeDir
     backend.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
       DataBuffer(Array[Byte](0)))
 
     val txd = overwriteTxd(txid, 0)
-    val trs = TransactionRecoveryState(storeId, txd.serialize(), List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))),
+    val trs = TransactionRecoveryState(crlStoreId, txd.serialize(), List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))),
       TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial)
-    CrashRecoveryLog.saveStoreState(storeId, List(trs), backend.crlSaveFile)
+    CrashRecoveryLog.saveStoreState(crlStoreId, List(trs), backend.crlSaveFile)
     backend
 
   private val ida = Replication(3, 2)
@@ -95,27 +78,32 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with HostTestHarness:
     TransactionDescription(id, HLCTimestamp(100), ptr, leader,
       List(DataUpdate(ptr, rev0, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida, Map(poolId -> ida))
 
-  private def newHost(): CrlSaveHost =
+  private def newCrlHost(): Host =
     val hostRoot = os.temp.dir()
     tempRoots += hostRoot
-    new CrlSaveHost(client, systemId, hostRoot, executionContext, net.objectCacheFactory, net,
-      net.FinalizerFactory, new RecordingCRL)
+    val crl = new RecordingCRL
+    new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+      new LockstepThreading(executionContext), net.objectCacheFactory, net,
+      BackgroundTaskManager.NoBackgroundTaskManager, new CrashRecoveryLogFactory { def createCRL() = crl },
+      net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS))
+
+  private def storeOf(host: Host): Option[Store] = host.control.router.loaded.get(crlStoreId)
 
   atest("a store loaded from its crl_save.log recreates its in-flight transactions and their locks"):
     given ExecutionContext = executionContext
     val backend = storeWithSaveFile()
-    val host = newHost()
+    val host = newCrlHost()
     val loaded = host.loadStore(deviceId, backend, None)
 
     def recovered: Boolean =
       host.testingOnlyHandleEvents()
-      loaded.isCompleted && host.storeOf(storeId).exists(_.frontend.transactions.contains(txid))
+      loaded.isCompleted && storeOf(host).exists(_.frontend.transactions.contains(txid))
 
     for
       _ <- yieldUntil(recovered)
       _ <- loaded
     yield
-      val store = host.storeOf(storeId).get
+      val store = storeOf(host).get
       store.frontend.transactions.keySet should be (Set(txid))
       store.objectCache.get(oid).flatMap(_.lockedToTransaction) should be (Some(txid))
       os.exists(backend.crlSaveFile) should be (false)
@@ -123,22 +111,22 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with HostTestHarness:
   atest("a prepare that arrives while the crl_save.log loads is handled after the recovered transactions lock"):
     given ExecutionContext = executionContext
     val backend = storeWithSaveFile()
-    val host = newHost()
+    val host = newCrlHost()
     val loaded = host.loadStore(deviceId, backend, None)
     // A conflicting transaction led by another store, whose responses go to a store the test network hosts
     val other = TransactionId(new UUID(7, 6))
-    host.receiveTransactionMessage(TxPrepare(storeId, net.storeId0, overwriteTxd(other, 1),
+    host.receiveTransactionMessage(TxPrepare(crlStoreId, net.storeId0, overwriteTxd(other, 1),
       ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), Nil, true))
 
     def handled: Boolean =
       host.testingOnlyHandleEvents()
-      loaded.isCompleted && host.storeOf(storeId).exists(_.frontend.transactions.contains(other)) &&
-        host.storeOf(storeId).exists(_.objectCache.get(oid).nonEmpty)
+      loaded.isCompleted && storeOf(host).exists(_.frontend.transactions.contains(other)) &&
+        storeOf(host).exists(_.objectCache.get(oid).nonEmpty)
 
     for
       _ <- yieldUntil(handled)
       _ <- loaded
     yield
-      val store = host.storeOf(storeId).get
+      val store = storeOf(host).get
       store.frontend.transactions.keySet should be (Set(txid, other))
       store.objectCache.get(oid).flatMap(_.lockedToTransaction) should be (Some(txid))

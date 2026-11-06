@@ -107,7 +107,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   def logTransactionStatus(log: String => Unit): Unit = stores.values.foreach(_.logTransactionStatus(log))
 
   /** The loaded stores, by id */
-  private[server] def loaded: Map[StoreId, Store] = stores
+  private[aspen] def loaded: Map[StoreId, Store] = stores
 
   /** The stores marked offline */
   private[server] def offlineStores: Set[StoreId] = offline

@@ -5,7 +5,8 @@ import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.StoreOffline
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.runSequentially
-import org.aspen_ddp.aspen.server.Host.{ShutdownOutcome, StoreFailedOnClose}
+import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
+import org.aspen_ddp.aspen.server.host.DeviceMetadata.ShutdownOutcome
 import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles}
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging

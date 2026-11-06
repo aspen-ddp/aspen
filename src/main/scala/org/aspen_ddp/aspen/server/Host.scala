@@ -8,12 +8,11 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLogFactory
-import org.aspen_ddp.aspen.server.host.{AdoptionClass, BackendOpener, BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DefaultBackendOpener, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LockstepThreading}
+import org.aspen_ddp.aspen.server.host.{BackendOpener, BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DefaultBackendOpener, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LocalStorageDeviceState, LockstepThreading}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
 import org.aspen_ddp.aspen.server.store.Store
-import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
@@ -102,106 +101,8 @@ object Host:
                                 created: Option[Promise[Unit]], onServed: Option[() => Unit]) extends Event
   private[server] case class InitializeTaskExecutor() extends Event
 
-  /** What updateStateForTransferredStore decided about a transfer that has finished shipping
-   *  bytes, so its caller knows whether the destination is allowed to keep the copy that just
-   *  arrived.
-   *
-   *  Returned rather than acted on inside that method because the two halves live on opposite
-   *  sides of the boundary: the decision is metadata and belongs in the transaction, while
-   *  loading or discarding a store directory is local disk work that only the event loop does.
-   */
-  private[aspen] enum TransferOutcome:
-    /** The pool now names the destination, which therefore owns the arrived copy. */
-    case PoolRepointed
-
-    /** As PoolRepointed, but the destination is shutting down or shut down, so its entry was
-     *  written Offline rather than Active. The arrived copy is ours but must not be served: it
-     *  stays unloaded behind its transferred-in marker until a restart or adoption makes the
-     *  entry Active, when the reconcile's completed-transfers-in pass loads it. */
-    case PoolRepointedOffline
-
-    /** The destination was declared failed mid-flight, so the source was put back to Active and
-     *  the pool left naming it. The arrived copy belongs to nobody. */
-    case SourceRestored
-
-    /** The transfer was aborted (AspenClient.abortStoreTransfer) before its bytes were recorded:
-     *  the source's entry is no longer TransferringOut to the destination. The pool still names
-     *  the source, which kept its copy, so the arrived copy belongs to nobody.
-     *
-     *  Also the outcome when the source was tombstoned and drained first: the store was rebuilt on
-     *  another device, the pool names that one, and the destination's stale entry is removed. */
-    case Aborted
-
-    /** The destination device now names another host: it was shut down and adopted while this
-     *  host's pool update was still in flight. Nothing was written. The arrived copy is left as
-     *  it is, behind its transferred-in marker, for the owner's reconcile to finish: its
-     *  TransferringIn pass finds the promoted copy and runs this update itself. */
-    case NotOwned
-
-  /** What markRebuiltStoreActive decided about a rebuilt store, so its caller knows whether the
-   *  device is allowed to adopt the copy the rebuild placed.
-   *
-   *  Returned rather than acted on inside that method because the two halves live on opposite
-   *  sides of the boundary: the decision is metadata and belongs in the transaction, while
-   *  loading or discarding a store directory is local disk work that only the event loop does.
-   */
-  private[aspen] enum RebuildOutcome:
-    /** The device entry was flipped to Active (or was already Active), so the store should be
-     *  loaded. */
-    case Adopt
-
-    /** The device is shutting down or shut down, so the entry was written Offline rather than
-     *  Active (or was found Offline already). The rebuilt store is the device's, but must not be
-     *  served: it is kept offline behind a transfer-out marker, like every other store the
-     *  shutdown closed, until a restart or adoption brings it back. */
-    case AdoptOffline
-
-    /** The tree does not say this device owns a rebuilt store: the device was tombstoned,
-     *  the entry vanished, or the entry has a status other than Rebuilding/Active. The rebuilt
-     *  store belongs to nobody and must be discarded. */
-    case Discard
-
-    /** The device now names another host: it was shut down and adopted while the rebuild was
-     *  finishing. Nothing was written and the rebuilt copy is left in place. The owner's
-     *  reconcile restarts the rebuild, which finds the store already at its final path and only
-     *  flips the entry. */
-    case NotOwned
-
-  /** What completeDeviceShutdown decided, so shutDownDevice knows whether to unload the device,
-   *  go round again, or undo its own on-disk work.
-   *
-   *  Returned rather than acted on inside that method for the same reason as TransferOutcome:
-   *  the decision is metadata, while unloading and marker files are local work.
-   */
-  private[aspen] enum ShutdownOutcome:
-    /** The device is Shutdown and has no Active entry. It may be unloaded. */
-    case Completed
-
-    /** Some entry was Active although the shutdown request had committed -- defence in depth,
-     *  as every writer of an Active entry writes Offline on a shutting-down device -- and has
-     *  been flipped to Offline instead of committing Shutdown. Its store may be open, so the
-     *  shutdown goes round again to close it. */
-    case StoresReactivated
-
-    /** The device is no longer ShuttingDown: a restart arrived (or the device was declared
-     *  failed). Nothing was written. */
-    case Cancelled
-
-
-  /** What adoptDevice decided, from the device state it re-read inside its transaction. */
-  private[aspen] enum AdoptOutcome:
-    /** Committed. `state` is exactly what was written, for the post-commit steps to act on. */
-    case Adopted(state: StorageDeviceState)
-
-    /** The device is no longer Shutdown and owned by the previous host. Nothing was written. */
-    case Changed
-
-    /** These Offline stores were not closed cleanly on disk (adoptionClass). Nothing was
-     *  written. */
-    case Unclean(stores: List[StoreId])
-
   /** Hands each I/O completion to the host's threading as an IOCompletion event. */
-  class IOHandler(host: Host) extends CompletionHandler:
+  private[server] class IOHandler(host: Host) extends CompletionHandler:
     override def complete(op: Completion): Unit =
       host.post(IOCompletion(op))
 
@@ -211,10 +112,8 @@ object Host:
     override def run(): Unit = host.handleEvent(event)
     override def name: String = event.getClass.getSimpleName
 
-  type LocalStorageDeviceState = org.aspen_ddp.aspen.server.host.LocalStorageDeviceState
-
   /** Replacements for what Host would otherwise do itself, injected by tests. `None` is the production
-   *  implementation. A `Some` is passed straight to DeviceControl in place of Host's own adapter.
+   *  implementation, built directly. A `Some` is passed straight to DeviceControl in its place.
    *
    *  Beyond the fields the design names, `wrapMetadata`, `loadStore`, `tryLoadStore` and `loadStoreById` exist
    *  because a recording seam must stand in front of the real thing, which a test cannot build before the Host
@@ -231,7 +130,9 @@ object Host:
                          gossipStoreOnline: Option[StoreId => Unit] = None,
                          loadStore: Option[(StorageDeviceId, Backend, Option[Long]) => Future[Unit]] = None,
                          tryLoadStore: Option[(LocalStorageDeviceState, os.Path, Option[() => Unit]) => Unit] = None,
-                         loadStoreById: Option[(StorageDeviceId, StoreId) => Unit] = None)
+                         loadStoreById: Option[(StorageDeviceId, StoreId) => Unit] = None,
+                         scheduleShutdownWorkTimeout: Option[(StorageDeviceId, () => Unit) => Unit] = None,
+                         wrapIoHandler: Option[CompletionHandler => CompletionHandler] = None)
 
   object Seams:
     val default: Seams = Seams()
@@ -283,45 +184,19 @@ class Host(val client: AspenClient,
 
   private val localDevices = new LocalDevices()
 
-  // Lazy: it takes the DeviceControl below, whose control context its callbacks run on.
-  private lazy val clientMetadata = new ClientDeviceMetadata(deviceControl)
+  // It takes the DeviceControl below, whose control context its callbacks run on, but only uses it once built.
+  private val clientMetadata = new ClientDeviceMetadata(deviceControl)
 
   // A delay expires on a BackgroundTaskManager thread; its function is posted to the control thread.
   private val controlScheduler: ControlScheduler = seams.scheduler.getOrElse(
     new BackgroundControlScheduler(backgroundTasks, fn => threading.controlEvents.execute(() => fn())))
 
-  private val hostMetadata: DeviceMetadata = seams.metadata.getOrElse(new DeviceMetadata:
-      override def updateStateForTransferredStore(storeId: StoreId, fromDeviceId: StorageDeviceId,
-                                                  toDeviceid: StorageDeviceId,
-                                                  gossipRetransmitter: GossipRetransmitter) =
-        Host.this.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid)
-      override def readHostStateForEndpoint() = Host.this.readHostStateForEndpoint()
-      override def abortLostTransfer(storeId: StoreId) = Host.this.abortLostTransfer(storeId)
-      override def markRebuiltStoreActive(storageDeviceId: StorageDeviceId, storeId: StoreId,
-                                          gossipStoreOnline: StoreId => Unit) =
-        Host.this.markRebuiltStoreActive(storageDeviceId, storeId)
-      override def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId, devicePath: os.Path,
-                               uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
-                               crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                               markRebuildRequired: os.Path => Unit) =
-        Host.this.adoptDevice(storageDeviceId, previousHostId, devicePath)
-      override def lookupStorageDeviceState(storageDeviceId: StorageDeviceId) =
-        Host.this.lookupStorageDeviceState(storageDeviceId)
-      override def readTransferSourceState(fromDeviceId: StorageDeviceId) =
-        Host.this.readTransferSourceState(fromDeviceId)
-      override def completeDeviceShutdown(storageDeviceId: StorageDeviceId) =
-        Host.this.completeDeviceShutdown(storageDeviceId))
+  private val hostMetadata: DeviceMetadata = seams.metadata.getOrElse(clientMetadata)
 
-  private val deviceControl = new DeviceControl(
+  private val deviceControl: DeviceControl = new DeviceControl(
     metadata = seams.wrapMetadata.fold(hostMetadata)(wrap => wrap(hostMetadata)),
     scheduler = controlScheduler,
-    // The real FSIF open and thread pool, with the two seams below redirected to this Host's protected methods so
-    // that test subclasses that override them still take effect.
-    backends = seams.backends.getOrElse(new DefaultBackendOpener(ec):
-      override def openFsifBackend(storeId: StoreId, storePath: os.Path, layout: FsifLayout,
-                                   onFatal: Throwable => Unit) =
-        Host.this.openFsifBackend(storeId, storePath, layout, onFatal)
-      override def fsifOpenEc = Host.this.fsifOpenEc),
+    backends = seams.backends.getOrElse(new DefaultBackendOpener(ec)),
     devices = localDevices,
     client = client,
     hostId = hostId,
@@ -333,7 +208,7 @@ class Host(val client: AspenClient,
     post = event => Host.this.post(event),
     crl = crl,
     txStatusCache = txStatusCache,
-    ioHandler = ioHandler,
+    ioHandler = seams.wrapIoHandler.fold(ioHandler)(wrap => wrap(ioHandler)),
     objectCacheFactory = objectCacheFactory,
     finalizerFactory = finalizerFactory,
     txDriverFactory = txDriverFactory,
@@ -343,30 +218,25 @@ class Host(val client: AspenClient,
     maxConcurrentRebuilds = maxConcurrentRebuilds,
     loadStore = seams.loadStore.getOrElse(
       (deviceId, backend, maxSliceSize) => Host.this.loadStore(deviceId, backend, maxSliceSize)),
-    tryLoadStore = seams.tryLoadStore.getOrElse((sds, path, onServed) => Host.this.tryLoadStore(sds, path, onServed)),
+    tryLoadStore = seams.tryLoadStore.getOrElse(
+      (sds, path, onServed) => deviceControl.loader.tryLoadStore(sds, path, onServed)),
     loadStoreById = seams.loadStoreById.getOrElse((deviceId, storeId) => Host.this.loadStoreById(deviceId, storeId)),
-    warn = seams.warn.getOrElse((path, msg) => Host.this.logDeviceDirWarning(path, msg)),
+    warn = seams.warn.getOrElse((_, msg) => logger.warn(msg)),
     storeTransferService = storeTransferService,
     shutdownWorkTimeout = shutdownWorkTimeout,
-    gossipStoreOnline = seams.gossipStoreOnline.getOrElse(storeId => Host.this.gossipStoreOnline(storeId)),
-    closeStoreForTransferOut = seams.closeForTransferOut.getOrElse(storeId => Host.this.closeStoreForTransferOut(storeId)),
-    closeStoreForShutdown = seams.closeForShutdown.getOrElse(storeId => Host.this.closeStoreForShutdown(storeId)),
-    scheduleShutdownWorkTimeout = (deviceId, fn) => Host.this.scheduleShutdownWorkTimeout(deviceId)(fn()),
-    scheduleEndpointRetry = fn => Host.this.scheduleEndpointRetry(fn()),
+    gossipStoreOnline = seams.gossipStoreOnline.getOrElse(storeId => deviceControl.services.gossipStoreOnline(storeId)),
+    closeStoreForTransferOut = seams.closeForTransferOut.getOrElse(
+      storeId => deviceControl.transfers.closeForTransferOut(storeId)),
+    closeStoreForShutdown = seams.closeForShutdown.getOrElse(
+      storeId => deviceControl.shutdown.closeForShutdown(storeId)),
+    scheduleShutdownWorkTimeout = seams.scheduleShutdownWorkTimeout.getOrElse(
+      (_, fn) => controlScheduler.schedule(shutdownWorkTimeout)(fn())),
+    scheduleEndpointRetry = fn => controlScheduler.schedule(Duration(5, SECONDS))(fn()),
     ec = ec)
 
   private val shutdownPromise: Promise[Unit] = Promise()
 
   val storageDevicesDir: os.Path = rootDir / StorageDeviceManager.StorageDevicesDirName
-
-  // tryLoadDevice is the only writer that adds entries in production. Entries are removed when a
-  // device is shut down and unloaded, so a lookup miss means a device that is not loaded right
-  // now: one never seen, one rejected by the load decision, or one unloaded by a shutdown. Tests
-  // inject entries directly via RecordingHost.injectLoadedDevice.
-  protected def storageDevices: Map[StorageDeviceId, LocalStorageDeviceState] = localDevices.devices
-  protected def storageDevices_=(devices: Map[StorageDeviceId, LocalStorageDeviceState]): Unit =
-    localDevices.devices = devices
-    deviceControl.publishView()
 
   protected def stores: Map[StoreId, Store] = deviceControl.router.loaded
 
@@ -424,27 +294,6 @@ class Host(val client: AspenClient,
 
   def getServiceExecutor(): Future[DurableServiceExecutor] = services.getServiceExecutor()
 
-  // protected so a test subclass can count what warnOnce lets through.
-  protected def logDeviceDirWarning(path: os.Path, msg: String): Unit = logger.warn(msg)
-
-  // protected so tests can subclass with a recording implementation instead of opening a real RocksDB backend.
-  // `stores` and `storageDevices` are already protected. onServed is run only if the store ends up served.
-  protected def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path,
-                             onServed: Option[() => Unit] = None): Unit =
-    deviceControl.loader.tryLoadStore(sds, potentialStoreFile, onServed)
-
-  /** Where FSIF stores are opened (recovered) and created, off the event thread. protected as a test seam. */
-  protected def fsifOpenEc: ExecutionContext = DefaultBackendOpener.FsifOpenEc
-
-  /** Opens an existing FSIF store (FsifBackend.open: a directory without the marker is initialized only if its
-   *  files are blank, otherwise recovered). protected as a test seam: a subclass can fail the open or keep
-   *  `onFatal`. */
-  protected def openFsifBackend(storeId: StoreId,
-                                storePath: os.Path,
-                                layout: FsifLayout,
-                                onFatal: Throwable => Unit): Backend =
-    FsifBackend.open(storeId, storePath, layout, FsifBackend.sharedIo, onFatal)
-
   /** Starts running the host's events. Until then they wait. */
   def start(): Unit = threading.start()
 
@@ -468,99 +317,12 @@ class Host(val client: AspenClient,
   def getDevicePath(storageDeviceId: StorageDeviceId): Option[os.Path] =
     deviceControl.currentView.devicePaths.get(storageDeviceId)
 
-  /** Records the outcome of a store transfer that has finished shipping bytes. See
-   *  ClientDeviceMetadata.updateStateForTransferredStore.
-   *
-   *  protected so a test subclass can observe the returned Future; the production caller is
-   *  StoreTransfers.startIn.
-   */
-  protected def updateStateForTransferredStore(storeId: StoreId,
-                                               fromDeviceId: StorageDeviceId,
-                                               toDeviceid: StorageDeviceId): Future[TransferOutcome] =
-    clientMetadata.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid, gossipRetransmitter)
-
   /** Makes this host's HostState endpoint match the configured one. See HostServices.reconcileEndpoint. */
   def reconcileEndpoint(address: String,
                         dataPort: Int,
                         httpPort: Int,
                         storeTransferPort: Int): Future[Boolean] =
     services.reconcileEndpoint(address, dataPort, httpPort, storeTransferPort)
-
-  /** Test seam: the read that decides whether the endpoint needs updating. */
-  protected def readHostStateForEndpoint(): Future[HostState] = clientMetadata.readHostStateForEndpoint()
-
-  /** Test seam: runs a failed reconcileEndpoint attempt's retry after the retry delay. */
-  protected def scheduleEndpointRetry(fn: => Unit): Unit =
-    controlScheduler.schedule(Duration(5, SECONDS))(fn)
-
-  private def discardStoreDirectory(storeId: StoreId,
-                                    deviceId: StorageDeviceId,
-                                    reason: String): Unit =
-    localDevices.discardStoreDirectory(storeId, deviceId, reason)
-
-  /** The abort returnLostTransferToRebuild issues. A seam for tests. */
-  protected def abortLostTransfer(storeId: StoreId): Future[Boolean] = clientMetadata.abortLostTransfer(storeId)
-
-  /** Decides whether a rebuilt store should be adopted or discarded. See
-   *  ClientDeviceMetadata.markRebuiltStoreActive. Protected as a test seam. */
-  protected def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
-                                       storeId: StoreId): Future[RebuildOutcome] =
-    clientMetadata.markRebuiltStoreActive(storageDeviceId, storeId, gossipStoreOnline)
-
-  /** Gossips StoreMoved for a store brought back online without repointing the pool. See
-   *  HostServices.gossipStoreOnline. protected as a test seam, so a test can see that it was called without a
-   *  readable pool. */
-  protected def gossipStoreOnline(storeId: StoreId): Unit = services.gossipStoreOnline(storeId)
-
-  /** Adopts a Shutdown device from its previous host. See ClientDeviceMetadata.adoptDevice.
-   *
-   *  protected so a test subclass can record the calls.
-   */
-  protected def adoptDevice(storageDeviceId: StorageDeviceId,
-                            previousHostId: HostId,
-                            devicePath: os.Path): Future[AdoptOutcome] =
-    val discovery = deviceControl.discovery
-    clientMetadata.adoptDevice(storageDeviceId, previousHostId, devicePath, discovery.uncleanStores,
-                               (path, state) => discovery.offlineStoresIn(path, state, AdoptionClass.CrlLost),
-                               deviceControl.rebuilds.markRebuildRequired)
-
-  /** Reads the state recorded for `storageDeviceId` in the storage-devices tree. A seam rather than a direct
-   *  client call so a test can hold a lookup in flight; see ClientDeviceMetadata.lookupStorageDeviceState.
-   *
-   *  May throw rather than return a failed Future. startDeviceCheck treats the two alike, so an
-   *  override is free to do either.
-   */
-  protected def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
-    clientMetadata.lookupStorageDeviceState(storageDeviceId)
-
-  /** Reads the source device of a transfer in, which the reconcile's TransferringIn pass re-reads
-   *  on every check. A seam so a test can tell when the read has been acted on. */
-  protected def readTransferSourceState(fromDeviceId: StorageDeviceId): Future[StorageDeviceState] =
-    clientMetadata.readTransferSourceState(fromDeviceId)
-
-  /** Takes a store out of service for a transfer out: closeStore if it is open, else nothing. A
-   *  seam so a test can hold the close open. Called on the control thread. */
-  protected def closeStoreForTransferOut(storeId: StoreId): Future[Unit] =
-    transfers.closeForTransferOut(storeId)
-
-  /** Takes one store out of service for a device shutdown. The default is closeStore, which saves
-   *  the store's CRL state beside it. A seam so a test can hold a close open, and count closes,
-   *  without real backends. */
-  protected def closeStoreForShutdown(storeId: StoreId): Future[Unit] =
-    deviceControl.shutdown.closeForShutdown(storeId)
-
-  /** Runs `fn` after shutdownWorkTimeout. A seam so a test can fire the timeout itself, since the
-   *  test hosts' BackgroundTaskManager never fires anything. */
-  protected def scheduleShutdownWorkTimeout(storageDeviceId: StorageDeviceId)(fn: => Unit): Unit =
-    controlScheduler.schedule(shutdownWorkTimeout)(fn)
-
-  /** The last step of a shutdown: one transaction on the device state that either commits
-   *  Shutdown or explains why it did not. See ClientDeviceMetadata.completeDeviceShutdown.
-   *
-   *  protected so a test can run work between the stores closing and this transaction.
-   */
-  protected def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome] =
-    clientMetadata.completeDeviceShutdown(storageDeviceId)
 
   // containsStore, getStoreIds, repairableStoreIds and isRepairable are called from other threads (the repair
   // service, the network bridge, RunningHost.stop), so each reads the published HostStoreView.
@@ -648,97 +410,8 @@ class Host(val client: AspenClient,
   /** Runs all posted work. Returns when none is left. Lockstep threading only. */
   def testingOnlyHandleEvents(): Unit = lockstep.drain()
 
-  /** Testing hook: runs a CheckAllDevices event synchronously.
-   *
-   *  Direct rather than posted + testingOnlyHandleEvents so a test does not also drain
-   *  the InitializeTaskExecutor event queued by the constructor, which would attempt a real
-   *  task-executor bootstrap transaction.
-   */
-  private[aspen] def testingOnlyCheckAllDevices(): Unit = handleEvent(CheckAllDevices())
-
-  /** Testing hook: runs a ScanDevices event synchronously. See testingOnlyCheckAllDevices. */
-  private[aspen] def testingOnlyScanDevices(): Unit = handleEvent(ScanDevices())
-
-  private[aspen] def testingOnlyLoadedDeviceDirs: Map[os.Path, StorageDeviceId] =
-    deviceControl.discovery.loadedDeviceDirs
-
-  private[aspen] def testingOnlyReportedDeviceDirs: Set[os.Path] =
-    deviceControl.discovery.reportedDeviceDirs
-
-  /** Testing hook: device directories with a shutdown-marker lookup or adoption in flight. */
-  private[aspen] def testingOnlyPendingMarkerResolutions: Set[os.Path] =
-    deviceControl.discovery.pendingMarkerResolutions
-
-  /** Testing hook: how many ShutdownMarkerResolved events are queued. */
-  private[aspen] def testingOnlyQueuedMarkerResolutions: Int =
-    lockstep.queuedItems.count(isMarkerResolution)
-
-  private def isMarkerResolution(task: Runnable): Boolean = task match
-    case t: EventTask => t.event.isInstanceOf[ShutdownMarkerResolved]
-    case _ => false
-
-  /** Testing hook: removes the queued ShutdownMarkerResolved events and handles them
-   *  synchronously, leaving every other event queued. See testingOnlyCheckAllDevices. */
-  private[aspen] def testingOnlyHandleMarkerResolutions(): Unit =
-    lockstep.removeQueued(isMarkerResolution).foreach(_.run())
-
-  /** Testing hook: runs receiveHostMessage's handler synchronously. See
-   *  testingOnlyCheckAllDevices for why this bypasses the event queue. */
-  private[aspen] def testingOnlyHandleHostMessage(msg: HostMessage): Unit =
-    handleEvent(HostMsg(msg))
-
-  /** Testing hook: handles a StartStoreTransfer as the event loop would, returning the Future that
-   *  fails when the request is refused, so a test can tell a refusal from a request still in flight. */
-  private[aspen] def testingOnlyStartStoreTransferOut(m: StartStoreTransfer): Future[Unit] =
-    transfers.startOut(m)
-
-  /** Testing hook: runs the post-transfer metadata update synchronously.
-   *
-   *  In production this is driven by a transfer in completing, which needs a real device
-   *  directory and a real byte stream. The metadata half is what the tests are about. */
-  private[aspen] def testingOnlyUpdateStateForTransferredStore(storeId: StoreId,
-                                                               fromDeviceId: StorageDeviceId,
-                                                               toDeviceId: StorageDeviceId): Future[TransferOutcome] =
-    updateStateForTransferredStore(storeId, fromDeviceId, toDeviceId)
-
   /** The components, for tests. */
   private[aspen] def control: DeviceControl = deviceControl
-
-  /** Testing hook: the stores with a transfer in under way, including one waiting out its retry delay. */
-  private[aspen] def testingOnlyTransferringIn: Set[StoreId] =
-    transfers.transferringIn.keySet
-
-  /** Testing hook: the stores whose failed transfer in is waiting out its retry delay. */
-  private[aspen] def testingOnlyScheduledTransferInRetries: Set[StoreId] =
-    transfers.transferInRetries.keySet
-
-  /** Testing hook: runs every scheduled transfer-in retry now rather than after its delay. */
-  private[aspen] def testingOnlyRetryTransferIns(): Unit =
-    transfers.transferInRetries.values.toList.foreach(_.run())
-
-  /** Testing hook: the devices with a re-check waiting out TransferOutRecheckDelay. */
-  private[aspen] def testingOnlyScheduledDeviceRechecks: Set[StorageDeviceId] =
-    reconciler.scheduledDeviceRechecks
-
-  /** Testing hook: runs every scheduled device re-check now rather than after its delay. */
-  private[aspen] def testingOnlyRunDeviceRechecks(): Unit =
-    reconciler.scheduledDeviceRechecks.foreach(reconciler.runDeviceRecheck)
-
-  /** Testing hook: the storage devices with a state lookup currently in flight. */
-  private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId] =
-    reconciler.activeDeviceChecks
-
-  /** Testing hook: whether a store awaiting space holds a real onServed callback; None if it is not awaiting
-   *  space */
-  private[aspen] def testingOnlyAwaitingSpaceHasCallback(storeId: StoreId): Option[Boolean] =
-    deviceControl.loader.awaitingSpaceHasCallback(storeId)
-
-  private[aspen] def testingOnlyOfflineStores: Set[StoreId] =
-    deviceControl.router.offlineStores
-
-  /** Testing hook: devices with a check request deferred behind an in-flight lookup. */
-  private[aspen] def testingOnlyDeferredDeviceChecks: Set[StorageDeviceId] =
-    reconciler.deferredDeviceChecks
 
   /** Runs on the control thread (lockstep: the draining test thread). */
   private def handleEvent(event: Event): Unit =

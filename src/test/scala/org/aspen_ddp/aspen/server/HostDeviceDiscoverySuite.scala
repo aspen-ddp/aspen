@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
-import org.aspen_ddp.aspen.server.host.{ControlFixture, LocalStorageDeviceState, LockstepThreading, StoreTransfers}
+import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, LockstepThreading, StagedSendService, StagedTransferService, StoreTransfers}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
@@ -21,118 +21,6 @@ import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, SECONDS}
-
-
-/** A StoreTransferService whose transfers move no bytes and finish only when the test says so.
- *
- *  The real StoreTransferManager needs a live sending host, a TLS socket and a `jar` subprocess,
- *  none of which exists here, but the interesting half of a transfer for these tests is what Host
- *  does once the Future from beginTransferIn resolves. beginTransferOut is unimplemented on
- *  purpose: nothing in this suite ships a store out, and a silently-working stub would hide it if
- *  something started to.
- */
-private class StagedTransferService extends StoreTransferService:
-  private val calls = mutable.ArrayBuffer[(StoreId, UUID, os.Path, Promise[Unit])]()
-  private val cancels = mutable.ArrayBuffer[(StoreId, UUID)]()
-
-  /** Every cancelTransferIn call, in order. */
-  def cancelledTransfersIn: Vector[(StoreId, UUID)] = synchronized(cancels.toVector)
-
-  /** Every beginTransferIn call, in order. */
-  def transfersIn: Vector[(StoreId, UUID, os.Path)] =
-    synchronized(calls.map((sid, uuid, dir, _) => (sid, uuid, dir)).toVector)
-
-  /** The stores a transfer in has been begun for. */
-  def startedTransfersIn: Set[StoreId] = transfersIn.map(_._1).toSet
-
-  private def latest(storeId: StoreId): Option[(StoreId, UUID, os.Path, Promise[Unit])] =
-    synchronized(calls.findLast(_._1 == storeId))
-
-  /** Resolves `storeId`'s latest transfer as if every byte had arrived. Leaves behind what
-   *  extraction would have: `<dir>/<storeId.directoryName>`, still carrying the source's
-   *  transfer-out marker and the CRL save file its close wrote, for Host's promotion step to
-   *  move into place. `crlValid = false` leaves a truncated save file instead. */
-  def finishTransferIn(storeId: StoreId, crlValid: Boolean = true): Unit =
-    latest(storeId).foreach: (sid, _, dir, p) =>
-      val staged = dir / sid.directoryName
-      os.makeDir.all(staged)
-      os.write.over(staged / StoreTransfer.TransferOutMarkerFile, "")
-      if crlValid then
-        CrashRecoveryLog.saveStoreState(sid, Nil, Backend.crlSaveFile(staged))
-      else
-        os.write.over(Backend.crlSaveFile(staged), "")
-      p.success(())
-
-  /** Fails `storeId`'s latest transfer, as a timed-out or truncated stream would. */
-  def failTransferIn(storeId: StoreId): Unit =
-    latest(storeId).foreach(_._4.failure(new Exception(s"Simulated failure of transfer in of $storeId")))
-
-  def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
-    synchronized:
-      val p = Promise[Unit]()
-      calls += ((storeId, transferUUID, destinationDirectory, p))
-      p.future
-
-  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Unit =
-    val p = synchronized:
-      cancels += ((storeId, transferUUID))
-      calls.find(c => c._1 == storeId && c._2 == transferUUID).map(_._4)
-    p.foreach(_.tryFailure(new Exception(s"Cancelled transfer in of $storeId")))
-
-  def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
-                       destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit =
-    throw new UnsupportedOperationException("StagedTransferService does not send stores")
-
-  // Sends exist only when a test declares one with markSending: this service never ships bytes.
-  private var sending = Set[StoreId]()
-  private val outCancels = mutable.ArrayBuffer[StoreId]()
-
-  /** Makes `storeId` read as transferring out until cancelTransferOut is called for it. */
-  def markSending(storeId: StoreId): Unit = synchronized:
-    sending += storeId
-
-  /** Every cancelTransferOut call, in order. */
-  def cancelledTransfersOut: Vector[StoreId] = synchronized(outCancels.toVector)
-
-  def cancelTransferOut(storeId: StoreId): Unit = synchronized:
-    outCancels += storeId
-    sending -= storeId
-
-  def isTransferringOut(storeId: StoreId): Boolean = synchronized(sending.contains(storeId))
-
-  def transferringOutStores: Set[StoreId] = synchronized(sending)
-
-
-/** A StoreTransferService whose sends move no bytes and end only when the test says so, for
- *  tests where this host is the transfer's source. beginTransferIn is unimplemented on purpose,
- *  as beginTransferOut is in StagedTransferService.
- */
-private class StagedSendService extends StoreTransferService:
-  private var sending = Set[StoreId]()
-  private var begun = Vector[(StoreId, UUID)]()
-
-  /** Every beginTransferOut call, in order. */
-  def transfersOut: Vector[(StoreId, UUID)] = synchronized(begun)
-
-  /** Ends `storeId`'s send, as a failure or a completion would: it is no longer transferring out. */
-  def endTransferOut(storeId: StoreId): Unit = synchronized:
-    sending -= storeId
-
-  def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
-    throw new UnsupportedOperationException("StagedSendService does not receive stores")
-
-  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Unit = ()
-
-  def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
-                       destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit = synchronized:
-    begun :+= (storeId, transferUUID)
-    sending += storeId
-
-  def cancelTransferOut(storeId: StoreId): Unit = endTransferOut(storeId)
-
-  def isTransferringOut(storeId: StoreId): Boolean = synchronized(sending.contains(storeId))
-
-  def transferringOutStores: Set[StoreId] = synchronized(sending)
 
 
 /** Delegates execution to `underlying`, and records every reportFailure call instead of
@@ -208,16 +96,6 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     StorageDeviceState(fixed_ids.FailedStorageDeviceId, fixed_ids.FailedHostId,
                        0L, 1024L, stores, deviceSetId,
                        status = StorageDeviceState.DeviceStatus.Failed)
-
-  /** Runs every transfer-in retry waiting out its delay, then drains the events they post. */
-  private def retryTransferIns(host: Host): Unit =
-    scheduler(host).runWhere(_ == StoreTransfers.TransferInRetryDelay)
-    host.testingOnlyHandleEvents()
-
-  /** Runs every device re-check waiting out its delay, then drains the events they post. */
-  private def runDeviceRechecks(host: Host): Unit =
-    scheduler(host).runWhere(_ == Host.TransferOutRecheckDelay)
-    host.testingOnlyHandleEvents()
 
   atest("constructor loads a device that already exists on disk"):
     val hostRoot = newHostDir()
@@ -612,7 +490,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     host.control.reconciler.activeDeviceChecks should be(empty)
 
     // A sanity anchor rather than a discriminator: no deferral can exist yet. checkStorageDevice
-    // and startDeviceCheck both run under the instance monitor, so nothing can slip a deferral in
+    // and startDeviceCheck both run on the control context, so nothing can slip a deferral in
     // between the guard entry and the lookup call that throws.
     host.control.reconciler.deferredDeviceChecks should be(empty)
 
@@ -1038,7 +916,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       dest <- client.getStorageDeviceState(net.secondDeviceId)
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
     yield
-      recorded(host).transferOutcomes.get(movingStore) should be(Some(Host.TransferOutcome.Aborted))
+      recorded(host).transferOutcomes.get(movingStore) should be(Some(DeviceMetadata.TransferOutcome.Aborted))
       poolState.stores(movingStore.poolIndex).storageDeviceId should not be(net.secondDeviceId)
       dest.stores.contains(movingStore) should be(false)
       os.exists(arrived) should be(false)
@@ -1096,7 +974,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     yield
       // pumpUntil gives up silently, so assert what it waited on.
       recorded(host).transferOutcomes.get(movingStore) should be(
-        Some(Host.TransferOutcome.SourceRestored))
+        Some(DeviceMetadata.TransferOutcome.SourceRestored))
 
       // The metadata half, from round 3: the pool keeps naming the source and the source's
       // entry goes back to Active.
@@ -1152,7 +1030,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
     yield
       recorded(host).transferOutcomes.get(movingStore) should be(
-        Some(Host.TransferOutcome.PoolRepointed))
+        Some(DeviceMetadata.TransferOutcome.PoolRepointed))
 
       poolState.stores(movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
       recorded(host).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
@@ -1184,7 +1062,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         case _ => false)
       (poolState, poolTimestamp) <- client.getStoragePoolStateAndTimestamp(movingStore.poolId)
     yield
-      recorded(host).transferOutcomes.get(movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
+      recorded(host).transferOutcomes.get(movingStore) should be(Some(DeviceMetadata.TransferOutcome.PoolRepointed))
       poolState.stores(movingStore.poolIndex).hostId should be(host.hostId)
       val gossip = net.takeCapturedGossip()
       gossip should have size 1
@@ -1256,7 +1134,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       val promoted = t.deviceDir / dirName
 
       recorded(t.host).transferOutcomes.get(t.movingStore) should be(
-        Some(Host.TransferOutcome.PoolRepointed))
+        Some(DeviceMetadata.TransferOutcome.PoolRepointed))
       os.exists(promoted) should be(true)
       // Left in place, either marker would keep the promoted store offline on every restart.
       os.exists(promoted / "transferring-out") should be(false)
@@ -1379,7 +1257,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       os.exists(promoted) should be(true)
       heldTransferringIn should contain(t.movingStore)
       attemptsWhileHeld should be(1)
-      recorded(t.host).transferOutcomes.get(t.movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
+      recorded(t.host).transferOutcomes.get(t.movingStore) should be(Some(DeviceMetadata.TransferOutcome.PoolRepointed))
       recorded(t.host).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
       t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
 
@@ -1447,7 +1325,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.transferStore(store, net.thirdDeviceId)
       _ <- waitForTransactionsToComplete()
       _ = host.control.reconciler.handleCheckMessage(
-      CheckStorageDevice(HostId.BootstrapHostId, client.clientId, net.thirdDeviceId))
+            CheckStorageDevice(HostId.BootstrapHostId, client.clientId, net.thirdDeviceId))
       _ <- pumpUntil(startTransferSent(transfers, store, 2))
     yield
       startTransferSent(transfers, store, 2) should be(true)
@@ -1576,7 +1454,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       dest <- client.getStorageDeviceState(net.secondDeviceId)
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
     yield
-      recorded(t.host).transferOutcomes.get(t.movingStore) should be(Some(Host.TransferOutcome.Aborted))
+      recorded(t.host).transferOutcomes.get(t.movingStore) should be(Some(DeviceMetadata.TransferOutcome.Aborted))
 
       // Recording it anyway would undo the abort: the pool repointed here, the source's entry
       // dropped, while the initiator believes the transfer never happened.
@@ -1613,7 +1491,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       attempts.size should be(2)
       attempts(1)._2 should not be attempts(0)._2
 
-      recorded(t.host).transferOutcomes.get(t.movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
+      recorded(t.host).transferOutcomes.get(t.movingStore) should be(Some(DeviceMetadata.TransferOutcome.PoolRepointed))
       poolState.stores(t.movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
       dest.stores.get(t.movingStore).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Active))
       recorded(t.host).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
@@ -1678,7 +1556,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, transferService = sends)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
 
-    // The recording host never loads the store, so closeStore has nothing to close and does not
+    // The recording seams never load the store, so closeStore has nothing to close and does not
     // mark it offline; that is done by hand, as ShutdownStore would.
     val storeDir = deviceDir / movingStore.directoryName
     os.makeDir.all(storeDir)
@@ -1822,7 +1700,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       // The device check resumed the metadata step rather than refusing the existing directory
       // or shipping the store again.
       transfers2.transfersIn should be(Vector())
-      recorded(host2).transferOutcomes.get(t.movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
+      recorded(host2).transferOutcomes.get(t.movingStore) should be(Some(DeviceMetadata.TransferOutcome.PoolRepointed))
       poolState.stores(t.movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
 
       // Loaded only once the pool names this device, and the marker goes with it.

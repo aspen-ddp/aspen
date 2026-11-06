@@ -20,7 +20,7 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
  *  tryLoadDevice is the only writer that adds entries in production. Entries are removed when a
  *  device is shut down and unloaded, so a lookup miss means a device that is not loaded right
  *  now: one never seen, one rejected by the load decision, or one unloaded by a shutdown. Tests
- *  inject entries directly via RecordingHost.injectLoadedDevice. */
+ *  inject entries directly via ControlFixture.injectLoadedDevice. */
 class LocalDevices extends Logging:
   var devices: Map[StorageDeviceId, LocalStorageDeviceState] = Map()
 

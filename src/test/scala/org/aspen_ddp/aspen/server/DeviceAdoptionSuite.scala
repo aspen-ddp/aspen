@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -20,9 +21,9 @@ import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
 /** Restart of a shut-down device on the host that shut it down, and adoption of one by another
- *  host. The adopting host is always the RecordingHost (BootstrapHostId); the "old host" is a
+ *  host. The adopting host is always the Host (BootstrapHostId); the "old host" is a
  *  second host registered with client.createHost. */
-class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
+class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
   import StorageDeviceState.{DeviceStatus, StoreEntry, StoreStatus}
 
   private val offline = StoreEntry(StoreStatus.Offline, None)
@@ -43,17 +44,17 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
 
   /** Waits for the shutdown-marker lookups issued by the last scan, handles their results, then
    *  waits for whatever those started (an adoption, the device check of a loaded device). */
-  private def resolve(host: RecordingHost): Future[Unit] =
+  private def resolve(host: Host): Future[Unit] =
     given ExecutionContext = executionContext
     for
-      _ <- pumpUntil(host.testingOnlyQueuedMarkerResolutions > 0)
-      _ = host.testingOnlyHandleMarkerResolutions()
-      _ <- pumpUntil(host.testingOnlyPendingMarkerResolutions.isEmpty &&
-                     host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ <- pumpUntil(queuedMarkerEvents(host) > 0)
+      _ = handleMarkerEvents(host)
+      _ <- pumpUntil(host.control.discovery.pendingMarkerResolutions.isEmpty &&
+                     host.control.reconciler.activeDeviceChecks.isEmpty)
     yield ()
 
-  private def scanAndResolve(host: RecordingHost): Future[Unit] =
-    host.testingOnlyScanDevices()
+  private def scanAndResolve(host: Host): Future[Unit] =
+    host.control.reconciler.scan()
     resolve(host)
 
   private def state(id: StorageDeviceId): Future[StorageDeviceState] = client.getStorageDeviceState(id)
@@ -133,7 +134,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- waitForTransactionsToComplete()
     yield stores
 
-  /** The device directory as carried to the RecordingHost's root: `owning-host` and
+  /** The device directory as carried to the Host's root: `owning-host` and
    *  `shutdown.state` naming `markerHost` (owning-host `owningHost`). */
   private def writeCarriedDevice(markerHost: HostId,
                                  owningHost: HostId): (os.Path, os.Path) =
@@ -166,7 +167,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       e1 <- poolEntry(s1)
       e2 <- poolEntry(s2)
     yield
-      host.adoptCalls.toList should be(List((deviceA, oldHostId)))
+      recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
       st.status should be(DeviceStatus.Operational)
       st.hostId should be(HostId.BootstrapHostId)
       st.stores(s0).status should be(StoreStatus.Active)
@@ -180,8 +181,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
       os.exists(marker(d0)) should be(false)
       os.exists(marker(d2)) should be(true)
-      host.loadedDevices.contains(deviceA) should be(true)
-      host.storeLoadAttempts.map(_._2) should contain(d0)
+      loadedDevices(host).contains(deviceA) should be(true)
+      recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
       val moves = storeMoves()
       moves.map(_.storeId) should be(List(s0))
       moves.head.hostId should be(HostId.BootstrapHostId)
@@ -235,17 +236,17 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
         st <- state(deviceA)
         e0 <- poolEntry(s0)
       yield
-        host.adoptCalls.toList should be(List((deviceA, oldHostId)))
+        recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
         st.status should be(DeviceStatus.Operational)
         st.hostId should be(HostId.BootstrapHostId)
         st.stores(s0) should be(rebuilding)
         st.stores(s1).status should be(StoreStatus.Active)
         e0.hostId should be(HostId.BootstrapHostId)
-        host.loadedDevices.contains(deviceA) should be(true)
+        loadedDevices(host).contains(deviceA) should be(true)
         rebuilds.created.map(_.storeId).toList should be(List(s0))
         // Discarded before the rebuild began, so the rebuild cannot take it for a store in place.
         os.exists(d0) should be(false)
-        host.storeLoadAttempts.map(_._2) should contain(d1)
+        recorded(host).storeLoadAttempts.map(_._2) should contain(d1)
 
   atest("a device whose shutdown did not finish is refused by another host"):
     given ExecutionContext = executionContext
@@ -259,9 +260,9 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- scanAndResolve(host)
       st <- state(deviceA)
     yield
-      host.loadedDevices.contains(deviceA) should be(false)
-      host.adoptCalls.toList should be(Nil)
-      host.deviceDirWarnings.count(_._1 == deviceDir) should be(1)
+      loadedDevices(host).contains(deviceA) should be(false)
+      recorded(host).adoptCalls.toList should be(Nil)
+      recorded(host).deviceDirWarnings.count(_._1 == deviceDir) should be(1)
       st.status should be(DeviceStatus.ShuttingDown)
       st.hostId should be(oldHostId)
       DeviceMarkers.readShutdownState(deviceDir) should be(Some(oldHostId))
@@ -281,12 +282,12 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       host = newHost(hostRoot)
       _ <- resolve(host)
     yield
-      host.adoptCalls.toList should be(Nil)
-      host.loadedDevices.contains(deviceA) should be(true)
+      recorded(host).adoptCalls.toList should be(Nil)
+      loadedDevices(host).contains(deviceA) should be(true)
       DeviceMarkers.readOwningHost(deviceDir) should be(Some(HostId.BootstrapHostId))
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
       os.exists(marker(d0)) should be(false)
-      host.storeLoadAttempts.map(_._2) should contain(d0)
+      recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
       storeMoves().map(_.storeId) should be(List(s0))
 
   atest("adoption proceeds when the previous host's state is missing"):
@@ -305,7 +306,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       st.hostId should be(HostId.BootstrapHostId)
       st.stores(stores.head).status should be(StoreStatus.Active)
       newHostState.storageDevices should contain(deviceA)
-      host.loadedDevices.contains(deviceA) should be(true)
+      loadedDevices(host).contains(deviceA) should be(true)
 
   atest("a Shutdown device back on its own host is not loaded until restarted"):
     given ExecutionContext = executionContext
@@ -318,23 +319,23 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       d0 = writeClosedStore(deviceDir, s0)
       host = newHost(hostRoot)
       _ <- resolve(host)
-      loadedWhileShutdown = host.loadedDevices.contains(deviceA)
-      warningsWhileShutdown = host.deviceDirWarnings.count(_._1 == deviceDir)
+      loadedWhileShutdown = loadedDevices(host).contains(deviceA)
+      warningsWhileShutdown = recorded(host).deviceDirWarnings.count(_._1 == deviceDir)
       _ <- client.restartStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = net.takeCapturedGossip()
-      _ = host.testingOnlyHandleHostMessage(CheckStorageDevice(me, client.clientId, deviceA))
+      _ = host.control.reconciler.handleCheckMessage(CheckStorageDevice(me, client.clientId, deviceA))
       _ <- resolve(host)
       st <- state(deviceA)
     yield
       loadedWhileShutdown should be(false)
       warningsWhileShutdown should be(0)
-      host.adoptCalls.toList should be(Nil)
-      host.loadedDevices.contains(deviceA) should be(true)
+      recorded(host).adoptCalls.toList should be(Nil)
+      loadedDevices(host).contains(deviceA) should be(true)
       st.status should be(DeviceStatus.Operational)
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
       os.exists(marker(d0)) should be(false)
-      host.storeLoadAttempts.map(_._2) should contain(d0)
+      recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
       storeMoves().map(_.storeId) should be(List(s0))
 
   atest("a host restarted mid-shutdown finishes it"):
@@ -347,13 +348,13 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       _ = writeClosedStore(deviceDir, stores.head)
       host = newHost(hostRoot)
       _ <- resolve(host)
-      loadedAfterResolve = host.loadedDevices.contains(deviceA)
-      _ = host.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(host.shutdownOutcomes.nonEmpty && !host.loadedDevices.contains(deviceA))
+      loadedAfterResolve = loadedDevices(host).contains(deviceA)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host).shutdownOutcomes.nonEmpty && !loadedDevices(host).contains(deviceA))
       st <- state(deviceA)
     yield
       loadedAfterResolve should be(true)
-      host.shutdownOutcomes.toList should contain(Host.ShutdownOutcome.Completed)
+      recorded(host).shutdownOutcomes.toList should contain(DeviceMetadata.ShutdownOutcome.Completed)
       st.status should be(DeviceStatus.Shutdown)
       DeviceMarkers.readShutdownState(deviceDir) should be(Some(me))
 
@@ -374,21 +375,21 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- resolve(host)
       st <- state(deviceA)
       markerKeptByAdoption = os.exists(d1 / StoreTransfer.TransferredInMarkerFile)
-      attemptsAfterAdoption = host.storeLoadAttempts.map(_._2).toList
-      // RecordingHost's tryLoadStore does not record the skipped store offline, as the real one
+      attemptsAfterAdoption = recorded(host).storeLoadAttempts.map(_._2).toList
+      // Host's tryLoadStore does not record the skipped store offline, as the real one
       // does on seeing the marker; done by hand so the completed-transfers-in pass sees it.
-      _ = host.loadedDevices(deviceA).offlineStores += s1
-      _ = host.testingOnlyCheckAllDevices()
+      _ = loadedDevices(host)(deviceA).offlineStores += s1
+      _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(!os.exists(d1 / StoreTransfer.TransferredInMarkerFile) &&
-                     host.testingOnlyActiveDeviceChecks.isEmpty)
+                     host.control.reconciler.activeDeviceChecks.isEmpty)
     yield
-      host.adoptCalls.toList should be(List((deviceA, oldHostId)))
+      recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
       st.status should be(DeviceStatus.Operational)
       st.stores(s1).status should be(StoreStatus.Active)
       markerKeptByAdoption should be(true)
       attemptsAfterAdoption.count(_ == d1) should be(1)
       os.exists(d1 / StoreTransfer.TransferredInMarkerFile) should be(false)
-      host.storeLoadAttempts.map(_._2).count(_ == d1) should be(2)
+      recorded(host).storeLoadAttempts.map(_._2).count(_ == d1) should be(2)
 
   atest("a store rebuilt after its device was shut down and unloaded is adopted"):
     given ExecutionContext = executionContext
@@ -401,16 +402,16 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       oldRoot = newHostDir()
       oldDir = writeDevice(oldRoot, "dev0", deviceA, owner = Some(oldHostId))
       oldHost = newHost(oldRoot, storeRebuildFactory = rebuilds, hostId = oldHostId)
-      _ = oldHost.testingOnlyCheckAllDevices()
-      _ <- pumpUntil(rebuilds.created.nonEmpty && oldHost.testingOnlyActiveDeviceChecks.isEmpty)
+      _ = oldHost.control.reconciler.checkAll()
+      _ <- pumpUntil(rebuilds.created.nonEmpty && oldHost.control.reconciler.activeDeviceChecks.isEmpty)
       // The pool lives on deviceA alone, so the real request would refuse this shutdown.
       _ <- forceShuttingDown(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = oldHost.testingOnlyCheckAllDevices()
+      _ = oldHost.control.reconciler.checkAll()
       // The rebuild ignores its cancel, so the shutdown proceeds only once its wait times out.
-      _ <- pumpUntil(oldHost.shutdownWorkTimeouts.nonEmpty)
-      _ = oldHost.fireShutdownWorkTimeouts()
-      _ <- pumpUntil(!oldHost.loadedDevices.contains(deviceA))
+      _ <- pumpUntil(recorded(oldHost).shutdownWorkTimeouts.nonEmpty)
+      _ = recorded(oldHost).fireShutdownWorkTimeouts()
+      _ <- pumpUntil(!loadedDevices(oldHost).contains(deviceA))
       // The rebuild, past its last read, lands its store and finishes on the unloaded device.
       d0Old = oldDir / s0.directoryName
       _ = os.makeDir.all(d0Old)
@@ -430,12 +431,12 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       entryAfterRebuild.status should be(StoreStatus.Offline)
       markerWritten should be(true)
       crlWritten should be(true)
-      host.adoptCalls.toList should be(List((deviceA, oldHostId)))
+      recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
       st.status should be(DeviceStatus.Operational)
       st.hostId should be(HostId.BootstrapHostId)
       st.stores(s0).status should be(StoreStatus.Active)
       os.exists(marker(newDir / s0.directoryName)) should be(false)
-      host.storeLoadAttempts.map(_._2) should contain(newDir / s0.directoryName)
+      recorded(host).storeLoadAttempts.map(_._2) should contain(newDir / s0.directoryName)
 
   private val destHostId = HostId(UUID.fromString("0a0a0a0a-0000-0000-0000-000000000002"))
 
@@ -443,12 +444,12 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
     net.takeCapturedHostMessages().collect { case m: StartStoreTransfer => m }
 
   /** deviceA, owned by the old host, sending its one store to deviceB on a third host whose
-   *  RecordingHost (`dest`) has already asked the old host for it. deviceA is then shut down and
-   *  carried to the adopting RecordingHost (`host`), which adopts it. Returns the store, the
+   *  Host (`dest`) has already asked the old host for it. deviceA is then shut down and
+   *  carried to the adopting Host (`host`), which adopts it. Returns the store, the
    *  first request, and both hosts. */
   private def adoptTransferSource(transfers: StagedTransferService,
                                   sends: StagedSendService)
-      : Future[(StoreId, StartStoreTransfer, RecordingHost, RecordingHost)] =
+      : Future[(StoreId, StartStoreTransfer, Host, Host)] =
     given ExecutionContext = executionContext
     val transferId = UUID.randomUUID()
     for
@@ -464,7 +465,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       _ = writeDevice(destRoot, "dev0", deviceB, owner = Some(destHostId))
       dest = newHost(destRoot, transferService = transfers, hostId = destHostId)
       _ = net.takeCapturedHostMessages()
-      _ = dest.testingOnlyCheckAllDevices()
+      _ = dest.control.reconciler.checkAll()
       _ <- pumpUntil(transfers.startedTransfersIn.contains(s0))
       firstAsk = startTransfers()
       _ <- setDeviceState(deviceA)(_.copy(status = DeviceStatus.Shutdown))
@@ -477,10 +478,10 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
     yield (s0, firstAsk.head, dest, host)
 
   /** Hands `ask` to `host` as its event loop would and waits for the send to begin. */
-  private def deliver(host: RecordingHost, sends: StagedSendService, ask: StartStoreTransfer): Future[Unit] =
+  private def deliver(host: Host, sends: StagedSendService, ask: StartStoreTransfer): Future[Unit] =
     given ExecutionContext = executionContext
     for
-      _ <- host.testingOnlyStartStoreTransferOut(ask)
+      _ <- host.control.transfers.startOut(ask)
       _ <- pumpUntil(sends.transfersOut.nonEmpty)
     yield ()
 
@@ -510,8 +511,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
     for
       (s0, firstAsk, dest, host) <- adoptTransferSource(transfers, sends)
       _ = transfers.failTransferIn(s0)
-      _ <- pumpUntil(dest.testingOnlyScheduledTransferInRetries.contains(s0))
-      _ = dest.testingOnlyRetryTransferIns()
+      _ <- pumpUntil(dest.control.transfers.transferInRetries.keySet.contains(s0))
+      _ = retryTransferIns(dest)
       _ <- pumpUntil(net.capturedHostMessages.exists(_.isInstanceOf[StartStoreTransfer]))
       retried = startTransfers()
       _ <- deliver(host, sends, retried.head)
@@ -524,7 +525,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
    *  the state as it was before the last of them was added: the adoption must act on the state
    *  it re-reads, not on that one. `closeLast` decides whether the last store's directory was
    *  closed cleanly. */
-  private def adoptWithStaleLookup(closeLast: Boolean): Future[(RecordingHost, os.Path, List[StoreId])] =
+  private def adoptWithStaleLookup(closeLast: Boolean): Future[(Host, os.Path, List[StoreId])] =
     given ExecutionContext = executionContext
     for
       stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 2, registerOldHost = true): ss =>
@@ -537,9 +538,9 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       _ = DeviceMarkers.writeShutdownState(deviceDir, oldHostId)
       _ = writeClosedStore(deviceDir, s0)
       _ = if closeLast then writeClosedStore(deviceDir, s1)
-      lookup = host.armLookup(deviceA)
+      lookup = recorded(host).armLookup(deviceA)
       _ = net.takeCapturedGossip()
-      _ = host.testingOnlyScanDevices()
+      _ = host.control.reconciler.scan()
       _ = lookup.success(current.copy(stores = current.stores - s1))
       _ <- resolve(host)
     yield (host, deviceDir, stores)
@@ -550,12 +551,12 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       (host, deviceDir, stores) <- adoptWithStaleLookup(closeLast = false)
       st <- state(deviceA)
     yield
-      host.adoptCalls.toList should be(List((deviceA, oldHostId)))
+      recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
       st.status should be(DeviceStatus.Shutdown)
       st.hostId should be(oldHostId)
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Offline))
-      host.loadedDevices.contains(deviceA) should be(false)
-      host.deviceDirWarnings.count(_._1 == deviceDir) should be(1)
+      loadedDevices(host).contains(deviceA) should be(false)
+      recorded(host).deviceDirWarnings.count(_._1 == deviceDir) should be(1)
       DeviceMarkers.readShutdownState(deviceDir) should be(Some(oldHostId))
 
   atest("adoption brings into service the stores of the state it committed"):
@@ -566,7 +567,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
     yield
       st.status should be(DeviceStatus.Operational)
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Active))
-      host.loadedDevices.contains(deviceA) should be(true)
+      loadedDevices(host).contains(deviceA) should be(true)
       stores.map(s => os.exists(marker(deviceDir / s.directoryName))) should be(List(false, false))
       storeMoves().map(_.storeId).toSet should be(stores.toSet)
 

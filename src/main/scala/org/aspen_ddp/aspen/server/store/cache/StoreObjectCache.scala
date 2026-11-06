@@ -161,11 +161,12 @@ final class StoreObjectCache private[cache] (host: HostObjectCache,
         publishOldest()
         true
 
-  /** Runs on this view's executor, posted by another view's rebalance: evicts this view's oldest entries while the
-    * host total is over budget, then passes any remaining pressure on to the next victim.
+  /** Runs on this view's executor, posted by another view's rebalance: evicts this view's oldest entries until the
+    * host total is down to the shed low-water mark, then passes any pressure left over the budget on to the next
+    * victim.
     */
   private[cache] def shed(): Unit =
     shedPending.set(false)
     if !cleared then
-      while host.total.get > host.maxBytes && evictOldest(None) do ()
+      while host.total.get > host.shedLowWater && evictOldest(None) do ()
       if host.total.get > host.maxBytes then host.rebalance(this, None)

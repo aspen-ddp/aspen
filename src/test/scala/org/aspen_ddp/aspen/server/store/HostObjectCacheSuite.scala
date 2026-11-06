@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{Key, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
@@ -23,6 +24,25 @@ object HostObjectCacheSuite {
   val store0: StoreId = StoreId(PoolId(new UUID(0, 9)), 0)
   val store1: StoreId = StoreId(PoolId(new UUID(0, 9)), 1)
   val store2: StoreId = StoreId(PoolId(new UUID(0, 9)), 2)
+
+  /** Runs each posted task at once, counting them */
+  class Inline extends ExecutionContext {
+    var posted = 0
+    def execute(r: Runnable): Unit =
+      posted += 1
+      r.run()
+    def reportFailure(t: Throwable): Unit = throw t
+  }
+
+  /** Counts the tasks posted through it and those that have finished running */
+  class Counting(ec: ExecutionContext) extends ExecutionContext {
+    val submitted = new AtomicLong(0)
+    val finished = new AtomicLong(0)
+    def execute(r: Runnable): Unit =
+      submitted.incrementAndGet()
+      ec.execute(() => try r.run() finally finished.incrementAndGet())
+    def reportFailure(t: Throwable): Unit = ec.reportFailure(t)
+  }
 
   /** Records posted tasks so a test decides when they run */
   class Queue extends ExecutionContext {
@@ -276,113 +296,118 @@ class HostObjectCacheSuite extends AnyFunSuite with Matchers {
     hc.sizeInBytes should be(2 * Overhead)
   }
 
+  // Cross-store tests use a cap of 32 entries: a shed then frees down to 31 (the cap less a 1/32 slack of one entry)
+  private val Cap32 = 32 * Overhead
+
+  private def objs(from: Int, until: Int): IndexedSeq[ObjectState] = (from until until).map(mkobj(_))
+
   test("a hot store's inserts evict a cold store's oldest entries") {
-    val hc = new HostObjectCache(4 * Overhead, clock)
+    val hc = new HostObjectCache(Cap32, clock)
     val coldQueue = new Queue
     val cold = hc.forStore(store0, coldQueue)
     val hot = hc.forStore(store1)
-    val c1 = mkobj(1); val c2 = mkobj(2)
-    val hs = (11 to 14).map(mkobj(_))
+    val cs = objs(1, 5)
+    val hs = objs(100, 129)
 
-    cold.insert(c1); cold.insert(c2)
-    hs.foreach(hot.insert)
+    cs.foreach(cold.insert)
+    hs.foreach(hot.insert) // 33 entries: over by one
 
     coldQueue.tasks.size shouldBe 1
     coldQueue.runAll()
-    cold.get(c1.objectId) shouldBe None
-    cold.get(c2.objectId) shouldBe None
-    hc.sizeInBytes shouldBe 4 * Overhead
+    // Freed down to the low-water mark of 31 entries: the two oldest
+    cold.get(cs(0).objectId) shouldBe None
+    cold.get(cs(1).objectId) shouldBe None
+    cold.get(cs(2).objectId) should be(Some(cs(2)))
+    hc.sizeInBytes shouldBe 31 * Overhead
     hs.foreach(h => hot.get(h.objectId) should be(Some(h)))
   }
 
   test("a store evicts its own entries when they are the oldest") {
-    val hc = new HostObjectCache(4 * Overhead, clock)
+    val hc = new HostObjectCache(Cap32, clock)
     val qa = new Queue
     val qb = new Queue
     val a = hc.forStore(store0, qa)
     val b = hc.forStore(store1, qb)
-    val b1 = mkobj(1); val b2 = mkobj(2); val b3 = mkobj(3)
-    val a1 = mkobj(11); val a2 = mkobj(12)
+    val bs = objs(1, 5)
 
-    b.insert(b1); b.insert(b2)
-    a.insert(a1); a.insert(a2)
-    b.insert(b3)
+    b.insert(bs(0)); b.insert(bs(1))
+    objs(100, 129).foreach(a.insert) // 31 entries
+    b.insert(bs(2))
+    b.insert(bs(3)) // 33: over by one
 
     qa.tasks shouldBe empty
     qb.tasks shouldBe empty
-    b.get(b1.objectId) shouldBe None
-    b.get(b2.objectId) should be(Some(b2))
-    b.get(b3.objectId) should be(Some(b3))
-    a.get(a1.objectId) should be(Some(a1))
-    hc.sizeInBytes shouldBe 4 * Overhead
+    // Local eviction is exact to the cap
+    b.get(bs(0).objectId) shouldBe None
+    b.get(bs(1).objectId) should be(Some(bs(1)))
+    a.entryCount shouldBe 29
+    hc.sizeInBytes shouldBe Cap32
   }
 
   test("only one shed is pending per victim") {
-    val hc = new HostObjectCache(2 * Overhead, clock)
+    val hc = new HostObjectCache(Cap32, clock)
     val coldQueue = new Queue
     val cold = hc.forStore(store0, coldQueue)
     val hot = hc.forStore(store1)
 
-    cold.insert(mkobj(1)); cold.insert(mkobj(2))
-    hot.insert(mkobj(11)); hot.insert(mkobj(12)); hot.insert(mkobj(13))
+    objs(1, 5).foreach(cold.insert)
+    objs(100, 130).foreach(hot.insert) // 34 entries: over at the 33rd and the 34th
 
     coldQueue.tasks.size shouldBe 1
     coldQueue.runAll()
-    cold.entryCount shouldBe 0
-    // The cold view's two entries were not enough: its shed passed the rest on to the hot view
-    hot.entryCount shouldBe 2
-    hc.sizeInBytes shouldBe 2 * Overhead
+    cold.entryCount shouldBe 1
+    hot.entryCount shouldBe 30
+    hc.sizeInBytes shouldBe 31 * Overhead
   }
 
   test("a shed that arrives after the pressure passed evicts nothing") {
-    val hc = new HostObjectCache(2 * Overhead, clock)
+    val hc = new HostObjectCache(Cap32, clock)
     val coldQueue = new Queue
     val cold = hc.forStore(store0, coldQueue)
     val hot = hc.forStore(store1)
-    val c1 = mkobj(1); val c2 = mkobj(2)
 
-    cold.insert(c1); cold.insert(c2)
-    hot.insert(mkobj(11))
+    objs(1, 3).foreach(cold.insert)
+    objs(100, 131).foreach(hot.insert) // 33 entries
     coldQueue.tasks.size shouldBe 1
     hot.clear()
     coldQueue.runAll()
 
-    cold.get(c1.objectId) should be(Some(c1))
-    cold.get(c2.objectId) should be(Some(c2))
+    cold.entryCount shouldBe 2
     hc.sizeInBytes shouldBe 2 * Overhead
   }
 
   test("a shed queued for a cleared view does nothing") {
-    val hc = new HostObjectCache(2 * Overhead, clock)
+    val hc = new HostObjectCache(Cap32, clock)
     val coldQueue = new Queue
     val cold = hc.forStore(store0, coldQueue)
     val hot = hc.forStore(store1)
 
-    cold.insert(mkobj(1)); cold.insert(mkobj(2))
-    hot.insert(mkobj(11)); hot.insert(mkobj(12)); hot.insert(mkobj(13))
+    objs(1, 3).foreach(cold.insert)
+    objs(100, 133).foreach(hot.insert) // 35 entries
     coldQueue.tasks.size shouldBe 1
     cold.clear()
-    hc.sizeInBytes shouldBe 3 * Overhead
+    hc.sizeInBytes shouldBe 33 * Overhead
     coldQueue.runAll()
 
-    hc.sizeInBytes shouldBe 3 * Overhead
-    hot.entryCount shouldBe 3
+    // Still over, but a cleared view neither evicts nor passes the pressure on
+    hc.sizeInBytes shouldBe 33 * Overhead
+    hot.entryCount shouldBe 33
   }
 
   test("a victim with too few entries passes the rest of the pressure on") {
-    val hc = new HostObjectCache(4 * Overhead, clock)
+    val hc = new HostObjectCache(Cap32, clock)
     val qa = new Queue
     val qb = new Queue
     val a = hc.forStore(store0, qa)
     val b = hc.forStore(store1, qb)
     val c = hc.forStore(store2)
     val a1 = mkobj(1)
-    val b1 = mkobj(2); val b2 = mkobj(3)
-    val cs = (11 to 13).map(mkobj(_))
+    val bs = objs(10, 14)
+    val cs = objs(100, 129)
 
     a.insert(a1)
-    b.insert(b1); b.insert(b2)
-    cs.foreach(c.insert)
+    bs.foreach(b.insert)
+    cs.foreach(c.insert) // 34 entries
 
     qa.tasks.size shouldBe 1
     qb.tasks shouldBe empty
@@ -391,10 +416,28 @@ class HostObjectCacheSuite extends AnyFunSuite with Matchers {
     qb.tasks.size shouldBe 1
     qb.runAll()
 
-    b.get(b1.objectId) shouldBe None
-    b.get(b2.objectId) should be(Some(b2))
+    b.get(bs(0).objectId) shouldBe None
+    b.get(bs(1).objectId) shouldBe None
+    b.get(bs(2).objectId) should be(Some(bs(2)))
     cs.foreach(o => c.get(o.objectId) should be(Some(o)))
-    hc.sizeInBytes shouldBe 4 * Overhead
+    hc.sizeInBytes shouldBe 31 * Overhead
+  }
+
+  test("sustained pressure posts one shed per slack's worth of inserts") {
+    // Cap of 320 entries: a shed frees down to 310, so the next ten inserts need no shed
+    val hc = new HostObjectCache(320 * Overhead, clock)
+    val inline = new Inline
+    val cold = hc.forStore(store0, inline)
+    val hot = hc.forStore(store1)
+
+    objs(1, 321).foreach(cold.insert) // exactly at the cap
+    objs(1000, 1110).foreach(hot.insert)
+
+    // Inserts 1, 12, 23, ..., 100 go over: 10 sheds of 11 entries each, rather than one per insert
+    inline.posted shouldBe 10
+    cold.entryCount shouldBe 210
+    hot.entryCount shouldBe 110
+    hc.sizeInBytes shouldBe 320 * Overhead
   }
 
   test("pinned states never make a store a victim") {
@@ -418,31 +461,53 @@ class HostObjectCacheSuite extends AnyFunSuite with Matchers {
 
   test("stores on their own threads keep the host total consistent") {
     val cap = 1000 * Overhead
-    val hc = new HostObjectCache(cap)
+    val ticks = new AtomicLong(0)
+    // Strictly increasing across threads, so the prefilled view's entries are always older than later ones
+    val hc = new HostObjectCache(cap, () => ticks.incrementAndGet())
     val poolA = Executors.newSingleThreadExecutor()
     val poolB = Executors.newSingleThreadExecutor()
     try
       val ecA = ExecutionContext.fromExecutor(poolA)
       val ecB = ExecutionContext.fromExecutor(poolB)
-      val a = hc.forStore(store0, ecA)
-      val b = hc.forStore(store1, ecB)
+      // The views post sheds through counting wrappers; the test's own tasks bypass them
+      val shedsA = new Counting(ecA)
+      val shedsB = new Counting(ecB)
+      val a = hc.forStore(store0, shedsA)
+      val b = hc.forStore(store1, shedsB)
 
-      def run(ec: ExecutionContext, view: StoreObjectCache, base: Int): Future[Unit] =
-        Future((0 until 10000).foreach(n => ec.execute(() => view.insert(mkobj(base + n)))))(using ec)
+      def await(f: Future[Unit]): Unit = Await.result(f, 60.seconds)
+
+      def insertAll(ec: ExecutionContext, view: StoreObjectCache, from: Int, until: Int): Future[Unit] =
+        Future((from until until).foreach(n => ec.execute(() => view.insert(mkobj(n)))))(using ec)
           .flatMap(_ => Future(())(using ec))(using ec)
 
-      val doneA = run(ecA, a, 0)
-      val doneB = run(ecB, b, 100000)
-      Await.result(doneA, 60.seconds)
-      Await.result(doneB, 60.seconds)
+      // A fills the cache alone, so B's first over-budget insert finds A's head oldest and posts it a shed
+      await(insertAll(ecA, a, 0, 1000))
+      val doneA = insertAll(ecA, a, 1000, 10000)
+      val doneB = insertAll(ecB, b, 100000, 110000)
+      await(doneA)
+      await(doneB)
 
-      // Drain until no shed is pending on either view
-      def drain(ec: ExecutionContext): Unit = Await.result(Future(())(using ec), 60.seconds)
+      // Quiescent once two consecutive snapshots, each taken after a drain of both threads, are equal and show every
+      // posted shed finished: no shed ran or was posted between them, and nothing else posts any more
+      def drain(): Unit =
+        await(Future(())(using ecA))
+        await(Future(())(using ecB))
+      def snapshot(): (Long, Long, Long, Long) =
+        (shedsA.submitted.get, shedsA.finished.get, shedsB.submitted.get, shedsB.finished.get)
+      drain()
+      var prev = snapshot()
       var rounds = 0
-      while { drain(ecA); drain(ecB); a.shedPending.get || b.shedPending.get } do
+      var quiescent = false
+      while !quiescent do
+        drain()
+        val cur = snapshot()
+        quiescent = cur == prev && cur._1 == cur._2 && cur._3 == cur._4
+        prev = cur
         rounds += 1
         rounds should be < 1000
 
+      (shedsA.finished.get + shedsB.finished.get) should be > 0L
       hc.sizeInBytes shouldBe (a.sizeInBytes + b.sizeInBytes)
       hc.sizeInBytes should be <= (cap + Overhead * 2)
     finally

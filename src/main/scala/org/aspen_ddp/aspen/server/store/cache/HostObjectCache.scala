@@ -30,6 +30,9 @@ class HostObjectCache(val maxBytes: Long, private[cache] val clock: () => Long =
 
   private val views = new ConcurrentHashMap[StoreId, StoreObjectCache]
 
+  /** A shed frees down to this, below the budget, so the next inserts fit without posting another shed */
+  private[cache] val shedLowWater: Long = maxBytes - maxBytes / HostObjectCache.ShedSlackDivisor
+
   /** Estimated bytes currently held by all stores */
   def sizeInBytes: Long = total.get
 
@@ -82,6 +85,13 @@ class HostObjectCache(val maxBytes: Long, private[cache] val clock: () => Long =
 
 
 object HostObjectCache:
+
+  /** A shed frees an extra 1/ShedSlackDivisor of the budget below it. Freeing only to the budget would leave the host
+    * exactly at it, so under sustained pressure every next insert would go over and post another shed to the same
+    * victim: one posted task per insert. With the slack a shed covers about maxBytes / 32 bytes of inserts. Local
+    * eviction by the inserting store needs no slack, as it posts nothing, and stays exact to the budget.
+    */
+  val ShedSlackDivisor: Long = 32
 
   /** Approximate fixed cost of a cached object: the ObjectState, its metadata, and the cache entry */
   val EntryOverhead: Long = 256

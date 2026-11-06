@@ -1,9 +1,6 @@
 TODO
 ====
 
-HostObjectCache is one `synchronized` cache shared by every store; with stores on parallel threads it is the likely
-next contention point (see docs/superpowers/specs/2026-11-05-host-refactor-design.md).
-
 Potential problem with rapid transactions. If we have a store backend that commits slowly, we could get a queue of
 pending commits if we allow the next transaction on an object to commit before the current, in-flight commit
 completes. In the pathological case, this could overflow the CRL. We need some mechanism to prevent the next transaction

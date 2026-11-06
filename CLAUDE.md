@@ -215,6 +215,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     per transaction, capped at `DefaultMaxEntries`), so these stay short: 5 s and 7 s with the host's 1 s heartbeat
   - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
     non-object requirements). The driver tallies each object's votes from its own pool's stores
+  - A store keeps a committed transaction's CRL state until its backend commits succeed; a failed commit keeps it (and
+    the pinned object state, still served) while the store is loaded
 -  Lifecycle:
   - The client builds a TransactionDescription and sends it plus object data to the stores
   - The stores check all local state against the TransactionRequirements and determine their Commit/Abort decision
@@ -241,6 +243,10 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   `Store`, `Frontend` or `Tx` runs there, so they take no locks. The exception is `Store.transactionDrivers`, a
   `@volatile` immutable Map so `hasTransactions`/`logTransactionStatus` may read it from any thread;
   `TransactionDriver`s keep their own locks for their timer threads
+- Each store's object cache is its own LRU, owned by its executor, under one host byte budget (`HostObjectCache`): an
+  over-budget store evicts its own oldest entries or posts a shed to the store holding the host's oldest, freeing to
+  `maxBytes / 32` below the budget. `Frontend` pins states held by transactions and in-flight commits; a failed
+  backend commit stays pinned and served
 - The hot path (network messages, I/O completions, heartbeats, repairs) goes through `StoreRouter` straight to the
   store's executor: a concurrent map lookup on the calling thread, then the task, which runs only if that store is
   not closed when the task runs (tasks queued ahead of a close still run). Unknown stores are answered from the

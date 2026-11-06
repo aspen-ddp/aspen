@@ -85,6 +85,13 @@ Need a mechanism to handle "out of space" errors
   - Could set up "spillover stores"
     - Dedicated to hosting data for full stores
     - Lots of implications though, will require some thought
+  - A late prepare arriving after the finalized status-cache entry expired can create a fresh Tx whose CRL save
+    replaces a failed commit's retained entry (possibly without object data), and an abort of that Tx deletes it.
+    The ErrorTree mark still covers it.
+  - When an in-place update fails partway (Tx.doCommit discards the object) while an earlier commit of the same
+    object is still in the backend, reads load and cache the pre-commit backend state; it stays cached after that
+    commit lands. A fix: backendReadComplete should not cache results while a non-deletion commit of the object is
+    in flight.
 
 Mint per-client certificates for the CLI and other client applications
   - Intentional technical debt: every client currently shares the single

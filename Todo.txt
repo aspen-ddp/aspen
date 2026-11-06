@@ -104,10 +104,9 @@ too): StoreTransferManagerSuite "one pass starts as many transfers as the floor 
 broken pipe, QUIC and vdisk timing tests, and the intermittent "Hung Test" print in TKVLBatchSuite above. Flaky tests
 are not permitted: find what each one's timing depends on and make it deterministic.
 
-JVM SIGSEGV in librocksdbjni, seen in a full `sbt test` run on commit e427c74c (2026-11-05, 27 s into the run) and again
-on host-refactor (2026-11-06, 20 s in, the same frames, thread "pool-23-thread-2", near HostSystemTaskSuite).
-Problematic frame `rocksdb::WriteBatchInternal::Count(rocksdb::WriteBatch const*)+0x4`, SEGV_MAPERR at address 0x58
-(a near-null WriteBatch), from `org.rocksdb.WriteBatch.count0` <- BufferedConsistentRocksDB.commitOnPool <-
-BufferedConsistentRocksDB.commit's Future callback, on a ScheduledThreadPoolExecutor thread ("pool-1233-thread-1").
-Looks like a WriteBatch used after it (or its DB) was closed, e.g. a test closing a store while a buffered commit is
-still scheduled. Check whether commitOnPool can run after close and guard it.
+Fixed (2026-11-06): JVM SIGSEGV in librocksdbjni at `rocksdb::WriteBatchInternal::Count`, from
+BufferedConsistentRocksDB.commitOnPool, seen twice in full `sbt test` runs. BufferedConsistentRocksDB.close() released
+the database and the next WriteBatch as soon as no operation was inside begin/endOperation, but a commit still queued
+on the pool, or one past its write, then read the freed nextBatch in its chaining step. close() now waits until no
+commit is queued or in progress, and is idempotent. Covered by the two close tests in BufferedConsistentRocksDBSuite.
+The bug predates the host refactor; the store executors only changed how often closes overlap commits.

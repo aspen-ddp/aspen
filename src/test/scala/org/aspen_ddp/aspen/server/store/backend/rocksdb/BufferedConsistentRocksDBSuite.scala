@@ -14,8 +14,11 @@ object BufferedConsistentRocksDBSuite:
   /** Allows tests to make the underlying RocksDB write fail on demand */
   class FailableRocksDB(path: os.Path)(using ExecutionContext) extends BufferedConsistentRocksDB(path):
     @volatile var failWrites = false
+    /** Runs inside each write, before it reaches RocksDB */
+    @volatile var duringWrite: () => Unit = () => ()
 
     override protected def writeBatch(writeOpts: WriteOptions, batch: WriteBatch): Unit =
+      duringWrite()
       if failWrites then
         throw InjectedWriteFailure()
       else
@@ -28,9 +31,13 @@ object BufferedConsistentRocksDBSuite:
     */
   class ManualExecutionContext extends ExecutionContext:
     private val tasks = new mutable.ArrayBuffer[Runnable]()
+    /** Called as each task is queued */
+    @volatile var onExecute: () => Unit = () => ()
 
-    override def execute(runnable: Runnable): Unit = synchronized:
-      tasks += runnable
+    override def execute(runnable: Runnable): Unit =
+      onExecute()
+      synchronized:
+        tasks += runnable
 
     override def reportFailure(cause: Throwable): Unit = cause.printStackTrace()
 
@@ -249,6 +256,47 @@ class BufferedConsistentRocksDBSuite extends FileBasedTests:
       intercept[BufferedConsistentRocksDB.DBClosed] {
         Await.result(fput, 5.seconds)
       }
+    }
+  }
+
+  // close() frees the database and the next WriteBatch. A commit still queued or running touches both after its
+  // write (nextBatch.count() in its chaining step), so freeing them first is a use-after-free: the
+  // WriteBatchInternal::Count SIGSEGV. These tests check the ordering without running the freed access.
+
+  test("close waits for a queued commit before releasing the database") {
+    withDB { (db, ec) =>
+      val fput = db.put(key(1), value("first"))
+      ec.pendingCount should be(1) // the commit
+
+      val fclose = db.close()
+      // Nothing may be scheduled to free the database while the commit has yet to run
+      ec.pendingCount should be(1)
+
+      ec.runAll()
+      Await.result(fclose, 5.seconds)
+      intercept[BufferedConsistentRocksDB.DBClosed] {
+        Await.result(fput, 5.seconds)
+      }
+    }
+  }
+
+  test("close during a write releases the database only after that commit has finished") {
+    withDB { (db, ec) =>
+      var fclose: Option[Future[Unit]] = None
+      @volatile var fput: Future[Unit] = Future.never
+      // Each task queued once close() has been called must find the commit already complete
+      val queuedBeforeCommitDone = new java.util.concurrent.atomic.AtomicInteger(0)
+      db.duringWrite = () =>
+        if fclose.isEmpty then
+          fclose = Some(db.close())
+          ec.onExecute = () => if !fput.isCompleted then queuedBeforeCommitDone.incrementAndGet()
+
+      fput = db.put(key(1), value("first"))
+      ec.runAll()
+
+      queuedBeforeCommitDone.get should be(0)
+      Await.result(fclose.get, 5.seconds)
+      Await.result(fput, 5.seconds)
     }
   }
 

@@ -41,6 +41,8 @@ class BufferedConsistentRocksDB(val dbPath: os.Path)(using ec: ExecutionContext)
   private var nextPromise = Promise[Unit]()
   private var commitInProgress = false
   private var closing: Option[Promise[Unit]] = None
+  /** close()'s result, so a second close returns it rather than releasing the database again */
+  private var closed: Option[Future[Unit]] = None
   private var outsandingOpCount = 0
 
   // Shadows the content of nextBatch and of the batch currently being written, respectively. These hold
@@ -80,9 +82,15 @@ class BufferedConsistentRocksDB(val dbPath: os.Path)(using ec: ExecutionContext)
   }
   private def endOperation(): Unit = synchronized {
     outsandingOpCount -= 1
-    if (outsandingOpCount == 0)
-      closing.foreach(p => p.success(()))
+    finishCloseIfIdle()
   }
+
+  /** Lets a pending close release the database once nothing can touch it or nextBatch: no operation running and no
+    * commit queued or in progress. A commit's chaining step reads nextBatch after its write's operation has ended, so
+    * the operation count alone is not enough. Called with the lock held. */
+  private def finishCloseIfIdle(): Unit =
+    if (outsandingOpCount == 0 && !commitInProgress)
+      closing.foreach(_.trySuccess(()))
 
 
   /** Sole point at which batches reach RocksDB. Overridable so tests may inject write failures. */
@@ -134,6 +142,9 @@ class BufferedConsistentRocksDB(val dbPath: os.Path)(using ec: ExecutionContext)
     // Deliberately completed after the state above is restored so that callbacks reacting to the
     // result find the database ready to accept further writes
     promise.complete(result)
+
+    // Only now has this commit finished with the native objects, so only now may a pending close release them
+    synchronized { finishCloseIfIdle() }
   }
 
   def bootstrapPut(key: Array[Byte], value: Array[Byte]): Unit = {
@@ -207,17 +218,20 @@ class BufferedConsistentRocksDB(val dbPath: os.Path)(using ec: ExecutionContext)
     }
   }
 
+  /** Stops accepting operations and releases the database once operations and commits already started have finished.
+    * Commits that have not begun their write fail with DBClosed. Closing again returns the first close's result. */
   def close(): Future[Unit] = synchronized {
+    closed.getOrElse {
+      val p = Promise[Unit]()
+      closing = Some(p)
+      finishCloseIfIdle()
 
-    val p = Promise[Unit]()
-    closing = Some(p)
-
-    if (outsandingOpCount == 0)
-      p.success(())
-
-    p.future.andThen{ case _ =>
-      RocksDBBackend.closeDatabase(db)
-      nextBatch.close()
+      val f = p.future.andThen { case _ =>
+        RocksDBBackend.closeDatabase(db)
+        nextBatch.close()
+      }
+      closed = Some(f)
+      f
     }
   }
 }

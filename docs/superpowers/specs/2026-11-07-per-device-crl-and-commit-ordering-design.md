@@ -95,9 +95,19 @@ once the previous commit to it has been persisted by the backend.
   transactions have their requirements checked normally and vote. This generalises the existing collision wait
   (`Tx.CollisionWait`, `Frontend.awaitLocksReleased`), but a wait on an in-flight commit has no timer: a backend commit
   always completes or fails.
-- **Every kind of transaction waits.** The rule applies to any transaction touching the object: writes, deletions,
-  refcount changes, and requirement-only transactions such as a `SharedRevisionLock` on a vdisk fence. Reads are
-  unaffected and keep seeing the committed-but-unpersisted state from memory, as today.
+- **Only changed objects are committed.** An object a committed transaction leaves unchanged, because its only
+  requirements on it are checks or locks (`SharedRevisionLock`, a revision requirement, and the like), gets no backend
+  commit and so never has a commit in flight. Its locks are released when the transaction resolves, as today.
+  Today `Tx.doCommit` issues a `Full` backend commit for every loaded object the applyer did not skip, including such
+  unchanged ones (`UpdateForm.of` returns `Full` when no update names the object). Under the one-in-flight rule that
+  would put a vdisk's fence permanently in flight and serialise every transaction holding a `SharedRevisionLock` on it,
+  which defeats the lock: many transactions holding it must commit concurrently while the fence's revision is
+  unchanged. So the builder must stop committing unchanged objects. Builder to confirm nothing relies on that rewrite.
+- **What waits.** A transaction waits on an object only while a commit that changes that object is in flight. That
+  covers writes, deletions and refcount changes, and also any transaction whose requirements merely check or lock the
+  object. A `SharedRevisionLock` on a fence therefore waits only while a write of the fence (an ownership takeover) is
+  in flight, and its revision check then fails as it should. Concurrent `SharedRevisionLock` holders never wait on one
+  another. Reads are unaffected and keep seeing the committed-but-unpersisted state from memory, as today.
 - **No partial locking while waiting.** A waiting transaction takes no locks on any of its objects until none of them
   has a commit in flight, so it never stalls writers on its other objects. (Builder-check call, not discussed.)
 - **Failed backend commit.** Transactions waiting on an object whose backend commit failed get abort votes, and so does

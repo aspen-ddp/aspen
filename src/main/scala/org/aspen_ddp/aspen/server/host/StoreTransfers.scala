@@ -79,7 +79,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  holds, to its crl_save.log, then deleted from the device CRL files once the file is durable. Nothing to take
    *  leaves the directory as it is. A save file already there that is unusable fails the close before anything is
    *  taken: its state is lost, and writing the CRL's entries over it would hide that. Runs on the control thread,
-   *  as the marker writes beside it do; nothing blocks on the CRL. */
+   *  as the marker writes beside it do; nothing blocks on the CRL. A crash between the save file and the deletion
+   *  leaves the same entries in both: harmless, as the save file's load re-saves them under the same ids. */
   private def extractUnloaded(storeId: StoreId): Future[Unit] =
     ctx.devices.devices.valuesIterator.find(sds => os.isDir(sds.devicePath / storeId.directoryName)) match
       case None => Future.unit

@@ -390,17 +390,23 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         sds.offlineStores += storeId
       // Drops whatever part of the saved state did reach the CRL. The save file is not
       // rewritten from it: the file on disk is still the whole state.
-      closeUnloaded(entry)
+      // The save file on disk still holds the whole state, so the entries may go for good
+      closeUnloaded(entry, dropDurably = true)
 
   /** Closes the store of `entry`, already removed from the router, without saving its CRL state: clears its object
-   *  cache and drops its CRL state for good on its executor (CrashRecoveryLog.dropStore), then closes it there, and
-   *  releases its executor slot once the close completes. Nothing is awaited. The caller has made the state
-   *  recoverable elsewhere (a save file still on disk) or marked the store rebuild-required. */
-  private[host] def closeUnloaded(entry: StoreRouter.Entry): Unit =
+   *  cache and drops its CRL state on its executor, then closes it there, and releases its executor slot once the
+   *  close completes. Nothing is awaited. With `dropDurably` the entries are deleted from the CRL files too
+   *  (CrashRecoveryLog.dropStore), which only a caller whose state is recoverable elsewhere (a save file still on
+   *  disk) or whose `rebuild-required` marker is on disk may ask for; otherwise they leave memory only, and a
+   *  restart recovers them. */
+  private[host] def closeUnloaded(entry: StoreRouter.Entry, dropDurably: Boolean): Unit =
     val store = entry.store
     startClose(entry):
       store.objectCache.clear()
-      store.crl.dropStore(store.storeId)
+      if dropDurably then
+        store.crl.dropStore(store.storeId)
+      else
+        store.crl.closeStore(store.storeId)
     .onComplete: _ =>
       onExecutor(entry)(store.close()).onComplete: _ =>
         ctx.threading.release(store.storeId)
@@ -476,7 +482,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             store.close()
           .flatMap: _ =>
             // Deleted from the device CRL files only once the save file holding them is durable, so a restart does
-            // not recover them on this device too
+            // not recover them on this device too. A crash between the two leaves them in both: harmless, as loading
+            // the save file re-saves them under the same ids
             extracted.fold(Future.unit)(trs => store.crl.deleteTransactions(storeId, trs.map(_.txd.transactionId)))
         .onComplete: result =>
           // The close has ended: the backend and directory belong to the control side again

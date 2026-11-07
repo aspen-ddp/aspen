@@ -52,6 +52,18 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit =
     inner.dropTransactionObjectData(storeId, txid)
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = inner.deleteTransaction(storeId, txid)
+  override def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
+    inner.deleteTransactions(storeId, txids)
+
+  /** Completed when dropStore is first called */
+  val dropCalled: Promise[Unit] = Promise()
+  /** While set, dropStore waits for it before dropping */
+  @volatile var dropGate: Option[Future[Unit]] = None
+  override def dropStore(storeId: StoreId): Future[Unit] =
+    dropCalled.trySuccess(())
+    dropGate match
+      case None => inner.dropStore(storeId)
+      case Some(gate) => gate.flatMap(_ => inner.dropStore(storeId))(using ExecutionContext.parasitic)
 
   override def shutdown(): Unit =
     shutdownCalls.incrementAndGet()
@@ -104,8 +116,11 @@ private class HookedMetadata(base: DeviceMetadata, beforeComplete: () => Future[
 /** The default opener, whose RocksDB backends report hasFailed while `failing` is set, as one that failed-stop does */
 private class FailingRocksOpener(ec: ExecutionContext) extends DefaultBackendOpener(ec):
   @volatile var failing: Boolean = false
+  /** The fail-stop callback of each backend opened, most recent first */
+  @volatile var onFatals: List[Throwable => Unit] = Nil
   override def open(storeCfg: StoreConfig, storePath: os.Path, create: Boolean,
                     onFatal: Throwable => Unit): Future[Backend] =
+    onFatals = onFatal :: onFatals
     storeCfg.backend match
       case _: StoreConfig.RocksDB =>
         Future.fromTry(scala.util.Try(new RocksDBBackend(storePath, storeCfg.storeId, ec):
@@ -597,3 +612,65 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       heldAfterExtract should be(Set())
       // Deleted from the files once the save file was durable: not recovered here on a restart as well
       heldOnDisk(deviceDir, storeId) should be(Set())
+
+  atest("a discarded store's directory and marker stay until its device-CRL entries are durably dropped"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    val gate = Promise[Unit]()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      _ = os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
+      restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
+      crl = second.opened.head
+      _ = crl.dropGate = Some(gate.future)
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, crl.dropCalled.isCompleted)
+      // More checks while the drop is held start nothing and discard nothing
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, false, rounds = 20)
+      dropRequested = crl.dropCalled.isCompleted
+      keptWhileDropping = os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile)
+      startedWhileDropping = rebuilds.created.nonEmpty
+      _ = gate.success(())
+      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
+      leftInCrl = held(crl, storeId)
+      _ = second.shutdownAll()
+    yield
+      dropRequested should be(true)
+      keptWhileDropping should be(true)
+      startedWhileDropping should be(false)
+      rebuilds.created.map(_.storeId).toList should be(List(storeId))
+      os.exists(storeDir) should be(false)
+      leftInCrl should be(Set())
+      heldOnDisk(deviceDir, storeId) should be(Set())
+
+  atest("a failed backend whose rebuild-required marker cannot be written keeps its CRL entries on disk"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val opener = new FailingRocksOpener(executionContext)
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory, seams = Host.Seams(backends = Some(opener)))
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
+      // A non-empty directory where the marker goes: its write fails
+      _ = os.makeDir.all(storeDir / RebuildingStore.RebuildRequiredMarkerFile)
+      _ = os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile / "blocker", "")
+      _ = opener.onFatals.head(new java.io.IOException("Input/output error"))
+      _ <- pumpUntil(host, !host.control.router.loaded.contains(storeId))
+      unloaded = !host.control.router.loaded.contains(storeId)
+      // Lets the close's CRL step reach the CRL thread, ahead of the shutdown below
+      _ <- pumpUntil(host, false, rounds = 50)
+      _ = factory.shutdownAll()
+    yield
+      unloaded should be(true)
+      os.isFile(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      // Taken out of memory only: a restart, which may serve the unmarked store, recovers them
+      heldOnDisk(deviceDir, storeId) should be(Set(txid))

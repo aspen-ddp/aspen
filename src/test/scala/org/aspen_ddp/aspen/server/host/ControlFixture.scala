@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig, StorageDeviceManager}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome, TransferOutcome}
-import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
+import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 
@@ -143,7 +143,8 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
     shutdownCloseGate.set(Some(p))
     p
 
-  /** Stores whose shutdown close fails as a ShutdownStore does when the backend failed-stop during it. */
+  /** Stores whose shutdown close fails as a ShutdownStore does when the backend failed-stop during it, leaving the
+   *  store's directory (on the host's loaded devices) marked rebuild-required as StoreRebuilds.failedOnClose does. */
   val failingShutdownCloses = new AtomicReference[Set[StoreId]](Set())
 
   /** Every store the transfer-out close was called for, in call order. */
@@ -296,6 +297,8 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
     synchronized:
       shutdownCloses += storeId
     if failingShutdownCloses.get.contains(storeId) then
+      attached.control.devices.devices.valuesIterator.map(_.devicePath / storeId.directoryName).filter(os.isDir)
+        .foreach(dir => os.write.over(dir / RebuildingStore.RebuildRequiredMarkerFile, ""))
       Future.failed(Host.StoreFailedOnClose(storeId))
     else
       shutdownCloseGate.get.map(_.future).getOrElse(Future.unit)

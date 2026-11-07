@@ -19,6 +19,7 @@ import scribe.Logging
 import java.util.UUID
 import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success}
+import scala.util.control.NonFatal
 
 /** Runs only on the control thread. See HostThreading.scala.
  *
@@ -156,8 +157,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  its comment.
    */
   def startRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+    lazy val discarded = discardLostStore(local, storeId)
     if !rebuildingStores.contains(storeId) && rebuildingStores.size < ctx.maxConcurrentRebuilds &&
-       ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && discardLostStore(local, storeId) then
+       ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && discarded.isDefined then
+      val crlDropped = discarded.get
       val sr = ctx.storeRebuildFactory.createRebuild(
         ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends)
 
@@ -197,8 +200,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       // guarantees the Failure branch's release() runs. The map entry is added unconditionally
       // after the catch, so reordering alone does not close the leak — what matters is that a
       // throwing complete cannot leave the callback unregistered.
+      // The rebuilt copy is loaded only once the discarded copy's CRL entries are durably gone, so it never
+      // recovers that copy's transactions, even across a crash. A failed drop fails the rebuild, which is retried.
       val completeFuture = try
-        sr.complete
+        sr.complete.flatMap(_ => crlDropped)
       catch
         case t: Throwable =>
           logger.error(s"Rebuild factory's complete threw for store $storeId: $t")
@@ -472,14 +477,20 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   /** Removes a store directory whose CRL state was lost, before its rebuild starts: a rebuild that
    *  finds a directory at the store's path takes it for a store already in place. Renamed out of
    *  the way first, which is atomic and forced to disk, so a crash during the delete never leaves
-   *  a partial directory at the store's path. Returns whether the path is now clear.
+   *  a partial directory at the store's path. The single point where a discarded store's entries
+   *  are dropped from its device CRL (CrashRecoveryLog.dropStore): its `rebuild-required` marker,
+   *  durable, is what says its state is gone, so they are dropped only once it exists. Returns None
+   *  if the path is not clear, else the drop (complete at once when nothing was discarded).
    */
-  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
+  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId): Option[Future[Unit]] =
     val storePath = local.devicePath / storeId.directoryName
     if !os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
-      true
+      Some(Future.unit)
     else
       try
+        val dropped =
+          try local.crl.dropStore(storeId)
+          catch case NonFatal(t) => Future.failed(t)
         val discardDir = local.devicePath / RebuildingStore.DiscardDirectory
         os.makeDir.all(discardDir)
         val target = discardDir / s"${storeId.directoryName}-${UUID.randomUUID()}"
@@ -488,8 +499,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         DurableFiles.syncDirectory(local.devicePath)
         try os.remove.all(target)
         catch case t: Throwable => logger.warn(s"Failed to delete discarded store copy $target: $t")
-        true
+        Some(dropped)
       catch
         case t: Throwable =>
           logger.error(s"Failed to discard store $storeId at $storePath. Not rebuilding it yet. Error: $t")
-          false
+          None

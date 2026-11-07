@@ -305,8 +305,12 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   dirs, or `openCRL` throws, each store dir gets `rebuild-required`, the old directory is kept as `crl.lost-<uuid>`, and
   a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`)
 - A backend fail-stop during a store's close marks it `rebuild-required` instead of closing it cleanly (no
-  `crl_save.log`, its device-CRL entries dropped). Such a store is never transferred: its transfer is aborted so it is
-  rebuilt
+  `crl_save.log`). Such a store is never transferred: its transfer is aborted so it is rebuilt
+- A store's device-CRL entries are dropped for good (`CrashRecoveryLog.dropStore`, durable) only once it cannot be
+  served: when a rebuild discards a `rebuild-required` directory (`StoreRebuilds.discardLostStore`; the rebuilt copy
+  loads only after the drop is durable), or when an unloaded store's save file still holds them. A transfer out
+  extracts them into `crl_save.log` (loaded or not, `StoreTransfers.closeForTransferOut`) and deletes them from the
+  device CRL files once that file is durable
 - `server.DurableFiles` forces files and their directories so markers and moves survive a pulled disk. That durability
   holds on Linux only, the supported host platform: directory fsync is a no-op on Windows and a plain fsync on macOS,
   each logging one warning

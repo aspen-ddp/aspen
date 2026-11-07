@@ -139,6 +139,19 @@ trait CrashRecoveryLog {
 
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit
 
+  /** Deletes `txids` of `storeId`, completing once the deletion is durable: a restart does not recover them. A
+    * transaction not held in memory (taken out by closeStore) is still deleted from the files. The default only
+    * deletes them, for CRLs that keep nothing on disk. */
+  def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
+    txids.foreach(deleteTransaction(storeId, _))
+    Future.unit
+
+  /** Drops every entry of `storeId` for good, completing once that is durable. For a store whose state is
+    * discarded (it is rebuilt): the caller must already have made it unservable (`rebuild-required`). */
+  def dropStore(storeId: StoreId): Future[Unit] =
+    closeStore(storeId).flatMap(trs => deleteTransactions(storeId, trs.map(_.txd.transactionId)))(
+      using scala.concurrent.ExecutionContext.parasitic)
+
   /** Stops the CRL's threads. Blocks until they have stopped */
   def shutdown(): Unit = ()
 

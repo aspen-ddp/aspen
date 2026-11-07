@@ -393,13 +393,14 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       closeUnloaded(entry)
 
   /** Closes the store of `entry`, already removed from the router, without saving its CRL state: clears its object
-   *  cache and drops its CRL state on its executor, then closes it there, and releases its executor slot once the
-   *  close completes. Nothing is awaited. */
+   *  cache and drops its CRL state for good on its executor (CrashRecoveryLog.dropStore), then closes it there, and
+   *  releases its executor slot once the close completes. Nothing is awaited. The caller has made the state
+   *  recoverable elsewhere (a save file still on disk) or marked the store rebuild-required. */
   private[host] def closeUnloaded(entry: StoreRouter.Entry): Unit =
     val store = entry.store
     startClose(entry):
       store.objectCache.clear()
-      store.crl.closeStore(store.storeId)
+      store.crl.dropStore(store.storeId)
     .onComplete: _ =>
       onExecutor(entry)(store.close()).onComplete: _ =>
         ctx.threading.release(store.storeId)
@@ -440,8 +441,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  cleared and, with `extractCrl`, `crl.closeStore` taking the store's state out of the device CRL; then that
    *  state saved to its crl_save.log (extractCrl only) and `store.close()`. Without `extractCrl` the state stays live
    *  in the device CRL and no save file is written. Back on the control thread, its executor slot is released,
-   *  whatever the outcome, and the fail-stop check decides the completion; a failed step fails it. A store whose
-   *  backend failed-stop is rebuilt, so its entries are then dropped from the device CRL either way. */
+   *  whatever the outcome, and the fail-stop check decides the completion; a failed step fails it. Extracted
+   *  entries are deleted from the device CRL files once the save file is durable. A store whose backend failed-stop
+   *  is marked rebuild-required (failedOnClose); its entries are dropped when the rebuild discards it
+   *  (StoreRebuilds.discardLostStore), after that marker is durable. */
   def handleClose(e: ShutdownStore): Unit =
     val ShutdownStore(storeId, extractCrl, completion) = e
     router.entry(storeId) match
@@ -471,12 +474,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           onExecutor(entry):
             extracted.foreach(trs => CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile))
             store.close()
-        .flatMap: _ =>
-          // A failed-stop store is rebuilt (failedOnClose below): its state must not be recovered by the rebuilt copy
-          if store.backend.hasFailed && !extractCrl then
-            onExecutor(entry)(store.crl.closeStore(storeId).map(_ => ()))
-          else
-            Future.unit
+          .flatMap: _ =>
+            // Deleted from the device CRL files only once the save file holding them is durable, so a restart does
+            // not recover them on this device too
+            extracted.fold(Future.unit)(trs => store.crl.deleteTransactions(storeId, trs.map(_.txd.transactionId)))
         .onComplete: result =>
           // The close has ended: the backend and directory belong to the control side again
           ctx.threading.release(storeId)

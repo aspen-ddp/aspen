@@ -22,7 +22,8 @@ import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome,
   TransferOutcome}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
-import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, DefaultBackendOpener, RocksDBConfig}
+import org.aspen_ddp.aspen.server.RecordingRebuildFactory
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
@@ -100,6 +101,17 @@ private class HookedMetadata(base: DeviceMetadata, beforeComplete: () => Future[
   def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome] =
     beforeComplete().flatMap(_ => base.completeDeviceShutdown(storageDeviceId))
 
+/** The default opener, whose RocksDB backends report hasFailed while `failing` is set, as one that failed-stop does */
+private class FailingRocksOpener(ec: ExecutionContext) extends DefaultBackendOpener(ec):
+  @volatile var failing: Boolean = false
+  override def open(storeCfg: StoreConfig, storePath: os.Path, create: Boolean,
+                    onFatal: Throwable => Unit): Future[Backend] =
+    storeCfg.backend match
+      case _: StoreConfig.RocksDB =>
+        Future.fromTry(scala.util.Try(new RocksDBBackend(storePath, storeCfg.storeId, ec):
+          override def hasFailed: Boolean = super.hasFailed || FailingRocksOpener.this.failing))
+      case _ => super.open(storeCfg, storePath, create, onFatal)
+
 class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
   private val poolId = storeId.poolId
@@ -131,12 +143,13 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
   /** A real Host, which opens RocksDB backends and its devices' CRLs through `crlFactory`, over `hostRoot` */
   private def newCrlHost(hostRoot: os.Path, crlFactory: CrashRecoveryLogFactory,
-                         hostId: HostId = HostId.BootstrapHostId, seams: Host.Seams = Host.Seams.default): Host =
+                         hostId: HostId = HostId.BootstrapHostId, seams: Host.Seams = Host.Seams.default,
+                         rebuilds: StoreRebuildFactory = StoreRebuildFactory.Filesystem): Host =
     new Host(client, hostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net,
       BackgroundTaskManager.NoBackgroundTaskManager, crlFactory, net.FinalizerFactory,
       TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
-      StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = seams)
+      StoreTransferService.Disabled, rebuilds, 2, seams = seams)
 
   /** Drains `host`'s events and yields until `condition` holds or `rounds` run out. The caller asserts it. */
   private def pumpUntil(host: Host, condition: => Boolean, rounds: Int = 2000): Future[Unit] =
@@ -450,3 +463,137 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       host.control.devices.devices.keySet should be(Set(deviceA))
       os.exists(CrashRecoveryLog.deviceCrlDir(deviceDir) / "0.crl") should be(true)
       os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
+
+  /** The transactions `crl` holds for `sid`. Blocks on the CRL thread, which never waits on this one */
+  private def held(crl: CrashRecoveryLog, sid: StoreId): Set[TransactionId] =
+    crl.getFullRecoveryState(sid).map(_.txd.transactionId).toSet
+
+  /** The transactions the CRL files of `deviceDir` hold for `sid`, as a restart recovers them. The CRL that wrote
+   *  them must be shut down first. */
+  private def heldOnDisk(deviceDir: os.Path, sid: StoreId): Set[TransactionId] =
+    val crl = newFactory().openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
+      deviceDir / StorageDeviceConfig.configFilename))
+    try held(crl, sid)
+    finally crl.shutdown()
+
+  /** deviceA in the tree with `storeId` Active, and its directory under a new host root holding a RocksDB store */
+  private def activeStoreDevice(): Future[(os.Path, os.Path, os.Path)] =
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    createCrl(deviceDir)
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.copy(
+             stores = Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+      _ <- waitForTransactionsToComplete()
+      storeDir <- writeRocksStore(deviceDir, storeId)
+    yield (hostRoot, deviceDir, storeDir)
+
+  /** Drives `host`'s checks until its rebuild of `storeId` starts, lands a fresh copy at `storeDir` as the walk
+   *  would and completes it, then waits for the copy to be served. Returns whether the old directory was discarded
+   *  and the copy's device CRL held nothing for the store once the rebuild started. */
+  private def rebuildAndServe(host: Host, rebuilds: RecordingRebuildFactory, deviceDir: os.Path,
+                              storeDir: os.Path): Future[(Boolean, Set[TransactionId])] =
+    given ExecutionContext = executionContext
+    host.control.reconciler.checkAll()
+    for
+      _ <- pumpWithTx(host, rebuilds.created.nonEmpty)
+      _ = rebuilds.created.map(_.storeId).toList should be(List(storeId))
+      discarded = !os.exists(storeDir)
+      // The drop is queued on the CRL thread ahead of this read
+      leftInCrl = held(host.control.devices.devices(deviceA).crl, storeId)
+      _ <- writeRocksStore(deviceDir, storeId)
+      _ = rebuilds.created.head.promise.success(())
+      _ <- pumpWithTx(host, host.control.router.loaded.contains(storeId))
+    yield (discarded, leftInCrl)
+
+  atest("a store that fails during its close is marked rebuild-required before its device-CRL entries go"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    val opener = new FailingRocksOpener(executionContext)
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory, seams = Host.Seams(backends = Some(opener)), rebuilds = rebuilds)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = host.control.devices.devices(deviceA).crl
+      _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
+      _ = opener.failing = true
+      closing = host.closeStore(storeId)
+      _ <- pumpUntil(host, closing.isCompleted)
+      closed <- closing.transform(r => scala.util.Success(r))
+      _ = opener.failing = false
+      markedAfterClose = os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile)
+      heldAfterClose = held(crl, storeId)
+      (discarded, leftInCrl) <- rebuildAndServe(host, rebuilds, deviceDir, storeDir)
+      rebuilt = host.control.router.loaded(storeId)
+      recoveredByCopy = rebuilt.frontend.transactions.keySet
+      _ <- rebuilt.backend.close()
+      _ = factory.shutdownAll()
+    yield
+      closed.failed.toOption should be(Some(Host.StoreFailedOnClose(storeId)))
+      markedAfterClose should be(true)
+      // Nothing dropped by the close itself: the marker comes first
+      heldAfterClose should be(Set(txid))
+      discarded should be(true)
+      leftInCrl should be(Set())
+      recoveredByCopy should be(Set())
+      heldOnDisk(deviceDir, storeId) should be(Set())
+
+  atest("a store discarded for rebuild after a restart does not get the discarded copy's transactions back"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      // Crash-only: the in-flight transaction stays in the device CRL. On the restart the store is found lost
+      // (as BackendStateLost or a lost save file mark it)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      _ = os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
+      restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
+      heldAtRestart = held(restarted.control.devices.devices(deviceA).crl, storeId)
+      (discarded, leftInCrl) <- rebuildAndServe(restarted, rebuilds, deviceDir, storeDir)
+      rebuilt = restarted.control.router.loaded(storeId)
+      recoveredByCopy = rebuilt.frontend.transactions.keySet
+      _ <- rebuilt.backend.close()
+      _ = second.shutdownAll()
+    yield
+      heldAtRestart should be(Set(txid))
+      discarded should be(true)
+      leftInCrl should be(Set())
+      recoveredByCopy should be(Set())
+      // Deleted from the files too, so a later restart does not recover them either
+      heldOnDisk(deviceDir, storeId) should be(Set())
+
+  atest("a network transfer out of an unloaded store ships its device-CRL entries in its crl_save.log"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = host.control.devices.devices(deviceA).crl
+      _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
+      // Closed without extraction: its state stays in the device CRL
+      closed = host.closeStore(storeId)
+      _ <- pumpUntil(host, closed.isCompleted)
+      _ <- closed
+      heldAfterClose = held(crl, storeId)
+      saveFileAfterClose = os.exists(Backend.crlSaveFile(storeDir))
+      _ <- host.control.transfers.closeForTransferOut(storeId)
+      saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
+      heldAfterExtract = held(crl, storeId)
+      _ = factory.shutdownAll()
+    yield
+      heldAfterClose should be(Set(txid))
+      saveFileAfterClose should be(false)
+      saved.map(_.map(_.txd.transactionId)) should be(Right(List(txid)))
+      heldAfterExtract should be(Set())
+      // Deleted from the files once the save file was durable: not recovered here on a restart as well
+      heldOnDisk(deviceDir, storeId) should be(Set())

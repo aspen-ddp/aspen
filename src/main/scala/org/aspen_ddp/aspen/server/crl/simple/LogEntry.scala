@@ -48,6 +48,10 @@ class LogEntry(val previousEntryLocation: StreamLocation,
       txs += (tx.id -> tx)
     completionHandlers = completionHandler :: completionHandlers
 
+  /** Runs `completionHandler` once this entry is durable */
+  def addCompletionHandler(completionHandler: () => Unit): Unit =
+    completionHandlers = completionHandler :: completionHandlers
+
   def deleteTx(txid: TxId): Unit =
     txDeletions = txid :: txDeletions
     txDelSet = txDelSet + txid

@@ -24,6 +24,9 @@ object SimpleCRL:
 
   case class DeleteTransaction(storeId: StoreId, transactionId: TransactionId) extends ActionRequest
 
+  case class DeleteTransactions(storeId: StoreId, transactionIds: List[TransactionId],
+                                completionHandler: () => Unit) extends ActionRequest
+
   case class WriteComplete(serialNumber: Long) extends ActionRequest
 
   case class Shutdown(completionHandler: () => Unit) extends ActionRequest
@@ -161,6 +164,20 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
         case DeleteTransaction(storeId, transactionId) => onDeleteTransaction(storeId, transactionId)
 
+        case DeleteTransactions(storeId, transactionIds, completionHandler) =>
+          if transactionIds.isEmpty then
+            completionHandler()
+          else
+            // All in the current entry, with the handler, before its write starts: the handler then runs once
+            // every deletion is durable
+            transactionIds.foreach: transactionId =>
+              val txid = TxId(storeId, transactionId)
+              currentLogEntry.deleteTx(txid)
+              transactions.get(txid).foreach(tx => removeFromQueue(tx))
+              transactions -= txid
+            currentLogEntry.addCompletionHandler(completionHandler)
+            startWrite()
+
         case WriteComplete(serialNumber) =>
           logger.trace(s"CRL write complete for entry serial number: ${serialNumber}")
 
@@ -213,6 +230,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     transactions = transactions.filter: (txid, tx) =>
       if txid.storeId == storeId then
         trsList = tx.state :: trsList
+        if removeStore then
+          removeFromQueue(tx)
         !removeStore
       else
         true
@@ -278,6 +297,11 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   def dropTransactionObjectData(storeId: StoreId, transactionid: TransactionId): Unit =
     ioQueue.put(DropTransactionData(storeId, transactionid))
+
+  override def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
+    val p = Promise[Unit]()
+    ioQueue.put(DeleteTransactions(storeId, txids, () => p.trySuccess(())))
+    p.future
 
   def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] =
     val p = Promise[List[TransactionRecoveryState]]()

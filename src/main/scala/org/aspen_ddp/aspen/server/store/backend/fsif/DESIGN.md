@@ -674,8 +674,9 @@ correlated loss.
 - **Opened but not served** (device unloaded or another backend serves it) **and failed**
   (`StoreLoader.handleBackendOpened`).
 - **Failed during a `ShutdownStore` close** (`StoreLoader.handleClose`, then `StoreRebuilds.failedOnClose`). The
-  store is marked, the `crl_save.log` a transfer-out close just wrote is **deleted**, and a close that left its state
-  in the device CRL drops it there, so an adopter sees `rebuild-required` and treats the store as CrlLost (L22).
+  store is marked, and the `crl_save.log` a transfer-out close just wrote is **deleted**, so an adopter sees
+  `rebuild-required` and treats the store as CrlLost (L22). Entries left in the device CRL are dropped when the
+  rebuild discards the directory, after the marker is durable.
 - **Transfer out** (`StoreTransfers.startOut`):
   - a store already marked whose entry is TransferringOut is returned to rebuild (Ruling 25,
     `StoreTransfers.returnLostTransferToRebuild`);

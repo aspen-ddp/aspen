@@ -20,6 +20,7 @@ import java.util.UUID
 import scala.concurrent.duration.{Duration, SECONDS}
 import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success}
+import scala.util.control.NonFatal
 
 object StoreTransfers:
   /** `toDeviceId` is the local device receiving the store, so a check of that device can tell
@@ -64,10 +65,44 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
   // stays in transferringIn meanwhile, so device checks do not start a parallel attempt.
   private[server] var transferInRetries: Map[StoreId, TransferInRetry] = Map()
 
-  /** Takes a store out of service for a transfer out: closes it if it is open, else nothing.
-   *  This is the default of Host.closeStoreForTransferOut, the seam a test replaces. */
+  /** Takes a store out of service for a transfer out, extracting its CRL state into its crl_save.log to travel with
+   *  it: closes it (extractCrl) if it is open or opening, else extracts the state of the closed store from its
+   *  device CRL (extractUnloaded). This is the default of Host.closeStoreForTransferOut, the seam a test replaces. */
   def closeForTransferOut(storeId: StoreId): Future[Unit] =
-    if ctx.router.loaded.contains(storeId) then ctx.loader.closeStore(storeId, extractCrl = true) else Future.unit
+    if ctx.router.loaded.contains(storeId) || ctx.loader.isOpening(storeId) then
+      ctx.loader.closeStore(storeId, extractCrl = true)
+    else
+      extractUnloaded(storeId)
+
+  /** A closed store's entries may still be live in its device CRL (closed without extraction, or awaiting space).
+   *  They are taken out (`crl.closeStore`) and written, with whatever an earlier extraction's save file already
+   *  holds, to its crl_save.log, then deleted from the device CRL files once the file is durable. Nothing to take
+   *  leaves the directory as it is. A save file already there that is unusable fails the close before anything is
+   *  taken: its state is lost, and writing the CRL's entries over it would hide that. Runs on the control thread,
+   *  as the marker writes beside it do; nothing blocks on the CRL. */
+  private def extractUnloaded(storeId: StoreId): Future[Unit] =
+    ctx.devices.devices.valuesIterator.find(sds => os.isDir(sds.devicePath / storeId.directoryName)) match
+      case None => Future.unit
+      case Some(sds) =>
+        val saveFile = Backend.crlSaveFile(sds.devicePath / storeId.directoryName)
+        val earlier =
+          if os.exists(saveFile) then CrashRecoveryLog.loadValidStoreState(saveFile, storeId) else Right(Nil)
+        earlier match
+          case Left(err) => Future.failed(err)
+          case Right(saved) =>
+            sds.crl.closeStore(storeId).flatMap: trs =>
+              if trs.isEmpty then
+                Future.unit
+              else
+                val ids = trs.map(_.txd.transactionId)
+                val kept = saved.filterNot(t => ids.contains(t.txd.transactionId))
+                try
+                  CrashRecoveryLog.saveStoreState(storeId, kept ++ trs, saveFile)
+                  sds.crl.deleteTransactions(storeId, ids)
+                catch
+                  case NonFatal(t) =>
+                    // Put back, so a retried request extracts them again
+                    sds.crl.loadStore(storeId, trs).transform(_ => Failure(t))
 
   /** The transfer-in work on `deviceId` that a shutdown of it must stop or wait for. `ingStores` are the stores
    *  the device's tree entry records as TransferringIn.

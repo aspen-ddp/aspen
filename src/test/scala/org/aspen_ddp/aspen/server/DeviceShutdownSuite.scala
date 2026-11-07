@@ -160,8 +160,13 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       st <- state(deviceA)
     yield
       recorded(host).shutdownCloses.toSet should be(Set(s0, s1))
+      // The failed store is marked for rebuild, which is what an adopter reads; the clean one is plain
+      os.exists(deviceDir / s0.directoryName / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      os.exists(deviceDir / s1.directoryName / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
       noMoveFiles(deviceDir / s0.directoryName) should be(true)
       noMoveFiles(deviceDir / s1.directoryName) should be(true)
+      st.stores(s0).status should be(StoreStatus.Offline)
+      st.stores(s1).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
 

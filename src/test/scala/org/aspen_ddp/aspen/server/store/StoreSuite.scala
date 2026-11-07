@@ -30,7 +30,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     TxPrepare(to, from, txd, ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient = false)
 
   private def mkStore(id: StoreId, statusCache: TransactionStatusCache, heartbeatTimeout: Duration,
-                      backend: MapBackend = new MapBackend(storeId)) =
+                      backendOverride: Option[MapBackend] = None) =
+    val backend = backendOverride.getOrElse(new MapBackend(id))
     val net = new TestNet
     val crl = new TestCrl
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.global, backend,
@@ -79,7 +80,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
   test("a finalized transaction with an outstanding commit is not driven again") {
     val backend = new DeferredCommitBackend
-    val (store, _, crl) = mkStore(storeId, new TransactionStatusCache(), Duration.Zero, backend)
+    val (store, _, crl) = mkStore(storeId, new TransactionStatusCache(), Duration.Zero, Some(backend))
 
     store.receiveTransactionMessage(prepare(storeId, leader).copy(fromClient = true,
       objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))

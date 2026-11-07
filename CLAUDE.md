@@ -244,8 +244,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   `@volatile` immutable Map so `hasTransactions`/`logTransactionStatus` may read it from any thread;
   `TransactionDriver`s keep their own locks for their timer threads
 - Each store's object cache is its own LRU, owned by its executor, under one host byte budget (`HostObjectCache`): an
-  over-budget store evicts its own oldest entries or posts a shed to the store holding the host's oldest, freeing to
-  `maxBytes / 32` below the budget. `Frontend` pins states held by transactions and in-flight commits; a failed
+  over-budget store evicts its own oldest entries down to the budget, or posts a shed to the store holding the host's
+  oldest; a shed frees to `maxBytes / 32` below the budget. `Frontend` pins states held by transactions and in-flight commits; a failed
   backend commit stays pinned and served
 - The hot path (network messages, I/O completions, heartbeats, repairs) goes through `StoreRouter` straight to the
   store's executor: a concurrent map lookup on the calling thread, then the task, which runs only if that store is

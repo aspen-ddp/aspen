@@ -143,7 +143,7 @@ longer committed.
   (`ShutdownStore` event), `host/DeviceShutdown.scala:207-235` (`closeStoresForShutdown`, `storesToClose`),
   `host/DeviceDiscovery.scala:264-278,331-345` (`adoptionClass`, `offlineStoresIn`, `uncleanStores`),
   `host/StoreTransfers.scala:553-610` (transfer-out close)
-- Test: `src/test/scala/org/aspen_ddp/aspen/server/DeviceAdoptionSuite.scala`, `server/host/DeviceShutdownSuite.scala`,
+- Test: `src/test/scala/org/aspen_ddp/aspen/server/DeviceAdoptionSuite.scala`, `server/DeviceShutdownSuite.scala`,
   `server/host/DeviceCrlSuite.scala`
 
 **Interfaces:**

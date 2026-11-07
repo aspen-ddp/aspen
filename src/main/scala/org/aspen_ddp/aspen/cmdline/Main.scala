@@ -1858,6 +1858,7 @@ object Main {
 
     os.write(bootstrapDevDir / StorageDeviceConfig.configFilename, storageDevConfig.yamlConfig)
     DeviceMarkers.writeOwningHost(bootstrapDevDir, bootstrapHostId)
+    CrashRecoveryLog.createDeviceCrlDir(bootstrapDevDir)
 
     val bootstrapStores =
       for

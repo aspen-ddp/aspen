@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetId}
 
@@ -108,6 +109,7 @@ object StorageDeviceManager:
           // must not be silently clobbered.
           os.write(configFile, cfg.yamlConfig)
           DeviceMarkers.writeOwningHost(devDir, hostConfig.hostId)
+          CrashRecoveryLog.createDeviceCrlDir(devDir)
         catch
           case t: FileAlreadyExistsException =>
             // Raced with another creation; the existing file is not ours to remove.

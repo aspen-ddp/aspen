@@ -14,6 +14,12 @@ object CrashRecoveryLog:
   /** Where a device's CRL files live */
   def deviceCrlDir(devicePath: os.Path): os.Path = devicePath / "crl"
 
+  /** Creates a new device's crl directory and forces it to disk. Device creation must do this: a device that holds
+   *  stores but has no crl directory is taken to have lost its CRL, and its stores are rebuilt. */
+  def createDeviceCrlDir(devicePath: os.Path): Unit =
+    os.makeDir.all(deviceCrlDir(devicePath))
+    DurableFiles.syncDirectory(devicePath)
+
   /** Writes `trsList` to `saveFilePath`, replacing it atomically and forcing it to disk before
    *  returning (DurableFiles): the file is what lets a closed store, possibly on a disk pulled
    *  right after its shutdown, resume its transactions wherever it is next loaded. */

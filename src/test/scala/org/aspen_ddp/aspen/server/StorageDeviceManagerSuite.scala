@@ -148,6 +148,8 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
       val cfg = StorageDeviceConfig.loadStorageDeviceConfig(written)
       cfg.storageDeviceId should be(deviceId)
       DeviceMarkers.readOwningHost(dir) should be(Some(hostConfig().hostId))
+      // A device is created with its CRL directory, or its first stores would be taken to have lost it
+      os.isDir(org.aspen_ddp.aspen.server.crl.CrashRecoveryLog.deviceCrlDir(dir)) should be(true)
       cfg.aspenSystemId should be(systemId)
       ds.hostId should be(HostId.BootstrapHostId)
       ds.storageDeviceSet should be(bootstrapSet)

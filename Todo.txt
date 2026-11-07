@@ -23,10 +23,6 @@ Store commit delay FSIF commits seem to be taking longer than they should when b
 timing of commits.
 
 vdisk (native TCMU frontend) follow-ups:
-- Run the root end-to-end scripts in scripts/vdisk-e2e/ (setup.sh, restart-under-io.sh, grow.sh in both modes,
-  teardown.sh; not yet run, see its README.md and docs/vdisk-tcmu-setup.md). Check dmesg after the first ext4 mount
-  (lazy-init zeroout), confirm hw_block_size=4096 / hw_max_sectors take effect, that `targetcli ... set attribute
-  dev_size=` sends a reconfig, and that a restart under I/O fits within cmd_time_out. Run shellcheck on the scripts.
 - LockState.Fenced is learned only when a commit fails; part 3 (ALUA) needs an active fence check.
 - TMR ring entries are logged and otherwise ignored (no abort of in-flight commands). Revisit with part 3.
 - vdisk tcmu: a timed-out acquire keeps running and can fence a later successful add of the same disk; needs a

@@ -56,9 +56,12 @@ object TestNetwork {
     override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = ()
   }
 
-  /** Opens a fresh no-op CRL for each device */
+  /** Opens a fresh no-op CRL for each device, creating the crl directory a real one would, so discovery does not
+    * take the device's stores to have lost theirs */
   object TestCRL extends CrashRecoveryLogFactory {
-    override def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog = new TestCRL()
+    override def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+      os.makeDir.all(CrashRecoveryLog.deviceCrlDir(devicePath))
+      new TestCRL()
   }
 
   class TClient(executionContext: ExecutionContext,

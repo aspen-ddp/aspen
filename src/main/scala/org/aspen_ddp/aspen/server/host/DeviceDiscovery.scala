@@ -3,13 +3,15 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
-import org.aspen_ddp.aspen.server.{DeviceMarkers, Host, StorageDeviceConfig, StorageDeviceManager, StoreConfig}
+import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, Host, StorageDeviceConfig, StorageDeviceManager,
+  StoreConfig}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
 
+import java.util.UUID
 import scala.concurrent.Future
 import scala.util.{Failure, Success, Try}
 
@@ -451,6 +453,34 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     else
       None
 
+  /** Opens the device's CRL. It is lost when its directory is absent from a device that holds stores, or when
+   *  opening it throws. The stores' transaction state was in it, so each is marked rebuild-required (the reconcile
+   *  pass turns them into rebuilds), the old directory is kept aside as `crl.lost-<uuid>`, and a fresh CRL is opened.
+   *  A device without stores simply gets its CRL created. */
+  private def openDeviceCrl(devicePath: os.Path,
+                            sdCfg: StorageDeviceConfig,
+                            children: Seq[os.Path]): CrashRecoveryLog =
+    val crlDir = CrashRecoveryLog.deviceCrlDir(devicePath)
+    val storeDirs = children.filter(dir => os.isDir(dir) && os.isFile(dir / StoreConfig.configFilename))
+    val lost =
+      if storeDirs.nonEmpty && ! os.exists(crlDir) then
+        logger.error(s"Storage device $devicePath holds stores but has no CRL directory. Its stores must be rebuilt")
+        true
+      else
+        try
+          return ctx.crlFactory.openCRL(devicePath, sdCfg)
+        catch
+          case t: Throwable =>
+            if storeDirs.isEmpty then
+              throw t
+            logger.error(s"Failed to recover the CRL of storage device $devicePath. Its stores must be rebuilt: $t")
+            true
+    storeDirs.foreach(ctx.rebuilds.markRebuildRequired)
+    if os.exists(crlDir) then
+      os.move(crlDir, devicePath / s"crl.lost-${UUID.randomUUID()}")
+    DurableFiles.syncDirectory(devicePath)
+    ctx.crlFactory.openCRL(devicePath, sdCfg)
+
   /** The load half of tryLoadDevice, run only once the device is known to be ours. */
   private def loadOwnedDevice(storageDevicePath: os.Path,
                               sdCfgPath: os.Path,
@@ -494,7 +524,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
           case Success(storeFiles) =>
             // Opened before any store is offered, so each store recovers from it. Recovery blocks the control
             // thread, as each store's getFullRecoveryState does in handleLoad. A throw leaves the device unloaded.
-            val crl = ctx.crlFactory.openCRL(storageDevicePath, sdCfg)
+            val crl = openDeviceCrl(storageDevicePath, sdCfg, storeFiles)
             val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl)
             logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
             try

@@ -15,7 +15,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{Host, StorageDeviceConfig, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
-import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
+import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
@@ -135,10 +135,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
-    val storeDir = deviceDir / storeId.directoryName
-    os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename,
-      StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
+    createCrl(deviceDir)
+    val storeDir = writeStoreDir(deviceDir)
     // Not the suite's serial context: bootstrapAllocate blocks on work it runs there
     val initial = new RocksDBBackend(storeDir, storeId, ExecutionContext.global)
     initial.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
@@ -211,3 +209,72 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       reloaded should be(List(deviceA))
       factory.opened.size should be(2)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened(1)
+
+  private def writeStoreDir(deviceDir: os.Path): os.Path =
+    val storeDir = deviceDir / storeId.directoryName
+    os.makeDir.all(storeDir)
+    os.write.over(storeDir / StoreConfig.configFilename,
+      StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
+    storeDir
+
+  /** Gives the device an empty CRL, as one that has run before has */
+  private def createCrl(deviceDir: os.Path): Unit =
+    newFactory().openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
+      deviceDir / StorageDeviceConfig.configFilename)).shutdown()
+
+  private def marker(storeDir: os.Path): os.Path = storeDir / RebuildingStore.RebuildRequiredMarkerFile
+
+  atest("a device whose CRL cannot be recovered marks its stores rebuild-required"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    val crlDir = CrashRecoveryLog.deviceCrlDir(deviceDir)
+    // An existing CRL, whose contents must survive
+    createCrl(deviceDir)
+    val oldFiles = os.list(crlDir).map(_.last).toSet
+
+    val inner = newFactory()
+    val calls = new AtomicInteger(0)
+    val failingFirst = new CrashRecoveryLogFactory:
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+        if calls.incrementAndGet() == 1 then
+          throw new java.io.IOException("unrecoverable")
+        inner.openCRL(devicePath, config)
+    val host = newCrlHost(hostRoot, failingFirst)
+
+    Future.successful:
+      os.exists(marker(storeDir)) should be(true)
+      host.control.router.loaded.contains(storeId) should be(false)
+      val lost = os.list(deviceDir).filter(_.last.startsWith("crl.lost-"))
+      lost.size should be(1)
+      os.list(lost.head).map(_.last).toSet should be(oldFiles)
+      calls.get should be(2)
+      inner.opened.size should be(1)
+      os.exists(crlDir / "0.crl") should be(true)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
+
+  atest("a device with stores but no crl dir marks them rebuild-required"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val factory = newFactory()
+    val host = newCrlHost(hostRoot, factory)
+    host.control.shutdown.unloadDevice(deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    os.remove.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
+    os.exists(marker(storeDir)) should be(false)
+
+    factory.opened.head.shutdownCalled.future.flatMap(_ => yieldUntil(host.control.devices.closingCrls.isEmpty)).map: _ =>
+      host.control.discovery.checkForNewDevices() should be(List(deviceA))
+      os.exists(marker(storeDir)) should be(true)
+      os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
+      os.exists(CrashRecoveryLog.deviceCrlDir(deviceDir) / "0.crl") should be(true)
+
+  atest("a new device with no stores just creates its CRL"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val host = newCrlHost(hostRoot, newFactory())
+
+    Future.successful:
+      host.control.devices.devices.keySet should be(Set(deviceA))
+      os.exists(CrashRecoveryLog.deviceCrlDir(deviceDir) / "0.crl") should be(true)
+      os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)

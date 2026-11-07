@@ -1736,6 +1736,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // candidate and honours no marker.
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
     val storeDir = deviceDir / storeId.directoryName
     os.makeDir.all(storeDir)
     os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)

@@ -297,6 +297,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   device does the same for such stores instead of refusing the device, and adopts any `rebuild-required` directory as
   Rebuilding whatever its other markers. A network transfer validates the staged copy's save file before promotion and
   retries on failure, since the source still holds the state
+- A lost device CRL does the same to every store on the device: if `<device>/crl` is absent from a device holding store
+  dirs, or `openCRL` throws, each store dir gets `rebuild-required`, the old directory is kept as `crl.lost-<uuid>`, and
+  a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`)
 - A backend fail-stop during a store's close marks it `rebuild-required` instead of closing it cleanly (no
   `transferring-out`, no `crl_save.log`). Such a store is never transferred: its transfer is aborted so it is rebuilt
 - `server.DurableFiles` forces files and their directories so markers and moves survive a pulled disk. That durability

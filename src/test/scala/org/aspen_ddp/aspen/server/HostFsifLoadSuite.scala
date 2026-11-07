@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
@@ -477,6 +478,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
   private def shutDownDeviceHost(): Future[(Host, Promise[StorageDeviceState])] =
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
     val storeDir = writeFsifStoreConfig(deviceDir)
     DeviceMarkers.writeShutdownState(deviceDir, HostId.BootstrapHostId)
     FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>

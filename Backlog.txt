@@ -1,6 +1,25 @@
 Backlog
 =======
 
+Isolate every device's I/O, and detect and handle hung devices
+  - Devices can hang for long durations, and every read and write to a hung device can hang indefinitely.
+  - Today some I/O pools span devices: FSIF's I/O pools and the shared RocksDB engines. A single hung device can
+    freeze all of those threads and effectively hang the whole host.
+  - Every thread that touches a device must belong to a small set dedicated to that device alone, so a hung device
+    stalls only its own stores. This needs a comprehensive plan covering every path that reaches a device: backend
+    I/O, opens, the per-device CRL (docs/superpowers/specs/2026-11-07-per-device-crl-and-commit-ordering-design.md),
+    rebuilds, transfers, markers and DurableFiles.
+  - It also needs a plan for detecting device errors and hangs and taking appropriate action. One option:
+    - Write `<host-root>/suspected-bad-device.yaml` naming the device, then restart the host process. A restart is the
+      only guaranteed way to clear every thread and all in-memory state.
+    - At startup the host sees the file and refuses to load the device's stores.
+    - It then runs diagnostics to decide whether to put the device back into service or alert the user.
+  - Automatically failing the device is a possible option, but it needs a cautious, well-thought-out plan. A bug could
+    trigger false positives, and a systemic issue could fail stores automatically until pools drop below threshold
+    (see the correlated "lost store" item below).
+  - Until then, a transaction waiting on an in-flight commit to a hung device waits as long as the device hangs. The
+    per-device CRL design accepts that.
+
 System-level protection against correlated "lost store" declarations
   - The main source of data loss in a system like this is not hardware. It is a systemic bug that wrongly triggers
     one of the automatic lost-store paths: a store decides from local evidence alone that its content can't be

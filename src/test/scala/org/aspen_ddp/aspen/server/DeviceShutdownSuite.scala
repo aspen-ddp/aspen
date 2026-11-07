@@ -123,7 +123,11 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
     yield ()
 
-  atest("a ShuttingDown device has its stores closed, marked and announced, then is Shutdown"):
+  /** Neither of the files a network transfer leaves: a shutdown leaves a store's state in its device's CRL */
+  private def noMoveFiles(storeDir: os.Path): Boolean =
+    !os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) && !os.exists(Backend.crlSaveFile(storeDir))
+
+  atest("a ShuttingDown device has its stores closed and announced, then is Shutdown"):
     given ExecutionContext = executionContext
     for
       (host, deviceDir) <- setUp(Map(s0 -> active, s1 -> active), loaded = Set(s0, s1))
@@ -135,8 +139,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     yield
       recorded(host).shutdownCloses.toSet should be(Set(s0, s1))
       recorded(host).shutdownCloses.size should be(2)
-      os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
-      os.exists(deviceDir / s1.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      noMoveFiles(deviceDir / s0.directoryName) should be(true)
+      noMoveFiles(deviceDir / s1.directoryName) should be(true)
       DeviceMarkers.readShutdownState(deviceDir) should be(Some(HostId.BootstrapHostId))
       st.status should be(DeviceStatus.Shutdown)
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Offline))
@@ -146,7 +150,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       hostState.storageDevices should contain(deviceA)
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
 
-  atest("a store whose backend fails during its shutdown close gets no transfer-out marker"):
+  atest("a store whose backend fails during its shutdown close does not stop the shutdown"):
     given ExecutionContext = executionContext
     for
       (host, deviceDir) <- setUp(Map(s0 -> active, s1 -> active), loaded = Set(s0, s1))
@@ -156,8 +160,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       st <- state(deviceA)
     yield
       recorded(host).shutdownCloses.toSet should be(Set(s0, s1))
-      os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(false)
-      os.exists(deviceDir / s1.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      noMoveFiles(deviceDir / s0.directoryName) should be(true)
+      noMoveFiles(deviceDir / s1.directoryName) should be(true)
       st.status should be(DeviceStatus.Shutdown)
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
 
@@ -218,7 +222,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     yield
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.StoresReactivated, ShutdownOutcome.Completed))
       recorded(host).shutdownCloses.toList should be(List(s0, s1))
-      os.exists(deviceDir / s1.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      noMoveFiles(deviceDir / s1.directoryName) should be(true)
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Offline))
       st.status should be(DeviceStatus.Shutdown)
 
@@ -255,9 +259,9 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.restartStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = gate.success(())
-      markers = List(s0, s1).map(s => deviceDir / s.directoryName / StoreTransfer.TransferOutMarkerFile)
+      paths = List(s0, s1).map(s => deviceDir / s.directoryName)
       _ <- pumpUntil(recorded(host).shutdownOutcomes.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty &&
-                     markers.forall(m => !os.exists(m)))
+                     paths.forall(recorded(host).storeLoadAttempts.map(_._2).contains))
       st <- state(deviceA)
     yield
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Cancelled))
@@ -265,8 +269,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Active))
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
       loadedDevices(host).contains(deviceA) should be(true)
-      // The reconcile's abandoned-transfer-out pass brought both stores back.
-      markers.exists(os.exists) should be(false)
+      // The reconcile brought both stores back: there were no markers to remove
+      paths.forall(noMoveFiles) should be(true)
       recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(deviceDir / s0.directoryName,
                                                                   deviceDir / s1.directoryName)
 
@@ -422,7 +426,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).loadStoreRequests.toList should be(List((deviceA, creating)))
       entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
       recorded(host).shutdownCloses.toList should be(List(creating))
-      os.exists(deviceDir / creating.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      noMoveFiles(deviceDir / creating.directoryName) should be(true)
       st.stores(creating).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
 
@@ -670,7 +674,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       closesRequested should be(List(movingStore))
       sendsWhileShuttingDown should be(Vector())
       sends.transfersOut should be(Vector())
-      // The shutdown marked it, as it does every store it closes.
-      os.exists(deviceDir / movingStore.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      // Not marked: the transfer never began, and the shutdown marks no store it closes
+      os.exists(deviceDir / movingStore.directoryName / StoreTransfer.TransferOutMarkerFile) should be(false)
       st.stores(movingStore).status should be(StoreStatus.TransferringOut)
       st.status should be(DeviceStatus.Shutdown)

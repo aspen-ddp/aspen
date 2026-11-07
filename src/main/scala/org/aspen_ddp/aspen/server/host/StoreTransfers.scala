@@ -67,7 +67,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
   /** Takes a store out of service for a transfer out: closes it if it is open, else nothing.
    *  This is the default of Host.closeStoreForTransferOut, the seam a test replaces. */
   def closeForTransferOut(storeId: StoreId): Future[Unit] =
-    if ctx.router.loaded.contains(storeId) then ctx.loader.closeStore(storeId) else Future.unit
+    if ctx.router.loaded.contains(storeId) then ctx.loader.closeStore(storeId, extractCrl = true) else Future.unit
 
   /** The transfer-in work on `deviceId` that a shutdown of it must stop or wait for. `ingStores` are the stores
    *  the device's tree entry records as TransferringIn.
@@ -584,9 +584,10 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           val storePath = sourceDs.devicePath / m.storeId.directoryName
           // Checked again now the close is done: a shutdown that began during it has already
           // run stopDeviceWork, which found no send to cancel, so a send begun here would run
-          // on a device being shelved. The store is left closed and unmarked, which the
-          // shutdown's closeStoresForShutdown picks up and marks like its own. A device
-          // unloaded meanwhile -- its shutdown already finished -- is not ours to send from.
+          // on a device being shelved. The store is left closed and unmarked, its state in the
+          // crl_save.log its close extracted, which its next load (here after a restart, or on an
+          // adopting host) reads back. A device unloaded meanwhile -- its shutdown already
+          // finished -- is not ours to send from.
           if ctx.shutdown.isShuttingDown(sourceDs.storageDeviceId) ||
              !ctx.devices.devices.get(sourceDs.storageDeviceId).contains(sourceDs) then
             logger.info(s"Not starting the transfer out of store ${m.storeId}: source device " +

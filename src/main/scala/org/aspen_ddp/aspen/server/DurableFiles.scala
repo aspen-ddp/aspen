@@ -7,8 +7,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import scribe.Logging
 
 /** Small files that must survive a power cut or a pulled disk the moment their write returns:
- *  the device markers, the per-store transfer-out marker and CRL save file that a shutdown
- *  leaves behind, and anything else a "safe to remove" decision depends on.
+ *  the device markers, the per-store transfer-out marker and CRL save file that a network transfer
+ *  or a rebuild leaves behind, and anything else a "safe to remove" decision depends on.
  *
  *  os-lib writes go through the page cache and return before anything reaches the disk, so a
  *  disk pulled right after a shutdown reports Shutdown can come back without the file, or with

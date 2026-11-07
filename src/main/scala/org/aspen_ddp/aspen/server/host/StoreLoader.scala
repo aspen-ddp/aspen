@@ -39,10 +39,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // rebuild: the store's data is intact, it just cannot finish recovery until space returns.
   private var storesAwaitingSpace: Map[StoreId, SpaceWait] = Map()
   // Stores whose backend open (recovery) or create is in progress (startOpen), each with the ShutdownStore
-  // completions that arrived meanwhile. Such a store is in its device's loadedStores, so a
+  // events that arrived meanwhile, newest first. Such a store is in its device's loadedStores, so a
   // shutdown closes it; its ShutdownStore is put again once the open's outcome is handled, after
   // the LoadStore that serves it, so it is closed like any served store.
-  private var opening: Map[StoreId, List[Promise[Unit]]] = Map()
+  private var opening: Map[StoreId, List[ShutdownStore]] = Map()
 
   /** SpaceRetryCap in device scans, at least 1 */
   private val spaceRetryCapScans: Int =
@@ -218,7 +218,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         sds.loadedStores -= storeId
         router.clearLoading(storeId)
         created.foreach(_.tryFailure(e))
-    deferred.reverse.foreach(c => ctx.post(ShutdownStore(storeId, c)))
+    deferred.reverse.foreach(ctx.post)
     // After the replay, so a callback that throws cannot lose a deferred shutdown's completion
     servedCallback.foreach: callback =>
       try callback()
@@ -251,9 +251,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       backend
     }(using ExecutionContext.parasitic)
 
-  def closeStore(storeId: StoreId): Future[Unit] =
+  /** Closes a store (handleClose). With `extractCrl` (a network transfer out only) its CRL state is taken out of the
+   *  device CRL into its crl_save.log, to travel with it; otherwise it stays live in the device CRL, which recovers
+   *  it when the store next loads from this device, here or on a host that adopts the device. */
+  def closeStore(storeId: StoreId, extractCrl: Boolean): Future[Unit] =
     val p = Promise[Unit]()
-    ctx.post(ShutdownStore(storeId, p))
+    ctx.post(ShutdownStore(storeId, extractCrl, p))
     p.future
 
   def handleLoad(e: LoadStore): Unit =
@@ -433,24 +436,26 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       ctx.tryLoadStore(sds, sds.devicePath / e.toreId.directoryName, None)
 
   /** Closes a store (spec section 5): removes it from the router, which marks it offline so new traffic gets the
-   *  offline handling, then runs the close on its executor, behind any tasks already queued for it: object cache
-   *  clear and `crl.closeStore`, then the CRL state saved and `store.close()`. Back on the control thread, its
-   *  executor slot is released, whatever the outcome, and the fail-stop check decides the completion; a failed step
-   *  fails it. */
+   *  offline handling, then runs the close on its executor, behind any tasks already queued for it: the object cache
+   *  cleared and, with `extractCrl`, `crl.closeStore` taking the store's state out of the device CRL; then that
+   *  state saved to its crl_save.log (extractCrl only) and `store.close()`. Without `extractCrl` the state stays live
+   *  in the device CRL and no save file is written. Back on the control thread, its executor slot is released,
+   *  whatever the outcome, and the fail-stop check decides the completion; a failed step fails it. A store whose
+   *  backend failed-stop is rebuilt, so its entries are then dropped from the device CRL either way. */
   def handleClose(e: ShutdownStore): Unit =
-    val ShutdownStore(storeId, completion) = e
+    val ShutdownStore(storeId, extractCrl, completion) = e
     router.entry(storeId) match
       case None if opening.contains(storeId) =>
         // Closed once its open ends and it is served (handleBackendOpened puts this event again)
-        opening += storeId -> (completion :: opening(storeId))
+        opening += storeId -> (e :: opening(storeId))
       case None => completion.success(())
       case Some(entry) =>
         val store = entry.store
         // isWriteFrozen may be read from any thread
         if store.backend.isWriteFrozen then
           // The close abandons the held writes as a crash would (Ruling 27): they were never
-          // acknowledged, so the CRL saved below keeps their data, and acknowledged commits are
-          // durable in the store's journal. It completes without waiting for space.
+          // acknowledged, so the CRL state (in the device CRL, or saved below) keeps their data, and
+          // acknowledged commits are durable in the store's journal. It completes without waiting for space.
           logger.warn(s"Closing store $storeId while its device is out of space: its held writes are " +
                       s"abandoned, as in a crash, and redone from the CRL when it next loads")
         router.remove(storeId)
@@ -458,11 +463,20 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           sds.offlineStores += storeId
         startClose(entry):
           store.objectCache.clear()
-          store.crl.closeStore(storeId)
-        .flatMap: trs =>
+          if extractCrl then
+            store.crl.closeStore(storeId).map(Some(_))
+          else
+            Future.successful(None)
+        .flatMap: extracted =>
           onExecutor(entry):
-            CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)
+            extracted.foreach(trs => CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile))
             store.close()
+        .flatMap: _ =>
+          // A failed-stop store is rebuilt (failedOnClose below): its state must not be recovered by the rebuilt copy
+          if store.backend.hasFailed && !extractCrl then
+            onExecutor(entry)(store.crl.closeStore(storeId).map(_ => ()))
+          else
+            Future.unit
         .onComplete: result =>
           // The close has ended: the backend and directory belong to the control side again
           ctx.threading.release(storeId)

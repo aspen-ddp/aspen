@@ -293,9 +293,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
   /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of
    *  service: it is not loaded, and it is recorded offline behind an empty transfer-out marker
-   *  plus an empty CRL save file. That is exactly how the shutdown leaves the stores it closed, so
-   *  a restart, or an adoption's check that every Offline store was closed cleanly, treats it
-   *  the same way. Empty because a store fresh from a rebuild has no transaction state.
+   *  plus an empty CRL save file. A restart keeps it offline behind the marker until the
+   *  reconcile or bringIntoService finds its entry Active, and an adoption classes it Clean (a
+   *  transfer-out marker with a valid save file). Empty because a store fresh from a rebuild has
+   *  no transaction state.
    *
    *  Written even when the device has already been unloaded (its shutdown finished first): the
    *  device path is still known, and without the pair an adopting host would refuse the whole

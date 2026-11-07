@@ -253,7 +253,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
           catch case _: Throwable => failed.set(true))
       senders.foreach(_.start())
       firstThousand.await(Bound, TimeUnit.SECONDS) should be(true)
-      val closed = fx.ctx.loader.closeStore(s0)
+      val closed = fx.ctx.loader.closeStore(s0, extractCrl = false)
       await(closed)
       senders.foreach(_.join(TimeUnit.SECONDS.toMillis(Bound)))
       senders.exists(_.isAlive) should be(false)
@@ -325,7 +325,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       val Queued = 10
       val reads = (0 until Queued).map(_ => read(s0))
       reads.foreach(fx.ctx.router.deliverClient)
-      val closed = fx.ctx.loader.closeStore(s0)
+      val closed = fx.ctx.loader.closeStore(s0, extractCrl = false)
       // handleClose has run: the store is removed and its close queued behind the reads
       fx.awaitControl()
       fx.ctx.router.entry(s0) should be(None)
@@ -517,7 +517,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
         executor.execute(() => { unblock.await(Bound, TimeUnit.SECONDS); () })
         gateBefore.countDown()
         beforePosted.await(Bound, TimeUnit.SECONDS) should be(true)
-        val closed = fx.ctx.loader.closeStore(s0)
+        val closed = fx.ctx.loader.closeStore(s0, extractCrl = false)
         fx.awaitControl()
         fx.ctx.router.entry(s0) should be(None)
         unblock.countDown()

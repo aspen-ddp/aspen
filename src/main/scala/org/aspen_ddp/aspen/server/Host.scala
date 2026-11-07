@@ -78,7 +78,10 @@ object Host:
                                             cfg: StorageDeviceConfig,
                                             markerHost: HostId,
                                             state: Try[StorageDeviceState]) extends Event
-  private[server] case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
+  /** Closes a store. `extractCrl` (a network transfer out only) moves its CRL state out of the device CRL into its
+   *  crl_save.log; otherwise the state stays live in the device CRL. See StoreLoader.handleClose. */
+  private[server] case class ShutdownStore(storeId: StoreId, extractCrl: Boolean, completion: Promise[Unit])
+    extends Event
   /** A backend open (`create = false`, from tryLoadStore) or create (createNewStore) started by StoreLoader.startOpen
    *  has ended. `previous` is the store's out-of-space wait before the open, for the backoff; `created` is completed
    *  for a create once its store is loaded, or failed; `onServed` is tryLoadStore's, run only if the store is served.
@@ -377,7 +380,7 @@ class Host(val client: AspenClient,
   }
   
   private[aspen] def closeStore(storeId: StoreId): Future[Unit] =
-    deviceControl.loader.closeStore(storeId)
+    deviceControl.loader.closeStore(storeId, extractCrl = false)
 
   protected def addRecoveryEvent(): Unit = post(RecoveryEvent())
 

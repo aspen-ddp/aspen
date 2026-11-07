@@ -7,8 +7,9 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.runSequentially
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.ShutdownOutcome
-import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles}
+import org.aspen_ddp.aspen.server.DeviceMarkers
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
 
@@ -33,12 +34,17 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
   // markers and transact the device state a second time in parallel with the first.
   private var shuttingDownDevices: Set[StorageDeviceId] = Set()
 
+  // The stores each device's shutdown has closed cleanly in this process and nothing has loaded again since. A
+  // cancelled shutdown leaves them offline with nothing on disk to say so, so the reconcile loads them back
+  // (reloadClosedStores). Forgotten when the device is unloaded: a restart or an adoption loads them from disk.
+  private var closedForShutdown: Map[StorageDeviceId, Set[StoreId]] = Map()
+
   /** True while the shutdown sequence of `id` is running. */
   def isShuttingDown(id: StorageDeviceId): Boolean = shuttingDownDevices.contains(id)
 
   /** Takes one store out of service for a device shutdown. This is the default of Host.closeStoreForShutdown, the
    *  seam a test replaces. */
-  def closeForShutdown(storeId: StoreId): Future[Unit] = ctx.loader.closeStore(storeId)
+  def closeForShutdown(storeId: StoreId): Future[Unit] = ctx.loader.closeStore(storeId, extractCrl = false)
 
   /** Shuts down a loaded device whose state reads ShuttingDown (or Shutdown, see below).
    *
@@ -48,7 +54,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  1. stopDeviceWork: cancel the rebuilds and transfers running on the device, then
    *     awaitShutdownWork: wait, at most shutdownWorkTimeout, for the cancelled rebuilds and any
    *     transfer-in pool update already running to finish acting on their outcome.
-   *  2. closeStoresForShutdown: close every open store, mark it and announce it offline.
+   *  2. closeStoresForShutdown: close every open store and announce it offline.
    *  3. Write shutdown.state naming this host, so the device is not loaded again on its own.
    *  4. completeDeviceShutdown, then act on its outcome.
    *
@@ -103,8 +109,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         case Success(ShutdownOutcome.Cancelled) =>
           // A restart arrived mid-shutdown. Removing shutdown.state lets the device load again
           // after a restart of this host. The check that follows runs the normal reconcile,
-          // whose abandoned-transfer-out pass finds each store this shutdown closed -- Active
-          // again, offline here, and carrying the marker -- and loads it.
+          // which loads each store this shutdown closed and that is Active again
+          // (reloadClosedStores).
           logger.info(s"Shutdown of storage device $deviceId was cancelled by a restart")
           try
             if os.exists(local.devicePath / DeviceMarkers.ShutdownStateFile) then
@@ -192,22 +198,19 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       done.future
 
   /** Step 2 of shutDownDevice, also run once more after Shutdown commits: closes each store open
-   *  on the device, then writes its transfer-out marker (empty, as no transfer owns it) and
-   *  gossips StoreOffline.
+   *  on the device, leaving its CRL state live in the device CRL, and gossips StoreOffline.
    *
-   *  The marker is what keeps the store from loading on any later start of this device, here or
-   *  on an adopting host, until a restart or adoption clears it. It is the same file a transfer
-   *  out writes, which lets the reconcile's abandoned-transfer-out pass bring the store back if
-   *  the shutdown is cancelled: that pass fires only for an Active entry, so it cannot misfire
-   *  against the Offline entries of a device that stays shut down.
+   *  Nothing is written into the store's directory: the device CRL already on the drive holds its
+   *  state, and the device as a whole is not loaded again while it reads Shutdown. A restart or an
+   *  adoption loads the store from the plain directory and recovers its transactions from the
+   *  device CRL. A cancelled shutdown's stores are loaded again by the reconcile
+   *  (reloadClosedStores), which is why the stores closed cleanly are remembered.
    *
-   *  Picked: every store loaded on the device that is still open, plus any closed one whose
-   *  directory lacks the marker -- an earlier attempt whose marker write failed. Stores closed by
-   *  a transfer out carry their own marker and are left alone, as are stores never loaded here
-   *  (Rebuilding, TransferringIn), which get no handling: they are left as a crash leaves them.
-   *  One at a time, so each store's close has finished before its marker is written.
+   *  Picked: every store loaded on the device that is not offline (storesToClose). One at a time,
+   *  so each close has finished before the next starts.
    */
   private def closeStoresForShutdown(local: LocalStorageDeviceState): Future[Unit] =
+    val deviceId = local.storageDeviceId
     runSequentially(storesToClose(local)): storeId =>
       // A store whose backend failed while closing is marked rebuild-required instead of closed
       // cleanly (see StoreRebuilds.failedOnClose), and an adopter takes it as Rebuilding.
@@ -219,21 +222,39 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         // steps read does not depend on how the store was closed.
         ctx.router.markOffline(storeId)
         local.offlineStores += storeId
-        // Forced to disk, as the CRL file ShutdownStore saved beside it was: once Shutdown
-        // commits the disk may be pulled at any moment, and an adopter refuses a store whose
-        // marker or CRL file did not survive.
         if clean then
-          DurableFiles.write(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile, "")
+          closedForShutdown += deviceId -> (closedForShutdown.getOrElse(deviceId, Set()) + storeId)
         ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
     .map(_ => ())
 
-  /** The stores closeStoresForShutdown picks. */
+  /** The stores closeStoresForShutdown picks: those loaded on the device and not offline. A crash
+   *  mid-shutdown reloads the device, ShuttingDown, with its stores served, and they are closed again. */
   private def storesToClose(local: LocalStorageDeviceState): List[StoreId] =
-    local.loadedStores.filter: storeId =>
-      val storePath = local.devicePath / storeId.directoryName
-      val unmarked = os.isDir(storePath) && !os.exists(storePath / StoreTransfer.TransferOutMarkerFile)
-      !ctx.router.isOffline(storeId) || unmarked
-    .toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+    local.loadedStores.filter(storeId => !ctx.router.isOffline(storeId))
+      .toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+
+  /** Run by the reconcile of an Operational device that is not shutting down: loads each store a
+   *  cancelled shutdown of it closed, once its entry is Active with no transfer named. A store whose
+   *  directory has since gained a marker (rebuild-required, a transfer's) is left to the pass that
+   *  owns that marker. One that is no longer offline here was loaded by something else. Each is
+   *  offered to tryLoadStore once; a load that fails leaves it offline until a restart loads it. */
+  def reloadClosedStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    val deviceId = local.storageDeviceId
+    closedForShutdown.get(deviceId).foreach: closed =>
+      def storePath(storeId: StoreId): os.Path = local.devicePath / storeId.directoryName
+      val (ready, notYet) = closed.filter(local.offlineStores.contains).partition: storeId =>
+        remote.stores.get(storeId).exists(entry =>
+          entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty)
+      if notYet.isEmpty then
+        closedForShutdown -= deviceId
+      else
+        closedForShutdown += deviceId -> notYet
+      val plain = ready.filter: storeId =>
+        List(RebuildingStore.RebuildRequiredMarkerFile, StoreTransfer.TransferOutMarkerFile,
+             StoreTransfer.TransferredInMarkerFile).forall(marker => !os.exists(storePath(storeId) / marker))
+      plain.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
+        logger.info(s"Loading store $storeId on device $deviceId again: the shutdown that closed it was cancelled")
+        ctx.tryLoadStore(local, storePath(storeId), Some(() => ctx.gossipStoreOnline(storeId)))
 
   /** Unloads a device whose Shutdown has committed, first closing any store loaded on it since
    *  the shutdown's own close: a rebuild or transfer in that flipped its entry Active before
@@ -259,6 +280,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  shutdown.state and leaves the device unloaded until a restart or adoption resolves it.
    */
   def unloadDevice(storageDeviceId: StorageDeviceId): Unit =
+    closedForShutdown -= storageDeviceId
     ctx.devices.devices.get(storageDeviceId).foreach(sds => shutDownCrl(sds.devicePath, sds.crl))
     ctx.devices.devices -= storageDeviceId
     ctx.discovery.forgetDevice(storageDeviceId)

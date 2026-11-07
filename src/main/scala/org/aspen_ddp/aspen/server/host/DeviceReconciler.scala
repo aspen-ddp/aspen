@@ -58,8 +58,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
 
   /** Reconciles a loaded device's on-disk state against the state recorded for it in the
    *  storage-devices tree: deletes stores transferred away, flips stores whose CRL state was lost
-   *  to Rebuilding, reinstates stores left offline by an abandoned transfer out, creates
-   *  Initializing stores, and starts transfers in.
+   *  to Rebuilding, reinstates stores left offline by an abandoned transfer out or a cancelled
+   *  shutdown, creates Initializing stores, and starts transfers in.
    *
    *  If the tree records a different host, none of that happens and the device is not claimed.
    *  tryLoadDevice only loads a device whose `owning-host` file names this host, so a mismatch
@@ -169,6 +169,13 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         ctx.transfers.reinstateAbandonedOut(local, storeId)
       if stillSending.nonEmpty then
         scheduleDeviceRecheck(local.storageDeviceId)
+
+      //----------------------
+      // Cancelled Shutdown
+      //
+      // A shutdown cancelled by a restart leaves the stores it closed offline here, with nothing
+      // on disk to say so: their state stayed in the device CRL. Loaded again once Active.
+      ctx.shutdown.reloadClosedStores(local, remote)
 
       //----------------------
       // Completed Transfers In

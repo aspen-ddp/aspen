@@ -285,23 +285,28 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - This approach is preferred over sending messages directly to the host, since those messages could be lost
   - An example is seeing that a DataStore is marked for transfer in or out. When seen, the hoste will start the process
 - Planned physical moves: `shutdownStorageDevice` makes Active stores Offline and the device ShuttingDown; its host
-  closes the stores (each gets an empty `transferring-out` marker and its `crl_save.log`), writes `shutdown.state`
-  (its HostId) in the device dir, and commits Shutdown. Each device dir also has `owning-host` (`server.DeviceMarkers`),
-  so the 10 s scan decides without the network; only a dir with `shutdown.state` needs a device-state lookup. On the
-  same host a Shutdown device waits for `restartStorageDevice`. Another host adopts it only when Shutdown and every
-  Offline store dir has `transferring-out` + `crl_save.log` (or `transferred-in`), in one transaction rewriting the
-  device, its pool entries and both HostStates, then rewrites `owning-host`, removes the markers and loads it
-- A `crl_save.log` in a store's final directory is the only copy of its CRL state: if it fails to load (missing,
-  truncated, or naming another store) the store is never served. It gets a `rebuild-required` marker, its entry is
-  flipped to Rebuilding by the reconcile, and the directory is discarded before the rebuild. Adoption of a Shutdown
-  device does the same for such stores instead of refusing the device, and adopts any `rebuild-required` directory as
-  Rebuilding whatever its other markers. A network transfer validates the staged copy's save file before promotion and
-  retries on failure, since the source still holds the state
+  closes the stores, leaving their CRL state live in the device CRL (no per-store marker or save file), writes
+  `shutdown.state` (its HostId) in the device dir, and commits Shutdown. Each device dir also has `owning-host`
+  (`server.DeviceMarkers`), so the 10 s scan decides without the network; only a dir with `shutdown.state` needs a
+  device-state lookup. On the same host a Shutdown device waits for `restartStorageDevice`; a restart that cancels a
+  shutdown in flight has the reconcile load the closed stores again (`DeviceShutdown.reloadClosedStores`). Another host
+  adopts it only when Shutdown and every Offline store has a directory, in one transaction rewriting the device, its
+  pool entries and both HostStates, then rewrites `owning-host` and loads it: it opens the device CRL and each store
+  recovers its transactions from it
+- `crl_save.log`, `transferring-out` and `transferred-in` are for network transfers only: a transfer out closes the
+  store with `extractCrl`, moving its state out of the device CRL into `crl_save.log` to travel with it. Such a file is
+  then the only copy of that state: if it fails to load (missing, truncated, or naming another store) the store is
+  never served. It gets a `rebuild-required` marker, its entry is flipped to Rebuilding by the reconcile, and the
+  directory is discarded before the rebuild. Adoption of a Shutdown device does the same for a `transferring-out` store
+  without a valid save file instead of refusing the device, and adopts any `rebuild-required` directory as Rebuilding
+  whatever its other markers. A network transfer validates the staged copy's save file before promotion and retries on
+  failure, since the source still holds the state
 - A lost device CRL does the same to every store on the device: if `<device>/crl` is absent from a device holding store
   dirs, or `openCRL` throws, each store dir gets `rebuild-required`, the old directory is kept as `crl.lost-<uuid>`, and
   a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`)
 - A backend fail-stop during a store's close marks it `rebuild-required` instead of closing it cleanly (no
-  `transferring-out`, no `crl_save.log`). Such a store is never transferred: its transfer is aborted so it is rebuilt
+  `crl_save.log`, its device-CRL entries dropped). Such a store is never transferred: its transfer is aborted so it is
+  rebuilt
 - `server.DurableFiles` forces files and their directories so markers and moves survive a pulled disk. That durability
   holds on Linux only, the supported host platform: directory fsync is a no-op on Windows and a plain fsync on macOS,
   each logging one warning

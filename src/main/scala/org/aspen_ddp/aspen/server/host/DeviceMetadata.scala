@@ -99,8 +99,8 @@ object DeviceMetadata:
 
     /** The device is shutting down or shut down, so the entry was written Offline rather than
      *  Active (or was found Offline already). The rebuilt store is the device's, but must not be
-     *  served: it is kept offline behind a transfer-out marker, like every other store the
-     *  shutdown closed, until a restart or adoption brings it back. */
+     *  served: it is kept offline behind a transfer-out marker (keepRebuiltStoreOffline) until a
+     *  restart or adoption brings it back. */
     case AdoptOffline
 
     /** The tree does not say this device owns a rebuilt store: the device was tombstoned,
@@ -449,8 +449,8 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
    *  Every object written carries a KeyRevision, so a restart on the old host or a second
    *  adopter racing this one makes one of them lose and re-read. Returns Changed, writing nothing,
    *  when the re-read finds the device no longer Shutdown and owned by `previousHostId`, and
-   *  Unclean, writing nothing, when an Offline entry of the re-read state has a directory under
-   *  `devicePath` that was not closed cleanly: the state validated is the state committed, so an
+   *  Unclean, writing nothing, when an Offline entry of the re-read state has no directory under
+   *  `devicePath` (DeviceDiscovery.adoptionClass): the state validated is the state committed, so an
    *  entry gone Offline since the caller's lookup is checked too. Adopted carries the state
    *  written, which the post-commit steps act on. The
    *  previous host's HostState is skipped if that host has no entry in the hosts tree: it was
@@ -534,8 +534,8 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
               // either way, and the marker is what keeps the directory from ever being loaded.
               val crlLost = crlLostStores(devicePath, state)
               crlLost.foreach: storeId =>
-                logger.warn(s"Store $storeId on storage device $storageDeviceId has a missing or " +
-                            s"unusable CRL save file. Adopting it as Rebuilding")
+                logger.warn(s"Store $storeId on storage device $storageDeviceId has lost its CRL state. " +
+                            s"Adopting it as Rebuilding")
                 markRebuildRequired(devicePath / storeId.directoryName)
               val reactivated = state.withOfflineStoresActive.copy(hostId = hostId, status = DeviceStatus.Operational)
               val newState = crlLost.foldLeft(reactivated): (st, storeId) =>

@@ -366,7 +366,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         repaired.isCompleted should be(false) // abandoned, never acknowledged
         host.getStoreIds should not contain storeId
         os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
-        os.exists(Backend.crlSaveFile(storeDir)) should be(true)
+        os.exists(Backend.crlSaveFile(storeDir)) should be(false)
         fsif(host).deviceFull = false
         load(host)
         host.getStoreIds should contain(storeId)
@@ -417,7 +417,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       closed.map: _ =>
         host.getStoreIds should not contain storeId
         host.control.router.offlineStores should contain(storeId)
-        os.exists(Backend.crlSaveFile(storeDir)) should be(true)
+        os.exists(Backend.crlSaveFile(storeDir)) should be(false)
         os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
 
   /** Holds every FSIF open of `host` until the test runs it */

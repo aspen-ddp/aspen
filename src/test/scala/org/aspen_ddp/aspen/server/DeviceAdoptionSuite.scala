@@ -94,13 +94,17 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
     given ExecutionContext = executionContext
     client.getStoragePoolState(storeId.poolId).map(_.stores(storeId.poolIndex))
 
-  /** A store directory as the shutdown leaves it: an empty transfer-out marker and a CRL save file. */
-  private def writeClosedStore(deviceDir: os.Path, storeId: StoreId, withCrl: Boolean = true): os.Path =
+  /** A store directory as the shutdown leaves it: plain, its state in the device's CRL. */
+  private def writeClosedStore(deviceDir: os.Path, storeId: StoreId): os.Path =
     val dir = deviceDir / storeId.directoryName
     os.makeDir.all(dir)
+    dir
+
+  /** A store directory as a network transfer out leaves it: a transfer-out marker and a CRL save file. */
+  private def writeTransferringOutStore(deviceDir: os.Path, storeId: StoreId): os.Path =
+    val dir = writeClosedStore(deviceDir, storeId)
     os.write.over(dir / StoreTransfer.TransferOutMarkerFile, "")
-    if withCrl then
-      CrashRecoveryLog.saveStoreState(storeId, Nil, Backend.crlSaveFile(dir))
+    CrashRecoveryLog.saveStoreState(storeId, Nil, Backend.crlSaveFile(dir))
     dir
 
   private def marker(dir: os.Path): os.Path = dir / StoreTransfer.TransferOutMarkerFile
@@ -156,7 +160,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
       d0 = writeClosedStore(deviceDir, s0)
       // A transfer out interrupted by the shutdown: its own marker, which adoption must leave.
-      d2 = writeClosedStore(deviceDir, s2)
+      d2 = writeTransferringOutStore(deviceDir, s2)
       _ = net.takeCapturedGossip()
       host = newHost(hostRoot, storeRebuildFactory = rebuilds)
       _ <- resolve(host)
@@ -203,50 +207,54 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       rebuilds.created.map(_.storeId).toList should be(List(s1))
       rebuilds.created.head.storageDeviceId should be(deviceA)
 
-  // The device reads Shutdown, so every close finished and was forced to disk: a save file
-  // missing or unusable now was lost afterwards (a disk pulled before it reached the platter, or
-  // a file copied from another store), and no host holds the state any more. Refusing the device
-  // would not bring it back, so the store is adopted as Rebuilding and its directory discarded
-  // before the rebuild; the device's other stores are adopted as usual.
+  /** Adopts a carried deviceA with two Offline stores, s0 left by `leave` and s1 closed by the shutdown, and checks
+   *  that s0 is adopted as Rebuilding and its directory discarded before the rebuild, and s1 adopted as usual. */
+  private def adoptWithLostStore(leave: (os.Path, StoreId) => Unit): Future[org.scalatest.Assertion] =
+    given ExecutionContext = executionContext
+    val rebuilds = new RecordingRebuildFactory
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 2, registerOldHost = true): ss =>
+                  Map(ss(0) -> offline, ss(1) -> offline)
+      List(s0, s1) = stores: @unchecked
+      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+      d0 = writeClosedStore(deviceDir, s0)
+      d1 = writeClosedStore(deviceDir, s1)
+      _ = leave(d0, s0)
+      host = newHost(hostRoot, storeRebuildFactory = rebuilds)
+      _ <- resolve(host)
+      _ <- pumpUntil(rebuilds.created.nonEmpty)
+      st <- state(deviceA)
+      e0 <- poolEntry(s0)
+    yield
+      recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
+      st.status should be(DeviceStatus.Operational)
+      st.hostId should be(HostId.BootstrapHostId)
+      st.stores(s0) should be(rebuilding)
+      st.stores(s1).status should be(StoreStatus.Active)
+      e0.hostId should be(HostId.BootstrapHostId)
+      loadedDevices(host).contains(deviceA) should be(true)
+      rebuilds.created.map(_.storeId).toList should be(List(s0))
+      // Discarded before the rebuild began, so the rebuild cannot take it for a store in place.
+      os.exists(d0) should be(false)
+      recorded(host).storeLoadAttempts.map(_._2) should contain(d1)
+
+  // Marked by the host that closed it (a backend that failed during its close, StoreRebuilds.failedOnClose): its
+  // state cannot be trusted whatever else its directory holds.
+  atest("a store marked rebuild-required is adopted as Rebuilding"):
+    adoptWithLostStore((dir, _) => os.write.over(dir / RebuildingStore.RebuildRequiredMarkerFile, ""))
+
+  // A network transfer out extracted the store's state from the device CRL into its save file. A save file missing
+  // or unusable now (a disk pulled before it reached the platter, or a file copied from another store) leaves no
+  // copy of that state anywhere: refusing the device would not bring it back.
   for (what, corrupt) <- List[(String, (os.Path, StoreId) => Unit)](
         ("no", (file, _) => os.remove(file)),
         ("a truncated", (file, _) => os.write.over(file, "")),
         ("another store's", (file, s) =>
-          CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), Nil, file)),
-        // As a close whose backend failed-stop leaves it (StoreRebuilds.failedOnClose): marked, no CRL file, no
-        // transfer-out marker
-        ("a failed-on-close store's", (file, _) =>
-          os.remove(file)
-          os.remove(file / os.up / StoreTransfer.TransferOutMarkerFile)
-          os.write.over(file / os.up / RebuildingStore.RebuildRequiredMarkerFile, ""))) do
-    atest(s"a store with $what CRL save file is adopted as Rebuilding and rebuilt"):
-      given ExecutionContext = executionContext
-      val rebuilds = new RecordingRebuildFactory
-      for
-        stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 2, registerOldHost = true): ss =>
-                    Map(ss(0) -> offline, ss(1) -> offline)
-        List(s0, s1) = stores: @unchecked
-        (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
-        d0 = writeClosedStore(deviceDir, s0)
-        d1 = writeClosedStore(deviceDir, s1)
-        _ = corrupt(Backend.crlSaveFile(d0), s0)
-        host = newHost(hostRoot, storeRebuildFactory = rebuilds)
-        _ <- resolve(host)
-        _ <- pumpUntil(rebuilds.created.nonEmpty)
-        st <- state(deviceA)
-        e0 <- poolEntry(s0)
-      yield
-        recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
-        st.status should be(DeviceStatus.Operational)
-        st.hostId should be(HostId.BootstrapHostId)
-        st.stores(s0) should be(rebuilding)
-        st.stores(s1).status should be(StoreStatus.Active)
-        e0.hostId should be(HostId.BootstrapHostId)
-        loadedDevices(host).contains(deviceA) should be(true)
-        rebuilds.created.map(_.storeId).toList should be(List(s0))
-        // Discarded before the rebuild began, so the rebuild cannot take it for a store in place.
-        os.exists(d0) should be(false)
-        recorded(host).storeLoadAttempts.map(_._2) should contain(d1)
+          CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), Nil, file))) do
+    atest(s"a store whose network transfer left transferring-out with $what save file is adopted as Rebuilding"):
+      adoptWithLostStore: (dir, s) =>
+        writeTransferringOutStore(dir / os.up, s)
+        corrupt(Backend.crlSaveFile(dir), s)
 
   atest("a device whose shutdown did not finish is refused by another host"):
     given ExecutionContext = executionContext
@@ -471,7 +479,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       _ <- setDeviceState(deviceA)(_.copy(status = DeviceStatus.Shutdown))
       (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
       // The transfer's own marker, as the old host's transfer out left it.
-      _ = writeClosedStore(deviceDir, s0)
+      _ = writeTransferringOutStore(deviceDir, s0)
       host = newHost(hostRoot, transferService = sends)
       _ <- resolve(host)
       _ = net.takeCapturedHostMessages()

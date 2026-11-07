@@ -17,12 +17,12 @@ import scala.util.{Failure, Success, Try}
 
 /** How one Offline store of a Shutdown device was left, as adoptionClass reads it from its directory. */
 private[aspen] enum AdoptionClass:
-  /** Everything it needs is in its directory: adopted Active. */
+  /** Its state is on the device (the device CRL, or a network transfer's save file): adopted Active. */
   case Clean
-  /** Closed, but its CRL save file is missing or unusable, so its transaction state is gone:
-   *  adopted Rebuilding. */
+  /** Its transaction state is gone (marked rebuild-required, or a transfer's save file missing or
+   *  unusable): adopted Rebuilding. */
   case CrlLost
-  /** Its close did not finish: the device is refused. */
+  /** Its directory is missing: the device is refused. */
   case Unclean
 
 /** Runs only on the control thread. See HostThreading.scala.
@@ -236,39 +236,29 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       stores.foreach(ctx.router.clearAwaitingDevice)
 
   /** How the store at `storePath`, whose entry is Offline, can be put back into service by an
-   *  adoption: every piece of its state must be in its own directory, since the host that took
-   *  it offline is not here.
+   *  adoption. The host that took it offline is not here, so its state must be on the device: in
+   *  the device CRL, or, for a network transfer in flight, in the store's own crl_save.log.
    *
-   *  An Offline entry on a shut-down device comes from one of three places, and each leaves a
-   *  recognisable directory:
-   *  - a store the shutdown closed: its transfer-out marker and the CRL save file ShutdownStore
-   *    wrote beside it (a transfer out rolled back to Offline is closed the same way);
-   *  - a store rebuilt during or after the shutdown (keepRebuiltStoreOffline): the same pair, the
-   *    CRL file empty since a fresh rebuild has no transaction state;
-   *  - a transfer in that landed during the shutdown (PoolRepointedOffline): its transferred-in
-   *    marker. It was never opened on this device, so it has no CRL state to carry.
-   *  A missing directory, or one with neither marker, is a store whose close did not finish, and
-   *  adopting it would drop the transactions its CRL state was holding: Unclean.
-   *
-   *  A transfer-out marker with a missing or unusable CRL file is CrlLost. The device reads
-   *  Shutdown, which the shutdown commits only once every close has finished and been forced to
-   *  disk, so the save file was lost afterwards -- a disk pulled before it reached the platter, or
-   *  later damage -- and the host that wrote it no longer holds the state either. Refusing the
-   *  device would not bring the state back, so the store is adopted as Rebuilding instead.
-   *
-   *  A store carrying `rebuild-required` is CrlLost whatever else its directory holds: its host
-   *  marked it because its state cannot be trusted (an FSIF backend that failed while closing).
-   *
-   *  The CRL file is parsed, not just found: loadValidStoreState rejects a file cut short, and one
-   *  whose header names another store, so a file copied from another store's directory does not
-   *  pass for this one's state.
+   *  - No directory: the store's close did not finish (or its directory was lost), and adopting it
+   *    would drop whatever it held: Unclean, and the device is refused.
+   *  - `rebuild-required`: CrlLost whatever else the directory holds. Its host marked it because
+   *    its state cannot be trusted (a backend that failed while closing, a lost CRL).
+   *  - `transferred-in`: Clean. A transfer in that landed during the shutdown (PoolRepointedOffline);
+   *    it was never opened on this device, so it has no CRL state to carry.
+   *  - `transferring-out`: a network transfer out had taken its state out of the device CRL into
+   *    crl_save.log. Clean with a valid save file. Without one the state is gone -- a disk pulled
+   *    before the file reached the platter, or later damage -- and the host that wrote it no longer
+   *    holds it either: refusing the device would not bring it back, so it is CrlLost and adopted as
+   *    Rebuilding. The save file is parsed, not just found: loadValidStoreState rejects a file cut
+   *    short, and one whose header names another store. A store rebuilt during or after the
+   *    shutdown (keepRebuiltStoreOffline) carries the marker with an empty save file: Clean.
+   *  - Any other directory: Clean. The shutdown closed it and left its state in the device CRL,
+   *    which the adopting host opens before loading it.
    */
   private def adoptionClass(storeId: StoreId, storePath: os.Path): AdoptionClass =
     if !os.isDir(storePath) then
       AdoptionClass.Unclean
     else if os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
-      // Marked by the host that closed it (a backend that failed during its close): never loaded
-      // again whatever else is present, so its state is lost and it is adopted as Rebuilding.
       AdoptionClass.CrlLost
     else if os.exists(storePath / StoreTransfer.TransferredInMarkerFile) then
       AdoptionClass.Clean
@@ -277,7 +267,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         case Right(_) => AdoptionClass.Clean
         case Left(_) => AdoptionClass.CrlLost
     else
-      AdoptionClass.Unclean
+      AdoptionClass.Clean
 
   /** Validates a device shut down by `previousHostId` and, if every Offline store was closed
    *  cleanly, adopts it. On success the post-commit steps run from the transaction's callback.
@@ -347,8 +337,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                           previousHostId: HostId,
                           unclean: List[StoreId]): Unit =
     warnOnce(path, s"Storage device $deviceId at $path was shut down by host $previousHostId, but " +
-                   s"stores ${unclean.mkString(", ")} were not closed cleanly (missing directory or " +
-                   s"transfer-out marker). Not adopting it. It may have been " +
+                   s"stores ${unclean.mkString(", ")} were not closed cleanly (missing directory). " +
+                   s"Not adopting it. It may have been " +
                    s"removed too early: return it to that host to finish the shutdown")
 
   /** The local half of a restart or adoption, once `state` -- Operational and owned by this host
@@ -356,10 +346,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  the next scan, which finds shutdown.state still present and lands here again:
    *  1. `owning-host` is rewritten to name this host (adoption only), so once shutdown.state is
    *     gone the device loads here on its own.
-   *  2. The transfer-out marker the shutdown left is removed from every store now Active, except
-   *     one whose entry still names a transfer or that this process is sending: there the marker
-   *     belongs to a transfer. Offline entries -- none are expected -- keep theirs and stay
-   *     unloaded. A transferred-in marker is left alone: the reconcile's completed-transfers-in
+   *  2. A stray transfer-out marker (a rebuilt store's, keepRebuiltStoreOffline, or an abandoned
+   *     transfer's) is removed from every store now Active, except one whose entry still names a
+   *     transfer or that this process is sending: there the marker belongs to a transfer. Offline
+   *     entries -- none are expected -- keep theirs and stay unloaded. The shutdown itself leaves
+   *     no marker. A transferred-in marker is left alone: the reconcile's completed-transfers-in
    *     pass clears it and loads the store, as it would after any crash.
    *  3. shutdown.state is removed.
    *  4. The device is loaded through tryLoadDevice and checked at once, so its Rebuilding and

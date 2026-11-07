@@ -8,10 +8,13 @@ import org.aspen_ddp.aspen.common.util.runSequentially
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.ShutdownOutcome
 import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles}
+import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
 
-import scala.concurrent.{Future, Promise}
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
 /** Runs only on the control thread. See HostThreading.scala.
@@ -256,6 +259,27 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  shutdown.state and leaves the device unloaded until a restart or adoption resolves it.
    */
   def unloadDevice(storageDeviceId: StorageDeviceId): Unit =
+    ctx.devices.devices.get(storageDeviceId).foreach(sds => shutDownCrl(sds.devicePath, sds.crl))
     ctx.devices.devices -= storageDeviceId
     ctx.discovery.forgetDevice(storageDeviceId)
     ctx.publishView()
+
+  /** Shuts `crl`, the CRL of the device at `devicePath`, down on DeviceShutdown.CrlShutdownEc, since the shutdown
+   *  blocks. Until it ends the path is in closingCrls, so the device is not loaded again over files still open. */
+  private[host] def shutDownCrl(devicePath: os.Path, crl: CrashRecoveryLog): Unit =
+    val closed = Future(crl.shutdown())(using DeviceShutdown.CrlShutdownEc)
+    ctx.devices.closingCrls += devicePath -> closed
+    closed.onComplete: result =>
+      result.failed.foreach(t => logger.error(s"Failed to shut down the CRL of the device at $devicePath: $t"))
+      if ctx.devices.closingCrls.get(devicePath).contains(closed) then
+        ctx.devices.closingCrls -= devicePath
+
+object DeviceShutdown:
+  /** Where device CRLs are shut down: cached daemon threads named crl-shutdown-N. Not one thread, as a CRL whose
+   *  thread has died never completes its shutdown and would hold every later one up behind it. */
+  private[aspen] lazy val CrlShutdownEc: ExecutionContext =
+    val counter = new AtomicInteger(0)
+    ExecutionContext.fromExecutorService(Executors.newCachedThreadPool: r =>
+      val t = new Thread(r, s"crl-shutdown-${counter.getAndIncrement()}")
+      t.setDaemon(true)
+      t)

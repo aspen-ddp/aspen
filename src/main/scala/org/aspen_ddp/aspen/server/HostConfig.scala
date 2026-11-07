@@ -16,10 +16,6 @@ address: 127.0.0.1
 data-port: 4750
 http-port: 4751
 store-transfer-port: 4752
-crl:
-  storage-engine: simple-crl
-  num-streams: 3
-  max-file-size-mb: 300
 object-cache-mb: 8192         # optional. Shared by all stores on the host. default: 25% of physical RAM
 rocksdb:                      # optional, as is each entry. Shared by all RocksDB stores on the host
   memory-mb: 4096             # default: 25% of physical RAM
@@ -41,7 +37,6 @@ case class HostConfig(hostId: HostId,
                       dataPort: Int,
                       httpPort: Int,
                       storeTransferPort: Int,
-                      crl: HostConfig.CRLBackend,
                       tlsCertificate: String,
                       tlsPrivateKey: String,
                       rocksdb: HostConfig.RocksDBResources = HostConfig.RocksDBResources(),
@@ -60,15 +55,7 @@ case class HostConfig(hostId: HostId,
        |data-port: $dataPort
        |http-port: $httpPort
        |store-transfer-port: $storeTransferPort
-       |crl:
        |""".stripMargin
-
-    val crlCfg = crl match
-      case s: HostConfig.SimpleCRL =>
-        s"""  storage-engine: simple-crl
-           |  num-streams: ${s.numStreams}
-           |  max-file-size-mb: ${s.fileSizeMb}
-           |""".stripMargin
 
     val rocksdbCfg =
       val entries = List(
@@ -82,7 +69,7 @@ case class HostConfig(hostId: HostId,
 
     val objectCacheCfg = objectCacheMb.map(v => s"object-cache-mb: $v\n").getOrElse("")
 
-    base + crlCfg + objectCacheCfg + rocksdbCfg +
+    base + objectCacheCfg + rocksdbCfg +
       yamlBlockScalar("tls-certificate", tlsCertificate) +
       yamlBlockScalar("tls-private-key", tlsPrivateKey)
 
@@ -93,20 +80,6 @@ object HostConfig extends YObject[HostConfig]:
 
   /** Share of physical RAM given to the object cache when the host config does not specify it */
   val DefaultObjectCacheFraction = 0.25
-
-  sealed abstract class CRLBackend
-
-  case class SimpleCRL(numStreams: Int,
-                       fileSizeMb: Int) extends CRLBackend
-
-  object SimpleCRL extends YObject[SimpleCRL]:
-    val numStreams: Optional[Int] = Optional("num-streams", YInt)
-    val fileSize: Optional[Int] = Optional("max-file-size-mb", YInt)
-    val attrs: List[Attr] = numStreams :: fileSize :: Nil
-
-    def create(o: Object): SimpleCRL = SimpleCRL(
-      numStreams.get(o).getOrElse(3),
-      fileSize.get(o).getOrElse(300))
 
   /** Host-wide RocksDB limits. Unspecified values are derived from the machine. See RocksDBBackend.ResourceConfig */
   case class RocksDBResources(memoryMb: Option[Int] = None,
@@ -135,7 +108,6 @@ object HostConfig extends YObject[HostConfig]:
   val dataPort: Required[Int]          = Required("data-port", YInt)
   val httpPort: Required[Int]           = Required("http-port", YInt)
   val storeTransferPort: Required[Int] = Required("store-transfer-port", YInt)
-  val crl: Required[SimpleCRL]         = Required("crl", Choice("storage-engine", Map("simple-crl" -> SimpleCRL)))
 
   val tlsCertificate: Required[String] = Required("tls-certificate", YString)
   val tlsPrivateKey: Required[String]  = Required("tls-private-key", YString)
@@ -150,7 +122,6 @@ object HostConfig extends YObject[HostConfig]:
     dataPort,
     httpPort,
     storeTransferPort,
-    crl,
     tlsCertificate,
     tlsPrivateKey,
     rocksdb,
@@ -165,7 +136,6 @@ object HostConfig extends YObject[HostConfig]:
     dataPort.get(o),
     httpPort.get(o),
     storeTransferPort.get(o),
-    crl.get(o),
     tlsCertificate.get(o),
     tlsPrivateKey.get(o),
     rocksdb.get(o).getOrElse(RocksDBResources()),

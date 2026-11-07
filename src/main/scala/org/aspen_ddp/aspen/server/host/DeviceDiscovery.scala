@@ -411,11 +411,18 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *    still be serving them from a copy or that crashed mid-transaction.
    *  The decision needs no network, which matters at startup: a host may need its own devices
    *  loaded before it can read any metadata.
+   *
+   *  Nothing is decided for a path whose unloaded device's CRL is still shutting down
+   *  (LocalDevices.closingCrls): a second CRL opened over the same files would corrupt them. The
+   *  scan retries it once the shutdown has ended.
    */
   private def tryLoadDevice(storageDevicePath: os.Path): Option[StorageDeviceId] =
     val sdCfgPath = storageDevicePath / StorageDeviceConfig.configFilename
 
-    if os.isDir(storageDevicePath) && os.exists(sdCfgPath) then
+    if ctx.devices.closingCrls.contains(storageDevicePath) then
+      logger.debug(s"Not loading the device at $storageDevicePath yet: its CRL is still shutting down")
+      None
+    else if os.isDir(storageDevicePath) && os.exists(sdCfgPath) then
       try
         val sdCfg = StorageDeviceConfig.loadStorageDeviceConfig(sdCfgPath)
         if sdCfg.aspenSystemId != ctx.aspenSystemId then
@@ -485,10 +492,19 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                                         s"Will retry on the next scan. Error: $t")
             None
           case Success(storeFiles) =>
-            val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath)
+            // Opened before any store is offered, so each store recovers from it. Recovery blocks the control
+            // thread, as each store's getFullRecoveryState does in handleLoad. A throw leaves the device unloaded.
+            val crl = ctx.crlFactory.openCRL(storageDevicePath, sdCfg)
+            val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl)
             logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
-            storeFiles.foreach: potentialStoreFile =>
-              ctx.tryLoadStore(sds, potentialStoreFile, None)
+            try
+              storeFiles.foreach: potentialStoreFile =>
+                ctx.tryLoadStore(sds, potentialStoreFile, None)
+            catch
+              case t: Throwable =>
+                // Shut down as an unload does, so the retry does not open the files a second time
+                ctx.shutdown.shutDownCrl(storageDevicePath, crl)
+                throw t
             // Registered only after every child has been offered to tryLoadStore. If
             // anything above throws, the catch in tryLoadDevice logs it and the device stays
             // unregistered, so the next scan retries the whole device rather than

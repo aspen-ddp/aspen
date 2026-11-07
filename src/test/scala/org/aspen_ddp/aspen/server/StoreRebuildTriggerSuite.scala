@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, fixed_ids}
@@ -208,7 +208,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       // Inject the device as loaded and trigger reconciliation
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename))
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL()))
       armed = recorded(host).armLookup(realDeviceId)
       _ = host.control.reconciler.checkAll()
       readState = deviceState(realDeviceId, Map(rebuilding(rebuilt)))
@@ -264,7 +264,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.makeDir.all(storeDir)
       _ = os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
       local = new LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename)
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL())
       _ = local.offlineStores = Set(lost)
       _ = injectLoadedDevice(host, local)
       _ = host.control.reconciler.checkAll()
@@ -330,7 +330,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.write(storePath / "marker.txt", "rebuilt store")
       // Inject device and trigger rebuild
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename))
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL()))
       armed = recorded(host).armLookup(realDeviceId)
       _ = host.control.reconciler.checkAll()
       readState = deviceState(realDeviceId, Map(rebuilding(storeN(0))))
@@ -363,9 +363,9 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
 
     // Inject both devices manually (no writeDevice, so auto-scan won't find them)
     injectLoadedDevice(host, new LocalStorageDeviceState(
-      syntheticA, deviceDir, deviceDir / "dummy.file"))
+      syntheticA, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL()))
     injectLoadedDevice(host, new LocalStorageDeviceState(
-      syntheticB, deviceDir2, deviceDir2 / "dummy.file"))
+      syntheticB, deviceDir2, deviceDir2 / "dummy.file", new TestNetwork.TestCRL()))
 
     val first = recorded(host).armLookup(syntheticA)
     host.control.reconciler.checkAll()

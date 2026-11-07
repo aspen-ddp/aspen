@@ -24,7 +24,6 @@ class HostConfigSuite extends AnyFunSuite with Matchers:
     4750,
     4751,
     4752,
-    HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300),
     sampleCert,
     sampleKey)
 
@@ -85,10 +84,6 @@ address: 127.0.0.1
 data-port: 4750
 http-port: 4751
 store-transfer-port: 4752
-crl:
-  storage-engine: simple-crl
-  num-streams: 3
-  max-file-size-mb: 300
 tls-certificate: |
   -----BEGIN CERTIFICATE-----
   AAAA
@@ -111,7 +106,6 @@ tls-private-key: |
       cfg.dataPort should be(4750)
       cfg.httpPort should be(4751)
       cfg.storeTransferPort should be(4752)
-      cfg.crl should be(HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300))
 
       cfg.tlsCertificate should be("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
       cfg.tlsPrivateKey should be("-----BEGIN PRIVATE KEY-----\nBBBB\n-----END PRIVATE KEY-----\n")

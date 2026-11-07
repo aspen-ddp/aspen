@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler}
@@ -44,7 +44,10 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val backgroundTasks: BackgroundTaskManager,
                           val threading: HostThreading,
                           val post: Host.Event => Unit,
-                          val crl: CrashRecoveryLog,
+                          /** Opens each device's CRL as the device loads */
+                          val crlFactory: CrashRecoveryLogFactory,
+                          /** The CRL of stores loaded onto a device this host has not loaded (Host.Seams) */
+                          val unloadedDeviceCrl: Option[CrashRecoveryLog],
                           val txStatusCache: TransactionStatusCache,
                           /** Wraps each backend's completion handler (a test seam; production: identity). */
                           val wrapCompletionHandler: CompletionHandler => CompletionHandler,

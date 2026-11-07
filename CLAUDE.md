@@ -191,7 +191,10 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - The Paxos algorithm itself is unmodified but some clever message handling is done to reduce the number of
     round-trips and optimize data flow. The details are only important when working on transaction message
     handling.
-  - The CRL is used to store the persistent state required by the Paxos protocol
+  - The CRL is used to store the persistent state required by the Paxos protocol. Each storage device has its own
+    (`<device>/crl`, opened when the device loads, sized by `crl-num-streams`/`crl-max-file-size-mb` in its device
+    config) shared by its stores; a dead CRL thread stalls only that device. An unloaded device is not loaded again
+    until its CRL has shut down (`LocalDevices.closingCrls`)
   - Stores hold requirement locks from a commit vote until the transaction resolves. `SharedRevisionLock` is a
     non-exclusive requirement on an object's revision: many transactions may hold it, but it collides with any write
     to that object

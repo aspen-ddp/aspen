@@ -20,7 +20,7 @@ import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, Transacti
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, Host, transaction}
+import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, Host, StorageDeviceConfig, transaction}
 import org.aspen_ddp.aspen.server.host.{HostThreading, LockstepThreading}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
@@ -56,8 +56,9 @@ object TestNetwork {
     override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = ()
   }
 
+  /** Opens a fresh no-op CRL for each device */
   object TestCRL extends CrashRecoveryLogFactory {
-    override def createCRL(): CrashRecoveryLog = new TestCRL()
+    override def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog = new TestCRL()
   }
 
   class TClient(executionContext: ExecutionContext,
@@ -244,7 +245,9 @@ class TestNetwork(executionContext: ExecutionContext,
     FinalizerFactory,
     TransactionDriver.noErrorRecoveryFactory,
     Duration(5, SECONDS),
-    Duration(60, SECONDS))
+    Duration(60, SECONDS),
+    // Its stores are loaded directly (below), onto a device it never loads
+    seams = Host.Seams(unloadedDeviceCrl = Some(new TestCRL())))
 
   // Stands in for each store's StoreConfig.effectiveMaxSliceSize, which Host reads from the store config file
   private val storesLoaded = (stores ++ metadataStores).map(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))

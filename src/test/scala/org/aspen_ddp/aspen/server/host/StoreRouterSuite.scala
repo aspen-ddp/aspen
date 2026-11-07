@@ -139,7 +139,7 @@ object StoreRouterSuite:
       hostId = HostId.BootstrapHostId, aspenSystemId = new UUID(0, 0), rootDir = os.root, net = net,
       backgroundTasks = BackgroundTaskManager.NoBackgroundTaskManager, threading = threading,
       post = event => threading.controlEvents.execute(() => handle(event)),
-      crl = crl, txStatusCache = new TransactionStatusCache(), wrapCompletionHandler = identity,
+      crlFactory = null, unloadedDeviceCrl = Some(crl), txStatusCache = new TransactionStatusCache(), wrapCompletionHandler = identity,
       objectCacheFactory = objectCacheFactory,
       finalizerFactory = null,
       txDriverFactory = TransactionDriver.noErrorRecoveryFactory, heartbeatPeriod = Duration(5, SECONDS),
@@ -179,7 +179,7 @@ object StoreRouterSuite:
     /** A device whose loadedStores already holds `storeId`, as serveOpened leaves it before its LoadStore runs. */
     def addDevice(storeId: StoreId): LocalStorageDeviceState = onControl:
       val dir = os.temp.dir()
-      val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg")
+      val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl)
       sds.loadedStores += storeId
       ctx.devices.devices += deviceId -> sds
       sds

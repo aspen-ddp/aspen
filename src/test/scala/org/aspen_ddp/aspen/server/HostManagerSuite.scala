@@ -93,8 +93,6 @@ class HostManagerSuite extends IntegrationTestSuite:
       cfg.dataPort should be(5750)
       cfg.httpPort should be(5751)
       cfg.storeTransferPort should be(5752)
-      cfg.crl should be(HostConfig.SimpleCRL(HostManager.DefaultCrlNumStreams,
-                                             HostManager.DefaultCrlFileSizeMb))
 
       // The registration and the file must describe the same host; asserting both is what
       // catches one of the two being wired to a different id.

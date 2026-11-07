@@ -168,9 +168,11 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // recorded, the idempotency guard would skip it forever and its stores would never load.
     loadedDevices(host).keySet should be(empty)
 
-    // A later scan retries it from scratch and succeeds.
-    host.control.reconciler.checkAll()
-    Future.successful(loadedDevices(host).keySet should be(Set(deviceA)))
+    // A later scan, once the CRL the failed load opened has shut down, retries it from scratch and succeeds.
+    yieldUntil(host.control.devices.closingCrls.isEmpty).map: _ =>
+      host.control.devices.closingCrls should be(empty)
+      host.control.reconciler.checkAll()
+      loadedDevices(host).keySet should be(Set(deviceA))
 
   atest("a second directory claiming a loaded device id is ignored"):
     val hostRoot = newHostDir()
@@ -528,7 +530,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val devDir = hostRoot / "injected-device"
     os.write(devDir / storeId.directoryName / StoreTransfer.TransferredInMarkerFile, "", createFolders = true)
     val local = new LocalStorageDeviceState(
-      deviceA, devDir, devDir / StorageDeviceConfig.configFilename)
+      deviceA, devDir, devDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL())
     local.offlineStores = Set(storeId)
     injectLoadedDevice(host, local)
 

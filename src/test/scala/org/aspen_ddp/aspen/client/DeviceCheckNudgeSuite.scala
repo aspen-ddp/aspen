@@ -54,7 +54,6 @@ class DeviceCheckNudgeSuite extends IntegrationTestSuite:
     1234,
     1235,
     1236,
-    HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300),
     tlsCert,
     tlsKey)
 

@@ -261,6 +261,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     // The save file is read before the Store exists: a store whose CRL state cannot be
     // recovered must never serve, not even briefly.
     val failed = backend.hasFailed
+    // The store's device's CRL. A store loaded directly onto a device this host has not loaded uses the test seam's
+    val deviceCrl = ctx.devices.devices.get(storageDeviceId).map(_.crl).orElse(ctx.unloadedDeviceCrl)
     val savedState =
       if failed then
         // Failed-stop between its open and this event. Its BackendFailed found nothing to
@@ -271,19 +273,25 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       else
         Right(None)
 
-    savedState match
-      case Left(err) if failed =>
+    (savedState, deviceCrl) match
+      case (Left(err), _) if failed =>
         logger.error(s"Store ${backend.storeId} cannot be loaded: its backend failed. Rebuilding it. Error: $err")
         ctx.rebuilds.retireUnserved(storageDeviceId, backend)
         router.clearLoading(backend.storeId)
         p.failure(err)
 
-      case Left(err) =>
+      case (Left(err), _) =>
         ctx.rebuilds.crlSaveFileLost(storageDeviceId, backend, err)
         router.clearLoading(backend.storeId)
         p.failure(err)
 
-      case Right(trs) =>
+      case (Right(_), None) =>
+        // Its device was unloaded since the open: nothing may serve it
+        val err = new IllegalStateException(s"device $storageDeviceId of store ${backend.storeId} is not loaded")
+        logger.warn(s"Not loading store ${backend.storeId}: its device $storageDeviceId is not loaded")
+        abandonLoad(storageDeviceId, backend, replaced = router.entry(backend.storeId).isDefined, err, p)
+
+      case (Right(trs), Some(crl)) =>
         val storeId = backend.storeId
         // A store loaded again over a loaded one replaces it on the same executor, as the map entry is replaced
         val replacing = router.entry(storeId)
@@ -310,7 +318,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               // The store's transaction drivers run on the host's ec, not the control context; they post back as
               // messages
               val store = new Store(storageDeviceId, ctx.ec, backend, objectCache,
-                ctx.net, ctx.backgroundTasks, ctx.crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
+                ctx.net, ctx.backgroundTasks, crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
                 Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize)
               val entry = new StoreRouter.Entry(store, executor)
               // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any
@@ -357,7 +365,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     trs match
       case None => p.success(())
       case Some(trs) =>
-        ctx.crl.loadStore(storeId, trs).onComplete:
+        store.crl.loadStore(storeId, trs).onComplete:
           case Success(_) =>
             // Recovered on the store's executor (StoreRouter.crlLoaded)
             router.crlLoaded(store, store.backend.crlSaveFile, p)
@@ -388,7 +396,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val store = entry.store
     startClose(entry):
       store.objectCache.clear()
-      ctx.crl.closeStore(store.storeId)
+      store.crl.closeStore(store.storeId)
     .onComplete: _ =>
       onExecutor(entry)(store.close()).onComplete: _ =>
         ctx.threading.release(store.storeId)
@@ -450,7 +458,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           sds.offlineStores += storeId
         startClose(entry):
           store.objectCache.clear()
-          ctx.crl.closeStore(storeId)
+          store.crl.closeStore(storeId)
         .flatMap: trs =>
           onExecutor(entry):
             CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)

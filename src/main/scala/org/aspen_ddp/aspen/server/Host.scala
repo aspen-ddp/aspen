@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLogFactory
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LocalStorageDeviceState, LockstepThreading}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
@@ -119,7 +119,10 @@ object Host:
                          tryLoadStore: Option[(LocalStorageDeviceState, os.Path, Option[() => Unit]) => Unit] = None,
                          loadStoreById: Option[(StorageDeviceId, StoreId) => Unit] = None,
                          scheduleShutdownWorkTimeout: Option[(StorageDeviceId, () => Unit) => Unit] = None,
-                         wrapIoHandler: Option[CompletionHandler => CompletionHandler] = None)
+                         wrapIoHandler: Option[CompletionHandler => CompletionHandler] = None,
+                         /** The CRL of stores that loadStore loads onto a device this host has not loaded, for tests
+                          *  that load stores directly. Without it such a load fails: a store uses its device's CRL. */
+                         unloadedDeviceCrl: Option[CrashRecoveryLog] = None)
 
   object Seams:
     val default: Seams = Seams()
@@ -139,6 +142,7 @@ class Host(val client: AspenClient,
                    val objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache,
                    val net: Messenger,
                    val backgroundTasks: BackgroundTaskManager,
+                   /** Opens each storage device's CRL as the device loads */
                    crlFactory: CrashRecoveryLogFactory,
                    val finalizerFactory: TransactionFinalizer.Factory,
                    val txDriverFactory: TransactionDriver.Factory,
@@ -165,8 +169,6 @@ class Host(val client: AspenClient,
 
   private val txStatusCache = new TransactionStatusCache(Host.txStatusCacheDuration(heartbeatPeriod))
 
-  private val crl = crlFactory.createCRL()
-
   private val localDevices = new LocalDevices()
 
   // It takes the DeviceControl below, whose control context its callbacks run on, but only uses it once built.
@@ -191,7 +193,8 @@ class Host(val client: AspenClient,
     backgroundTasks = backgroundTasks,
     threading = threading,
     post = event => Host.this.post(event),
-    crl = crl,
+    crlFactory = crlFactory,
+    unloadedDeviceCrl = seams.unloadedDeviceCrl,
     txStatusCache = txStatusCache,
     wrapCompletionHandler = seams.wrapIoHandler.getOrElse(identity),
     objectCacheFactory = objectCacheFactory,

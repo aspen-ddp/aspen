@@ -34,7 +34,7 @@ class ControlContextSuite extends AnyFunSuite with Matchers:
       metadata = null, scheduler = null, backends = null, devices = new LocalDevices(), client = null,
       hostId = HostId.BootstrapHostId, aspenSystemId = new UUID(0, 0), rootDir = os.root, net = null,
       backgroundTasks = BackgroundTaskManager.NoBackgroundTaskManager, threading = threading, post = _ => (),
-      crl = null, txStatusCache = null, wrapCompletionHandler = identity, objectCacheFactory = null,
+      crlFactory = null, unloadedDeviceCrl = None, txStatusCache = null, wrapCompletionHandler = identity, objectCacheFactory = null,
       finalizerFactory = null,
       txDriverFactory = null, heartbeatPeriod = Duration(5, SECONDS), deviceScanPeriod = Duration(10, SECONDS),
       storeRebuildFactory = null, maxConcurrentRebuilds = 2, loadStore = null, tryLoadStore = null,

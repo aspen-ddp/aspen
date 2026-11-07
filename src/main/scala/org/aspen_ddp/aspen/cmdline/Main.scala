@@ -1638,8 +1638,7 @@ object Main {
     configureLogging(Some(hostLogFile(hostDir)))
     Thread.setDefaultUncaughtExceptionHandler(logUncaughtExceptions(scribe.Logger.root))
 
-    // Crash-only: halt, since without its CRL the host could serve reads but never finish a transaction
-    val h = startHost(hostDir, loadJars, _ => Runtime.getRuntime.halt(1), storeThreads)
+    val h = startHost(hostDir, loadJars, storeThreads)
 
     // The storage host is meant to run indefinitely. Blocking the main thread on the IO
     // thread is what keeps the process alive; the IO thread itself is a daemon thread.
@@ -1657,13 +1656,10 @@ object Main {
    *  `loadJars` names the version directory under `<host-dir>/jars` whose user type factories the
    *  host's client is given. They are loaded before anything else is started so a bad jar fails fast.
    *
-   *  `onCrlThreadDeath` is called if a CRL thread dies. An in-process caller must not halt its JVM.
-   *
    *  `storeThreads` caps the host's store threads (StoreThreadPool's `maxThreads`); by default one per CPU.
    */
   def startHost(hostDir: os.Path,
                 loadJars: Option[String] = None,
-                onCrlThreadDeath: Throwable => Unit = _ => (),
                 storeThreads: Option[Int] = None): RunningHost = {
 
     val userTypeFactories = loadJars.map(UserJarLoader.load(hostDir, _)).getOrElse(Nil)
@@ -1695,19 +1691,16 @@ object Main {
       atomicWrite(bsCfgFile, yaml)
       scribe.info(s"Updated bootstrap config written to $bsCfgFile")
 
-    val simpleCrl = hostCfg.crl match {
-      case b: HostConfig.SimpleCRL =>
-        val crlRoot = hostDir / "crl"
-        os.makeDir.all(crlRoot)
-        SimpleCRL.Factory(crlRoot, b.numStreams, b.fileSizeMb * 1024 * 1024, onCrlThreadDeath)
-    }
-
-    // Remembers the CRL the Host creates so RunningHost.stop can shut down its threads.
-    val createdCrl = AtomicReference[Option[CrashRecoveryLog]](None)
+    // One CRL per storage device. A dead CRL thread stalls only its own device's transactions, so it is logged
+    // rather than halting the host. Every CRL opened is remembered so RunningHost.stop can shut down its threads.
+    val openedCrls = AtomicReference[List[CrashRecoveryLog]](Nil)
     val crlFactory = new CrashRecoveryLogFactory:
-      def createCRL(): CrashRecoveryLog =
-        val crl = simpleCrl.createCRL()
-        createdCrl.set(Some(crl))
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+        val crl = SimpleCRL.DeviceFactory(t =>
+          scribe.error(s"The CRL thread of storage device ${config.storageDeviceId} at $devicePath died. " +
+                       s"No transaction on its stores can complete until the host restarts", t)
+        ).openCRL(devicePath, config)
+        openedCrls.updateAndGet(crl :: _)
         crl
 
     val tls = TlsCredentials.fromPem(bootstrapCfg.caCertificate, hostCfg.tlsCertificate, hostCfg.tlsPrivateKey)
@@ -1780,7 +1773,7 @@ object Main {
       step(httpServer.stop())
       step(Await.result(Future.sequence(host.getStoreIds.map(host.closeStore)), timeout))
       step(Await.result(host.shutdown(), timeout))
-      step(createdCrl.get.foreach { case c: SimpleCRL => c.shutdown(); case _ => () })
+      openedCrls.get.foreach(crl => step(crl.shutdown()))
       step(client.shutdown())
       step(client.clientContext match
         case es: java.util.concurrent.ExecutorService => es.shutdownNow()
@@ -1852,7 +1845,6 @@ object Main {
       dataPort,
       httpPort,
       storeTransferPort,
-      HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300),
       Pem.encodeCertificate(tlsCert),
       Pem.encodePrivateKey(tlsKeyPair.getPrivate)
     )

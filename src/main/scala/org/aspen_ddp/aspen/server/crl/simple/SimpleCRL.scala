@@ -2,11 +2,13 @@ package org.aspen_ddp.aspen.server.crl.simple
 
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.server.StorageDeviceConfig
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import scribe.Logging
 
 import java.util.UUID
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue}
+import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.immutable.HashMap
 import scala.concurrent.{Future, Promise}
 
@@ -35,17 +37,16 @@ object SimpleCRL:
   case class InitialCRLState(crl: SimpleCRL,
                              trsList: List[TransactionRecoveryState])
 
-  case class Factory(streamsDir: os.Path,
-                     numStreams: Int,
-                     maxSizeInBytes: Long,
-                     onThreadDeath: Throwable => Unit = _ => ()) extends CrashRecoveryLogFactory:
-    def createCRL(): CrashRecoveryLog =
-      SimpleCRL(streamsDir, numStreams, maxSizeInBytes, onThreadDeath).crl
+  /** Opens each device's SimpleCRL in `CrashRecoveryLog.deviceCrlDir`, creating the directory if absent, sized by
+   *  the device's config. `onThreadDeath` is called if a CRL thread dies: that device's transactions stop. */
+  case class DeviceFactory(onThreadDeath: Throwable => Unit = _ => ()) extends CrashRecoveryLogFactory:
+    def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+      val dir = CrashRecoveryLog.deviceCrlDir(devicePath)
+      os.makeDir.all(dir)
+      SimpleCRL(dir, config.crlNumStreams, config.crlFileSizeMb * 1024L * 1024L, onThreadDeath).crl
 
-
-
-  /** @param onThreadDeath called if a CRL thread dies. No transaction can make progress after that: stores vote only
-    *                      once a save completes, so a host should stop rather than hang.
+  /** @param onThreadDeath called if a CRL thread dies. No transaction of the CRL's stores can make progress after
+    *                      that: stores vote only once a save completes.
     */
   def apply(streamsDir: os.Path,
             numStreams: Int,
@@ -288,7 +289,11 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
     p.future
 
-  def shutdown(): Unit =
-    val q = new LinkedBlockingQueue[String]()
-    ioQueue.put(Shutdown(() => q.put("")))
-    q.take()
+  private val shutdownRequested = new AtomicBoolean(false)
+  private val shutdownComplete = new CountDownLatch(1)
+
+  /** Idempotent: a later call waits for the first one's shutdown, as a second Shutdown would find no thread */
+  override def shutdown(): Unit =
+    if shutdownRequested.compareAndSet(false, true) then
+      ioQueue.put(Shutdown(() => shutdownComplete.countDown()))
+    shutdownComplete.await()

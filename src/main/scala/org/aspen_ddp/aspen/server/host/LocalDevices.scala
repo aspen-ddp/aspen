@@ -2,11 +2,17 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import scribe.Logging
 
+import scala.concurrent.Future
+
+/** A device loaded on this host. `crl` is the device's own CRL, opened before any of its stores loads: every store on
+ *  the device saves to, recovers from and deletes from it. */
 class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
                               val devicePath: os.Path,
-                              val configFile: os.Path):
+                              val configFile: os.Path,
+                              val crl: CrashRecoveryLog):
   var loadedStores: Set[StoreId] = Set()
   var offlineStores: Set[StoreId] = Set()
 
@@ -23,6 +29,11 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
  *  inject entries directly via ControlFixture.injectLoadedDevice. */
 class LocalDevices extends Logging:
   var devices: Map[StorageDeviceId, LocalStorageDeviceState] = Map()
+
+  /** Paths of unloaded devices whose CRL is still shutting down, each with that shutdown. A device is not loaded
+   *  again from such a path until its entry is removed (DeviceShutdown.unloadDevice): two CRLs open over the same
+   *  files would corrupt them. */
+  var closingCrls: Map[os.Path, Future[Unit]] = Map()
 
   /** Reclaims the store copy a transfer just delivered onto a device that turned out to be
    *  tombstoned.

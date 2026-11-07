@@ -11,6 +11,9 @@ import java.util.UUID
 import scala.concurrent.{Future, Promise}
 
 object CrashRecoveryLog:
+  /** Where a device's CRL files live */
+  def deviceCrlDir(devicePath: os.Path): os.Path = devicePath / "crl"
+
   /** Writes `trsList` to `saveFilePath`, replacing it atomically and forcing it to disk before
    *  returning (DurableFiles): the file is what lets a closed store, possibly on a disk pulled
    *  right after its shutdown, resume its transactions wherever it is next loaded. */
@@ -129,4 +132,10 @@ trait CrashRecoveryLog {
   def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit
 
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit
+
+  /** Stops the CRL's threads. Blocks until they have stopped */
+  def shutdown(): Unit = ()
+
+  /** How many bytes of live state the CRL admits */
+  def admissionLimitBytes: Long = Long.MaxValue
 }

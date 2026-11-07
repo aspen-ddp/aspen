@@ -30,9 +30,24 @@ class StorageDeviceConfigSuite extends AnyFunSuite with Matchers:
     finally
       os.remove(f)
 
+  test("CRL sizing round-trips and defaults when absent"):
+    val sized = sample.copy(crlNumStreams = 5, crlFileSizeMb = 2)
+    val f = os.temp(prefix = "aspen-storage-device-crl", suffix = ".yaml")
+    try
+      os.write.over(f, sized.yamlConfig)
+      StorageDeviceConfig.loadStorageDeviceConfig(f) should be(sized)
+      os.write.over(f, s"storage-device-id: $zero\naspen-system-id: $zero\n")
+      val defaulted = StorageDeviceConfig.loadStorageDeviceConfig(f)
+      defaulted.crlNumStreams should be(StorageDeviceConfig.DefaultCrlNumStreams)
+      defaulted.crlFileSizeMb should be(StorageDeviceConfig.DefaultCrlFileSizeMb)
+    finally
+      os.remove(f)
+
   test("doc-comment example config parses correctly"):
     val docExampleYaml = """storage-device-id: 00000000-0000-0000-0000-000000000000
 aspen-system-id: 00000000-0000-0000-0000-000000000000
+crl-num-streams: 3
+crl-max-file-size-mb: 300
 """
 
     val f = os.temp(prefix = "aspen-storage-device-docexample", suffix = ".yaml")
@@ -42,6 +57,8 @@ aspen-system-id: 00000000-0000-0000-0000-000000000000
 
       cfg.storageDeviceId should be(StorageDeviceId(zero))
       cfg.aspenSystemId should be(zero)
+      cfg.crlNumStreams should be(3)
+      cfg.crlFileSizeMb should be(300)
 
       StorageDeviceConfig(StorageDeviceId(zero), zero).yamlConfig should be(docExampleYaml)
     finally

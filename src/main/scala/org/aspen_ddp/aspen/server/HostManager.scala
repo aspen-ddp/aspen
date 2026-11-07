@@ -17,12 +17,6 @@ import scala.concurrent.{ExecutionContext, Future}
  */
 object HostManager:
 
-  /** CRL settings given to a newly created host. Matches what bootstrap gives the bootstrap
-   *  host so a host's CRL does not depend on which command created it. Not yet configurable
-   *  from the command line. */
-  val DefaultCrlNumStreams: Int = 3
-  val DefaultCrlFileSizeMb: Int = 300
-
   class HostAlreadyConfigured(val directory: os.Path)
     extends Exception(s"$directory already contains ${HostConfig.configFilename}")
 
@@ -128,7 +122,6 @@ object HostManager:
               dataPort,
               httpPort,
               storeTransferPort,
-              HostConfig.SimpleCRL(DefaultCrlNumStreams, DefaultCrlFileSizeMb),
               Pem.encodeCertificate(tlsCert),
               Pem.encodePrivateKey(tlsKeyPair.getPrivate)
             )

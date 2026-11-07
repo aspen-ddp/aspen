@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.paxos.PersistentState
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, SharedRevisionLock, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, RevisionLock, SharedRevisionLock, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.TempDirManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
@@ -1231,6 +1231,26 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val after = backend.reads
     readData(frontend, net, op1) shouldBe Right(List[Byte](1))
     backend.reads shouldBe after + 1
+  }
+
+  test("a lock-only object gets no backend commit") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(fencePtr, rev0), overwrite(op1)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+    committedMessages(net) shouldBe Nil
+    backend.deliverOne()
+    committedMessages(net).size shouldBe 1
+  }
+
+  test("a transaction that changes nothing here still reports committed") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    prepare(frontend, net, lockTxd(txid1, List(RevisionLock(fencePtr, rev0)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 0
+    committedMessages(net).size shouldBe 1
   }
 
   test("a read during a deletion's commit gets ObjectNotFound without reaching the backend") {

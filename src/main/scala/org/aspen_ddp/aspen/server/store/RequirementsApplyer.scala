@@ -25,6 +25,17 @@ object RequirementsApplyer extends Logging {
     def uncommittable: Set[ObjectId] = skipped | failed
   }
 
+  /** Objects the requirements modify: those named by a DataUpdate, KeyValueUpdate, RefcountUpdate or VersionBump.
+    * Objects named only by RevisionLock or SharedRevisionLock are unchanged.
+    */
+  def changedObjects(requirements: List[TransactionRequirement]): Set[ObjectId] =
+    requirements.iterator.collect {
+      case r: DataUpdate => r.objectPointer.id
+      case r: KeyValueUpdate => r.objectPointer.id
+      case r: RefcountUpdate => r.objectPointer.id
+      case r: VersionBump => r.objectPointer.id
+    }.toSet
+
   def apply(transactionId: TransactionId,
             timestamp: HLCTimestamp,
             requirements: List[TransactionRequirement],

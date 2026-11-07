@@ -408,7 +408,10 @@ class Tx( trs: TransactionRecoveryState,
 
     // Count what is actually committed. uncommittable may name objects this store never
     // loaded, so objects.size - uncommittable.size can undercount the commits in flight.
-    val toCommit = objects.valuesIterator.filter(os => !uncommittable.contains(os.objectId)).toList
+    // Objects the transaction only locks are unchanged: they get no backend commit
+    val changed = RequirementsApplyer.changedObjects(requirements)
+    val toCommit = objects.valuesIterator
+      .filter(os => changed.contains(os.objectId) && !uncommittable.contains(os.objectId)).toList
 
     pendingObjectCommits = toCommit.size
 

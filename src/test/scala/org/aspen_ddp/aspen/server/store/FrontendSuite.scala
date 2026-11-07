@@ -5,10 +5,10 @@ import java.util.concurrent.LinkedBlockingQueue
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, OpportunisticRebuild, ReadResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Insert, Key, KeySet, KeyValueOperation, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.paxos.PersistentState
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, SharedRevisionLock, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.TempDirManager
@@ -18,6 +18,7 @@ import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache, StoreObjectCache}
 import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
+import org.aspen_ddp.aspen.client.DataObjectState
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -97,11 +98,16 @@ object FrontendSuite {
       deleted = deleted :+ txid
   }
 
-  /** Holds commits until deliverCommits, applying each to the map only then, and counts backend reads */
+  /** Holds commits until deliverCommits, applying each to the map only then, and counts backend reads and repairs.
+    * With `deferReads`, reads are held too, until deliverReads.
+    */
   class DeferredCommitBackend extends MapBackend(storeId):
     private var handler: Option[CompletionHandler] = None
     private var held: List[(CommitState, TransactionId)] = Nil
+    private var heldReads: List[ObjectPointer] = Nil
     var reads: Int = 0
+    var repairs: Int = 0
+    var deferReads: Boolean = false
 
     override def setCompletionHandler(h: CompletionHandler): Unit =
       handler = Some(h)
@@ -109,7 +115,16 @@ object FrontendSuite {
 
     override def read(pointer: ObjectPointer): Unit =
       reads += 1
-      super.read(pointer)
+      if deferReads then heldReads = heldReads :+ pointer else super.read(pointer)
+
+    def deliverReads(): Unit =
+      val ptrs = heldReads
+      heldReads = Nil
+      ptrs.foreach(super.read)
+
+    override def repair(state: CommitState, complete: Promise[Unit]): Unit =
+      repairs += 1
+      super.repair(state, complete)
 
     override def commit(state: CommitState, transactionId: TransactionId): Unit =
       held = held :+ (state, transactionId)
@@ -1356,6 +1371,92 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.reads shouldBe reads
   }
 
+  test("a backend read completing during a commit does not cache the state the commit replaces") {
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
+    prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(kvPtr, rev0)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid2, List(keyRevision(1))), corruptKVUpdate)
+    resolve(frontend, net, txid2, committed = true)
+    frontend.readObjectForNetwork(clientId, new UUID(1, 1), kvPtr, FullObject())
+    net.clientMessage() should not be empty
+    val kv = mkKVObjectState()
+    val rebuilt = KVObjectState.encode(Some(k(0)), None, None, None, Map(k(1) ->
+      new ValueState(Value(Array[Byte](9)), rev0, HLCTimestamp(1), None)))
+    frontend.readObjectForOpportunisticRebuild(OpportunisticRebuild(storeId, clientId, kvPtr, rev0,
+      kv.metadata.refcount, HLCTimestamp(50), rebuilt))
+    backend.heldCommits shouldBe 1
+
+    // A read issued before the rebuild's commit returns the state that commit replaces
+    frontend.backendReadComplete(oid2, Left(ReadState(oid2, kv.metadata, kv.objectType, kv.data, Set())))
+
+    def served(): List[Byte] =
+      frontend.readObjectForNetwork(clientId, new UUID(1, 2), kvPtr, FullObject())
+      net.clientMessage() match
+        case Some(rr: ReadResponse) => rr.result.toOption.get.objectData.get.getByteArray.toList
+        case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
+
+    served() shouldBe rebuilt.getByteArray.toList
+    backend.deliverCommits()
+    resolve(frontend, net, txid1, committed = false)
+    val reads = backend.reads
+    served() shouldBe rebuilt.getByteArray.toList
+    backend.reads shouldBe reads
+  }
+
+  test("a failed in-place update during an in-flight commit does not cache the pre-commit backend state") {
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
+    val insertKey4 = KeyValueOperation.encode(List(new Insert(k(4), Array[Byte](4))), ida)(0)
+    prepare(frontend, net, lockTxd(txid1, List(keyRevision(1))), insertKey4).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+    // Its update fails partway through, discarding the state txid1's commit holds
+    prepare(frontend, net, lockTxd(txid2, List(keyRevision(2))), corruptKVUpdate)
+    resolve(frontend, net, txid2, committed = true)
+    backend.heldCommits shouldBe 1
+
+    def keys(): Set[Int] =
+      frontend.readObjectForNetwork(clientId, new UUID(1, 3), kvPtr, FullObject())
+      readResponseKeys(net)._1
+
+    // Answered from the backend, which does not have txid1's commit yet
+    keys() shouldBe Set(1, 2, 3)
+    backend.deliverCommits()
+    keys() shouldBe Set(1, 2, 3, 4)
+  }
+
+  def repairState(): DataObjectState =
+    new DataObjectState(op1, ObjectRevision(txid2), ObjectRefcount(1, 1), HLCTimestamp(1L << 20), HLCTimestamp(1L << 20), ida, 1,
+      DataBuffer(Array[Byte](5)))
+
+  test("a repair during a deletion's commit is not applied") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    val delete = RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 0))
+    prepare(frontend, net, lockTxd(txid1, List(delete))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+
+    val done = Promise[Unit]()
+    frontend.readObjectForRepair(repairState(), done)
+    done.isCompleted shouldBe true
+    backend.repairs shouldBe 0
+  }
+
+  test("a repair whose read completes during a deletion's commit is not applied") {
+    val (frontend, backend, _, _) = commitWindowFixture()
+    backend.deferReads = true
+    val done = Promise[Unit]()
+    frontend.readObjectForRepair(repairState(), done)
+    backend.reads shouldBe 1
+
+    val metadata = Metadata(ObjectRevision(txid1), ObjectRefcount(2, 0), HLCTimestamp(200))
+    frontend.commit(new ObjectState(oid1, metadata, ObjectType.Data, DataBuffer.Empty),
+      CommitState(op1, metadata, ObjectType.Data, DataBuffer.Empty), txid1)
+    backend.deliverReads()
+    done.isCompleted shouldBe true
+    backend.repairs shouldBe 0
+  }
+
   // ---- A store keeps a committed transaction's CRL state until its backend commits succeed ----
 
   /** Prepares txid1 overwriting op1 and resolves it committed, its backend commit held */
@@ -1417,9 +1518,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       crl.getFullRecoveryState(storeId)
     override def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] = crl.closeStore(storeId)
     override def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
-      val done = new LinkedBlockingQueue[Unit]()
-      crl.save(txid, state, () => done.put(()))
-      done.take()
+      val done = new LinkedBlockingQueue[java.lang.Boolean]()
+      crl.save(txid, state, () => done.put(true))
+      if done.poll(10, java.util.concurrent.TimeUnit.SECONDS) eq null then
+        fail(s"SimpleCRL did not complete the save of transaction $txid within 10 seconds")
       completionHandler()
     override def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit =
       crl.dropTransactionObjectData(storeId, txid)

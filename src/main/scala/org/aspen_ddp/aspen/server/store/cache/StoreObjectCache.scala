@@ -17,7 +17,8 @@ import scala.concurrent.ExecutionContext
   *
   * Evictable entries sit in an access-ordered LRU. States a transaction references are pinned: they are counted but
   * never evicted. A pinned state that is also the cached state for its object is held out of the LRU and is returned
-  * by `get`; unpinning puts it back at the most recently used end.
+  * by `get`, ahead of any LRU entry for the object; unpinning puts it back at the most recently used end, replacing
+  * that entry.
   *
   * Eviction only ever drops this view's own LRU head, on this view's executor. When an insert or unpin takes the host
   * total over its budget, [[HostObjectCache.rebalance]] picks the view whose LRU head is oldest: this view evicts
@@ -78,14 +79,20 @@ final class StoreObjectCache private[cache] (host: HostObjectCache,
     if cleared then
       None
     else
-      val e = lru.get(objectId)
-      if e != null then
-        e.lastAccess = host.clock()
-        publishOldest()
-        Some(e.state)
+      // A pinned cached state is preferred to an LRU entry for the same object, unless it must be reloaded
+      val p = pinnedCached.get(objectId)
+      if p != null && !p.state.reloadRequired then
+        Some(p.state)
       else
-        val p = pinnedCached.get(objectId)
-        if p != null then Some(p.state) else None
+        val e = lru.get(objectId)
+        if e != null then
+          e.lastAccess = host.clock()
+          publishOldest()
+          Some(e.state)
+        else if p != null then
+          Some(p.state)
+        else
+          None
 
   def insert(state: ObjectState): Unit =
     if !cleared then
@@ -128,9 +135,11 @@ final class StoreObjectCache private[cache] (host: HostObjectCache,
     if !cleared then
       val p = pinned.remove(state)
       if p != null then
-        if p.cached then pinnedCached.remove(state.objectId, p)
-        if p.cached && !state.reloadRequired && !lru.containsKey(state.objectId) then
-          lru.put(state.objectId, Entry(state, p.size, host.clock()))
+        // The cached state get returns for its object: it replaces any LRU entry for the object, as it did in get
+        val served = p.cached && pinnedCached.remove(state.objectId, p)
+        if served && !state.reloadRequired then
+          val old = lru.put(state.objectId, Entry(state, p.size, host.clock()))
+          if old != null then adjust(-old.size)
           publishOldest()
           rebalanceIfOver(state.objectId)
         else

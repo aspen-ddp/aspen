@@ -74,6 +74,11 @@ class Frontend(val storeId: StoreId,
     * once the deletion is applied
     */
   private val deleting = scala.collection.mutable.HashMap[ObjectId, Int]()
+
+  /** The states of outstanding non-deletion backend commits of each object, newest first. A backend read completing
+    * meanwhile may return the state such a commit replaces, so it is never cached. See backendReadComplete
+    */
+  private val committing = scala.collection.mutable.HashMap[ObjectId, List[ObjectState]]()
   private val commitStage = s"store commit (${backend.getClass.getSimpleName})"
 
   /** A transaction's backend commits on this store, made through commit with `forTransaction = true`.
@@ -205,6 +210,8 @@ class Frontend(val storeId: StoreId,
     inFlight(key) = inFlight.getOrElse(key, Nil) :+ InFlight(os, System.nanoTime(), deletes, forTransaction)
     if deletes then
       deleting(os.objectId) = deleting.getOrElse(os.objectId, 0) + 1
+    else
+      committing(os.objectId) = os :: committing.getOrElse(os.objectId, Nil)
     // Before the backend commit: a synchronous backend completes inside it
     if forTransaction then
       txCommits.getOrElseUpdate(txid, new TxCommits(0, false, false)).outstanding += 1
@@ -352,6 +359,8 @@ class Frontend(val storeId: StoreId,
           BackendTiming.report.record(commitStage, System.nanoTime() - f.start)
           if f.forTransaction then
             transactionCommitComplete(c.transactionId, c.result.isLeft)
+          if !f.deletes then
+            committingComplete(f.os)
           c.result match
             case Left(_) =>
               release(f.os)
@@ -370,6 +379,12 @@ class Frontend(val storeId: StoreId,
         tx.commitComplete(c.objectId, c.result)
       }
   }
+
+  /** A non-deletion backend commit of `os` completed, successfully or not */
+  private def committingComplete(os: ObjectState): Unit =
+    val (before, after) = committing.getOrElse(os.objectId, Nil).span(s => !(s eq os))
+    val rest = before ++ after.drop(1)
+    if rest.isEmpty then committing.remove(os.objectId) else committing(os.objectId) = rest
 
   def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType): Unit = {
     val objectId = pointer.id
@@ -423,7 +438,8 @@ class Frontend(val storeId: StoreId,
     val objectId = current.pointer.id
     servableState(objectId) match {
       case Some(os) => repair(current, completion, os)
-      case None if deleting.contains(objectId) => repairMissing(current, completion)
+      // A repair would write the repairer's state after the deletion, resurrecting the slice
+      case None if deleting.contains(objectId) => completion.success(())
       case None =>
         if current.pointer.poolId == storeId.poolId then
           pendingReads.get(objectId) match {
@@ -535,12 +551,18 @@ class Frontend(val storeId: StoreId,
 
     effective match {
       case Left(rs) =>
-        // A state still referenced by transactions is never replaced. See referenced
+        // A state still referenced by transactions is never replaced. See referenced. While a non-deletion commit of
+        // the object is in flight, the read may have returned the state that commit replaces: the committed state is
+        // served instead, if it can be, and otherwise the load answers the waiting readers without being cached
         val loaded = new ObjectState(objectId, rs.metadata, rs.objectType, rs.data)
-        val inUse = referenced.get(objectId).filter(!_.reloadRequired)
-        if inUse.isEmpty then
-          objectCache.insert(loaded)
-        val os = inUse.getOrElse(loaded)
+        val os = referenced.get(objectId).filter(!_.reloadRequired) match
+          case Some(inUse) => inUse
+          case None =>
+            committing.get(objectId) match
+              case Some(newest :: _) => if newest.reloadRequired then loaded else newest
+              case _ =>
+                objectCache.insert(loaded)
+                loaded
 
         waiting.foreach { lpr =>
           lpr.foreach {
@@ -578,7 +600,9 @@ class Frontend(val storeId: StoreId,
 
             case _: OpportuneRebuild => // Can't guarantee correctness so we need to ignore this
 
-            case RepairRead(cos, completion) => repairMissing(cos, completion)
+            case RepairRead(cos, completion) =>
+              // Not found because a deletion's commit is in flight: a repair would resurrect the slice
+              if deleting.contains(objectId) then completion.success(()) else repairMissing(cos, completion)
           }
         }
     }

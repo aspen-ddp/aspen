@@ -235,6 +235,35 @@ class HostObjectCacheSuite extends AnyFunSuite with Matchers {
     hc.sizeInBytes should be(Overhead + 100)
   }
 
+  test("a pinned cached state is returned over an LRU entry for the same object, and replaces it when unpinned") {
+    val (hc, c) = mk(10 * Overhead)
+    val committed = mkobj(1)
+    val loaded = mkobj(1)
+
+    c.insert(committed)
+    c.pin(committed)
+    c.insert(loaded)
+    hc.sizeInBytes should be(2 * Overhead)
+    c.get(committed.objectId).get should be theSameInstanceAs committed
+
+    c.unpin(committed)
+    c.get(committed.objectId).get should be theSameInstanceAs committed
+    c.entryCount should be(1)
+    hc.sizeInBytes should be(Overhead)
+  }
+
+  test("a pinned cached state that must be reloaded does not hide an LRU entry for the same object") {
+    val (_, c) = mk(10 * Overhead)
+    val discarded = mkobj(1)
+    val loaded = mkobj(1)
+
+    c.insert(discarded)
+    c.pin(discarded)
+    discarded.reloadRequired = true
+    c.insert(loaded)
+    c.get(loaded.objectId).get should be theSameInstanceAs loaded
+  }
+
   test("stores share one host total but not objects") {
     val hc = new HostObjectCache(10 * Overhead, clock)
     val c0 = hc.forStore(store0)

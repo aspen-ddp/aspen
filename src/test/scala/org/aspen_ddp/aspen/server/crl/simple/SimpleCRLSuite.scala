@@ -621,6 +621,23 @@ class SimpleCRLSuite extends FileBasedTests {
     i2.crl.shutdown()
   }
 
+  test("A CRL holding a live transaction recovers it across repeated reopens") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    i.crl.shutdown()
+
+    // Each reopen writes the recovered transaction into a new entry, linked to the entries before it
+    for n <- 1 to 3 do
+      val opened = new LinkedBlockingQueue[SimpleCRL.InitialCRLState]()
+      val t = new Thread(() => opened.put(SimpleCRL(tdir, 3, 1024 * 1024)))
+      t.setDaemon(true)
+      t.start()
+      val r = opened.poll(10, TimeUnit.SECONDS)
+      assert(r != null, s"reopen $n did not finish its recovery")
+      assert(r.trsList.map(_.txd.transactionId) == List(transactionId), s"reopen $n")
+      r.crl.shutdown()
+  }
+
   test("A dead CRL thread is reported") {
     val died = new LinkedBlockingQueue[Throwable]()
     val i = SimpleCRL(tdir, 3, 8192, t => died.put(t))

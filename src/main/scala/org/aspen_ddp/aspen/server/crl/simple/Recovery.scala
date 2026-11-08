@@ -11,6 +11,10 @@ import scala.collection.immutable.HashMap
 
 object Recovery extends Logging:
 
+  /** Thrown when the chain of entries from the newest back to the oldest one needed is broken: an entry cannot be
+   *  read, or its previous-entry link ends or does not lead to an older entry. Its CRL cannot be recovered. */
+  class BrokenEntryChain(reason: String) extends Exception(s"CRL entry chain is broken: $reason")
+
   case class Result(activeStreamId: StreamId,
                     currentStreamUUID: UUID,
                     initialNextEntrySerialNumber: Long,
@@ -43,30 +47,42 @@ object Recovery extends Logging:
       readers(streamId.number).findHighestEntry() match
         case None => assert(false, "Failed to find highest entry")
         case Some((nextWriteEntryOffset, lastEntry)) =>
+          val lastEntryLocation = StreamLocation(
+            streamId,
+            nextWriteEntryOffset - lastEntry.entrySize,
+            lastEntry.entrySize.toInt)
           activeStreamId = streamId
           initialNextEntryOffset = nextWriteEntryOffset
-          initialPreviousEntryLocation = lastEntry.previousEntryStreamLocation
+          // The next entry links to the last one. Linking to the last one's own previous entry skipped it, so the next
+          // recovery's walk could not reach an oldest entry needed that was the skipped one
+          initialPreviousEntryLocation = lastEntryLocation
           initialNextEntrySerialNumber = lastEntry.entrySerialNumber + 1
           initialOldestEntryNeeded = lastEntry.oldestEntryNeeded
 
+          // Walks from the newest entry back to the oldest one needed. Each step must reach an entry older than the
+          // last, so a broken chain throws rather than looping
           @tailrec
-          def loadPrevious(previousEntryLocation: StreamLocation): Unit =
+          def loadPrevious(previousEntryLocation: StreamLocation, newerSerialNumber: Long): Unit =
+            if previousEntryLocation.streamId.number < 0 || previousEntryLocation.streamId.number >= readers.length then
+              throw BrokenEntryChain(s"the entry after serial number $newerSerialNumber links to " +
+                                     s"$previousEntryLocation, before reaching the oldest entry needed, " +
+                                     s"${lastEntry.oldestEntryNeeded}")
             val reader = readers(previousEntryLocation.streamId.number)
             reader.readEntry(previousEntryLocation.offset) match
-              case None => assert(false, "Failed to load a CRL entry")
+              case None => throw BrokenEntryChain(s"no entry can be read at $previousEntryLocation")
               case Some((_, h)) =>
+                if h.entrySerialNumber >= newerSerialNumber then
+                  throw BrokenEntryChain(s"the entry at $previousEntryLocation has serial number " +
+                                         s"${h.entrySerialNumber}, not older than the $newerSerialNumber linking to it")
                 val bb = reader.read(
                   previousEntryLocation.offset + LogEntry.StaticEntryHeaderSize + h.dynamicDataSize,
                   h.staticDataSize.toInt)
                 LogEntry.loadStaticEntryContent(h, bb, rs)
                 currentStreamUUID = h.streamUUID
-                if h.entrySerialNumber != lastEntry.oldestEntryNeeded then
-                  loadPrevious(h.previousEntryStreamLocation)
+                if h.entrySerialNumber > lastEntry.oldestEntryNeeded then
+                  loadPrevious(h.previousEntryStreamLocation, h.entrySerialNumber)
 
-          loadPrevious(StreamLocation(
-            streamId,
-            nextWriteEntryOffset - lastEntry.entrySize,
-            lastEntry.entrySize.toInt))
+          loadPrevious(lastEntryLocation, lastEntry.entrySerialNumber + 1)
 
     def readStreamLocation(loc: StreamLocation): DataBuffer =
       DataBuffer(readers(loc.streamId.number).read(loc.offset, loc.length))

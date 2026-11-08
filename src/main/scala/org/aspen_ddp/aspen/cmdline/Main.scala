@@ -1692,15 +1692,18 @@ object Main {
       scribe.info(s"Updated bootstrap config written to $bsCfgFile")
 
     // One CRL per storage device. A dead CRL thread stalls only its own device's transactions, so it is logged
-    // rather than halting the host. Every CRL opened is remembered so RunningHost.stop can shut down its threads.
-    val openedCrls = AtomicReference[List[CrashRecoveryLog]](Nil)
+    // rather than halting the host. The CRL last opened on each device is remembered so RunningHost.stop can shut
+    // down its threads. One per path: a device is loaded again only once its previous CRL has shut down
+    // (LocalDevices.closingCrls), so the new one replaces it. Shutdown is idempotent, so one already shut down at an
+    // unload is harmless here.
+    val openedCrls = AtomicReference[Map[os.Path, CrashRecoveryLog]](Map())
     val crlFactory = new CrashRecoveryLogFactory:
       def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
         val crl = SimpleCRL.DeviceFactory(t =>
           scribe.error(s"The CRL thread of storage device ${config.storageDeviceId} at $devicePath died. " +
                        s"No transaction on its stores can complete until the host restarts", t)
         ).openCRL(devicePath, config)
-        openedCrls.updateAndGet(crl :: _)
+        openedCrls.updateAndGet(_ + (devicePath -> crl))
         crl
 
     val tls = TlsCredentials.fromPem(bootstrapCfg.caCertificate, hostCfg.tlsCertificate, hostCfg.tlsPrivateKey)
@@ -1773,7 +1776,7 @@ object Main {
       step(httpServer.stop())
       step(Await.result(Future.sequence(host.getStoreIds.map(host.closeStore)), timeout))
       step(Await.result(host.shutdown(), timeout))
-      openedCrls.get.foreach(crl => step(crl.shutdown()))
+      openedCrls.get.valuesIterator.foreach(crl => step(crl.shutdown()))
       step(client.shutdown())
       step(client.clientContext match
         case es: java.util.concurrent.ExecutorService => es.shutdownNow()

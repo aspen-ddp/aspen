@@ -2,7 +2,6 @@ TODO
 ====
 
 Per-device CRL follow-ups (final review of the per-device CRL branch, 2026-11-07):
-- Main's `openedCrls` is never pruned: CRLs shut down at unload stay listed. Memory only (shutdown is idempotent).
 - `<device>/crl.lost-<uuid>` directories (a lost CRL moved aside) are kept forever, up to num-streams x file size
   each (900 MB by default). Tie them into the suspected-loss retention policy (Backlog: correlated "lost store"
   declarations), or delete them once the device's stores are rebuilt.

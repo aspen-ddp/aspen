@@ -671,23 +671,28 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     given ExecutionContext = executionContext
     val factory = newFactory()
     val opener = new FailingRocksOpener(executionContext)
+    // The marker's write fails and leaves nothing behind, as a failed write does. (Anything left at the marker's path
+    // counts as a marker: a reconcile would then rebuild the store and drop its entries itself.)
+    @volatile var markerWrites = 0
+    val failingMarker: os.Path => Unit = _ =>
+      markerWrites += 1
+      throw new java.io.IOException("Input/output error")
     for
       (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
-      host = newCrlHost(hostRoot, factory, seams = Host.Seams(backends = Some(opener)))
+      host = newCrlHost(hostRoot, factory,
+               seams = Host.Seams(backends = Some(opener), writeRebuildRequiredMarker = Some(failingMarker)))
       _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
       _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
-      // A non-empty directory where the marker goes: its write fails
-      _ = os.makeDir.all(storeDir / RebuildingStore.RebuildRequiredMarkerFile)
-      _ = os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile / "blocker", "")
       _ = opener.onFatals.head(new java.io.IOException("Input/output error"))
       _ <- pumpUntil(host, !host.control.router.loaded.contains(storeId))
       unloaded = !host.control.router.loaded.contains(storeId)
-      // Lets the close's CRL step reach the CRL thread, ahead of the shutdown below
+      // Lets the close run on the store's executor, ahead of the shutdown below
       _ <- pumpUntil(host, false, rounds = 50)
       _ = factory.shutdownAll()
     yield
       unloaded should be(true)
-      os.isFile(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      markerWrites should be >= 1
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
       // Left in the device CRL: a restart, which may serve the unmarked store, recovers them
       heldOnDisk(deviceDir, storeId) should be(Set(txid))
 

@@ -71,7 +71,9 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val scheduleEndpointRetry: (() => Unit) => Unit,
                           /** The host's general-purpose context: stores' transaction drivers and client
                            *  transactions run on it. Never a given. */
-                          val ec: ExecutionContext):
+                          val ec: ExecutionContext,
+                          /** Writes a store directory's rebuild-required marker (a test seam) */
+                          val writeRebuildRequiredMarker: os.Path => Unit = StoreRebuilds.writeRebuildRequiredMarker):
   given ExecutionContext = threading.control
 
   lazy val router: StoreRouter = new StoreRouter(this)

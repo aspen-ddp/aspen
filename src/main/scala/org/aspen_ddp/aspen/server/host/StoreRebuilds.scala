@@ -326,8 +326,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
   /** Writes the marker that keeps the store at `storePath` from ever being loaded again: its CRL
    *  save file is unusable and was the only copy of its transaction state. */
-  def markRebuildRequired(storePath: os.Path): Unit =
-    DurableFiles.write(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+  def markRebuildRequired(storePath: os.Path): Unit = ctx.writeRebuildRequiredMarker(storePath)
 
   /** The LoadStore handler found `backend`'s CRL save file unusable. The file sits in the store's
    *  own directory, so it is the only copy of that state: the store is permanently failed. It
@@ -532,3 +531,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       case t: Throwable =>
         logger.error(s"Failed to discard store $storeId at $storePath. Not rebuilding it yet. Error: $t")
         false
+
+object StoreRebuilds:
+  /** Writes the rebuild-required marker of the store at `storePath`, durably */
+  def writeRebuildRequiredMarker(storePath: os.Path): Unit =
+    DurableFiles.write(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")

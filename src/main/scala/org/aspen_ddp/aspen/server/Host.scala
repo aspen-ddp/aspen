@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
-import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LocalStorageDeviceState, LockstepThreading}
+import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LocalStorageDeviceState, LockstepThreading, StoreRebuilds}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
@@ -125,7 +125,10 @@ object Host:
                          wrapIoHandler: Option[CompletionHandler => CompletionHandler] = None,
                          /** The CRL of stores that loadStore loads onto a device this host has not loaded, for tests
                           *  that load stores directly. Without it such a load fails: a store uses its device's CRL. */
-                         unloadedDeviceCrl: Option[CrashRecoveryLog] = None)
+                         unloadedDeviceCrl: Option[CrashRecoveryLog] = None,
+                         /** Writes a store directory's rebuild-required marker (StoreRebuilds.markRebuildRequired), for
+                          *  tests of a write that fails and leaves nothing behind */
+                         writeRebuildRequiredMarker: Option[os.Path => Unit] = None)
 
   object Seams:
     val default: Seams = Seams()
@@ -223,7 +226,8 @@ class Host(val client: AspenClient,
     scheduleShutdownWorkTimeout = seams.scheduleShutdownWorkTimeout.getOrElse(
       (_, fn) => controlScheduler.schedule(shutdownWorkTimeout)(fn())),
     scheduleEndpointRetry = fn => controlScheduler.schedule(Duration(5, SECONDS))(fn()),
-    ec = ec)
+    ec = ec,
+    writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker))
 
   private val shutdownPromise: Promise[Unit] = Promise()
 

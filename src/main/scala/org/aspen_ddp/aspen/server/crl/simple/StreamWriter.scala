@@ -48,11 +48,19 @@ class StreamWriter(val maxSizeInBytes: Long,
     t._1 -> channel
   ).toMap
   private var exitLoop = false
+  // Set once the writer thread has died. Nothing takes from the queue after that, so a Shutdown queued then (or
+  // still queued) is completed by completeShutdowns instead: the CRL's own shutdown waits on it.
+  @volatile private var dead = false
   private val writerThread = new Thread {
     override def run(): Unit =
       try writeThreadLoop()
       catch case t: Throwable =>
         logger.error("CRL writer thread died", t)
+        dead = true
+        streams.valuesIterator.foreach: channel =>
+          try channel.close()
+          catch case _: Throwable => ()
+        completeShutdowns()
         onThreadDeath(t)
   }
   writerThread.start()
@@ -71,7 +79,21 @@ class StreamWriter(val maxSizeInBytes: Long,
           exitLoop = true
           completionHandler()
         
-  def shutdown(completionHandler: () => Unit = () => ()): Unit = queue.add(WriterThread.Shutdown(completionHandler))
+  def shutdown(completionHandler: () => Unit = () => ()): Unit =
+    queue.add(WriterThread.Shutdown(completionHandler))
+    // Checked after the add: either the dying thread's completeShutdowns finds this Shutdown, or this check sees it dead
+    if dead then
+      completeShutdowns()
+
+  /** Runs the completion handler of every queued Shutdown, once the writer thread has died. Each is polled off the
+   *  queue, so it runs once even when the dying thread and a shutdown call both get here. */
+  private def completeShutdowns(): Unit =
+    var next = queue.poll()
+    while next != null do
+      next match
+        case WriterThread.Shutdown(completionHandler) => completionHandler()
+        case _: WriterThread.Write => ()
+      next = queue.poll()
   
   def write(streamId: StreamId, 
             offset: Long, 

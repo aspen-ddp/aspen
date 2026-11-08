@@ -136,11 +136,19 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   initializing = false
 
+  // Before the thread starts: its catch counts shutdownComplete down
+  private val shutdownRequested = new AtomicBoolean(false)
+  private val shutdownComplete = new CountDownLatch(1)
+
   private val ioThread = new Thread {
     override def run(): Unit =
       try crlThread()
       catch case t: Throwable =>
         logger.error("CRL thread died", t)
+        // Nothing takes the Shutdown that shutdown() queues now, so the shutdown is completed here: the files are
+        // closed and the latch counted down once the writer finishes what it holds. Without it the device could not
+        // be loaded again (its path stays in closingCrls) and the host's stop would wait forever.
+        writer.shutdown(() => shutdownComplete.countDown())
         onThreadDeath(t)
   }
   ioThread.start()
@@ -320,9 +328,6 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     val p = Promise[List[TransactionRecoveryState]]()
     ioQueue.put(GetRecoveryState(storeId, trsList => p.success(trsList)))
     p.future
-
-  private val shutdownRequested = new AtomicBoolean(false)
-  private val shutdownComplete = new CountDownLatch(1)
 
   /** Idempotent: a later call waits for the first one's shutdown, as a second Shutdown would find no thread */
   override def shutdown(): Unit =

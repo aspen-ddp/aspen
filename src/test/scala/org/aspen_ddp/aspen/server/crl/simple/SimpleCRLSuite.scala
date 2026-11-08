@@ -630,6 +630,7 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.save(transactionId, trsValidTxd.copy(objectUpdates = List(tooBig)), () => ())
 
     assert(died.poll(10, TimeUnit.SECONDS).isInstanceOf[IllegalArgumentException])
+    assertShutdownReturns(i.crl)
   }
 
   test("A dead CRL writer thread is reported") {
@@ -641,7 +642,19 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.save(transactionId, trsValidTxd, () => throw err)
 
     assert(died.poll(10, TimeUnit.SECONDS) eq err)
+    assertShutdownReturns(i.crl)
   }
+
+  /** A CRL whose thread has died still completes its shutdown, so its device can be loaded again and its host can
+   *  stop */
+  private def assertShutdownReturns(crl: CrashRecoveryLog): Unit =
+    val done = new CountDownLatch(1)
+    val t = new Thread(() => { crl.shutdown(); done.countDown() })
+    t.setDaemon(true)
+    t.start()
+    assert(done.await(10, TimeUnit.SECONDS), "the shutdown of a CRL whose thread died did not return")
+    // Idempotent: a second shutdown returns too
+    crl.shutdown()
 
   test("Recovery preserves latest paxos state after multiple saves") {
     val i = SimpleCRL(tdir, 3, 1024 * 1024)

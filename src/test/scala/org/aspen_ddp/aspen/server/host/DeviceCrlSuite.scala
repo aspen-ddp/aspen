@@ -44,7 +44,18 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   val shutdownCalls = new AtomicInteger(0)
 
   def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = inner.getFullRecoveryState(storeId)
-  def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] = inner.closeStore(storeId)
+  /** Completed when the store state is first read for an extraction */
+  val readCalled: Promise[Unit] = Promise()
+  /** While set, a read of a store's state completes only once it completes: a host stopped there crashes in the
+   *  window between the read and the save file's write */
+  @volatile var readGate: Option[Future[Unit]] = None
+  override def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] =
+    val read = inner.readStoreState(storeId)
+    readCalled.trySuccess(())
+    readGate match
+      case None => read
+      case Some(gate) => read.flatMap(trs => gate.map(_ => trs)(using ExecutionContext.parasitic))(
+        using ExecutionContext.parasitic)
   override def loadStore(storeId: StoreId, trsList: List[TransactionRecoveryState]): Future[Unit] =
     inner.loadStore(storeId, trsList)
   def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
@@ -60,11 +71,15 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   val dropCalled: Promise[Unit] = Promise()
   /** While set, dropStore waits for it before dropping */
   @volatile var dropGate: Option[Future[Unit]] = None
+  /** Completed when a dropStore has completed */
+  val dropDone: Promise[Unit] = Promise()
   override def dropStore(storeId: StoreId): Future[Unit] =
     dropCalled.trySuccess(())
-    dropGate match
+    val dropped = dropGate match
       case None => inner.dropStore(storeId)
       case Some(gate) => gate.flatMap(_ => inner.dropStore(storeId))(using ExecutionContext.parasitic)
+    dropped.foreach(_ => dropDone.trySuccess(()))(using ExecutionContext.parasitic)
+    dropped
 
   override def shutdown(): Unit =
     shutdownCalls.incrementAndGet()
@@ -673,7 +688,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     yield
       unloaded should be(true)
       os.isFile(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
-      // Taken out of memory only: a restart, which may serve the unmarked store, recovers them
+      // Left in the device CRL: a restart, which may serve the unmarked store, recovers them
       heldOnDisk(deviceDir, storeId) should be(Set(txid))
 
   atest("a full device slows only its own stores"):
@@ -752,3 +767,140 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     yield
       one should be > 0L
       both should be(2 * one)
+
+  /** Saves another store's transaction on `crl` twice. The second entry then needs nothing older than the first, so
+   *  a recovery stops walking back there: only transactions still live in the CRL before these saves survive. */
+  private def advanceLog(crl: CrashRecoveryLog, template: TransactionRecoveryState): Future[Unit] =
+    given ExecutionContext = executionContext
+    val other = template.copy(storeId = StoreId(storeId.poolId, 7.toByte))
+    def saveOnce(): Future[Unit] =
+      val p = Promise[Unit]()
+      crl.save(TransactionId(new UUID(9, 77)), other, () => p.trySuccess(()))
+      p.future
+    saveOnce().flatMap(_ => saveOnce())
+
+  /** Extracts `storeId`'s CRL state for a network transfer out, from the open store (`loaded`, a close) or from its
+   *  device CRL once closed (extractUnloaded), with an in-flight transaction. With `crash`, the host stops between
+   *  reading that state and writing the save file; otherwise the save file's write fails. Other stores' entries then
+   *  move the log on, and the host crashes. Returns how the extraction ended, the transactions the device CRL held
+   *  for the store once it had, and those a restart recovers. */
+  private def interruptedExtraction(loaded: Boolean, crash: Boolean)
+    : Future[(Option[scala.util.Try[Unit]], Set[TransactionId], Set[TransactionId], Boolean)] =
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = factory.opened.head
+      _ <- prepareInFlight(host, crl, storeId, txid)
+      template = crl.getFullRecoveryState(storeId).head
+      backend = host.control.router.loaded(storeId).backend
+      _ <-
+        if loaded then
+          Future.unit
+        else
+          val closed = host.closeStore(storeId)
+          pumpUntil(host, closed.isCompleted).flatMap(_ => closed)
+      _ =
+        if crash then
+          crl.readGate = Some(Promise[Unit]().future)
+        else
+          // A non-empty directory where the save file's temporary goes: its write fails
+          os.makeDir.all(storeDir / s".${Backend.crlSaveFile(storeDir).last}.tmp" / "blocker")
+      extracting = host.control.transfers.closeForTransferOut(storeId)
+      _ <- pumpUntil(host, if crash then crl.readCalled.isCompleted else extracting.isCompleted)
+      outcome = extracting.value
+      heldAfter = held(crl, storeId)
+      _ <- advanceLog(crl, template)
+      // A store stopped mid-close never closed its backend
+      _ <- if loaded && crash then backend.close() else Future.unit
+      _ = factory.shutdownAll()
+      saveFile = os.exists(Backend.crlSaveFile(storeDir))
+    yield (outcome, heldAfter, heldOnDisk(deviceDir, storeId), saveFile)
+
+  atest("a transfer out of an open store whose save file fails keeps its transactions in the device CRL"):
+    given ExecutionContext = executionContext
+    interruptedExtraction(loaded = true, crash = false).map: (outcome, heldAfter, onDisk, saveFile) =>
+      outcome.exists(_.isFailure) should be(true)
+      saveFile should be(false)
+      heldAfter should be(Set(txid))
+      onDisk should be(Set(txid))
+
+  atest("a transfer out of a closed store whose save file fails keeps its transactions in the device CRL"):
+    given ExecutionContext = executionContext
+    interruptedExtraction(loaded = false, crash = false).map: (outcome, heldAfter, onDisk, saveFile) =>
+      outcome.exists(_.isFailure) should be(true)
+      saveFile should be(false)
+      heldAfter should be(Set(txid))
+      onDisk should be(Set(txid))
+
+  atest("a crash before an open store's transfer-out save file is written keeps its transactions in the device CRL"):
+    given ExecutionContext = executionContext
+    interruptedExtraction(loaded = true, crash = true).map: (outcome, _, onDisk, saveFile) =>
+      outcome should be(None)
+      saveFile should be(false)
+      onDisk should be(Set(txid))
+
+  atest("a crash before a closed store's transfer-out save file is written keeps its transactions in the device CRL"):
+    given ExecutionContext = executionContext
+    interruptedExtraction(loaded = false, crash = true).map: (outcome, _, onDisk, saveFile) =>
+      outcome should be(None)
+      saveFile should be(false)
+      onDisk should be(Set(txid))
+
+  atest("deleting a store transferred away drops its leftover device-CRL entries"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = factory.opened.head
+      _ <- prepareInFlight(host, crl, storeId, txid)
+      // As a crash between a transfer out's save file and the deletion of its entries leaves them
+      closed = host.closeStore(storeId)
+      _ <- pumpUntil(host, closed.isCompleted)
+      _ <- closed
+      // The transfer completed: the device's entry no longer names the store
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map()))
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpWithTx(host, !os.exists(storeDir) && crl.dropDone.isCompleted)
+      deleted = !os.exists(storeDir)
+      leftInCrl = held(crl, storeId)
+      _ = factory.shutdownAll()
+    yield
+      deleted should be(true)
+      leftInCrl should be(Set())
+      heldOnDisk(deviceDir, storeId) should be(Set())
+
+  /** Opens a device whose CRL was created with 3 streams of 1 MB, holding a store, with `config` instead */
+  private def resizedCrlDevice(config: StorageDeviceConfig => StorageDeviceConfig): Future[org.scalatest.Assertion] =
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    createCrl(deviceDir)
+    val crlDir = CrashRecoveryLog.deviceCrlDir(deviceDir)
+    val oldFiles = os.list(crlDir).map(_.last).toSet
+    os.write.over(deviceDir / StorageDeviceConfig.configFilename,
+      config(StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = 1)).yamlConfig)
+    val factory = newFactory()
+    val host = newCrlHost(hostRoot, factory)
+
+    Future.successful:
+      os.exists(marker(storeDir)) should be(true)
+      host.control.router.loaded.contains(storeId) should be(false)
+      val lost = os.list(deviceDir).filter(_.last.startsWith("crl.lost-"))
+      lost.size should be(1)
+      os.list(lost.head).map(_.last).toSet should be(oldFiles)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.last
+
+  atest("a device CRL opened with fewer streams than it was created with is treated as lost"):
+    resizedCrlDevice(_.copy(crlNumStreams = 2))
+
+  atest("a device CRL opened with more streams than it was created with is treated as lost"):
+    resizedCrlDevice(_.copy(crlNumStreams = 4))
+
+  atest("a device CRL opened with another file size than it was created with is treated as lost"):
+    resizedCrlDevice(_.copy(crlFileSizeMb = 2))

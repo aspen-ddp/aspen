@@ -9,6 +9,10 @@
   is about to overwrite that live data.
 - One CRL per storage device, in `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`), opened by
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
+- Sizing (`crl-num-streams`, `crl-max-file-size-mb`) is fixed when the device's CRL is created: `SimpleCRL.apply`
+  throws `SizingMismatch` for stream files of another count or size, and the device's CRL is then treated as lost
+- A transfer out reads a store's state (`readStoreState`, which leaves it live) and removes it with
+  `deleteTransactions` only once its `crl_save.log` is durable: entries leave the log only through a written deletion
 - Stores vote only after a save completes, so a dead CRL thread stops every transaction on its device while reads
   keep working. `onThreadDeath` reports it; the `host` command logs it and keeps serving its other devices
 - `admissionLimitBytes` (SimpleCRL: half a stream, so a recycled stream's live copy-forward always fits) sizes the

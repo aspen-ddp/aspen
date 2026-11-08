@@ -312,6 +312,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             // store is then not served, so the load is undone here rather than throwing out of the handler.
             // The store's object cache view, once made: a failed build clears it, so it does not stay registered
             var cache: Option[ObjectCache] = None
+            // The store, once made: a failed build releases what its recovered transactions were counted for
+            var madeStore: Option[Store] = None
             val built = Try:
               val objectCache = ctx.objectCacheFactory(storeId, executor)
               cache = Some(objectCache)
@@ -324,6 +326,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 ctx.net, ctx.backgroundTasks, crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
                 Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize,
                 ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited))
+              madeStore = Some(store)
               val entry = new StoreRouter.Entry(store, executor)
               // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any
               backend.setCompletionHandler(ctx.wrapCompletionHandler(router.completionHandler(entry)))
@@ -336,6 +339,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 logger.error(s"Failed to build store $storeId. Not serving it. Error: $err")
                 // On the executor, where other views post its sheds, and before its slot is released
                 cache.foreach(c => executor.execute(() => c.clear()))
+                madeStore.foreach(_.frontend.releaseAllAdmissions())
                 if replacing.isEmpty then
                   ctx.threading.release(storeId)
                 abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
@@ -395,11 +399,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       closeUnloaded(entry, dropDurably = true)
 
   /** Closes the store of `entry`, already removed from the router, without saving its CRL state: clears its object
-   *  cache and drops its CRL state on its executor, then closes it there, and releases its executor slot once the
-   *  close completes. Nothing is awaited. With `dropDurably` the entries are deleted from the CRL files too
-   *  (CrashRecoveryLog.dropStore), which only a caller whose state is recoverable elsewhere (a save file still on
-   *  disk) or whose `rebuild-required` marker is on disk may ask for; otherwise they leave memory only, and a
-   *  restart recovers them. */
+   *  cache on its executor, then closes it there, and releases its executor slot once the close completes. Nothing
+   *  is awaited. With `dropDurably` its entries are deleted from the CRL (CrashRecoveryLog.dropStore), which only a
+   *  caller whose state is recoverable elsewhere (a save file still on disk) or whose `rebuild-required` marker is on
+   *  disk may ask for; otherwise they stay live in the device CRL, and a restart recovers them. */
   private[host] def closeUnloaded(entry: StoreRouter.Entry, dropDurably: Boolean): Unit =
     val store = entry.store
     startClose(entry):
@@ -407,7 +410,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       if dropDurably then
         store.crl.dropStore(store.storeId)
       else
-        store.crl.closeStore(store.storeId)
+        Future.unit
     .onComplete: _ =>
       onExecutor(entry)(store.close()).onComplete: _ =>
         ctx.threading.release(store.storeId)
@@ -445,11 +448,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   /** Closes a store (spec section 5): removes it from the router, which marks it offline so new traffic gets the
    *  offline handling, then runs the close on its executor, behind any tasks already queued for it: the object cache
-   *  cleared and, with `extractCrl`, `crl.closeStore` taking the store's state out of the device CRL; then that
-   *  state saved to its crl_save.log (extractCrl only) and `store.close()`. Without `extractCrl` the state stays live
-   *  in the device CRL and no save file is written. Back on the control thread, its executor slot is released,
-   *  whatever the outcome, and the fail-stop check decides the completion; a failed step fails it. Extracted
-   *  entries are deleted from the device CRL files once the save file is durable. A store whose backend failed-stop
+   *  cleared and, with `extractCrl`, `crl.readStoreState` reading the store's state, which stays live in the device
+   *  CRL; then that state saved to its crl_save.log (extractCrl only) and `store.close()`. Without `extractCrl` no
+   *  save file is written. Back on the control thread, its executor slot is released, whatever the outcome, and the
+   *  fail-stop check decides the completion; a failed step fails it. Extracted entries are deleted from the device
+   *  CRL (memory and files) only once the save file is durable, so a crash or a failed save before that leaves the
+   *  device CRL holding them. A store whose backend failed-stop
    *  is marked rebuild-required (failedOnClose); its entries are dropped when the rebuild discards it
    *  (StoreRebuilds.discardLostStore), after that marker is durable. */
   def handleClose(e: ShutdownStore): Unit =
@@ -474,7 +478,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         startClose(entry):
           store.objectCache.clear()
           if extractCrl then
-            store.crl.closeStore(storeId).map(Some(_))
+            store.crl.readStoreState(storeId).map(Some(_))
           else
             Future.successful(None)
         .transformWith: extractedTry =>

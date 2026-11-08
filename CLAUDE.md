@@ -194,7 +194,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - The CRL is used to store the persistent state required by the Paxos protocol. Each storage device has its own
     (`<device>/crl`, opened when the device loads, sized by `crl-num-streams`/`crl-max-file-size-mb` in its device
     config) shared by its stores; a dead CRL thread stalls only that device. An unloaded device is not loaded again
-    until its CRL has shut down (`LocalDevices.closingCrls`)
+    until its CRL has shut down (`LocalDevices.closingCrls`). The sizing is fixed when the device is created: stream
+    files on disk that differ from it in count or size make `openCRL` throw, so the CRL is treated as lost
   - Stores hold requirement locks from a commit vote until the transaction resolves. `SharedRevisionLock` is a
     non-exclusive requirement on an object's revision: many transactions may hold it, but it collides with any write
     to that object
@@ -233,8 +234,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     half a CRL stream (`SimpleCRL.admissionLimitBytes`). Object data arriving later is charged once per object without
     a check. Everything else (known transactions' prepares, accepts, resolutions, finalizations, heartbeats, status
     requests) is handled. Nothing is exempt. Bytes are released when the entry is deleted, a Tx is forgotten without
-    one, or the store closes; a Tx waiting on an in-flight commit keeps its admission. Accepted gaps: recovered
-    transactions are not counted, and a retransmit past the mark while a store awaits its crl_save.log is dropped
+    one, or the store closes; a Tx waiting on an in-flight commit keeps its admission. Recovered transactions are
+    counted too, without a check. Accepted gap: a retransmit past the mark while a store awaits its crl_save.log is
+    dropped
 -  Lifecycle:
   - The client builds a TransactionDescription and sends it plus object data to the stores
   - The stores check all local state against the TransactionRequirements and determine their Commit/Abort decision
@@ -309,7 +311,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   pool entries and both HostStates, then rewrites `owning-host` and loads it: it opens the device CRL and each store
   recovers its transactions from it
 - `crl_save.log`, `transferring-out` and `transferred-in` are for network transfers only: a transfer out closes the
-  store with `extractCrl`, moving its state out of the device CRL into `crl_save.log` to travel with it. Such a file is
+  store with `extractCrl`, copying its state from the device CRL into `crl_save.log` to travel with it. Such a file is
   then the only copy of that state: if it fails to load (missing, truncated, or naming another store) the store is
   never served. It gets a `rebuild-required` marker, its entry is flipped to Rebuilding by the reconcile, and the
   directory is discarded before the rebuild. Adoption of a Shutdown device does the same for a `transferring-out` store
@@ -324,9 +326,11 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - A store's device-CRL entries are dropped for good (`CrashRecoveryLog.dropStore`, durable) only once it cannot be
   served: when a rebuild discards a `rebuild-required` directory (`StoreRebuilds.discardLostStore`: marker durable,
   then drop durable, then the directory removed and the rebuild started), or when an unloaded store's save file still
-  holds them. Without the marker on disk, entries leave memory only. A transfer out
-  extracts them into `crl_save.log` (loaded or not, `StoreTransfers.closeForTransferOut`) and deletes them from the
-  device CRL files once that file is durable
+  holds them, or when the reconcile deletes the directory of a store transferred away (`DeviceReconciler`, retried
+  on failure). Without the marker on disk, entries stay in the device CRL. A transfer out reads them
+  (`readStoreState`, leaving them live) into `crl_save.log` (loaded or not, `StoreTransfers.closeForTransferOut`)
+  and deletes them from the device CRL (`deleteTransactions`) only once that file is durable: a crash or failed save
+  before that leaves the device CRL holding them
 - `server.DurableFiles` forces files and their directories so markers and moves survive a pulled disk. That durability
   holds on Linux only, the supported host platform: directory fsync is a no-op on Windows and a plain fsync on macOS,
   each logging one warning

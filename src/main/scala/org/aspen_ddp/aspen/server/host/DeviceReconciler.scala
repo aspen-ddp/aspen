@@ -3,12 +3,15 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
 
+import scala.concurrent.Future
 import scala.util.{Failure, Success}
+import scala.util.control.NonFatal
 
 /** Runs only on the control thread. See HostThreading.scala.
  *
@@ -24,6 +27,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   // Devices with a re-check waiting out TransferOutRecheckDelay. At most one each.
   private var scheduledRechecks: Set[StorageDeviceId] = Set()
   private var deferredChecks: Set[StorageDeviceId] = Set()
+  // Stores transferred away whose device-CRL entries are not durably dropped yet, by device, and those whose drop is
+  // running. A failed drop stays due and is retried by the device's next reconcile
+  private var crlDropsDue: Map[StorageDeviceId, Set[StoreId]] = Map()
+  private var crlDropsRunning: Set[StoreId] = Set()
 
   private[server] def activeDeviceChecks: Set[StorageDeviceId] = activeChecks
 
@@ -55,6 +62,31 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     if ! ctx.devices.devices.contains(m.deviceId) then
       ctx.discovery.checkForNewDevices()
     checkStorageDevice(m.deviceId)
+
+  /** Drops the device-CRL entries of stores transferred away from `local`. A crash between a transfer out's save
+   *  file and the deletion of its entries leaves them in the device CRL, where they would be copied forward forever,
+   *  uncounted by admission, and recovered if the store ever came back. A store the device's entry names again (it
+   *  was transferred back) is no longer due: its entries are its own once more. */
+  private def dropTransferredCrlState(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    val deviceId = local.storageDeviceId
+    def done(storeId: StoreId): Unit =
+      val left = crlDropsDue.getOrElse(deviceId, Set()) - storeId
+      crlDropsDue = if left.isEmpty then crlDropsDue - deviceId else crlDropsDue + (deviceId -> left)
+    crlDropsDue.getOrElse(deviceId, Set()).foreach: storeId =>
+      if remote.stores.contains(storeId) then
+        done(storeId)
+      else if !crlDropsRunning.contains(storeId) then
+        crlDropsRunning += storeId
+        val dropped =
+          try local.crl.dropStore(storeId)
+          catch case NonFatal(t) => Future.failed(t)
+        dropped.onComplete: result =>
+          crlDropsRunning -= storeId
+          result match
+            case Success(_) => done(storeId)
+            case Failure(t) =>
+              logger.error(s"Failed to drop the device-CRL entries of store $storeId, transferred away. Retrying " +
+                           s"at the device's next check. Error: $t")
 
   /** Reconciles a loaded device's on-disk state against the state recorded for it in the
    *  storage-devices tree: deletes stores transferred away, flips stores whose CRL state was lost
@@ -115,6 +147,9 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
             os.remove.all(storePath)
           catch
             case t: Throwable => logger.error(s"Failed to delete store $storePath. Error: $t")
+        // Any entries a crash after its save file left in the device CRL go too (dropTransferredCrlState)
+        crlDropsDue += local.storageDeviceId -> (crlDropsDue.getOrElse(local.storageDeviceId, Set()) + storeId)
+      dropTransferredCrlState(local, remote)
 
       //----------------------
       // Lost CRL State

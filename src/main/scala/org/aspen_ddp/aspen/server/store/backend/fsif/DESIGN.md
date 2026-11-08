@@ -667,8 +667,8 @@ correlated loss.
 
 **Host routes for `BackendFailed` and other failed-backend checks.** Each of these writes `rebuild-required`:
 
-- **Served store** (`StoreRebuilds.handleBackendFailed`, then `backendFailed`). The store is unloaded, its CRL state is
-  dropped (`crl.closeStore`), it is marked and left offline, and the device is checked.
+- **Served store** (`StoreRebuilds.handleBackendFailed`, then `backendFailed`). The store is marked, unloaded and left
+  offline, its CRL state dropped (`crl.dropStore`) once the marker is on disk, and the device is checked.
 - **Not served, not replaced, directory on a loaded device** (`StoreRebuilds.backendFailed`).
 - **Failed before its `LoadStore` ran** (`StoreLoader.handleLoad`, then `StoreRebuilds.retireUnserved`).
 - **Opened but not served** (device unloaded or another backend serves it) **and failed**

@@ -75,12 +75,14 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       extractUnloaded(storeId)
 
   /** A closed store's entries may still be live in its device CRL (closed without extraction, or awaiting space).
-   *  They are taken out (`crl.closeStore`) and written, with whatever an earlier extraction's save file already
-   *  holds, to its crl_save.log, then deleted from the device CRL files once the file is durable. Nothing to take
-   *  leaves the directory as it is. A save file already there that is unusable fails the close before anything is
-   *  taken: its state is lost, and writing the CRL's entries over it would hide that. Runs on the control thread,
-   *  as the marker writes beside it do; nothing blocks on the CRL. A crash between the save file and the deletion
-   *  leaves the same entries in both: harmless, as the save file's load re-saves them under the same ids. */
+   *  They are read (`crl.readStoreState`, leaving them live) and written, with whatever an earlier extraction's save
+   *  file already holds, to its crl_save.log, then deleted from the device CRL once the file is durable. A crash or a
+   *  failed save before that leaves the device CRL holding them. Nothing to take leaves the directory as it is. A
+   *  save file already there that is unusable fails the close before anything is read: its state is lost, and
+   *  writing the CRL's entries over it would hide that. Runs on the control thread, as the marker writes beside it
+   *  do; nothing blocks on the CRL. A crash between the save file and the deletion leaves the same entries in both:
+   *  harmless, as the save file's load re-saves them under the same ids, and the source's copy is dropped when its
+   *  directory is deleted (DeviceReconciler). */
   private def extractUnloaded(storeId: StoreId): Future[Unit] =
     ctx.devices.devices.valuesIterator.find(sds => os.isDir(sds.devicePath / storeId.directoryName)) match
       case None => Future.unit
@@ -91,19 +93,15 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         earlier match
           case Left(err) => Future.failed(err)
           case Right(saved) =>
-            sds.crl.closeStore(storeId).flatMap: trs =>
+            sds.crl.readStoreState(storeId).flatMap: trs =>
               if trs.isEmpty then
                 Future.unit
               else
                 val ids = trs.map(_.txd.transactionId)
                 val kept = saved.filterNot(t => ids.contains(t.txd.transactionId))
-                try
-                  CrashRecoveryLog.saveStoreState(storeId, kept ++ trs, saveFile)
-                  sds.crl.deleteTransactions(storeId, ids)
-                catch
-                  case NonFatal(t) =>
-                    // Put back, so a retried request extracts them again
-                    sds.crl.loadStore(storeId, trs).transform(_ => Failure(t))
+                // A failed save leaves them in the device CRL, for a retried request to extract again
+                CrashRecoveryLog.saveStoreState(storeId, kept ++ trs, saveFile)
+                sds.crl.deleteTransactions(storeId, ids)
 
   /** The transfer-in work on `deviceId` that a shutdown of it must stop or wait for. `ingStores` are the stores
    *  the device's tree entry records as TransferringIn.

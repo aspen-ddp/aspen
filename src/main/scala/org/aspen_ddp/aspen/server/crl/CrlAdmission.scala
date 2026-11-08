@@ -13,8 +13,9 @@ import scala.annotation.tailrec
   *
   * A transaction is counted for its description, its object data (each object once, charged without a limit check
   * when it arrives after the transaction was admitted) and the CRL's static record of it (`TxOverheadBytes`,
-  * `ObjectUpdateOverheadBytes`). Accepted gaps: transactions recovered at store load are not counted (the CRL already
-  * holds them), and a retransmitted prepare arriving past the mark while the store awaits its crl_save.log state is
+  * `ObjectUpdateOverheadBytes`). Transactions recovered at store load are counted the same way, charged without a
+  * limit check (the CRL already holds them), so repeated restarts under load cannot stack uncounted live bytes. An
+  * accepted gap: a retransmitted prepare arriving past the mark while the store awaits its crl_save.log state is
   * dropped until recovery recreates the transaction.
   */
 final class CrlAdmission(val limitBytes: Long):

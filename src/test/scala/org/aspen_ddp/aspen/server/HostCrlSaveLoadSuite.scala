@@ -30,11 +30,6 @@ private class RecordingCRL extends CrashRecoveryLog:
   def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = synchronized:
     states.getOrElse(storeId, Map()).values.toList
 
-  def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] = synchronized:
-    val l = getFullRecoveryState(storeId)
-    states -= storeId
-    Future.successful(l)
-
   def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
     synchronized:
       states += state.storeId -> (states.getOrElse(state.storeId, Map()) + (txid -> state))

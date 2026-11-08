@@ -32,7 +32,6 @@ object SimpleCRL:
   case class Shutdown(completionHandler: () => Unit) extends ActionRequest
 
   case class GetRecoveryState(storeId: StoreId,
-                              removeStore: Boolean,
                               completion: List[TransactionRecoveryState] => Unit
                              ) extends ActionRequest
 
@@ -48,8 +47,15 @@ object SimpleCRL:
       os.makeDir.all(dir)
       SimpleCRL(dir, config.crlNumStreams, config.crlFileSizeMb * 1024L * 1024L, onThreadDeath).crl
 
+  /** Thrown by apply when the stream files on disk were created with another count or size than it is given */
+  class SizingMismatch(streamsDir: os.Path, reason: String)
+    extends Exception(s"CRL stream files in $streamsDir do not match the configured sizing: $reason")
+
   /** @param onThreadDeath called if a CRL thread dies. No transaction of the CRL's stores can make progress after
     *                      that: stores vote only once a save completes.
+    * @throws SizingMismatch if `streamsDir` holds stream files other than `numStreams` of `maxSizeInBytes` each.
+    *                        The sizing is fixed when the CRL is created: recovering with another would silently
+    *                        ignore files holding live entries, so such a CRL is treated as unrecoverable.
     */
   def apply(streamsDir: os.Path,
             numStreams: Int,
@@ -58,6 +64,8 @@ object SimpleCRL:
     val files: List[(StreamId, os.Path)] = (0 until numStreams).map(i =>
       (StreamId(i), streamsDir / s"$i.crl")
     ).toList
+
+    checkSizing(streamsDir, files.map(_._2).toSet, maxSizeInBytes)
 
     val r = Recovery.recover(files)
 
@@ -69,6 +77,18 @@ object SimpleCRL:
         onThreadDeath),
       r.trsList)
 
+  /** A directory with no stream files is a new CRL. Otherwise its files must be exactly `expected`, each
+    * `maxSizeInBytes` long (StreamWriter creates them at that size) */
+  private def checkSizing(streamsDir: os.Path, expected: Set[os.Path], maxSizeInBytes: Long): Unit =
+    val present =
+      if os.isDir(streamsDir) then os.list(streamsDir).filter(_.ext == "crl").toSet else Set[os.Path]()
+    if present.nonEmpty then
+      if present != expected then
+        throw SizingMismatch(streamsDir, s"found ${present.map(_.last).toList.sorted.mkString(", ")}, expected " +
+          s"${expected.size} streams")
+      present.foreach: f =>
+        if os.size(f) != maxSizeInBytes then
+          throw SizingMismatch(streamsDir, s"${f.last} is ${os.size(f)} bytes, expected $maxSizeInBytes")
 
 class SimpleCRL private (val maxSizeInBytes: Long,
                          files: List[(StreamId, os.Path)],
@@ -189,8 +209,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
           writeInProgress = false
           startWrite()
 
-        case GetRecoveryState(storeId, removeStore, completion) =>
-          onGetRecoveryState(storeId, removeStore, completion)
+        case GetRecoveryState(storeId, completion) =>
+          onGetRecoveryState(storeId, completion)
 
         case Shutdown(completionHandler) =>
           writer.shutdown(completionHandler)
@@ -225,23 +245,11 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     if queueTail.isEmpty then
       queueTail = Some(lc)
 
+  /** Leaves the transactions live: only a deletion, which is written, takes them out of the log */
   private def onGetRecoveryState(storeId: StoreId,
-                                 removeStore: Boolean,
                                  completion: List[TransactionRecoveryState] => Unit
                                 ): Unit =
-
-    var trsList: List[TransactionRecoveryState] = Nil
-
-    transactions = transactions.filter: (txid, tx) =>
-      if txid.storeId == storeId then
-        trsList = tx.state :: trsList
-        if removeStore then
-          removeFromQueue(tx)
-        !removeStore
-      else
-        true
-
-    completion(trsList)
+    completion(transactions.valuesIterator.filter(_.id.storeId == storeId).map(_.state).toList)
 
   private def onSaveTransaction(transactionId: TransactionId,
                       state: TransactionRecoveryState,
@@ -286,7 +294,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
       trsList = tl
       blockingQueue.put("")
 
-    ioQueue.put(GetRecoveryState(storeId, false, completion))
+    ioQueue.put(GetRecoveryState(storeId, completion))
 
     blockingQueue.take()
 
@@ -308,14 +316,9 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     ioQueue.put(DeleteTransactions(storeId, txids, () => p.trySuccess(())))
     p.future
 
-  def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] =
+  override def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] =
     val p = Promise[List[TransactionRecoveryState]]()
-
-    def completion(trsList: List[TransactionRecoveryState]): Unit =
-      p.success(trsList)
-
-    ioQueue.put(GetRecoveryState(storeId, true, completion))
-
+    ioQueue.put(GetRecoveryState(storeId, trsList => p.success(trsList)))
     p.future
 
   private val shutdownRequested = new AtomicBoolean(false)

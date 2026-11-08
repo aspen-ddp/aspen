@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
   TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CompletionHandler, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
@@ -107,11 +107,6 @@ object StoreRouterSuite:
 
     def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = synchronized:
       states.getOrElse(storeId, Map()).values.toList
-
-    def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] = synchronized:
-      val l = getFullRecoveryState(storeId)
-      states -= storeId
-      Future.successful(l)
 
     override def loadStore(storeId: StoreId, trsList: List[TransactionRecoveryState]): Future[Unit] =
       gate.flatMap(_ => super.loadStore(storeId, trsList))(using ExecutionContext.parasitic)
@@ -382,6 +377,22 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       fx.ctx.router.markLoading(s0)
       await(fx.load(bootstrappedBackend(s0)))
       fx.ctx.router.isLoading(s0) should be(false)
+
+  test("a load whose store fails to build releases what its recovered transactions were counted for"):
+    val s0 = StoreId(poolId, 0)
+    val crl = emptyCrl
+    crl.save(TransactionId(new UUID(15, 7)), TransactionRecoveryState(s0,
+      overwriteTxd(TransactionId(new UUID(15, 7))).serialize(), List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))),
+      TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial), () => ())
+    val admission = new CrlAdmission(Long.MaxValue)
+    withRouter(crl): fx =>
+      fx.onControl:
+        val dir = os.temp.dir()
+        val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
+        sds.loadedStores += s0
+        fx.ctx.devices.devices += deviceId -> sds
+      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, os.temp.dir()))))
+      admission.admittedBytes should be(0)
 
   test("a load whose store fails to build is undone and the store can load again"):
     val s0 = StoreId(poolId, 0)

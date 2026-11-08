@@ -117,7 +117,12 @@ class SimpleCRLSuite extends FileBasedTests {
 
     assert(t2.size == 1)
 
-    val t = Await.result(i.crl.closeStore(storeId), Duration(5000, MILLISECONDS))
+    val t = Await.result(i.crl.readStoreState(storeId), Duration(5000, MILLISECONDS))
+
+    // Read, not removed: only the deletion takes them out
+    assert(i.crl.getFullRecoveryState(storeId).size == 1)
+
+    Await.result(i.crl.deleteTransactions(storeId, t.map(_.txd.transactionId)), Duration(5000, MILLISECONDS))
 
     val t3 = i.crl.getFullRecoveryState(storeId)
 
@@ -1071,7 +1076,7 @@ class SimpleCRLSuite extends FileBasedTests {
     i2.crl.shutdown()
   }
 
-  test("closeStore does not record log deletion") {
+  test("readStoreState leaves a store's transactions live while other stores' entries move the log on") {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
@@ -1082,30 +1087,20 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.save(transactionId2, trsValidTxd2, completionHandler)
     queue.take()
 
-    // closeStore removes from in-memory state but NOT from the log
-    val closedTrs = Await.result(i.crl.closeStore(storeId), Duration(5000, MILLISECONDS))
-    assert(closedTrs.length == 1)
-    assert(closedTrs.head.storeId == storeId)
+    val read = Await.result(i.crl.readStoreState(storeId), Duration(5000, MILLISECONDS))
+    assert(read.map(_.storeId) == List(storeId))
+    assert(i.crl.getFullRecoveryState(storeId).length == 1)
 
-    assert(i.crl.getFullRecoveryState(storeId).isEmpty)
-    assert(i.crl.getFullRecoveryState(storeId2).length == 1)
-
-    // Flush to disk
-    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    // A new transaction of another store, saved twice: the last entry needs nothing older than the first of these
+    i.crl.save(transactionId3, trsValidTxd2, completionHandler)
+    queue.take()
+    i.crl.save(transactionId3, trsValidTxd2, completionHandler)
     queue.take()
 
     i.crl.shutdown()
 
-    // On recovery, tx1 reappears because closeStore never wrote a deletion to the log.
-    // This is expected behavior: the migrate-out process must use deleteTransaction
-    // or the store must be re-closed after recovery.
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
-
-    val store1Txs = i2.trsList.filter(_.storeId == storeId)
-    val store2Txs = i2.trsList.filter(_.storeId == storeId2)
-    assert(store1Txs.length == 1)
-    assert(store2Txs.length == 1)
-
+    assert(i2.trsList.count(_.storeId == storeId) == 1)
     i2.crl.shutdown()
   }
 

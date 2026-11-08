@@ -6,7 +6,8 @@ import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, Rep
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, RefcountUpdate, RevisionMismatch, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, LocalTimeRequirement,
+  RefcountUpdate, RevisionLock, RevisionMismatch, SharedRevisionLock, TransactionId, VersionBump}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -243,5 +244,25 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     assert(result.failed.isEmpty)
     assert(o.metadata.revision == rev1)
     assert(o.data.getByteArray sameElements Array[Byte](1, 2, 3))
+  }
+
+  test("changedObjects includes every object a DataUpdate, KeyValueUpdate, RefcountUpdate or VersionBump names") {
+    val ids = (2 to 5).map(i => ObjectId(new UUID(0, i))).toList
+    val pool = PoolId(new UUID(0, 0))
+    val reqs = List(
+      DataUpdate(DataObjectPointer(ids(0), pool, Array[Byte]()), rev1, DataUpdateOperation.Overwrite),
+      KeyValueUpdate(KeyValueObjectPointer(ids(1), pool, Array[Byte]()), None, None, Nil),
+      RefcountUpdate(DataObjectPointer(ids(2), pool, Array[Byte]()), ref1, ObjectRefcount(2, 0)),
+      VersionBump(DataObjectPointer(ids(3), pool, Array[Byte]()), rev1))
+    RequirementsApplyer.changedObjects(reqs) shouldBe ids.toSet
+  }
+
+  test("changedObjects excludes objects only locked or checked, and non-object requirements") {
+    val pool = PoolId(new UUID(0, 0))
+    val reqs = List(
+      RevisionLock(DataObjectPointer(ObjectId(new UUID(0, 6)), pool, Array[Byte]()), rev1),
+      SharedRevisionLock(DataObjectPointer(ObjectId(new UUID(0, 7)), pool, Array[Byte]()), rev1),
+      LocalTimeRequirement(ts1, LocalTimeRequirement.Requirement.LessThan))
+    RequirementsApplyer.changedObjects(reqs) shouldBe empty
   }
 }

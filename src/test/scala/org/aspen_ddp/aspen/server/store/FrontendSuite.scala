@@ -83,9 +83,6 @@ object FrontendSuite {
 
     override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = Nil
 
-    override def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] =
-      Future.successful(Nil)
-
     override def save(txid: TransactionId,
                       state: TransactionRecoveryState,
                       completionHandler: () => Unit): Unit =
@@ -1575,7 +1572,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   class SyncCrl(val crl: SimpleCRL) extends CrashRecoveryLog:
     override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
       crl.getFullRecoveryState(storeId)
-    override def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] = crl.closeStore(storeId)
+    override def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] = crl.readStoreState(storeId)
     override def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
       val done = new LinkedBlockingQueue[java.lang.Boolean]()
       crl.save(txid, state, () => done.put(true))
@@ -1594,7 +1591,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       val (frontend, backend, _) = heldCommit(crl)
       backend.deliverCommits(Right(CommitError.IOFailure))
       finalizeTx1(frontend)
-      Await.result(crl.closeStore(storeId), Duration(10, SECONDS))
+      Await.result(crl.readStoreState(storeId), Duration(10, SECONDS))
     finally
       crl.crl.shutdown()
       tdir.delete()
@@ -2014,28 +2011,65 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     admission.admittedBytes shouldBe 0
   }
 
-  test("recovered transactions are not admitted, and releasing them frees nothing") {
-    val admission = new CrlAdmission(Long.MaxValue)
-    admission.tryAdmit(10) shouldBe true
+  /** A Frontend over `admission` recovering txid1 (a commit vote overwriting oid1) from its CRL, its object cached
+    * so it loads while the Frontend is built. Returns the Frontend, its CRL and the recovered state's bytes
+    */
+  def recoveredAdmission(admission: CrlAdmission): (Frontend, TestCrl, Long) =
     val backend = new MapBackend(storeId)
     populate(backend)
-    val saved = List(TransactionRecoveryState(storeId, lockTxd(txid1, List(overwrite(op1))).serialize(),
-      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), TransactionDisposition.VoteCommit,
-      TransactionStatus.Unresolved, PersistentState.initial))
+    val trs = TransactionRecoveryState(storeId, lockTxd(txid1, List(overwrite(op1))).serialize(),
+      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1, 2, 3)))), TransactionDisposition.VoteCommit,
+      TransactionStatus.Unresolved, PersistentState.initial)
     val crl = new TestCrl:
-      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = saved
-    // Cached, so the recovered transaction loads its object while the Frontend is built
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     cache.insert(mkObjectState(oid1))
     val frontend = new Frontend(storeId, backend, cache, new TestNet, crl, new TransactionStatusCache(),
       admission = admission)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    (frontend, crl, CrlAdmission.TxOverheadBytes + trs.serializedTxd.size + CrlAdmission.objectUpdateBytes(3))
+
+  test("recovered transactions are counted for their bytes, and released when they finalize") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val (frontend, crl, bytes) = recoveredAdmission(admission)
     frontend.transactions.contains(txid1) shouldBe true
-    admission.admittedBytes shouldBe 10
+    admission.admittedBytes shouldBe bytes
 
     frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false))
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false))
     crl.deleted should contain (txid1)
-    admission.admittedBytes shouldBe 10
+    admission.admittedBytes shouldBe 0
+  }
+
+  test("closing a store releases what its recovered transactions are counted for") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val (frontend, _, bytes) = recoveredAdmission(admission)
+    admission.admittedBytes shouldBe bytes
+    Await.result(frontend.close(), Duration(5, SECONDS))
+    admission.admittedBytes shouldBe 0
+  }
+
+  test("a prepare admitted while its saved state loads is not counted again when that state is recovered") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    var recoverable: List[TransactionRecoveryState] = Nil
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = recoverable
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    cache.insert(mkObjectState(oid1))
+    val frontend = new Frontend(storeId, backend, cache, new TestNet, crl, new TransactionStatusCache(),
+      admission = admission)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    frontend.awaitRecovery()
+
+    val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+    frontend.admitPrepare(p1) shouldBe true
+    frontend.receiveTransactionMessage(p1)
+    recoverable = List(TransactionRecoveryState(storeId, p1.txd.serialize(), p1.objectUpdates,
+      TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial))
+    frontend.recover()
+    frontend.transactions.contains(txid1) shouldBe true
+    admission.admittedBytes shouldBe admissionBytes(p1)
   }
 }

@@ -42,9 +42,6 @@ object TestNetwork {
   class TestCRL extends CrashRecoveryLog {
     override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = Nil
 
-    override def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] =
-      Future.successful(Nil)
-
     override def save(txid: TransactionId,
                       state: TransactionRecoveryState,
                       completionHandler: () => Unit): Unit = {

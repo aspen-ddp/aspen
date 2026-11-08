@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
-import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitState, Completion, Read}
@@ -197,6 +197,16 @@ class Frontend(val storeId: StoreId,
 
   private def holding: Boolean = awaitingCrl || recoveringTransactions.nonEmpty || undecidedRecovered.nonEmpty
 
+  /** What a transaction this Frontend admitted holds in the device's CRL admission, until released.
+    *
+    * @param bytes      the bytes charged so far
+    * @param dataCounted the objects whose update data is charged: each is charged once, however often it arrives
+    * @param serializedTxd the description serialized to size it, kept for the Tx's recovery state until taken
+    */
+  private final class Admitted(var bytes: Long, var dataCounted: Set[ObjectId], var serializedTxd: Option[DataBuffer])
+  // Before recoverTransactions, which counts what it recovers (see admitPrepare)
+  private val admitted = scala.collection.mutable.HashMap[TransactionId, Admitted]()
+
   recoverTransactions()
 
   /** Recreates the transactions the CRL holds for this store that are not already known.
@@ -214,6 +224,7 @@ class Frontend(val storeId: StoreId,
         None
       else
         val pointers = txd.allHostedObjects(storeId)
+        admitRecovered(txd.transactionId, trs)
         val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, pointers, recovered = true)
         transactions += (txd.transactionId -> tx)
         // A transaction with no objects here never loads any
@@ -260,36 +271,22 @@ class Frontend(val storeId: StoreId,
       held.foreach(handleTransactionMessage)
 
 
-  // ---- Backpressure: see CrlAdmission ----
-
-  /** What a transaction this Frontend admitted holds in the device's CRL admission, until released.
-    *
-    * @param bytes      the bytes charged so far
-    * @param dataCounted the objects whose update data is charged: each is charged once, however often it arrives
-    * @param serializedTxd the description serialized to size it, kept for the Tx's recovery state until taken
-    */
-  private final class Admitted(var bytes: Long, var dataCounted: Set[ObjectId], var serializedTxd: Option[DataBuffer])
-  private val admitted = scala.collection.mutable.HashMap[TransactionId, Admitted]()
+  // ---- Backpressure: see CrlAdmission (Admitted and admitted are declared above recoverTransactions) ----
 
   /** Whether a prepare may be handled.
     *
-    * A transaction this Frontend admitted always is, since dropping it would free nothing and could strand it. Object
-    * data it brings that is not yet counted is charged without a limit check. A transaction known here but not
-    * admitted (recovered from the CRL) always is too, as is one finalized in the status cache, which is answered from
-    * the cache and never reaches the CRL. Any other is counted for its description, object data and CRL record, and
-    * admitted only while the device's admission has room. The status cache is host-wide, so a transaction merely
-    * started on another store is not known here.
+    * A transaction this Frontend admitted (recovered ones included) always is, since dropping it would free nothing
+    * and could strand it. Object data it brings that is not yet counted is charged without a limit check. A known
+    * transaction always is too, as is one finalized in the status cache, which is answered from the cache and never
+    * reaches the CRL. Any other is counted for its description, object data and CRL record, and admitted only while
+    * the device's admission has room. The status cache is host-wide, so a transaction merely started on another
+    * store is not known here.
     */
   def admitPrepare(m: TxPrepare): Boolean =
     val txid = m.txd.transactionId
     admitted.get(txid) match
       case Some(a) =>
-        val added = m.objectUpdates.filterNot(ou => a.dataCounted.contains(ou.objectId))
-        if added.nonEmpty then
-          val bytes = added.iterator.map(ou => CrlAdmission.objectUpdateBytes(ou.data.size)).sum
-          admission.charge(bytes)
-          a.bytes += bytes
-          a.dataCounted ++= added.iterator.map(_.objectId)
+        chargeData(a, m.objectUpdates)
         true
       case None if transactions.contains(txid) || statusCache.getStatus(txid).exists(_.finalized) => true
       // Checked before serializing: a prepare that will be dropped costs nothing more
@@ -304,6 +301,28 @@ class Frontend(val storeId: StoreId,
         else
           false
 
+  /** Charges `a` for the data of `updates` not counted yet, without a limit check */
+  private def chargeData(a: Admitted, updates: List[ObjectUpdate]): Unit =
+    val added = updates.filterNot(ou => a.dataCounted.contains(ou.objectId))
+    if added.nonEmpty then
+      val bytes = added.iterator.map(ou => CrlAdmission.objectUpdateBytes(ou.data.size)).sum
+      admission.charge(bytes)
+      a.bytes += bytes
+      a.dataCounted ++= added.iterator.map(_.objectId)
+
+  /** Counts a transaction recovered from the CRL, without a limit check (the CRL already holds it), as admitPrepare
+    * counts a new one: repeated restarts under load must not stack uncounted live bytes in the device CRL. One whose
+    * prepare was admitted while the store awaited its saved state is charged only for data not yet counted
+    */
+  private def admitRecovered(txid: TransactionId, trs: TransactionRecoveryState): Unit =
+    admitted.get(txid) match
+      case Some(a) => chargeData(a, trs.objectUpdates)
+      case None =>
+        val a = new Admitted(CrlAdmission.TxOverheadBytes + trs.serializedTxd.size, Set(), None)
+        admission.charge(a.bytes)
+        admitted(txid) = a
+        chargeData(a, trs.objectUpdates)
+
   /** The description `admitPrepare` serialized for `txid`, if not taken yet */
   private def takeSerializedTxd(txid: TransactionId): Option[DataBuffer] =
     admitted.get(txid).flatMap: a =>
@@ -312,7 +331,7 @@ class Frontend(val storeId: StoreId,
       s
 
   /** Releases what `txid` was admitted for, if anything: its CRL entry was deleted, or it is forgotten without one.
-    * Idempotent; recovered transactions were never admitted
+    * Idempotent
     */
   def releaseAdmission(txid: TransactionId): Unit =
     admitted.remove(txid).foreach(a => admission.release(a.bytes))
@@ -322,9 +341,14 @@ class Frontend(val storeId: StoreId,
     crl.deleteTransaction(storeId, txid)
     releaseAdmission(txid)
 
-  def close(): Future[Unit] =
+  /** Releases everything this Frontend's transactions were admitted for: it is closing, or was built and never
+    * served */
+  def releaseAllAdmissions(): Unit =
     admitted.valuesIterator.foreach(a => admission.release(a.bytes))
     admitted.clear()
+
+  def close(): Future[Unit] =
+    releaseAllAdmissions()
     backend.close()
 
   def path: os.Path = backend.path

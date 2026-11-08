@@ -117,7 +117,11 @@ object CrashRecoveryLog:
 trait CrashRecoveryLog {
   def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState]
 
-  def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]]
+  /** The transactions held for `storeId`, which stay in the CRL: removed only by deleteTransactions, which records
+    * the deletion. A transfer out writes them to its save file first, so a crash or failed save in between leaves
+    * the CRL holding them. The default reads getFullRecoveryState, for CRLs whose read does not block. */
+  def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] =
+    Future.successful(getFullRecoveryState(storeId))
 
   def loadStore(storeId: StoreId,
                 trsList: List[TransactionRecoveryState]): Future[Unit] =
@@ -140,8 +144,8 @@ trait CrashRecoveryLog {
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit
 
   /** Deletes `txids` of `storeId`, completing once the deletion is durable: a restart does not recover them. A
-    * transaction not held in memory (taken out by closeStore) is still deleted from the files. The default only
-    * deletes them, for CRLs that keep nothing on disk. */
+    * transaction not held in memory is still deleted from the files. The default only deletes them, for CRLs that
+    * keep nothing on disk. */
   def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
     txids.foreach(deleteTransaction(storeId, _))
     Future.unit
@@ -149,7 +153,7 @@ trait CrashRecoveryLog {
   /** Drops every entry of `storeId` for good, completing once that is durable. For a store whose state is
     * discarded (it is rebuilt): the caller must already have made it unservable (`rebuild-required`). */
   def dropStore(storeId: StoreId): Future[Unit] =
-    closeStore(storeId).flatMap(trs => deleteTransactions(storeId, trs.map(_.txd.transactionId)))(
+    readStoreState(storeId).flatMap(trs => deleteTransactions(storeId, trs.map(_.txd.transactionId)))(
       using scala.concurrent.ExecutionContext.parasitic)
 
   /** Stops the CRL's threads. Blocks until they have stopped */

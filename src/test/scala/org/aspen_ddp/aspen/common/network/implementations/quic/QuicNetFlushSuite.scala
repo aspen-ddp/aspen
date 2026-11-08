@@ -215,9 +215,9 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     try
       eventually("the sender is running"):
         sent.get() > 100
-      val start = System.nanoTime()
+      // The sender never stops, so a flush that waited for messages sent after it was called would never complete:
+      // completing within the bound is the whole check. (A separate elapsed-time check would need the same load scaling)
       c.net.awaitPendingMessagesSent(LoadProbe.scale(Duration(5, SECONDS))) shouldBe true
-      elapsedMillis(start) should be < 5000L
       sender.isAlive shouldBe true
     finally
       running.set(false)

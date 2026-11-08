@@ -78,11 +78,27 @@ trait FailedStorageDeviceTestHarness:
 
   /** Wait until `passes` has advanced by `n`. A pass already running when this is called may be
    *  the first to finish, so the assertion that follows is made after at least n - 1 passes that
-   *  began afterwards. Deterministic where a fixed sleep only hopes passes ran. */
+   *  began afterwards. Deterministic where a fixed sleep only hopes passes ran.
+   *
+   *  The bound only detects a stalled task: a pass reads every store's device and tries each
+   *  candidate store, and with the full suite running beside a loaded machine five of them took
+   *  over 20 s. A timeout reports how far the passes got and when each finished. */
   protected def awaitPasses(passes: => Int, n: Int): Future[Unit] =
-    val target = passes + n
-    awaitUntil(s"$n more polling passes", Duration(20000, MILLISECONDS))(
-      Future.successful(passes >= target))
+    given ExecutionContext = executionContext
+    val start = passes
+    val target = start + n
+    val t0 = System.nanoTime()
+    var finishedAt: List[Long] = Nil
+    var seen = start
+    awaitUntil(s"$n more polling passes"):
+      val p = passes
+      if p != seen then
+        finishedAt = (System.nanoTime() - t0) / 1000000 :: finishedAt
+        seen = p
+      Future.successful(p >= target)
+    .recover:
+      case e: Throwable =>
+        throw new AssertionError(s"$e: passes went from $start to $passes, finishing at ms ${finishedAt.reverse.mkString(", ")}", e)
 
   protected def statusOf(deviceId: StorageDeviceId,
                          sid: StoreId): Future[Option[StorageDeviceState.StoreStatus]] =

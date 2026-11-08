@@ -1,13 +1,6 @@
 TODO
 ====
 
-Adopt a storage device without a clean shutdown. Once each device carries its own CRL (see
-docs/superpowers/specs/2026-11-07-per-device-crl-and-commit-ordering-design.md), the common case should be: yank a
-drive out of a running or crashed machine, plug it into another host, and have it adopted and put back into service.
-A shutdown first is still required when the device's CRL is not physically on the device. A reasonable host
-configuration places the CRLs of HDD devices on an NVMe device to avoid double-writing to already slow media; for such
-a device, the shutdown must write its current CRL state onto the drive in preparation for the physical move.
-
 Potential hole in transaction recovery. Scenario, a Tx starts and reaches a commit decision. A store that voted to
 commit crashes and recovers after the transaction was finalized and expunged from the transaction cache. Enough stores
 fail to put the object at read-threshold and the store's pre-committed state is now required to restore the object.

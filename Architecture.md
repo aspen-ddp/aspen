@@ -517,19 +517,17 @@ This process continues indefinitely and the CRL data is never read during normal
 time the log is read is during the initialization process to restore into memory the state needed to 
 resume the transactions from where they left off.
 
-Given the high-volume of data being sent to the CRL, most deployments will probably want to back the 
-CRL files with NVMe or SSD media. Importantly, the data in the CRL is centralized and the state for 
-transactions affecting all the DataStores on the host are commingled. Consequently, the in-flight 
-transaction data is NOT stored on the StorageDevice hosting the DataStore. So, you can’t just pull a 
-drive out of one host and plug it into another. A drive must first be shut down with the 
-`shutdown-device` command: its host closes every DataStore on it, writing each one's active transaction 
-state into the DataStore's folder on the drive (the same mechanism used when transferring a DataStore 
-between hosts), records on the drive which host shut it down, and marks the device Shutdown. The drive 
-can then be pulled and plugged into any other host. That host notices the new drive within ten seconds, 
-checks that every DataStore was closed properly, and adopts it in a single transaction that moves the 
-device and its DataStores to the new host before loading them. A drive pulled before its shutdown 
-finished is refused; plugging it back into its original host lets the shutdown complete. A shut-down 
-drive left in, or returned to, its original host stays offline until `restart-device` is used.
+Each StorageDevice has its own CRL, stored on the device itself and shared by the DataStores it hosts. 
+A device's in-flight transaction state therefore travels with the drive, so a drive can be pulled out of 
+one host, even a running or crashed one, and plugged into another. The new host notices the drive within 
+ten seconds and adopts it in a single transaction that moves the device and its DataStores to the new 
+host. It then loads them and recovers their transactions from the device's CRL, as the original host 
+would have done after a crash. Updates the DataStores missed while the drive was out are repaired like 
+those missed during any host outage. If the original host is still running, it stops serving the device 
+once it sees that the device has a new owner. The `shutdown-device` command is still useful for a 
+planned move: it takes the device's DataStores offline cleanly and marks the device Shutdown. A 
+shut-down drive left in, or returned to, its original host stays offline until `restart-device` is 
+used. A drive is adopted only when its CRL is on it.
 
 Aspen is currently being co-developed with the distributed file system [AmoebaFS](Amoebafs.md) which is 
 Aspen's first real-world use case. AmoebaFS and designed both validate and demonstrate most of 

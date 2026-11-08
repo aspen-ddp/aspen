@@ -26,6 +26,27 @@ Device CRL recovery runs on the host control thread
     the host. Move the open off the control thread (as BackendOpener does for FSIF opens) and post the result back.
     Fold into the device I/O isolation item above.
 
+Off-device CRLs
+  - A reasonable host configuration puts the CRLs of HDD devices on an NVMe device, so already-slow media is not
+    written twice. Today a device's CRL is always `<device>/crl` (CrashRecoveryLog.deviceCrlDir); add a per-device
+    location (e.g. a `crl-dir` in the device config, defaulting to the device directory).
+  - Such a device cannot be adopted without a shutdown: its transaction state is not on the drive. The shutdown must
+    write the CRL state onto the device as its final step before `shutdown.state`/`Shutdown`: copy it into a
+    temporary directory on the device (`<device>/crl.incoming-<uuid>`), force the files and the directory, then
+    atomically rename it to `<device>/crl` and force the device directory.
+  - Adoption already requires `<device>/crl` when the device holds stores
+    (docs/superpowers/specs/2026-11-08-unclean-device-adoption-design.md), so a drive pulled before that rename (or
+    without a shutdown) is refused until it returns to its host. The device directory must therefore never carry a
+    stale `crl` from an earlier move: delete it (durably) once the CRL lives elsewhere again.
+  - The lost-CRL rule in DeviceDiscovery.openDeviceCrl (stores but no `<device>/crl`) must check the configured
+    location instead.
+  - An adopting host whose own config puts the device's CRL elsewhere may move it off the device: copy, force, then
+    switch atomically, never leaving two live copies that could both be opened.
+  - A restart on the same host after a shutdown, or a cancelled shutdown, must open whichever copy is current. Decide
+    which copy wins and make the switch a single durable step.
+  - CRL sizing (`crl-num-streams`/`crl-max-file-size-mb`) still travels with the device config, so a moved CRL opens
+    with the same geometry.
+
 System-level protection against correlated "lost store" declarations
   - The main source of data loss in a system like this is not hardware. It is a systemic bug that wrongly triggers
     one of the automatic lost-store paths: a store decides from local evidence alone that its content can't be

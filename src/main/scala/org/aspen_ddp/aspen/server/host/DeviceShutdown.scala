@@ -34,6 +34,9 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
   // markers and transact the device state a second time in parallel with the first.
   private var shuttingDownDevices: Set[StorageDeviceId] = Set()
 
+  // Devices whose relinquishDevice sequence is running. One at a time per device, for the same reason.
+  private var relinquishingDevices: Set[StorageDeviceId] = Set()
+
   // The stores each device's shutdown has closed cleanly in this process and nothing has loaded again since. A
   // cancelled shutdown leaves them offline with nothing on disk to say so, so the reconcile loads them back
   // (reloadClosedStores). Forgotten when the device is unloaded: a restart or an adoption loads them from disk.
@@ -226,6 +229,54 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
           closedForShutdown += deviceId -> (closedForShutdown.getOrElse(deviceId, Set()) + storeId)
         ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
     .map(_ => ())
+
+  /** Stops serving a loaded device that the storage-devices tree records as owned by `remote.hostId`, another host:
+   *  its drive was pulled from this host and adopted there. Its work is stopped as a shutdown's is, its loaded
+   *  stores closed and taken offline, and the device and its CRL unloaded. No marker, shutdown.state or tree entry
+   *  is written for it: it is that host's now (closing a backend writes only what a crash would leave, and on a
+   *  pulled drive nothing at all). No StoreOffline is gossiped either, as the stores are served there (its
+   *  StoreMoved has told peers so). A store whose close fails is left as its failure leaves it.
+   *
+   *  The directory is disowned first, so a scan meanwhile, or after the unload, does not load it again. One sequence
+   *  at a time per device; a failure leaves the device loaded for the next check to try again. */
+  def relinquishDevice(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    val deviceId = local.storageDeviceId
+    if ! relinquishingDevices.contains(deviceId) then
+      relinquishingDevices += deviceId
+      logger.warn(s"Storage device $deviceId at ${local.devicePath} is now owned by host ${remote.hostId}. " +
+                  s"Unloading it without writing to it")
+      ctx.discovery.disown(local.devicePath)
+      val frelinquish =
+        try
+          val stopping = stopDeviceWork(local, remote)
+          for
+            _ <- awaitShutdownWork(deviceId, stopping)
+            _ <- closeStoresToRelinquish(local)
+          yield ()
+        catch case t: Throwable => Future.failed(t)
+      frelinquish.onComplete: result =>
+        relinquishingDevices -= deviceId
+        result match
+          case Success(_) =>
+            if ctx.devices.devices.get(deviceId).exists(_ eq local) then
+              unloadDevice(deviceId)
+              logger.info(s"Storage device $deviceId, owned by host ${remote.hostId}, is unloaded")
+          case Failure(t) =>
+            logger.warn(s"Failed to unload storage device $deviceId, owned by host ${remote.hostId}. The next " +
+                        s"check of the device will try again. Error: $t")
+
+  /** Closes every store open on a relinquished device, one at a time, until none is left: one loaded meanwhile is
+   *  closed by another round. */
+  private def closeStoresToRelinquish(local: LocalStorageDeviceState): Future[Unit] =
+    val open = storesToClose(local)
+    if open.isEmpty then
+      Future.unit
+    else
+      runSequentially(open): storeId =>
+        ctx.closeStoreForShutdown(storeId).transform(_ => Success(())).map: _ =>
+          ctx.router.markOffline(storeId)
+          local.offlineStores += storeId
+      .flatMap(_ => closeStoresToRelinquish(local))
 
   /** The stores closeStoresForShutdown picks: those loaded on the device and not offline. A crash
    *  mid-shutdown reloads the device, ShuttingDown, with its stores served, and they are closed again. */

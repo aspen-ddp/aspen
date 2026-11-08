@@ -582,7 +582,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       host.control.reconciler.activeDeviceChecks should be(empty)
       host.control.reconciler.deferredDeviceChecks should be(empty)
 
-  atest("a device owned by another host is not loaded or claimed"):
+  atest("a device owned by another host is looked up, not loaded"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = Some(HostId(UUID.randomUUID())))
     os.makeDir.all(deviceDir / storeId.directoryName)
@@ -594,11 +594,11 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     Future.successful:
       loadedDevices(host).keySet should be(empty)
       recorded(host).storeLoadAttempts should be(empty)
-      // Never loaded, so never checked: nothing reads the device's state, let alone writes it.
-      recorded(host).lookupAttempts should be(empty)
-      host.control.discovery.reportedDeviceDirs should be(Set(deviceDir))
+      // One lookup, still in flight: whether it may be adopted depends on the tree (DeviceAdoptionSuite)
+      recorded(host).lookupAttempts.toList should be(List(deviceA))
+      host.control.discovery.pendingMarkerResolutions should be(Set(deviceDir))
 
-  atest("a loaded device the tree records as owned by another host is left alone"):
+  atest("a loaded device the tree records as owned by another host is relinquished and not loaded again"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newHost(hostRoot)
@@ -611,10 +611,20 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing, None)),
       deviceSetId))
 
-    yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).map: _ =>
+    yieldUntil(!loadedDevices(host).contains(deviceA) && host.control.devices.closingCrls.isEmpty).map: _ =>
+      loadedDevices(host).keySet should be(empty)
+      host.control.discovery.disownedDeviceDirs should be(Set(deviceDir))
+      // Its owning-host file still names this host, but the scan leaves it alone
+      host.control.reconciler.scan()
+      loadedDevices(host).keySet should be(empty)
       os.exists(deviceDir / storeId.directoryName) should be(false)
+      os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
+      DeviceMarkers.readOwningHost(deviceDir) should be(Some(HostId.BootstrapHostId))
       recorded(host).storeLoadAttempts.size should be(before)
-      loadedDevices(host).keySet should be(Set(deviceA))
+      // Forgotten once its directory goes, so a disk inserted there later is read afresh
+      os.move(deviceDir, hostRoot / "parked-dev0")
+      host.control.reconciler.scan()
+      host.control.discovery.disownedDeviceDirs should be(empty)
 
   atest("the device scan skips directories that are already loaded"):
     val hostRoot = newHostDir()

@@ -74,10 +74,14 @@ object Host:
   private[server] case class SystemTaskHeartbeatEvent() extends Event
   private[server] case class CheckAllDevices() extends Event
   private[server] case class ScanDevices() extends Event
-  private[server] case class ShutdownMarkerResolved(path: os.Path,
-                                            cfg: StorageDeviceConfig,
-                                            markerHost: HostId,
-                                            state: Try[StorageDeviceState]) extends Event
+  /** The StorageDeviceState looked up for a device directory this host does not load on its own: one carrying
+   *  `shutdown.state` (`fromShutdownMarker`), or one whose `owning-host` names another host. `previousHost` is the
+   *  host that file names. See DeviceDiscovery.handleOwnershipResolved. */
+  private[server] case class DeviceOwnershipResolved(path: os.Path,
+                                                     cfg: StorageDeviceConfig,
+                                                     previousHost: HostId,
+                                                     fromShutdownMarker: Boolean,
+                                                     state: Try[StorageDeviceState]) extends Event
   /** Closes a store. `extractCrl` (a network transfer out only) moves its CRL state out of the device CRL into its
    *  crl_save.log; otherwise the state stays live in the device CRL. See StoreLoader.handleClose. */
   private[server] case class ShutdownStore(storeId: StoreId, extractCrl: Boolean, completion: Promise[Unit])
@@ -432,8 +436,8 @@ class Host(val client: AspenClient,
 
       case CheckAllDevices() => reconciler.checkAll()
 
-      case e: ShutdownMarkerResolved =>
-        deviceControl.discovery.handleMarkerResolved(e)
+      case e: DeviceOwnershipResolved =>
+        deviceControl.discovery.handleOwnershipResolved(e)
 
       case ScanDevices() => reconciler.scan()
 

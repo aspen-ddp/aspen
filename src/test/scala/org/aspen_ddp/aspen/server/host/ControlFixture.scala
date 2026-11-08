@@ -522,18 +522,18 @@ trait ControlFixture:
     host.testingOnlyHandleEvents()
 
   private def isMarkerResolution(task: Runnable): Boolean = task match
-    case t: Host.EventTask => t.event.isInstanceOf[Host.ShutdownMarkerResolved]
+    case t: Host.EventTask => t.event.isInstanceOf[Host.DeviceOwnershipResolved]
     case _ => false
 
   private def lockstep(host: Host): LockstepThreading = host.threading match
     case t: LockstepThreading => t
     case other => throw new IllegalStateException(s"Needs LockstepThreading, not ${other.getClass.getSimpleName}")
 
-  /** How many ShutdownMarkerResolved events are queued. */
+  /** How many DeviceOwnershipResolved events are queued. */
   protected def queuedMarkerEvents(host: Host): Int =
     lockstep(host).queuedItems.count(isMarkerResolution)
 
-  /** Removes the queued ShutdownMarkerResolved events and handles them, leaving every other event queued. */
+  /** Removes the queued DeviceOwnershipResolved events and handles them, leaving every other event queued. */
   protected def handleMarkerEvents(host: Host): Unit =
     lockstep(host).removeQueued(isMarkerResolution).foreach(_.run())
 

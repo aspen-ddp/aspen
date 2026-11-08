@@ -108,13 +108,11 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  to Rebuilding, reinstates stores left offline by an abandoned transfer out or a cancelled
    *  shutdown, creates Initializing stores, and starts transfers in.
    *
-   *  If the tree records a different host, none of that happens and the device is not claimed.
-   *  tryLoadDevice only loads a device whose `owning-host` file names this host, so a mismatch
-   *  means the file and the tree disagree -- a hand-edited or copied file, or a device adopted
-   *  by another host and then carried back here without a shutdown (an adoption itself rewrites
-   *  the file only after its commit, while shutdown.state still keeps the device unloaded) --
-   *  and reconciling against another host's records could delete or create
-   *  stores that are not ours. It is logged once per device and left for an operator.
+   *  If the tree records a different host, none of that happens and the device is relinquished
+   *  (DeviceShutdown.relinquishDevice): another host has adopted it, normally because its drive
+   *  was pulled from this running host and plugged in there. Reconciling against another host's
+   *  records could delete or create stores that are not ours, and serving them would compete
+   *  with the host that now does.
    *  A device the tree records as failed is ignored outright: it is neither claimed nor
    *  reconciled, and its stores are being rebuilt elsewhere.
    *  A device the tree records as ShuttingDown (or Shutdown) is handed to shutDownDevice instead
@@ -128,8 +126,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // another owner by the branch below. Its stores are being rebuilt elsewhere.
       logger.info(s"Ignoring failed storage device ${local.storageDeviceId}")
     else if remote.hostId != ctx.hostId then
-      ctx.discovery.warnOnce(local.devicePath,
-        s"Storage device ${local.storageDeviceId} owned by host ${remote.hostId} is loaded here. Not claiming it")
+      ctx.shutdown.relinquishDevice(local, remote)
     else if remote.status == StorageDeviceState.DeviceStatus.ShuttingDown ||
             remote.status == StorageDeviceState.DeviceStatus.Shutdown ||
             ctx.shutdown.isShuttingDown(local.storageDeviceId) then

@@ -439,7 +439,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
               // produces "healthy device, entry vanished", but it's the wrong default.
               RebuildOutcome.Discard
 
-  /** Moves a device shut down by `previousHostId` onto this host, in one transaction:
+  /** Moves a device last owned by `previousHostId`, shut down or not, onto this host, in one transaction:
    *  - the device: Offline stores Active, status Operational, hostId this host;
    *  - every pool entry naming this device: hostId this host. Entries naming another device are
    *    left alone -- a TransferringIn entry's pool still names its source;
@@ -448,13 +448,20 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
    *
    *  Every object written carries a KeyRevision, so a restart on the old host or a second
    *  adopter racing this one makes one of them lose and re-read. Returns Changed, writing nothing,
-   *  when the re-read finds the device no longer Shutdown and owned by `previousHostId`, and
-   *  Unclean, writing nothing, when an Offline entry of the re-read state has no directory under
-   *  `devicePath` (DeviceDiscovery.adoptionClass): the state validated is the state committed, so an
-   *  entry gone Offline since the caller's lookup is checked too. Adopted carries the state
+   *  when the re-read finds the device Failed or no longer owned by `previousHostId`, and
+   *  Unclean, writing nothing, when an Offline or Active entry of the re-read state has no directory
+   *  under `devicePath` (DeviceDiscovery.adoptionClass): the state validated is the state committed,
+   *  so an entry changed since the caller's lookup is checked too. Adopted carries the state
    *  written, which the post-commit steps act on. The
    *  previous host's HostState is skipped if that host has no entry in the hosts tree: it was
    *  removed, and there is nothing left to take the device out of.
+   *
+   *  Its status does not matter. A device that is Operational or ShuttingDown was pulled without
+   *  (or before the end of) a shutdown, and is in the state a crash of the previous host leaves it:
+   *  its Active entries stay Active, and Rebuilding and Transferring ones are resumed by the same
+   *  paths that resume them after a crash. A shutdown in progress ends with the adoption. Once
+   *  committed, the previous host is nudged, so that if it is still running it relinquishes the
+   *  device now rather than at its next periodic check.
    *
    *  Only a collision is retried, as everywhere else in Host: a permanent error would otherwise
    *  hold the device's pendingMarkerResolutions entry for the life of the process.
@@ -496,7 +503,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
         state = StorageDeviceState(devKvos)
         unclean = uncleanStores(devicePath, state)
         adopted <-
-          if state.status != DeviceStatus.Shutdown || state.hostId != previousHostId then
+          if state.isFailed || state.hostId != previousHostId then
             Future.successful(AdoptOutcome.Changed)
           else if unclean.nonEmpty then
             Future.successful(AdoptOutcome.Unclean(unclean))
@@ -553,7 +560,10 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
               writeHost(newPtr, newKvos, HostState(newKvos).addStorageDevice(storageDeviceId))
 
               tx.result.foreach: _ =>
-                logger.info(s"Adopted storage device $storageDeviceId from host $previousHostId")
+                logger.info(s"Adopted storage device $storageDeviceId (${state.status}) from host $previousHostId")
+                // Best-effort: the previous host's periodic check is the guarantee
+                client.sendBestEffortHostMessage(
+                  CheckStorageDevice(previousHostId, client.clientId, storageDeviceId))
               AdoptOutcome.Adopted(newState)
       yield adopted
 

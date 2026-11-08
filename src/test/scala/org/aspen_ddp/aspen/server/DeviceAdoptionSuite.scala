@@ -256,12 +256,81 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
         writeTransferringOutStore(dir / os.up, s)
         corrupt(Backend.crlSaveFile(dir), s)
 
-  atest("a device whose shutdown did not finish is refused by another host"):
+  /** The device directory as pulled from its host without a shutdown: `owning-host` naming `owningHost`, and no
+   *  `shutdown.state`. */
+  private def writePulledDevice(owningHost: HostId): (os.Path, os.Path) =
+    val hostRoot = newHostDir()
+    (hostRoot, writeDevice(hostRoot, "dev0", deviceA, owner = Some(owningHost)))
+
+  atest("a device pulled from its host without a shutdown is adopted"):
+    given ExecutionContext = executionContext
+    val rebuilds = new RecordingRebuildFactory
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Operational, 3, registerOldHost = true): ss =>
+                  Map(ss(0) -> StoreEntry(StoreStatus.Active, None), ss(1) -> rebuilding,
+                      ss(2) -> StoreEntry(StoreStatus.TransferringOut, Some(deviceB), Some(UUID.randomUUID())))
+      List(s0, s1, s2) = stores: @unchecked
+      (hostRoot, deviceDir) = writePulledDevice(oldHostId)
+      d0 = writeClosedStore(deviceDir, s0)
+      d2 = writeTransferringOutStore(deviceDir, s2)
+      _ = net.takeCapturedGossip()
+      _ = net.takeCapturedHostMessages()
+      host = newHost(hostRoot, storeRebuildFactory = rebuilds)
+      _ <- resolve(host)
+      st <- state(deviceA)
+      oldHostState <- client.getHostState(oldHostId)
+      newHostState <- client.getHostState(HostId.BootstrapHostId)
+      entries <- Future.sequence(stores.map(poolEntry))
+    yield
+      recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
+      st.status should be(DeviceStatus.Operational)
+      st.hostId should be(HostId.BootstrapHostId)
+      st.stores(s0).status should be(StoreStatus.Active)
+      st.stores(s1) should be(rebuilding)
+      st.stores(s2).status should be(StoreStatus.TransferringOut)
+      oldHostState.storageDevices should not contain deviceA
+      newHostState.storageDevices should contain(deviceA)
+      entries.map(_.hostId).toSet should be(Set(HostId.BootstrapHostId))
+      DeviceMarkers.readOwningHost(deviceDir) should be(Some(HostId.BootstrapHostId))
+      os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
+      os.exists(marker(d2)) should be(true)
+      loadedDevices(host).contains(deviceA) should be(true)
+      recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
+      storeMoves().map(_.storeId) should be(List(s0))
+      net.takeCapturedHostMessages().collect { case m: CheckStorageDevice => m } should contain(
+        CheckStorageDevice(oldHostId, client.clientId, deviceA))
+
+  for withMarker <- List(true, false) do
+    val how = if withMarker then "after writing shutdown.state" else "before writing shutdown.state"
+    atest(s"a device pulled while shutting down, $how, is adopted"):
+      given ExecutionContext = executionContext
+      for
+        // s0 was closed by the shutdown, s1 not yet: both have their state in the device CRL
+        stores <- setUpMetadata(oldHostId, DeviceStatus.ShuttingDown, 2, registerOldHost = true): ss =>
+                    Map(ss(0) -> offline, ss(1) -> offline)
+        List(s0, s1) = stores: @unchecked
+        (hostRoot, deviceDir) =
+          if withMarker then writeCarriedDevice(oldHostId, oldHostId) else writePulledDevice(oldHostId)
+        d0 = writeClosedStore(deviceDir, s0)
+        d1 = writeClosedStore(deviceDir, s1)
+        host = newHost(hostRoot)
+        _ <- resolve(host)
+        st <- state(deviceA)
+      yield
+        recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
+        st.status should be(DeviceStatus.Operational)
+        st.hostId should be(HostId.BootstrapHostId)
+        st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Active))
+        loadedDevices(host).contains(deviceA) should be(true)
+        os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
+        recorded(host).storeLoadAttempts.map(_._2) should contain allOf (d0, d1)
+
+  atest("a pulled device whose store directory is missing is refused"):
     given ExecutionContext = executionContext
     for
-      stores <- setUpMetadata(oldHostId, DeviceStatus.ShuttingDown, 1, registerOldHost = true): ss =>
-                  Map(ss(0) -> offline)
-      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Operational, 2, registerOldHost = true): ss =>
+                  Map(ss(0) -> StoreEntry(StoreStatus.Active, None), ss(1) -> StoreEntry(StoreStatus.Active, None))
+      (hostRoot, deviceDir) = writePulledDevice(oldHostId)
       _ = writeClosedStore(deviceDir, stores.head)
       host = newHost(hostRoot)
       _ <- resolve(host)
@@ -271,9 +340,50 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       loadedDevices(host).contains(deviceA) should be(false)
       recorded(host).adoptCalls.toList should be(Nil)
       recorded(host).deviceDirWarnings.count(_._1 == deviceDir) should be(1)
-      st.status should be(DeviceStatus.ShuttingDown)
       st.hostId should be(oldHostId)
-      DeviceMarkers.readShutdownState(deviceDir) should be(Some(oldHostId))
+      DeviceMarkers.readOwningHost(deviceDir) should be(Some(oldHostId))
+
+  private val thirdHostId = HostId(UUID.fromString("0a0a0a0a-0000-0000-0000-000000000003"))
+
+  for (what, status, owner) <- List(("declared failed", DeviceStatus.Failed, oldHostId),
+                                    ("owned by a third host", DeviceStatus.Operational, thirdHostId)) do
+    atest(s"a pulled device the tree records as $what is refused"):
+      given ExecutionContext = executionContext
+      for
+        stores <- setUpMetadata(owner, status, 1, registerOldHost = false): ss =>
+                    Map(ss(0) -> StoreEntry(StoreStatus.Active, None))
+        (hostRoot, deviceDir) = writePulledDevice(oldHostId)
+        _ = writeClosedStore(deviceDir, stores.head)
+        host = newHost(hostRoot)
+        _ <- resolve(host)
+        _ <- scanAndResolve(host)
+        st <- state(deviceA)
+      yield
+        loadedDevices(host).contains(deviceA) should be(false)
+        recorded(host).adoptCalls.toList should be(Nil)
+        recorded(host).deviceDirWarnings.count(_._1 == deviceDir) should be(1)
+        st.hostId should be(owner)
+        DeviceMarkers.readOwningHost(deviceDir) should be(Some(oldHostId))
+
+  atest("a crash between a pulled device's adoption commit and its owning-host rewrite is finished on the next scan"):
+    given ExecutionContext = executionContext
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Operational, 1, registerOldHost = true): ss =>
+                  Map(ss(0) -> StoreEntry(StoreStatus.Active, None))
+      s0 = stores.head
+      _ <- setDeviceState(deviceA)(_.copy(hostId = HostId.BootstrapHostId))
+      _ <- setPoolEntry(s0, HostId.BootstrapHostId, deviceA)
+      (hostRoot, deviceDir) = writePulledDevice(oldHostId)
+      d0 = writeClosedStore(deviceDir, s0)
+      _ = net.takeCapturedGossip()
+      host = newHost(hostRoot)
+      _ <- resolve(host)
+    yield
+      recorded(host).adoptCalls.toList should be(Nil)
+      loadedDevices(host).contains(deviceA) should be(true)
+      DeviceMarkers.readOwningHost(deviceDir) should be(Some(HostId.BootstrapHostId))
+      recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
+      storeMoves().map(_.storeId) should be(List(s0))
 
   atest("a crash between the adoption commit and the load is finished on the next scan"):
     given ExecutionContext = executionContext

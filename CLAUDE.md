@@ -311,14 +311,20 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   (`server.DeviceMarkers`), so the 10 s scan decides without the network; only a dir with `shutdown.state` needs a
   device-state lookup. On the same host a Shutdown device waits for `restartStorageDevice`; a restart that cancels a
   shutdown in flight has the reconcile load the closed stores again (`DeviceShutdown.reloadClosedStores`). Another host
-  adopts it only when Shutdown and every Offline store has a directory, in one transaction rewriting the device, its
-  pool entries and both HostStates, then rewrites `owning-host` and loads it: it opens the device CRL and each store
-  recovers its transactions from it
+  adopts it, in one transaction rewriting the device, its pool entries and both HostStates, then rewrites
+  `owning-host` and loads it: it opens the device CRL and each store recovers its transactions from it
+- Adoption needs no shutdown: a drive pulled from a running or crashed host is in the state that host's crash leaves
+  it in. A device whose `shutdown.state` (or, absent that, `owning-host`) names another host is looked up and adopted
+  when the tree records it as owned by that host and not Failed, `<device>/crl` exists (if it holds stores), and
+  every Offline or Active entry has a directory. Physical presence is trusted: there is no fencing of the old host.
+  A running old host whose reconcile finds the tree naming another owner relinquishes the device
+  (`DeviceShutdown.relinquishDevice`): it closes the stores, unloads the device, writes nothing, and keeps the
+  directory disowned in memory. The adopter nudges it with `CheckStorageDevice`
 - `crl_save.log`, `transferring-out` and `transferred-in` are for network transfers only: a transfer out closes the
   store with `extractCrl`, copying its state from the device CRL into `crl_save.log` to travel with it. Such a file is
   then the only copy of that state: if it fails to load (missing, truncated, or naming another store) the store is
   never served. It gets a `rebuild-required` marker, its entry is flipped to Rebuilding by the reconcile, and the
-  directory is discarded before the rebuild. Adoption of a Shutdown device does the same for a `transferring-out` store
+  directory is discarded before the rebuild. Adoption of a device does the same for a `transferring-out` store
   without a valid save file instead of refusing the device, and adopts any `rebuild-required` directory as Rebuilding
   whatever its other markers. A network transfer validates the staged copy's save file before promotion and retries on
   failure, since the source still holds the state

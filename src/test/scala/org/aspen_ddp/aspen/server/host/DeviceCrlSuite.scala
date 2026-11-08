@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState,
   StoragePoolState}
-import org.aspen_ddp.aspen.common.network.TxPrepare
+import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, TxPrepare}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Metadata, ObjectId, ObjectRefcount,
   ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
@@ -295,6 +295,118 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       adopted.stores(sid).status should be(StorageDeviceState.StoreStatus.Active)
       noMoveFiles(newDir / sid.directoryName) should be(true)
       DeviceMarkers.readOwningHost(newDir) should be(Some(HostId.BootstrapHostId))
+
+  atest("a device pulled from its running host is adopted with its in-flight transaction and relinquished there"):
+    given ExecutionContext = executionContext
+    val oldRoot = newHostDir()
+    val oldDir = writeSmallCrlDevice(oldRoot, "dev0", deviceA, owner = oldHostId)
+    createCrl(oldDir)
+    val first = newFactory()
+    val second = newFactory()
+    for
+      _ <- client.createHost("old-host", "10.0.0.9", 5750, 5751, 5752, oldHostId)
+      _ <- net.createDevice(deviceA)
+      pool <- client.createNewStoragePool("crl-pull-pool", Replication(1, 1), None, RocksDBConfig(),
+                StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      sid = StoreId(pool, 0.toByte)
+      _ <- client.transactUntilSuccessful: tx =>
+             for
+               ptr <- client.getStoragePoolPointer(pool)
+               kvos <- client.read(ptr)
+             yield
+               val cfg = StoragePoolState(kvos)
+               cfg.stores(0) = StoragePoolState.StoreEntry(oldHostId, deviceA)
+               tx.update(ptr, None, None,
+                 List(KeyRevision(StoragePoolState.ConfigKey, kvos.contents(StoragePoolState.ConfigKey).revision)),
+                 List(Insert(StoragePoolState.ConfigKey, cfg.encode())))
+      _ <- setDeviceState(deviceA)(_.copy(hostId = oldHostId,
+             stores = Map(sid -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+      _ <- client.transactUntilSuccessful: tx =>
+             for
+               ptr <- client.getHostPointer(oldHostId)
+               kvos <- client.read(ptr)
+             yield
+               tx.update(ptr, None, None,
+                 List(KeyRevision(HostState.StateKey, kvos.contents(HostState.StateKey).revision)),
+                 List(Insert(HostState.StateKey, HostState(kvos).addStorageDevice(deviceA).encode())))
+      _ <- waitForTransactionsToComplete()
+      oldStoreDir <- writeRocksStore(oldDir, sid)
+      oldHost = newCrlHost(oldRoot, first, hostId = oldHostId)
+      _ <- pumpUntil(oldHost, oldHost.control.router.loaded.contains(sid))
+      _ <- prepareInFlight(oldHost, first.opened.head, sid, txid)
+      // The drive is pulled while the old host runs: its files are released, as a vanished disk's are, and nothing
+      // on it is written again. The old host still has the device and the store loaded.
+      _ <- oldHost.control.router.loaded(sid).backend.close()
+      _ = first.opened.head.inner.shutdown()
+      newRoot = newHostDir()
+      newDir = StorageDeviceManager.deviceDirectory(newRoot, "dev0")
+      _ = os.move(oldDir, newDir)
+      _ = net.takeCapturedHostMessages()
+      host = newCrlHost(newRoot, second)
+      _ <- pumpWithTx(host, recovered(host, sid, txid))
+      adopted <- client.getStorageDeviceState(deviceA)
+      oldHostState <- client.getHostState(oldHostId)
+      newHostState <- client.getHostState(HostId.BootstrapHostId)
+      poolEntry <- client.getStoragePoolState(pool).map(_.stores(0))
+      recoveredTx = recovered(host, sid, txid)
+      nudges = net.takeCapturedHostMessages().collect { case m: CheckStorageDevice => m }
+      loadedBeforeNudge = oldHost.control.devices.devices.contains(deviceA)
+      _ = nudges.filter(_.toHost == oldHostId).foreach(oldHost.control.reconciler.handleCheckMessage)
+      _ <- pumpWithTx(oldHost, !oldHost.control.devices.devices.contains(deviceA))
+      _ <- host.control.router.loaded.get(sid).map(_.backend.close()).getOrElse(Future.unit)
+    yield
+      recoveredTx should be(true)
+      adopted.status should be(StorageDeviceState.DeviceStatus.Operational)
+      adopted.hostId should be(HostId.BootstrapHostId)
+      adopted.stores(sid).status should be(StorageDeviceState.StoreStatus.Active)
+      oldHostState.storageDevices should not contain deviceA
+      newHostState.storageDevices should contain(deviceA)
+      poolEntry.hostId should be(HostId.BootstrapHostId)
+      DeviceMarkers.readOwningHost(newDir) should be(Some(HostId.BootstrapHostId))
+      os.exists(newDir / DeviceMarkers.ShutdownStateFile) should be(false)
+      noMoveFiles(newDir / sid.directoryName) should be(true)
+      nudges.map(_.toHost) should contain(oldHostId)
+      loadedBeforeNudge should be(true)
+      oldHost.control.devices.devices.contains(deviceA) should be(false)
+      oldHost.control.router.loaded.contains(sid) should be(false)
+      oldHost.control.router.isOffline(sid) should be(true)
+
+  atest("a device holding stores without its CRL directory is not adopted until the CRL is on it"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA, owner = oldHostId)
+    val factory = newFactory()
+    for
+      _ <- client.createHost("old-host", "10.0.0.9", 5750, 5751, 5752, oldHostId)
+      _ <- net.createDevice(deviceA)
+      pool <- client.createNewStoragePool("crl-missing-pool", Replication(1, 1), None, RocksDBConfig(),
+                StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      sid = StoreId(pool, 0.toByte)
+      _ <- setDeviceState(deviceA)(_.copy(hostId = oldHostId,
+             stores = Map(sid -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+      _ <- waitForTransactionsToComplete()
+      storeDir <- writeRocksStore(deviceDir, sid)
+      // As a shutdown copying an off-device CRL onto the drive leaves it when pulled before its final move
+      _ = os.remove.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpWithTx(host, host.control.discovery.reportedDeviceDirs.contains(deviceDir) &&
+                            host.control.discovery.pendingMarkerResolutions.isEmpty)
+      refused <- client.getStorageDeviceState(deviceA)
+      openedWhileRefused = factory.opened.size
+      markedWhileRefused = os.exists(marker(storeDir))
+      // The CRL arrives on the drive
+      _ = createCrl(deviceDir)
+      _ = host.control.reconciler.scan()
+      _ <- pumpWithTx(host, host.control.router.loaded.contains(sid))
+      adopted <- client.getStorageDeviceState(deviceA)
+      _ <- host.control.router.loaded.get(sid).map(_.backend.close()).getOrElse(Future.unit)
+    yield
+      refused.hostId should be(oldHostId)
+      openedWhileRefused should be(0)
+      markedWhileRefused should be(false)
+      adopted.hostId should be(HostId.BootstrapHostId)
+      adopted.stores(sid).status should be(StorageDeviceState.StoreStatus.Active)
+      os.exists(marker(storeDir)) should be(false)
 
   atest("a cancelled shutdown reloads its stores with their in-flight transactions"):
     given ExecutionContext = executionContext

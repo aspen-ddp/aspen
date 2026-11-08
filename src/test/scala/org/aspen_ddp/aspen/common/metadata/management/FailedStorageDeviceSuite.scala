@@ -10,7 +10,8 @@ import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.compute.DurableTaskFactory
+import org.aspen_ddp.aspen.compute.{DurableTaskFactory, DurableTaskPointer}
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
@@ -76,6 +77,55 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
     val p = Promise[Unit]()
     client.backgroundTaskManager.schedule(d)(p.success(()))
     p.future
+
+  /** Ticks the test fires itself */
+  private final class ManualTicks:
+    private var armed: List[() => Unit] = Nil
+    def count: Int = synchronized(armed.size)
+    def schedule(d: Duration, f: () => Unit): BackgroundTaskManager.ScheduledTask = synchronized:
+      armed = f :: armed
+      new BackgroundTaskManager.ScheduledTask:
+        def cancel(): Unit = ManualTicks.this.synchronized { armed = armed.filterNot(_ eq f) }
+    def fireAll(): Unit =
+      val now = synchronized:
+        val a = armed
+        armed = Nil
+        a
+      now.foreach(_())
+
+  atest("a tick dropped while a pass runs leaves the next one armed"):
+    // The pass re-arms the poll from inside itself, while it still holds the single-flight guard. A tick that fires
+    // before the guard is released is dropped, so it must arm the next one itself, or the task stalls for good
+    given ExecutionContext = executionContext
+    val ticks = new ManualTicks
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.failStorageDevice(net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      enrolled <- enrolledTasks()
+      task = new FailedStorageDeviceDurableTask(DurableTaskPointer(enrolled.head._2), client, net.secondDeviceId,
+               fastPoll, Some(ticks.schedule))
+      // The first pass is still reading the device: its reply is handled only once this step returns
+      armedDuringPass = ticks.count
+      _ = ticks.fireAll() // dropped by the guard
+      rearmed = ticks.count
+      _ <- driveUntil(ticks, task.completed.isCompleted, Duration(60000, MILLISECONDS))
+    yield
+      armedDuringPass should be(1)
+      rearmed should be(1)
+      task.completed.isCompleted should be(true)
+
+  /** Fires `ticks` every poll period until `done` or the timeout */
+  private def driveUntil(ticks: ManualTicks, done: => Boolean, timeout: Duration): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + timeout.toNanos
+    def loop(): Future[Unit] =
+      if done || System.nanoTime() > deadline then Future.unit
+      else
+        ticks.fireAll()
+        delay(fastPoll).flatMap(_ => loop())
+    loop()
 
   atest("step 1 zeroes both ids and removes the device from its set and host"):
     given ExecutionContext = executionContext

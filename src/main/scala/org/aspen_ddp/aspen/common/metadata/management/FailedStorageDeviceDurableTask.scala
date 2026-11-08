@@ -72,7 +72,10 @@ class FailedStorageDeviceDurableTask(
     val taskPointer: DurableTaskPointer,
     client: AspenClient,
     deviceId: StorageDeviceId,
-    pollPeriod: Duration
+    pollPeriod: Duration,
+    /** Arms a tick: runs the function after the delay unless cancelled. A test seam; None uses the client's
+     *  background task manager */
+    scheduleTick: Option[(Duration, () => Unit) => ScheduledTask] = None
 ) extends DurableTask with Logging:
 
   import FailedStorageDeviceDurableTask.StoreAlreadyMoved
@@ -84,6 +87,20 @@ class FailedStorageDeviceDurableTask(
 
   private var pollTask: ScheduledTask = NoTask
 
+  private val armTick: (Duration, () => Unit) => ScheduledTask =
+    scheduleTick.getOrElse((d, f) => client.backgroundTaskManager.schedule(d)(f()))
+
+  /** Test hook: entries into drive(), counted before anything in the pass can fail.
+   *
+   *  A wedged single-flight flag is indistinguishable from a healthy poll loop by every other
+   *  observable this class has -- the promise stays incomplete either way, and the logs are
+   *  silent either way. Only the pass count separates them, which is why this seam exists.
+   *
+   *  Not atomic, and does not need to be: entries into drive() are serialized by the
+   *  single-flight wrapper. @volatile is for the reading test thread. Declared before the first
+   *  run() below, so the first pass's count is not reset by this initializer. */
+  @volatile private[management] var testDriveCount: Int = 0
+
   /** Single-flight guard: a tick arriving while a pass is still running is dropped.
    *
    *  A failed Future or a synchronous throw out of processNext releases the guard rather than
@@ -91,8 +108,16 @@ class FailedStorageDeviceDurableTask(
    *  period of progress, so processNext should continue to handle its own errors. The remaining
    *  wedge mode is a Future that never completes: the guard reports it (see the device id in
    *  the name) but cannot break it, because it cannot distinguish it from a slow pass. */
-  private val run: () => Unit =
+  private val guardedRun: () => Unit =
     boundedSingleFlight(s"failed-device-task ${deviceId.uuid}")(processNext())
+
+  /** Every invocation, including one the guard drops, arms the next tick first. A pass re-arms
+   *  from inside itself (scheduleRecheck), while it still holds the guard: a tick firing before
+   *  the guard is released is dropped, and with nothing else armed the task stalls for good.
+   *  As in MigratePoolToSetDurableTask. */
+  private def run(): Unit =
+    scheduleRecheck()
+    guardedRun()
 
   // Begin driving immediately.
   run()
@@ -102,13 +127,14 @@ class FailedStorageDeviceDurableTask(
     if !promise.isCompleted then promise.failure(new TaskStopped)
 
   private def scheduleRecheck(): Unit = synchronized:
-    if !isStopped then
+    if !isStopped && !promise.isCompleted then
       pollTask.cancel()
-      pollTask = client.backgroundTaskManager.schedule(pollPeriod):
-        run()
+      pollTask = armTick(pollPeriod, () => run())
 
   private def finishOk(): Unit = synchronized:
-    if !promise.isCompleted then promise.success(None)
+    if !promise.isCompleted then
+      pollTask.cancel()
+      promise.success(None)
 
   private def processNext(): Future[Unit] =
     if isStopped then
@@ -138,16 +164,6 @@ class FailedStorageDeviceDurableTask(
           case _: Throwable => () // nothing left to report with; the next tick is the recovery
 
         Future.unit
-
-  /** Test hook: entries into drive(), counted before anything in the pass can fail.
-   *
-   *  A wedged single-flight flag is indistinguishable from a healthy poll loop by every other
-   *  observable this class has -- the promise stays incomplete either way, and the logs are
-   *  silent either way. Only the pass count separates them, which is why this seam exists.
-   *
-   *  Not atomic, and does not need to be: entries into drive() are serialized by the
-   *  single-flight wrapper. @volatile is for the reading test thread. */
-  @volatile private[management] var testDriveCount: Int = 0
 
   /** One pass: tombstone the device (step 1) or move one of its stores (step 2). */
   private def drive(): Future[Unit] =

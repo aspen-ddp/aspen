@@ -31,6 +31,8 @@ docs/investigations/2026-11-07-threaded-host-hang/.
     - StoreRouter treating stores as unknown, offline, loading or awaitingDevice, which makes them silent;
     - adaptive-pool mailbox moves;
     - TestNetwork.handleEvents outside lockstep.
+  - Also hung once on an idle machine in a plain `timeout 70 sbt test` at 6e8388cd (log:
+    idle-hang-6e8388cd.log.xz in the same directory), so it is not load-only.
   - Next step: at the hang, dump StoreRouter state and mailbox queue lengths to a file (sbt buffers a hung suite's
     stdout, and warns are suppressed in tests). Hunt on both HEAD and d7ab3839, about 8 minutes per loaded run.
 
@@ -83,7 +85,11 @@ too conservative or whether finalization actions collide more than they should.
 
 Load-sensitive test failures under full CPU load, all predating the host-refactor branch (seen on its base commits
 too): StoreTransferManagerSuite "one pass starts as many transfers as the floor admits", a StoreTransferManagerSuite
-broken pipe, QUIC and vdisk timing tests, and the intermittent "Hung Test" print in TKVLBatchSuite above. Flaky tests
+broken pipe, QUIC and vdisk timing tests, and the intermittent "Hung Test" print in TKVLBatchSuite above. Seen
+since (2026-11-07, not checked against older commits): SetRebalanceDurableTaskSuite "a source dying mid-transfer is
+waited out while it rebuilds, then the task finishes" (log:
+docs/investigations/2026-11-07-setrebalance-source-dying-failure.log.xz) and "a destination dying mid-transfer
+restores the source..." (its 60 s drain deadline). Flaky tests
 are not permitted: find what each one's timing depends on and make it deterministic.
 
 Fixed (2026-11-06): JVM SIGSEGV in librocksdbjni at `rocksdb::WriteBatchInternal::Count`, from

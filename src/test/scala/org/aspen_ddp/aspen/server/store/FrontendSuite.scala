@@ -1848,7 +1848,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     mkPrepare(txd, fromClient = true).copy(objectUpdates = updates)
 
   /** The bytes a prepare is admitted for */
-  def admissionBytes(m: TxPrepare): Long = m.txd.serialize().size + m.objectUpdates.map(_.data.size).sum
+  def admissionBytes(m: TxPrepare): Long = CrlAdmission.TxOverheadBytes + m.txd.serialize().size +
+    m.objectUpdates.map(_.data.size + CrlAdmission.ObjectUpdateOverheadBytes).sum
 
   test("a new prepare is dropped past the mark") {
     val admission = new CrlAdmission(100)
@@ -1925,6 +1926,46 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("a finalized transaction releases its admission: abort") {
     checkReleasedAtFinalization(committed = false, finalizeBeforePersisted = false)
+  }
+
+  test("object data arriving after a data-less prepare is charged once, and returned at finalization") {
+    // Past the mark once tx1 is admitted: the data is charged anyway, since tx1 is known
+    val admission = new CrlAdmission(1)
+    val (store, backend, net) = admissionStore(admission)
+    val withData = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+    val dataLess = withData.copy(objectUpdates = Nil, fromClient = false)
+
+    store.receiveTransactionMessage(dataLess)
+    admission.admittedBytes shouldBe admissionBytes(dataLess)
+    store.receiveTransactionMessage(withData)
+    admission.admittedBytes shouldBe admissionBytes(withData)
+    // A retransmission is not charged again
+    store.receiveTransactionMessage(withData)
+    admission.admittedBytes shouldBe admissionBytes(withData)
+    prepareResponses(net, txid1) should not be empty
+
+    store.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+    backend.deliverCommits()
+    store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true))
+    admission.admittedBytes shouldBe 0
+  }
+
+  test("a transaction another store on the host has seen is still counted here") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val statusCache = new TransactionStatusCache()
+    // Another store sharing the host's status cache has started the transaction
+    statusCache.updateStatus(txid1, TransactionStatus.Unresolved)
+    val backend = new DeferredCommitBackend
+    populate(backend)
+    val net = new TestNet
+    val store = new Store(StorageDeviceId(new UUID(0, 99)), scala.concurrent.ExecutionContext.parasitic, backend,
+      new HostObjectCache(1024 * 1024).forStore(storeId), net, BackgroundTaskManager.NoBackgroundTaskManager,
+      new TestCrl, statusCache, null, TransactionDriver.noErrorRecoveryFactory, Duration(60, SECONDS), None, admission)
+    backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
+    val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+
+    store.receiveTransactionMessage(p1)
+    admission.admittedBytes shouldBe admissionBytes(p1)
   }
 
   test("a transaction waiting on an in-flight commit keeps its admission") {

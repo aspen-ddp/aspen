@@ -262,30 +262,60 @@ class Frontend(val storeId: StoreId,
 
   // ---- Backpressure: see CrlAdmission ----
 
-  /** Bytes each transaction this Frontend admitted holds in the device's CRL admission, until released */
-  private val admitted = scala.collection.mutable.HashMap[TransactionId, Long]()
+  /** What a transaction this Frontend admitted holds in the device's CRL admission, until released.
+    *
+    * @param bytes      the bytes charged so far
+    * @param dataCounted the objects whose update data is charged: each is charged once, however often it arrives
+    * @param serializedTxd the description serialized to size it, kept for the Tx's recovery state until taken
+    */
+  private final class Admitted(var bytes: Long, var dataCounted: Set[ObjectId], var serializedTxd: Option[DataBuffer])
+  private val admitted = scala.collection.mutable.HashMap[TransactionId, Admitted]()
 
-  /** Whether a prepare may be handled. A transaction already known here (or in the status cache) always is: dropping
-    * it would free nothing and could strand it. Any other is admitted for its description and object data only while
-    * the device's CRL admission has room
+  /** Whether a prepare may be handled.
+    *
+    * A transaction this Frontend admitted always is, since dropping it would free nothing and could strand it. Object
+    * data it brings that is not yet counted is charged without a limit check. A transaction known here but not
+    * admitted (recovered from the CRL) always is too, as is one finalized in the status cache, which is answered from
+    * the cache and never reaches the CRL. Any other is counted for its description, object data and CRL record, and
+    * admitted only while the device's admission has room. The status cache is host-wide, so a transaction merely
+    * started on another store is not known here.
     */
   def admitPrepare(m: TxPrepare): Boolean =
     val txid = m.txd.transactionId
-    if transactions.contains(txid) || admitted.contains(txid) || statusCache.getStatus(txid).isDefined then
-      true
-    else
-      val bytes = m.txd.serialize().size.toLong + m.objectUpdates.iterator.map(_.data.size.toLong).sum
-      if admission.tryAdmit(bytes) then
-        admitted(txid) = bytes
+    admitted.get(txid) match
+      case Some(a) =>
+        val added = m.objectUpdates.filterNot(ou => a.dataCounted.contains(ou.objectId))
+        if added.nonEmpty then
+          val bytes = added.iterator.map(ou => CrlAdmission.objectUpdateBytes(ou.data.size)).sum
+          admission.charge(bytes)
+          a.bytes += bytes
+          a.dataCounted ++= added.iterator.map(_.objectId)
         true
-      else
-        false
+      case None if transactions.contains(txid) || statusCache.getStatus(txid).exists(_.finalized) => true
+      // Checked before serializing: a prepare that will be dropped costs nothing more
+      case None if admission.full => false
+      case None =>
+        val stxd = m.txd.serialize()
+        val bytes = CrlAdmission.TxOverheadBytes + stxd.size +
+          m.objectUpdates.iterator.map(ou => CrlAdmission.objectUpdateBytes(ou.data.size)).sum
+        if admission.tryAdmit(bytes) then
+          admitted(txid) = new Admitted(bytes, m.objectUpdates.iterator.map(_.objectId).toSet, Some(stxd))
+          true
+        else
+          false
+
+  /** The description `admitPrepare` serialized for `txid`, if not taken yet */
+  private def takeSerializedTxd(txid: TransactionId): Option[DataBuffer] =
+    admitted.get(txid).flatMap: a =>
+      val s = a.serializedTxd
+      a.serializedTxd = None
+      s
 
   /** Releases what `txid` was admitted for, if anything: its CRL entry was deleted, or it is forgotten without one.
     * Idempotent; recovered transactions were never admitted
     */
   def releaseAdmission(txid: TransactionId): Unit =
-    admitted.remove(txid).foreach(admission.release)
+    admitted.remove(txid).foreach(a => admission.release(a.bytes))
 
   /** Deletes a transaction's CRL entry and releases its admission */
   def deleteTransactionState(txid: TransactionId): Unit =
@@ -293,7 +323,7 @@ class Frontend(val storeId: StoreId,
     releaseAdmission(txid)
 
   def close(): Future[Unit] =
-    admitted.valuesIterator.foreach(admission.release)
+    admitted.valuesIterator.foreach(a => admission.release(a.bytes))
     admitted.clear()
     backend.close()
 
@@ -445,7 +475,7 @@ class Frontend(val storeId: StoreId,
     case None =>
       logger.trace(s"**** CREATING NEW TX: ${m.txd.transactionId}")
       val known = statusCache.getStatus(m.txd.transactionId).filter(_.status != TransactionStatus.Unresolved)
-      val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates)
+      val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates, takeSerializedTxd(m.txd.transactionId))
       val pointers = m.txd.allHostedObjects(m.to)
       val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers)
       transactions += (m.txd.transactionId -> tx)

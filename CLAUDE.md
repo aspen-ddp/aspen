@@ -228,11 +228,13 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     every transaction on that object votes abort (`BackendCommitFailed`) until the store reloads. Objects a
     transaction only checks or locks get no backend commit, so concurrent `SharedRevisionLock` holders never wait
   - Backpressure (`CrlAdmission`, one per device, shared by its stores): a store admits a prepare for a transaction it
-    has not seen (not in `Frontend.transactions` or the status cache) for its description and object data, and drops
-    it silently while the device's admitted bytes are at or past half a CRL stream (`SimpleCRL.admissionLimitBytes`).
-    Everything else (known transactions' prepares, accepts, resolutions, finalizations, heartbeats, status requests)
-    is handled. Nothing is exempt. Bytes are released when the entry is deleted, a Tx is forgotten without one, or the
-    store closes; a Tx waiting on an in-flight commit keeps its admission. Recovered transactions are not counted
+    has not seen (not admitted or recovered by its Frontend, nor finalized in the host-wide status cache) for its
+    description, object data and CRL record, and drops it silently while the device's admitted bytes are at or past
+    half a CRL stream (`SimpleCRL.admissionLimitBytes`). Object data arriving later is charged once per object without
+    a check. Everything else (known transactions' prepares, accepts, resolutions, finalizations, heartbeats, status
+    requests) is handled. Nothing is exempt. Bytes are released when the entry is deleted, a Tx is forgotten without
+    one, or the store closes; a Tx waiting on an in-flight commit keeps its admission. Accepted gaps: recovered
+    transactions are not counted, and a retransmit past the mark while a store awaits its crl_save.log is dropped
 -  Lifecycle:
   - The client builds a TransactionDescription and sends it plus object data to the stores
   - The stores check all local state against the TransactionRequirements and determine their Commit/Abort decision

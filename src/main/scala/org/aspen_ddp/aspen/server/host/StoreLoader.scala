@@ -477,11 +477,15 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             store.crl.closeStore(storeId).map(Some(_))
           else
             Future.successful(None)
-        .flatMap: extracted =>
+        .transformWith: extractedTry =>
           onExecutor(entry):
-            extracted.foreach(trs => CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile))
-            store.close()
+            // Closed whatever the CRL step did, so the store's backend and CRL admissions are released; a failed
+            // step then fails the close
+            val saved = Try(extractedTry.get.foreach(trs =>
+              CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)))
+            store.close().flatMap(_ => Future.fromTry(saved))(using ExecutionContext.parasitic)
           .flatMap: _ =>
+            val extracted = extractedTry.get
             // Deleted from the device CRL files only once the save file holding them is durable, so a restart does
             // not recover them on this device too. A crash between the two leaves them in both: harmless, as loading
             // the save file re-saves them under the same ids

@@ -16,10 +16,11 @@ case class TransactionRecoveryState( storeId: StoreId,
 object TransactionRecoveryState {
   def initial(storeId: StoreId,
               txd: TransactionDescription,
-              objectUpdates: List[ObjectUpdate]): TransactionRecoveryState = {
+              objectUpdates: List[ObjectUpdate],
+              /** `txd` already serialized, if it was */
+              serializedTxd: Option[DataBuffer] = None): TransactionRecoveryState = {
 
-
-    val stxd = txd.serialize()
+    val stxd = serializedTxd.getOrElse(txd.serialize())
 
     TransactionRecoveryState(storeId, stxd, objectUpdates, TransactionDisposition.Undetermined,
       TransactionStatus.Unresolved, PersistentState.initial)

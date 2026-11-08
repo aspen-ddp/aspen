@@ -720,3 +720,35 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       crlB.firstSave.isCompleted should be(true)
       answeredB should be(true)
       devices(deviceB).admission.admittedBytes should be > 0L
+
+  atest("two stores on one device receiving the same transaction are both counted"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dirA = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    createCrl(dirA)
+    val sid0 = storeId
+    val sid1 = StoreId(storeId.poolId, 1.toByte)
+    val factory = newFactory()
+    // Led by a third store, so neither starts a driver
+    def prepare(sid: StoreId) =
+      TxPrepare(sid, net.storeId0, overwriteTxd(txid, 2), ProposalId.initialProposal(2),
+        List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), Nil, true)
+    for
+      _ <- writeRocksStore(dirA, sid0)
+      _ <- writeRocksStore(dirA, sid1)
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(sid0) && host.control.router.loaded.contains(sid1))
+      admission = host.control.devices.devices(deviceA).admission
+      store0 = host.control.router.loaded(sid0)
+      store1 = host.control.router.loaded(sid1)
+      _ = host.receiveTransactionMessage(prepare(sid0))
+      _ <- pumpUntil(host, store0.frontend.transactions.contains(txid))
+      one = admission.admittedBytes
+      _ = host.receiveTransactionMessage(prepare(sid1))
+      _ <- pumpUntil(host, store1.frontend.transactions.contains(txid))
+      both = admission.admittedBytes
+      _ <- store0.backend.close()
+      _ <- store1.backend.close()
+    yield
+      one should be > 0L
+      both should be(2 * one)

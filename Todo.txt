@@ -32,7 +32,8 @@ docs/investigations/2026-11-07-threaded-host-hang/.
     - adaptive-pool mailbox moves;
     - TestNetwork.handleEvents outside lockstep.
   - Also hung once on an idle machine in a plain `timeout 70 sbt test` at 6e8388cd (log:
-    idle-hang-6e8388cd.log.xz in the same directory), so it is not load-only.
+    idle-hang-6e8388cd.log.xz in the same directory), so it is not load-only. At 4409fa11 it hung in 2 of 4 idle
+    full runs (idle-hang-4409fa11.log.xz): reproducible without load, which should make the hunt much cheaper.
   - Next step: at the hang, dump StoreRouter state and mailbox queue lengths to a file (sbt buffers a hung suite's
     stdout, and warns are suppressed in tests). Hunt on both HEAD and d7ab3839, about 8 minutes per loaded run.
 

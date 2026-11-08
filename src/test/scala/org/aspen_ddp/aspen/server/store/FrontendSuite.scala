@@ -12,7 +12,10 @@ import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.paxos.PersistentState
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, RevisionLock, SharedRevisionLock, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.TempDirManager
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, TransactionRecoveryState}
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
+import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend, UpdateForm}
@@ -1818,5 +1821,180 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.deliverOne(Right(CommitError.IOFailure))
     backend.issued shouldBe List(txid1)
     committedMessages(net).filter(_.transactionId == txid2).map(_.objectCommitErrors) shouldBe List(List(oid1))
+  }
+
+  // ---- Backpressure: prepares for unseen transactions are dropped while the device CRL is filling ----
+
+  /** A Store over a DeferredCommitBackend whose device admits through `admission`. Its transactions are led by
+    * another store, so it starts no driver
+    */
+  def admissionStore(admission: CrlAdmission, crl: TestCrl = new TestCrl): (Store, DeferredCommitBackend, TestNet) =
+    val backend = new DeferredCommitBackend
+    populate(backend)
+    val net = new TestNet
+    val store = new Store(StorageDeviceId(new UUID(0, 99)), scala.concurrent.ExecutionContext.parasitic, backend,
+      new HostObjectCache(1024 * 1024).forStore(storeId), net, BackgroundTaskManager.NoBackgroundTaskManager, crl,
+      new TransactionStatusCache(), null, TransactionDriver.noErrorRecoveryFactory, Duration(60, SECONDS), None,
+      admission)
+    backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
+    (store, backend, net)
+
+  def ledTxd(txid: TransactionId, reqs: List[TransactionRequirement]): TransactionDescription =
+    lockTxd(txid, reqs).copy(designatedLeaderUID = 1.toByte)
+
+  /** A client prepare carrying data for every DataUpdate */
+  def dataPrepare(txd: TransactionDescription): TxPrepare =
+    val updates = txd.requirements.collect { case r: DataUpdate => ObjectUpdate(r.objectPointer.id, DataBuffer(Array[Byte](1))) }
+    mkPrepare(txd, fromClient = true).copy(objectUpdates = updates)
+
+  /** The bytes a prepare is admitted for */
+  def admissionBytes(m: TxPrepare): Long = m.txd.serialize().size + m.objectUpdates.map(_.data.size).sum
+
+  test("a new prepare is dropped past the mark") {
+    val admission = new CrlAdmission(100)
+    admission.tryAdmit(100) shouldBe true
+    val crl = new TestCrl
+    val (store, _, net) = admissionStore(admission, crl)
+
+    store.receiveTransactionMessage(dataPrepare(ledTxd(txid1, List(overwrite(op1)))))
+
+    store.frontend.transactions shouldBe empty
+    store.hasTransactions shouldBe false
+    net.sentTx shouldBe empty
+    net.cr shouldBe None
+    crl.txSaved shouldBe false
+    admission.admittedBytes shouldBe 100
+  }
+
+  test("a known transaction's retransmitted prepare is answered past the mark") {
+    // Below the limit until tx1 is admitted, which crosses it
+    val admission = new CrlAdmission(1)
+    val crl = new TestCrl
+    val (store, backend, net) = admissionStore(admission, crl)
+    val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+
+    store.receiveTransactionMessage(p1)
+    prepareResponses(net, txid1).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+    admission.admittedBytes shouldBe admissionBytes(p1)
+
+    // A new transaction is dropped
+    store.receiveTransactionMessage(dataPrepare(ledTxd(txid2, List(overwrite(fencePtr)))))
+    store.frontend.transactions.contains(txid2) shouldBe false
+    prepareResponses(net, txid2) shouldBe empty
+
+    store.receiveTransactionMessage(p1)
+    prepareResponses(net, txid1).size shouldBe 2
+
+    store.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+    backend.deliverCommits()
+    committedMessages(net).map(_.transactionId) shouldBe List(txid1)
+    store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true))
+    store.frontend.transactions.contains(txid1) shouldBe false
+    crl.deleted shouldBe List(txid1)
+    admission.admittedBytes shouldBe 0
+  }
+
+  def checkReleasedAtFinalization(committed: Boolean, finalizeBeforePersisted: Boolean): Unit =
+    val admission = new CrlAdmission(Long.MaxValue)
+    val crl = new TestCrl
+    val (store, backend, net) = admissionStore(admission, crl)
+    val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+    store.receiveTransactionMessage(p1)
+    admission.admittedBytes shouldBe admissionBytes(p1)
+
+    store.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed))
+    if finalizeBeforePersisted then
+      store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed))
+      // A committed transaction's CRL entry, and so its admission, outlives the Tx until its commit persists
+      admission.admittedBytes shouldBe (if committed then admissionBytes(p1) else 0L)
+      backend.deliverCommits()
+    else
+      backend.deliverCommits()
+      store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed))
+    store.frontend.transactions.contains(txid1) shouldBe false
+    crl.deleted should contain (txid1)
+    admission.admittedBytes shouldBe 0
+
+  test("a finalized transaction releases its admission: commit") {
+    checkReleasedAtFinalization(committed = true, finalizeBeforePersisted = false)
+  }
+
+  test("a finalized transaction releases its admission: commit finalized before it persists") {
+    checkReleasedAtFinalization(committed = true, finalizeBeforePersisted = true)
+  }
+
+  test("a finalized transaction releases its admission: abort") {
+    checkReleasedAtFinalization(committed = false, finalizeBeforePersisted = false)
+  }
+
+  test("a transaction waiting on an in-flight commit keeps its admission") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val (store, backend, net) = admissionStore(admission)
+    val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+    store.receiveTransactionMessage(p1)
+    store.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+    store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true))
+    backend.heldCommits shouldBe 1
+
+    val p2 = dataPrepare(ledTxd(txid2, List(overwriteAfter(txid1))))
+    store.receiveTransactionMessage(p2)
+    prepareResponses(net, txid2) shouldBe empty
+    admission.admittedBytes shouldBe admissionBytes(p1) + admissionBytes(p2)
+
+    // tx1's commit persists: its entry goes, and tx2 votes, still admitted
+    backend.deliverOne()
+    prepareResponses(net, txid2).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+    admission.admittedBytes shouldBe admissionBytes(p2)
+  }
+
+  test("a prepare for a transaction already finalized here is admitted without counting, and answered") {
+    val admission = new CrlAdmission(100)
+    admission.tryAdmit(100) shouldBe true
+    val statusCache = new TransactionStatusCache()
+    statusCache.updateStatus(txid1, TransactionStatus.Committed, finalized = true)
+    val backend = new DeferredCommitBackend
+    populate(backend)
+    val net = new TestNet
+    val store = new Store(StorageDeviceId(new UUID(0, 99)), scala.concurrent.ExecutionContext.parasitic, backend,
+      new HostObjectCache(1024 * 1024).forStore(storeId), net, BackgroundTaskManager.NoBackgroundTaskManager,
+      new TestCrl, statusCache, null, TransactionDriver.noErrorRecoveryFactory, Duration(60, SECONDS), None, admission)
+
+    store.receiveTransactionMessage(dataPrepare(ledTxd(txid1, List(overwrite(op1)))))
+    net.sentTx.collect { case f: TxFinalized => f.transactionId } shouldBe List(txid1)
+    admission.admittedBytes shouldBe 100
+  }
+
+  test("closing the store releases what its transactions were admitted for") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val (store, _, _) = admissionStore(admission)
+    store.receiveTransactionMessage(dataPrepare(ledTxd(txid1, List(overwrite(op1)))))
+    admission.admittedBytes should be > 0L
+    Await.result(store.close(), Duration(5, SECONDS))
+    admission.admittedBytes shouldBe 0
+  }
+
+  test("recovered transactions are not admitted, and releasing them frees nothing") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    admission.tryAdmit(10) shouldBe true
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val saved = List(TransactionRecoveryState(storeId, lockTxd(txid1, List(overwrite(op1))).serialize(),
+      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), TransactionDisposition.VoteCommit,
+      TransactionStatus.Unresolved, PersistentState.initial))
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = saved
+    // Cached, so the recovered transaction loads its object while the Frontend is built
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    cache.insert(mkObjectState(oid1))
+    val frontend = new Frontend(storeId, backend, cache, new TestNet, crl, new TransactionStatusCache(),
+      admission = admission)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    frontend.transactions.contains(txid1) shouldBe true
+    admission.admittedBytes shouldBe 10
+
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false))
+    crl.deleted should contain (txid1)
+    admission.admittedBytes shouldBe 10
   }
 }

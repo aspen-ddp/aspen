@@ -537,7 +537,7 @@ class Tx( trs: TransactionRecoveryState,
       if (committed)
         doCommit()
       else
-        crl.deleteTransaction(storeId, transactionId)
+        frontend.deleteTransactionState(transactionId)
 
       unlock() // Ensure we've unlocked the objects now that result of the Tx is known
 

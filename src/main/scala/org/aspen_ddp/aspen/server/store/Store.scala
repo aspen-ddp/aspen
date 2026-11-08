@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -30,10 +30,13 @@ class Store(val storageDeviceId: StorageDeviceId,
             val txDriverFactory: TransactionDriver.Factory,
             val txHeartbeatTimeout: Duration,
             /** The store's effective slice size limit (StoreConfig.effectiveMaxSliceSize). None means unlimited. */
-            val maxSliceSize: Option[Long]) extends Logging {
+            val maxSliceSize: Option[Long],
+            /** The admission of the store's device's CRL, shared by the device's stores */
+            val admission: CrlAdmission = CrlAdmission.Unlimited) extends Logging {
 
   val storeId: StoreId = backend.storeId
-  val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize)
+  val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
+    admission = admission)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's
@@ -93,7 +96,15 @@ class Store(val storageDeviceId: StorageDeviceId,
   def logTransactionStatus(log: String => Unit): Unit =
     transactionDrivers.values.foreach(_.printState(log))
 
-  def receiveTransactionMessage(msg: TxMessage): Unit = {
+  def receiveTransactionMessage(msg: TxMessage): Unit = msg match {
+    // Backpressure: while the device's CRL is filling, a prepare for a transaction this store has not seen is dropped
+    // without a reply. The client retransmits; other stores may commit it without this one, which repair catches up
+    case m: TxPrepare if !frontend.admitPrepare(m) =>
+      logger.trace(s"Store $storeId dropped the prepare of unseen Tx ${m.txd.transactionId}: its device's CRL is filling")
+    case _ => handleTransactionMessage(msg)
+  }
+
+  private def handleTransactionMessage(msg: TxMessage): Unit = {
 
     msg match {
       case m: TxPrepare =>

@@ -11,3 +11,6 @@
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
 - Stores vote only after a save completes, so a dead CRL thread stops every transaction on its device while reads
   keep working. `onThreadDeath` reports it; the `host` command logs it and keeps serving its other devices
+- `admissionLimitBytes` (SimpleCRL: half a stream, so a recycled stream's live copy-forward always fits) sizes the
+  device's `CrlAdmission`, which drops prepares for unseen transactions past it. `Stream.writeEntry`'s `require` stays
+  the fail-stop backstop

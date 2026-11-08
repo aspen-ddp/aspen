@@ -52,6 +52,7 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit =
     inner.dropTransactionObjectData(storeId, txid)
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = inner.deleteTransaction(storeId, txid)
+  override def admissionLimitBytes: Long = inner.admissionLimitBytes
   override def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
     inner.deleteTransactions(storeId, txids)
 
@@ -674,3 +675,48 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       os.isFile(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
       // Taken out of memory only: a restart, which may serve the unmarked store, recovers them
       heldOnDisk(deviceDir, storeId) should be(Set(txid))
+
+  atest("a full device slows only its own stores"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dirA = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val dirB = writeSmallCrlDevice(hostRoot, "dev1", deviceB)
+    createCrl(dirA)
+    createCrl(dirB)
+    val sidA = storeId
+    val sidB = StoreId(storeId.poolId, 1.toByte)
+    val txA = TransactionId(new UUID(9, 5))
+    val txB = TransactionId(new UUID(9, 6))
+    val factory = newFactory()
+    // Led by a third store, so neither starts a driver
+    def prepare(sid: StoreId, id: TransactionId) =
+      TxPrepare(sid, net.storeId0, overwriteTxd(id, 2), ProposalId.initialProposal(2),
+        List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), Nil, true)
+    for
+      _ <- writeRocksStore(dirA, sidA)
+      _ <- writeRocksStore(dirB, sidB)
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(sidA) && host.control.router.loaded.contains(sidB))
+      devices = host.control.devices.devices
+      crlB = factory.opened.find(_.devicePath == dirB).get
+      limitA = devices(deviceA).admission.limitBytes
+      // Device A's CRL is past the mark
+      _ = devices(deviceA).admission.tryAdmit(limitA) should be(true)
+      _ = host.receiveTransactionMessage(prepare(sidA, txA))
+      _ = host.receiveTransactionMessage(prepare(sidB, txB))
+      _ <- pumpUntil(host, crlB.firstSave.isCompleted)
+      storeA = host.control.router.loaded(sidA)
+      storeB = host.control.router.loaded(sidB)
+      droppedA = !storeA.frontend.transactions.contains(txA)
+      answeredB = storeB.frontend.transactions.contains(txB)
+      _ <- storeA.backend.close()
+      _ <- storeB.backend.close()
+    yield
+      // 1 MB CRL files: half of one
+      limitA should be(512L * 1024)
+      (devices(deviceA).admission ne devices(deviceB).admission) should be(true)
+      droppedA should be(true)
+      factory.opened.find(_.devicePath == dirA).get.firstSave.isCompleted should be(false)
+      crlB.firstSave.isCompleted should be(true)
+      answeredB should be(true)
+      devices(deviceB).admission.admittedBytes should be > 0L

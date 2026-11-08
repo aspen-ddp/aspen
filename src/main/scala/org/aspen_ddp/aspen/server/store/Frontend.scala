@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadR
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitState, Completion, Read}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -44,7 +44,9 @@ class Frontend(val storeId: StoreId,
                val statusCache: TransactionStatusCache,
                /** The store's effective slice size limit, enforced by its transactions. None means unlimited. */
                val maxSliceSize: Option[Long] = None,
-               val missingDataWait: Duration = Frontend.MissingDataWait) extends Logging {
+               val missingDataWait: Duration = Frontend.MissingDataWait,
+               /** The admission of the store's device's CRL: see admitPrepare */
+               val admission: CrlAdmission = CrlAdmission.Unlimited) extends Logging {
 
   import Frontend._
 
@@ -258,7 +260,42 @@ class Frontend(val storeId: StoreId,
       held.foreach(handleTransactionMessage)
 
 
-  def close(): Future[Unit] = backend.close()
+  // ---- Backpressure: see CrlAdmission ----
+
+  /** Bytes each transaction this Frontend admitted holds in the device's CRL admission, until released */
+  private val admitted = scala.collection.mutable.HashMap[TransactionId, Long]()
+
+  /** Whether a prepare may be handled. A transaction already known here (or in the status cache) always is: dropping
+    * it would free nothing and could strand it. Any other is admitted for its description and object data only while
+    * the device's CRL admission has room
+    */
+  def admitPrepare(m: TxPrepare): Boolean =
+    val txid = m.txd.transactionId
+    if transactions.contains(txid) || admitted.contains(txid) || statusCache.getStatus(txid).isDefined then
+      true
+    else
+      val bytes = m.txd.serialize().size.toLong + m.objectUpdates.iterator.map(_.data.size.toLong).sum
+      if admission.tryAdmit(bytes) then
+        admitted(txid) = bytes
+        true
+      else
+        false
+
+  /** Releases what `txid` was admitted for, if anything: its CRL entry was deleted, or it is forgotten without one.
+    * Idempotent; recovered transactions were never admitted
+    */
+  def releaseAdmission(txid: TransactionId): Unit =
+    admitted.remove(txid).foreach(admission.release)
+
+  /** Deletes a transaction's CRL entry and releases its admission */
+  def deleteTransactionState(txid: TransactionId): Unit =
+    crl.deleteTransaction(storeId, txid)
+    releaseAdmission(txid)
+
+  def close(): Future[Unit] =
+    admitted.valuesIterator.foreach(admission.release)
+    admitted.clear()
+    backend.close()
 
   def path: os.Path = backend.path
 
@@ -297,7 +334,7 @@ class Frontend(val storeId: StoreId,
   def transactionFinalized(txid: TransactionId): Unit =
     txCommits.get(txid) match
       case Some(r) => r.finalized = true
-      case None => crl.deleteTransaction(storeId, txid)
+      case None => deleteTransactionState(txid)
 
   private def transactionCommitComplete(txid: TransactionId, succeeded: Boolean): Unit =
     txCommits.get(txid).foreach { r =>
@@ -307,7 +344,7 @@ class Frontend(val storeId: StoreId,
       if r.outstanding == 0 && !r.failed then
         txCommits.remove(txid)
         if r.finalized then
-          crl.deleteTransaction(storeId, txid)
+          deleteTransactionState(txid)
     }
 
   /** Called when a transaction takes `os` for one of its objects, and by commit for the commit's duration. A state that
@@ -397,6 +434,8 @@ class Frontend(val storeId: StoreId,
     // status cache, so it is ignored. A resolved one takes no locks; it still learns its outcome from TxFinalized.
     case None if statusCache.getStatus(m.txd.transactionId).exists(_.finalized) =>
       logger.trace(s"**** IGNORING PREPARE FOR FINALIZED TX: ${m.txd.transactionId}")
+      // Admitted while held for recovery, before the finalization was known: no Tx will release it
+      releaseAdmission(m.txd.transactionId)
       // Either a retransmission or this store's data arriving too late to be used
       if m.fromClient && m.objectUpdates.nonEmpty then
         val age = (HLCTimestamp.now - m.txd.startTimestamp).toMillis

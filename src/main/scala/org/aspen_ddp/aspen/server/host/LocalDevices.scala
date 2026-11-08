@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission}
 import scribe.Logging
 
 import scala.concurrent.Future
@@ -12,7 +12,8 @@ import scala.concurrent.Future
 class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
                               val devicePath: os.Path,
                               val configFile: os.Path,
-                              val crl: CrashRecoveryLog):
+                              val crl: CrashRecoveryLog,
+                              val admission: CrlAdmission = CrlAdmission.Unlimited):
   var loadedStores: Set[StoreId] = Set()
   var offlineStores: Set[StoreId] = Set()
 

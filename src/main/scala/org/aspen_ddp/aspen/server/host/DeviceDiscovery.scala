@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
 import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, Host, StorageDeviceConfig, StorageDeviceManager,
   StoreConfig}
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -516,7 +516,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             // Opened before any store is offered, so each store recovers from it. Recovery blocks the control
             // thread, as each store's getFullRecoveryState does in handleLoad. A throw leaves the device unloaded.
             val crl = openDeviceCrl(storageDevicePath, sdCfg, storeFiles)
-            val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl)
+            val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl,
+              new CrlAdmission(crl.admissionLimitBytes))
             logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
             try
               storeFiles.foreach: potentialStoreFile =>

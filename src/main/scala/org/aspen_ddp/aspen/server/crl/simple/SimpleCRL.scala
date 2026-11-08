@@ -79,6 +79,11 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   val numStreams: Int = files.size
 
+  /** Half a stream: when the ring recycles a stream, everything live is at most half a stream, so the copy-forward
+    * always fits. Stream.writeEntry's require stays as the backstop
+    */
+  override def admissionLimitBytes: Long = maxSizeInBytes / 2
+
   private val writer = StreamWriter(maxSizeInBytes, files, onThreadDeath)
   private var currentStream: Int = r.activeStreamId.number
   private var currentLogEntry: LogEntry = new LogEntry(r.initialPreviousEntryLocation,

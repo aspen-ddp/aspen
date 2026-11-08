@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{Host, StoreConfig}
 import org.aspen_ddp.aspen.server.Host.{BackendFailed, BackendOpened, LoadStore, LoadStoreById, ShutdownStore,
   SpaceWait, StoreFailedOnClose, UnloadFailedStore}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendStateLost}
@@ -322,7 +322,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               // messages
               val store = new Store(storageDeviceId, ctx.ec, backend, objectCache,
                 ctx.net, ctx.backgroundTasks, crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
-                Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize)
+                Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize,
+                ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited))
               val entry = new StoreRouter.Entry(store, executor)
               // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any
               backend.setCompletionHandler(ctx.wrapCompletionHandler(router.completionHandler(entry)))

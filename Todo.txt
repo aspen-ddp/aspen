@@ -1,34 +1,18 @@
 TODO
 ====
 
-Investigate next, once the per-device CRL feature is complete: "concurrent transactions commit on store threads" in
-ThreadedHostSuite / AdaptiveThreadedHostSuite hangs under full CPU load (24 busy loops alongside `sbt test`). Flaky
-tests are not permitted. Evidence (thread dumps, test log, hung-read output, notes) is in
-docs/investigations/2026-11-07-threaded-host-hang/.
-  - Tally:
-    - Before the one-in-flight-commit change (d7ab3839): 0 hangs in 8 loaded runs, not conclusive at this rate.
-    - With it, before its lost-wakeup fix: 3 in about 23 runs.
-    - After the fix: 1 in 5 runs, at which point the hunt stopped.
-    - Running the two threaded suites alone under load: 0 in 40, so the hang needs the full-suite context.
-  - The lost wakeup was a transaction resolved before its objects loaded registering a vote wait that hid its held
-    commit. It has a FrontendSuite regression test. Some of the earlier hangs may have been the hang below instead.
-  - Signature of the remaining hang:
-    - The test thread waits in SerialExecutionContext for a callback that never comes.
-    - Every aspen-store-N thread, the control thread and the balancer are idle on empty queues.
-    - The store threads had used 0.1-20 ms of CPU in 271 s, so the test stalled near its start, probably in
-      allocate().
-    - The client logged 11 reads with zero responses. Reads never consult in-flight commit state, so either the
-      stores never got them or their replies were lost.
-  - Hypothesis (unconfirmed): a message-delivery or routing stall in the threaded TestNetwork host that the new commit
-    timing exposes. Candidates:
-    - StoreRouter treating stores as unknown, offline, loading or awaitingDevice, which makes them silent;
-    - adaptive-pool mailbox moves;
-    - TestNetwork.handleEvents outside lockstep.
-  - Also hung once on an idle machine in a plain `timeout 70 sbt test` at 6e8388cd (log:
-    idle-hang-6e8388cd.log.xz in the same directory), so it is not load-only. At 4409fa11 it hung in 2 of 4 idle
-    full runs (idle-hang-4409fa11.log.xz): reproducible without load, which should make the hunt much cheaper.
-  - Next step: at the hang, dump StoreRouter state and mailbox queue lengths to a file (sbt buffers a hung suite's
-    stdout, and warns are suppressed in tests). Hunt on both HEAD and d7ab3839, about 8 minutes per loaded run.
+KV reads racing concurrent key inserts stall for the client's read resend (2 s in `aspen` clients). Found while fixing
+the AdaptiveThreadedHostSuite hang (docs/investigations/2026-11-07-threaded-host-hang/notes.md):
+  - A blind KV insert (TKVL `set`: WithinRange only) leaves the object's revision unchanged. With one in-flight commit
+    per object, stores apply concurrent inserts to one node at different times (66 ms apart in the test).
+  - A read in that window sees the key on one store while a lagging store still holds the insert's lock (its commit
+    is queued behind an earlier one). KeyValueObjectReader can neither restore the key nor take it as deleted, so the
+    read waits for more replies.
+  - BaseReadDriver re-reads at once only a store holding a lock known to be committed (status cache, or another
+    store's object revision). An insert never shows in the object revision, so the read waits for SimpleReadDriver's
+    next full resend. Every allocation inserts into its pool's AllocationTree this way.
+  - Possible fix: also count a lock as committed when another store's reply holds a key whose revision is that
+    transaction.
 
 Per-device CRL follow-ups (final review of the per-device CRL branch, 2026-11-07):
 - A device reloaded (restartStorageDevice) while its CRL is still shutting down (`LocalDevices.closingCrls`) is loaded

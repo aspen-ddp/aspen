@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.common.transaction.TransactionId
 import scribe.{Level, Logging}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.duration.{FiniteDuration, MILLISECONDS, SECONDS}
 
 abstract class BaseReadDriver(
                                val client: ReadDriverClient,
@@ -253,6 +254,12 @@ abstract class BaseReadDriver(
 
 object BaseReadDriver:
 
+  /** noErrorRecoveryReadDriver: how often an incomplete read is re-sent, when it is reported hung, and how many
+    * resends it makes before giving up (a test that has failed must not keep posting reads) */
+  val ResendEvery: FiniteDuration = FiniteDuration(100, MILLISECONDS)
+  val HungAfter: FiniteDuration = FiniteDuration(2, SECONDS)
+  val MaxResends: Int = 600
+
   /** Reads slower than this are logged with every store's last reply */
   val SlowReadMillis: Long = 2000
 
@@ -279,17 +286,23 @@ object BaseReadDriver:
 
       given ec: ExecutionContext = this.client.clientContext
 
-      var hung = false
       val test = this.client.getSystemAttribute("unittest.name").getOrElse("UNKNOWN TEST")
 
+      // Re-sends the read every ResendEvery until it completes, as SimpleReadDriver does with backoff. Replies are
+      // only a snapshot: a read racing a commit can get three replies that cannot be restored. A KV insert leaves the
+      // object's revision unchanged, so with the key applied on one store and another still holding the insert's lock
+      // (its commit queued behind an earlier one), the key is neither restorable nor deleted and the reader waits for
+      // replies that, without a resend, never come. Resent on the client's context, so a lockstep
+      // network is still driven from the test's thread. A store that stays behind still hangs the read: resending
+      // never hides a missed update
       val myRunnable: Runnable = () =>
         var count = 0
-        while ! promise.isCompleted && !hung do
-          Thread.sleep(10) // Simulate some work
+        while ! promise.isCompleted && count < MaxResends do
+          Thread.sleep(ResendEvery.toMillis)
           count += 1
-          if (count == 200)
-            hung = true
-
+          if !promise.isCompleted then
+            ec.execute(() => if !promise.isCompleted then sendReadRequests())
+          if count * ResendEvery.toMillis == HungAfter.toMillis then
             objectReader.debugLogStatus(s"*** HUNG READ in test $test", println)
 
       val checkerThread = new Thread(myRunnable, "waitForReadCompleteThread")

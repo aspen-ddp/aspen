@@ -398,4 +398,41 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     summary.length should be < 200
     Future.successful(succeed)
   }
+
+  test("the test harness's read driver re-sends a read whose replies cannot be restored yet") {
+    // A KV insert leaves the object's revision unchanged. A read racing it can find the key on one store of three
+    // while another store holds the insert's lock, its commit queued behind an earlier one: the key can be neither
+    // restored nor taken as deleted, and only a re-read gets replies that can be
+    val readsSent = new java.util.concurrent.atomic.AtomicInteger()
+    val m = new RecordingClient:
+      override private[client] val messenger: Messenger = new Messenger:
+        def sendClientRequest(msg: ClientRequest): Unit = msg match
+          case _: Read => readsSent.incrementAndGet()
+          case _ => ()
+        def sendTransactionMessage(msg: TxMessage): Unit = ()
+        def sendTransactionMessages(msg: List[TxMessage]): Unit = ()
+        def sendHostMessage(msg: HostMessage): Unit = ()
+        def dropCacheForStore(storeId: StoreId): Unit = ()
+    val r = BaseReadDriver.noErrorRecoveryReadDriver(m, kvptr, ida, readUUID, "", disableOpportunisticRebuild = true,
+      FullObject())
+    val insertTx = TransactionId(new UUID(0, 7))
+    val ts = HLCTimestamp.now
+    def kvs(withKey: Boolean, locks: Set[TransactionId] = Set()) = Right(ReadResponse.CurrentState(rev, ref, ts, 5,
+      if withKey then kvData(ObjectRevision(insertTx), ts) else Some(KVObjectState.encode(None, None, None, None, Map())),
+      locks))
+
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, kvs(withKey = true)))
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, kvs(withKey = false, locks = Set(insertTx))))
+    r.receiveReadResponse(ReadResponse(client, ds2, readUUID, ts, kvs(withKey = false)))
+    r.readResult.isCompleted shouldBe false
+
+    val deadline = System.nanoTime() + 5.seconds.toNanos
+    while readsSent.get < ida.width && System.nanoTime() < deadline do
+      Thread.sleep(5)
+    readsSent.get should be >= ida.width
+
+    // By the re-read the stores have applied the insert
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, kvs(withKey = true)))
+    Await.result(r.readResult, 1.second).asInstanceOf[KeyValueObjectState].contents.contains(kvKey) shouldBe true
+  }
 }

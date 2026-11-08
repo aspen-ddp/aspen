@@ -6,7 +6,7 @@ import org.freedesktop.dbus.Marshalling
 import org.freedesktop.dbus.messages.ExportedObject
 import org.scalatest.funsuite.AnyFunSuite
 import org.slf4j.LoggerFactory
-import org.slf4j.helpers.NOPLogger
+import org.slf4j.helpers.{NOPLogger, SubstituteLoggerFactory}
 import org.scalatest.matchers.should.Matchers
 
 import scala.concurrent.duration.*
@@ -57,6 +57,11 @@ class TcmuDbusServiceSuite extends AnyFunSuite with Matchers:
 
   test("dbus-java's slf4j logging reaches scribe"):
     // dbus-java brings slf4j-api 2.x, which needs a 2.x provider (scribe-slf4j2), or every slf4j logger is a no-op.
+    // While another thread is initializing slf4j (suites run in parallel) it hands out its SubstituteLoggerFactory,
+    // so wait for that initialization to end first
+    val deadline = System.nanoTime() + 10.seconds.toNanos
+    while LoggerFactory.getILoggerFactory.isInstanceOf[SubstituteLoggerFactory] && System.nanoTime() < deadline do
+      Thread.sleep(1)
     LoggerFactory.getILoggerFactory.getClass.getName should startWith ("scribe.")
     LoggerFactory.getLogger(classOf[ExportedObject]) should not be a [NOPLogger]
 

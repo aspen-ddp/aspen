@@ -1999,13 +1999,19 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     admission.admittedBytes shouldBe 100
   }
 
-  test("closing the store releases what its transactions were admitted for") {
+  test("closing the store keeps what its transactions were admitted for counted until they leave the CRL") {
     val admission = new CrlAdmission(Long.MaxValue)
     val (store, _, _) = admissionStore(admission)
     store.receiveTransactionMessage(dataPrepare(ledTxd(txid1, List(overwrite(op1)))))
-    admission.admittedBytes should be > 0L
+    val bytes = admission.admittedBytes
+    bytes should be > 0L
     Await.result(store.close(), Duration(5, SECONDS))
+    // Its entries stay live in the CRL
+    admission.admittedBytes shouldBe bytes
+    admission.retainedBytes(storeId) shouldBe bytes
+    admission.releaseRetained(storeId)
     admission.admittedBytes shouldBe 0
+    admission.retainedBytes(storeId) shouldBe 0
   }
 
   /** A Frontend over `admission` recovering txid1 (a commit vote overwriting oid1) from its CRL, its object cached
@@ -2038,11 +2044,13 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     admission.admittedBytes shouldBe 0
   }
 
-  test("closing a store releases what its recovered transactions are counted for") {
+  test("closing a store retains what its recovered transactions are counted for") {
     val admission = new CrlAdmission(Long.MaxValue)
     val (frontend, _, bytes) = recoveredAdmission(admission)
     admission.admittedBytes shouldBe bytes
     Await.result(frontend.close(), Duration(5, SECONDS))
+    admission.retainedBytes(storeId) shouldBe bytes
+    admission.releaseRetained(storeId)
     admission.admittedBytes shouldBe 0
   }
 

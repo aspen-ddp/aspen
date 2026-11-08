@@ -351,6 +351,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                   ctx.threading.release(storeId)
                 abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
               case Success(entry) =>
+                // Its recovered transactions are counted by the new store, in place of what its last close kept
+                if replacing.isEmpty then
+                  entry.store.frontend.admission.releaseRetained(storeId)
                 router.install(entry)
                 awaitCrlLoad(entry.store, trs, p)
 
@@ -415,11 +418,14 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     startClose(entry):
       store.objectCache.clear()
       if dropDurably then
-        store.crl.dropStore(store.storeId)
+        store.crl.dropStore(store.storeId).map(_ => true)(using ExecutionContext.parasitic)
       else
-        Future.unit
-    .onComplete: _ =>
+        Future.successful(false)
+    .onComplete: dropped =>
       onExecutor(entry)(store.close()).onComplete: _ =>
+        // Released once the close has retained them: dropped entries are no longer in the CRL
+        if dropped == Success(true) then
+          store.frontend.admission.releaseRetained(store.storeId)
         ctx.threading.release(store.storeId)
 
   /** The first step of a close, on the executor of `entry`, whose store the router no longer holds. Every task
@@ -500,7 +506,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             // Deleted from the device CRL files only once the save file holding them is durable, so a restart does
             // not recover them on this device too. A crash between the two leaves them in both: harmless, as loading
             // the save file re-saves them under the same ids
-            extracted.fold(Future.unit)(trs => store.crl.deleteTransactions(storeId, trs.map(_.txd.transactionId)))
+            extracted.fold(Future.unit): trs =>
+              store.crl.deleteTransactions(storeId, trs.map(_.txd.transactionId)).map: _ =>
+                // Every entry of the closed store has left the device CRL
+                store.frontend.admission.releaseRetained(storeId)
         .onComplete: result =>
           // The close has ended: the backend and directory belong to the control side again
           ctx.threading.release(storeId)

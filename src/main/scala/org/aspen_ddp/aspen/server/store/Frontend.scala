@@ -347,8 +347,11 @@ class Frontend(val storeId: StoreId,
     admitted.valuesIterator.foreach(a => admission.release(a.bytes))
     admitted.clear()
 
+  /** Closes the store. Its entries stay live in the CRL unless the closer takes them out, so what its transactions
+    * were admitted for stays counted, retained for the store (CrlAdmission.retain) */
   def close(): Future[Unit] =
-    releaseAllAdmissions()
+    admission.retain(storeId, admitted.valuesIterator.map(_.bytes).sum)
+    admitted.clear()
     backend.close()
 
   def path: os.Path = backend.path

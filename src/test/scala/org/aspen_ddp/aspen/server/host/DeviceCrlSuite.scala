@@ -825,6 +825,38 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       saveFile = os.exists(Backend.crlSaveFile(storeDir))
     yield (outcome, heldAfter, heldOnDisk(deviceDir, storeId), saveFile)
 
+  atest("a closed store's live device-CRL entries stay counted by admission until they leave the CRL"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, _, _) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      admission = host.control.devices.devices(deviceA).admission
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = factory.opened.head
+      _ <- prepareInFlight(host, crl, storeId, txid)
+      counted = admission.admittedBytes
+      // Closed without extraction: its entries stay live in the device CRL
+      closed = host.closeStore(storeId)
+      _ <- pumpUntil(host, closed.isCompleted)
+      _ <- closed
+      afterClose = admission.admittedBytes
+      // Loaded again, it counts its recovered transaction in place of what its close kept
+      _ = host.loadStoreById(deviceA, storeId)
+      _ <- pumpUntil(host, recovered(host, storeId, txid))
+      afterReload = admission.admittedBytes
+      // A transfer out's extraction takes the entries out of the device CRL, and their count with them
+      extracted = host.control.transfers.closeForTransferOut(storeId)
+      _ <- pumpUntil(host, extracted.isCompleted)
+      _ <- extracted
+      afterExtraction = admission.admittedBytes
+      _ = factory.shutdownAll()
+    yield
+      counted should be > 0L
+      afterClose should be(counted)
+      afterReload should be(counted)
+      afterExtraction should be(0L)
+
   atest("an extraction during which its closed store loads again leaves the store's transactions in the device CRL"):
     given ExecutionContext = executionContext
     val factory = newFactory()

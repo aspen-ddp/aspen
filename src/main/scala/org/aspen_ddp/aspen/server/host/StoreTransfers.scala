@@ -110,7 +110,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                 val kept = saved.filterNot(t => ids.contains(t.txd.transactionId))
                 // A failed save leaves them in the device CRL, for a retried request to extract again
                 CrashRecoveryLog.saveStoreState(storeId, kept ++ trs, saveFile)
-                sds.crl.deleteTransactions(storeId, ids)
+                sds.crl.deleteTransactions(storeId, ids).map(_ => sds.admission.releaseRetained(storeId))
 
   /** The transfer-in work on `deviceId` that a shutdown of it must stop or wait for. `ingStores` are the stores
    *  the device's tree entry records as TransferringIn.

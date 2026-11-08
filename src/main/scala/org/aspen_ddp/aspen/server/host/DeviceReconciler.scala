@@ -97,6 +97,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
               catch case NonFatal(t) => Future.failed(t)
             dropped.onComplete: result =>
               crlDropsRunning -= storeId
+              if result.isSuccess then
+                local.admission.releaseRetained(storeId)
               result.failed.foreach: t =>
                 logger.error(s"Failed to drop the device-CRL entries of store $storeId, which storage device " +
                              s"$deviceId no longer holds. Retrying at the device's next check. Error: $t")

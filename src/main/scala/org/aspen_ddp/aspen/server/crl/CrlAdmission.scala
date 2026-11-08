@@ -1,5 +1,8 @@
 package org.aspen_ddp.aspen.server.crl
 
+import org.aspen_ddp.aspen.common.store.StoreId
+
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import scala.annotation.tailrec
 
@@ -7,8 +10,11 @@ import scala.annotation.tailrec
   *
   * A store admits a prepare for a transaction it has not seen only while the bytes admitted on the device are below
   * `limitBytes` (`CrashRecoveryLog.admissionLimitBytes`), and drops it otherwise: the client retransmits, and that
-  * stall is the slowdown. Admitted bytes are released when the transaction's CRL entry is deleted, when the store
-  * forgets a transaction that never reached the CRL, or when the store closes. The check is against the total before
+  * stall is the slowdown. Admitted bytes are released when the transaction's CRL entry is deleted, or when the store
+  * forgets a transaction that never reached the CRL. A store that closes leaves its entries live in the CRL unless its
+  * closer takes them out, so its bytes stay counted, retained for it (`retain`) until they leave the CRL with all of
+  * the store's entries (`releaseRetained`: a transfer out's extraction, a dropStore) or the store loads again and
+  * counts its recovered transactions afresh. The check is against the total before
   * the admission, so one transaction may cross the limit: the limit leaves headroom for that.
   *
   * A transaction is counted for its description, its object data (each object once, charged without a limit check
@@ -39,6 +45,23 @@ final class CrlAdmission(val limitBytes: Long):
   def full: Boolean = total.get >= limitBytes
 
   def release(bytes: Long): Unit = total.addAndGet(-bytes)
+
+  // What closed stores' live entries are counted for, by store
+  private val retained = new ConcurrentHashMap[StoreId, java.lang.Long]()
+
+  /** Keeps `bytes`, which a closing store of the device was admitted for, counted until releaseRetained */
+  def retain(storeId: StoreId, bytes: Long): Unit =
+    if bytes > 0 then
+      retained.merge(storeId, bytes, (a, b) => a + b)
+
+  /** Releases what `storeId` was retained for: its entries have left the CRL, or it is loaded again. Idempotent */
+  def releaseRetained(storeId: StoreId): Unit =
+    val bytes = retained.remove(storeId)
+    if bytes != null then
+      total.addAndGet(-bytes)
+
+  /** What `storeId` is retained for */
+  def retainedBytes(storeId: StoreId): Long = Option(retained.get(storeId)).map(_.longValue).getOrElse(0L)
 
   def admittedBytes: Long = total.get
 

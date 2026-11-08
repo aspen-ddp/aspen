@@ -507,6 +507,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               logger.error(s"Failed to drop the CRL state of store $storeId before rebuilding it. Not rebuilding " +
                            s"it yet. Error: $t")
             case Success(_) =>
+              local.admission.releaseRetained(storeId)
               // A device unloaded meanwhile is discarded by whichever load of it comes next
               if ctx.devices.devices.get(local.storageDeviceId).exists(_ eq local) then
                 if removeLostStoreDirectory(local, storeId) then

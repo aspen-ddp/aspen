@@ -163,10 +163,13 @@ class QuicNetPeerQuerySuite extends AnyFunSuite with Matchers with BeforeAndAfte
     send(d, hostIdC)
     eventually("D's dial to C fails", WaitMillis)(d.net.failingSinceForTests(hostIdC).isDefined)
 
-    // A dial still handshaking when the replacement lands: its close must not restart the old clock
-    send(d, hostIdC)
+    // A dial still handshaking when the replacement lands: its close must not restart the old clock. A dial to C's
+    // unbound port fails quickly, so a starved test thread can miss one: send again until one is seen in progress
     val old = d.net.metadataManager.peekHostEntry(hostIdC).get
-    eventually("D is dialing C again", WaitMillis)(old.connection.get() != null)
+    eventually("D is dialing C again", WaitMillis):
+      if old.connection.get() == null then
+        send(d, hostIdC)
+      old.connection.get() != null
     val replacedAt = System.nanoTime()
     d.net.dispatchForTests(HostEndpointAnswer(hostIdC, Some(endpoint(hostIdC, freeUdpPort(), ts(2)))))
     d.net.metadataManager.hostTimestamp(hostIdC) shouldBe Some(ts(2))

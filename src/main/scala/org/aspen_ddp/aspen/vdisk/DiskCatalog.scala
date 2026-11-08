@@ -212,11 +212,12 @@ object DiskCatalog:
         _ <- tree.deleteTree(Some((_, v) =>
           deleteBlock(client, info, ObjectPointer(v.bytes).asInstanceOf[DataObjectPointer], fenceRevision)))
           .recoverWith:
-            // The tree walk's own transactions are not retried. If they lost to a concurrent delete the fence has
-            // moved on, which is reported as Fenced so that delete starts over. Anything else is a real failure.
-            case e: TransactionAborted =>
-              client.read(info.fencePointer).flatMap: fence =>
-                if fence.revision != fenceRevision then Future.failed(Fenced) else Future.failed(e)
+            // The tree walk's own transactions are not retried: an abort starts delete over, as Fenced does. Most
+            // often a concurrent delete took ownership after ours, but the loser of a race can be the newer owner
+            // too: an older delete that has not yet noticed it was fenced is still walking the same nodes. Starting
+            // over takes ownership again, which fences it, and every step is safe to repeat. Anything else is a real
+            // failure.
+            case _: TransactionAborted => Future.failed(Fenced)
         _ <- deleteConfigAndFence(info)
       yield
         ()

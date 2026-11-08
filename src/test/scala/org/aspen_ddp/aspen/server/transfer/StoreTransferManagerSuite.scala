@@ -46,7 +46,11 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val kp = CertificateAuthority.generateKeyPair()
     TlsCredentials(ca.certificate, ca.signCertificate(UUID.randomUUID(), kp.getPublic), kp.getPrivate)
 
-  private def newManager(ioTimeout: FiniteDuration = 1.second): StoreTransferManager =
+  /** Tests of the I/O timeout itself pass a short one. Every other test gets a long one: a transfer stalled for a
+    * second by a loaded machine would otherwise fail a test that expects it to succeed */
+  private val ShortIoTimeout: FiniteDuration = 1.second
+
+  private def newManager(ioTimeout: FiniteDuration = 10.seconds): StoreTransferManager =
     val m = new StoreTransferManager(0, credsFrom(TestTLS.ca), ioTimeout = ioTimeout)
     managers += m
     m
@@ -392,7 +396,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     assertExtracted(dest / sid.directoryName)
 
   test("receiver times out on stalled sender"):
-    val m = newManager()
+    val m = newManager(ioTimeout = ShortIoTimeout)
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
@@ -487,7 +491,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     a.transferringOutStores should be(Set(sid))
 
   test("sender times out on stalled receiver"):
-    val a = newManager()
+    val a = newManager(ioTimeout = ShortIoTimeout)
     val r = recordingServer()
     val sid = newStoreId()
     a.beginTransferOut(sid, UUID.randomUUID(), bigTree(), "127.0.0.1", r.port, HLCTimestamp.now)
@@ -517,12 +521,17 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val b = newManager()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = b.beginTransferIn(sid, u, tempDir())
+    val dest = tempDir()
+    val f = b.beginTransferIn(sid, u, dest)
     a.beginTransferOut(sid, u, bigTree(), "127.0.0.1", b.boundPort, HLCTimestamp.now)
-    eventually { a.isTransferringOut(sid) should be(true) }
+    // The receiver is extracting: cancelled before it connected, the receiver would hear nothing and fail only by
+    // timing out
+    eventually { os.exists(dest / sid.directoryName) should be(true) }
     a.cancelTransferOut(sid)
     a.isTransferringOut(sid) should be(false)
-    await(f).isFailure should be(true)
+    val result = await(f)
+    result.isFailure should be(true)
+    result.failed.get.isInstanceOf[java.util.concurrent.TimeoutException] should be(false)
 
   test("cancelTransferOut with no active send does nothing"):
     val a = newManager()

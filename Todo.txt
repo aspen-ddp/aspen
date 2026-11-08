@@ -1,11 +1,6 @@
 TODO
 ====
 
-Per-device CRL follow-ups (final review of the per-device CRL branch, 2026-11-07):
-- `<device>/crl.lost-<uuid>` directories (a lost CRL moved aside) are kept forever, up to num-streams x file size
-  each (900 MB by default). Tie them into the suspected-loss retention policy (Backlog: correlated "lost store"
-  declarations), or delete them once the device's stores are rebuilt.
-
 Adopt a storage device without a clean shutdown. Once each device carries its own CRL (see
 docs/superpowers/specs/2026-11-07-per-device-crl-and-commit-ordering-design.md), the common case should be: yank a
 drive out of a running or crashed machine, plug it into another host, and have it adopted and put back into service.

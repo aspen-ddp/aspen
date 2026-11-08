@@ -44,6 +44,10 @@ System-level protection against correlated "lost store" declarations
     - Instead, move it to `<storage-device>/suspected-loss/<store-dir>-<uuid>` and keep it. Record why, when, which
       software version, and which check fired.
     - A rebuild can still proceed into a fresh directory, so availability doesn't depend on the decision.
+    - A device CRL that fails to open is the same kind of local detection: `DeviceDiscovery.openDeviceCrl` moves it
+      aside as `<device>/crl.lost-<uuid>` (up to num-streams x file size, 900 MB by default) and marks every store on
+      the device rebuild-required. Those directories are kept forever today, deliberately: they are suspected-loss
+      content, held for the system-level check below, never deleted on local evidence alone.
   - A higher-level system check decides what happens to suspected-loss content.
     - Look across the pool and the whole system for correlation:
       - several stores of one pool declared lost within a short window;
@@ -56,8 +60,8 @@ System-level protection against correlated "lost store" declarations
       deletion instruction for the retained content, through the usual object-based admin channel so it can't
       be lost.
   - Related: a rebuild that can't find enough healthy peers must fail loudly rather than rebuild from what's left.
-  - Track suspected-loss space use per device, since retained copies compete with live stores; see the "Full
-    storage devices" item.
+  - Track suspected-loss space use per device, including `crl.lost-*` directories, since retained copies compete
+    with live stores; see the "Full storage devices" item.
 
 Follow-up to the DataObject TKVL: a RandomAccessReedSolomon-specialized, append-based DataObject node
 encoding. Rather than a full overwrite on every kv insert/delete, append operations insert kv pairs

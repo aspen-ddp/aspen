@@ -200,7 +200,10 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     await(fx.a.handler.clientRequests, 1).head.message shouldBe req
 
   test("flush does not wait for messages sent after it was called"):
-    val c = fx.client()
+    // A small ceiling bounds what the flush waits for, the backlog the sender piled up before it: with the default
+    // (256 MiB) a starved loop could not drain it within the bound. Sends past the ceiling are dropped, which a flush
+    // counts as done
+    val c = fx.client(cfg = fx.config.copy(connectionCeilingBytes = 1024L * 1024))
     // Connect first, so the sender's messages are written rather than held for the handshake
     val first = read(fx.storesB.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(first)

@@ -1,0 +1,8 @@
+7690:*** HUNG READ in test concurrent transactions commit on store threads
+7691-Read Transaction: f2c05410-c796-44d9-a963-1bdc63db9415
+7692-Num Responses: 0. Num Errors: 0. Matching Store States: 0
+7693-Last Restore Error: None. restore() result: None 
+--
+7695:*** HUNG READ in test concurrent transactions commit on store threads
+7696-Read Transaction: 2b9abee4-e5da-49ea-80f9-61cb10311135
+7697-Num Responses: 0. Num Errors: 0. Matching Store States: 0

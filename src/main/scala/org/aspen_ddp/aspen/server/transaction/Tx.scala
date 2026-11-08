@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, KeyValueUpdate, ObjectUpdate, RevisionLock, SharedRevisionLock, VersionBump, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, KeyValueUpdate, ObjectUpdate, RevisionLock, SharedRevisionLock, VersionBump, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -88,6 +88,13 @@ class Tx( trs: TransactionRecoveryState,
   private var collisionWaitReported = false
   private var pendingCollisionPrepare: Option[TxPrepare] = None
 
+  /** The objects whose in-flight commits this transaction waits for before voting: see determineDisposition */
+  private var awaitingCommits: Set[ObjectId] = Set()
+  /** The commit is queued in the Frontend behind earlier commits of the objects it changes: see holdForTurn */
+  private var commitQueued = false
+  /** TxFinalized arrived while the commit was held for its turn: the Frontend is told once the commit is issued */
+  private var finalizeDeferred = false
+
   statusCache.updateStatus(transactionId, status)
 
   private def allObjectsLoaded: Boolean = pendingObjectLoads == 0
@@ -117,9 +124,27 @@ class Tx( trs: TransactionRecoveryState,
   private def commitAwaitsData: Boolean = !recovered && !clientPrepared && ofinalized.isEmpty && missingObjectData
 
   private def releaseHeldCommit(): Unit =
-    if commitHeld && !commitAwaitsData then
+    if commitHeld && !commitAwaitsData && !(commitQueued && !frontend.heldCommitReady(changedHere, this)) then
       commitHeld = false
       resolvedAndAllObjectsLoaded(true)
+
+  /** The loaded objects this transaction changes, and so commits. Set once all objects have loaded (or failed to) */
+  private var changedHere: Set[ObjectId] = Set()
+
+  /** Whether the commit must wait its turn: an earlier commit of an object it changes is in flight, or held. If so, it
+    * is queued in the Frontend, which calls commitPersisted when it may be its turn
+    */
+  private def holdForTurn(): Boolean =
+    if committing || committed then
+      false
+    else if commitQueued then
+      !frontend.heldCommitReady(changedHere, this)
+    else if changedHere.exists(frontend.commitInFlight) then
+      commitQueued = true
+      frontend.holdCommit(changedHere, this)
+      true
+    else
+      false
 
   private def updateLastEvent(): Unit = lastEvent = System.nanoTime()
 
@@ -135,15 +160,17 @@ class Tx( trs: TransactionRecoveryState,
     s"Age: ${age}ms. Idle: ${idle}ms. Vote: $disposition. Resolution: $oresolution. Finalized: $ofinalized. " +
       s"Locked: $locked. CommitHeld: $commitHeld. Committing: $committing. Committed: $committed. " +
       s"PendingLoads: $pendingObjectLoads. PendingCommits: $pendingObjectCommits. ClientPrepared: $clientPrepared. " +
-      s"Recovered: $recovered. Waiting on: $waitingOn. Last proposer: $lastProposer. Object revisions: $revisions"
+      s"Recovered: $recovered. Waiting on: $waitingOn. Awaiting commits of: $awaitingCommits. " +
+      s"Commit queued: $commitQueued. Last proposer: $lastProposer. Object revisions: $revisions"
 
   private var lastStuckReport: Option[Long] = None
 
   /** Logs a transaction whose store has not applied it long after it started: it holds its locks, has a held commit,
-    * or is waiting on the backend. Repeats every `Tx.StuckReportEvery`. Returns whether it logged.
+    * withholds its vote for in-flight commits, or is waiting on the backend. Repeats every `Tx.StuckReportEvery`.
+    * Returns whether it logged.
     */
   def reportIfStuck(now: Long = System.nanoTime()): Boolean =
-    val stuck = locked || commitHeld || (committing && !committed)
+    val stuck = locked || commitHeld || awaitingCommits.nonEmpty || (committing && !committed)
     val due = stuck && now - startNanos >= Tx.StuckReportAfter.toNanos &&
       lastStuckReport.forall(last => now - last >= Tx.StuckReportEvery.toNanos)
     if due then
@@ -188,6 +215,9 @@ class Tx( trs: TransactionRecoveryState,
 
   private def waitingForCollision: Boolean = waitingOn.nonEmpty
 
+  /** The vote is withheld: waiting out a collision, or for in-flight commits of this transaction's objects */
+  private def withholdingVote: Boolean = waitingForCollision || awaitingCommits.nonEmpty
+
   /** The lock holders this transaction may wait for instead of voting abort: every failed requirement is a collision
     * with a holder that this transaction is built on, one whose revision of the object it requires, and each holder
     * still holds its locks here. That is a single writer's next transaction on an object arriving before this store
@@ -225,21 +255,35 @@ class Tx( trs: TransactionRecoveryState,
       if waitingOn.isEmpty then
         endCollisionWait()
 
-  /** Store heartbeat: a wait that has lasted `Tx.CollisionWait` ends, and the transaction votes as it would have */
+  /** The Frontend: no commit of `oid` is in flight any more. A transaction waiting to vote decides once none of its
+    * objects has one; a held commit is issued if it is now its turn on every object it changes
+    */
+  def commitPersisted(oid: ObjectId): Unit =
+    if awaitingCommits.contains(oid) then
+      awaitingCommits -= oid
+      if awaitingCommits.isEmpty then
+        endCollisionWait()
+    // Not an else: a vote wait must never hide the release of a held commit
+    if commitQueued then
+      releaseHeldCommit()
+
+  /** Store heartbeat: a wait that has lasted `Tx.CollisionWait` ends, and the transaction votes as it would have. A
+    * wait for in-flight commits has no timer: a backend commit always completes or fails
+    */
   def checkCollisionWait(now: Long = System.nanoTime()): Unit =
     if waitingForCollision && now - collisionWaitStart >= Tx.CollisionWait.toNanos then
       collisionWaitExpired = true
       waitingOn = Set()
       endCollisionWait()
 
-  /** Decides the vote now that the holders are gone, unless another holder takes their place, and answers the
-    * prepares that arrived meanwhile
+  /** Decides the vote now that the holders, or the in-flight commits, are gone, unless another takes their place, and
+    * answers the prepares that arrived meanwhile
     */
   private def endCollisionWait(): Unit =
     if allObjectsLoaded && oresolution.isEmpty && disposition == TransactionDisposition.Undetermined then
       determineDisposition()
       lock()
-    if !waitingForCollision then
+    if !withholdingVote then
       sendDelayedPrepare()
       pendingCollisionPrepare.foreach: m =>
         pendingCollisionPrepare = None
@@ -278,6 +322,7 @@ class Tx( trs: TransactionRecoveryState,
   }
 
   private def onAllObjectsLoaded(): Unit =
+    changedHere = RequirementsApplyer.changedObjects(requirements).intersect(objects.keySet)
     if recovered then
       // Frontend orders the recovered transactions' completions. See Frontend.recoveredTransactionLoaded
       frontend.recoveredTransactionLoaded(this, hasVote = disposition != TransactionDisposition.Undetermined)
@@ -317,8 +362,8 @@ class Tx( trs: TransactionRecoveryState,
 
     // Case received prepare before the objects are loaded. This will always be true for the first prepare
     // message as the receivePrepare() method is called immediately after transaction creation. A transaction waiting
-    // out a collision answers when the wait ends
-    if !waitingForCollision then
+    // out a collision, or waiting for in-flight commits, answers when the wait ends
+    if !withholdingVote then
       sendDelayedPrepare()
   }
 
@@ -336,22 +381,43 @@ class Tx( trs: TransactionRecoveryState,
     }
   }
 
+  /** Decides the vote, or withholds it. An object whose backend commit failed on this store gets an abort vote. One with
+    * a commit in flight, whether or not this transaction builds on it, makes the transaction wait with its vote
+    * withheld and no locks taken (see Frontend.commitInFlight); the requirements are checked against the state as it is
+    * once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
+    */
   private def determineDisposition(): Unit = {
-    val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
+    val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
+    val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet
 
-    val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
-      frontend.maxSliceSize)
+    if failed.nonEmpty then
+      waitingOn = Set()
+      awaitingCommits = Set()
+      decideDisposition(failed.map(_ -> BackendCommitFailed()).toMap, Nil)
+    else if inFlight.nonEmpty && oresolution.isEmpty && !outcomeKnown then
+      // Once the outcome is known the vote no longer matters, so nothing waits for it: a resolved transaction may
+      // decide here only because its objects finished loading after the resolution
+      waitingOn = Set()
+      awaitingCommits = inFlight
+      frontend.awaitCommitPersisted(inFlight, this)
+      logger.trace(s"Tx $transactionId waits for the in-flight commits of $inFlight before voting")
+    else
+      awaitingCommits = Set()
+      val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
-    awaitableHolders(m, l) match
-      case Some(holders) =>
-        if collisionWaitStart == 0L then
-          collisionWaitStart = System.nanoTime()
-        waitingOn = holders
-        holders.foreach(frontend.awaitLocksReleased(_, this))
-        logger.trace(s"Tx $transactionId waits for lock holders $holders before voting")
-      case None =>
-        waitingOn = Set()
-        decideDisposition(m, l)
+      val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
+        frontend.maxSliceSize)
+
+      awaitableHolders(m, l) match
+        case Some(holders) =>
+          if collisionWaitStart == 0L then
+            collisionWaitStart = System.nanoTime()
+          waitingOn = holders
+          holders.foreach(frontend.awaitLocksReleased(_, this))
+          logger.trace(s"Tx $transactionId waits for lock holders $holders before voting")
+        case None =>
+          waitingOn = Set()
+          decideDisposition(m, l)
   }
 
   private def decideDisposition(m: Map[ObjectId, RequirementError], l: List[RequirementError]): Unit = {
@@ -387,8 +453,17 @@ class Tx( trs: TransactionRecoveryState,
 
     val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
+    // An object whose earlier backend commit failed is neither changed nor committed: missing from the objects applied
+    // to, it is uncommittable and reported in TxCommitted, and repair restores it
+    val changed = RequirementsApplyer.changedObjects(requirements)
+    val failedHere = objects.keySet.filter(oid => changed.contains(oid) && frontend.commitFailed(oid))
+    failedHere.foreach { objectId =>
+      logger.warn(s"Tx $transactionId. Store $storeId does not apply the committed update of object $objectId: an " +
+        s"earlier backend commit of it failed")
+    }
+
     val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, requirements,
-      objects, ou, frontend.maxSliceSize)
+      objects -- failedHere, ou, frontend.maxSliceSize)
 
     // Objects that threw partway through their update hold partially-applied, potentially
     // corrupt state. Drop them from the cache so the next access reloads the last durable
@@ -398,7 +473,7 @@ class Tx( trs: TransactionRecoveryState,
       frontend.discard(objectId)
     }
 
-    result.skippedReasons.foreach { (objectId, reason) =>
+    result.skippedReasons.filterNot((objectId, _) => failedHere.contains(objectId)).foreach { (objectId, reason) =>
       val current = objects.get(objectId).map(_.metadata.revision.lastUpdateTxUUID)
       logger.warn(s"Tx $transactionId. Store $storeId cannot apply the committed update of object $objectId: $reason. " +
         s"Vote: $disposition. Client prepare seen: $clientPrepared. Revision on store: $current")
@@ -409,7 +484,6 @@ class Tx( trs: TransactionRecoveryState,
     // Count what is actually committed. uncommittable may name objects this store never
     // loaded, so objects.size - uncommittable.size can undercount the commits in flight.
     // Objects the transaction only locks are unchanged: they get no backend commit
-    val changed = RequirementsApplyer.changedObjects(requirements)
     val toCommit = objects.valuesIterator
       .filter(os => changed.contains(os.objectId) && !uncommittable.contains(os.objectId)).toList
 
@@ -425,6 +499,14 @@ class Tx( trs: TransactionRecoveryState,
 
       frontend.commit(os, cs, transactionId, forTransaction = true)
     }
+
+    // After the commits are issued, so that they are what the next transactions on these objects wait for
+    if commitQueued then
+      commitQueued = false
+      frontend.heldCommitIssued(changedHere, this)
+    if finalizeDeferred then
+      finalizeDeferred = false
+      frontend.transactionFinalized(transactionId)
 
     // Nothing was committed, so no commit completions will arrive to trigger the notification.
     // Without this the proposer never learns this store's outcome.
@@ -447,6 +529,10 @@ class Tx( trs: TransactionRecoveryState,
     if committed && commitAwaitsData then
       logger.trace(s"Holding the commit of $transactionId until its object data arrives")
       commitHeld = true
+    else if committed && holdForTurn() then
+      // Never issued while an earlier commit of the same object is in flight. Locks are kept until it is applied
+      logger.trace(s"Holding the commit of $transactionId until earlier commits of its objects persist")
+      commitHeld = true
     else
       if (committed)
         doCommit()
@@ -461,9 +547,10 @@ class Tx( trs: TransactionRecoveryState,
   private var objectsReleased = false
 
   /** Releases this transaction's references to its objects. Also called by Frontend when it forgets a transaction
-    * whose objects have not all loaded, which therefore never reached resolvedAndAllObjectsLoaded.
+    * whose objects have not all loaded, which therefore never reached resolvedAndAllObjectsLoaded. A commit held for
+    * its turn keeps them, and its locks, until it is applied.
     */
-  def releaseObjects(): Unit = if !objectsReleased then
+  def releaseObjects(): Unit = if !objectsReleased && !commitHeld then
     objectsReleased = true
     unlock()
     objects.valuesIterator.foreach(frontend.release)
@@ -476,6 +563,9 @@ class Tx( trs: TransactionRecoveryState,
     // The vote no longer matters
     waitingOn = Set()
     pendingCollisionPrepare = None
+    if awaitingCommits.nonEmpty then
+      frontend.stopAwaitingCommits(awaitingCommits, this)
+      awaitingCommits = Set()
 
     status = if (committed)
       TransactionStatus.Committed
@@ -526,19 +616,21 @@ class Tx( trs: TransactionRecoveryState,
     answerPrepare(m)
   }
 
-  /** Answers a prepare, unless the vote is withheld: while object data is missing, or while waiting out a collision,
-    * whose end answers the latest such prepare
+  /** Answers a prepare, unless the vote is withheld: while object data is missing, or while waiting out a collision or
+    * for in-flight commits, whose end answers the latest such prepare
     */
   private def answerPrepare(m: TxPrepare): Unit = {
     if awaitingData then
       logger.trace(s"Withholding the vote on ${m.transactionId} until its object data arrives")
     else
-      // completeLoad left the vote undecided if the Tx was waiting for data then
-      if allObjectsLoaded && !recovered && oresolution.isEmpty && disposition == TransactionDisposition.Undetermined then
+      // completeLoad left the vote undecided if the Tx was waiting for data then. A wait for in-flight commits ends
+      // only when they persist
+      if allObjectsLoaded && !recovered && oresolution.isEmpty && disposition == TransactionDisposition.Undetermined &&
+        awaitingCommits.isEmpty then
         determineDisposition()
         lock()
 
-      if waitingForCollision then
+      if withholdingVote then
         pendingCollisionPrepare = Some(m)
       else
         respondToPrepare(m)
@@ -595,8 +687,11 @@ class Tx( trs: TransactionRecoveryState,
     ofinalized = Some(m.committed)
     releaseHeldCommit()
     // Whatever the outcome: a prepare after an abort, or from a recovery driver, may have saved this Tx again. Deferred
-    // while backend commits of a committed transaction are outstanding or failed
-    frontend.transactionFinalized(transactionId)
+    // while backend commits of a committed transaction are outstanding or failed, or still held for their turn
+    if commitHeld then
+      finalizeDeferred = true
+    else
+      frontend.transactionFinalized(transactionId)
     statusCache.updateStatus(transactionId, status, finalized = true)
   }
 

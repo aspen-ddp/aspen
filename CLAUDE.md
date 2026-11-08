@@ -220,6 +220,13 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     non-object requirements). The driver tallies each object's votes from its own pool's stores
   - A store keeps a committed transaction's CRL state until its backend commits succeed; a failed commit keeps it (and
     the pinned object state, still served) while the store is loaded
+  - One in-flight transaction commit per object (`Frontend.commitInFlight`): a transaction touching an object whose
+    commit is in flight, whether or not it builds on it, withholds its vote with no locks and no timer until the commit
+    persists, then checks its requirements against the state as it is then. A follower resolved committed meanwhile
+    holds its commit (queued per object, oldest first) until earlier commits of its objects persist. Locks still
+    release when a commit is applied in memory: the in-flight marker orders followers. After a failed backend commit
+    every transaction on that object votes abort (`BackendCommitFailed`) until the store reloads. Objects a
+    transaction only checks or locks get no backend commit, so concurrent `SharedRevisionLock` holders never wait
 -  Lifecycle:
   - The client builds a TransactionDescription and sends it plus object data to the stores
   - The stores check all local state against the TransactionRequirements and determine their Commit/Abort decision

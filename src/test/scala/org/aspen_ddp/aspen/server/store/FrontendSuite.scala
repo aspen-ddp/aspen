@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
-import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.ida.{AppendDelta, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, OpportunisticRebuild, ReadResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Insert, Key, KeySet, KeyValueOperation, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
@@ -15,7 +15,7 @@ import org.aspen_ddp.aspen.TempDirManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.network.Messenger
-import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend}
+import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend, UpdateForm}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache, StoreObjectCache}
 import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
 import org.aspen_ddp.aspen.client.DataObjectState
@@ -126,12 +126,21 @@ object FrontendSuite {
       repairs += 1
       super.repair(state, complete)
 
+    /** The transactions of the commits received, in the order received */
+    var issued: List[TransactionId] = Nil
+    /** The most commits held at once */
+    var maxHeld: Int = 0
+
     override def commit(state: CommitState, transactionId: TransactionId): Unit =
       held = held :+ (state, transactionId)
+      issued = issued :+ transactionId
+      maxHeld = math.max(maxHeld, held.size)
 
     def heldCommits: Int = held.size
 
-    /** Completes the oldest held commit */
+    /** Completes the oldest held commit. A ranged commit writes only its spans over the stored slice, as a backend that
+      * avoids rewriting unchanged bytes does
+      */
     def deliverOne(result: Either[Unit, CommitError.Value] = Left(())): Unit =
       val (state, txid) = held.head
       held = held.tail
@@ -139,7 +148,16 @@ object FrontendSuite {
         if state.metadata.refcount.count == 0 then
           m -= state.objectId
         else
-          m += (state.objectId -> new ObjectState(state.objectId, state.metadata, state.objectType, state.data))
+          val data = (state.form, m.get(state.objectId)) match
+            case (UpdateForm.Ranges(_, spans), Some(stored)) =>
+              val bytes = new Array[Byte](state.data.size)
+              val base = stored.data.getByteArray
+              System.arraycopy(base, 0, bytes, 0, math.min(base.length, bytes.length))
+              val src = state.data.getByteArray
+              spans.foreach((off, len) => System.arraycopy(src, off, bytes, off, len))
+              DataBuffer(bytes)
+            case _ => state.data
+          m += (state.objectId -> new ObjectState(state.objectId, state.metadata, state.objectType, data))
       handler.foreach(_.complete(Commit(this.storeId, state.objectId, txid, result)))
 
     def deliverCommits(result: Either[Unit, CommitError.Value] = Left(())): Unit =
@@ -917,7 +935,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     r.disposition shouldBe TransactionDisposition.VoteAbort
   }
 
-  test("a failed backend commit does not drop another transaction's shared lock") {
+  test("after a failed backend commit, every transaction on the object votes abort, shared lock holders included") {
     val (frontend, _, net) = failingCommitFixture()
 
     prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(fencePtr, rev0)))).disposition shouldBe
@@ -927,16 +945,18 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       TransactionDisposition.VoteAbort
     resolve(frontend, net, txid2, committed = true)
 
-    // The backend still holds rev0, but the shared lock must still be honoured
     prepare(frontend, net, lockTxd(txid3, List(overwrite(fencePtr)))).disposition shouldBe
       TransactionDisposition.VoteAbort
 
-    // Once the holder resolves, the failed commit's state stays in force: the store may have voted for it
+    // Even one built on the failed commit, after the holder resolves: until the store reloads
     resolve(frontend, net, txid1, committed = false)
-    prepare(frontend, net, lockTxd(TransactionId(new UUID(0, 13)), List(overwrite(fencePtr)))).disposition shouldBe
-      TransactionDisposition.VoteAbort
     val afterFailed = DataUpdate(fencePtr, ObjectRevision(txid2), DataUpdateOperation.Overwrite)
     prepare(frontend, net, lockTxd(TransactionId(new UUID(0, 14)), List(afterFailed))).disposition shouldBe
+      TransactionDisposition.VoteAbort
+    prepare(frontend, net, lockTxd(TransactionId(new UUID(0, 15)), List(SharedRevisionLock(fencePtr, ObjectRevision(txid2)))))
+      .disposition shouldBe TransactionDisposition.VoteAbort
+    // Other objects are unaffected
+    prepare(frontend, net, lockTxd(TransactionId(new UUID(0, 16)), List(SharedRevisionLock(op1, rev0)))).disposition shouldBe
       TransactionDisposition.VoteCommit
   }
 
@@ -1262,11 +1282,13 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     val reads = backend.reads
     readData(frontend, net, op1) shouldBe Left(ReadError.ObjectNotFound)
-    // A transaction finds the object missing too
-    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteAbort
+    // A transaction finds the object missing too, once it no longer waits for the deletion to persist
+    sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
+    prepareResponses(net, txid2) shouldBe empty
     backend.reads shouldBe reads
 
     backend.deliverCommits()
+    prepareResponses(net, txid2).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
     readData(frontend, net, op1) shouldBe Left(ReadError.ObjectNotFound)
     backend.reads shouldBe reads + 1
   }
@@ -1290,16 +1312,18 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         afterPressure shouldBe reads + others.size
   }
 
+  /** A rebuild-like commit of op1 holding `b`, at the revision `txid` writes: not a transaction's commit */
+  def rebuildCommit(frontend: Frontend, txid: TransactionId, b: Byte): Unit =
+    val metadata = Metadata(ObjectRevision(txid), ObjectRefcount(1, 1), HLCTimestamp(200))
+    val data = DataBuffer(Array[Byte](b))
+    frontend.commit(new ObjectState(oid1, metadata, ObjectType.Data, data),
+      CommitState(op1, metadata, ObjectType.Data, data), txid)
+
   test("two in-flight commits of one object serve the newest state") {
     val (frontend, backend, _, net) = commitWindowFixture()
-    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
-    resolve(frontend, net, txid1, committed = true)
-
-    val txd2 = lockTxd(txid2, List(overwriteAfter(txid1)))
-    frontend.receiveTransactionMessage(mkPrepare(txd2, fromClient = true).copy(
-      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](2))))))
-    responseFor(net, txid2).disposition shouldBe TransactionDisposition.VoteCommit
-    resolve(frontend, net, txid2, committed = true)
+    // Transactions' commits of one object are never in flight together; rebuilds' may be
+    rebuildCommit(frontend, txid1, 1)
+    rebuildCommit(frontend, txid2, 2)
     backend.heldCommits shouldBe 2
 
     val reads = backend.reads
@@ -1313,6 +1337,14 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     readData(frontend, net, op1) shouldBe Right(List[Byte](2))
     backend.get(oid1).get.data.getByteArray.toList shouldBe List[Byte](2)
     afterPressure shouldBe reads + others.size
+  }
+
+  test("a transaction does not wait for a rebuild's in-flight commit") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    rebuildCommit(frontend, txid1, 1)
+    backend.heldCommits shouldBe 1
+    prepare(frontend, net, lockTxd(txid2, List(overwriteAfter(txid1)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
   }
 
   test("an aborted transaction leaves its objects cached") {
@@ -1423,15 +1455,17 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.reads shouldBe reads
   }
 
-  test("a failed in-place update during an in-flight commit does not cache the pre-commit backend state") {
+  test("a failed in-place update held behind an in-flight commit is applied only once that commit persists") {
     val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
     val insertKey4 = KeyValueOperation.encode(List(new Insert(k(4), Array[Byte](4))), ida)(0)
     prepare(frontend, net, lockTxd(txid1, List(keyRevision(1))), insertKey4).disposition shouldBe
       TransactionDisposition.VoteCommit
     resolve(frontend, net, txid1, committed = true)
     backend.heldCommits shouldBe 1
-    // Its update fails partway through, discarding the state txid1's commit holds
-    prepare(frontend, net, lockTxd(txid2, List(keyRevision(2))), corruptKVUpdate)
+    // Waits for txid1's commit to persist, and is committed by the other stores' votes meanwhile
+    frontend.receiveTransactionMessage(mkPrepare(lockTxd(txid2, List(keyRevision(2))), fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid2, corruptKVUpdate))))
+    prepareResponses(net, txid2) shouldBe empty
     resolve(frontend, net, txid2, committed = true)
     backend.heldCommits shouldBe 1
 
@@ -1439,9 +1473,11 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.readObjectForNetwork(clientId, new UUID(1, 3), kvPtr, FullObject())
       readResponseKeys(net)._1
 
-    // Answered from the backend, which does not have txid1's commit yet
-    keys() shouldBe Set(1, 2, 3)
+    // txid1's committed state, from memory
+    keys() shouldBe Set(1, 2, 3, 4)
+    // txid2's update then fails partway through, discarding the state, which the backend now has
     backend.deliverCommits()
+    backend.issued shouldBe List(txid1)
     keys() shouldBe Set(1, 2, 3, 4)
   }
 
@@ -1580,11 +1616,207 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.contains(txid1) shouldBe true
   }
 
-  test("locks are released at finalization while a commit is outstanding") {
+  test("after finalization, a transaction built on an in-flight commit still waits for it to persist") {
     val (frontend, backend, net) = heldCommit(new TestCrl)
     finalizeTx1(frontend)
-    prepare(frontend, net, lockTxd(txid2, List(overwriteAfter(txid1)))).disposition shouldBe
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    prepareResponses(net, txid2) shouldBe empty
+
+    backend.deliverOne()
+    prepareResponses(net, txid2).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+    frontend.transactions(txid2).holdsLocks shouldBe true
+  }
+
+  // ---- One in-flight transaction commit per object ----
+
+  /** Sends a client prepare carrying `data` for op1 */
+  def sendData(frontend: Frontend, txd: TransactionDescription, data: DataBuffer): Unit =
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, data))))
+
+  test("a transaction built on an in-flight commit waits for it to persist") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    prepareResponses(net, txid2) shouldBe empty
+    frontend.transactions(txid2).holdsLocks shouldBe false
+
+    backend.deliverOne()
+    prepareResponses(net, txid2).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+    frontend.transactions(txid2).holdsLocks shouldBe true
+  }
+
+  test("a transaction not built on the in-flight commit waits rather than colliding") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    // Requires op1's revision from before txid1
+    sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
+    prepareResponses(net, txid2) shouldBe empty
+
+    backend.deliverOne()
+    val r = prepareResponses(net, txid2)
+    r.map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+    r.head.collisions shouldBe Nil
+  }
+
+  test("a lock-only transaction waits on an in-flight commit of its object") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    sendPrepare(frontend, lockTxd(txid2, List(SharedRevisionLock(op1, ObjectRevision(txid1)))))
+    prepareResponses(net, txid2) shouldBe empty
+
+    backend.deliverOne()
+    prepareResponses(net, txid2).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+  }
+
+  test("a wait on an in-flight commit has no timer") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    val tx2 = frontend.transactions(txid2)
+    val start = System.nanoTime()
+
+    tx2.checkCollisionWait(start + 10 * Tx.CollisionWait.toNanos)
+    prepareResponses(net, txid2) shouldBe empty
+    // Reported as stuck while it waits, as a hung backend would leave it
+    tx2.reportIfStuck(start + Tx.StuckReportAfter.toNanos + 1000000000L) shouldBe true
+
+    backend.deliverOne()
+    prepareResponses(net, txid2).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+  }
+
+  test("prepares that arrive during a wait on an in-flight commit are answered when it ends") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    val txd2 = lockTxd(txid2, List(overwriteAfter(txid1)))
+    val first = mkPrepare(txd2, fromClient = true).proposalId
+    val retry = ProposalId(first.number + 1, first.peer)
+    sendPrepare(frontend, txd2)
+    sendPrepare(frontend, txd2, Some(retry))
+    prepareResponses(net, txid2) shouldBe empty
+
+    backend.deliverOne()
+    val r = prepareResponses(net, txid2)
+    r.map(_.proposalId) should contain (retry)
+    r.map(_.disposition).toSet shouldBe Set(TransactionDisposition.VoteCommit)
+  }
+
+  test("a SharedRevisionLock holder does not wait for another holder's in-flight commit") {
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
+    prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(fencePtr, rev0), overwrite(op1)))).disposition shouldBe
       TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
     backend.heldCommits shouldBe 1
+
+    prepare(frontend, net, lockTxd(txid2, List(SharedRevisionLock(fencePtr, rev0)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+  }
+
+  test("a resolved commit waits for the in-flight commit it follows") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    prepareResponses(net, txid2) shouldBe empty
+
+    // Committed by the other stores' votes while this store withholds its vote
+    resolve(frontend, net, txid2, committed = true)
+    backend.heldCommits shouldBe 1
+    backend.issued shouldBe List(txid1)
+
+    backend.deliverOne()
+    backend.issued shouldBe List(txid1, txid2)
+    backend.deliverOne()
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+    committedMessages(net).filter(_.transactionId == txid2).map(_.objectCommitErrors) shouldBe List(Nil)
+  }
+
+  test("a transaction resolved before its objects load still commits once the in-flight commit it follows persists") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    // The fence's read completes only after the resolution, as when TxResolved queues ahead of a read completion
+    backend.deferReads = true
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1), overwrite(fencePtr))))
+    resolve(frontend, net, txid2, committed = true)
+    backend.deliverReads()
+    backend.issued shouldBe List(txid1)
+
+    backend.deliverOne()
+    backend.issued.take(2) shouldBe List(txid1, txid2)
+    while backend.heldCommits > 0 do backend.deliverOne()
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+  }
+
+  test("a held commit finalized before it is applied is still applied, and its CRL entry kept until it persists") {
+    val crl = new TestCrl
+    val (frontend, backend, net) = heldCommit(crl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    resolve(frontend, net, txid2, committed = true)
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true))
+    frontend.transactions.contains(txid2) shouldBe false
+    crl.deleted should not contain txid2
+
+    backend.deliverOne()
+    backend.issued shouldBe List(txid1, txid2)
+    crl.deleted should not contain txid2
+    backend.deliverOne()
+    crl.deleted should contain (txid2)
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+  }
+
+  test("a waiting transaction that resolves is no longer called when the commit persists") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    resolve(frontend, net, txid2, committed = false)
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = false))
+
+    backend.deliverOne()
+    prepareResponses(net, txid2) shouldBe empty
+    backend.issued shouldBe List(txid1)
+  }
+
+  test("chained commits persist in commit order") {
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
+    val base = Array.tabulate[Byte](16)(_.toByte)
+    sendData(frontend, lockTxd(txid1, List(overwrite(op1))), DataBuffer(base.clone()))
+    responseFor(net, txid1).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+
+    // Each built on the previous one, and committed by the other stores' votes
+    val d2 = AppendDelta(16, 16, List(XorRegion(4, Array[Byte](1, 2, 3))), None)
+    val d3 = AppendDelta(16, 16, List(XorRegion(10, Array[Byte](7, 7))), None)
+    sendData(frontend, lockTxd(txid2, List(DataUpdate(op1, ObjectRevision(txid1), DataUpdateOperation.WriteRange))),
+      d2.encode)
+    sendData(frontend, lockTxd(txid3, List(DataUpdate(op1, ObjectRevision(txid2), DataUpdateOperation.WriteRange))),
+      d3.encode)
+    resolve(frontend, net, txid2, committed = true)
+    resolve(frontend, net, txid3, committed = true)
+
+    while backend.heldCommits > 0 do backend.deliverOne()
+
+    backend.issued shouldBe List(txid1, txid2, txid3)
+    backend.maxHeld shouldBe 1
+    val expected = base.clone()
+    expected(4) = (expected(4) ^ 1).toByte
+    expected(5) = (expected(5) ^ 2).toByte
+    expected(6) = (expected(6) ^ 3).toByte
+    expected(10) = (expected(10) ^ 7).toByte
+    expected(11) = (expected(11) ^ 7).toByte
+    backend.get(oid1).get.data.getByteArray.toList shouldBe expected.toList
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid3)
+  }
+
+  test("waiters on a failed backend commit vote abort") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    prepareResponses(net, txid2) shouldBe empty
+
+    backend.deliverOne(Right(CommitError.IOFailure))
+    prepareResponses(net, txid2).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+
+    sendPrepare(frontend, lockTxd(txid3, List(overwriteAfter(txid1))))
+    prepareResponses(net, txid3).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+  }
+
+  test("a held commit whose predecessor's backend commit fails commits nothing for that object") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    resolve(frontend, net, txid2, committed = true)
+
+    backend.deliverOne(Right(CommitError.IOFailure))
+    backend.issued shouldBe List(txid1)
+    committedMessages(net).filter(_.transactionId == txid2).map(_.objectCommitErrors) shouldBe List(List(oid1))
   }
 }

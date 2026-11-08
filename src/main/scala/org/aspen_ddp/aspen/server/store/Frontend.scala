@@ -63,6 +63,77 @@ class Frontend(val storeId: StoreId,
   def locksReleased(holder: TransactionId): Unit =
     collisionWaiters.remove(holder).foreach(_.foreach(_.collisionHolderReleased(holder)))
 
+  // ---- One in-flight transaction commit per object ----
+  //
+  // An object accepts its next transaction only once the previous transaction commit to it has been persisted by the
+  // backend, so at most one committed-but-unpersisted transaction per object is in the CRL. A transaction touching an
+  // object with a commit in flight withholds its vote until the commit persists (no timer: a backend commit always
+  // completes or fails), and a committed transaction holds its own commit until it is its turn on every object it
+  // changes. Locks still release when a commit is applied in memory: the in-flight marker, not the lock, orders the
+  // followers. An object a transaction only checks or locks gets no commit and so is never in flight
+
+  /** Outstanding backend commits of transactions' changes, deletions included, by object: commit with
+    * `forTransaction = true`. Rebuild and repair commits are not counted
+    */
+  private val txCommitsInFlight = scala.collection.mutable.HashMap[ObjectId, Int]()
+
+  /** Committed transactions holding their commit until it is their turn, by object, oldest first. See holdCommit */
+  private val heldCommits = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
+
+  /** Transactions withholding their vote until no commit of the object is in flight, oldest first */
+  private val commitWaiters = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
+
+  /** Objects a transaction's backend commit failed to write. Never cleared: the store reloads with a new Frontend */
+  private val failedCommits = scala.collection.mutable.HashSet[ObjectId]()
+
+  /** A transaction's commit of `oid` is outstanding, or a committed transaction holds one waiting its turn */
+  def commitInFlight(oid: ObjectId): Boolean = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)
+
+  /** A transaction's backend commit of `oid` failed: every later transaction on it votes abort until the store reloads */
+  def commitFailed(oid: ObjectId): Boolean = failedCommits.contains(oid)
+
+  /** `waiter` withholds its vote until each of `oids` has no commit in flight: it is then told through
+    * Tx.commitPersisted, once per object
+    */
+  def awaitCommitPersisted(oids: Set[ObjectId], waiter: Tx): Unit =
+    oids.foreach(oid => commitWaiters(oid) = commitWaiters.getOrElse(oid, Nil).filterNot(_ eq waiter) :+ waiter)
+
+  /** `waiter` no longer waits: it resolved */
+  def stopAwaitingCommits(oids: Set[ObjectId], waiter: Tx): Unit =
+    oids.foreach(oid => removeFrom(commitWaiters, oid, waiter))
+
+  /** Queues `tx`'s commit of `oids` behind the commits of them in flight and those already held. Queues are appended to
+    * together, so the oldest held commit heads the queue of every object it changes and the held commits cannot
+    * wait on one another in a cycle. `tx` is told through Tx.commitPersisted when it may be its turn
+    */
+  def holdCommit(oids: Set[ObjectId], tx: Tx): Unit =
+    oids.foreach(oid => heldCommits(oid) = heldCommits.getOrElse(oid, Nil) :+ tx)
+
+  /** Whether `tx`, holding its commit of `oids`, may issue it now: no commit of them is in flight and it heads their
+    * queues
+    */
+  def heldCommitReady(oids: Set[ObjectId], tx: Tx): Boolean =
+    oids.forall(oid => !txCommitsInFlight.contains(oid) && heldCommits.get(oid).exists(_.head eq tx))
+
+  /** `tx` has issued the commits it held, so the next in the queues may follow once they persist */
+  def heldCommitIssued(oids: Set[ObjectId], tx: Tx): Unit =
+    oids.foreach(oid => removeFrom(heldCommits, oid, tx))
+    oids.foreach(commitTurnFree)
+
+  private def removeFrom(m: scala.collection.mutable.HashMap[ObjectId, List[Tx]], oid: ObjectId, tx: Tx): Unit =
+    m.get(oid).foreach: l =>
+      val rest = l.filterNot(_ eq tx)
+      if rest.isEmpty then m.remove(oid) else m(oid) = rest
+
+  /** Tells whoever is next on `oid`, unless a commit of it is still in flight: the oldest held commit, or else every
+    * transaction waiting to vote
+    */
+  private def commitTurnFree(oid: ObjectId): Unit =
+    if !txCommitsInFlight.contains(oid) then
+      heldCommits.get(oid) match
+        case Some(next :: _) => next.commitPersisted(oid)
+        case _ => commitWaiters.remove(oid).foreach(_.foreach(_.commitPersisted(oid)))
+
   /** Outstanding backend commits, oldest first. Each holds a reference to its state (see retain) from commit until
     * the backend reports it complete, so the state is served and checked from memory rather than read from a backend
     * that may not have it yet. `start` times the commit as the store sees it: BackendTiming
@@ -215,6 +286,7 @@ class Frontend(val storeId: StoreId,
     // Before the backend commit: a synchronous backend completes inside it
     if forTransaction then
       txCommits.getOrElseUpdate(txid, new TxCommits(0, false, false)).outstanding += 1
+      txCommitsInFlight(os.objectId) = txCommitsInFlight.getOrElse(os.objectId, 0) + 1
     backend.commit(cs, txid)
 
   /** A transaction was finalized. Its CRL state is deleted now, unless backend commits this store issued for it are
@@ -353,12 +425,25 @@ class Frontend(val storeId: StoreId,
     case r: Read => backendReadComplete(r.objectId, r.result)
     case c: Commit =>
       val key = (c.objectId, c.transactionId)
+      var turnFree = false
+      // A rebuild commit can share its (object, transaction) key with a transaction's commit of the object. Completions
+      // are matched to the oldest record for the key, which assumes the backend completes one key's commits in the
+      // order it received them. Otherwise the transaction's commit could be counted persisted when the rebuild's
+      // completes, letting its followers through early
       inFlight.get(key) match
         case Some(f :: rest) =>
           if rest.isEmpty then inFlight.remove(key) else inFlight(key) = rest
           BackendTiming.report.record(commitStage, System.nanoTime() - f.start)
           if f.forTransaction then
             transactionCommitComplete(c.transactionId, c.result.isLeft)
+            if c.result.isRight then
+              failedCommits += c.objectId
+            val n = txCommitsInFlight.getOrElse(c.objectId, 1) - 1
+            if n == 0 then
+              txCommitsInFlight.remove(c.objectId)
+              turnFree = true
+            else
+              txCommitsInFlight(c.objectId) = n
           if !f.deletes then
             committingComplete(f.os)
           c.result match
@@ -378,6 +463,9 @@ class Frontend(val storeId: StoreId,
       transactions.get(c.transactionId).foreach { tx =>
         tx.commitComplete(c.objectId, c.result)
       }
+      // Last: the next transaction on the object may commit, and with a synchronous backend complete, inside this
+      if turnFree then
+        commitTurnFree(c.objectId)
   }
 
   /** A non-deletion backend commit of `os` completed, successfully or not */

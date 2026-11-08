@@ -28,6 +28,11 @@ case class RequirementCheckFailure() extends RequirementError
   */
 case class StaleObjectState() extends RequirementError
 
+/** A backend commit of the object failed on this store: every later transaction on the object votes abort until the
+  * store reloads. Purely local, like RequirementCheckFailure.
+  */
+case class BackendCommitFailed() extends RequirementError
+
 /** An Append delta does not apply to the store's current slice.
   *
   * Either the payload could not be decoded or its expected slice length or trailer differs from

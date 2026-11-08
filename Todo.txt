@@ -8,15 +8,31 @@ A shutdown first is still required when the device's CRL is not physically on th
 configuration places the CRLs of HDD devices on an NVMe device to avoid double-writing to already slow media; for such
 a device, the shutdown must write its current CRL state onto the drive in preparation for the physical move.
 
-Potential problem with rapid transactions. If we have a store backend that commits slowly, we could get a queue of
-pending commits if we allow the next transaction on an object to commit before the current, in-flight commit
-completes. In the pathological case, this could overflow the CRL. We need some mechanism to prevent the next transaction
-from committing while the current one is in-flight. We could just not release the locks until the commit operation
-completes but that's not ideal in that the subsequent transaction could "conflict" with the previous transaction in
-the sequence, which doesn't make logical sense. The alternative would be to delay processing the transaction until
-the commit completes. Usually, commit operations are fast, 10s of milliseconds, but they can experience random long
-delays so buffering of high-transaction volume could be a concern. We are allowed to drop messages though so a
-dropping solution could be incorporated into the solution.
+Investigate next, once the per-device CRL feature is complete: "concurrent transactions commit on store threads" in
+ThreadedHostSuite / AdaptiveThreadedHostSuite hangs under full CPU load (24 busy loops alongside `sbt test`). Flaky
+tests are not permitted. Evidence (thread dumps, test log, hung-read output, notes) is in
+docs/investigations/2026-11-07-threaded-host-hang/.
+  - Tally:
+    - Before the one-in-flight-commit change (d7ab3839): 0 hangs in 8 loaded runs, not conclusive at this rate.
+    - With it, before its lost-wakeup fix: 3 in about 23 runs.
+    - After the fix: 1 in 5 runs, at which point the hunt stopped.
+    - Running the two threaded suites alone under load: 0 in 40, so the hang needs the full-suite context.
+  - The lost wakeup was a transaction resolved before its objects loaded registering a vote wait that hid its held
+    commit. It has a FrontendSuite regression test. Some of the earlier hangs may have been the hang below instead.
+  - Signature of the remaining hang:
+    - The test thread waits in SerialExecutionContext for a callback that never comes.
+    - Every aspen-store-N thread, the control thread and the balancer are idle on empty queues.
+    - The store threads had used 0.1-20 ms of CPU in 271 s, so the test stalled near its start, probably in
+      allocate().
+    - The client logged 11 reads with zero responses. Reads never consult in-flight commit state, so either the
+      stores never got them or their replies were lost.
+  - Hypothesis (unconfirmed): a message-delivery or routing stall in the threaded TestNetwork host that the new commit
+    timing exposes. Candidates:
+    - StoreRouter treating stores as unknown, offline, loading or awaitingDevice, which makes them silent;
+    - adaptive-pool mailbox moves;
+    - TestNetwork.handleEvents outside lockstep.
+  - Next step: at the hang, dump StoreRouter state and mailbox queue lengths to a file (sbt buffers a hung suite's
+    stdout, and warns are suppressed in tests). Hunt on both HEAD and d7ab3839, about 8 minutes per loaded run.
 
 Potential hole in transaction recovery. Scenario, a Tx starts and reaches a commit decision. A store that voted to
 commit crashes and recovers after the transaction was finalized and expunged from the transaction cache. Enough stores

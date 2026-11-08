@@ -41,6 +41,27 @@ object RequirementsApplyer extends Logging {
         case _: LocalTimeRequirement => None
     }.toSet
 
+  /** The objects in `objects` that already show `transactionId`'s update, which proves that it committed: only applying
+    * a committed update, or repair and rebuild copying a committed state, gives an object that revision. An object
+    * shows it when its revision is the transaction's, for an update that moves the revision (DataUpdate, VersionBump,
+    * KeyValueUpdate with a required revision), or when a key carries it, for a KeyValueUpdate without one. A
+    * RefcountUpdate, or a KeyValueUpdate that only deletes, leaves no trace.
+    */
+  def appliedBy(transactionId: TransactionId,
+                requirements: List[TransactionRequirement],
+                objects: Map[ObjectId, ObjectState]): Set[ObjectId] =
+    val rev = ObjectRevision(transactionId)
+    def atRevision(oid: ObjectId): Option[ObjectState] = objects.get(oid).filter(_.metadata.revision == rev)
+    requirements.iterator.flatMap { (r: TransactionRequirement) =>
+      r match
+        case r: DataUpdate => atRevision(r.objectPointer.id)
+        case r: VersionBump => atRevision(r.objectPointer.id)
+        case r: KeyValueUpdate if r.requiredRevision.isDefined => atRevision(r.objectPointer.id)
+        case r: KeyValueUpdate =>
+          objects.get(r.objectPointer.id).filter(_.kvState.exists(_.content.valuesIterator.exists(_.revision == rev)))
+        case _ => None
+    }.map(_.objectId).toSet
+
   def apply(transactionId: TransactionId,
             timestamp: HLCTimestamp,
             requirements: List[TransactionRequirement],

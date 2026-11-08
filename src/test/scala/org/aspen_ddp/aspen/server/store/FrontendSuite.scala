@@ -582,6 +582,112 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       committedMessages(net) shouldBe Nil
   }
 
+  // ---- A prepare for a forgotten transaction this store has already applied ----
+  //
+  // A recovery driver may prepare a transaction the other stores finalized and forgot: a store that voted commit
+  // crashed before applying it, and recovered after. Its object at the transaction's revision proves the commit.
+  // Voting on requirements that the commit itself made fail would let the driver decide abort, and the recovering
+  // store would drop an update that counted towards the write threshold.
+
+  private val provenRev = ObjectRevision(txid1)
+  private val recoveryDriver = StoreId(poolId, 2)
+  private val appliedData = Array[Byte](3, 3)
+
+  /** A store holding op1 already at txid1's revision, with the fence object at `fenceRevision` */
+  private def withApplied(fenceRevision: ObjectRevision = rev0)
+                         (f: (Frontend, MapBackend, TestNet, TestCrl) => Unit): Unit =
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val crl = new TestCrl
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
+      DataBuffer(appliedData))
+    backend.bootstrapAllocate(fenceOid, ObjectType.Data, Metadata(fenceRevision, ObjectRefcount(1, 1),
+      HLCTimestamp(1)), DataBuffer(new Array[Byte](0)))
+    f(frontend, backend, net, crl)
+
+  private def driverPrepare(txd: TransactionDescription): TxPrepare =
+    val p = mkPrepare(txd, fromClient = false)
+    p.copy(from = recoveryDriver, proposalId = ProposalId(p.proposalId.number + 1, 2.toByte))
+
+  private def resolvedMessages(net: TestNet): List[TxResolved] = net.sentTx.collect { case r: TxResolved => r }
+  private def votes(net: TestNet): List[TxPrepareResponse] = net.sentTx.collect { case r: TxPrepareResponse => r }
+
+  test("a driver's prepare for a forgotten transaction this store has applied is answered with its commit") {
+    withApplied(): (frontend, _, net, crl) =>
+      frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd))
+
+      resolvedMessages(net) shouldBe List(TxResolved(recoveryDriver, storeId, txid1, committed = true))
+      votes(net) shouldBe Nil
+      crl.txSaved shouldBe false
+      // No locks: another transaction on the object is unaffected
+      frontend.transactions(txid1).holdsLocks shouldBe false
+  }
+
+  test("a retransmitted driver prepare for a proven commit is answered with the commit again") {
+    withApplied(): (frontend, _, net, _) =>
+      frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd))
+      frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd))
+
+      resolvedMessages(net).size shouldBe 2
+      votes(net) shouldBe Nil
+  }
+
+  test("a proven commit is not applied again and reports no commit errors when finalized") {
+    withApplied(): (frontend, backend, net, crl) =>
+      frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd))
+      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = true))
+
+      committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+      backend.get(oid1).get.data.getByteArray shouldBe appliedData
+      frontend.transactions.contains(txid1) shouldBe false
+      crl.txDel shouldBe true
+  }
+
+  test("a late client prepare with data for an applied transaction does not apply the data again") {
+    withApplied(): (frontend, backend, net, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+
+      resolvedMessages(net).map(_.committed) shouldBe List(true)
+      votes(net) shouldBe Nil
+      committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+      backend.get(oid1).get.data.getByteArray shouldBe appliedData
+  }
+
+  test("a forgotten transaction is proven committed although a lock-only object has moved on") {
+    withApplied(fenceRevision = new ObjectRevision(new UUID(0, 99))): (frontend, _, net, _) =>
+      val txd = lockTxd(txid1, List(overwrite(op1), SharedRevisionLock(fencePtr, rev0)))
+      frontend.receiveTransactionMessage(driverPrepare(txd))
+
+      resolvedMessages(net).map(_.committed) shouldBe List(true)
+      votes(net) shouldBe Nil
+  }
+
+  test("a forgotten KeyValue transaction without a required revision is proven committed by a key it wrote") {
+    val (frontend, backend, _, net) = mkFrontendWithNet()
+    val contents = Map(k(1) -> new ValueState(Value(Array[Byte](1)), provenRev, HLCTimestamp(100), None))
+    backend.bootstrapAllocate(oid2, ObjectType.KeyValue, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(100)),
+      KVObjectState.encode(None, None, None, None, contents))
+    val txd = lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.DoesNotExist(k(1))))))
+
+    frontend.receiveTransactionMessage(driverPrepare(txd))
+
+    resolvedMessages(net).map(_.committed) shouldBe List(true)
+    votes(net) shouldBe Nil
+  }
+
+  test("a forgotten transaction whose object is at another revision still gets an abort vote") {
+    withApplied(): (frontend, _, net, _) =>
+      val other = TransactionId(new UUID(0, 98))
+      frontend.receiveTransactionMessage(driverPrepare(lockTxd(other, List(overwrite(op1)))).copy(
+        objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](7))))))
+
+      resolvedMessages(net) shouldBe Nil
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+  }
+
   // ---- Requirement locks held between a commit vote and resolution ----
 
   val txid3 = TransactionId(new UUID(0, 11))

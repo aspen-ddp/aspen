@@ -116,7 +116,19 @@ class Tx( trs: TransactionRecoveryState,
     */
   private def awaitingData: Boolean =
     disposition == TransactionDisposition.Undetermined && !recovered && !clientPrepared && !outcomeKnown &&
-      oresolution.isEmpty && missingObjectData && System.nanoTime() - startNanos < frontend.missingDataWait.toNanos
+      oresolution.isEmpty && missingObjectData && System.nanoTime() - startNanos < frontend.missingDataWait.toNanos &&
+      !(allObjectsLoaded && appliedHere.nonEmpty) // A proven commit needs no data: see proveCommitted
+
+  /** The loaded objects that already show this transaction's update, proving that it committed. See
+    * RequirementsApplyer.appliedBy
+    */
+  private def appliedHere: Set[ObjectId] = RequirementsApplyer.appliedBy(transactionId, requirements, objects)
+
+  /** This store found the transaction's update already applied to an object it hosts, without knowing the
+    * transaction: the other stores finalized and forgot it, and a recovery driver prepares it again for a store that
+    * voted commit and recovered after. See proveCommitted
+    */
+  private var provenCommitted: Boolean = false
 
   /** The commit decision can overtake the client's prepare too. Applying now would lose the object update, so the
     * commit waits, without a TxCommitted, and the driver sees the store's TxCommitted when the data arrives instead of
@@ -354,13 +366,16 @@ class Tx( trs: TransactionRecoveryState,
     // A recovered transaction keeps the vote it persisted: the vote may already have been counted, and recomputing it
     // against state that changed since could contradict it. A recovered commit vote takes its locks again; a recovered
     // abort vote must not become a commit vote that conflicts with a recovered commit vote it collided with.
+    // Taken first: a proven commit (see proveCommitted) resolves itself
+    val resolution = oresolution
+
     if !(recovered && disposition != TransactionDisposition.Undetermined) && !awaitingData then
       determineDisposition()
 
     lock()
 
     // Case Resolution Complete
-    oresolution.foreach { resolution =>
+    resolution.foreach { resolution =>
       resolvedAndAllObjectsLoaded(resolution)
     }
 
@@ -435,7 +450,10 @@ class Tx( trs: TransactionRecoveryState,
 
     disposition = if (m.isEmpty && l.isEmpty) TransactionDisposition.VoteCommit else TransactionDisposition.VoteAbort
 
-    if (disposition == TransactionDisposition.VoteAbort) {
+    if disposition == TransactionDisposition.VoteAbort && oresolution.isEmpty && !outcomeKnown &&
+      appliedHere.nonEmpty then
+      proveCommitted()
+    else if (disposition == TransactionDisposition.VoteAbort) {
       m.foreach(t => logger.trace(s"Tx ${txd.transactionId}. Object: ${t._1.uuid}. Requirement Error: ${t._2}"))
       l.foreach(e => logger.trace(s"Tx ${txd.transactionId}. Requirement Error: ${e}"))
       AbortVoteReport.report.record(transactionId, m.toList.map((o, e) => Some(o) -> e) ++ l.map(None -> _))
@@ -449,6 +467,24 @@ class Tx( trs: TransactionRecoveryState,
         else "abort vote"
       AbortVoteReport.report.recordCollisionWait(outcome, System.nanoTime() - collisionWaitStart)
   }
+
+  /** The requirements fail only because this store has applied the transaction: an object it hosts shows the update
+    * (see RequirementsApplyer.appliedBy), so the transaction committed. An abort vote here could let a recovery driver
+    * decide abort, since the stores that finalized the transaction forgot their Paxos state, and a recovering store
+    * would then drop an update that counted towards the write threshold. So the store gives no vote and tells the
+    * proposer the outcome instead; the proposer finalizes it, and every store applies what it lacks. Nothing is saved
+    * and no locks are taken. A proven commit applies nothing to the objects that already show it (see doCommit).
+    */
+  private def proveCommitted(): Unit =
+    logger.info(s"Tx $transactionId on store $storeId: objects $appliedHere already show its update, so it committed. " +
+      s"Telling $lastProposer")
+    provenCommitted = true
+    delayedPrepare = None
+    sendProvenResolution(lastProposer)
+    resolved(true)
+
+  private def sendProvenResolution(to: StoreId): Unit =
+    net.sendTransactionMessage(TxResolved(to, storeId, transactionId, committed = true))
 
   private def doCommit(): Unit = if (!committed && !committing && allObjectsLoaded) {
     committing = true
@@ -477,19 +513,27 @@ class Tx( trs: TransactionRecoveryState,
       frontend.discard(objectId)
     }
 
-    result.skippedReasons.filterNot((objectId, _) => failedHere.contains(objectId)).foreach { (objectId, reason) =>
+    // Skipped because they already show this transaction's update (see proveCommitted): applied, though not by this
+    // commit. Only skipped objects are looked at, so a commit applied normally pays nothing for this
+    val alreadyApplied = RequirementsApplyer.appliedBy(transactionId, requirements,
+      objects.filter((oid, _) => result.skipped.contains(oid) && !failedHere.contains(oid)))
+    if alreadyApplied.nonEmpty then
+      logger.info(s"Tx $transactionId. Store $storeId already holds the committed update of objects $alreadyApplied")
+
+    result.skippedReasons.filterNot((objectId, _) => failedHere.contains(objectId) || alreadyApplied.contains(objectId))
+      .foreach { (objectId, reason) =>
       val current = objects.get(objectId).map(_.metadata.revision.lastUpdateTxUUID)
       logger.warn(s"Tx $transactionId. Store $storeId cannot apply the committed update of object $objectId: $reason. " +
         s"Vote: $disposition. Client prepare seen: $clientPrepared. Revision on store: $current")
     }
 
-    val uncommittable = result.uncommittable
+    val uncommittable = result.uncommittable -- alreadyApplied
 
     // Count what is actually committed. uncommittable may name objects this store never
     // loaded, so objects.size - uncommittable.size can undercount the commits in flight.
-    // Objects the transaction only locks are unchanged: they get no backend commit
+    // Objects the transaction only locks are unchanged: they get no backend commit, nor do those already applied
     val toCommit = objects.valuesIterator
-      .filter(os => changed.contains(os.objectId) && !uncommittable.contains(os.objectId)).toList
+      .filter(os => changed.contains(os.objectId) && !result.uncommittable.contains(os.objectId)).toList
 
     pendingObjectCommits = toCommit.size
 
@@ -624,7 +668,9 @@ class Tx( trs: TransactionRecoveryState,
     * for in-flight commits, whose end answers the latest such prepare
     */
   private def answerPrepare(m: TxPrepare): Unit = {
-    if awaitingData then
+    if provenCommitted then
+      sendProvenResolution(m.from)
+    else if awaitingData then
       logger.trace(s"Withholding the vote on ${m.transactionId} until its object data arrives")
     else
       // completeLoad left the vote undecided if the Tx was waiting for data then. A wait for in-flight commits ends
@@ -634,7 +680,9 @@ class Tx( trs: TransactionRecoveryState,
         determineDisposition()
         lock()
 
-      if withholdingVote then
+      if provenCommitted then
+        () // proveCommitted answered this prepare's sender
+      else if withholdingVote then
         pendingCollisionPrepare = Some(m)
       else
         respondToPrepare(m)

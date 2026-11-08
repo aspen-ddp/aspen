@@ -152,6 +152,31 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       TxAccept(ds2, ds0, txd.transactionId, ProposalId(1, 0), value = true)))
   }
 
+  // A recovery driver for a transaction the other stores forgot: a store that has applied it answers with the commit
+  // rather than a vote (Tx.proveCommitted). The votes it gets meanwhile must not decide abort first
+  test("A recovery driver waits for a store that proves the commit rather than deciding abort on the other votes") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    // Called after onFinalized has sent its messages
+    val finalizedSent = Promise[Unit]()
+    val driver = new TTD(ds0, messenger, mkprep(2, 0, 0, txd), new TFinalizer(), _ => finalizedSent.trySuccess(()))
+
+    def vote(from: StoreId, disposition: TransactionDisposition.Value): Unit =
+      driver.receiveTxPrepareResponse(TxPrepareResponse(ds0, from, txd.transactionId,
+        Right(TxPrepareResponse.Promise(None)), ProposalId(1, 0), disposition, Nil))
+
+    vote(ds0, TransactionDisposition.VoteCommit) // The recovered commit vote
+    vote(ds2, TransactionDisposition.VoteAbort) // A store that never received the transaction
+    messenger.messages.collect { case a: TxAccept => a } should be (Nil)
+
+    driver.receiveTxResolved(org.aspen_ddp.aspen.common.network.TxResolved(ds0, ds1, txd.transactionId,
+      committed = true))
+
+    // The finalizer completes on another thread
+    scala.concurrent.Await.result(finalizedSent.future, scala.concurrent.duration.Duration(5, "s"))
+    messenger.messages.collect { case f: TxFinalized => f.committed }.toSet should be (Set(true))
+  }
+
   test("Ignore invalid acceptors") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val prep = mkprep(1, 0, 0, txd)

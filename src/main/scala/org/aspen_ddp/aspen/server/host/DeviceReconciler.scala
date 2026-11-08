@@ -27,9 +27,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   // Devices with a re-check waiting out TransferOutRecheckDelay. At most one each.
   private var scheduledRechecks: Set[StorageDeviceId] = Set()
   private var deferredChecks: Set[StorageDeviceId] = Set()
-  // Stores transferred away whose device-CRL entries are not durably dropped yet, by device, and those whose drop is
-  // running. A failed drop stays due and is retried by the device's next reconcile
-  private var crlDropsDue: Map[StorageDeviceId, Set[StoreId]] = Map()
+  // Stores whose leftover device-CRL entries are being dropped (dropLeftoverCrlState)
   private var crlDropsRunning: Set[StoreId] = Set()
 
   private[server] def activeDeviceChecks: Set[StorageDeviceId] = activeChecks
@@ -65,30 +63,43 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       else Nil
     (loaded :+ m.deviceId).distinct.foreach(checkStorageDevice)
 
-  /** Drops the device-CRL entries of stores transferred away from `local`. A crash between a transfer out's save
-   *  file and the deletion of its entries leaves them in the device CRL, where they would be copied forward forever,
-   *  uncounted by admission, and recovered if the store ever came back. A store the device's entry names again (it
-   *  was transferred back) is no longer due: its entries are its own once more. */
-  private def dropTransferredCrlState(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+  /** Drops the device-CRL entries of every store the device no longer holds: one its entry does not name, with no
+   *  directory on the device and not loaded. That is a store transferred away, left so by a crash between a transfer
+   *  out's save file and the deletion of its entries, or by one between the deletion of its directory and the drop of
+   *  its entries (or by a failed drop). Left there, they would be copied forward forever, uncounted by admission, and
+   *  recovered if the store ever came back. The CRL is what is read, not a list kept in memory, so a restart forgets
+   *  nothing. A store transferred back has its entry, and so its entries are its own once more.
+   *
+   *  The directory and loaded checks run when the CRL's answer arrives, in the same control task that starts the
+   *  drop: a store that lands on the device has its directory before anything saves entries for it. A failed drop is
+   *  retried by the device's next reconcile. */
+  private def dropLeftoverCrlState(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     val deviceId = local.storageDeviceId
-    def done(storeId: StoreId): Unit =
-      val left = crlDropsDue.getOrElse(deviceId, Set()) - storeId
-      crlDropsDue = if left.isEmpty then crlDropsDue - deviceId else crlDropsDue + (deviceId -> left)
-    crlDropsDue.getOrElse(deviceId, Set()).foreach: storeId =>
-      if remote.stores.contains(storeId) then
-        done(storeId)
-      else if !crlDropsRunning.contains(storeId) then
-        crlDropsRunning += storeId
-        val dropped =
-          try local.crl.dropStore(storeId)
-          catch case NonFatal(t) => Future.failed(t)
-        dropped.onComplete: result =>
-          crlDropsRunning -= storeId
-          result match
-            case Success(_) => done(storeId)
-            case Failure(t) =>
-              logger.error(s"Failed to drop the device-CRL entries of store $storeId, transferred away. Retrying " +
-                           s"at the device's next check. Error: $t")
+    val listed =
+      try local.crl.storesWithEntries()
+      catch case NonFatal(t) => Future.failed(t)
+    listed.onComplete:
+      case Failure(t) =>
+        logger.error(s"Failed to list the stores in the CRL of storage device $deviceId. Retrying at its next " +
+                     s"check. Error: $t")
+      case Success(stores) =>
+        def leftover(storeId: StoreId): Boolean =
+          !remote.stores.contains(storeId) && !local.loadedStores.contains(storeId) &&
+            !os.exists(local.devicePath / storeId.directoryName) && !crlDropsRunning.contains(storeId)
+        // Only while the device is still loaded: an unloaded one's CRL is shut down
+        if ctx.devices.devices.get(deviceId).exists(_ eq local) then
+          stores.filter(leftover).toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
+            logger.info(s"Dropping the device-CRL entries of store $storeId, which storage device $deviceId no " +
+                        s"longer holds")
+            crlDropsRunning += storeId
+            val dropped =
+              try local.crl.dropStore(storeId)
+              catch case NonFatal(t) => Future.failed(t)
+            dropped.onComplete: result =>
+              crlDropsRunning -= storeId
+              result.failed.foreach: t =>
+                logger.error(s"Failed to drop the device-CRL entries of store $storeId, which storage device " +
+                             s"$deviceId no longer holds. Retrying at the device's next check. Error: $t")
 
   /** Reconciles a loaded device's on-disk state against the state recorded for it in the
    *  storage-devices tree: deletes stores transferred away, flips stores whose CRL state was lost
@@ -149,9 +160,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
             os.remove.all(storePath)
           catch
             case t: Throwable => logger.error(s"Failed to delete store $storePath. Error: $t")
-        // Any entries a crash after its save file left in the device CRL go too (dropTransferredCrlState)
-        crlDropsDue += local.storageDeviceId -> (crlDropsDue.getOrElse(local.storageDeviceId, Set()) + storeId)
-      dropTransferredCrlState(local, remote)
+      // Any entries a store transferred away left in the device CRL go too
+      dropLeftoverCrlState(local, remote)
 
       //----------------------
       // Lost CRL State

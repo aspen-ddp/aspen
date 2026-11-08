@@ -66,6 +66,7 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   override def admissionLimitBytes: Long = inner.admissionLimitBytes
   override def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
     inner.deleteTransactions(storeId, txids)
+  override def storesWithEntries(): Future[Set[StoreId]] = inner.storesWithEntries()
 
   /** Completed when dropStore is first called */
   val dropCalled: Promise[Unit] = Promise()
@@ -877,6 +878,33 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = factory.shutdownAll()
     yield
       deleted should be(true)
+      leftInCrl should be(Set())
+      heldOnDisk(deviceDir, storeId) should be(Set())
+
+  atest("a restart drops the device-CRL entries a store transferred away left behind"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      // A crash after the reconcile deleted the directory of a store transferred away, before its drop was durable
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      _ = os.remove.all(storeDir)
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map()))
+      _ <- waitForTransactionsToComplete()
+      heldBefore = heldOnDisk(deviceDir, storeId)
+      restarted = newCrlHost(hostRoot, second)
+      _ = restarted.control.reconciler.checkAll()
+      crl = second.opened.head
+      _ <- pumpUntil(restarted, crl.dropDone.isCompleted)
+      leftInCrl = held(crl, storeId)
+      _ = second.shutdownAll()
+    yield
+      heldBefore should be(Set(txid))
       leftInCrl should be(Set())
       heldOnDisk(deviceDir, storeId) should be(Set())
 

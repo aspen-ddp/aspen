@@ -151,10 +151,16 @@ trait CrashRecoveryLog {
     Future.unit
 
   /** Drops every entry of `storeId` for good, completing once that is durable. For a store whose state is
-    * discarded (it is rebuilt): the caller must already have made it unservable (`rebuild-required`). */
+    * discarded (it is rebuilt), or no longer on the device: the caller must already have made it unservable
+    * (`rebuild-required`) or know it is not here. Only the entries held when it is called are dropped: entries saved
+    * after the call, by the store loaded again (transferred back), are kept, however long the drop takes. The default
+    * keeps that by reading through readStoreState, which a CRL must answer in order with its saves. */
   def dropStore(storeId: StoreId): Future[Unit] =
     readStoreState(storeId).flatMap(trs => deleteTransactions(storeId, trs.map(_.txd.transactionId)))(
       using scala.concurrent.ExecutionContext.parasitic)
+
+  /** The stores the CRL holds entries for. The default holds none, for CRLs that keep nothing on disk. */
+  def storesWithEntries(): Future[Set[StoreId]] = Future.successful(Set())
 
   /** Stops the CRL's threads. Blocks until they have stopped */
   def shutdown(): Unit = ()

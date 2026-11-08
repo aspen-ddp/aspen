@@ -35,6 +35,8 @@ object SimpleCRL:
                               completion: List[TransactionRecoveryState] => Unit
                              ) extends ActionRequest
 
+  case class GetStoresWithEntries(completion: Set[StoreId] => Unit) extends ActionRequest
+
 
   case class InitialCRLState(crl: SimpleCRL,
                              trsList: List[TransactionRecoveryState])
@@ -220,6 +222,9 @@ class SimpleCRL private (val maxSizeInBytes: Long,
         case GetRecoveryState(storeId, completion) =>
           onGetRecoveryState(storeId, completion)
 
+        case GetStoresWithEntries(completion) =>
+          completion(transactions.keysIterator.map(_.storeId).toSet)
+
         case Shutdown(completionHandler) =>
           writer.shutdown(completionHandler)
           return
@@ -327,6 +332,11 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   override def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] =
     val p = Promise[List[TransactionRecoveryState]]()
     ioQueue.put(GetRecoveryState(storeId, trsList => p.success(trsList)))
+    p.future
+
+  override def storesWithEntries(): Future[Set[StoreId]] =
+    val p = Promise[Set[StoreId]]()
+    ioQueue.put(GetStoresWithEntries(stores => p.success(stores)))
     p.future
 
   /** Idempotent: a later call waits for the first one's shutdown, as a second Shutdown would find no thread */

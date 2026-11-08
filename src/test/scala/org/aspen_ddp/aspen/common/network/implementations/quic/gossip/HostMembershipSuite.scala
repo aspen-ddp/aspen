@@ -81,8 +81,10 @@ class HostMembershipSuite extends AnyFunSuite with Matchers:
   test("hosts join through seeds and see each other online"):
     withNet: net =>
       awaitAllOnline(net)
+      // Eventually, not at once: on a loaded machine the tests' short suspicion timeout can briefly take a host
+      // offline again after awaitAllOnline saw it, which is the failure detector doing its job
       for h <- net.seeds; o <- net.seeds if o != h do
-        net.hm(h).isOnline(o) shouldBe true
+        eventually(s"$h sees $o online")(net.hm(h).isOnline(o))
         eventually(s"$h got online($o)")(net.rec(h).has(HostEvent.Online(o)))
 
   test("local host in seed list is ignored"):

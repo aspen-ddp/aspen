@@ -1,12 +1,6 @@
 TODO
 ====
 
-MayExist on a key that does not exist takes no requirement lock, so two concurrent inserts of the same absent key can
-both be voted to commit. Pre-existing; decide whether an absent key should be locked like a present one. Also, verify
-that inserts with no requirement lock the modification of that key to the transaction. We must prevent the case where
-two simultaneous transactions attempt to blind-insert the same key. If locks are not taken, the order of applications
-could corrupt the key/value pair and make it non recoverable.
-
 Per-device CRL follow-ups (final review of the per-device CRL branch, 2026-11-07):
 - A device reloaded (restartStorageDevice) while its CRL is still shutting down (`LocalDevices.closingCrls`) is loaded
   later by the plain scan path, which skips checkStorageDevice and gossipStoreOnline, so peers keep its stores'

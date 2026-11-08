@@ -24,7 +24,7 @@ class ObjectStateSuite extends AnyFunSuite with Matchers:
   test("lockedWriteTransactions includes key non-existence, full content and range locks"):
     val os = kvObject()
     val kvs = os.kvState.get
-    kvs.noExistenceLocks += Key(Array[Byte](1)) -> tx1
+    kvs.absentKeyLocks += Key(Array[Byte](1)) -> tx1
     kvs.contentLocked = Some(tx2)
     kvs.rangeLocks += tx3
     os.lockedWriteTransactions shouldBe Set(tx1, tx2, tx3)

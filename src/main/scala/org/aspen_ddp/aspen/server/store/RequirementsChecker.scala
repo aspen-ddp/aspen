@@ -121,23 +121,38 @@ object RequirementsChecker extends Logging {
             }
 
           case r: KeyValueUpdate =>
-            // Requirements that lock the whole object, rather than only the keys they name
+            val ops = objectUpdates.get(r.objectPointer.id).map { data =>
+              KeyValueOperation.decode(data, ObjectRevision(transactionId), txTimestamp)
+            }
+            val writes = ops.map(KVWrites.of)
+
+            // Requirements and operations that lock the whole object, rather than only the keys they name
             val wholeObject = r.requiredRevision.nonEmpty || r.contentLock.nonEmpty ||
-              r.requirements.exists(_.isInstanceOf[KeyValueUpdate.KeyObjectRevision])
+              r.requirements.exists(_.isInstanceOf[KeyValueUpdate.KeyObjectRevision]) ||
+              writes.exists(_.objectLevel)
             val state = getState(r.objectPointer.id, wholeObject)
             checkKVRequirements(state, transactionId, r.requiredRevision,
               txTimestamp, r.contentLock, r.requirements, ignoreLocks = applying)
 
-            if (!objectUpdates.contains(r.objectPointer.id))
+            if (ops.isEmpty)
               throw ObjectErr(r.objectPointer.id, MissingObjectUpdate())
 
-            // checkKVRequirements guarantees kvState is defined. The measure is the serialized KVObjectState,
-            // which is what the store persists for the object (RequirementsApplyer sets data = kvs.encode()).
+            // checkKVRequirements guarantees kvState is defined
+            val kvs = state.kvState.get
+
+            // Every written key is locked like a key requirement, so another transaction's lock on it collides
+            if !applying then
+              writes.get.keys.foreach { key =>
+                val holder = kvs.content.get(key) match
+                  case Some(vs) => vs.lockedToTransaction
+                  case None => kvs.absentKeyLocks.get(key)
+                collide(r.objectPointer.id, holder)
+              }
+
+            // The measure is the serialized KVObjectState, which is what the store persists for the object
+            // (RequirementsApplyer sets data = kvs.encode()).
             maxSliceSize.foreach { limit =>
-              val kvs = state.kvState.get
-              val ops = KeyValueOperation.decode(objectUpdates(r.objectPointer.id), ObjectRevision(transactionId),
-                txTimestamp)
-              checkSliceSize(r.objectPointer.id, kvs.encodedSize.toLong, kvs.encodedSizeAfter(ops).toLong, limit)
+              checkSliceSize(r.objectPointer.id, kvs.encodedSize.toLong, kvs.encodedSizeAfter(ops.get).toLong, limit)
             }
 
           case r: RefcountUpdate => checkRefcount(getState(r.objectPointer.id), r.requiredRefcount)
@@ -295,14 +310,14 @@ object RequirementsChecker extends Logging {
             }
 
             case r: KeyValueUpdate.MayExist => kvs.content.get(r.key) match {
-              case None =>
-                if (otherLock(kvs.noExistenceLocks.get(r.key)).nonEmpty)
-                  throw ObjectErr(state.objectId, KeyExistenceError())
+              case None => otherLock(kvs.absentKeyLocks.get(r.key)).foreach { txid =>
+                throw ObjectErr(state.objectId, TransactionCollision(txid))
+              }
               case Some(vs) => checkLock(vs, kvs)
             }
 
             case r: KeyValueUpdate.DoesNotExist => kvs.content.get(r.key) match {
-              case None => otherLock(kvs.noExistenceLocks.get(r.key)).foreach { txid =>
+              case None => otherLock(kvs.absentKeyLocks.get(r.key)).foreach { txid =>
                 throw ObjectErr(state.objectId, TransactionCollision(txid))
               }
               case Some(_) => throw ObjectErr(state.objectId, KeyExistenceError())

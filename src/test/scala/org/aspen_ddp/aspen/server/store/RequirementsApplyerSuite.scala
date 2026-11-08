@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, Rep
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, LocalTimeRequirement,
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, RequirementCheckFailure, DataUpdateOperation, KeyValueUpdate, LocalTimeRequirement,
   RefcountUpdate, RevisionLock, RevisionMismatch, SharedRevisionLock, TransactionId, VersionBump}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -106,64 +106,37 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     assert(o.data.getByteArray sameElements Array[Byte](1, 2, 3))
   }
 
-  test("unexpected error while applying an update marks the object failed") {
-    // The requirements check passes but the encoded update carries an unknown opcode, so
-    // KeyValueOperation.decode throws partway through application. The object's metadata has
-    // already been rewritten at that point, leaving it corrupt: it must be reported as failed
-    // so the caller neither commits it nor keeps the in-memory state.
-    val o = new ObjectState(
-      oid1,
-      Metadata(rev1, ref1, ts1),
-      ObjectType.Data,
-      DataBuffer(new Array[Byte](0))
-    )
-
+  /** A KeyValue object and an update of it carrying an unknown opcode */
+  private def undecodableKVUpdate() =
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data, DataBuffer(new Array[Byte](0)))
     o.kvState = Some(new KVObjectState)
-
-    var objects: HashMap[ObjectId, ObjectState] = new HashMap
-    var updates: HashMap[ObjectId, DataBuffer] = new HashMap
-
-    objects += (o.objectId -> o)
     // 0x20 is not a valid KeyValueOperation code. The trailing byte is the varint data length.
-    updates += (o.objectId -> DataBuffer(Array[Byte](0x20, 0x00)))
+    (o, Map(o.objectId -> o), Map(o.objectId -> DataBuffer(Array[Byte](0x20, 0x00))))
 
+  test("an undecodable KeyValue update fails its check and is skipped, leaving the object untouched") {
+    val (o, objects, updates) = undecodableKVUpdate()
     val req = KeyValueUpdate(kp1, Some(rev1), None, Nil)
 
-    // Confirm the check itself is happy, so the failure can only come from apply
-    val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
-    assert(oerrs.isEmpty)
-    assert(errs.isEmpty)
+    // The check decodes the operations, so the update cannot pass it and then fail partway through application
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)._1 shouldBe
+      Map(oid1 -> RequirementCheckFailure())
 
     val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(req), objects, updates)
 
-    assert(result.skipped.isEmpty)
-    assert(result.failed == Set(oid1))
-    assert(result.uncommittable == Set(oid1))
+    assert(result.skipped == Set(oid1))
+    assert(result.failed.isEmpty)
+    assert(o.metadata == Metadata(rev1, ref1, ts1))
   }
 
   test("an object that fails one requirement is not modified by its later requirements") {
-    val o = new ObjectState(
-      oid1,
-      Metadata(rev1, ref1, ts1),
-      ObjectType.Data,
-      DataBuffer(new Array[Byte](0))
-    )
-
-    o.kvState = Some(new KVObjectState)
-
-    var objects: HashMap[ObjectId, ObjectState] = new HashMap
-    var updates: HashMap[ObjectId, DataBuffer] = new HashMap
-
-    objects += (o.objectId -> o)
-    updates += (o.objectId -> DataBuffer(Array[Byte](0x20, 0x00)))
-
+    val (o, objects, updates) = undecodableKVUpdate()
     val badUpdate = KeyValueUpdate(kp1, Some(rev1), None, Nil)
     val refcountUpdate = RefcountUpdate(kp1, ref1, ObjectRefcount(2, 2))
 
     val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now,
       List(badUpdate, refcountUpdate), objects, updates)
 
-    assert(result.failed == Set(oid1))
+    assert(result.skipped == Set(oid1))
 
     // The refcount update follows the failure and must not have been applied
     assert(o.metadata.refcount == ref1)

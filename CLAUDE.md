@@ -199,6 +199,10 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Stores hold requirement locks from a commit vote until the transaction resolves. `SharedRevisionLock` is a
     non-exclusive requirement on an object's revision: many transactions may hold it, but it collides with any write
     to that object
+  - A KeyValue update's operations lock what they write, as requirements do (`server.store.KVWrites`): each key an
+    Insert or Delete names (an absent key through `absentKeyLocks`, shared with `DoesNotExist`/`MayExist`), and the
+    whole object for a min/max/left/right change. Blind writes of one key collide, so stores applying committed
+    transactions in different orders cannot diverge
   - A prepare that reaches a store after its transaction was finalized is not applied there: the store relies on
     missed-update repair. A collision is an ordinary abort vote, even with an already-completed transaction, except
     one with a lock holder the transaction is built on (it requires the revision the holder writes): the store then

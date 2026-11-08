@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, 
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
-import org.aspen_ddp.aspen.server.store.{Frontend, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
+import org.aspen_ddp.aspen.server.store.{Frontend, KVWrites, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
 import scribe.Logging
 
 import scala.concurrent.duration._
@@ -77,6 +77,8 @@ class Tx( trs: TransactionRecoveryState,
   private var committing: Boolean = false
   private var commitHeld: Boolean = false
   private var locked: Boolean = false
+  /** The KeyValue writes locked by lock(), released by unlock(). The object data may change or be dropped meanwhile */
+  private var lockedWrites: Map[ObjectId, KVWrites] = Map()
   private var outcomeKnown: Boolean = false
   private var lastProposer: StoreId = StoreId(txd.primaryObject.poolId, txd.designatedLeaderUID)
   private var objectCommitErrors: List[ObjectId] = Nil
@@ -203,7 +205,8 @@ class Tx( trs: TransactionRecoveryState,
     if !locked && !outcomeKnown && status == TransactionStatus.Unresolved &&
       disposition == TransactionDisposition.VoteCommit then
       locked = true
-      RequirementsLocker.lock(transactionId, requirements, objects)
+      lockedWrites = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
+      RequirementsLocker.lock(transactionId, requirements, objects, lockedWrites)
 
   /** The transaction is known to be resolved, though this Tx has not been told the outcome: its prepare arrived
     * after the resolution did. Its vote cannot affect the outcome, so it takes no locks.
@@ -292,7 +295,8 @@ class Tx( trs: TransactionRecoveryState,
   private def unlock(): Unit = if (locked) {
     locked = false
 
-    RequirementsLocker.unlock(transactionId, requirements, objects)
+    RequirementsLocker.unlock(transactionId, requirements, objects, lockedWrites)
+    lockedWrites = Map()
   }
 
 

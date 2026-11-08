@@ -920,16 +920,14 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   def keyRevision(n: Int): KeyValueUpdate =
     KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(n), rev0)))
 
-  /** 0x20 is not a KeyValueOperation code, so applying this update throws partway through */
-  val corruptKVUpdate: DataBuffer = DataBuffer(Array[Byte](0x20, 0x00))
+  // A failed update discards the object's state (Tx.commit). The requirement check decodes the operations, so bad
+  // data can no longer pass it and then fail in application; these tests discard the state directly.
 
-  test("an update that fails partway through does not drop another transaction's key lock") {
+  test("discarding an object's state does not drop another transaction's key lock") {
     val (frontend, _, net) = lockFixture()
 
     prepare(frontend, net, lockTxd(txid1, List(keyRevision(1)))).disposition shouldBe TransactionDisposition.VoteCommit
-    prepare(frontend, net, lockTxd(txid2, List(keyRevision(2))), corruptKVUpdate).disposition shouldBe
-      TransactionDisposition.VoteCommit
-    resolve(frontend, net, txid2, committed = true)
+    frontend.discard(kvPtr.id)
 
     val r = prepare(frontend, net, lockTxd(txid3, List(keyRevision(1))))
     r.disposition shouldBe TransactionDisposition.VoteAbort
@@ -1394,10 +1392,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
     prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(kvPtr, rev0)))).disposition shouldBe
       TransactionDisposition.VoteCommit
-    // Committed by the other stores' votes; its update fails partway through, discarding the locked state
-    prepare(frontend, net, lockTxd(txid2, List(keyRevision(1))), corruptKVUpdate).disposition shouldBe
-      TransactionDisposition.VoteAbort
-    resolve(frontend, net, txid2, committed = true)
+    frontend.discard(kvPtr.id)
 
     // A network read loads a fresh state, which an opportunistic rebuild then commits
     frontend.readObjectForNetwork(clientId, new UUID(1, 1), kvPtr, FullObject())
@@ -1427,8 +1422,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
     prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(kvPtr, rev0)))).disposition shouldBe
       TransactionDisposition.VoteCommit
-    prepare(frontend, net, lockTxd(txid2, List(keyRevision(1))), corruptKVUpdate)
-    resolve(frontend, net, txid2, committed = true)
+    frontend.discard(kvPtr.id)
     frontend.readObjectForNetwork(clientId, new UUID(1, 1), kvPtr, FullObject())
     net.clientMessage() should not be empty
     val kv = mkKVObjectState()
@@ -1455,7 +1449,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.reads shouldBe reads
   }
 
-  test("a failed in-place update held behind an in-flight commit is applied only once that commit persists") {
+  /** 0x20 is not a KeyValueOperation code, so this update fails its requirement check */
+  val corruptKVUpdate: DataBuffer = DataBuffer(Array[Byte](0x20, 0x00))
+
+  test("an unappliable update held behind an in-flight commit is checked only once that commit persists") {
     val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
     val insertKey4 = KeyValueOperation.encode(List(new Insert(k(4), Array[Byte](4))), ida)(0)
     prepare(frontend, net, lockTxd(txid1, List(keyRevision(1))), insertKey4).disposition shouldBe
@@ -1475,7 +1472,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     // txid1's committed state, from memory
     keys() shouldBe Set(1, 2, 3, 4)
-    // txid2's update then fails partway through, discarding the state, which the backend now has
+    // txid2's update is then skipped, leaving txid1's state, which the backend now has
     backend.deliverCommits()
     backend.issued shouldBe List(txid1)
     keys() shouldBe Set(1, 2, 3, 4)

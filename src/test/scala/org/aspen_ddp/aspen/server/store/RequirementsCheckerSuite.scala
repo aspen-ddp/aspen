@@ -4,7 +4,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, SetMax, SetRight, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
 import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, AppendMismatch, VersionBump, WithinRangeError}
@@ -236,7 +236,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   test("two SharedRevisionLocks on one object both pass") {
     val objects = sharedLockFixture()
-    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects, Map())
     val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(SharedRevisionLock(p1, rev1)),
       objects, Map())
     assert(oerrs.isEmpty)
@@ -249,7 +249,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   /** Locks tx1 shared, then checks a tx2 DataUpdate on the same object at time `now` */
   private def collideWithSharedLock(objects: Map[ObjectId, ObjectState]): Map[ObjectId, RequirementError] =
-    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects, Map())
     val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now,
       List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)), objects, Map(oid1 -> DataBuffer.Empty),
       nanoTime = () => now)
@@ -286,7 +286,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   test("a committed transaction's re-check ignores locks held by other transactions") {
     val objects = sharedLockFixture()
-    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects, Map())
     objects(oid1).lockedToTransaction = Some(tx3)
     val reqs = List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite))
     val updates = Map(oid1 -> DataBuffer.Empty)
@@ -304,7 +304,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("unlock releases only locks held by the unlocking transaction") {
     val objects = sharedLockFixture()
     objects(oid1).lockedToTransaction = Some(tx2)
-    RequirementsLocker.unlock(tx1, List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)), objects)
+    RequirementsLocker.unlock(tx1, List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)), objects, Map())
     assert(objects(oid1).lockedToTransaction == Some(tx2))
   }
 
@@ -312,7 +312,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     val objects = sharedLockFixture()
     collideWithSharedLock(objects)
     // Tx unlocks before applying, so the re-check at apply time must not be refused by the window
-    RequirementsLocker.unlock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    RequirementsLocker.unlock(tx1, List(SharedRevisionLock(p1, rev1)), objects, Map())
     val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(SharedRevisionLock(p1, rev1)), objects, Map())
     assert(result.uncommittable.isEmpty)
   }
@@ -327,9 +327,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   test("SharedRevisionLock unlock releases the object for exclusive use") {
     val objects = sharedLockFixture()
-    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects, Map())
     assert(objects(oid1).lockHolders == Set(tx1))
-    RequirementsLocker.unlock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    RequirementsLocker.unlock(tx1, List(SharedRevisionLock(p1, rev1)), objects, Map())
     assert(objects(oid1).sharedLocks.isEmpty)
     val (oerrs, _) = RequirementsChecker.check(tx2, HLCTimestamp.now,
       List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)), objects, Map(oid1 -> DataBuffer.Empty))
@@ -1111,13 +1111,13 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       KeyValueUpdate.WithinRange(k, ByteArrayKeyOrdering)))
     val updates = Map(oid1 -> DataBuffer.Empty)
 
-    RequirementsLocker.lock(tx1, List(req), objects)
+    RequirementsLocker.lock(tx1, List(req), objects, Map())
 
     RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates) shouldBe (Map(), Nil)
     RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)._1 shouldBe
       Map(oid1 -> TransactionCollision(tx1))
 
-    RequirementsLocker.unlock(tx1, List(req), objects)
+    RequirementsLocker.unlock(tx1, List(req), objects, Map())
     RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates) shouldBe (Map(), Nil)
   }
 
@@ -1126,7 +1126,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     val req = KeyValueUpdate(kp1, None, Some(FullContentLock(Nil)), Nil)
     val updates = Map(oid1 -> DataBuffer.Empty)
 
-    RequirementsLocker.lock(tx1, List(req), objects)
+    RequirementsLocker.lock(tx1, List(req), objects, Map())
 
     RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)._1 shouldBe
       Map(oid1 -> TransactionCollision(tx1))
@@ -1160,7 +1160,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     val updates = Map(oid1 -> DataBuffer.Empty)
     RequirementsChecker.check(tx1, HLCTimestamp.now, List(first), objects, updates, nanoTime = () => 0L) shouldBe
       (Map(), Nil)
-    RequirementsLocker.lock(tx1, List(first), objects)
+    RequirementsLocker.lock(tx1, List(first), objects, Map())
     RequirementsChecker.check(tx2, HLCTimestamp.now, List(second), objects, updates, nanoTime = () => 0L)._1
 
   private val conflicting: List[(String, TransactionRequirement, TransactionRequirement)] = List(
@@ -1194,5 +1194,103 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
         applying = applying)._1 shouldBe Map(oid1 -> StaleObjectState())
       RequirementsChecker.check(tx1, HLCTimestamp.now, List(shared), objects, Map(), applying = applying)._1 shouldBe
         Map(oid1 -> StaleObjectState())
+  }
+
+  // ---- A KeyValue update's operations lock what they write ----
+
+  private def kvData(ops: List[KeyValueOperation]): DataBuffer = KeyValueOperation.encode(ops, Replication(3, 2))(0)
+
+  /** A KeyValueUpdate of oid1 with no requirements beyond `reqs`, and its object data */
+  private case class KVTx(txid: TransactionId, reqs: List[KeyValueUpdate.KeyRequirement], ops: List[KeyValueOperation],
+                          requiredRevision: Option[ObjectRevision] = None):
+    val requirements: List[TransactionRequirement] = List(KeyValueUpdate(kp1, requiredRevision, None, reqs))
+    val updates: Map[ObjectId, DataBuffer] = Map(oid1 -> kvData(ops))
+    def writes: Map[ObjectId, KVWrites] = KVWrites.from(requirements, updates)
+    def check(objects: Map[ObjectId, ObjectState], applying: Boolean = false): Map[ObjectId, RequirementError] =
+      RequirementsChecker.check(txid, HLCTimestamp.now, requirements, objects, updates, applying = applying,
+        nanoTime = () => 0L)._1
+    def lock(objects: Map[ObjectId, ObjectState]): Unit = RequirementsLocker.lock(txid, requirements, objects, writes)
+    def unlock(objects: Map[ObjectId, ObjectState]): Unit =
+      RequirementsLocker.unlock(txid, requirements, objects, writes)
+
+  /** `first` passes and locks, then `second` is checked. Returns second's errors */
+  private def lockThenCheckKV(objects: Map[ObjectId, ObjectState], first: KVTx, second: KVTx) =
+    first.check(objects) shouldBe Map()
+    first.lock(objects)
+    second.check(objects)
+
+  private def insert(key: Key) = Insert(key, Array[Byte](7))
+
+  private val blindInsertPresent = (t: TransactionId) => KVTx(t, Nil, List(insert(kk1)))
+  private val blindInsertAbsent = (t: TransactionId) => KVTx(t, Nil, List(insert(kk9)))
+
+  test("two MayExist requirements on an absent key collide") {
+    val may = (t: TransactionId) => KVTx(t, List(KeyValueUpdate.MayExist(kk9)), Nil)
+    lockThenCheckKV(emptyKVObject(), may(tx1), may(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
+  }
+
+  test("two blind inserts of one key collide, absent or present") {
+    lockThenCheckKV(emptyKVObject(), blindInsertAbsent(tx1), blindInsertAbsent(tx2)) shouldBe
+      Map(oid1 -> TransactionCollision(tx1))
+    lockThenCheckKV(kvObjectWithKey(), blindInsertPresent(tx1), blindInsertPresent(tx2)) shouldBe
+      Map(oid1 -> TransactionCollision(tx1))
+  }
+
+  test("blind inserts of different keys do not collide") {
+    lockThenCheckKV(kvObjectWithKey(), blindInsertPresent(tx1), blindInsertAbsent(tx2)) shouldBe Map()
+    lockThenCheckKV(kvObjectWithKey(), blindInsertAbsent(tx1), blindInsertPresent(tx2)) shouldBe Map()
+  }
+
+  test("a blind insert and key requirements on its key collide in both arrival orders") {
+    val pairs = List(
+      (() => kvObjectWithKey(), KVTx(_, List(KeyRevision(kk1, rev1)), Nil), blindInsertPresent),
+      (() => kvObjectWithKey(), KVTx(_, List(KeyValueUpdate.Exists(kk1)), Nil), blindInsertPresent),
+      (() => emptyKVObject(), KVTx(_, List(KeyValueUpdate.DoesNotExist(kk9)), Nil), blindInsertAbsent))
+    for (mk, req, write) <- pairs do
+      lockThenCheckKV(mk(), req(tx1), write(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
+      lockThenCheckKV(mk(), write(tx1), req(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
+  }
+
+  test("a blind delete collides with a lock on its key") {
+    val delete = KVTx(tx2, Nil, List(Delete(kk1)))
+    lockThenCheckKV(kvObjectWithKey(), KVTx(tx1, List(KeyValueUpdate.Exists(kk1)), Nil), delete) shouldBe
+      Map(oid1 -> TransactionCollision(tx1))
+  }
+
+  test("an object-level operation without a required revision locks the whole object") {
+    val relink = (t: TransactionId) => KVTx(t, Nil, List(SetRight(Array[Byte](1))))
+    val withinRange = (t: TransactionId) => KVTx(t, List(KeyValueUpdate.WithinRange(kk9, ByteArrayKeyOrdering)), Nil)
+    val split = (t: TransactionId) => KVTx(t, Nil, List(SetMax(kk9)), requiredRevision = Some(rev1))
+    for other <- List(withinRange, blindInsertAbsent, blindInsertPresent, split) do
+      lockThenCheckKV(kvObjectWithKey(), relink(tx1), other(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
+      lockThenCheckKV(kvObjectWithKey(), other(tx1), relink(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
+  }
+
+  test("applying a committed transaction ignores other transactions' write locks") {
+    val objects = kvObjectWithKey()
+    blindInsertPresent(tx1).lock(objects)
+    blindInsertAbsent(tx1).lock(objects)
+    blindInsertPresent(tx2).check(objects, applying = true) shouldBe Map()
+    blindInsertAbsent(tx2).check(objects, applying = true) shouldBe Map()
+  }
+
+  test("unlock releases write locks after the commit inserted or deleted the key") {
+    val objects = kvObjectWithKey()
+    val tx = KVTx(tx1, List(KeyValueUpdate.MayExist(kk9)), List(Delete(kk1), insert(kk9)))
+    tx.check(objects) shouldBe Map()
+    tx.lock(objects)
+    objects(oid1).lockedWriteTransactions shouldBe Set(tx1)
+
+    val kvs = objects(oid1).kvState.get
+    kvs.content = kvs.content - kk1 + (kk9 -> new ValueState(Value(Array[Byte](7)), ObjectRevision(tx1), ts1, None))
+    tx.unlock(objects)
+    objects(oid1).lockedWriteTransactions shouldBe Set()
+  }
+
+  test("unlock leaves another transaction's lock on a written key") {
+    val objects = emptyKVObject()
+    blindInsertAbsent(tx1).lock(objects)
+    blindInsertAbsent(tx2).unlock(objects)
+    objects(oid1).lockedWriteTransactions shouldBe Set(tx1)
   }
 }

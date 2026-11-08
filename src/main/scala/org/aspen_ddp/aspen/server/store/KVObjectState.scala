@@ -16,7 +16,8 @@ class KVObjectState(
   var left: Option[Value] = None,
   var right: Option[Value] = None,
   var content: Map[Key, ValueState] = Map(),
-  var noExistenceLocks: Map[Key, TransactionId] = Map(),
+  /** Exclusive locks on absent keys: DoesNotExist and MayExist requirements, and Inserts or Deletes of the key */
+  var absentKeyLocks: Map[Key, TransactionId] = Map(),
   var contentLocked: Option[TransactionId] = None,
   var rangeLocks: Set[TransactionId] = Set() // Read locks on the object revision
 ) {

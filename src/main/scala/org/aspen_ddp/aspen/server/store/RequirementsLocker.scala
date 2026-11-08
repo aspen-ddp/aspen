@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
-import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.server.store.RequirementsChecker.ObjectErr
@@ -22,10 +22,14 @@ object RequirementsLocker extends Logging {
 
   /** Locks all objects hosted by this store to the transaction. This method may be
     * called ONLY after a call to RequirementsChecker.check returns ZERO errors
+    *
+    * @param kvWrites What the transaction's KeyValue operations change (KVWrites.from). Written keys and
+    *                 object-level fields are locked like requirements on them. unlock must be given the same value
     */
   def lock(transactionId: TransactionId,
            requirements: List[TransactionRequirement],
-           objects: Map[ObjectId, ObjectState]): Unit = {
+           objects: Map[ObjectId, ObjectState],
+           kvWrites: Map[ObjectId, KVWrites]): Unit = {
 
     def getState(oid: ObjectId): ObjectState = {
       objects.get(oid) match {
@@ -43,7 +47,9 @@ object RequirementsLocker extends Logging {
           case r: DataUpdate => lockExclusive(getState(r.objectPointer.id), transactionId)
 
           case r: KeyValueUpdate =>
-            lockKV(getState(r.objectPointer.id), transactionId, r.requiredRevision, r.contentLock, r.requirements)
+            val state = getState(r.objectPointer.id)
+            lockKV(state, transactionId, r.requiredRevision, r.contentLock, r.requirements)
+            kvWrites.get(r.objectPointer.id).foreach(lockWrites(state, transactionId, _))
 
           case r: RefcountUpdate => lockExclusive(getState(r.objectPointer.id), transactionId)
 
@@ -88,11 +94,9 @@ object RequirementsLocker extends Logging {
               vs.lockedToTransaction = Some(transactionId)
             }
 
-            case r: KeyValueUpdate.MayExist => kvs.content.get(r.key).foreach { vs =>
-              vs.lockedToTransaction = Some(transactionId)
-            }
+            case r: KeyValueUpdate.MayExist => lockKey(kvs, r.key, transactionId)
 
-            case r: KeyValueUpdate.DoesNotExist => kvs.noExistenceLocks += (r.key -> transactionId)
+            case r: KeyValueUpdate.DoesNotExist => kvs.absentKeyLocks += (r.key -> transactionId)
 
             case r: KeyValueUpdate.TimestampEquals => kvs.content.get(r.key).foreach { vs =>
               vs.lockedToTransaction = Some(transactionId)
@@ -109,6 +113,30 @@ object RequirementsLocker extends Logging {
         }
     }
   }
+
+  /** Locks an existing key's value, or an absent key's absence */
+  private def lockKey(kvs: KVObjectState, key: Key, transactionId: TransactionId): Unit =
+    kvs.content.get(key) match
+      case Some(vs) => vs.lockedToTransaction = Some(transactionId)
+      case None => kvs.absentKeyLocks += (key -> transactionId)
+
+  /** Releases this transaction's lock on a key, whether the key was present or absent when it was locked: applying
+    * the transaction may have inserted or deleted it since
+    */
+  private def releaseKey(kvs: KVObjectState, key: Key, transactionId: TransactionId): Unit =
+    kvs.content.get(key).foreach(vs => releaseValue(vs, transactionId))
+    if kvs.absentKeyLocks.get(key).contains(transactionId) then
+      kvs.absentKeyLocks -= key
+
+  private def lockWrites(state: ObjectState, transactionId: TransactionId, writes: KVWrites): Unit =
+    if writes.objectLevel then
+      lockExclusive(state, transactionId)
+    state.kvState.foreach(kvs => writes.keys.foreach(lockKey(kvs, _, transactionId)))
+
+  private def unlockWrites(state: ObjectState, transactionId: TransactionId, writes: KVWrites): Unit =
+    if writes.objectLevel then
+      release(state, transactionId)
+    state.kvState.foreach(kvs => writes.keys.foreach(releaseKey(kvs, _, transactionId)))
 
   private def isLoaded(req: TransactionRequirement, objects: Map[ObjectId, ObjectState]): Boolean = req match
     case r: TransactionObjectRequirement => objects.contains(r.objectPointer.id)
@@ -128,7 +156,8 @@ object RequirementsLocker extends Logging {
     */
   def unlock(transactionId: TransactionId,
              requirements: List[TransactionRequirement],
-             objects: Map[ObjectId, ObjectState]): Unit = {
+             objects: Map[ObjectId, ObjectState],
+             kvWrites: Map[ObjectId, KVWrites]): Unit = {
 
     def getState(oid: ObjectId): ObjectState = {
       objects.get(oid) match {
@@ -145,7 +174,9 @@ object RequirementsLocker extends Logging {
           case r: DataUpdate => release(getState(r.objectPointer.id), transactionId)
 
           case r: KeyValueUpdate =>
-            unlockKV(getState(r.objectPointer.id), transactionId, r.requiredRevision, r.contentLock, r.requirements)
+            val state = getState(r.objectPointer.id)
+            unlockKV(state, transactionId, r.requiredRevision, r.contentLock, r.requirements)
+            kvWrites.get(r.objectPointer.id).foreach(unlockWrites(state, transactionId, _))
 
           case r: RefcountUpdate => release(getState(r.objectPointer.id), transactionId)
 
@@ -187,11 +218,11 @@ object RequirementsLocker extends Logging {
 
             case r: KeyValueUpdate.Exists => kvs.content.get(r.key).foreach(vs => releaseValue(vs, transactionId))
 
-            case r: KeyValueUpdate.MayExist => kvs.content.get(r.key).foreach(vs => releaseValue(vs, transactionId))
+            case r: KeyValueUpdate.MayExist => releaseKey(kvs, r.key, transactionId)
 
             case r: KeyValueUpdate.DoesNotExist =>
-              if kvs.noExistenceLocks.get(r.key).contains(transactionId) then
-                kvs.noExistenceLocks -= r.key
+              if kvs.absentKeyLocks.get(r.key).contains(transactionId) then
+                kvs.absentKeyLocks -= r.key
 
             case r: KeyValueUpdate.TimestampEquals => kvs.content.get(r.key).foreach(vs => releaseValue(vs, transactionId))
 

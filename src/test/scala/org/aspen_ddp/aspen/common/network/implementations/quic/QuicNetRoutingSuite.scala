@@ -93,8 +93,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
   test("path MTU discovery raises packets to maxUdpPayloadBytes on loopback"):
     assume(io.netty.channel.epoll.Epoll.isAvailable, "path MTU discovery needs epoll")
     val entry = entryFor(fx.a.net, fx.hostIdB)
-    val conn = fx.a.net.connectionFor(entry)
-    eventually("connection active")(conn.isActive)
+    val conn = connected(fx.a.net, entry)
     fx.a.net.sendToHost(entry, rebuild(fx.storesB.head, 4 * 1024 * 1024, 0))
     await(fx.b.handler.clientRequests, 1, 30000)
     eventually("path MTU discovered", 5000):
@@ -138,6 +137,9 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
   test("TxMessages flow host to host in both directions"):
     val aToB = txHeartbeat(fx.storesB.head, fx.storesA.head)
     val bToA = txHeartbeat(fx.storesA.head, fx.storesB.head)
+    // Connected first: a message sent while a dial fails is dropped
+    connected(fx.a.net, fx.hostIdB)
+    connected(fx.b.net, fx.hostIdA)
     fx.a.net.serverMessenger.sendTransactionMessage(aToB)
     fx.b.net.serverMessenger.sendTransactionMessage(bToA)
     await(fx.b.handler.txMessages, 1).map(_.message) shouldBe List(aToB)
@@ -156,6 +158,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
   test("TxPrepare with 8 MiB of updates arrives intact"):
     val updates = (0 until 8).toList.map(i => ObjectUpdate(ObjectId(UUID.randomUUID()), DataBuffer(bytes(1024 * 1024, i))))
     val m = prepare(fx.storesB.head, fx.storesA.head, updates)
+    connected(fx.a.net, fx.hostIdB) // a message sent while a dial fails is dropped
     fx.a.net.serverMessenger.sendTransactionMessage(m)
     val got = await(fx.b.handler.txMessages, 1).head.message.asInstanceOf[TxPrepare]
     got.txd shouldBe m.txd
@@ -166,8 +169,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
 
   test("three back-to-back 16 MiB messages to an idle connection all arrive"):
     val entry = entryFor(fx.a.net, fx.hostIdB)
-    val conn = fx.a.net.connectionFor(entry)
-    eventually("connection active")(conn.isActive)
+    val conn = connected(fx.a.net, entry)
     val msgs = (0 until 3).map(i => rebuild(fx.storesB.head, 16 * 1024 * 1024, i))
     msgs.foreach(m => fx.a.net.sendToHost(entry, m)) // faster than the loop drains: all three queue at once
     val got = await(fx.b.handler.clientRequests, 3, 30000).map(_.message.asInstanceOf[OpportunisticRebuild])
@@ -230,10 +232,9 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
 
   test("peer restart mid-transfer recovers"):
     val big = rebuild(fx.storesB.head, 64 * 1024 * 1024)
-    val conn = fx.a.net.connectionFor(entryFor(fx.a.net, fx.hostIdB))
     // Host membership dials B as soon as A is built, possibly before B is bound; a handshake still retrying then
     // could complete against the restarted B, so the transfer must start on a connection to the original B
-    eventually("A's connection to B is up")(conn.isActive)
+    val conn = connected(fx.a.net, fx.hostIdB)
     // Encoded only now: a wait that fails above must not leave the pooled buffer unreleased, reported as a leak
     val enc = QuicMessageCodec.encode(big, PooledByteBufAllocator.DEFAULT)
     conn.submit(enc) shouldBe true
@@ -243,7 +244,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     fx.restartB()
 
     // A keeps sending until the restarted B gets something; A's stale connection must close and be re-dialed
-    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
+    val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(LoadProbe.scaleMillis(15000))
     var delivered = false
     while !delivered && System.nanoTime() - deadline < 0 do
       fx.a.net.clientMessenger.sendClientRequest(rebuild(fx.storesB.head, 100))
@@ -314,6 +315,9 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
   test("MessageHandler callbacks run on event loop threads"):
     val c = fx.client()
     val req = read(fx.storesA.head, c.net.clientId)
+    // Connected first: a message sent while a dial fails is dropped
+    connected(c.net, fx.hostIdA)
+    connected(fx.a.net, fx.hostIdB)
     c.net.clientMessenger.sendClientRequest(req)
     val hostSide = await(fx.a.handler.clientRequests, 1).head
     hostSide.threadName should startWith("aspen-quic")

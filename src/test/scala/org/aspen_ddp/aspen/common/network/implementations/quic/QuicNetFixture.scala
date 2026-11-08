@@ -32,7 +32,10 @@ import scala.concurrent.duration.{Duration, MILLISECONDS}
   * It holds A and B; a test adding a host, or moving one, puts its state there. Client-mode nets get no lookup client.
   */
 final class QuicNetFixture(val config: QuicConfig = QuicConfig(gossip = GossipConfig.ForTests),
-                           val heartbeatPeriod: Duration = Duration(500, MILLISECONDS)):
+                           /** Also sets the QUIC idle timeout (three heartbeats) unless `config` does. Stretched on a
+                             * loaded machine by default: QUIC applies the idle timeout during the handshake too, and
+                             * a starved handshake outlasted 1.5 s */
+                           val heartbeatPeriod: Duration = LoadProbe.scale(Duration(500, MILLISECONDS))):
   import QuicNetFixture.*
 
   val hostIdA: HostId = HostId(UUID.randomUUID())
@@ -227,6 +230,22 @@ object QuicNetFixture:
     out.toList
 
   /** Polls `cond` every 10ms until it holds, failing after `timeoutMillis` */
+  /** An active outbound connection from `net` to the host of `entry`. Each poll asks `connectionFor`, which dials
+    * afresh once a connection has closed: a connection whose handshake failed stays closed, so waiting on that one
+    * object would wait forever. A message sent while the dials are failing is dropped, so tests that need theirs
+    * delivered connect first. */
+  def connected(net: QuicNet, entry: QuicHostEntry, timeoutMillis: Long = AwaitMillis): QuicConnection =
+    var conn: QuicConnection = null
+    eventually(s"an active connection to ${entry.name}", timeoutMillis):
+      conn = net.connectionFor(entry)
+      conn.isActive
+    conn
+
+  /** `connected` to `hostId`, which `net` must already have an entry for */
+  def connected(net: QuicNet, hostId: HostId): QuicConnection =
+    connected(net, net.metadataManager.peekHostEntry(hostId).getOrElse(
+      throw new AssertionError(s"no host entry for $hostId")))
+
   def eventually(what: String, timeoutMillis: Long = AwaitMillis)(cond: => Boolean): Unit =
     val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
     while !cond do

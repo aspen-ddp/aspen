@@ -106,14 +106,10 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
   private def quietClient(): Node =
     fx.client(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests.copy(relayCount = 0)))
 
-  /** `entry`'s own outbound connection, once it is up. Being online says nothing about it: membership replies can
-    * travel over the connection the peer dialed, so a host may be online while its own dial is still handshaking */
-  private def activeConnection(entry: QuicHostEntry): QuicConnection =
-    var conn: QuicConnection | Null = null
-    eventually(s"the outbound connection to ${entry.hostId} is up", WaitMillis):
-      conn = entry.connection.get()
-      conn != null && conn.nn.isActive
-    conn.nn
+  /** `entry`'s own outbound connection from `net`, once it is up. Being online says nothing about it: membership
+    * replies can travel over the connection the peer dialed, so a host may be online while its own dial is still
+    * handshaking */
+  private def activeConnection(net: QuicNet, entry: QuicHostEntry): QuicConnection = connected(net, entry, WaitMillis)
 
   private def awaitOnline(): Unit =
     eventually("each host sees the other online", WaitMillis):
@@ -148,7 +144,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
 
   test("dead peer's connection is cleaned up and re-dialed"):
     awaitOnline()
-    val stale = activeConnection(entryFor(fx.a.net, fx.hostIdB))
+    val stale = activeConnection(fx.a.net, entryFor(fx.a.net, fx.hostIdB))
     fx.stopB()
     eventually("A's connection to the stopped B closes", LoadProbe.scaleMillis(15000)):
       stale.isClosed
@@ -200,8 +196,8 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     awaitOnline()
     val recA = listen(fx.a.net)
     val recB = listen(fx.b.net)
-    val bOut = activeConnection(entryFor(fx.b.net, fx.hostIdA))
-    val aOut = activeConnection(entryFor(fx.a.net, fx.hostIdB))
+    val bOut = activeConnection(fx.b.net, entryFor(fx.b.net, fx.hostIdA))
+    val aOut = activeConnection(fx.a.net, entryFor(fx.a.net, fx.hostIdB))
     aOut.loop.execute(() => aOut.close())
     eventually("A's outbound connection closes", WaitMillis)(aOut.isClosed)
     val m = txHeartbeat(fx.storesB.head, fx.storesA.head)
@@ -223,7 +219,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
   test("HostEndpointChanged gossip replaces the host entry on peers, and a repeat of it is ignored"):
     awaitOnline()
     val old = entryFor(fx.b.net, fx.hostIdA)
-    val bOut = activeConnection(old)
+    val bOut = activeConnection(fx.b.net, old)
     val g = endpointChanged(fx.hostIdA, old.dataPort)
     fx.a.net.serverMessenger.broadcastGossip(g)
     eventually("B replaces its entry for A", WaitMillis)(replaced(fx.b.net, fx.hostIdA, old))

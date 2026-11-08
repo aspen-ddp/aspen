@@ -89,14 +89,22 @@ holding requirement locks. They come from finalization actions waiting ~2.5-3.2 
 backoff; the tests pass. Investigate together with the DataObject TKVL item above: determine whether the backoff is
 too conservative or whether finalization actions collide more than they should.
 
-Load-sensitive test failures under full CPU load, all predating the host-refactor branch (seen on its base commits
-too): StoreTransferManagerSuite "one pass starts as many transfers as the floor admits", a StoreTransferManagerSuite
-broken pipe, QUIC and vdisk timing tests, and the intermittent "Hung Test" print in TKVLBatchSuite above. Seen
-since (2026-11-07, not checked against older commits): SetRebalanceDurableTaskSuite "a source dying mid-transfer is
-waited out while it rebuilds, then the task finishes" (log:
-docs/investigations/2026-11-07-setrebalance-source-dying-failure.log.xz) and "a destination dying mid-transfer
-restores the source..." (its 60 s drain deadline). Flaky tests
-are not permitted: find what each one's timing depends on and make it deterministic.
+Load-sensitive test failures: the flake hunt of 2026-11-08 (full `sbt test` alongside 0, 12, 24 and 48 busy loops on
+24 cores) fixed every failure it found that recurred at up to 24 loops. See that day's commits, notably:
+- the failed-device drain's lost wakeup (a product bug: SetRebalanceDurableTaskSuite's source- and
+  destination-dying tests);
+- vdisk delete losing a race as the newer owner (a product bug: DiskCatalogSuite's two concurrent deletes);
+- QUIC tests sending before a connection was up.
+Open:
+- At 48 busy loops (2x oversubscribed), wall-clock waits still fail occasionally. Not chased: most such waits are
+  hang detectors that no fixed bound can satisfy at unbounded load.
+- The StoreTransferManagerSuite broken pipe from earlier notes was not seen.
+- DataObject/KV TKVL "Hung Test" prints (items above) are still frequent under load; the tests pass.
+
+QUIC applies the idle timeout (`QuicNet`: three heartbeats unless `QuicConfig.idleTimeout` is set) during the
+handshake too. In the tests a CPU-starved handshake outlasted 1.5 s and the dial closed, so on a host starved for
+longer than its idle timeout every dial fails until the load drops. Check whether production hosts need a handshake
+allowance separate from the idle timeout.
 
 Fixed (2026-11-06): JVM SIGSEGV in librocksdbjni at `rocksdb::WriteBatchInternal::Count`, from
 BufferedConsistentRocksDB.commitOnPool, seen twice in full `sbt test` runs. BufferedConsistentRocksDB.close() released

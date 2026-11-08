@@ -170,10 +170,12 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       e
     val barrier = conn.postBarrier()
     barrier.await(5000) shouldBe true
-    eventually("the connection closed")(conn.isClosed)
+    // close() marks the connection closed first and forgets it in the entry last, on the loop: waiting for the
+    // entry to forget it is waiting for the drops and releases in between too
+    eventually("the entry forgot the closed connection")(entry.connection.get() == null)
+    conn.isClosed shouldBe true
     conn.drops shouldBe 3
     encs.foreach(_.prefix.refCnt() shouldBe 0)
-    entry.connection.get() shouldBe null
     c.net.awaitPendingMessagesSent(LoadProbe.scale(Duration(1, SECONDS))) shouldBe true
 
   test("a second host on a port in use fails clearly and leaves nothing behind"):

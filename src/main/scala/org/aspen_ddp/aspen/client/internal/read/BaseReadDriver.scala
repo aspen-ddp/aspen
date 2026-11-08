@@ -56,7 +56,9 @@ abstract class BaseReadDriver(
   private var undecidedLockStores: Map[StoreId, Set[TransactionId]] = Map()
 
   /** Known from the transaction status cache, or from another store having applied it: stores apply only committed
-    * transactions. A store's own revision is not counted, so a reply cannot cause its own re-read */
+    * transactions. Applied shows in another store's object revision or, for a blind KV insert (which leaves the
+    * object's revision unchanged), in a key's revision. A store's own reply is not counted, so a reply cannot cause
+    * its own re-read */
   private def holdsKnownCommittedLock(store: StoreId, locks: Set[TransactionId]): Boolean =
     if locks.isEmpty then
       false
@@ -65,7 +67,8 @@ abstract class BaseReadDriver(
         case (s, Right(cs)) if s != store => cs.revision.lastUpdateTxUUID
       .toSet
       locks.exists: txid =>
-        othersApplied.contains(txid.uuid) || client.txStatusCache.getTransactionResolution(txid).exists(_._1)
+        othersApplied.contains(txid.uuid) || objectReader.appliedElsewhere(store, txid.uuid) ||
+          client.txStatusCache.getTransactionResolution(txid).exists(_._1)
 
   /** Re-reads, once per reply, every store whose locks have since been learned to belong to committed transactions.
     * Its reply is stale, and it was the only reply that store will send before the next full resend */
@@ -289,10 +292,8 @@ object BaseReadDriver:
       val test = this.client.getSystemAttribute("unittest.name").getOrElse("UNKNOWN TEST")
 
       // Re-sends the read every ResendEvery until it completes, as SimpleReadDriver does with backoff. Replies are
-      // only a snapshot: a read racing a commit can get three replies that cannot be restored. A KV insert leaves the
-      // object's revision unchanged, so with the key applied on one store and another still holding the insert's lock
-      // (its commit queued behind an earlier one), the key is neither restorable nor deleted and the reader waits for
-      // replies that, without a resend, never come. Resent on the client's context, so a lockstep
+      // only a snapshot: a read racing a commit can get replies that cannot be restored, and the immediate re-read
+      // covers only stores holding a lock known to have committed. Resent on the client's context, so a lockstep
       // network is still driven from the test's thread. A store that stays behind still hangs the read: resending
       // never hides a missed update
       val myRunnable: Runnable = () =>

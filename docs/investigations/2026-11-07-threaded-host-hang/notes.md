@@ -63,4 +63,7 @@ host's threads, so nothing answers them. They are not the hang. The zero-respons
 (fixjstack5) are probably the same, but its near-idle store threads were not re-examined: if a loaded hang still shows
 that signature, it is a different problem.
 
-The production side (a 2 s read stall in this race) is in Todo.txt.
+The production side (a 2 s read stall in this race) is fixed too: `BaseReadDriver` now also counts a lock as committed
+when another store's reply holds a key whose revision is that transaction (stores apply only committed transactions),
+and re-reads the lagging store at once rather than at the next full resend. The test driver's resend stays as the
+net for replies that are really lost.

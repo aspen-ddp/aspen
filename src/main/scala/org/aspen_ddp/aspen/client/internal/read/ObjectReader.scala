@@ -27,6 +27,10 @@ trait ObjectReader {
 
   def numResponses: Int
 
+  /** True when the last reply of a store other than `store` shows transaction `tx` applied: its object revision or
+    * one of its keys' revisions. Stores apply only committed transactions */
+  def appliedElsewhere(store: StoreId, tx: UUID): Boolean
+
   def receivedResponsesFromAllStores: Boolean = numResponses == ida.width
 
   def debugLogStatus(header: String, log: String => Unit): Unit

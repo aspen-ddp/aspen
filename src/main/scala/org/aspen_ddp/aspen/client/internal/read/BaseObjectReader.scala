@@ -45,6 +45,10 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
 
   def numResponses: Int = responses.size
 
+  def appliedElsewhere(store: StoreId, tx: UUID): Boolean = responses.exists:
+    case (s, Right(ss)) => s != store && ss.appliedTransactions.contains(tx)
+    case _ => false
+
   def debugLogStatus(header: String, log: String => Unit): Unit = synchronized {
     val (allStoreStates, matchingStoreStates) = getStoreStates()
     val sb = new StringBuilder

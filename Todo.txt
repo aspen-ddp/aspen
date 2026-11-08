@@ -1,19 +1,6 @@
 TODO
 ====
 
-KV reads racing concurrent key inserts stall for the client's read resend (2 s in `aspen` clients). Found while fixing
-the AdaptiveThreadedHostSuite hang (docs/investigations/2026-11-07-threaded-host-hang/notes.md):
-  - A blind KV insert (TKVL `set`: WithinRange only) leaves the object's revision unchanged. With one in-flight commit
-    per object, stores apply concurrent inserts to one node at different times (66 ms apart in the test).
-  - A read in that window sees the key on one store while a lagging store still holds the insert's lock (its commit
-    is queued behind an earlier one). KeyValueObjectReader can neither restore the key nor take it as deleted, so the
-    read waits for more replies.
-  - BaseReadDriver re-reads at once only a store holding a lock known to be committed (status cache, or another
-    store's object revision). An insert never shows in the object revision, so the read waits for SimpleReadDriver's
-    next full resend. Every allocation inserts into its pool's AllocationTree this way.
-  - Possible fix: also count a lock as committed when another store's reply holds a key whose revision is that
-    transaction.
-
 MayExist on a key that does not exist takes no requirement lock, so two concurrent inserts of the same absent key can
 both be voted to commit. Pre-existing; decide whether an absent key should be locked like a present one. Also, verify
 that inserts with no requirement lock the modification of that key to the transaction. We must prevent the case where

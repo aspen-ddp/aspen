@@ -21,6 +21,9 @@ sealed abstract class StoreState(
 
   def lastUpdateTimestamp: HLCTimestamp
 
+  /** Transactions this reply shows applied. Stores apply only committed transactions, so each of them committed */
+  def appliedTransactions: Set[UUID]
+
   def debugLogStatus(log: String => Unit): Unit
 }
 
@@ -34,6 +37,8 @@ class DataObjectStoreState(
                             val objectData: Option[DataBuffer]) extends StoreState(storeId, revision, refcount, timestamp, readTimestamp) {
 
   def lastUpdateTimestamp: HLCTimestamp = timestamp
+
+  def appliedTransactions: Set[UUID] = Set(revision.lastUpdateTxUUID)
 
   def debugLogStatus(log: String => Unit): Unit = log(s"  DOSS ${storeId.poolIndex} Rev $revision Ref $refcount $timestamp")
 
@@ -60,6 +65,10 @@ class KeyValueObjectStoreState(
 
     if (maxContentTs > timestamp) maxContentTs else timestamp
   }
+
+  /** A blind insert leaves the object's revision unchanged and shows only in its key's revision */
+  lazy val appliedTransactions: Set[UUID] =
+    kvoss.contents.valuesIterator.map(_.revision.lastUpdateTxUUID).toSet + revision.lastUpdateTxUUID
 
   def debugLogStatus(log: String => Unit): Unit = {
     log(s"  KVOSS ${storeId.poolIndex} Rev $revision Ref $refcount TS $timestamp")

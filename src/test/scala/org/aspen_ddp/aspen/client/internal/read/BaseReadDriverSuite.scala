@@ -385,6 +385,47 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     m.requests shouldBe Nil
   }
 
+  // A blind KV insert leaves the object's revision unchanged: only the key's revision on a store that applied it shows
+  // that the insert committed. A store still holding its lock must be re-read at once, not at the next full resend
+  val insertTx = TransactionId(new UUID(0, 7))
+
+  def kvReply(withKey: Boolean, locks: Set[TransactionId] = Set()) =
+    val ts = HLCTimestamp.now
+    Right(ReadResponse.CurrentState(rev, ref, ts, 5,
+      if withKey then kvData(ObjectRevision(insertTx), ts) else Some(KVObjectState.encode(None, None, None, None, Map())),
+      locks))
+
+  def hasKey(r: BaseReadDriver): Boolean =
+    Await.result(r.readResult, awaitDuration).asInstanceOf[KeyValueObjectState].contents.contains(kvKey)
+
+  test("a store holding the lock of a KV insert another store has applied is re-read at once") {
+    val m = new RecordingClient
+    val r = mkReader(m, objectPointer = kvptr)
+    val ts = HLCTimestamp.now
+
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, kvReply(withKey = true)))
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, kvReply(withKey = false, locks = Set(insertTx))))
+    reads(m, ds1) shouldBe 1
+    r.readResult.isCompleted shouldBe false
+
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, kvReply(withKey = true)))
+    hasKey(r) shouldBe true
+  }
+
+  test("a store holding the lock of a KV insert is re-read once another store's reply shows the insert applied") {
+    val m = new RecordingClient
+    val r = mkReader(m, objectPointer = kvptr)
+    val ts = HLCTimestamp.now
+
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, kvReply(withKey = false, locks = Set(insertTx))))
+    reads(m, ds1) shouldBe 0
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, kvReply(withKey = true)))
+    reads(m, ds1) shouldBe 1
+
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, kvReply(withKey = true)))
+    hasKey(r) shouldBe true
+  }
+
   test("a lock summary reports every lock's count but only a few of their ids") {
     val few = Set.fill(BaseReadDriver.MaxLocksReported)(TransactionId(UUID.randomUUID()))
     val many = Set.fill(5000)(TransactionId(UUID.randomUUID()))

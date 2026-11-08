@@ -129,7 +129,11 @@ trait FailedStorageDeviceTestHarness:
              case e: Throwable =>
                // Say where the drain stopped: the failed device's remaining stores and the tasks still enrolled.
                // A Future boxes an Error such as the timeout's AssertionError, so it is not matched by type.
-               describeStuckDrain(deviceId).map(d => throw new AssertionError(s"$e; $d", e))
+               val drives0 = drain.testDriveCount
+               sleep(Duration(1000, MILLISECONDS)).flatMap: _ =>
+                 val drives1 = drain.testDriveCount
+                 describeStuckDrain(deviceId).map(d =>
+                   throw new AssertionError(s"$e; $d; drain passes entered ${drives0} then ${drives1} a second later", e))
            .transform: result =>
              drain.stop()
              result

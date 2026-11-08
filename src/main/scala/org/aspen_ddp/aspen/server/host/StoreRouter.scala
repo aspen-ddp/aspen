@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ReadError}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionStatus
+import org.aspen_ddp.aspen.server.DurableFiles
 import org.aspen_ddp.aspen.server.repair.StoreNotHosted
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.CompletionHandler
@@ -201,7 +202,8 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private[host] def crlLoaded(store: Store, saveFile: os.Path, p: Promise[Unit]): Unit =
     route(store.storeId, () => { p.success(()); () }): installed =>
       if installed eq store then
-        os.remove(saveFile)
+        // Durably: a save file brought back by a crash would be loaded again over newer device-CRL state
+        DurableFiles.remove(saveFile)
         installed.frontend.recover()
       p.success(())
 
@@ -236,12 +238,20 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
     val store = entry.store
     val replaced = stores.put(store.storeId, entry)
     // A reload over a loaded store, with no close: its queued tasks run, later ones skip it. Its object cache view is
-    // cleared here, on its executor, behind those tasks: the view's bytes belong to that executor
+    // cleared here, on its executor, behind those tasks: the view's bytes belong to that executor. It is closed there
+    // too, releasing what its transactions were counted for: the new store counted the recovered ones again. A
+    // backend the new store reuses is left open, its charges released alone
     if replaced != null then
       replaced.executor.execute: () =>
         replaced.closing = true
         replaced.closed = true
         replaced.store.objectCache.clear()
+        if replaced.store.backend eq store.backend then
+          replaced.store.frontend.releaseAllAdmissions()
+        else
+          replaced.store.close().failed.foreach(t =>
+            logger.warn(s"Failed to close the replaced store ${store.storeId}: $t"))(
+            using scala.concurrent.ExecutionContext.parasitic)
     offline.remove(store.storeId)
     loading.remove(store.storeId)
     ctx.publishView()

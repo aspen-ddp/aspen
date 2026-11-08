@@ -410,6 +410,33 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       fx.onControl(fx.ctx.router.entry(s0).map(_.store.backend)) should be(Some(backend))
       fx.onControl(fx.threading.assignedCounts.sum) should be(1)
 
+  test("a reload over a loaded store closes the old one, releasing what its transactions were counted for"):
+    val s0 = StoreId(poolId, 0)
+    val crl = emptyCrl
+    crl.save(TransactionId(new UUID(15, 8)), TransactionRecoveryState(s0,
+      overwriteTxd(TransactionId(new UUID(15, 8))).serialize(), List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))),
+      TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial), () => ())
+    val admission = new CrlAdmission(Long.MaxValue)
+    withRouter(crl): fx =>
+      fx.onControl:
+        val dir = os.temp.dir()
+        val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
+        sds.loadedStores += s0
+        fx.ctx.devices.devices += deviceId -> sds
+      val first = bootstrappedBackend(s0)
+      await(fx.load(first))
+      val executor = fx.ctx.router.entry(s0).get.executor
+      val once = admission.admittedBytes
+      once should be > 0L
+      val second = bootstrappedBackend(s0)
+      await(fx.load(second))
+      fx.awaitExecutor(executor)
+      fx.awaitExecutor(executor)
+      // The recovered transaction is counted once, by the new store
+      admission.admittedBytes should be(once)
+      first.closed should be(true)
+      second.closed should be(false)
+
   test("a reload over a loaded store leaves its view to its queued tasks, then uncounts it"):
     val s0 = StoreId(poolId, 0)
     val hc = new HostObjectCache(1024 * 1024)

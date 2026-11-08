@@ -84,10 +84,6 @@ apparently not flaky, it suggests that these tests may be taking an inordinately
 to see if these tests are slower than they should be and where the hung transactions are occurring. Determine if
 this is purely a test issue that can be fixed or if there may be an underlying system issue that needs to be addressed.
 
-QuicConnectionSuite "a burst from many threads schedules few drains" is flaky under load (observed 1 failure in 14
-full test runs: 930 not < 800). The assertion depends on thread scheduling. Flaky tests are not permitted: make the
-test deterministic or change what it measures.
-
 "Hung Test" prints now also appear occasionally in TKVLBatchSuite and AppendIntegrationSuite since stores began
 holding requirement locks. They come from finalization actions waiting ~2.5-3.2 s on lock contention and retry
 backoff; the tests pass. Investigate together with the DataObject TKVL item above: determine whether the backoff is

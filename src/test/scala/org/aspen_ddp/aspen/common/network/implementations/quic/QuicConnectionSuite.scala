@@ -348,9 +348,13 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     eventually("new sends to arrive")(fx.srv.received.asScala.map(seqOf).count(_ >= 1000) == 10)
     fx.conn.drops shouldBe dropsBefore
 
-  test("a burst from many threads schedules few drains"):
+  test("a burst from many threads schedules one drain while the loop is busy"):
     val fx = fixture()
     fx.dialAndWait()
+    // The loop is held until every submit is in, so each submit after the first finds a drain already scheduled.
+    // Unheld, how many drains run depends only on how the threads are scheduled
+    val drainsBefore = fx.conn.drainExecutions
+    val release = blockLoop(fx.loop)
     val threads = 8
     val perThread = 1000
     val start = new CountDownLatch(1)
@@ -372,10 +376,11 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     start.countDown()
     workers.foreach(_.join(AwaitMillis))
     failures.asScala shouldBe empty
+    release.countDown()
     val got = awaitAll(fx.srv, threads * perThread)
     got.map(seqOf).toSet.size shouldBe threads * perThread
     fx.conn.drops shouldBe 0
-    fx.conn.drainExecutions should be < (threads * perThread / 10).toLong
+    fx.conn.drainExecutions shouldBe drainsBefore + 1
 
   test("concurrent submits from one thread keep their order"):
     val fx = fixture()

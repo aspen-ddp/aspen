@@ -106,6 +106,17 @@ Per-device CRL follow-ups (final review of the per-device CRL branch, 2026-11-07
   declarations), or delete them once the device's stores are rebuilt.
 - A failed device-CRL `dropStore` for a transferred-away store is retried only in memory (DeviceReconciler); a
   restart forgets it and the entries stay live and uncounted. Only a dead CRL thread makes a drop fail today.
+- StoreRouter.crlLoaded removes `crl_save.log` with a plain os.remove that does not make the removal durable. After a
+  crash a resurrected stale save file is re-saved over newer device-CRL state for the same TxIds on the next load.
+  Use DurableFiles.remove. Predates the per-device CRL branch.
+- A store closed with its entries left live (transfer-out save failed; closeUnloaded with dropDurably = false)
+  releases its admission charges, so those live bytes go uncounted until the store loads again. Bounded and rare.
+- StoreRouter.install replacing a loaded store never closes the old Frontend, so its admission charges leak and the
+  new Frontend charges recovered transactions again. Reachable only through a direct Host.loadStore (tests) today.
+- DeviceReconciler's leftover-entry drop reads the store's entries when it runs. A store transferred back onto the
+  device while a stalled drop is pending could lose its new entries. Theoretical (a transfer takes far longer).
+- extractUnloaded has a window between its async read and its delete in which a load of the same store would have its
+  recovered entries deleted. No production path loads an offline TransferringOut store.
 
 Fixed (2026-11-06): JVM SIGSEGV in librocksdbjni at `rocksdb::WriteBatchInternal::Count`, from
 BufferedConsistentRocksDB.commitOnPool, seen twice in full `sbt test` runs. BufferedConsistentRocksDB.close() released

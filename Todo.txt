@@ -98,10 +98,6 @@ Load-sensitive test failures: the flake hunt of 2026-11-08 (full `sbt test` alon
 Open:
 - At 48 busy loops (2x oversubscribed), wall-clock waits still fail occasionally. Not chased: most such waits are
   hang detectors that no fixed bound can satisfy at unbounded load.
-- QuicNetLivenessSuite "quiet client connection survives beyond the idle timeout" failed once in 8 runs under
-  bursts of 72 busy loops (3x oversubscribed, 1-4 s on). Its 600 ms idle timeout is load-scaled only when the
-  fixture is built, and a burst then starves the keepalive past it. A longer timeout slows every liveness test that
-  waits for an idle close; left as is.
 - The StoreTransferManagerSuite broken pipe from earlier notes was not seen.
 - DataObject/KV TKVL "Hung Test" prints (items above) are still frequent under load; the tests pass.
 

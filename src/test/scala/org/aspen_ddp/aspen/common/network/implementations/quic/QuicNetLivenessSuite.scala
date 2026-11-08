@@ -129,14 +129,19 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
       !entryFor(fx.a.net, fx.hostIdB).isOnline
 
   test("quiet client connection survives beyond the idle timeout"):
-    val c = quietClient()
+    // Its own, longer idle timeout (QUIC uses the smaller of the two ends'), so that keepalives every second
+    // rather than every 300 ms carry the connection: bursts of load starved the shorter ones past the timeout
+    val idle = LoadProbe.scale(Duration(2, SECONDS))
+    fx.close()
+    fx = new QuicNetFixture(QuicConfig(idleTimeout = Some(idle), gossip = GossipConfig.ForTests), HeartbeatPeriod)
+    val c = fx.client(QuicConfig(idleTimeout = Some(idle), gossip = GossipConfig.ForTests.copy(relayCount = 0)))
     val req = read(fx.storesA.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(req)
     await(fx.a.handler.clientRequests, 1)
     val connsBefore = c.net.connectionCount
     connsBefore shouldBe 1
     // The client sends nothing for more than three idle timeouts
-    Thread.sleep(LoadProbe.scaleMillis(2000))
+    Thread.sleep(idle.toMillis * 3 + 500)
     val resp = response(c.net.clientId, req.toStore, req.readUUID)
     fx.a.net.serverMessenger.sendClientResponse(resp)
     await(c.handler.clientResponses, 1).map(_.message) shouldBe List(resp)

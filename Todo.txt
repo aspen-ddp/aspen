@@ -14,6 +14,12 @@ the AdaptiveThreadedHostSuite hang (docs/investigations/2026-11-07-threaded-host
   - Possible fix: also count a lock as committed when another store's reply holds a key whose revision is that
     transaction.
 
+MayExist on a key that does not exist takes no requirement lock, so two concurrent inserts of the same absent key can
+both be voted to commit. Pre-existing; decide whether an absent key should be locked like a present one. Also, verify
+that inserts with no requirement lock the modification of that key to the transaction. We must prevent the case where
+two simultaneous transactions attempt to blind-insert the same key. If locks are not taken, the order of applications
+could corrupt the key/value pair and make it non recoverable.
+
 Per-device CRL follow-ups (final review of the per-device CRL branch, 2026-11-07):
 - A device reloaded (restartStorageDevice) while its CRL is still shutting down (`LocalDevices.closingCrls`) is loaded
   later by the plain scan path, which skips checkStorageDevice and gossipStoreOnline, so peers keep its stores'
@@ -72,12 +78,6 @@ vdisk: Rename "vdisk" to "amoeba_disk"
 
 Verify that RevisionLock transaction requirement is exclusive. If so, rename to ExclusiveRevisionLock to make this
 explicit.
-
-MayExist on a key that does not exist takes no requirement lock, so two concurrent inserts of the same absent key can
-both be voted to commit. Pre-existing; decide whether an absent key should be locked like a present one. Also, verify
-that inserts with no requirement lock the modification of that key to the transaction. We must prevent the case where
-two simultaneous transactions attempt to blind-insert the same key. If locks are not taken, the order of applications
-could corrupt the key/value pair and make it non recoverable.
 
 DataObject TKVL test suite sometimes reports hung tests during full test runs though it still succeeds. Although
 apparently not flaky, it suggests that these tests may be taking an inordinately long time to complete. Investigate

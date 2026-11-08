@@ -61,15 +61,18 @@ class BootstrapFetcherSuite extends AnyFunSuite with Matchers:
         BootstrapFetcher.fetch(cfg(List(bad, good)), None).from should be (good)
 
   test("a host that accepts but never answers is bounded by the timeout"):
+    // Only the silent host: the timeout is per attempt, so a responsive host listed with it would have to answer
+    // within the same short timeout, which a loaded machine does not. Falling through to the next host is the test
+    // above
     val silent = new ServerSocket(0)
     try
       val sep = BootstrapEndpoint("127.0.0.1", silent.getLocalPort)
-      withServer(serving(yamlFor(systemId, "host-b"))): good =>
-        val start = System.nanoTime()
-        val r = BootstrapFetcher.fetch(cfg(List(sep, good)), None, 300.millis)
-        val elapsed = (System.nanoTime() - start).nanos
-        r.from should be (good)
-        elapsed should be < 30.seconds // bounded: a silent host would otherwise block forever
+      val start = System.nanoTime()
+      val e = intercept[BootstrapFetcher.NoReachableHosts]:
+        BootstrapFetcher.fetch(cfg(List(sep)), None, 300.millis)
+      val elapsed = (System.nanoTime() - start).nanos
+      e.attempts should be (List(sep -> "timed out"))
+      elapsed should be < 30.seconds // bounded: a silent host would otherwise block forever
     finally silent.close()
 
   test("reports every attempt when no cached host can be reached"):

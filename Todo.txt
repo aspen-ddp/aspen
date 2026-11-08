@@ -2,12 +2,6 @@ TODO
 ====
 
 Per-device CRL follow-ups (final review of the per-device CRL branch, 2026-11-07):
-- A device reloaded (restartStorageDevice) while its CRL is still shutting down (`LocalDevices.closingCrls`) is loaded
-  later by the plain scan path, which skips checkStorageDevice and gossipStoreOnline, so peers keep its stores'
-  StoreOffline. The window is milliseconds; remember the pending gossip per path (DeviceDiscovery bringIntoService).
-- A device whose CRL thread died never completes its CRL shutdown: its path stays in closingCrls (the device can't be
-  reloaded without a host restart) and RunningHost.stop waits forever. Count down shutdownComplete in the io
-  thread's catch.
 - Main's `openedCrls` is never pruned: CRLs shut down at unload stay listed. Memory only (shutdown is idempotent).
 - `<device>/crl.lost-<uuid>` directories (a lost CRL moved aside) are kept forever, up to num-streams x file size
   each (900 MB by default). Tie them into the suspected-loss retention policy (Backlog: correlated "lost store"

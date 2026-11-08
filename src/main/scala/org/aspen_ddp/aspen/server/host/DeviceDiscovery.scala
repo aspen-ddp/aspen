@@ -56,6 +56,12 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   // messages are dropped (and retransmitted) rather than answered as unknown while it is decided.
   private var pendingResolutions: Map[os.Path, Set[StoreId]] = Map()
 
+  // The Active stores of a restarted or adopted device, by its directory, whose StoreMoved gossip waits for the
+  // device to load. bringIntoService removes shutdown.state before loading, so a load that does not happen then (the
+  // device's CRL is still shutting down, or the load throws) is left to a plain scan, which knows nothing of the
+  // restart: without this, peers would keep the stores' StoreOffline. loadOwnedDevice gossips them and drops the entry.
+  private var announceOnLoad: Map[os.Path, Set[StoreId]] = Map()
+
   private[server] def loadedDeviceDirs: Map[os.Path, StorageDeviceId] = loadedDirs
   private[server] def reportedDeviceDirs: Set[os.Path] = reportedDirs
   private[server] def pendingMarkerResolutions: Set[os.Path] = pendingResolutions.keySet
@@ -357,12 +363,14 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *     TransferringIn work resumes now rather than at the next periodic check.
    *  5. StoreMoved is gossiped for every Active store, read from the pool as for a completed
    *     transfer in: the shutdown announced them all offline, and after an adoption peers must
-   *     also learn the new host. The stores' LoadStore events are already queued ahead of any
-   *     message a peer sends in response.
+   *     also learn the new host. loadOwnedDevice does it, once the stores' LoadStore events are
+   *     queued ahead of any message a peer sends in response.
    *
    *  A failed marker removal in step 2 only leaves that store offline: the reconcile's
    *  abandoned-transfer-out pass picks it up on a later check. A failed step 3 leaves the whole
-   *  device to the next scan.
+   *  device to the next scan. A step 4 that does not load the device (its CRL is still shutting
+   *  down, or the load throws) leaves it to a plain scan, shutdown.state being gone: the scan
+   *  checks the device it loads, and announceOnLoad carries step 5 over to that load.
    */
   private def bringIntoService(path: os.Path,
                                sdCfg: StorageDeviceConfig,
@@ -383,12 +391,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
           logger.error(s"Failed to remove the transfer-out marker for store $storeId at $markerFile. " +
                        s"The store stays offline until a later check of its device. Error: $t")
 
+    announceOnLoad += path -> active.keySet
     if os.exists(path / DeviceMarkers.ShutdownStateFile) then
       DeviceMarkers.removeShutdownState(path)
 
-    tryLoadDevice(path).foreach: deviceId =>
-      ctx.reconciler.checkStorageDevice(deviceId)
-      active.keysIterator.foreach(ctx.gossipStoreOnline)
+    tryLoadDevice(path).foreach(ctx.reconciler.checkStorageDevice)
 
   /** Loads the device at `storageDevicePath` if this host owns it, returning its id when this
    *  call is what loaded it.
@@ -537,4 +544,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             ctx.publishView()
             loadedDirs += storageDevicePath -> sdCfg.storageDeviceId
             reportedDirs -= storageDevicePath
+            announceOnLoad.get(storageDevicePath).foreach: stores =>
+              announceOnLoad -= storageDevicePath
+              stores.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach(ctx.gossipStoreOnline)
             Some(sdCfg.storageDeviceId)

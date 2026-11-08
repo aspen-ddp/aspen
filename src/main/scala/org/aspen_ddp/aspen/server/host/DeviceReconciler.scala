@@ -58,10 +58,12 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   def handleCheckMessage(m: CheckStorageDevice): Unit =
     // A device id we do not know may simply be one that has appeared on disk since
     // our last scan -- create-storage-device sends this message as a discovery nudge
-    // for exactly that case -- so rescan before concluding the device is not ours.
-    if ! ctx.devices.devices.contains(m.deviceId) then
-      ctx.discovery.checkForNewDevices()
-    checkStorageDevice(m.deviceId)
+    // for exactly that case -- so rescan before concluding the device is not ours. Any
+    // other device the rescan loads is checked too, as the periodic scan checks it.
+    val loaded =
+      if ! ctx.devices.devices.contains(m.deviceId) then ctx.discovery.checkForNewDevices()
+      else Nil
+    (loaded :+ m.deviceId).distinct.foreach(checkStorageDevice)
 
   /** Drops the device-CRL entries of stores transferred away from `local`. A crash between a transfer out's save
    *  file and the deletion of its entries leaves them in the device CRL, where they would be copied forward forever,

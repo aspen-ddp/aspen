@@ -705,6 +705,32 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).storeLoadAttempts should be(empty)
       host.control.discovery.loadedDeviceDirs should be(empty)
 
+  atest("a restarted device that fails to load announces its stores online once a later scan loads it"):
+    val hostRoot = newHostDir()
+    val host = newHost(hostRoot, failFirstStoreLoad = true)
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    DeviceMarkers.writeShutdownState(deviceDir, HostId.BootstrapHostId)
+    os.makeDir.all(deviceDir / storeId.directoryName)
+
+    val armed = recorded(host).armLookup(deviceA)
+    host.control.reconciler.scan()
+    // Restarted while unloaded: Operational and owned here
+    armed.success(deviceState(deviceA,
+      Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+
+    for
+      _ <- yieldUntil(queuedMarkerEvents(host) == 1)
+      // bringIntoService removes shutdown.state, then the load throws and leaves the device to the scan
+      _ = handleMarkerEvents(host)
+      _ = loadedDevices(host).keySet should be(empty)
+      _ = os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
+      _ = recorded(host).gossipedOnline should be(empty)
+      _ <- yieldUntil(host.control.devices.closingCrls.isEmpty)
+      _ = host.control.reconciler.scan()
+    yield
+      loadedDevices(host).keySet should be(Set(deviceA))
+      recorded(host).gossipedOnline.toList should be(List(storeId))
+
   atest("the scan runs on the configured period"):
     def periodsOf(scanPeriod: Option[Duration]): List[Duration] =
       val tasks = new PeriodRecordingTasks

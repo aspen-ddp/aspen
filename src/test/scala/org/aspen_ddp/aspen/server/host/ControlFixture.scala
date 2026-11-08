@@ -47,6 +47,13 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
    *  `aspen-storage-device-config.yaml`. */
   val storeLoadAttempts = mutable.ListBuffer[(StorageDeviceId, os.Path)]()
 
+  /** Every store gossipStoreOnline was called for, in call order. The call then goes on to the host's own. */
+  val gossipedOnline = mutable.ListBuffer[StoreId]()
+
+  private def gossipStoreOnline(storeId: StoreId): Unit =
+    synchronized(gossipedOnline += storeId)
+    attached.control.services.gossipStoreOnline(storeId)
+
   /** True while a simulated store-load failure is still owed. The first tryLoadStore call to see it set clears it
    *  and throws, modelling a device that dies part-way through loading its stores (a yanked hot-plug disk, an IO
    *  error). */
@@ -325,6 +332,7 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
       loadStore = Some(loadStore),
       tryLoadStore = Some(tryLoadStore),
       loadStoreById = Some(loadStoreById),
+      gossipStoreOnline = Some(gossipStoreOnline),
       scheduleShutdownWorkTimeout = Some(scheduleShutdownWorkTimeout))
 
 /** Shared test fixture for the Host's components: builds Hosts with LockstepThreading, a ManualControlScheduler and

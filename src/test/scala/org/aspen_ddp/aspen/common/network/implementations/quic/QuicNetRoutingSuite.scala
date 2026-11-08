@@ -230,11 +230,12 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
 
   test("peer restart mid-transfer recovers"):
     val big = rebuild(fx.storesB.head, 64 * 1024 * 1024)
-    val enc = QuicMessageCodec.encode(big, PooledByteBufAllocator.DEFAULT)
     val conn = fx.a.net.connectionFor(entryFor(fx.a.net, fx.hostIdB))
     // Host membership dials B as soon as A is built, possibly before B is bound; a handshake still retrying then
     // could complete against the restarted B, so the transfer must start on a connection to the original B
     eventually("A's connection to B is up")(conn.isActive)
+    // Encoded only now: a wait that fails above must not leave the pooled buffer unreleased, reported as a leak
+    val enc = QuicMessageCodec.encode(big, PooledByteBufAllocator.DEFAULT)
     conn.submit(enc) shouldBe true
     Thread.sleep(100)
     val completedBeforeRestart = !fx.b.handler.clientRequests.isEmpty

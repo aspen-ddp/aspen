@@ -825,6 +825,39 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       saveFile = os.exists(Backend.crlSaveFile(storeDir))
     yield (outcome, heldAfter, heldOnDisk(deviceDir, storeId), saveFile)
 
+  atest("an extraction during which its closed store loads again leaves the store's transactions in the device CRL"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = factory.opened.head
+      _ <- prepareInFlight(host, crl, storeId, txid)
+      closed = host.closeStore(storeId)
+      _ <- pumpUntil(host, closed.isCompleted)
+      _ <- closed
+      gate = Promise[Unit]()
+      _ = crl.readGate = Some(gate.future)
+      extracting = host.control.transfers.closeForTransferOut(storeId)
+      _ <- pumpUntil(host, crl.readCalled.isCompleted)
+      // The store loads again while the extraction's read is outstanding, recovering its transaction
+      _ = host.loadStoreById(deviceA, storeId)
+      _ <- pumpUntil(host, recovered(host, storeId, txid))
+      _ = gate.success(())
+      _ <- pumpUntil(host, extracting.isCompleted)
+      outcome = extracting.value
+      heldAfter = held(crl, storeId)
+      served = recovered(host, storeId, txid)
+      _ <- host.control.router.loaded.get(storeId).map(_.backend.close()).getOrElse(Future.unit)
+      _ = factory.shutdownAll()
+    yield
+      outcome.exists(_.isFailure) should be(true)
+      served should be(true)
+      heldAfter should be(Set(txid))
+      os.exists(Backend.crlSaveFile(storeDir)) should be(false)
+      heldOnDisk(deviceDir, storeId) should be(Set(txid))
+
   atest("a transfer out of an open store whose save file fails keeps its transactions in the device CRL"):
     given ExecutionContext = executionContext
     interruptedExtraction(loaded = true, crash = false).map: (outcome, heldAfter, onDisk, saveFile) =>

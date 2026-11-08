@@ -43,6 +43,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // shutdown closes it; its ShutdownStore is put again once the open's outcome is handled, after
   // the LoadStore that serves it, so it is closed like any served store.
   private var opening: Map[StoreId, List[ShutdownStore]] = Map()
+  // How many opens each store has started in this process (startOpen). Compared across an asynchronous step, it
+  // says whether the store was opened at any point in between, even if closed again since
+  private var openCounts: Map[StoreId, Long] = Map()
 
   /** SpaceRetryCap in device scans, at least 1 */
   private val spaceRetryCapScans: Int =
@@ -96,6 +99,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   /** Whether the store's backend is being opened or created (startOpen) */
   private[host] def isOpening(storeId: StoreId): Boolean = opening.contains(storeId)
 
+  /** How many opens of the store have started in this process */
+  private[host] def opensStarted(storeId: StoreId): Long = openCounts.getOrElse(storeId, 0L)
+
   /** Records an opened backend as loaded and queues its LoadStore. The store keeps its router loading mark until
    *  that LoadStore installs it or gives up (handleLoad). */
   private[host] def serveOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
@@ -123,6 +129,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case (Some(waiting), Some(current)) => Some(() => { waiting(); current() })
       case (waiting, current) => waiting.orElse(current)
     opening += storeId -> Nil
+    openCounts += storeId -> (opensStarted(storeId) + 1)
     sds.loadedStores += storeId
     router.markLoading(storeId)
     val fopen =

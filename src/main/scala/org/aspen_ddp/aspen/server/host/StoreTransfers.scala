@@ -82,7 +82,12 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  writing the CRL's entries over it would hide that. Runs on the control thread, as the marker writes beside it
    *  do; nothing blocks on the CRL. A crash between the save file and the deletion leaves the same entries in both:
    *  harmless, as the save file's load re-saves them under the same ids, and the source's copy is dropped when its
-   *  directory is deleted (DeviceReconciler). */
+   *  directory is deleted (DeviceReconciler).
+   *
+   *  The store must stay closed throughout: one loaded meanwhile recovered the entries read, which the deletion would
+   *  take from under it, and may have saved others the file would lack. Nothing keeps it closed (the transfer-out
+   *  marker is written only once this completes), so an open started during the read fails the extraction, with
+   *  nothing written or deleted; the transfer's retransmitted request closes the store and extracts again. */
   private def extractUnloaded(storeId: StoreId): Future[Unit] =
     ctx.devices.devices.valuesIterator.find(sds => os.isDir(sds.devicePath / storeId.directoryName)) match
       case None => Future.unit
@@ -93,8 +98,12 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         earlier match
           case Left(err) => Future.failed(err)
           case Right(saved) =>
+            val opens = ctx.loader.opensStarted(storeId)
             sds.crl.readStoreState(storeId).flatMap: trs =>
-              if trs.isEmpty then
+              if ctx.loader.opensStarted(storeId) != opens then
+                Future.failed(new IllegalStateException(
+                  s"store $storeId was opened while its CRL state was being extracted"))
+              else if trs.isEmpty then
                 Future.unit
               else
                 val ids = trs.map(_.txd.transactionId)

@@ -7,8 +7,6 @@ Per-device CRL follow-ups (final review of the per-device CRL branch, 2026-11-07
   declarations), or delete them once the device's stores are rebuilt.
 - A store closed with its entries left live (transfer-out save failed; closeUnloaded with dropDurably = false)
   releases its admission charges, so those live bytes go uncounted until the store loads again. Bounded and rare.
-- extractUnloaded has a window between its async read and its delete in which a load of the same store would have its
-  recovered entries deleted. No production path loads an offline TransferringOut store.
 
 Adopt a storage device without a clean shutdown. Once each device carries its own CRL (see
 docs/superpowers/specs/2026-11-07-per-device-crl-and-commit-ordering-design.md), the common case should be: yank a

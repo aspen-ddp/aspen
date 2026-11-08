@@ -20,6 +20,12 @@ Isolate every device's I/O, and detect and handle hung devices
   - Until then, a transaction waiting on an in-flight commit to a hung device waits as long as the device hangs. The
     per-device CRL design accepts that.
 
+Device CRL recovery runs on the host control thread
+  - DeviceDiscovery opens and recovers each device's CRL (up to num-streams x file size, 3 x 300 MB by default) on
+    aspen-host-control at startup and adoption. On HDD that can take seconds, stalling all other device management on
+    the host. Move the open off the control thread (as BackendOpener does for FSIF opens) and post the result back.
+    Fold into the device I/O isolation item above.
+
 System-level protection against correlated "lost store" declarations
   - The main source of data loss in a system like this is not hardware. It is a systemic bug that wrongly triggers
     one of the automatic lost-store paths: a store decides from local evidence alone that its content can't be

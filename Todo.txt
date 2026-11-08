@@ -93,6 +93,20 @@ docs/investigations/2026-11-07-setrebalance-source-dying-failure.log.xz) and "a 
 restores the source..." (its 60 s drain deadline). Flaky tests
 are not permitted: find what each one's timing depends on and make it deterministic.
 
+Per-device CRL follow-ups (final review of the per-device CRL branch, 2026-11-07):
+- A device reloaded (restartStorageDevice) while its CRL is still shutting down (`LocalDevices.closingCrls`) is loaded
+  later by the plain scan path, which skips checkStorageDevice and gossipStoreOnline, so peers keep its stores'
+  StoreOffline. The window is milliseconds; remember the pending gossip per path (DeviceDiscovery bringIntoService).
+- A device whose CRL thread died never completes its CRL shutdown: its path stays in closingCrls (the device can't be
+  reloaded without a host restart) and RunningHost.stop waits forever. Count down shutdownComplete in the io
+  thread's catch.
+- Main's `openedCrls` is never pruned: CRLs shut down at unload stay listed. Memory only (shutdown is idempotent).
+- `<device>/crl.lost-<uuid>` directories (a lost CRL moved aside) are kept forever, up to num-streams x file size
+  each (900 MB by default). Tie them into the suspected-loss retention policy (Backlog: correlated "lost store"
+  declarations), or delete them once the device's stores are rebuilt.
+- A failed device-CRL `dropStore` for a transferred-away store is retried only in memory (DeviceReconciler); a
+  restart forgets it and the entries stay live and uncounted. Only a dead CRL thread makes a drop fail today.
+
 Fixed (2026-11-06): JVM SIGSEGV in librocksdbjni at `rocksdb::WriteBatchInternal::Count`, from
 BufferedConsistentRocksDB.commitOnPool, seen twice in full `sbt test` runs. BufferedConsistentRocksDB.close() released
 the database and the next WriteBatch as soon as no operation was inside begin/endOperation, but a commit still queued

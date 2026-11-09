@@ -267,18 +267,19 @@ class Frontend(val storeId: StoreId,
   private val tracelessLookups = scala.collection.mutable.HashMap[TransactionId, TracelessLookup]()
   private var nextTracelessRequest: Long = 0L
 
-  if deferRecovery then awaitRecovery() else recoverTransactions()
+  // Undeferred (tests only), the state is read here, which may block on the CRL
+  if deferRecovery then awaitRecovery() else recoverTransactions(crl.getFullRecoveryState(storeId))
 
-  /** Recreates the transactions the CRL holds for this store that are not already known.
+  /** Recreates the transactions in `states`, which the CRL holds for this store, that are not already known.
     *
     * Transaction messages are held until every recovered transaction has loaded its objects, and with them taken the
     * locks of its recovered commit vote. A transaction started meanwhile could otherwise load a shared object first and
     * take conflicting locks.
     */
-  private def recoverTransactions(): Unit =
+  private def recoverTransactions(states: List[TransactionRecoveryState]): Unit =
     // Every recovered transaction is registered before any of their reads starts: one that loads synchronously (its
     // objects cached, or all allocated) must not find the others missing and release the held messages early
-    val recovered = crl.getFullRecoveryState(storeId).flatMap { trs =>
+    val recovered = states.flatMap { trs =>
       val txd = TransactionDescription.deserialize(trs.serializedTxd)
       if transactions.contains(txd.transactionId) then
         None
@@ -317,12 +318,13 @@ class Frontend(val storeId: StoreId,
     */
   def awaitRecovery(): Unit = awaitingCrl = true
 
-  /** The CRL now holds the store's recovery state: recreates its transactions. Held messages are handled, in arrival
-    * order, once those transactions have loaded their objects. The flag is cleared only once they are registered, so
+  /** `states` is the store's recovery state, read from the CRL by the caller (CrashRecoveryLog.readStoreState, which
+    * does not block): recreates its transactions. Held messages are handled, in arrival order, once those
+    * transactions have loaded their objects. The flag is cleared only once they are registered, so
     * mayHoldTransaction, read from other threads, never reads false in between
     */
-  def recover(): Unit =
-    recoverTransactions()
+  def recover(states: List[TransactionRecoveryState]): Unit =
+    recoverTransactions(states)
     awaitingCrl = false
     releaseHeldMessages()
 

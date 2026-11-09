@@ -561,7 +561,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             None
           case Success(storeFiles) =>
             // Opened before any store is offered, so each store recovers from it. Recovery blocks the control
-            // thread, as each store's getFullRecoveryState does in handleLoad. A throw leaves the device unloaded.
+            // thread. A throw leaves the device unloaded.
             val crl = openDeviceCrl(storageDevicePath, sdCfg, storeFiles)
             val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl,
               new CrlAdmission(crl.admissionLimitBytes))

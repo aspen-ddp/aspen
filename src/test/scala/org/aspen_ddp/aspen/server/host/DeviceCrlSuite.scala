@@ -46,13 +46,17 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = inner.getFullRecoveryState(storeId)
   /** Completed when the store state is first read for an extraction */
   val readCalled: Promise[Unit] = Promise()
-  /** While set, a read of a store's state completes only once it completes: a host stopped there crashes in the
-   *  window between the read and the save file's write */
+  /** While set, the next read of a store's state completes only once it completes: a host stopped there crashes in
+   *  the window between the read and the save file's write. Later reads (a store's recovery) are not gated */
   @volatile var readGate: Option[Future[Unit]] = None
   override def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] =
     val read = inner.readStoreState(storeId)
     readCalled.trySuccess(())
-    readGate match
+    val gate = synchronized:
+      val g = readGate
+      readGate = None
+      g
+    gate match
       case None => read
       case Some(gate) => read.flatMap(trs => gate.map(_ => trs)(using ExecutionContext.parasitic))(
         using ExecutionContext.parasitic)

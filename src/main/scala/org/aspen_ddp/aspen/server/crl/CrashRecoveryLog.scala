@@ -115,6 +115,7 @@ object CrashRecoveryLog:
 
 
 trait CrashRecoveryLog {
+  /** The transactions held for `storeId`. May block on the CRL's own thread: stores recover through readStoreState */
   def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState]
 
   /** The transactions held for `storeId`, which stay in the CRL: removed only by deleteTransactions, which records

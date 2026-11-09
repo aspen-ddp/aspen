@@ -1310,7 +1310,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     recoverable = List(TransactionRecoveryState(storeId, lockTxd(txid1, List(overwrite(op1))).serialize(),
       List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), TransactionDisposition.VoteCommit,
       TransactionStatus.Unresolved, PersistentState.initial))
-    frontend.recover()
+    frontend.recover(recoverable)
 
     frontend.transactions.keySet shouldBe Set(txid1, txid2)
     net.txMessage() match
@@ -1361,7 +1361,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
     recoverable = List(commitVote(txid1, List(overwrite(op1))))
-    frontend.recover()
+    frontend.recover(recoverable)
     backend.deliver() // The shared read of op1 completes after recover returned
     backend.deliver() // and so does any read issued once the held prepare is handled
 
@@ -1385,7 +1385,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.setCompletionHandler(op => f.backendOperationComplete(op))
     frontend = Some(f)
 
-    f.recover()
+    // Read as the host reads it: before recover, while recovery is awaited
+    f.recover(crl.getFullRecoveryState(storeId))
     seenDuringRecovery shouldBe List(true)
     f.mayHoldTransaction(txid1) shouldBe true
   }
@@ -1543,7 +1544,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     recoverable = List(
       recoveryState(txid1, List(SharedRevisionLock(fencePtr, rev0)), TransactionDisposition.VoteCommit),
       recoveryState(txid2, List(overwrite(op1)), TransactionDisposition.VoteCommit))
-    frontend.recover()
+    frontend.recover(recoverable)
     backend.deliver()
     backend.deliver()
 
@@ -2803,7 +2804,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.receiveTransactionMessage(p1)
     recoverable = List(TransactionRecoveryState(storeId, p1.txd.serialize(), p1.objectUpdates,
       TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial))
-    frontend.recover()
+    frontend.recover(recoverable)
     frontend.transactions.contains(txid1) shouldBe true
     admission.admittedBytes shouldBe admissionBytes(p1)
   }

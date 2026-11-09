@@ -7,14 +7,16 @@ import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.{DurableFiles, Host}
+import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 import org.aspen_ddp.aspen.server.repair.StoreNotHosted
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store}
 import org.aspen_ddp.aspen.server.store.backend.CompletionHandler
 import scribe.Logging
 
 import java.util.concurrent.ConcurrentHashMap
-import scala.concurrent.{Future, Promise}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.jdk.CollectionConverters.*
+import scala.util.{Failure, Success}
 import scala.util.control.NonFatal
 
 object StoreRouter:
@@ -210,14 +212,40 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private[host] def recoverDeferred(store: Store): Unit =
     route(store.storeId, () => ()): installed =>
       if installed eq store then
-        recoverOrFail(installed)
+        readAndRecover(installed)
 
-  /** Recovers `store`'s transactions, on its executor. A recovery that throws may have recreated only some of them:
-   *  the store keeps holding its messages and dropping reads (Frontend.awaitRecovery stays set) and is fail-stopped
-   *  on the control thread (StoreRebuilds.handleRecoveryFailed) */
-  private def recoverOrFail(store: Store): Unit =
+  /** On `store`'s executor: asks the CRL for the store's state without blocking (readStoreState), then recovers from
+   *  it on the executor if the store is still installed. Asked from the executor, the read queues behind every CRL
+   *  save the tasks ahead of it issued, a replaced store's included (install). The store holds its transaction
+   *  messages until it recovers, so it saves nothing in between. A failed read fail-stops it as a failed recovery
+   *  does */
+  private def readAndRecover(store: Store): Unit =
+    val failed: Throwable => Unit = err =>
+      logger.error(s"Store ${store.storeId} failed to read its transactions from its CRL: $err")
+      ctx.post(Host.StoreRecoveryFailed(store, err))
+    // The default readStoreState reads getFullRecoveryState inline, which may throw
+    val read =
+      try store.crl.readStoreState(store.storeId)
+      catch case NonFatal(err) => Future.failed(err)
+    read.value match
+      // Already answered (a CRL whose read does not block): recovered in this task, still the store installed
+      case Some(Success(trs)) => recoverOrFail(store, trs)
+      case Some(Failure(err)) => failed(err)
+      case None =>
+        read.onComplete {
+          case Failure(err) => failed(err)
+          case Success(trs) =>
+            route(store.storeId, () => ()): installed =>
+              if installed eq store then
+                recoverOrFail(installed, trs)
+        }(using ExecutionContext.parasitic)
+
+  /** Recovers `store`'s transactions from `trs`, on its executor. A recovery that throws may have recreated only some
+   *  of them: the store keeps holding its messages and dropping reads (Frontend.awaitRecovery stays set) and is
+   *  fail-stopped on the control thread (StoreRebuilds.handleRecoveryFailed) */
+  private def recoverOrFail(store: Store, trs: List[TransactionRecoveryState]): Unit =
     try
-      store.frontend.recover()
+      store.frontend.recover(trs)
     catch
       case NonFatal(err) =>
         logger.error(s"Store ${store.storeId} failed to recover its transactions from its CRL: $err")
@@ -231,7 +259,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
       if installed eq store then
         // Durably: a save file brought back by a crash would be loaded again over newer device-CRL state
         DurableFiles.remove(saveFile)
-        recoverOrFail(installed)
+        readAndRecover(installed)
       p.success(())
 
   def get(storeId: StoreId): Option[Store] = Option(stores.get(storeId)).map(_.store)

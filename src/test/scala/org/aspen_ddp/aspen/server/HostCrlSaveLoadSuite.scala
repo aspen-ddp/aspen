@@ -23,7 +23,7 @@ import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.scalatest.compatible
 
 import java.util.UUID
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, SECONDS}
 
 class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
@@ -123,6 +123,53 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       val store = storeOf(host).get
       store.frontend.transactions.keySet should be (Set(txid))
       store.objectCache.get(oid).flatMap(_.lockedToTransaction) should be (Some(txid))
+
+  /** A RecordingCRL whose readStoreState answers only when the test completes `answer`, as a busy CRL thread would,
+   *  and which records any blocking getFullRecoveryState call */
+  private class SlowReadCRL extends TestNetwork.RecordingCRL:
+    @volatile var blockingReads = 0
+    @volatile var asked = false
+    val answer: Promise[Unit] = Promise()
+    override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+      blockingReads += 1
+      super.getFullRecoveryState(storeId)
+    override def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] =
+      asked = true
+      val held = super.getFullRecoveryState(storeId)
+      answer.future.map(_ => held)(using ExecutionContext.parasitic)
+
+  atest("device-CRL recovery waits for the CRL without blocking and holds messages until it recovers"):
+    given ExecutionContext = executionContext
+    val crl = new SlowReadCRL
+    crl.save(txid, commitVote(), () => ())
+    val backend = storeWithObject()
+    val host = newCrlHost(crl)
+    val loaded = host.loadStore(deviceId, backend, None)
+    val other = TransactionId(new UUID(7, 6))
+    host.receiveTransactionMessage(TxPrepare(crlStoreId, net.storeId0, overwriteTxd(other, 1),
+      ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), Nil, true))
+
+    def reading: Boolean =
+      host.testingOnlyHandleEvents()
+      loaded.isCompleted && crl.asked
+
+    def handled: Boolean =
+      host.testingOnlyHandleEvents()
+      storeOf(host).exists(_.frontend.transactions.contains(other))
+
+    for
+      _ <- yieldUntil(reading)
+      _ = host.testingOnlyHandleEvents()
+      waiting = storeOf(host).map(_.frontend.transactions.keySet)
+      _ = crl.answer.success(())
+      _ <- yieldUntil(handled)
+    yield
+      withClue("the store is served and holds the prepare while its read is outstanding: "):
+        waiting should be (Some(Set()))
+      val store = storeOf(host).get
+      store.frontend.transactions.keySet should be (Set(txid, other))
+      store.objectCache.get(oid).flatMap(_.lockedToTransaction) should be (Some(txid))
+      crl.blockingReads should be (0)
 
   /** A RecordingCRL whose reads of a store's recovery state throw once `failing`, as a corrupt entry would make it */
   private class ThrowingCRL extends TestNetwork.RecordingCRL:

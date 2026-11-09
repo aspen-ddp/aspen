@@ -1688,6 +1688,17 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.get(tracelessTxid).map(_.holdsLocks) shouldBe Some(false)
   }
 
+  test("a held TxFinalized abort is not replaced by a later held TxResolved, so the Tx is forgotten once accepted") {
+    val (frontend, _, _, _, lookup) = tracelessFixture()
+    lookup.answer(tracelessTxid, Success(false))
+
+    frontend.receiveTransactionMessage(TxFinalized(storeId, tracelessDriver, tracelessTxid, committed = false))
+    frontend.receiveTransactionMessage(TxResolved(storeId, tracelessDriver, tracelessTxid, committed = false))
+    lookup.answer(tracelessTxid, Success(false))
+
+    frontend.transactions.contains(tracelessTxid) shouldBe false
+  }
+
   test("an abort arriving before the TracelessCommits entry is visible waits for a later lookup and then commits") {
     val (frontend, backend, _, _, lookup) = tracelessFixture()
     lookup.answer(tracelessTxid, Success(false))

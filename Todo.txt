@@ -6,6 +6,10 @@ KeyValue deletes without a required revision) are recorded in each pool's Tracel
 them, and a recovered commit vote applies a commit found there. Repair reconciles exactly, and late prepares past the
 status cache horizon vote TransactionTooOld. See docs/superpowers/specs/2026-11-08-traceless-commits-design.md.
 
+Device-CRL recovery reads getFullRecoveryState on the store's executor, a shared store thread, which blocks on the
+CRL thread. Move it off the store thread: read the store's state on the control side (readStoreState) and hand it to
+the store with its recovery.
+
 Store commit delay FSIF commits seem to be taking longer than they should when backed by NVMe media. Investigate the
 timing of commits.
 

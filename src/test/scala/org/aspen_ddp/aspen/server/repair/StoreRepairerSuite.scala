@@ -489,6 +489,33 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       storeRefcount(2, dataPtr) shouldBe Some(expected)
       remaining shouldBe empty
 
+  test("a store that missed a DataObject data write and then applied a later refcount change gets the missed data"):
+    for
+      dataPtr <- client.transactUntilSuccessful: tx =>
+                   given Transaction = tx
+                   for
+                     pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+                     p <- new PoolObjectAllocator(client, pool).allocateDataObject(DataBuffer(Array[Byte](1)))
+                   yield p
+      _ <- scanAllUntilQuiet()
+      before <- client.read(dataPtr)
+      expected = before.refcount.setCount(before.refcount.count + 1)
+      _ <- missedBy(2)(_.overwrite(dataPtr, before.revision, DataBuffer(Array[Byte](2))))
+      _ <- missedBy(0)(_.setRefcount(dataPtr, before.refcount, expected))
+      marked <- errorEntries(2)
+      _ = withClue("store 2 missed only the data write: "):
+            storeRefcount(2, dataPtr) shouldBe Some(expected)
+            stored(2, dataPtr.id).map(_.data.getByteArray.toSeq) shouldBe Some(Seq[Byte](1))
+            marked should not be empty
+      _ <- scanUntilQuiet(2)
+      after <- client.read(dataPtr)
+      remaining <- errorEntries(2)
+    yield
+      stored(2, dataPtr.id).map(_.data.getByteArray.toSeq) shouldBe Some(Seq[Byte](2))
+      stored(2, dataPtr.id).map(_.metadata.revision) shouldBe Some(after.revision)
+      storeRefcount(2, dataPtr) shouldBe Some(expected)
+      remaining shouldBe empty
+
   test("a commit applied between the snapshot and the install survives and is retried next pass"):
     // The repair reads the object before k3 is inserted, so the read lacks k3. The store applies the insert before
     // the install: only the snapshot check keeps the install from deleting it

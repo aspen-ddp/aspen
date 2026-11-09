@@ -157,6 +157,33 @@ class ReconcileSuite extends AnyFunSuite with Matchers:
     stale.data shouldBe None
     stale.result.stale shouldBe true
 
+  test("a DataObject's data is installed when its revision differs and the read is not older"):
+    def read(revision: ObjectRevision, timestamp: HLCTimestamp): DataObjectState =
+      DataObjectState(dataPtr, revision, ObjectRefcount(1, 1), timestamp, timestamp, ida, 0,
+        DataBuffer(value(31).bytes))
+    // The store missed the data write but applied a later refcount change: the timestamps are equal
+    val store = RepairSnapshot(oid, rev(1), ObjectRefcount(1, 1), ts(20), Map(), None)
+    val equal = plan(store, store, read(rev(2), ts(20)))
+    equal.data.map(_.getByteArray.toSeq) shouldBe Some(slice(value(31)).bytes.toSeq)
+    equal.revision shouldBe Some(rev(2))
+    equal.timestamp shouldBe None
+    equal.result.complete shouldBe true
+
+    // A read older than the store's copy changes nothing
+    val older = plan(store, store, read(rev(2), ts(10)))
+    older.changesNothing shouldBe true
+    older.result.complete shouldBe true
+
+    // The same revision changes nothing, whatever the timestamps
+    plan(store, store, read(rev(1), ts(30))).data shouldBe None
+
+    // The store's revision changed since the snapshot: left alone, stale
+    val rewritten = RepairSnapshot(oid, rev(3), ObjectRefcount(1, 1), ts(20), Map(), None)
+    val stale = plan(store, rewritten, read(rev(2), ts(20)))
+    stale.data shouldBe None
+    stale.revision shouldBe None
+    stale.result.stale shouldBe true
+
   test("the object timestamp becomes the larger of the two"):
     val store = kvStore(Map(k0 -> rev(1)), timestamp = ts(10))
     plan(store, store, kvRead(Map(k0 -> rev(1), k1 -> rev(2)), timestamp = ts(30))).timestamp shouldBe Some(ts(30))

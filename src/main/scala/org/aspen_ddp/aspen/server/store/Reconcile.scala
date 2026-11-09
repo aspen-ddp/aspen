@@ -128,9 +128,11 @@ object Reconcile:
       val (refcount, refcountStale) =
         if locks.objectLevel then (None, false) else planRefcount(snapshot, current, read)
 
-      // Revisions of a DataObject form a single chain, so the timestamp gate is exact for its contents
+      // HLC timestamps are per transaction, so a read no older than the store's copy reflects every transaction the
+      // store applied. A refcount change advances the timestamp without the revision, so equal timestamps with
+      // differing revisions mean the store missed a data write: the revision, not the timestamp, decides
       val (data, dataStale) =
-        if read.timestamp <= current.timestamp then
+        if read.revision == current.revision || read.timestamp < current.timestamp then
           (None, false)
         else if current.revision != snapshot.revision then
           (None, true)
@@ -140,7 +142,7 @@ object Reconcile:
       ReconcilePlan(Map(), Set(), refcount, None,
         revision = data.map(_ => read.revision),
         data = data,
-        timestamp = data.map(_ => read.timestamp),
+        timestamp = data.flatMap(_ => Option.when(read.timestamp > current.timestamp)(read.timestamp)),
         ReconcileResult(Set(), locks.objectLevel, refcountStale || dataStale))
 
   private def planKeyValue(snapshot: RepairSnapshot, current: RepairSnapshot, read: KeyValueObjectState,

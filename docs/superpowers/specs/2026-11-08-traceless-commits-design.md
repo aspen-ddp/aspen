@@ -189,8 +189,11 @@ it. No hook in rebuild or store removal is needed.
      to every object type, with no timestamp gate. A `RefcountUpdate` takes an exclusive object lock
      (`RequirementsLocker`), so a refcount change a voter has not yet applied shows up as a reported object-level lock.
      The refcount is then deferred like the other object-level parts, and its fallback is the same proof (below).
-   - **DataObjects:** contents and revision keep today's rule. Their revisions form a single chain, so the timestamp
-     gate is exact for them.
+   - **DataObjects:** contents and revision are installed when the read's revision differs from the store's and the
+     read's timestamp is at least the store's. The object timestamp becomes the larger of the two. HLC timestamps
+     are per transaction, so a read no older than the store reflects every transaction the store applied. A
+     `RefcountUpdate` advances the timestamp without changing the revision, so equal timestamps with differing
+     revisions mean the store missed a data write. A strict "read is newer" gate would leave that write missing.
    - **KeyValueObjects:** for every key not reported locked, make the store's key equal to the read's: install the
      read's version (the store's IDA slice of it) when it differs or the store lacks the key, and delete the store's
      key when the read lacks it. Object-level parts (revision, min, max, left, right) are made equal to the read's

@@ -361,7 +361,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   failure, since the source still holds the state
 - A lost device CRL does the same to every store on the device: if `<device>/crl` is absent from a device holding store
   dirs, or `openCRL` throws, each store dir gets `rebuild-required`, the old directory is kept as `crl.lost-<uuid>`, and
-  a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`)
+  a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`). A transient error (I/O or VM error,
+  `DeviceDiscovery.isTransient`) leaves the device unloaded for the next scan instead, until `CrlOpenAttempts` (3) in a row
 - A backend fail-stop during a store's close marks it `rebuild-required` instead of closing it cleanly (no
   `crl_save.log`). Such a store is never transferred: its transfer is aborted so it is rebuilt
 - A store's device-CRL entries are dropped for good (`CrashRecoveryLog.dropStore`, durable) only once it cannot be

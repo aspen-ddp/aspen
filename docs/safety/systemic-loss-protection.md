@@ -88,6 +88,9 @@ These are facts about the code, each checked. They define the problem; none is a
   (`server/crl/CrashRecoveryLog.scala:113-114`). Recovery read failure fail-stops the store
   (`server/host/StoreRouter.scala:222-256`). Transient (EMFILE, EIO, timeouts, interrupts), persistent, and
   configuration/version causes all lead to the same conclusion. There is no retry before declaring.
+  *Update 2026-11-09:* the CRL open now retries transient errors (I/O and VM errors) on 3 scans before declaring
+  (crash-recovery-log.md F6). Persistent and configuration causes still declare at once, by decision: protection
+  against correlated declarations is to be built at a higher level, which this document still leaves unsolved.
 * **S6 Configuration and version skew are treated as corruption.** `SimpleCRL.SizingMismatch` is thrown when the
   stream files on disk differ in count or size from the device config (`server/crl/simple/SimpleCRL.scala:53,84-93`);
   the keys `crl-num-streams` and `crl-max-file-size-mb` are optional and default in code

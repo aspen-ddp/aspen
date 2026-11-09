@@ -303,7 +303,8 @@ write, `currentLogEntry = new LogEntry(location, serial + 1, oldestEntryNeeded)`
 `writeCurrentLogEntry` (`SimpleCRL.scala:170-191`):
 
 1. If the entry does not fit the current stream, advance `currentStream`, `recycleStream()` it, and for every live `Tx`
-   whose txd or object data lies in the recycled stream (`Tx.closeStream`, `LogContent.scala:185-204`) clear its
+   whose txd or object data lies in the stream *after* the recycled one (since the F3 fix; data still in the recycled
+   stream itself would break the invariant and is logged and copied too) (`Tx.closeStream`, `LogContent.scala:185-204`) clear its
    locations, move it to the queue head and add it to the entry being written. Then set the entry's
    `oldestEntryNeeded` to the queue tail's serial.
 2. `Stream.writeEntry` builds the buffers (`LogEntry.createEntryBuffers`, `LogEntry.scala:59-121`): header, then the
@@ -367,8 +368,10 @@ chain walk: after the moves, every live transaction's queue position is in the n
 `oldestEntryNeeded` is at least the new entry's own serial or the serial of the oldest *unmoved* transaction, which by
 the ring order is in a stream younger than the recycled one. So no entry in the recycled stream is needed afterwards.
 
-What the argument does **not** cover is the instant of the overwrite itself: the re-emission is written *into the same
-stream whose old contents it replaces*, starting at offset 0 (F3).
+What the argument did **not** cover was the instant of the overwrite itself: the re-emission was written *into the same
+stream whose old contents it replaced*, starting at offset 0 (F3). Since the F3 fix the rotation into stream *k*
+re-emits the live data of stream *k+1* instead, so *k* holds nothing needed when it is overwritten: the stream after
+the active one never holds a needed entry.
 
 ### 5.8 Deletion
 
@@ -535,10 +538,10 @@ no wrong state is recovered, assuming A1-A6.
 
 | # | Scenario | Outcome | Safe? |
 |---|----------|---------|-------|
-| 10.1 | Crash mid-write of an appended entry | See below | Yes for appends; no for a rotation write (F3) |
+| 10.1 | Crash mid-write of an appended entry | See below | Yes (a rotation write since the F3 fix) |
 | 10.2 | Torn or corrupted entry | See below | No, partially (F1, F5) |
 | 10.3 | Power loss with write caching | See below | Yes if A1; no if the drive lies |
-| 10.4 | A full stream | See below | Yes by design; F3 at the moment of the overwrite |
+| 10.4 | A full stream | See below | Yes (F3 fixed) |
 | 10.5 | A slow fsync | See below | Safe; liveness only |
 | 10.6 | A dead CRL thread | See below | Safe for state; F9 for operations |
 | 10.7 | The device is pulled | See below | Safe |
@@ -547,8 +550,8 @@ no wrong state is recovered, assuming A1-A6.
 | 10.10 | Crash during transfer-out, after `crl_save.log` durable | See below | Safe |
 | 10.11 | Crash between `dropStore` and directory removal | See below | Safe |
 | 10.12 | Stores sharing a CRL, one rebuilt | See below | Safe except F8 and F12 |
-| 10.13 | Crash during recovery's re-save | See below | Safe unless it rotates (F3) |
-| 10.14 | CRL files unrecoverable at open | See below | Safe for the CRL; F6 for the system |
+| 10.13 | Crash during recovery's re-save | See below | Safe (F3 fixed) |
+| 10.14 | CRL files unrecoverable at open | See below | Safe for the CRL; transient errors retried (F6) |
 | 10.15 | Sizing mismatch | See below | Safe for state, destructive (F6) |
 | 10.16 | A completion handler throws | See below | State safe; device stops |
 | 10.17 | Device full | See below | Not safe for liveness (F7) |
@@ -647,7 +650,8 @@ append does not fit and rotates, the F3 hazard applies to the open itself, and r
 the ring at the rate of the live set size.
 
 **10.14 CRL files unrecoverable.** `openCRL` throws (`BrokenEntryChain`, `CorruptedEntry`, I/O error, anything).
-`openDeviceCrl` marks every store with a config file `rebuild-required` (durably, one by one), moves `crl/` aside, opens
+Since the F6 fix an I/O or VM error is first retried on the next scans, the device unloaded meanwhile; after
+`CrlOpenAttempts` (3) in a row, or at once for any other error, `openDeviceCrl` marks every store with a config file `rebuild-required` (durably, one by one), moves `crl/` aside, opens
 a fresh one (`DeviceDiscovery.scala:512-520`). A crash between the markers and the move leaves markers and the old
 `crl/`: the next open may succeed (e.g. transient error) but the stores stay unservable behind their markers. The
 decision is irreversible and made from local evidence only (F6).
@@ -728,6 +732,14 @@ acknowledged after that restart until the next rotation. Forgotten Paxos promise
 
 ### F3. Rotation overwrites, in place, the stream that holds the only copy of live data (high confidence in the mechanism; not executed)
 
+> **FIXED (2026-11-09).** A rotation now copies forward the live data of the stream *after* the one it recycles
+> (`SimpleCRL.writeCurrentLogEntry`). Invariant: the stream after the active one holds no needed entry, so the stream
+> a rotation overwrites is never needed, whatever part of the write persists. With two streams the copy is the whole
+> live set, still at most half a stream. `SimpleCRL.apply` requires at least 2 streams. Covered by the SimpleCRLSuite
+> test "A rotation write torn at any sector leaves every earlier acknowledged save recoverable", which tears every
+> rotation of a three-lap run at each sector prefix and with only its first sector old; before the fix it threw
+> `BrokenEntryChain`.
+
 **Verification: PLAUSIBLE (mechanism confirmed by reading, not executed), severity data-loss.** `Stream.recycleStream` (`Stream.scala:14-17`) resets the offset to 0 and picks a new UUID; `writeCurrentLogEntry` (`SimpleCRL.scala:170-191`) then writes the copy-forward entry over the same file in one `write`. The last durable entry's `oldestEntryNeeded` is the only thing that tells recovery which older entries matter, and it still points into the stream being overwritten until the new entry is durable. A crash that tears this write (power loss or kernel crash; a plain process kill does not tear a `write` syscall) can leave old sector 0 replaced (new file UUID, so every old entry in the file is unreadable: `BrokenEntryChain`) or old header with foreign tails. No test covers a torn rotation. Trigger needs power loss inside a single-entry write window, repeated on every rotation, so rare but not negligible on a fleet. Fix sketch: write copy-forward into a stream that holds no needed data (reserve one spare stream, or require `oldestEntryNeeded` to have advanced past the stream first), and only then recycle.
 
 On a rotation the live transactions with data in stream *k+1* are re-emitted into the entry that is then written at
@@ -788,6 +800,15 @@ bytes to an object. Whether it requires power loss or a device misbehaving is th
 checksum would convert silent corruption into C8 (a loud failure).
 
 ### F6. Any exception from `openCRL` irreversibly turns every store on the device into a rebuild (high confidence the behaviour exists; severity systemic)
+
+> **FIXED (2026-11-09), as scoped by the owner.** A CRL that cannot be loaded does mean its stores must be rebuilt;
+> only transient errors are now suppressed. `openDeviceCrl` rethrows an I/O or VM error (`DeviceDiscovery.isTransient`),
+> leaving the device unloaded and its stores untouched for the next scan, and declares the CRL lost only after
+> `CrlOpenAttempts` (3) such failures in a row. Everything else (`BrokenEntryChain`, `CorruptedEntry`, `SizingMismatch`,
+> decode errors, bugs) is lost at once, as before. Protection against fleet-wide declarations belongs at a higher
+> level (systemic-loss-protection.md). Covered by the DeviceCrlSuite tests "a transient CRL open failure leaves the
+> stores untouched and a later scan loads the device" and "a CRL open failing transiently CrlOpenAttempts times in a
+> row is treated as lost".
 
 **Verification: CONFIRMED, severity systemic (data-loss class).** `DeviceDiscovery.scala:498-520`: the `catch case t: Throwable` at `:510-515` covers `SizingMismatch`, `BrokenEntryChain`, OOM and I/O errors alike, then `markRebuildRequired` on every store dir and the `os.move` to `crl.lost-<uuid>` (nothing reads that directory: grep finds only the move and tests). F2 (verified above) and F4 give in-product ways to reach it. Note also: when the first `openCRL` fails after `StreamWriter` was constructed (for example the `require` in the open-time re-save), the writer thread and file handles are not shut down before the second `openCRL`, so two writers can briefly exist over the same files. Fix sketch: catch only `BrokenEntryChain`/`CorruptedEntry`; rethrow `SizingMismatch`, `Error` and I/O errors so the device stays unloaded and alarms; shut down a half-built CRL.
 
@@ -948,6 +969,11 @@ discards them (systemic-loss-protection.md D2/X3). Reproduced with `verify-crl/E
 
 ### F21 (new). `openDeviceCrl` retry after a failed first open does not stop the first attempt's threads
 
+> **FIXED (2026-11-09).** A `SimpleCRL` constructor that fails after building its writer shuts the writer down and
+> waits for it before rethrowing. A writer thread that dies during the open-time re-save now wakes the constructor
+> (`WriterDied`), which previously waited forever for the write. Covered by the SimpleCRLSuite test "An open whose
+> re-save cannot fit in a stream fails, and fails the same way when retried".
+
 If `SimpleCRL`'s constructor fails after `StreamWriter` was built (for example `Stream.writeEntry`'s `require` during
 the open-time re-save, `SimpleCRL.scala:132-136`), the writer thread and channels are left running while
 `openDeviceCrl` moves `crl/` aside and opens a new CRL (`DeviceDiscovery.scala:510-520`). Confidence: medium (read,
@@ -959,7 +985,7 @@ not executed). Fix sketch: close the writer in a constructor failure path.
 |-----------------|------|
 | "a dead CRL thread stalls that device ... reads keep working" (`S/crl/CLAUDE.md`) | `readStoreState`, `dropStore`, `deleteTransactions` and `storesWithEntries` all need the CRL thread; they hang. Object reads of the stores continue. |
 | "The sizing is fixed ... the CRL is treated as lost" | True, and it happens for any configuration edit, not only a disk fault (F6). |
-| Stream recycling "the oldest live data is copied to the head of the buffer whenever it is about to overwrite that live data" | The copy is written *over* the stream being recycled (F3). |
+| Stream recycling "the oldest live data is copied to the head of the buffer whenever it is about to overwrite that live data" | The copy was written *over* the stream being recycled (F3). Fixed: the copy is now one stream ahead; crl/CLAUDE.md updated. |
 | "Only read at application startup" | Also read by `readStoreState` for every store load, transfer and drop. |
 | Admission "so a recycled stream's live copy-forward always fits" | Only for the bytes admission counts (F8). |
 

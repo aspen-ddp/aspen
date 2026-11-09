@@ -29,6 +29,9 @@ object SimpleCRL:
 
   case class WriteComplete(serialNumber: Long) extends ActionRequest
 
+  /** Queued when the writer thread dies, so the open-time re-save does not wait forever for its write */
+  case class WriterDied(cause: Throwable) extends ActionRequest
+
   case class Shutdown(completionHandler: () => Unit) extends ActionRequest
 
   case class GetRecoveryState(storeId: StoreId,
@@ -63,6 +66,8 @@ object SimpleCRL:
             numStreams: Int,
             maxSizeInBytes: Long,
             onThreadDeath: Throwable => Unit = _ => ()): InitialCRLState =
+    // A rotation copies the next stream's live data into the one it recycles, which needs a second stream
+    require(numStreams >= 2, s"A CRL needs at least 2 streams, not $numStreams")
     val files: List[(StreamId, os.Path)] = (0 until numStreams).map(i =>
       (StreamId(i), streamsDir / s"$i.crl")
     ).toList
@@ -101,12 +106,16 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   val numStreams: Int = files.size
 
-  /** Half a stream: when the ring recycles a stream, everything live is at most half a stream, so the copy-forward
-    * always fits. Stream.writeEntry's require stays as the backstop
+  /** Half a stream: when the ring recycles a stream, everything live is at most half a stream, so the copy-forward of
+    * the next stream's live data always fits. Stream.writeEntry's require stays as the backstop
     */
   override def admissionLimitBytes: Long = maxSizeInBytes / 2
 
-  private val writer = StreamWriter(maxSizeInBytes, files, onThreadDeath)
+  private val ioQueue = new LinkedBlockingQueue[ActionRequest]()
+
+  private val writer = StreamWriter(maxSizeInBytes, files, t =>
+    ioQueue.put(WriterDied(t))
+    onThreadDeath(t))
   private var currentStream: Int = r.activeStreamId.number
   private var currentLogEntry: LogEntry = new LogEntry(r.initialPreviousEntryLocation,
     r.initialNextEntrySerialNumber, r.initialOldestEntryNeeded)
@@ -116,8 +125,6 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   private var queueHead: Option[Tx] = None
   private var queueTail: Option[Tx] = None
-
-  private val ioQueue = new LinkedBlockingQueue[ActionRequest]()
 
   private var initializing = true
   private var writeInProgress = false
@@ -129,12 +136,20 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     else
       streams(tpl._1.number) = new Stream(tpl._1, writer, UUID.randomUUID(), 0)
 
-  r.trsList.foreach(trs => onSaveTransaction(trs.txd.transactionId, trs, () => ()))
+  // A failed open shuts its writer down: the caller may open the same files again
+  try
+    r.trsList.foreach(trs => onSaveTransaction(trs.txd.transactionId, trs, () => ()))
 
-  if !currentLogEntry.isEmpty then
-    writeCurrentLogEntry()
-    val event = ioQueue.take()
-    ioQueue.put(event)
+    if !currentLogEntry.isEmpty then
+      writeCurrentLogEntry()
+      ioQueue.take() match
+        case WriterDied(t) => throw t
+        case event => ioQueue.put(event) // The WriteComplete, for the CRL thread
+  catch case t: Throwable =>
+    val closed = new CountDownLatch(1)
+    writer.shutdown(() => closed.countDown())
+    closed.await()
+    throw t
 
   initializing = false
 
@@ -173,10 +188,19 @@ class SimpleCRL private (val maxSizeInBytes: Long,
       if currentStream == streams.length then
         currentStream = 0
 
-      val streamId = StreamId(currentStream)
+      // The stream recycled now holds nothing needed: the previous rotation copied its live data forward. This entry
+      // copies forward the live data of the next stream to be recycled, so a torn write here, or there at the next
+      // rotation, overwrites only entries no recovery needs. The last durable entry's oldestEntryNeeded never points
+      // into the stream after the active one
+      val recycled = StreamId(currentStream)
+      val nextToRecycle = StreamId((currentStream + 1) % streams.length)
       streams(currentStream).recycleStream()
       transactions.foreach: tx =>
-        if tx._2.closeStream(streamId) then
+        val inRecycled = tx._2.closeStream(recycled)
+        val inNext = tx._2.closeStream(nextToRecycle)
+        if inRecycled then
+          logger.error(s"CRL transaction ${tx._1} still had data in recycled stream $recycled. Copying it forward")
+        if inRecycled || inNext then
           moveToQueueHead(tx._2)
           currentLogEntry.addTx(tx._2, () => ())
 
@@ -212,6 +236,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
               transactions -= txid
             currentLogEntry.addCompletionHandler(completionHandler)
             startWrite()
+
+        case WriterDied(_) => () // Reported through onThreadDeath
 
         case WriteComplete(serialNumber) =>
           logger.trace(s"CRL write complete for entry serial number: ${serialNumber}")

@@ -18,7 +18,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig,
   StorageDeviceManager, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
-import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
+import org.aspen_ddp.aspen.server.crl.simple.{Recovery, SimpleCRL}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome,
   TransferOutcome}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
@@ -571,7 +571,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     val failingFirst = new CrashRecoveryLogFactory:
       def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
         if calls.incrementAndGet() == 1 then
-          throw new java.io.IOException("unrecoverable")
+          throw Recovery.BrokenEntryChain("unrecoverable")
         inner.openCRL(devicePath, config)
     val host = newCrlHost(hostRoot, failingFirst)
 
@@ -584,6 +584,52 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       calls.get should be(2)
       inner.opened.size should be(1)
       os.exists(crlDir / "0.crl") should be(true)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
+
+  /** A device holding a store whose CRL opens fail with an I/O error the first `failures` times */
+  private def transientlyFailingCrlDevice(failures: Int): (os.Path, os.Path, RecordingCrlFactory, AtomicInteger, Host) =
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    createCrl(deviceDir)
+    val inner = newFactory()
+    val calls = new AtomicInteger(0)
+    val failing = new CrashRecoveryLogFactory:
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+        if calls.incrementAndGet() <= failures then
+          throw new java.io.IOException("transient")
+        inner.openCRL(devicePath, config)
+    (deviceDir, storeDir, inner, calls, newCrlHost(hostRoot, failing))
+
+  atest("a transient CRL open failure leaves the stores untouched and a later scan loads the device"):
+    val failures = DeviceDiscovery.CrlOpenAttempts - 1
+    val (deviceDir, storeDir, inner, calls, host) = transientlyFailingCrlDevice(failures)
+    // The startup scan failed once
+    host.control.devices.devices.contains(deviceA) should be(false)
+    os.exists(marker(storeDir)) should be(false)
+    for _ <- 2 to failures do
+      host.control.discovery.checkForNewDevices() should be(Nil)
+    os.exists(marker(storeDir)) should be(false)
+
+    host.control.discovery.checkForNewDevices() should be(List(deviceA))
+    calls.get should be(failures + 1)
+    Future.successful:
+      os.exists(marker(storeDir)) should be(false)
+      os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
+
+  atest("a CRL open failing transiently CrlOpenAttempts times in a row is treated as lost"):
+    val (deviceDir, storeDir, inner, calls, host) = transientlyFailingCrlDevice(DeviceDiscovery.CrlOpenAttempts)
+    for _ <- 2 until DeviceDiscovery.CrlOpenAttempts do
+      host.control.discovery.checkForNewDevices() should be(Nil)
+    os.exists(marker(storeDir)) should be(false)
+
+    // The last attempt fails too: the CRL is lost and a fresh one opened
+    host.control.discovery.checkForNewDevices() should be(List(deviceA))
+    Future.successful:
+      os.exists(marker(storeDir)) should be(true)
+      os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
+      calls.get should be(DeviceDiscovery.CrlOpenAttempts + 1)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
 
   atest("a device with stores but no crl dir marks them rebuild-required"):

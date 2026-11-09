@@ -26,6 +26,16 @@ private[aspen] enum AdoptionClass:
   /** Its directory is missing: the device is refused. */
   case Unclean
 
+object DeviceDiscovery:
+  /** Opens of a device's CRL that may fail with a transient error, one per scan, before it is treated as lost */
+  val CrlOpenAttempts = 3
+
+  /** An I/O error or a VM error (out of memory) may clear on a later attempt. Anything else, corruption, a sizing
+   *  mismatch or a bug, recurs on every attempt over the same files */
+  def isTransient(t: Throwable): Boolean = t match
+    case _: java.io.IOException | _: java.io.UncheckedIOException | _: VirtualMachineError => true
+    case _ => false
+
 /** Runs only on the control thread. See HostThreading.scala.
  *
  *  Finds the storage devices under `storage-devices/` and decides whether to load, restart, or adopt each. */
@@ -69,6 +79,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   // its adoption elsewhere reaches this, and it is never written to again. An entry is dropped when its path stops
   // being listed, as loadedDirs' are. In memory only: a restart loads it once more and relinquishes it again.
   private var disownedDirs: Set[os.Path] = Set()
+
+  // Consecutive transient failures to open each device directory's CRL (openDeviceCrl). In memory only: a restart
+  // allows CrlOpenAttempts more
+  private var transientCrlFailures: Map[os.Path, Int] = Map()
 
   /** Keeps the scan from loading the device at `path` again (see disownedDirs). */
   private[host] def disown(path: os.Path): Unit =
@@ -492,8 +506,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       None
 
   /** Opens the device's CRL. It is lost when its directory is absent from a device that holds stores, or when
-   *  opening it throws. The stores' transaction state was in it, so each is marked rebuild-required (the reconcile
-   *  pass turns them into rebuilds), the old directory is kept aside as `crl.lost-<uuid>`, and a fresh CRL is opened.
+   *  opening it throws anything but a transient error (DeviceDiscovery.isTransient) or a transient error
+   *  CrlOpenAttempts times in a row. The stores' transaction state was in it, so each is marked rebuild-required
+   *  (the reconcile pass turns them into rebuilds), the old directory is kept aside as `crl.lost-<uuid>`, and a fresh
+   *  CRL is opened. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
    *  A device without stores simply gets its CRL created. */
   private def openDeviceCrl(devicePath: os.Path,
                             sdCfg: StorageDeviceConfig,
@@ -506,11 +522,21 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         true
       else
         try
-          return ctx.crlFactory.openCRL(devicePath, sdCfg)
+          val crl = ctx.crlFactory.openCRL(devicePath, sdCfg)
+          transientCrlFailures -= devicePath
+          return crl
         catch
           case t: Throwable =>
             if storeDirs.isEmpty then
               throw t
+            if DeviceDiscovery.isTransient(t) then
+              val attempts = transientCrlFailures.getOrElse(devicePath, 0) + 1
+              if attempts < DeviceDiscovery.CrlOpenAttempts then
+                transientCrlFailures += devicePath -> attempts
+                logger.error(s"Failed to open the CRL of storage device $devicePath (attempt $attempts of " +
+                             s"${DeviceDiscovery.CrlOpenAttempts}). Retrying on the next scan: $t")
+                throw t
+            transientCrlFailures -= devicePath
             logger.error(s"Failed to recover the CRL of storage device $devicePath. Its stores must be rebuilt: $t")
             true
     storeDirs.foreach(ctx.rebuilds.markRebuildRequired)

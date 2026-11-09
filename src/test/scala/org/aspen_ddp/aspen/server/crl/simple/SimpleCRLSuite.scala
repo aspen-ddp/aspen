@@ -1294,4 +1294,73 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(i4.trsList.length == 3)
     i4.crl.shutdown()
   }
+
+  test("A rotation write torn at any sector leaves every earlier acknowledged save recoverable") {
+    val size = 4096L * 4
+    val sector = 4096
+    val files = (0 until 3).map(i => tdir / s"$i.crl")
+    // X lives throughout with data spanning several sectors, so a rotation that copies it forward writes a
+    // multi-sector entry. Y is re-saved to move the log on
+    val x0 = mkTx(1, 1)
+    val x = (x0._1, x0._2.copy(objectUpdates =
+      List(ObjectUpdate(ObjectId(new UUID(9, 100)), DataBuffer(Array.tabulate[Byte](6000)(i => (i % 101).toByte))))))
+    val y = mkTx(2, 2)
+
+    // Each rotation: the stream it wrote into, and every file before and after its write
+    var rotations: List[(Int, IndexedSeq[Array[Byte]], IndexedSeq[Array[Byte]])] = Nil
+    val i1 = SimpleCRL(tdir, 3, size)
+    saveAndWait(i1.crl, x._1, x._2)
+    saveAndWait(i1.crl, y._1, y._2)
+    for _ <- 1 to 20 do
+      val before = files.map(os.read.bytes(_))
+      val stream = i1.crl.currentStreamNumber
+      saveAndWait(i1.crl, y._1, y._2)
+      if i1.crl.currentStreamNumber != stream then
+        rotations = (i1.crl.currentStreamNumber, before, files.map(os.read.bytes(_))) :: rotations
+    i1.crl.shutdown()
+    assert(rotations.size >= 4)
+
+    def recoversXandY(image: IndexedSeq[Array[Byte]], what: String): Unit =
+      files.zip(image).foreach((f, bytes) => os.write.over(f, bytes))
+      val r = try SimpleCRL(tdir, 3, size) catch case t: Throwable => fail(s"$what: $t")
+      val byTx = r.trsList.map(t => t.txd.transactionId -> t).toMap
+      assert(byTx.keySet == Set(x._1, y._1), what)
+      assert(byTx(x._1).objectUpdates == x._2.objectUpdates, what)
+      assert(byTx(y._1).objectUpdates == y._2.objectUpdates, what)
+      r.crl.shutdown()
+
+    var largestRotation = 0
+    for (stream, before, after) <- rotations.reverse do
+      val changed = (0 until (size / sector).toInt).filter: s =>
+        !java.util.Arrays.equals(before(stream), s * sector, (s + 1) * sector, after(stream), s * sector, (s + 1) * sector)
+      assert(changed.nonEmpty)
+      largestRotation = largestRotation.max(changed.size)
+      // Sectors 0..n-1 of the new entry persisted, and the rest not; or every sector but the first (old head intact)
+      def torn(newSectors: Set[Int]): IndexedSeq[Array[Byte]] =
+        val bytes = before(stream).clone()
+        newSectors.foreach(s => System.arraycopy(after(stream), s * sector, bytes, s * sector, sector))
+        before.updated(stream, bytes)
+      for n <- 0 until changed.size do
+        recoversXandY(torn(changed.take(n).toSet), s"rotation into $stream, first $n of ${changed.size} sectors")
+      recoversXandY(torn(changed.drop(1).toSet), s"rotation into $stream, all but its first sector")
+    // Some rotation copied X forward
+    assert(largestRotation > 1)
+  }
+
+  test("An open whose re-save cannot fit in a stream fails, and fails the same way when retried") {
+    val size = 4096L * 4
+    def big(n: Int) =
+      val t = mkTx(n, 1)
+      (t._1, t._2.copy(objectUpdates = List(ObjectUpdate(ObjectId(new UUID(9, n)), DataBuffer(new Array[Byte](10000))))))
+    val a = big(1)
+    val b = big(2)
+    // Without admission the two live transactions fill more than a stream, so the open's re-save of both cannot fit
+    val i1 = SimpleCRL(tdir, 3, size)
+    saveAndWait(i1.crl, a._1, a._2)
+    saveAndWait(i1.crl, b._1, b._2)
+    i1.crl.shutdown()
+
+    for _ <- 1 to 2 do
+      assertThrows[IllegalArgumentException](SimpleCRL(tdir, 3, size))
+  }
 }

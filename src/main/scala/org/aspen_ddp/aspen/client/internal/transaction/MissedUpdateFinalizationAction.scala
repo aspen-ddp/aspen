@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
-import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedUpdate
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedTracelessCommit, MissedUpdate}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -78,9 +78,18 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
           } ++ l
     }
 
+    // A store that sent no TxCommitted may also have missed a change that leaves no trace on its objects
+    val traceless = txd.allDataStores.toList.flatMap: storeId =>
+      if commitErrors.contains(storeId) then
+        None
+      else
+        val objects = txd.allHostedObjects(storeId).filter(ptr => txd.tracelessObjects.contains(ptr.id))
+        Option.when(objects.nonEmpty):
+          MissedTracelessCommit(storeId, txd.transactionId, TracelessCommitEntry(txd.startTimestamp, objects))
+
     reportMarks(errors.map(_.store))
 
-    client.missedUpdateMarker.mark(errors).foreach { _ =>
+    client.missedUpdateMarker.mark(errors, traceless).foreach { _ =>
       synchronized {
         if (!completionPromise.isCompleted)
           completionPromise.success(())

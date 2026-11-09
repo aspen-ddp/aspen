@@ -5,9 +5,10 @@ import java.nio.{ByteBuffer, ByteOrder}
 import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, Transaction, TransactionCreationError, UnknownStoragePool}
 import org.aspen_ddp.aspen.client.tkvl.TKVLInsert
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectId}
+import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import scribe.Logging
 
 import scala.collection.mutable
@@ -22,6 +23,9 @@ object MissedUpdateMarker:
                                 objectId: ObjectId,
                                 missedTimestamp: HLCTimestamp,
                                 storePointer: Array[Byte])
+
+  /** A store missed a transaction's traceless change to some of its objects */
+  final case class MissedTracelessCommit(store: StoreId, transactionId: TransactionId, entry: TracelessCommitEntry)
 
   private[transaction] def errorKey(store: StoreId, objectId: ObjectId): Key =
     val keyBytes = new Array[Byte](17)
@@ -48,23 +52,30 @@ class MissedUpdateMarker(client: AspenClient,
   private final class Queued(var update: MissedUpdate):
     val written: Promise[Unit] = Promise()
 
+  private final class QueuedTraceless(val commit: MissedTracelessCommit):
+    val written: Promise[Unit] = Promise()
+
+  private final class Batch(val updates: List[Queued], val traceless: List[QueuedTraceless])
+
   private final class PoolQueue:
+    val tracelessPending: mutable.LinkedHashMap[(Byte, TransactionId), QueuedTraceless] = mutable.LinkedHashMap()
     val pending: mutable.LinkedHashMap[(Byte, ObjectId), Queued] = mutable.LinkedHashMap()
     var writing = false
 
   private val queues: mutable.Map[PoolId, PoolQueue] = mutable.Map()
 
-  /** Completes once all of `updates` are recorded, or fails if one of their pools' writes gives up */
-  def mark(updates: List[MissedUpdate]): Future[Unit] =
+  /** Completes once all of `updates` and `traceless` are recorded, or fails if one of their pools' writes gives up */
+  def mark(updates: List[MissedUpdate], traceless: List[MissedTracelessCommit] = Nil): Future[Unit] =
     val (written, batches) = synchronized:
-      val written = updates.map(enqueue)
-      (written, updates.map(_.store.poolId).distinct.flatMap(p => nextBatch(p, wasWriting = false).map(p -> _)))
+      val written = updates.map(enqueue) ++ traceless.map(enqueueTraceless)
+      val pools = (updates.map(_.store.poolId) ++ traceless.map(_.store.poolId)).distinct
+      (written, pools.flatMap(p => nextBatch(p, wasWriting = false).map(p -> _)))
 
     batches.foreach((poolId, batch) => write(poolId, batch))
     Future.sequence(written).map(_ => ())
 
   /** The entries waiting for a write */
-  def queued: Int = synchronized(queues.valuesIterator.map(_.pending.size).sum)
+  def queued: Int = synchronized(queues.valuesIterator.map(q => q.pending.size + q.tracelessPending.size).sum)
 
   // An entry can only say one thing, so a store missing an object repeatedly needs one write of the newest miss:
   // a repair that catches the store up to it is past the older ones too
@@ -81,35 +92,46 @@ class MissedUpdateMarker(client: AspenClient,
         queue.pending(key) = queued
         queued.written.future
 
+  // A transaction's entry for a store is written once, so a repeat is the same entry
+  private def enqueueTraceless(commit: MissedTracelessCommit): Future[Unit] =
+    val queue = queues.getOrElseUpdate(commit.store.poolId, new PoolQueue)
+    queue.tracelessPending.getOrElseUpdate((commit.store.poolIndex, commit.transactionId), new QueuedTraceless(commit)).written.future
+
   /** Must hold the lock. `wasWriting` says that the caller's write has just finished */
-  private def nextBatch(poolId: PoolId, wasWriting: Boolean): Option[List[Queued]] =
+  private def nextBatch(poolId: PoolId, wasWriting: Boolean): Option[Batch] =
     val queue = queues(poolId)
     if wasWriting then
       queue.writing = false
 
-    if queue.writing || queue.pending.isEmpty then
+    if queue.writing || (queue.pending.isEmpty && queue.tracelessPending.isEmpty) then
       None
     else
       val batch = queue.pending.take(maxEntriesPerBatch).toList
       batch.foreach((key, _) => queue.pending.remove(key))
+      val traceless = queue.tracelessPending.take(maxEntriesPerBatch).toList
+      traceless.foreach((key, _) => queue.tracelessPending.remove(key))
       queue.writing = true
-      Some(batch.map(_._2))
+      Some(Batch(batch.map(_._2), traceless.map(_._2)))
 
-  private def write(poolId: PoolId, batch: List[Queued]): Unit =
-    writeBatch(poolId, batch.map(_.update)).onComplete: result =>
+  private def write(poolId: PoolId, batch: Batch): Unit =
+    writeBatch(poolId, batch.updates.map(_.update), batch.traceless.map(_.commit)).onComplete: result =>
       finished(poolId, batch, result)
 
-  private def finished(poolId: PoolId, batch: List[Queued], result: Try[Unit]): Unit =
+  private def finished(poolId: PoolId, batch: Batch, result: Try[Unit]): Unit =
     result match
-      case Failure(err) => logger.warn(s"Gave up recording ${batch.size} missed updates for pool $poolId: $err")
+      case Failure(err) => logger.warn(s"Gave up recording ${batch.updates.size + batch.traceless.size} missed updates for pool $poolId: $err")
       case _ =>
-    batch.foreach(_.written.complete(result))
+    batch.updates.foreach(_.written.complete(result))
+    batch.traceless.foreach(_.written.complete(result))
     synchronized(nextBatch(poolId, wasWriting = true)).foreach(write(poolId, _))
 
-  private def writeBatch(poolId: PoolId, updates: List[MissedUpdate]): Future[Unit] =
+  private def writeBatch(poolId: PoolId, updates: List[MissedUpdate], traceless: List[MissedTracelessCommit]): Future[Unit] =
     val inserts = updates.map: u =>
       TKVLInsert(errorKey(u.store, u.objectId),
                  MissedUpdateFinalizationAction.encodeErrorEntry(u.missedTimestamp, u.storePointer))
+
+    val tracelessInserts = traceless.map: t =>
+      TKVLInsert(TracelessCommitEntry.key(t.store, t.transactionId), Value(t.entry.encode))
 
     def onFail(err: Throwable): Future[Unit] = err match
       case err: UnknownStoragePool =>
@@ -127,6 +149,8 @@ class MissedUpdateMarker(client: AspenClient,
         pool <- client.getStoragePool(poolId)
         tx = client.newTransaction()
         _ <- pool.errorTree.prepareUpdates(inserts, Nil)(using tx)
+        _ <- if tracelessInserts.isEmpty then Future.unit
+             else pool.tracelessCommitsTree.prepareUpdates(tracelessInserts, Nil)(using tx)
         _ = MissedUpdateFinalizationAction.limitTracking(poolId, tx)
         _ <- commitErrorTreeTransaction(tx)
       yield ()

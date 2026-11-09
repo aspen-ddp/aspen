@@ -88,6 +88,15 @@ final case class TransactionDescription (
       case _ => false
     locks.map(_.objectPointer.id).toSet -- changes.map(_.objectPointer.id)
 
+  /** Objects whose change leaves no trace for repair to compare: a refcount change, or a key delete that does
+    * not require a revision
+    */
+  def tracelessObjects: Set[ObjectId] =
+    requirements.collect:
+      case r: RefcountUpdate => r.objectPointer.id
+      case r: KeyValueUpdate if r.requiredRevision.isEmpty && r.deletesKeys => r.objectPointer.id
+    .toSet
+
   def primaryObjectDataStores: Set[StoreId] =
     (0 until primaryObjectIDA.width).map(i => StoreId(primaryObject.poolId, i.toByte)).toSet
 

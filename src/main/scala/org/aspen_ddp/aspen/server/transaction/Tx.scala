@@ -117,6 +117,14 @@ class Tx( trs: TransactionRecoveryState,
   /** A lookup started after the held aborts found no entry: they, and later ones, are accepted */
   private var abortsAccepted = false
 
+  /** A late commit (a TxResolved or TxFinalized with `late = true`) reached this commit vote before it learned its
+    * outcome: it waits for its UnackedCommits lookup. See lateCommit
+    */
+  private var lateCommitHeld = false
+
+  /** This Tx's outcome is a late commit: its status cache entry and status answers say so */
+  private var lateOutcome = false
+
   statusCache.updateStatus(transactionId, txStatus)
 
   private def allObjectsLoaded: Boolean = pendingObjectLoads == 0
@@ -128,12 +136,17 @@ class Tx( trs: TransactionRecoveryState,
     * drop an update that counted towards the write threshold. So every recovered unresolved commit vote looks up its
     * UnackedCommits entry once it has loaded, and again before accepting any abort (held until a lookup started after
     * the abort finds none). An entry means the store cast a counted commit vote and had not acknowledged applying T
-    * when T was finalized, i.e. it owes T: the Tx applies its update and is forgotten as if finalized. See
-    * Frontend.requestUnackedLookup
+    * when T was finalized, i.e. it owes T: the Tx applies its update and resolves committed, keeping its state until
+    * TxFinalized (see unackedCommitFound). See Frontend.requestUnackedLookup
     */
   def needsUnackedCheck: Boolean =
     recovered && disposition == TransactionDisposition.VoteCommit && txStatus == TransactionStatus.Unresolved &&
       oresolution.isEmpty
+
+  /** Whether an UnackedCommits lookup answer still matters: a recovered commit vote's check (needsUnackedCheck), or a
+    * late commit held for its lookup (lateCommit)
+    */
+  def awaitsUnackedLookup: Boolean = needsUnackedCheck || (lateCommitHeld && oresolution.isEmpty)
 
   private def missingObjectData: Boolean =
     val have = objectUpdates.iterator.map(_.objectId).toSet
@@ -524,20 +537,33 @@ class Tx( trs: TransactionRecoveryState,
   /** The requirements fail only because this store has applied the transaction: an object it hosts shows the update
     * (see RequirementsApplyer.appliedBy), so the transaction committed. An abort vote here could let a recovery driver
     * decide abort, since the stores that finalized the transaction forgot their Paxos state, and a recovering store
-    * would then drop an update that counted towards the write threshold. So the store gives no vote and tells the
-    * proposer the outcome instead; the proposer finalizes it, and every store applies what it lacks. Nothing is saved
-    * and no locks are taken. A proven commit applies nothing to the objects that already show it (see doCommit).
+    * would then drop an update that counted towards the write threshold. So the store sends the proposer a proof (a
+    * TxResolved with `proof = true`) instead of a vote; only a response already held for the objects to load still
+    * goes out, as an abort vote that the driver, once it has the proof, does not count (a recovered commit vote also
+    * holds an abort for its UnackedCommits lookup). The proof only keeps the driver from deciding abort:
+    * it may come from a store that got the transaction's state without seeing it while the transaction is still live,
+    * so the driver resolves late only on a quorum of memoryless promises to a round started after the proof
+    * (TransactionDriver.resolveLate). Nothing is saved, no locks are taken, and nothing is recorded in the status
+    * cache: a status there must stem from a real outcome.
+    *
+    * The prover stays live. It answers later prepares as an ordinary acceptor, with its abort vote and a promise
+    * carrying no accepted value (it has no state for the transaction), saved as usual; those promises are what let
+    * the driver resolve late. A muted prover keeps sending the proof only. It applies nothing whatever the outcome
+    * (applyNothing): it holds no commit vote, so it is not owed the commit.
     */
   private def proveCommitted(): Unit =
     logger.info(s"Tx $transactionId on store $storeId: objects $appliedHere already show its update, so it committed. " +
       s"Telling $lastProposer")
     provenCommitted = true
-    delayedPrepare = None
-    sendProvenResolution(lastProposer)
-    resolved(true)
+    // A response held for the objects to load stays: its promise was given, and it may answer a driver's post-proof
+    // round, which may wait for it (a designated leader may never retransmit). The prepare it answers may even be the
+    // first this Tx saw, so it cannot be told from a pre-proof one. It goes out as the abort vote it now is
+    // (sendDelayedPrepare); an abort vote with a memoryless promise is always allowed, and a driver counts no promise
+    // to a round older than the proof
+    sendProof(lastProposer)
 
-  private def sendProvenResolution(to: StoreId): Unit =
-    net.sendTransactionMessage(TxResolved(to, storeId, transactionId, committed = true, late = false, proof = false))
+  private def sendProof(to: StoreId): Unit =
+    net.sendTransactionMessage(TxResolved(to, storeId, transactionId, committed = true, late = false, proof = true))
 
   private def doCommit(): Unit = if (!committed && !committing && allObjectsLoaded) {
     committing = true
@@ -659,7 +685,10 @@ class Tx( trs: TransactionRecoveryState,
     // After the commit was applied: a waiter built on it now finds the revision it requires
     frontend.locksReleased(transactionId)
 
-  private def resolved(committed: Boolean): Unit = if (oresolution.isEmpty) {
+  /** @param record whether to record the outcome in the host's status cache: not for an outcome learned from the
+    *               UnackedCommits tree (see unackedCommitFound)
+    */
+  private def resolved(committed: Boolean, record: Boolean = true): Unit = if (oresolution.isEmpty) {
     oresolution = Some(committed)
 
     // The vote no longer matters
@@ -674,7 +703,8 @@ class Tx( trs: TransactionRecoveryState,
     else
       TransactionStatus.Aborted
 
-    statusCache.updateStatus(transactionId, txStatus)
+    if record then
+      statusCache.updateStatus(transactionId, txStatus, late = lateOutcome)
 
     if (allObjectsLoaded)
       resolvedAndAllObjectsLoaded(committed)
@@ -723,7 +753,8 @@ class Tx( trs: TransactionRecoveryState,
     */
   private def answerPrepare(m: TxPrepare): Unit = {
     if provenCommitted then
-      sendProvenResolution(m.from)
+      // See proveCommitted. Allowed by Paxos: the vote was decided (abort) and the acceptor has no state to report
+      if muted then sendProof(m.from) else answerPrepareAsAcceptor(m)
     else if awaitingData then
       logger.trace(s"Withholding the vote on ${m.transactionId} until its object data arrives")
     else
@@ -790,15 +821,22 @@ class Tx( trs: TransactionRecoveryState,
     )
   }
 
-  def receiveResolved(m: TxResolved): Unit = {
-    reportLateOutcome("TxResolved", m.from)
-    updateLastEvent()
-    if m.committed || !holdAbort(m) then
-      resolved(m.committed)
-  }
+  def receiveResolved(m: TxResolved): Unit =
+    // A proof is meant for drivers only (see proveCommitted): it is no outcome. Store hands every TxResolved to the
+    // Frontend as well as to its driver, so the proposer's own Tx sees the proofs sent to it
+    if !m.proof then
+      reportLateOutcome("TxResolved", m.from)
+      updateLastEvent()
+      if provenCommitted then
+        // A late commit implies the transaction was finalized, as in lateCommit
+        applyNothing(m.committed, finalMessage = m.late, late = m.late)
+      else if m.committed && m.late then
+        lateCommit()
+      else if m.committed || !holdAbort(m) then
+        resolved(m.committed)
 
-  /** Returns false if the finalization is held for a UnackedCommits lookup (see needsUnackedCheck): the Tx is then
-    * still live
+  /** Returns false if the Frontend must not forget the Tx now: the finalization is held for a UnackedCommits lookup
+    * (see needsUnackedCheck and lateCommit), or the Tx already concluded itself (applyNothing, lateCommit)
     */
   def receiveFinalized(m: TxFinalized): Boolean =
     if ofinalized.nonEmpty then
@@ -806,7 +844,13 @@ class Tx( trs: TransactionRecoveryState,
     else
       reportLateOutcome("TxFinalized", m.from)
       updateLastEvent()
-      if !m.committed && holdAbort(m) then
+      if provenCommitted then
+        applyNothing(m.committed, finalMessage = true, late = m.late)
+        false
+      else if m.committed && m.late then
+        lateCommit()
+        false
+      else if !m.committed && holdAbort(m) then
         false
       else
         finalized(m.committed)
@@ -822,7 +866,64 @@ class Tx( trs: TransactionRecoveryState,
       finalizeDeferred = true
     else
       frontend.transactionFinalized(transactionId)
-    statusCache.updateStatus(transactionId, txStatus, finalized = true)
+    statusCache.updateStatus(transactionId, txStatus, finalized = true, late = lateOutcome)
+
+  /** A late commit: the driver learned the commit only after the transaction was finalized and forgotten
+    * (docs/superpowers/specs/2026-11-09-replay-pins-design.md, 1c). Every other acceptor forgot it on TxFinalized, so
+    * its finalization completed, and a store is owed the commit only if its UnackedCommits entry says so.
+    *  - Already resolved committed: the commit was learned normally and is applied, or held, as usual. It finalizes.
+    *  - Undecided with its own commit vote, recovered or live: held for a lookup started now (one per hold, so a
+    *    retransmit does not push the lookup that counts further away). An entry applies the update
+    *    (unackedCommitFound), none applies nothing (unackedCommitAbsent). A failed or unanswered lookup is retried at
+    *    heartbeat (Frontend.retryUnackedLookups).
+    *  - Otherwise (an abort vote, no vote, a muted Tx, or an abort already learned): applies nothing.
+    * The Tx concludes itself: the Frontend forgets it here, not on the message
+    */
+  private def lateCommit(): Unit =
+    lateOutcome = true
+    oresolution match
+      case Some(true) =>
+        finalized(true)
+        frontend.forget(this)
+      case None if disposition == TransactionDisposition.VoteCommit =>
+        if !lateCommitHeld then
+          lateCommitHeld = true
+          logger.info(s"Tx $transactionId on store $storeId: late commit, looking up its UnackedCommits entry")
+          frontend.requestUnackedLookup(this)
+      case _ =>
+        applyNothing(committed = true, finalMessage = true, late = true)
+
+  /** Concludes the Tx without applying anything: no commit and no TxCommitted. Its CRL state is deleted, its locks and
+    * objects released, the outcome recorded in the status cache as the real message gave it, and it is forgotten. For
+    * a late commit not owed to this store, and for a prover (see proveCommitted) on any outcome. Never called once a
+    * commit was issued or held: a late commit of a Tx that already resolved committed finalizes instead
+    *
+    * @param finalMessage the outcome came in a TxFinalized, so the status cache marks it finalized
+    */
+  private def applyNothing(committed: Boolean, finalMessage: Boolean, late: Boolean): Unit =
+    lateCommitHeld = false
+    heldAborts = Nil
+    // The vote no longer matters
+    waitingOn = Set()
+    pendingCollisionPrepare = None
+    delayedPrepare = None
+    if awaitingCommits.nonEmpty then
+      frontend.stopAwaitingCommits(awaitingCommits, this)
+      awaitingCommits = Set()
+    if oresolution.isEmpty then
+      oresolution = Some(committed)
+      txStatus = if committed then TransactionStatus.Committed else TransactionStatus.Aborted
+    ofinalized = Some(committed)
+    lateOutcome = late
+    frontend.deleteTransactionState(transactionId)
+    unlock()
+    releaseObjects()
+    statusCache.updateStatus(transactionId,
+      if committed then TransactionStatus.Committed else TransactionStatus.Aborted, finalized = finalMessage,
+      late = late)
+    logger.info(s"Tx $transactionId on store $storeId applies nothing of its ${if late then "late " else ""}" +
+      s"${if committed then "commit" else "abort"}: ${if provenCommitted then "it proved the commit" else "not owed"}")
+    frontend.forget(this)
 
   /** Holds an abort resolution of a recovered commit vote until a UnackedCommits lookup started after it completes.
     * A lookup already in flight does not count: the entry may have been written after it read the tree. Only the
@@ -842,16 +943,26 @@ class Tx( trs: TransactionRecoveryState,
     else
       false
 
-  /** The pool's UnackedCommits tree holds this store's entry for the transaction: it committed, and was finalized
-    * and forgotten while this store was down. The saved update is applied through the normal commit path, its
-    * requirements re-checked so nothing is applied twice, and the Tx is concluded as if finalized: no TxFinalized will
-    * come. The Frontend then forgets it. The tree entry is left for the repair scan
+  /** The pool's UnackedCommits tree holds this store's entry for the transaction: this store cast a commit vote that
+    * the commit relied on and had not acknowledged applying it when it was finalized, so it is owed the commit. The
+    * saved update is applied through the normal commit path, its requirements re-checked so nothing is applied twice.
+    *
+    * Found by a recovered vote's check, the Tx resolves committed but is not forgotten: it keeps its CRL and acceptor
+    * state, so acceptors still forget only on TxFinalized (the late premise of TransactionDriver.resolveLate), and
+    * waits for TxFinalized, or for its heartbeat driver to learn the outcome. It records nothing in the host's status
+    * cache: it answers for itself, and a cached Committed would let a sibling store resolve a replay committed. A later
+    * abort or late commit concludes it without applying anything again.
+    *
+    * Found for a held late commit, it applies its update and is forgotten as finalized: every other acceptor forgot
+    * the transaction on TxFinalized. The tree entry is left for the repair scan either way
     */
   def unackedCommitFound(): Unit =
-    if needsUnackedCheck then
+    if awaitsUnackedLookup then
+      val late = lateCommitHeld
+      lateCommitHeld = false
       heldAborts = Nil
       updateLastEvent()
-      finalized(true)
+      if late then finalized(true) else resolved(true, record = false)
       val changed = RequirementsApplyer.changedObjects(requirements).intersect(pointersById.keySet)
       def ids(objects: Iterable[ObjectId]) = objects.map(_.uuid).mkString(", ")
       val outcome =
@@ -864,17 +975,25 @@ class Tx( trs: TransactionRecoveryState,
         else
           s"applying its update to objects ${ids(issuedCommits)}" +
             (if issuedCommits.size < changed.size then s", skipping ${ids(changed -- issuedCommits)}" else "")
-      logger.info(s"Store $storeId learned committed transaction $transactionId from the UnackedCommits tree: $outcome")
+      val kind = if late then "late commit of transaction" else "committed transaction"
+      logger.info(s"Store $storeId learned $kind $transactionId from the UnackedCommits tree: $outcome")
+      if late then
+        frontend.forget(this)
 
-  /** A UnackedCommits lookup started after the held aborts found no entry: either the transaction did not commit, or
-    * this store applied it durably. Returns the held aborts, for the Frontend to handle again; they are accepted now
+  /** A UnackedCommits lookup that counts found no entry. A held late commit applies nothing: this store is not owed it
+    * (it applied the commit durably, or its vote did not count). Otherwise either the transaction did not commit, or
+    * this store applied it durably: returns the held aborts, for the Frontend to handle again; they are accepted now
     */
   def unackedCommitAbsent(): List[TxMessage] =
-    val held = heldAborts
-    heldAborts = Nil
-    if held.nonEmpty then
-      abortsAccepted = true
-    held
+    if lateCommitHeld then
+      applyNothing(committed = true, finalMessage = true, late = true)
+      Nil
+    else
+      val held = heldAborts
+      heldAborts = Nil
+      if held.nonEmpty then
+        abortsAccepted = true
+      held
 
   def receiveHeartbeat(m: TxHeartbeat): Unit = {
     updateLastEvent()
@@ -882,7 +1001,7 @@ class Tx( trs: TransactionRecoveryState,
 
   def receiveStatusRequest(m: TxStatusRequest): Unit = {
     val r = TxStatusResponse(m.from, storeId, transactionId, m.requestUUID,
-      Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = false)))
+      Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = lateOutcome)))
     net.sendTransactionMessage(r)
   }
 

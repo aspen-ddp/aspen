@@ -257,7 +257,7 @@ class Frontend(val storeId: StoreId,
   // Before recoverTransactions, which counts what it recovers (see admitPrepare)
   private val admitted = scala.collection.mutable.HashMap[TransactionId, Admitted]()
 
-  /** A recovered commit vote's UnackedCommits lookups (see Tx.needsUnackedCheck). Each lookup has its own request
+  /** A recovered commit vote's, or a held late commit's, UnackedCommits lookups (see Tx.awaitsUnackedLookup). Each lookup has its own request
     * id, from a counter of this Frontend's lookups, and its answer names it.
     *
     * @param latest the id of the latest lookup made
@@ -335,7 +335,7 @@ class Frontend(val storeId: StoreId,
     awaitingCrl = false
     releaseHeldMessages()
 
-  // ---- UnackedCommits lookups of recovered commit votes (Tx.needsUnackedCheck) ----
+  // ---- UnackedCommits lookups of recovered commit votes and held late commits (Tx.awaitsUnackedLookup) ----
 
   /** `tx` needs a UnackedCommits lookup started now: it has loaded, or an abort arrived. Only lookups made from now
     * on can show the entry absent. One already in flight is not repeated: if it finds no entry, another is made
@@ -364,14 +364,15 @@ class Frontend(val storeId: StoreId,
 
   /** The answer to UnackedCommits lookup `requestId`, delivered on the store's executor.
     *
-    * An entry found concludes the Tx as committed, whichever lookup found it. None found releases the aborts it held,
-    * if the lookup was made after the latest of them arrived; otherwise, if it was the latest lookup, another is made.
+    * An entry found resolves the Tx committed, whichever lookup found it (Tx.unackedCommitFound). None found releases
+    * the aborts it held, or makes a held late commit apply nothing, if the lookup was made after the latest of them
+    * arrived; otherwise, if it was the latest lookup, another is made.
     * A failure of the latest lookup keeps the aborts held, and retryUnackedLookups tries again. Ignored once the Tx
     * no longer needs it (it learned its outcome another way), and for a lookup this Frontend did not make
     */
   def unackedLookupComplete(txid: TransactionId, requestId: Long, result: Try[Boolean]): Unit =
     unackedLookups.get(txid).filter(_.latest >= requestId).foreach: l =>
-      transactions.get(txid).filter(_.needsUnackedCheck) match
+      transactions.get(txid).filter(_.awaitsUnackedLookup) match
         case None => unackedLookups.remove(txid)
         case Some(tx) =>
           val isLatest = requestId == l.latest
@@ -380,9 +381,8 @@ class Frontend(val storeId: StoreId,
           result match
             case Success(true) =>
               unackedLookups.remove(txid)
+              // Forgotten by the Tx itself only for a held late commit: see Tx.unackedCommitFound
               tx.unackedCommitFound()
-              tx.releaseObjects() // Already done unless some of its objects had not loaded
-              transactions -= txid
             case Success(false) if requestId >= l.firstCounting =>
               unackedLookups.remove(txid)
               tx.unackedCommitAbsent().foreach(handleTransactionMessage)
@@ -404,7 +404,7 @@ class Frontend(val storeId: StoreId,
     unackedLookups.toList.foreach: (txid, l) =>
       val timedOut = l.inFlight && now - l.startedAt >= UnackedLookupTimeout.toNanos
       if l.failed || timedOut then
-        if transactions.get(txid).exists(_.needsUnackedCheck) then
+        if transactions.get(txid).exists(_.awaitsUnackedLookup) then
           if timedOut then
             logger.warn(s"Store $storeId: UnackedCommits lookup of recovered transaction $txid went unanswered " +
               s"for $UnackedLookupTimeout, looking up again")
@@ -484,7 +484,12 @@ class Frontend(val storeId: StoreId,
   def releaseAdmission(txid: TransactionId): Unit =
     admitted.remove(txid).foreach(a => admission.release(a.bytes))
 
-  /** Deletes a transaction's CRL entry and releases its admission */
+  /** Forgets a Tx that concluded itself (Tx.applyNothing, or a late commit), as a TxFinalized forgets one */
+  def forget(tx: Tx): Unit =
+    if transactions.get(tx.transactionId).exists(_ eq tx) then
+      transactions -= tx.transactionId
+      tx.releaseObjects() // Already done unless some of its objects had not loaded
+
   /** Drops a muted Tx that was not proven committed (Tx.muted): it holds no locks and saved nothing */
   def forgetMuted(tx: Tx): Unit =
     if transactions.get(tx.transactionId).exists(_ eq tx) then
@@ -494,6 +499,7 @@ class Frontend(val storeId: StoreId,
       tx.releaseObjects()
       releaseAdmission(tx.transactionId)
 
+  /** Deletes a transaction's CRL entry and releases its admission */
   def deleteTransactionState(txid: TransactionId): Unit =
     crl.deleteTransaction(storeId, txid)
     releaseAdmission(txid)
@@ -625,10 +631,11 @@ class Frontend(val storeId: StoreId,
     case m: TxResolved =>
       transactions.get(m.transactionId) match
         case Some(tx) => tx.receiveResolved(m)
-        // Remembered for a prepare that arrives after this. See receivePrepare
+        // Remembered for a prepare that arrives after this, late included (see receivePrepare). Not a proof: it is
+        // meant for drivers and is no outcome (Tx.proveCommitted)
         case None =>
-          if !statusCache.getStatus(m.transactionId).exists(_.finalized) then
-            statusCache.updateStatus(m.transactionId, statusOf(m.committed))
+          if !m.proof && !statusCache.getStatus(m.transactionId).exists(_.finalized) then
+            statusCache.updateStatus(m.transactionId, statusOf(m.committed), late = m.late)
     case m: TxFinalized =>
       transactions.get(m.transactionId) match
         case Some(tx) =>
@@ -637,7 +644,7 @@ class Frontend(val storeId: StoreId,
             tx.releaseObjects() // Already done unless some of its objects had not loaded
             transactions -= m.transactionId
         // Remembered for a prepare that arrives after this. See receivePrepare
-        case None => statusCache.updateStatus(m.transactionId, statusOf(m.committed), finalized = true)
+        case None => statusCache.updateStatus(m.transactionId, statusOf(m.committed), finalized = true, late = m.late)
     case m: TxHeartbeat => transactions.get(m.transactionId).foreach(tx => tx.receiveHeartbeat(m))
     case m: TxStatusRequest => transactions.get(m.transactionId).foreach(tx => tx.receiveStatusRequest(m))
     case _ => // Other TxMessages are not relevant
@@ -680,7 +687,8 @@ class Frontend(val storeId: StoreId,
         // A muted Tx takes no part, a cached outcome included
         if !muted then
           tx.outcomeDecided()
-        statusCache.updateStatus(m.txd.transactionId, entry.status) // The new Tx recorded itself as Unresolved
+        // The new Tx recorded itself as Unresolved
+        statusCache.updateStatus(m.txd.transactionId, entry.status, entry.finalized, entry.late)
       }
       pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
   }

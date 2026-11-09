@@ -58,8 +58,32 @@ class StoreSuite extends AnyFunSuite with Matchers:
       case f :: Nil =>
         f.to shouldBe peer
         f.committed shouldBe true
+        // The finalized relay reports a finalized commit late: the driver runs no finalization actions again
+        f.late shouldBe true
       case other => throw new AssertionError(s"Expected one TxFinalized, got $other")
     store.frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("the finalized relay reports a finalized abort as not late") {
+    val statusCache = new TransactionStatusCache()
+    statusCache.updateStatus(txid1, TransactionStatus.Aborted, finalized = true)
+    val (store, net, _) = mkStore(storeId, statusCache, Duration(40, SECONDS))
+
+    store.receiveTransactionMessage(prepare(storeId, peer))
+
+    net.sentTx.collect { case f: TxFinalized => (f.committed, f.late) } shouldBe List((false, false))
+  }
+
+  test("a relayed resolution of a non-finalized entry carries the entry's late flag") {
+    for late <- List(false, true) do
+      val statusCache = new TransactionStatusCache()
+      statusCache.updateStatus(txid1, TransactionStatus.Committed, late = late)
+      val (store, net, _) = mkStore(storeId, statusCache, Duration(40, SECONDS))
+
+      store.receiveTransactionMessage(prepare(storeId, peer))
+
+      net.sentTx.collect { case r: TxResolved => (r.committed, r.late, r.proof) } shouldBe List((true, late, false))
+      net.sentTx.collect { case f: TxFinalized => f } shouldBe Nil
   }
 
   test("after a lost TxFinalized a held commit ends once a recovery driver learns the outcome") {

@@ -123,9 +123,8 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       _ <- forgottenByStores(t)
       yAfterReplay <- client.read(y)
     yield
-      // Today a store taking the replay proves T committed from x's revision (Tx.proveCommitted), and the stores apply
-      // T's blind delete again over T2's k. Pending until a late commit applies nothing on stores that already hold it
-      pendingUntilFixed:
-        withClue("every store of y still holds k as T2 wrote it: "):
-          (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
-        yAfterReplay.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))
+      // A store taking the replay proves T committed from x's revision (Tx.proveCommitted). The replay's driver then
+      // resolves it as a late commit, and no store applies T's blind delete again over T2's k: none is owed T
+      withClue("every store of y still holds k as T2 wrote it: "):
+        (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
+      yAfterReplay.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))

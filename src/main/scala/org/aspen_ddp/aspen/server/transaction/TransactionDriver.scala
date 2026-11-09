@@ -517,8 +517,10 @@ abstract class TransactionDriver(
     *    started after the proof arrived, none of whose promises carries an accepted value. The proof shows the commit
     *    was chosen, so a quorum Q accepted it before the proof was sent, and so before any post-proof prepare. That
     *    quorum intersects the responding one, so some acceptor in Q forgot the transaction. An acceptor forgets a
-    *    committed transaction only on TxFinalized or on finding its UnackedCommits entry (Tx.unackedCommitFound); a
-    *    rebuilt one is muted and does not answer. Promises to earlier rounds never count: they may have been given
+    *    committed transaction only on TxFinalized, or on a late commit, which follows it (Tx.unackedCommitFound
+    *    applies an owed update but keeps the Tx until then); a rebuilt one is muted and does not answer. A prover
+    *    (Tx.proveCommitted) answers the post-proof round with a promise carrying no accepted value: it holds no state
+    *    for the transaction, so if it was in Q it forgot on TxFinalized too. Promises to earlier rounds never count: they may have been given
     *    before Q accepted, at a higher proposal of another driver, and then prove nothing (the prover may be a muted
     *    rebuilt store while that driver's finalizer still runs). The first proof therefore starts a new round
     *    (`receiveTxResolved`);
@@ -553,14 +555,13 @@ abstract class TransactionDriver(
     * Ordering premise: this driver sends TxFinalized only from onFinalized, which a commit reaches only once the
     * finalizer completes (`f.complete foreach onFinalized`), or on a TxFinalized from another driver, sent under the
     * same rule, or on a late commit (`resolveLate`), which follows a finalization whose actions other than the
-    * UnackedCommits marker already completed. A store forgets a committed transaction only on TxFinalized
-    * (Frontend.receiveTransactionMessage via Tx.receiveFinalized) or when the UnackedCommits tree holds its entry
-    * (Frontend.unackedLookupComplete via Tx.unackedCommitFound), and the finalizer writes those entries only after its
-    * other actions completed (RegisteredTransactionFinalizerFactory.Finalizer). So everything the finalizer writes
-    * before them is durable before any store forgets the transaction. A muted Tx (Frontend.forgetMuted) is dropped
-    * without either, but it never voted. Tx.unackedCommitFound records the transaction Committed, not finalized, in its
-    * host's status cache (replay-pins design, section 1c), so a finalized status, and the TxFinalized a store relays
-    * from it, always stems from a real TxFinalized.
+    * UnackedCommits marker already completed. A store forgets a committed transaction it voted on only on TxFinalized
+    * (Frontend.receiveTransactionMessage via Tx.receiveFinalized), or on a late commit, which follows TxFinalized
+    * (Tx.lateCommit). Finding its UnackedCommits entry (Tx.unackedCommitFound) applies the update but does not forget
+    * it. So everything the finalizer writes, in every pool, is durable before any voter forgets the transaction. A
+    * muted Tx (Frontend.forgetMuted) and a prover (Tx.proveCommitted) are dropped without TxFinalized, but neither
+    * voted commit. Tx.unackedCommitFound and Tx.proveCommitted record nothing in the host's status cache, so a
+    * finalized status, and the TxFinalized(late = true) a store relays from it, always stems from a real TxFinalized.
     */
   protected def onResolution(committed: Boolean, sendResolutionMessage: Boolean): Unit = synchronized {
     if (!resolved) {

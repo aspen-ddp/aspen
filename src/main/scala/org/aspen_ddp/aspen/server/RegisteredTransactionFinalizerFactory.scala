@@ -19,9 +19,11 @@ object RegisteredTransactionFinalizerFactory {
     *
     * Invariant: a transaction's UnackedCommits entries (written by the MissedUpdateFinalizationAction) become durable
     * only after every other finalization action of the transaction completed, and its driver sends TxFinalized only
-    * after all of them did. So an acceptor that forgot the transaction, on TxFinalized or on finding its UnackedCommits
-    * entry (Tx.unackedCommitFound), implies the transaction's other finalization actions are done. A late commit
-    * (TransactionDriver.resolveLate) relies on this when it runs none of them.
+    * after all of them did. An acceptor forgets a committed transaction only on TxFinalized, or on a late commit, which
+    * itself follows TxFinalized; finding its UnackedCommits entry (Tx.unackedCommitFound) applies the update but keeps
+    * the Tx until then. So an acceptor that forgot the transaction implies all its finalization actions, the marker's
+    * writes in every pool included, are done. A late commit (TransactionDriver.resolveLate) relies on this when it runs
+    * none of them. The ordering is kept as defence in depth.
     *
     * The marker receives `updateCommitErrors` and `commitVoters` from the start, before it executes, and keeps them.
     */

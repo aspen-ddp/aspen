@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.metadata.HostId
 
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ReadLocks, StoragePool,
                                    ObjectState as ClientObjectState}
-import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateFinalizationAction, TracelessCommitEntry}
+import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateFinalizationAction, UnackedCommitEntry}
 import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer,
@@ -21,16 +21,16 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.duration.Duration
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
-/** What one store's scan found. `seen` and `tracelessSeen` drive pacing: any entry at all, repaired, deferred or
+/** What one store's scan found. `seen` and `unackedSeen` drive pacing: any entry at all, repaired, deferred or
   * skipped, means the store is not quiet and should be scanned again at the floor.
   *
   * @param seen errorTree entries seen
   * @param repaired entries of either tree repaired and removed
   * @param deferred entries of either tree left for a later pass
-  * @param tracelessSeen TracelessCommits entries seen
+  * @param unackedSeen UnackedCommits entries seen
   */
-case class ScanResult(seen: Int, repaired: Int, deferred: Int, tracelessSeen: Int = 0):
-  def foundEntries: Boolean = seen > 0 || tracelessSeen > 0
+case class ScanResult(seen: Int, repaired: Int, deferred: Int, unackedSeen: Int = 0):
+  def foundEntries: Boolean = seen > 0 || unackedSeen > 0
 
 object ScanResult:
   val Empty: ScanResult = ScanResult(0, 0, 0)
@@ -38,7 +38,7 @@ object ScanResult:
 /** Lock deferrals of one store's repair entries, kept in memory across its scans by RepairService. A host restart
   * forgets them: the next pass then reconciles each whole object again and restarts the count.
   *
-  * Keyed per entry and object (StoreRepairer.errorDeferralKey, tracelessDeferralKey). Only parts deferred by a lock
+  * Keyed per entry and object (StoreRepairer.errorDeferralKey, unackedDeferralKey). Only parts deferred by a lock
   * count: `deferredKeys` and `objectLevelDeferred`, the latter including a refcount deferred under an object lock. A
   * pass that is only `stale` defers nothing by a lock: the object is retried on the next pass, but the pass neither
   * counts toward `RepairPolicy.proofAfterDeferrals` nor triggers a proof, since a proof cannot help an object whose
@@ -93,7 +93,7 @@ final class DeferralState:
 object DeferralState:
   private final case class Deferral(count: Int, only: Option[Set[Key]])
 
-/** Repairs one store, once. Walks the store's slice of its pool's errorTree, then of its TracelessCommits tree,
+/** Repairs one store, once. Walks the store's slice of its pool's errorTree, then of its UnackedCommits tree,
   * brings each recorded object back into agreement with the rest of the system, and removes the entry.
   *
   * Parts of an object deferred by a lock are retried on later passes, only those keys when nothing else was left
@@ -117,12 +117,12 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     val seen = AtomicInteger(0)
     val repaired = AtomicInteger(0)
     val deferred = AtomicInteger(0)
-    val tracelessSeen = AtomicInteger(0)
+    val unackedSeen = AtomicInteger(0)
     private var touched = Set[Key]()
 
     def touch(keys: Iterable[Key]): Unit = synchronized { touched ++= keys }
     def touchedKeys: Set[Key] = synchronized(touched)
-    def result: ScanResult = ScanResult(seen.get, repaired.get, deferred.get, tracelessSeen.get)
+    def result: ScanResult = ScanResult(seen.get, repaired.get, deferred.get, unackedSeen.get)
 
   def scan(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState = DeferralState()): Future[ScanResult] =
     val counts = Counts()
@@ -140,8 +140,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
         for
           pool <- client.getStoragePool(storeId.poolId)
           _ <- pool.errorTree.foreachInRange(min, max, repairErrorEntry(pool, storeId, policy, deferral, counts))
-          _ <- pool.tracelessCommitsTree.foreachInRange(min, max,
-                 repairTracelessEntry(pool, storeId, policy, deferral, counts))
+          _ <- pool.unackedCommitsTree.foreachInRange(min, max,
+                 repairUnackedEntry(pool, storeId, policy, deferral, counts))
         yield
           deferral.retain(counts.touchedKeys)
           counts.result
@@ -217,7 +217,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                 Future.unit
         yield ()
 
-  /** A TracelessCommits entry: the store missed transaction T, whose change to the entry's objects left nothing for
+  /** A UnackedCommits entry: the store missed transaction T, whose change to the entry's objects left nothing for
     * an errorTree comparison to see. Skipped while the store holds T live: its Tx applies T (recovery). Otherwise each
     * object is reconciled, or deleted from the store when its allocation is gone. As for errorTree entries, that
     * needs the entry to be older than `policy.minErrorEntryAgeForDeletion`: an allocation's RefcountUpdate is
@@ -225,22 +225,22 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * and an object absent from the allocation tree meanwhile is live. A younger one is left for a later pass. The
     * entry is deleted once every object is complete.
     */
-  private def repairTracelessEntry(pool: StoragePool, storeId: StoreId, policy: RepairPolicy,
+  private def repairUnackedEntry(pool: StoragePool, storeId: StoreId, policy: RepairPolicy,
                                    deferral: DeferralState, counts: Counts)
                                   (node: KeyValueListNode, key: Key, value: ValueState): Future[Unit] =
     if abandoned(storeId) then
       Future.unit
     else
       Future.unit.flatMap: _ =>
-        counts.tracelessSeen.incrementAndGet()
-        val txid = TracelessCommitEntry.decodeTransactionId(key)
+        counts.unackedSeen.incrementAndGet()
+        val txid = UnackedCommitEntry.decodeTransactionId(key)
         if target.holdsTransaction(storeId, txid) then
-          logger.debug(s"Skipping TracelessCommits entry of $txid on $storeId: the store holds it live")
+          logger.debug(s"Skipping UnackedCommits entry of $txid on $storeId: the store holds it live")
           counts.deferred.incrementAndGet()
           Future.unit
         else
-          val entry = TracelessCommitEntry.decode(value.value.bytes)
-          val entryKeys = entry.objects.map(ptr => ptr -> tracelessDeferralKey(key, ptr.id))
+          val entry = UnackedCommitEntry.decode(value.value.bytes)
+          val entryKeys = entry.objects.map(ptr => ptr -> unackedDeferralKey(key, ptr.id))
           counts.touch(entryKeys.map(_._2))
 
           // One object at a time, as errorTree entries are
@@ -253,7 +253,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                   repairDeletion(storeId, ptr.id, ptr.storePointer).map(_ => allComplete)
                 case None =>
                   logger.debug(s"Deferring repair of ${ptr.id} on $storeId: absent from the allocation tree but its " +
-                               s"TracelessCommits entry is too recent to treat as a deletion")
+                               s"UnackedCommits entry is too recent to treat as a deletion")
                   Future.successful(false)
                 case Some(_) =>
                   repairUpdate(storeId, ptr, entry.timestamp, entryKey, policy, deferral)
@@ -263,7 +263,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
             if allComplete then
               entryKeys.foreach((_, entryKey) => deferral.clear(entryKey))
               deleteEntryIfUnchanged(value.revision, node, key).map: _ =>
-                logger.info(s"Repair complete for TracelessCommits entry of $txid on store $storeId")
+                logger.info(s"Repair complete for UnackedCommits entry of $txid on store $storeId")
                 counts.repaired.incrementAndGet()
             else
               counts.deferred.incrementAndGet()
@@ -386,8 +386,8 @@ object StoreRepairer:
   private[repair] def errorDeferralKey(entryKey: Key, entryRevision: ObjectRevision): Key =
     Key(Array[Byte](0) ++ entryKey.bytes ++ entryRevision.toArray)
 
-  /** The DeferralState key of one object of a TracelessCommits entry */
-  private[repair] def tracelessDeferralKey(entryKey: Key, objectId: ObjectId): Key =
+  /** The DeferralState key of one object of a UnackedCommits entry */
+  private[repair] def unackedDeferralKey(entryKey: Key, objectId: ObjectId): Key =
     Key(Array[Byte](1) ++ entryKey.bytes ++ objectId.toBytes)
 
   /** Decodes the ObjectId from an errorTree key: one poolIndex byte then the UUID, big-endian. */

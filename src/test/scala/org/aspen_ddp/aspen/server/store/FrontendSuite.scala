@@ -76,8 +76,8 @@ object FrontendSuite {
     }
   }
 
-  /** Records the TracelessCommits lookups a Frontend makes, and answers them when the test says */
-  class ManualLookup extends TracelessCommitLookup:
+  /** Records the UnackedCommits lookups a Frontend makes, and answers them when the test says */
+  class ManualLookup extends UnackedCommitLookup:
     var frontend: Option[Frontend] = None
     /** The lookups made, oldest first, with their request ids */
     var made: List[(TransactionId, Long)] = Nil
@@ -1227,7 +1227,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
-      tracelessLookup = lookup)
+      unackedLookup = lookup)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, net)
@@ -1246,7 +1246,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     r2.collisions shouldBe List(txid1)
 
     resolve(frontend, net, txid1, committed = false)
-    // Neither the recovery's TracelessCommits lookup nor the one started after the abort finds an entry
+    // Neither the recovery's UnackedCommits lookup nor the one started after the abort finds an entry
     lookup.answer(txid1, Success(false))
     lookup.answer(txid1, Success(false))
     prepare(frontend, net, lockTxd(txid3, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
@@ -1694,19 +1694,19 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     out.toString should not include "UNEXPECTED"
   }
 
-  // ---- A recovered commit vote learns its commit from the TracelessCommits tree ----
+  // ---- A recovered commit vote learns its commit from the UnackedCommits tree ----
   //
   // T committed and was finalized and forgotten while this store was down. Its change (a key delete) leaves no trace a
-  // proof of commit or repair could find, so the finalizer recorded the miss in the pool's TracelessCommits tree.
+  // proof of commit or repair could find, so the finalizer recorded the miss in the pool's UnackedCommits tree.
 
-  private val tracelessTxid = TransactionId(new UUID(0, 40))
-  private val tracelessDriver = StoreId(poolId, 2)
+  private val unackedTxid = TransactionId(new UUID(0, 40))
+  private val unackedDriver = StoreId(poolId, 2)
 
   /** T's update: a KV Delete of key 2 on kvPtr */
   private val deleteK2: KeyValueUpdate = KeyValueUpdate(kvPtr, None, None, Nil, deletesKeys = true)
 
   /** A Frontend recovering T, a commit vote of `reqs` deleting key 2 of kvPtr, with its lookups made through `lookup` */
-  private def tracelessFixture(reqs: List[TransactionRequirement] = List(deleteK2))
+  private def unackedFixture(reqs: List[TransactionRequirement] = List(deleteK2))
       : (Frontend, MapBackend, TestNet, TestCrl, ManualLookup) =
     val backend = new MapBackend(storeId)
     populate(backend)
@@ -1714,7 +1714,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     // Cached so the recovered transaction's object loads during Frontend construction
     cache.insert(mkKVObjectState())
     val update = KeyValueOperation.encode(List(new Delete(k(2))), ida)(0)
-    val trs = TransactionRecoveryState(storeId, lockTxd(tracelessTxid, reqs).serialize(),
+    val trs = TransactionRecoveryState(storeId, lockTxd(unackedTxid, reqs).serialize(),
       List(ObjectUpdate(oid2, update)), TransactionDisposition.VoteCommit, TransactionStatus.Unresolved,
       PersistentState.initial)
     val crl = new TestCrl:
@@ -1722,7 +1722,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val net = new TestNet
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
-      tracelessLookup = lookup)
+      unackedLookup = lookup)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, backend, net, crl, lookup)
@@ -1736,162 +1736,162 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
 
   /** Runs `f`, returning the Tx log lines naming T, with their levels */
-  private def tracelessLog(f: => Unit): List[(scribe.Level, String)] =
+  private def unackedLog(f: => Unit): List[(scribe.Level, String)] =
     val lines = new LinkedBlockingQueue[(scribe.Level, String)]()
     val handler = scribe.handler.LogHandler(scribe.Level.Info): r =>
       val text = r.logOutput.plainText
-      if text.contains(tracelessTxid.toString) then
+      if text.contains(unackedTxid.toString) then
         lines.add(r.level -> text)
     scribe.Logger.root.withHandler(handler).replace()
     try f
     finally scribe.Logger.root.withoutHandler(handler).replace()
     lines.toArray(Array.empty[(scribe.Level, String)]).toList
 
-  test("a recovered commit vote with a TracelessCommits entry applies its update and is forgotten") {
-    val (frontend, backend, _, crl, lookup) = tracelessFixture()
-    lookup.requests shouldBe List(tracelessTxid)
+  test("a recovered commit vote with a UnackedCommits entry applies its update and is forgotten") {
+    val (frontend, backend, _, crl, lookup) = unackedFixture()
+    lookup.requests shouldBe List(unackedTxid)
     kvKeys(backend) should contain (k(2))
 
-    val log = tracelessLog:
-      lookup.answer(tracelessTxid, Success(true))
+    val log = unackedLog:
+      lookup.answer(unackedTxid, Success(true))
 
     kvKeys(backend) should not contain k(2)
-    frontend.transactions.contains(tracelessTxid) shouldBe false
-    crl.deleted should contain (tracelessTxid)
+    frontend.transactions.contains(unackedTxid) shouldBe false
+    crl.deleted should contain (unackedTxid)
     log.exists((level, text) => level == scribe.Level.Info &&
-      text.contains(s"learned committed transaction $tracelessTxid") &&
+      text.contains(s"learned committed transaction $unackedTxid") &&
       text.contains("applying its update to objects")) shouldBe true
   }
 
-  test("a recovered commit vote without a TracelessCommits entry accepts an abort") {
-    val (frontend, backend, _, crl, lookup) = tracelessFixture()
-    lookup.answer(tracelessTxid, Success(false))
+  test("a recovered commit vote without a UnackedCommits entry accepts an abort") {
+    val (frontend, backend, _, crl, lookup) = unackedFixture()
+    lookup.answer(unackedTxid, Success(false))
 
-    frontend.receiveTransactionMessage(TxFinalized(storeId, tracelessDriver, tracelessTxid, committed = false))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false))
     // The abort waits for a lookup started after it arrived
-    lookup.requests.count(_ == tracelessTxid) shouldBe 2
-    frontend.transactions.contains(tracelessTxid) shouldBe true
-    lookup.answer(tracelessTxid, Success(false))
+    lookup.requests.count(_ == unackedTxid) shouldBe 2
+    frontend.transactions.contains(unackedTxid) shouldBe true
+    lookup.answer(unackedTxid, Success(false))
 
     kvKeys(backend) should contain (k(2))
-    frontend.transactions.contains(tracelessTxid) shouldBe false
-    crl.deleted should contain (tracelessTxid)
+    frontend.transactions.contains(unackedTxid) shouldBe false
+    crl.deleted should contain (unackedTxid)
   }
 
   test("a retransmitted abort does not push back the lookup a held abort waits for") {
     // A driver resends its resolution until it hears back: each copy moving the counting window forward would keep a
     // lookup in flight from ever counting, and the Tx holding its locks
-    val (frontend, _, _, _, lookup) = tracelessFixture()
-    lookup.answer(tracelessTxid, Success(false))
+    val (frontend, _, _, _, lookup) = unackedFixture()
+    lookup.answer(unackedTxid, Success(false))
 
-    frontend.receiveTransactionMessage(TxResolved(storeId, tracelessDriver, tracelessTxid, committed = false))
-    frontend.receiveTransactionMessage(TxResolved(storeId, tracelessDriver, tracelessTxid, committed = false))
-    lookup.requests.count(_ == tracelessTxid) shouldBe 2
-    lookup.answer(tracelessTxid, Success(false))
+    frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false))
+    frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false))
+    lookup.requests.count(_ == unackedTxid) shouldBe 2
+    lookup.answer(unackedTxid, Success(false))
 
-    frontend.transactions.get(tracelessTxid).map(_.status).forall(_ == TransactionStatus.Aborted) shouldBe true
-    frontend.transactions.get(tracelessTxid).map(_.holdsLocks) shouldBe Some(false)
+    frontend.transactions.get(unackedTxid).map(_.status).forall(_ == TransactionStatus.Aborted) shouldBe true
+    frontend.transactions.get(unackedTxid).map(_.holdsLocks) shouldBe Some(false)
   }
 
   test("a held TxFinalized abort is not replaced by a later held TxResolved, so the Tx is forgotten once accepted") {
-    val (frontend, _, _, _, lookup) = tracelessFixture()
-    lookup.answer(tracelessTxid, Success(false))
+    val (frontend, _, _, _, lookup) = unackedFixture()
+    lookup.answer(unackedTxid, Success(false))
 
-    frontend.receiveTransactionMessage(TxFinalized(storeId, tracelessDriver, tracelessTxid, committed = false))
-    frontend.receiveTransactionMessage(TxResolved(storeId, tracelessDriver, tracelessTxid, committed = false))
-    lookup.answer(tracelessTxid, Success(false))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false))
+    frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false))
+    lookup.answer(unackedTxid, Success(false))
 
-    frontend.transactions.contains(tracelessTxid) shouldBe false
+    frontend.transactions.contains(unackedTxid) shouldBe false
   }
 
-  test("an abort arriving before the TracelessCommits entry is visible waits for a later lookup and then commits") {
-    val (frontend, backend, _, _, lookup) = tracelessFixture()
-    lookup.answer(tracelessTxid, Success(false))
+  test("an abort arriving before the UnackedCommits entry is visible waits for a later lookup and then commits") {
+    val (frontend, backend, _, _, lookup) = unackedFixture()
+    lookup.answer(unackedTxid, Success(false))
 
-    frontend.receiveTransactionMessage(TxResolved(storeId, tracelessDriver, tracelessTxid, committed = false))
-    lookup.requests.count(_ == tracelessTxid) shouldBe 2 // a fresh lookup started after the abort
-    frontend.transactions(tracelessTxid).status shouldBe TransactionStatus.Unresolved
+    frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false))
+    lookup.requests.count(_ == unackedTxid) shouldBe 2 // a fresh lookup started after the abort
+    frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Unresolved
 
-    lookup.answer(tracelessTxid, Success(true))
+    lookup.answer(unackedTxid, Success(true))
     kvKeys(backend) should not contain k(2)
-    frontend.transactions.contains(tracelessTxid) shouldBe false
+    frontend.transactions.contains(unackedTxid) shouldBe false
   }
 
-  test("an abort arriving while the recovery's TracelessCommits lookup is in flight waits for a fresh lookup") {
-    val (frontend, backend, _, _, lookup) = tracelessFixture()
-    frontend.receiveTransactionMessage(TxResolved(storeId, tracelessDriver, tracelessTxid, committed = false))
-    lookup.requests.count(_ == tracelessTxid) shouldBe 1
+  test("an abort arriving while the recovery's UnackedCommits lookup is in flight waits for a fresh lookup") {
+    val (frontend, backend, _, _, lookup) = unackedFixture()
+    frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false))
+    lookup.requests.count(_ == unackedTxid) shouldBe 1
 
     // Started before the abort, so its answer does not count: another lookup is made
-    lookup.answer(tracelessTxid, Success(false))
-    lookup.requests.count(_ == tracelessTxid) shouldBe 2
-    frontend.transactions(tracelessTxid).status shouldBe TransactionStatus.Unresolved
+    lookup.answer(unackedTxid, Success(false))
+    lookup.requests.count(_ == unackedTxid) shouldBe 2
+    frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Unresolved
 
-    lookup.answer(tracelessTxid, Success(false))
-    frontend.transactions(tracelessTxid).status shouldBe TransactionStatus.Aborted
+    lookup.answer(unackedTxid, Success(false))
+    frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Aborted
     kvKeys(backend) should contain (k(2))
   }
 
-  test("a failing TracelessCommits lookup holds the abort and is retried at heartbeat") {
-    val (frontend, _, net, _, lookup) = tracelessFixture()
-    lookup.answer(tracelessTxid, Failure(new Exception("metadata pool down")))
-    frontend.receiveTransactionMessage(TxFinalized(storeId, tracelessDriver, tracelessTxid, committed = false))
-    lookup.requests.count(_ == tracelessTxid) shouldBe 2
+  test("a failing UnackedCommits lookup holds the abort and is retried at heartbeat") {
+    val (frontend, _, net, _, lookup) = unackedFixture()
+    lookup.answer(unackedTxid, Failure(new Exception("metadata pool down")))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false))
+    lookup.requests.count(_ == unackedTxid) shouldBe 2
 
     // Only failed lookups are retried
-    frontend.retryTracelessLookups()
-    lookup.requests.count(_ == tracelessTxid) shouldBe 2
-    lookup.answer(tracelessTxid, Failure(new Exception("still down")))
-    frontend.retryTracelessLookups()
-    lookup.requests.count(_ == tracelessTxid) shouldBe 3
+    frontend.retryUnackedLookups()
+    lookup.requests.count(_ == unackedTxid) shouldBe 2
+    lookup.answer(unackedTxid, Failure(new Exception("still down")))
+    frontend.retryUnackedLookups()
+    lookup.requests.count(_ == unackedTxid) shouldBe 3
 
-    frontend.transactions(tracelessTxid).status shouldBe TransactionStatus.Unresolved
-    lockedWriteTransactions(frontend, net, kvPtr) should contain (tracelessTxid)
+    frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Unresolved
+    lockedWriteTransactions(frontend, net, kvPtr) should contain (unackedTxid)
   }
 
-  test("an object whose requirements fail on the TracelessCommits local apply is skipped and the Tx still completes") {
+  test("an object whose requirements fail on the UnackedCommits local apply is skipped and the Tx still completes") {
     // The store's key 2 is at a different revision than T requires
     val stale = KeyValueUpdate(kvPtr, None, None,
       List(KeyValueUpdate.KeyRevision(k(2), new ObjectRevision(new UUID(0, 41)))), deletesKeys = true)
-    val (frontend, backend, _, crl, lookup) = tracelessFixture(List(stale))
+    val (frontend, backend, _, crl, lookup) = unackedFixture(List(stale))
 
-    lookup.answer(tracelessTxid, Success(true))
+    lookup.answer(unackedTxid, Success(true))
 
-    frontend.transactions.contains(tracelessTxid) shouldBe false
+    frontend.transactions.contains(unackedTxid) shouldBe false
     kvKeys(backend) should contain (k(2))
-    crl.deleted should contain (tracelessTxid)
+    crl.deleted should contain (unackedTxid)
   }
 
-  test("a TracelessCommits lookup whose answer is lost is made again at heartbeat once it times out") {
-    val (frontend, backend, _, _, lookup) = tracelessFixture()
+  test("a UnackedCommits lookup whose answer is lost is made again at heartbeat once it times out") {
+    val (frontend, backend, _, _, lookup) = unackedFixture()
     val lost = lookup.made.last._2 // the recovery's lookup, whose answer never arrives
-    frontend.receiveTransactionMessage(TxResolved(storeId, tracelessDriver, tracelessTxid, committed = false))
-    lookup.requests.count(_ == tracelessTxid) shouldBe 1
+    frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false))
+    lookup.requests.count(_ == unackedTxid) shouldBe 1
 
     val now = System.nanoTime()
-    frontend.retryTracelessLookups(now)
-    lookup.requests.count(_ == tracelessTxid) shouldBe 1
-    frontend.retryTracelessLookups(now + Frontend.TracelessLookupTimeout.toNanos + 1)
-    lookup.requests.count(_ == tracelessTxid) shouldBe 2
+    frontend.retryUnackedLookups(now)
+    lookup.requests.count(_ == unackedTxid) shouldBe 1
+    frontend.retryUnackedLookups(now + Frontend.UnackedLookupTimeout.toNanos + 1)
+    lookup.requests.count(_ == unackedTxid) shouldBe 2
 
     // The lost lookup read the tree before the abort arrived: its late answer finding no entry does not count
-    lookup.answer(tracelessTxid, Success(false), Some(lost))
-    frontend.transactions(tracelessTxid).status shouldBe TransactionStatus.Unresolved
-    lookup.requests.count(_ == tracelessTxid) shouldBe 2
+    lookup.answer(unackedTxid, Success(false), Some(lost))
+    frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Unresolved
+    lookup.requests.count(_ == unackedTxid) shouldBe 2
 
-    lookup.answer(tracelessTxid, Success(true))
+    lookup.answer(unackedTxid, Success(true))
     kvKeys(backend) should not contain k(2)
-    frontend.transactions.contains(tracelessTxid) shouldBe false
+    frontend.transactions.contains(unackedTxid) shouldBe false
   }
 
-  test("a TracelessCommits lookup answering after the Tx resolved committed is ignored") {
-    val (frontend, backend, _, _, lookup) = tracelessFixture()
-    frontend.receiveTransactionMessage(TxFinalized(storeId, tracelessDriver, tracelessTxid, committed = true))
+  test("a UnackedCommits lookup answering after the Tx resolved committed is ignored") {
+    val (frontend, backend, _, _, lookup) = unackedFixture()
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true))
     kvKeys(backend) should not contain k(2)
-    frontend.transactions.contains(tracelessTxid) shouldBe false
+    frontend.transactions.contains(unackedTxid) shouldBe false
 
-    lookup.answer(tracelessTxid, Success(true))
-    frontend.transactions.contains(tracelessTxid) shouldBe false
+    lookup.answer(unackedTxid, Success(true))
+    frontend.transactions.contains(unackedTxid) shouldBe false
   }
 
   // ---- States stay in memory from a commit until the backend reports it complete ----
@@ -2858,7 +2858,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     cache.insert(mkObjectState(oid1))
     val frontend = new Frontend(storeId, backend, cache, new TestNet, crl, new TransactionStatusCache(),
-      admission = admission, tracelessLookup = lookup)
+      admission = admission, unackedLookup = lookup)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, crl, CrlAdmission.TxOverheadBytes + trs.serializedTxd.size + CrlAdmission.objectUpdateBytes(3))
@@ -2872,7 +2872,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false))
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false))
-    // Neither the recovery's TracelessCommits lookup nor the one started after the aborts finds an entry
+    // Neither the recovery's UnackedCommits lookup nor the one started after the aborts finds an entry
     lookup.answer(txid1, Success(false))
     lookup.answer(txid1, Success(false))
     crl.deleted should contain (txid1)

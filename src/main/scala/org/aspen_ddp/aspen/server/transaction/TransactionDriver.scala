@@ -459,7 +459,7 @@ abstract class TransactionDriver(
 
   /** The stores this driver received commit votes from, when they reach the write threshold of every object; None
     * otherwise (the outcome came from another driver or a recovered accepted value). Only these voters can hold a
-    * saved commit vote that the commit relied on, so only they need a TracelessCommits entry
+    * saved commit vote that the commit relied on, so only they need a UnackedCommits entry
     */
   private def countedCommitVoters: Option[Set[StoreId]] =
     val voters = peerDispositions.collect { case (s, TransactionDisposition.VoteCommit) => s }.toSet
@@ -473,10 +473,10 @@ abstract class TransactionDriver(
     * Ordering: this driver sends TxFinalized only from onFinalized, which a commit reaches only once the finalizer
     * completes (`f.complete foreach onFinalized`), or on a TxFinalized from another driver, sent under the same rule.
     * A store forgets a committed transaction only on TxFinalized (Frontend.receiveTransactionMessage via
-    * Tx.receiveFinalized) or when the TracelessCommits tree holds its entry (Frontend.tracelessLookupComplete via
-    * Tx.tracelessCommitFound). So everything the finalizer writes, its TracelessCommits entries included, is durable
+    * Tx.receiveFinalized) or when the UnackedCommits tree holds its entry (Frontend.unackedLookupComplete via
+    * Tx.unackedCommitFound). So everything the finalizer writes, its UnackedCommits entries included, is durable
     * before any store forgets the transaction. A muted Tx (Frontend.forgetMuted) is dropped without either, but it
-    * never voted. Caveat: tracelessCommitFound marks the transaction finalized in its host's status cache, and Store
+    * never voted. Caveat: unackedCommitFound marks the transaction finalized in its host's status cache, and Store
     * answers a later prepare to that host with TxFinalized, so another driver can then finalize before the original
     * finalizer's remaining actions complete.
     */

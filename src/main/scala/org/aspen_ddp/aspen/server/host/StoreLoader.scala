@@ -333,7 +333,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 ctx.net, ctx.backgroundTasks, crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
                 Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize,
                 ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited),
-                ctx.tracelessLookup, Some(router.post(backend.storeId)), Host.txHorizon(ctx.heartbeatPeriod),
+                ctx.unackedLookup, Some(router.post(backend.storeId)), Host.txHorizon(ctx.heartbeatPeriod),
                 RebuildingStore.readAcceptorSince(backend.path),
                 // Its backend's completion handler is set below, after the Store is built: recovered transactions read
                 // their objects once it is installed (awaitCrlLoad)

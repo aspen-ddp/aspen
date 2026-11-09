@@ -110,8 +110,8 @@ class Tx( trs: TransactionRecoveryState,
   /** TxFinalized arrived while the commit was held for its turn: the Frontend is told once the commit is issued */
   private var finalizeDeferred = false
 
-  /** The latest abort resolution held until a TracelessCommits lookup started after the first completes. See
-    * needsTracelessCheck and holdAbort
+  /** The latest abort resolution held until a UnackedCommits lookup started after the first completes. See
+    * needsUnackedCheck and holdAbort
     */
   private var heldAborts: List[TxMessage] = Nil
   /** A lookup started after the held aborts found no entry: they, and later ones, are accepted */
@@ -126,11 +126,11 @@ class Tx( trs: TransactionRecoveryState,
   /** A commit vote recovered from the CRL whose outcome is unknown. Its transaction may have committed and been
     * finalized and forgotten while this store was down: a recovery driver could then decide abort, and the store would
     * drop an update that counted towards the write threshold. If the change leaves no trace (a refcount change or a key
-    * delete), the finalizer recorded the miss in the pool's TracelessCommits tree, so the Tx looks up its entry once
+    * delete), the finalizer recorded the miss in the pool's UnackedCommits tree, so the Tx looks up its entry once
     * it has loaded, and holds every abort until a lookup started after the abort finds none. An entry found means the
-    * transaction committed: the Tx applies its update and is forgotten as if finalized. See Frontend.requestTracelessLookup
+    * transaction committed: the Tx applies its update and is forgotten as if finalized. See Frontend.requestUnackedLookup
     */
-  def needsTracelessCheck: Boolean =
+  def needsUnackedCheck: Boolean =
     recovered && disposition == TransactionDisposition.VoteCommit && txStatus == TransactionStatus.Unresolved &&
       oresolution.isEmpty
 
@@ -422,8 +422,8 @@ class Tx( trs: TransactionRecoveryState,
     if !withholdingVote then
       sendDelayedPrepare()
 
-    if needsTracelessCheck then
-      frontend.requestTracelessLookup(this)
+    if needsUnackedCheck then
+      frontend.requestUnackedLookup(this)
   }
 
   private def sendDelayedPrepare(): Unit = {
@@ -796,7 +796,7 @@ class Tx( trs: TransactionRecoveryState,
       resolved(m.committed)
   }
 
-  /** Returns false if the finalization is held for a TracelessCommits lookup (see needsTracelessCheck): the Tx is then
+  /** Returns false if the finalization is held for a UnackedCommits lookup (see needsUnackedCheck): the Tx is then
     * still live
     */
   def receiveFinalized(m: TxFinalized): Boolean =
@@ -823,31 +823,31 @@ class Tx( trs: TransactionRecoveryState,
       frontend.transactionFinalized(transactionId)
     statusCache.updateStatus(transactionId, txStatus, finalized = true)
 
-  /** Holds an abort resolution of a recovered commit vote until a TracelessCommits lookup started after it completes.
+  /** Holds an abort resolution of a recovered commit vote until a UnackedCommits lookup started after it completes.
     * A lookup already in flight does not count: the entry may have been written after it read the tree. Only the
     * first held abort starts the wait: a later one (a driver's retransmit) replaces the held message, and moving the
     * wait forward again would let retransmits keep every lookup from counting. A held TxFinalized is kept over a later
     * TxResolved, which would resolve the Tx without finalizing it
     */
   private def holdAbort(m: TxMessage): Boolean =
-    if needsTracelessCheck && !abortsAccepted then
+    if needsUnackedCheck && !abortsAccepted then
       val first = heldAborts.isEmpty
       val finalizedHeld = heldAborts.exists(_.isInstanceOf[TxFinalized])
       if m.isInstanceOf[TxFinalized] || !finalizedHeld then
         heldAborts = List(m)
       if first then
-        frontend.requestTracelessLookup(this)
+        frontend.requestUnackedLookup(this)
       true
     else
       false
 
-  /** The pool's TracelessCommits tree holds this store's entry for the transaction: it committed, and was finalized
+  /** The pool's UnackedCommits tree holds this store's entry for the transaction: it committed, and was finalized
     * and forgotten while this store was down. The saved update is applied through the normal commit path, its
     * requirements re-checked so nothing is applied twice, and the Tx is concluded as if finalized: no TxFinalized will
     * come. The Frontend then forgets it. The tree entry is left for the repair scan
     */
-  def tracelessCommitFound(): Unit =
-    if needsTracelessCheck then
+  def unackedCommitFound(): Unit =
+    if needsUnackedCheck then
       heldAborts = Nil
       updateLastEvent()
       finalized(true)
@@ -863,12 +863,12 @@ class Tx( trs: TransactionRecoveryState,
         else
           s"applying its update to objects ${ids(issuedCommits)}" +
             (if issuedCommits.size < changed.size then s", skipping ${ids(changed -- issuedCommits)}" else "")
-      logger.info(s"Store $storeId learned committed transaction $transactionId from the TracelessCommits tree: $outcome")
+      logger.info(s"Store $storeId learned committed transaction $transactionId from the UnackedCommits tree: $outcome")
 
-  /** A TracelessCommits lookup started after the held aborts found no entry: either the transaction did not commit, or
+  /** A UnackedCommits lookup started after the held aborts found no entry: either the transaction did not commit, or
     * this store applied it durably. Returns the held aborts, for the Frontend to handle again; they are accepted now
     */
-  def tracelessCommitAbsent(): List[TxMessage] =
+  def unackedCommitAbsent(): List[TxMessage] =
     val held = heldAborts
     heldAborts = Nil
     if held.nonEmpty then

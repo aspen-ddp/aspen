@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.client.internal.transaction.TracelessCommitEntry
+import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, SinglePoolNodeAllocator, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.repair.{RepairPolicy, StoreRepairer}
-import org.aspen_ddp.aspen.server.store.TracelessCommitLookup
+import org.aspen_ddp.aspen.server.store.UnackedCommitLookup
 
 import java.nio.{ByteBuffer, ByteOrder}
 import scala.concurrent.Future
@@ -23,7 +23,7 @@ import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 
 /** A store that voted commit, crashed before learning the outcome, and is restarted after the transaction was
   * finalized and forgotten (its status cache entry gone) still applies the committed update: from the pool's
-  * TracelessCommits tree for a change that leaves no trace, and through proof-of-commit for one that does.
+  * UnackedCommits tree for a change that leaves no trace, and through proof-of-commit for one that does.
   *
   * The bootstrap host records its stores' CRL state, so restarting a store recovers its commit vote, and its recovery
   * drivers send. Its heartbeat is short so the status cache expires quickly. Its time (heartbeats and driver timers)
@@ -31,17 +31,17 @@ import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
   * learn the outcome from the status cache.
   *
   * A recovering store that never accepted the commit, driving the transaction with no store that did, gets no
-  * accepted value from Paxos: the other stores forgot it. Without the TracelessCommits lookup or proof-of-commit,
+  * accepted value from Paxos: the other stores forgot it. Without the UnackedCommits lookup or proof-of-commit,
   * its driver decides abort on their votes, and it drops the update.
   */
-class TracelessCommitsIntegrationSuite extends IntegrationTestSuite:
+class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
 
   override def testIda: IDA = ReedSolomon(5, 3, 4)
 
-  /** Holds the host's TracelessCommits lookups while `holding`, for the test to answer: through the real lookup, or
+  /** Holds the host's UnackedCommits lookups while `holding`, for the test to answer: through the real lookup, or
     * with a given result. Each is answered through the Frontend's own `answer`, as the host's lookup answers
     */
-  class HoldingLookup(inner: TracelessCommitLookup) extends TracelessCommitLookup:
+  class HoldingLookup(inner: UnackedCommitLookup) extends UnackedCommitLookup:
     final class Held(val storeId: StoreId, val transactionId: TransactionId, val requestId: Long,
                      val answer: Try[Boolean] => Unit):
       def release(): Unit = inner.lookup(storeId, transactionId, requestId, answer)
@@ -57,7 +57,7 @@ class TracelessCommitsIntegrationSuite extends IntegrationTestSuite:
 
   override def testHostOptions: TestNetwork.HostOptions =
     TestNetwork.HostOptions(heartbeatPeriod = Duration(300, MILLISECONDS), recordCrl = true, recoveryDrivers = true,
-      wrapTracelessLookup = Some(inner => { lookups = new HoldingLookup(inner); lookups }))
+      wrapUnackedLookup = Some(inner => { lookups = new HoldingLookup(inner); lookups }))
 
   private val k = Key(Array[Byte](1))
 
@@ -164,16 +164,16 @@ class TracelessCommitsIntegrationSuite extends IntegrationTestSuite:
       found <- Future.sequence(stores.map(i => pool.errorTree.get(errorKey(i, objectId)).map(o => i -> o.isDefined)))
     yield found.collect { case (i, true) => i }
 
-  /** The pool's TracelessCommits entries for `txid`, by pool index. Only those: the system's own transactions write
+  /** The pool's UnackedCommits entries for `txid`, by pool index. Only those: the system's own transactions write
     * entries too when a store misses one under load
     */
-  private def tracelessEntries(txid: TransactionId): Future[Map[Int, TracelessCommitEntry]] =
+  private def unackedEntries(txid: TransactionId): Future[Map[Int, UnackedCommitEntry]] =
     for
       pool <- client.getStoragePool(PoolId.BootstrapPoolId)
-      all <- pool.tracelessCommitsTree.foldLeft(Map[Key, TracelessCommitEntry]()): (acc, contents) =>
-        acc ++ contents.map((key, vs) => key -> TracelessCommitEntry.decode(vs.value.bytes))
+      all <- pool.unackedCommitsTree.foldLeft(Map[Key, UnackedCommitEntry]()): (acc, contents) =>
+        acc ++ contents.map((key, vs) => key -> UnackedCommitEntry.decode(vs.value.bytes))
     yield all.collect:
-      case (key, entry) if TracelessCommitEntry.decodeTransactionId(key) == txid => key.bytes(0).toInt -> entry
+      case (key, entry) if UnackedCommitEntry.decodeTransactionId(key) == txid => key.bytes(0).toInt -> entry
 
   /** A KeyValueObjects TKVL in the bootstrap pool holding `k`, with its single (tier 0) node */
   private def treeHoldingK(): Future[(TieredKeyValueList, KeyValueObjectPointer)] =
@@ -209,8 +209,8 @@ class TracelessCommitsIntegrationSuite extends IntegrationTestSuite:
       (tree, nodePtr) <- treeHoldingK()
       txid <- commitHeldBy(Set(sid(2), sid(3)))(tx => tree.delete(k)(using tx))
       _ = neverAccepted(2, txid)
-      marked <- tracelessEntries(txid)
-      _ = withClue("only the holders lack the delete, and each has a TracelessCommits entry: "):
+      marked <- unackedEntries(txid)
+      _ = withClue("only the holders lack the delete, and each has a UnackedCommits entry: "):
             (0 until 5).foreach: i =>
               if i == 2 || i == 3 then storeKeys(i, nodePtr) should contain (k)
               else storeKeys(i, nodePtr) should not contain k
@@ -234,9 +234,9 @@ class TracelessCommitsIntegrationSuite extends IntegrationTestSuite:
                _ <- allStores.foldLeft(Future.unit): (f, i) =>
                       f.flatMap(_ => pump(repairer.scan(sid(i), RepairPolicy.Default), clock = true)).map(_ => ())
                _ <- settle(clock = true)
-               traceless <- tracelessEntries(txid)
+               unacked <- unackedEntries(txid)
                errors <- errorEntries(allStores, nodePtr.id)
-             yield traceless.isEmpty && errors.isEmpty
+             yield unacked.isEmpty && errors.isEmpty
       value <- tree.get(k)
     yield
       (0 until 5).foreach(i => storeKeys(i, nodePtr) should not contain k)
@@ -254,8 +254,8 @@ class TracelessCommitsIntegrationSuite extends IntegrationTestSuite:
                 tx.overwrite(dataPtr, before.revision, DataBuffer(Array[Byte](2)))
                 Future.unit
       _ = neverAccepted(2, txid)
-      marked <- tracelessEntries(txid)
-      _ = withClue("only store 2 lacks the overwrite, and a data write leaves no TracelessCommits entry: "):
+      marked <- unackedEntries(txid)
+      _ = withClue("only store 2 lacks the overwrite, and a data write leaves no UnackedCommits entry: "):
             storeRevision(2, dataPtr) shouldBe Some(before.revision)
             List(0, 1, 3, 4).foreach(i => storeRevision(i, dataPtr) shouldBe Some(ObjectRevision(txid)))
             marked shouldBe empty
@@ -271,7 +271,7 @@ class TracelessCommitsIntegrationSuite extends IntegrationTestSuite:
       after.revision shouldBe ObjectRevision(txid)
       after.data.getByteArray.toSeq shouldBe Seq[Byte](2)
 
-  test("a TracelessCommits lookup answer for a replaced store is not taken by its successor"):
+  test("a UnackedCommits lookup answer for a replaced store is not taken by its successor"):
     for
       (tree, nodePtr) <- treeHoldingK()
       txid <- commitHeldBy(Set(sid(2)))(tx => tree.delete(k)(using tx))
@@ -293,7 +293,7 @@ class TracelessCommitsIntegrationSuite extends IntegrationTestSuite:
              Future.successful(!storeKeys(2, nodePtr).contains(k))
     yield succeed
 
-  test("a TracelessCommits lookup that fails is made again at the store heartbeat, and then applies"):
+  test("a UnackedCommits lookup that fails is made again at the store heartbeat, and then applies"):
     for
       (tree, nodePtr) <- treeHoldingK()
       txid <- commitHeldBy(Set(sid(2)))(tx => tree.delete(k)(using tx))

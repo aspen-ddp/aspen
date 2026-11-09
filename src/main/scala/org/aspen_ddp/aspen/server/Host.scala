@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectState as ClientObjectState}
-import org.aspen_ddp.aspen.client.internal.transaction.TracelessCommitEntry
+import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDevice
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
-import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store, TracelessCommitLookup}
+import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store, UnackedCommitLookup}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler, DefaultBackendOpener}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
@@ -143,8 +143,8 @@ object Host:
                          /** Writes a store directory's rebuild-required marker (StoreRebuilds.markRebuildRequired), for
                           *  tests of a write that fails and leaves nothing behind */
                          writeRebuildRequiredMarker: Option[os.Path => Unit] = None,
-                         /** Wraps the host's TracelessCommits lookup, for tests that hold, fail or replay lookups */
-                         wrapTracelessLookup: Option[TracelessCommitLookup => TracelessCommitLookup] = None)
+                         /** Wraps the host's UnackedCommits lookup, for tests that hold, fail or replay lookups */
+                         wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None)
 
   object Seams:
     val default: Seams = Seams()
@@ -203,13 +203,13 @@ class Host(val client: AspenClient,
 
   private val hostMetadata: DeviceMetadata = seams.metadata.getOrElse(clientMetadata)
 
-  /** Stores have no client, so a recovered commit vote's TracelessCommits lookup reads its pool's tree through the
+  /** Stores have no client, so a recovered commit vote's UnackedCommits lookup reads its pool's tree through the
    *  host's, on `ec`. The Frontend's `answer` posts the result to its own store, which drops it if replaced or gone. */
-  private val tracelessLookup: TracelessCommitLookup = (storeId, txid, _, answer) =>
+  private val unackedLookup: UnackedCommitLookup = (storeId, txid, _, answer) =>
     given ExecutionContext = ec
     Future.unit
       .flatMap(_ => client.getStoragePool(storeId.poolId))
-      .flatMap(_.tracelessCommitsTree.get(TracelessCommitEntry.key(storeId, txid)))
+      .flatMap(_.unackedCommitsTree.get(UnackedCommitEntry.key(storeId, txid)))
       .onComplete(result => answer(result.map(_.isDefined)))
 
   private val deviceControl: DeviceControl = new DeviceControl(
@@ -254,7 +254,7 @@ class Host(val client: AspenClient,
     scheduleEndpointRetry = fn => controlScheduler.schedule(Duration(5, SECONDS))(fn()),
     ec = ec,
     writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker),
-    tracelessLookup = seams.wrapTracelessLookup.fold(tracelessLookup)(wrap => wrap(tracelessLookup)))
+    unackedLookup = seams.wrapUnackedLookup.fold(unackedLookup)(wrap => wrap(unackedLookup)))
 
   private val shutdownPromise: Promise[Unit] = Promise()
 

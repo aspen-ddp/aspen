@@ -500,12 +500,12 @@ abstract class BaseAspenClient(
           (treeAlloc, nodeAllocator) <- treeAllocators()
           errTreeRoot <- treeAlloc.allocateKeyValueObject(Map())
           allocTreeRoot <- treeAlloc.allocateKeyValueObject(Map())
-          tracelessRoot <- treeAlloc.allocateKeyValueObject(Map())
+          unackedRoot <- treeAlloc.allocateKeyValueObject(Map())
 
           poolConfig = config.encode()
           errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), nodeAllocator).encode()
           allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), nodeAllocator).encode()
-          tracelessTree = Root(0, ByteArrayKeyOrdering, Some(tracelessRoot), nodeAllocator).encode()
+          unackedTree = Root(0, ByteArrayKeyOrdering, Some(unackedRoot), nodeAllocator).encode()
 
           // An FSIF pool selects FsifIndexAllocationStrategy and gets its zeroed index bitmap from the same
           // metadata allocator as the trees
@@ -518,7 +518,7 @@ abstract class BaseAspenClient(
             StoragePoolState.ConfigKey -> Value(poolConfig),
             StoragePoolState.ErrorTreeKey -> Value(errorTree),
             StoragePoolState.AllocationTreeKey -> Value(allocTree),
-            StoragePoolState.TracelessCommitsTreeKey -> Value(tracelessTree)
+            StoragePoolState.UnackedCommitsTreeKey -> Value(unackedTree)
           ) ++ strategyEntries)
         yield
           poolPtr

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedTracelessCommit, MissedUpdate}
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedUnackedCommit, MissedUpdate}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -320,15 +320,15 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     // two of each per write, and two writes
     val marker = new ObservedMarker(maxEntries = 2)
     val updates = List.fill(3)(missed(net.storeId0))
-    val entry = TracelessCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
+    val entry = UnackedCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
     val txids = List.fill(3)(TransactionId(UUID.randomUUID()))
-    val traceless = txids.map(MissedTracelessCommit(net.storeId0, _, entry))
+    val unacked = txids.map(MissedUnackedCommit(net.storeId0, _, entry))
 
     for
-      _ <- marker.mark(updates, traceless)
+      _ <- marker.mark(updates, unacked)
       pool <- client.getStoragePool(Radicle.poolId)
       entries <- Future.sequence(updates.map(u => pool.errorTree.get(buildErrorKey(u.store, u.objectId))))
-      written <- tracelessEntries(Radicle.poolId, txids*)
+      written <- unackedEntries(Radicle.poolId, txids*)
     yield
       marker.commits shouldBe 3
       entries.forall(_.isDefined) shouldBe true
@@ -397,17 +397,17 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
 
     fa.complete.map(_ => succeed)
 
-  // TracelessCommits entries
+  // UnackedCommits entries
 
-  /** The pool's TracelessCommits entries for `txids`. Only those: the system's own transactions write entries too
+  /** The pool's UnackedCommits entries for `txids`. Only those: the system's own transactions write entries too
     * when a store misses one under load
     */
-  private def tracelessEntries(poolId: PoolId, txids: TransactionId*): Future[Map[Key, TracelessCommitEntry]] =
+  private def unackedEntries(poolId: PoolId, txids: TransactionId*): Future[Map[Key, UnackedCommitEntry]] =
     for
       pool <- client.getStoragePool(poolId)
-      all <- pool.tracelessCommitsTree.foldLeft(Map[Key, TracelessCommitEntry]()): (acc, contents) =>
-        acc ++ contents.map((k, vs) => k -> TracelessCommitEntry.decode(vs.value.bytes))
-    yield all.filter((k, _) => txids.contains(TracelessCommitEntry.decodeTransactionId(k)))
+      all <- pool.unackedCommitsTree.foldLeft(Map[Key, UnackedCommitEntry]()): (acc, contents) =>
+        acc ++ contents.map((k, vs) => k -> UnackedCommitEntry.decode(vs.value.bytes))
+    yield all.filter((k, _) => txids.contains(UnackedCommitEntry.decodeTransactionId(k)))
 
   private def refcountTxd(ptr: ObjectPointer): TransactionDescription =
     txdFor(ptr).copy(requirements = List(RefcountUpdate(ptr, ObjectRefcount(0, 1), ObjectRefcount(1, 0))))
@@ -422,15 +422,15 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     fa.markMissedUpdates()
     fa.complete
 
-  atest("a store that sent no TxCommitted for a refcount change gets a TracelessCommits entry"):
+  atest("a store that sent no TxCommitted for a refcount change gets a UnackedCommits entry"):
     val ptr = pointerWith(Array[Byte](4, 2))
     val txd = refcountTxd(ptr)
     for
       _ <- runMark(txd, Map(net.storeId0 -> Nil, net.storeId1 -> Nil))
-      entries <- tracelessEntries(Radicle.poolId, txd.transactionId)
+      entries <- unackedEntries(Radicle.poolId, txd.transactionId)
     yield
-      entries shouldBe Map(TracelessCommitEntry.key(net.storeId2, txd.transactionId) ->
-        TracelessCommitEntry(txd.startTimestamp, List(ptr)))
+      entries shouldBe Map(UnackedCommitEntry.key(net.storeId2, txd.transactionId) ->
+        UnackedCommitEntry(txd.startTimestamp, List(ptr)))
 
   /** Marks `txd` as a driver that counted `voters` reports them, with every store in `commitErrors` having replied */
   private def runMarkWithVoters(txd: TransactionDescription, voters: Set[StoreId],
@@ -441,27 +441,27 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     fa.markMissedUpdates()
     fa.complete
 
-  atest("a store that never voted commit gets an ErrorTree mark but no TracelessCommits entry"):
+  atest("a store that never voted commit gets an ErrorTree mark but no UnackedCommits entry"):
     // store2 was offline throughout: it holds no commit vote to recover, so repair through the ErrorTree is enough
     val ptr = pointerWith(Array[Byte](4, 3))
     val txd = refcountTxd(ptr)
     for
       _ <- runMarkWithVoters(txd, Set(net.storeId0, net.storeId1), Map(net.storeId0 -> Nil, net.storeId1 -> Nil))
-      entries <- tracelessEntries(Radicle.poolId, txd.transactionId)
+      entries <- unackedEntries(Radicle.poolId, txd.transactionId)
       marked <- markedStores(ptr, List(net.storeId0, net.storeId1, net.storeId2))
     yield
       entries shouldBe empty
       marked shouldBe List(net.storeId2)
 
-  atest("a commit voter that sent no TxCommitted gets a TracelessCommits entry"):
+  atest("a commit voter that sent no TxCommitted gets a UnackedCommits entry"):
     // store1 voted commit and then crashed before applying: on recovery it looks for this entry
     val ptr = pointerWith(Array[Byte](4, 4))
     val txd = refcountTxd(ptr)
     for
       _ <- runMarkWithVoters(txd, Set(net.storeId0, net.storeId1), Map(net.storeId0 -> Nil))
-      entries <- tracelessEntries(Radicle.poolId, txd.transactionId)
+      entries <- unackedEntries(Radicle.poolId, txd.transactionId)
     yield
-      entries.keySet shouldBe Set(TracelessCommitEntry.key(net.storeId1, txd.transactionId))
+      entries.keySet shouldBe Set(UnackedCommitEntry.key(net.storeId1, txd.transactionId))
 
   atest("a flagged KV delete without a required revision gets an entry; an insert-only update does not"):
     val delPtr = KeyValueObjectPointer(ObjectId(UUID.randomUUID()), Radicle.poolId)
@@ -472,21 +472,21 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     for
       _ <- runMark(deleteTx, seen)
       _ <- runMark(insertTx, seen)
-      entries <- tracelessEntries(Radicle.poolId, deleteTx.transactionId, insertTx.transactionId)
+      entries <- unackedEntries(Radicle.poolId, deleteTx.transactionId, insertTx.transactionId)
     yield
-      entries.keySet shouldBe Set(TracelessCommitEntry.key(net.storeId2, deleteTx.transactionId))
+      entries.keySet shouldBe Set(UnackedCommitEntry.key(net.storeId2, deleteTx.transactionId))
 
-  atest("a store that sent TxCommitted with object errors gets no TracelessCommits entry"):
+  atest("a store that sent TxCommitted with object errors gets no UnackedCommits entry"):
     val ptr = pointerWith(Array[Byte](1))
     val txd = refcountTxd(ptr)
     for
       _ <- runMark(txd, Map(net.storeId0 -> Nil, net.storeId1 -> Nil, net.storeId2 -> List(ptr.id)))
-      entries <- tracelessEntries(Radicle.poolId, txd.transactionId)
+      entries <- unackedEntries(Radicle.poolId, txd.transactionId)
     yield entries.isEmpty shouldBe true
 
   atest("a transaction spanning two pools writes each store's entry to its own pool's tree, naming only its objects"):
     for
-      poolB <- client.createNewStoragePool("traceless-pool-b", Replication(1, 1), None, RocksDBConfig(),
+      poolB <- client.createNewStoragePool("unacked-pool-b", Replication(1, 1), None, RocksDBConfig(),
                                            StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
       ptrA = pointerWith(Array[Byte](1))
       ptrB = DataObjectPointer(ObjectId(UUID.randomUUID()), poolB, Array[Byte](2))
@@ -495,28 +495,28 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
                             RefcountUpdate(ptrB, ObjectRefcount(0, 1), ObjectRefcount(1, 0))),
         poolIDAMap = Map(Radicle.poolId -> net.ida, poolB -> Replication(1, 1)))
       _ <- runMark(txd, Map.empty)
-      a <- tracelessEntries(Radicle.poolId, txd.transactionId)
-      b <- tracelessEntries(poolB, txd.transactionId)
+      a <- unackedEntries(Radicle.poolId, txd.transactionId)
+      b <- unackedEntries(poolB, txd.transactionId)
     yield
-      a.values.toList shouldBe List.fill(3)(TracelessCommitEntry(txd.startTimestamp, List(ptrA)))
-      b shouldBe Map(TracelessCommitEntry.key(StoreId(poolB, 0.toByte), txd.transactionId) ->
-        TracelessCommitEntry(txd.startTimestamp, List(ptrB)))
+      a.values.toList shouldBe List.fill(3)(UnackedCommitEntry(txd.startTimestamp, List(ptrA)))
+      b shouldBe Map(UnackedCommitEntry.key(StoreId(poolB, 0.toByte), txd.transactionId) ->
+        UnackedCommitEntry(txd.startTimestamp, List(ptrB)))
 
-  atest("TracelessCommits entries are written in the same transaction as the pool's ErrorTree marks"):
+  atest("UnackedCommits entries are written in the same transaction as the pool's ErrorTree marks"):
     val marker = new ObservedMarker
     val txid = TransactionId(UUID.randomUUID())
-    val entry = TracelessCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
+    val entry = UnackedCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
     for
       _ <- marker.mark(List(missed(net.storeId0), missed(net.storeId1)),
-                       List(MissedTracelessCommit(net.storeId0, txid, entry), MissedTracelessCommit(net.storeId1, txid, entry)))
-      entries <- tracelessEntries(Radicle.poolId, txid)
+                       List(MissedUnackedCommit(net.storeId0, txid, entry), MissedUnackedCommit(net.storeId1, txid, entry)))
+      entries <- unackedEntries(Radicle.poolId, txid)
     yield
       marker.commits shouldBe 1
-      entries.keySet shouldBe Set(TracelessCommitEntry.key(net.storeId0, txid), TracelessCommitEntry.key(net.storeId1, txid))
+      entries.keySet shouldBe Set(UnackedCommitEntry.key(net.storeId0, txid), UnackedCommitEntry.key(net.storeId1, txid))
 
-  test("a traceless commit entry round-trips and its key names the transaction"):
+  test("a unacked commit entry round-trips and its key names the transaction"):
     val ptr = pointerWith(Array[Byte](9, 9, 9))
-    val entry = TracelessCommitEntry(missedTimestamp, List(ptr, pointerWith(Array[Byte]())))
+    val entry = UnackedCommitEntry(missedTimestamp, List(ptr, pointerWith(Array[Byte]())))
     val txid = TransactionId(UUID.randomUUID())
-    TracelessCommitEntry.decode(entry.encode) shouldBe entry
-    TracelessCommitEntry.decodeTransactionId(TracelessCommitEntry.key(net.storeId1, txid)) shouldBe txid
+    UnackedCommitEntry.decode(entry.encode) shouldBe entry
+    UnackedCommitEntry.decodeTransactionId(UnackedCommitEntry.key(net.storeId1, txid)) shouldBe txid

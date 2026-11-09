@@ -13,7 +13,7 @@ import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 
 /** A transaction's client prepares, re-delivered after every store finalized and forgot it, must not apply it again.
   *
-  * The bootstrap host records its stores' CRL state and has recovery drivers, as TracelessCommitsIntegrationSuite's
+  * The bootstrap host records its stores' CRL state and has recovery drivers, as UnackedCommitsIntegrationSuite's
   * does. Its heartbeat is short so the status cache forgets a transaction quickly.
   */
 class ReplayIntegrationSuite extends IntegrationTestSuite:

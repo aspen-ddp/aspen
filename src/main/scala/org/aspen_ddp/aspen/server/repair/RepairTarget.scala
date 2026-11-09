@@ -35,7 +35,7 @@ trait RepairTarget:
   def isRepairable(storeId: StoreId): Boolean
 
   /** Whether the store holds transaction `txid` live (recovered or active), or may once the CRL state it is loading
-    * is recovered. A TracelessCommits entry for such a transaction is skipped: the store's Tx applies it. Callable
+    * is recovered. A UnackedCommits entry for such a transaction is skipped: the store's Tx applies it. Callable
     * from any thread: it reads `@volatile` snapshots, as `Host.hasTransactions` does
     */
   def holdsTransaction(storeId: StoreId, txid: TransactionId): Boolean

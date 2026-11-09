@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
-import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedTracelessCommit, MissedUpdate}
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedUnackedCommit, MissedUpdate}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -94,7 +94,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
       else
         val objects = txd.allHostedObjects(storeId).filter(ptr => txd.tracelessObjects.contains(ptr.id))
         Option.when(objects.nonEmpty):
-          MissedTracelessCommit(storeId, txd.transactionId, TracelessCommitEntry(txd.startTimestamp, objects))
+          MissedUnackedCommit(storeId, txd.transactionId, UnackedCommitEntry(txd.startTimestamp, objects))
 
     reportMarks(errors.map(_.store))
 

@@ -2,8 +2,8 @@ package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, ReadLocks, Transaction}
-import org.aspen_ddp.aspen.client.internal.transaction.TracelessCommitEntry
-import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedTracelessCommit
+import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedUnackedCommit
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -386,18 +386,18 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- tree.foreachInRange(min, max, (_, key, _) => { synchronized { keys = key :: keys }; Future.unit })
     yield keys
 
-  /** The keys of store `i`'s TracelessCommits entries */
-  private def tracelessEntries(i: Int): Future[List[Key]] =
+  /** The keys of store `i`'s UnackedCommits entries */
+  private def unackedEntries(i: Int): Future[List[Key]] =
     @volatile var keys: List[Key] = Nil
     val min = Key(Array[Byte](i.toByte))
     val max = Key(Array[Byte]((i + 1).toByte))
     for
       pool <- client.getStoragePool(PoolId.BootstrapPoolId)
-      _ <- pool.tracelessCommitsTree.foreachInRange(min, max,
+      _ <- pool.unackedCommitsTree.foreachInRange(min, max,
              (_, key, _) => { synchronized { keys = key :: keys }; Future.unit })
     yield keys
 
-  /** Deletes store `i`'s errorTree entries, so that only its TracelessCommits entries drive its repair */
+  /** Deletes store `i`'s errorTree entries, so that only its UnackedCommits entries drive its repair */
   private def dropErrorEntries(i: Int): Future[Unit] =
     for
       keys <- errorEntries(i)
@@ -454,19 +454,19 @@ class StoreRepairerSuite extends IntegrationTestSuite:
         committed.flatMap(_ => settled).map(_ => tx.id)
 
   /** missedByTx, standing in for a commit voter that crashed holding its vote and dropped it on recovery: its copies
-    * lack the change, and it has the TracelessCommits entry the finalizer writes for a voter that sent no TxCommitted,
+    * lack the change, and it has the UnackedCommits entry the finalizer writes for a voter that sent no TxCommitted,
     * naming `objects`. A store that missed the transaction outright gets no entry: it never voted
     */
   private def missedByCrashedVoter(i: Int, objects: ObjectPointer*)(build: Transaction => Unit): Future[TransactionId] =
     val start = HLCTimestamp.now
     for
       txid <- missedByTx(i)(build)
-      entry = MissedTracelessCommit(sid(i), txid, TracelessCommitEntry(start, objects.toList))
+      entry = MissedUnackedCommit(sid(i), txid, UnackedCommitEntry(start, objects.toList))
       _ <- pump(client.missedUpdateMarker.mark(Nil, List(entry)), deadline())
       _ <- settle()
     yield txid
 
-  /** Scans store `i` through the live host until its errorTree and TracelessCommits ranges are empty */
+  /** Scans store `i` through the live host until its errorTree and UnackedCommits ranges are empty */
   private def scanUntilQuiet(i: Int, repairer: StoreRepairer = StoreRepairer(client, net.smgr),
                              passes: Int = 20): Future[Unit] =
     for
@@ -474,8 +474,8 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- pump(repairer.scan(sid(i), RepairPolicy.Default), deadline())
       _ <- settle()
       errors <- errorEntries(i)
-      traceless <- tracelessEntries(i)
-      remaining = errors ++ traceless
+      unacked <- unackedEntries(i)
+      remaining = errors ++ unacked
       _ <- if remaining.isEmpty then Future.unit
            else if passes <= 1 then Future.failed(new AssertionError(s"store $i never went quiet: $remaining"))
            else scanUntilQuiet(i, repairer, passes - 1)
@@ -619,7 +619,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       storeKeys(2, kvPtr) shouldBe Set(k0, k1, k3)
       remaining shouldBe empty
 
-  // ---- TracelessCommits entries, deferral and proofs ---------------------------------------------------------------
+  // ---- UnackedCommits entries, deferral and proofs ---------------------------------------------------------------
 
   /** The live host, with test seams: `live` stands in for transactions a store still holds live, `lockedKeys` and
     * `objectLocked` for locks every read of an object reports. Only a proof transaction gets past those locks: the
@@ -668,25 +668,25 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- scanAllUntilQuiet()
     yield ptr
 
-  test("a TracelessCommits entry for a transaction the store holds live is skipped"):
+  test("a UnackedCommits entry for a transaction the store holds live is skipped"):
     val target = SeamTarget()
     val repairer = StoreRepairer(client, target)
     for
       kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
       txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
       _ <- dropErrorEntries(2)
-      before <- tracelessEntries(2)
+      before <- unackedEntries(2)
       _ = target.live += (sid(2) -> txid)
       result <- pass(2, repairer, DeferralState())
-      after <- tracelessEntries(2)
+      after <- unackedEntries(2)
     yield
-      before shouldBe List(TracelessCommitEntry.key(sid(2), txid))
+      before shouldBe List(UnackedCommitEntry.key(sid(2), txid))
       after shouldBe before
-      result.tracelessSeen shouldBe 1
+      result.unackedSeen shouldBe 1
       result.deferred shouldBe 1
       storeKeys(2, kvPtr) shouldBe Set(k0, k1)
 
-  test("a TracelessCommits entry is reconciled and deleted once the store no longer holds it"):
+  test("a UnackedCommits entry is reconciled and deleted once the store no longer holds it"):
     val target = SeamTarget()
     val repairer = StoreRepairer(client, target)
     for
@@ -695,17 +695,17 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- dropErrorEntries(2)
       _ = target.live += (sid(2) -> txid)
       _ <- pass(2, repairer, DeferralState())
-      held <- tracelessEntries(2)
+      held <- unackedEntries(2)
       _ = target.live = Set()
       _ <- scanUntilQuiet(2, repairer)
-      remaining <- tracelessEntries(2)
+      remaining <- unackedEntries(2)
     yield
       held should not be empty
       remaining shouldBe empty
       storeKeys(2, kvPtr) should not contain k1
       storeKeys(2, kvPtr) shouldBe Set(k0)
 
-  test("a TracelessCommits entry for a deleted object deletes it from the store"):
+  test("a UnackedCommits entry for a deleted object deletes it from the store"):
     for
       dataPtr <- sharedDataObject()
       before <- client.read(dataPtr)
@@ -714,9 +714,9 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ = withClue("store 2 missed the deletion: "):
             storeHasObject(2, dataPtr.id) shouldBe true
             storeHasObject(0, dataPtr.id) shouldBe false
-      marked <- tracelessEntries(2)
+      marked <- unackedEntries(2)
       _ <- pass(2, StoreRepairer(client, net.smgr), DeferralState(), noDeletionAge)
-      remaining <- tracelessEntries(2)
+      remaining <- unackedEntries(2)
     yield
       marked should not be empty
       storeHasObject(2, dataPtr.id) shouldBe false
@@ -726,7 +726,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   /** A policy treating any entry whose object has no allocation as a deletion, however young */
   private val noDeletionAge: RepairPolicy = RepairPolicy.Default.copy(minErrorEntryAgeForDeletion = Duration(0, SECONDS))
 
-  test("a young TracelessCommits entry whose object has no allocation yet does not delete the live object"):
+  test("a young UnackedCommits entry whose object has no allocation yet does not delete the live object"):
     // An allocation's RefcountUpdate is traceless, so a store missing it gets an entry before
     // AllocationFinalizationAction records the allocation: absent from the allocation tree is not yet a deletion
     val oid = ObjectId(new UUID(7, 70))
@@ -738,18 +738,18 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       pool <- client.getStoragePool(PoolId.BootstrapPoolId)
       tx = client.newRepairTransaction()
-      _ <- pool.tracelessCommitsTree.set(TracelessCommitEntry.key(sid(2), txid),
-             Value(TracelessCommitEntry(HLCTimestamp.now, List(ptr)).encode))(using tx)
+      _ <- pool.unackedCommitsTree.set(UnackedCommitEntry.key(sid(2), txid),
+             Value(UnackedCommitEntry(HLCTimestamp.now, List(ptr)).encode))(using tx)
       _ <- pump(tx.commit(), deadline())
       result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
-      remaining <- tracelessEntries(2)
+      remaining <- unackedEntries(2)
     yield
       storeHasObject(2, oid) shouldBe true
-      remaining shouldBe List(TracelessCommitEntry.key(sid(2), txid))
-      result.tracelessSeen shouldBe 1
+      remaining shouldBe List(UnackedCommitEntry.key(sid(2), txid))
+      result.unackedSeen shouldBe 1
       result.deferred shouldBe 1
 
-  test("a store holding none of its entries' transactions live clears every TracelessCommits entry in one scan"):
+  test("a store holding none of its entries' transactions live clears every UnackedCommits entry in one scan"):
     for
       kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
       dataPtr <- sharedDataObject()
@@ -758,12 +758,12 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
       _ <- missedByCrashedVoter(2, dataPtr)(_.setRefcount(dataPtr, before.refcount, expected))
       _ <- dropErrorEntries(2)
-      marked <- tracelessEntries(2)
+      marked <- unackedEntries(2)
       result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
-      remaining <- tracelessEntries(2)
+      remaining <- unackedEntries(2)
     yield
       marked.size shouldBe 2
-      result.tracelessSeen shouldBe 2
+      result.unackedSeen shouldBe 2
       remaining shouldBe empty
       storeKeys(2, kvPtr) shouldBe Set(k0)
       storeRefcount(2, dataPtr) shouldBe Some(expected)
@@ -772,7 +772,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   // current reads: no hook in rebuild is needed, the first scan passes every entry at once and changes nothing. The
   // rebuild's end state is stood in for by store 2 restarted with no CRL state and a peer's copies (Replication, so
   // the slices are the same)
-  test("after a rebuild, the first scan clears the store's TracelessCommits entries and changes nothing"):
+  test("after a rebuild, the first scan clears the store's UnackedCommits entries and changes nothing"):
     for
       kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
       dataPtr <- sharedDataObject()
@@ -781,20 +781,20 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
       _ <- missedByCrashedVoter(2, dataPtr)(_.setRefcount(dataPtr, before.refcount, expected))
       _ <- dropErrorEntries(2)
-      marked <- tracelessEntries(2)
+      marked <- unackedEntries(2)
       _ = net.stores(2).m = net.stores(0).m.map: (id, os) =>
             id -> new org.aspen_ddp.aspen.server.store.ObjectState(id, os.metadata, os.objectType, os.data)
       _ <- pump(net.restartStore(net.stores(2)), deadline())
       _ <- settle()
       rebuilt = Map(kvPtr.id -> stored(2, kvPtr.id).map(_.metadata), dataPtr.id -> stored(2, dataPtr.id).map(_.metadata))
       result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
-      remaining <- tracelessEntries(2)
+      remaining <- unackedEntries(2)
     yield
       withClue("the rebuilt store holds the transactions' changes: "):
         storeKeys(2, kvPtr) shouldBe Set(k0)
         storeRefcount(2, dataPtr) shouldBe Some(expected)
       marked.size shouldBe 2
-      result.tracelessSeen shouldBe 2
+      result.unackedSeen shouldBe 2
       result.repaired shouldBe 2
       remaining shouldBe empty
       Map(kvPtr.id -> stored(2, kvPtr.id).map(_.metadata), dataPtr.id -> stored(2, dataPtr.id).map(_.metadata)) shouldBe
@@ -814,7 +814,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     yield
       withClue("store 2 missed the deletes: "):
         storeKeys(2, kvPtr) shouldBe Set(k0, k1, k2)
-      (kvPtr, StoreRepairer.tracelessDeferralKey(TracelessCommitEntry.key(sid(2), txid), kvPtr.id))
+      (kvPtr, StoreRepairer.unackedDeferralKey(UnackedCommitEntry.key(sid(2), txid), kvPtr.id))
 
   test("one permanently locked key is deferred while every other key of the object is reconciled at once"):
     val target = SeamTarget()
@@ -823,7 +823,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       (kvPtr, entryKey) <- lockedKeyScenario(target)
       result <- pass(2, repairer, deferral)
-      remaining <- tracelessEntries(2)
+      remaining <- unackedEntries(2)
     yield
       storeKeys(2, kvPtr) shouldBe Set(k0, k2)
       deferral.deferredKeys(entryKey) shouldBe Some(Set(k2))
@@ -839,9 +839,9 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       (kvPtr, entryKey) <- lockedKeyScenario(target)
       _ <- passes(n - 1, 2, repairer, deferral)
       keysBeforeProof = storeKeys(2, kvPtr)
-      entriesBeforeProof <- tracelessEntries(2)
+      entriesBeforeProof <- unackedEntries(2)
       _ <- pass(2, repairer, deferral)
-      remaining <- tracelessEntries(2)
+      remaining <- unackedEntries(2)
     yield
       keysBeforeProof shouldBe Set(k0, k2)
       entriesBeforeProof should not be empty
@@ -874,11 +874,11 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ = writeK2 = Some(kvPtr)
       _ <- pass(2, repairer, deferral)
       proofsOnAbortPass = proofs
-      afterAbort <- tracelessEntries(2)
+      afterAbort <- unackedEntries(2)
       keysAfterAbort = storeKeys(2, kvPtr)
       deferredAfterAbort = deferral.deferredKeys(entryKey)
       _ <- pass(2, repairer, deferral)
-      remaining <- tracelessEntries(2)
+      remaining <- unackedEntries(2)
     yield
       writeK2 shouldBe None
       proofsBefore shouldBe empty
@@ -905,9 +905,9 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       first <- pass(2, repairer, deferral)
       _ <- passes(n - 2, 2, repairer, deferral)
       refcountBeforeProof = storeRefcount(2, dataPtr)
-      entriesBeforeProof <- tracelessEntries(2)
+      entriesBeforeProof <- unackedEntries(2)
       _ <- pass(2, repairer, deferral)
-      remaining <- tracelessEntries(2)
+      remaining <- unackedEntries(2)
     yield
       first.deferred shouldBe 1
       refcountBeforeProof shouldBe Some(before.refcount)

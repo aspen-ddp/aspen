@@ -8,11 +8,11 @@ import org.aspen_ddp.aspen.common.objects.{Key, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 
-/** A TracelessCommits tree value: a store missed a transaction whose change to `objects` leaves nothing for
+/** A UnackedCommits tree value: a store missed a transaction whose change to `objects` leaves nothing for
   * repair to compare (a refcount change, or a key delete), so the transaction's start `timestamp` and
   * the pointers, which keep their store pointers, are recorded for the store's repair.
   */
-final case class TracelessCommitEntry(timestamp: HLCTimestamp, objects: List[ObjectPointer]):
+final case class UnackedCommitEntry(timestamp: HLCTimestamp, objects: List[ObjectPointer]):
   def encode: Array[Byte] =
     val ptrs = objects.map(_.toArray)
     val bb = ByteBuffer.allocate(HLCTimestamp.EncodedSize + 4 + ptrs.map(_.length + 4).sum)
@@ -24,8 +24,8 @@ final case class TracelessCommitEntry(timestamp: HLCTimestamp, objects: List[Obj
       bb.put(p)
     bb.array()
 
-object TracelessCommitEntry:
-  def decode(bytes: Array[Byte]): TracelessCommitEntry =
+object UnackedCommitEntry:
+  def decode(bytes: Array[Byte]): UnackedCommitEntry =
     val bb = ByteBuffer.wrap(bytes)
     bb.order(ByteOrder.BIG_ENDIAN)
     val ts = HLCTimestamp(bb.getLong())
@@ -34,7 +34,7 @@ object TracelessCommitEntry:
       val p = new Array[Byte](bb.getInt())
       bb.get(p)
       ObjectPointer.fromArray(p)
-    TracelessCommitEntry(ts, objects)
+    UnackedCommitEntry(ts, objects)
 
   /** poolIndex byte then the transaction UUID, big-endian: 17 bytes, like MissedUpdateMarker.errorKey */
   def key(store: StoreId, txid: TransactionId): Key =

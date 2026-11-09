@@ -66,31 +66,31 @@ class BootstrapMetadataSuite extends IntegrationTestSuite:
       got.map(_.value.bytes.toList) should be(Some(value.bytes.toList))
       ()
 
-  atest("the bootstrap and initial metadata pools have a TracelessCommits tree"):
+  atest("the bootstrap and initial metadata pools have a UnackedCommits tree"):
     given ExecutionContext = executionContext
     Future.sequence(List(PoolId.BootstrapPoolId, PoolId.InitialMetadataPoolId).map: poolId =>
       client.getStoragePool(poolId).flatMap: pool =>
-        insertAndGet(pool.tracelessCommitsTree, Key(Array[Byte](1, 2)), Value(Array[Byte](3)))
+        insertAndGet(pool.unackedCommitsTree, Key(Array[Byte](1, 2)), Value(Array[Byte](3)))
     ).map(_ => succeed)
 
-  atest("a new storage pool has a TracelessCommits tree"):
+  atest("a new storage pool has a UnackedCommits tree"):
     given ExecutionContext = executionContext
     for
       poolId <- client.createNewStoragePool("ordinary-tc", Replication(1, 1), None, RocksDBConfig(),
                   StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
       _ <- waitForTransactionsToComplete()
       pool <- client.getStoragePool(poolId)
-      _ <- insertAndGet(pool.tracelessCommitsTree, Key(Array[Byte](1, 2)), Value(Array[Byte](3)))
+      _ <- insertAndGet(pool.unackedCommitsTree, Key(Array[Byte](1, 2)), Value(Array[Byte](3)))
     yield succeed
 
-  atest("a new metadata pool has a TracelessCommits tree"):
+  atest("a new metadata pool has a UnackedCommits tree"):
     given ExecutionContext = executionContext
     for
       poolId <- client.createNewMetadataPool("metadata-tc", Replication(1, 1), None, RocksDBConfig(),
                   StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
       _ <- waitForTransactionsToComplete()
       pool <- client.getStoragePool(poolId)
-      _ <- insertAndGet(pool.tracelessCommitsTree, Key(Array[Byte](1, 2)), Value(Array[Byte](3)))
+      _ <- insertAndGet(pool.unackedCommitsTree, Key(Array[Byte](1, 2)), Value(Array[Byte](3)))
     yield succeed
 
   atest("the bootstrap device set lists the initial metadata pool"):

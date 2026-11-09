@@ -35,8 +35,8 @@ class Store(val storageDeviceId: StorageDeviceId,
             val maxSliceSize: Option[Long],
             /** The admission of the store's device's CRL, shared by the device's stores */
             val admission: CrlAdmission = CrlAdmission.Unlimited,
-            /** Looks up recovered commit votes in the pool's TracelessCommits tree (Frontend.requestTracelessLookup) */
-            val tracelessLookup: TracelessCommitLookup = TracelessCommitLookup.Never,
+            /** Looks up recovered commit votes in the pool's UnackedCommits tree (Frontend.requestUnackedLookup) */
+            val unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
             /** Posts a task to the executor of the store installed under this store's id (StoreRouter.post). None
               * runs tasks inline, for tests with synchronous backends
               */
@@ -50,7 +50,7 @@ class Store(val storageDeviceId: StorageDeviceId,
 
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
-    admission = admission, tracelessLookup = tracelessLookup,
+    admission = admission, unackedLookup = unackedLookup,
     // A reload installs a new Store under the same id: a task of this one's is dropped then
     post = postToStore match
       case None => task => task()
@@ -73,7 +73,7 @@ class Store(val storageDeviceId: StorageDeviceId,
       td.heartbeat()
     }
     frontend.transactions.values.foreach(_.checkCollisionWait())
-    frontend.retryTracelessLookups()
+    frontend.retryUnackedLookups()
     frontend.transactions.values.foreach { tx =>
       tx.reportIfStuck()
       if (tx.durationSinceLastEvent > txHeartbeatTimeout && !transactionDrivers.contains(tx.transactionId))

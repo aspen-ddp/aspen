@@ -187,7 +187,7 @@ class RepairService(client: AspenClient,
         scanStore(storeId, policy))
       .map: result =>
         if result.foundEntries then
-          logger.info(s"Repair scan of $storeId: ${result.seen} seen, ${result.tracelessSeen} TracelessCommits " +
+          logger.info(s"Repair scan of $storeId: ${result.seen} seen, ${result.unackedSeen} UnackedCommits " +
                       s"seen, ${result.repaired} repaired, ${result.deferred} deferred")
         result.foundEntries
 

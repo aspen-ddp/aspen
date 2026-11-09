@@ -142,9 +142,9 @@ class RepairServiceSuite extends IntegrationTestSuite:
       s.currentInterval shouldBe RepairPolicy.Default.scanIntervalFloor
       s.nextDue should be > 60_000L
 
-  test("a scan that finds only TracelessCommits entries is not quiet"):
+  test("a scan that finds only UnackedCommits entries is not quiet"):
     Future.successful:
-      ScanResult(seen = 0, repaired = 0, deferred = 0, tracelessSeen = 1).foundEntries shouldBe true
+      ScanResult(seen = 0, repaired = 0, deferred = 0, unackedSeen = 1).foundEntries shouldBe true
       ScanResult.Empty.foundEntries shouldBe false
 
   test("a store's deferral state is kept across its scans and dropped when the store departs"):

@@ -26,10 +26,10 @@ object Frontend {
     */
   val MissingDataWait: Duration = Duration(5, SECONDS)
 
-  /** How long a TracelessCommits lookup may go unanswered before the store heartbeat makes another. An answer can be
+  /** How long a UnackedCommits lookup may go unanswered before the store heartbeat makes another. An answer can be
     * lost: one completing before its store is installed in the StoreRouter is dropped
     */
-  val TracelessLookupTimeout: FiniteDuration = FiniteDuration(5, SECONDS)
+  val UnackedLookupTimeout: FiniteDuration = FiniteDuration(5, SECONDS)
 
   sealed abstract class ReadKind
 
@@ -58,8 +58,8 @@ class Frontend(val storeId: StoreId,
                val missingDataWait: Duration = Frontend.MissingDataWait,
                /** The admission of the store's device's CRL: see admitPrepare */
                val admission: CrlAdmission = CrlAdmission.Unlimited,
-               /** Looks up recovered commit votes in the pool's TracelessCommits tree: see requestTracelessLookup */
-               val tracelessLookup: TracelessCommitLookup = TracelessCommitLookup.Never,
+               /** Looks up recovered commit votes in the pool's UnackedCommits tree: see requestUnackedLookup */
+               val unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
                /** Runs a task on this store's executor: how completions arriving on other threads, such as a repair's
                  * backend write, get back to the Frontend's state. Inline by default, for tests with synchronous
                  * backends
@@ -257,7 +257,7 @@ class Frontend(val storeId: StoreId,
   // Before recoverTransactions, which counts what it recovers (see admitPrepare)
   private val admitted = scala.collection.mutable.HashMap[TransactionId, Admitted]()
 
-  /** A recovered commit vote's TracelessCommits lookups (see Tx.needsTracelessCheck). Each lookup has its own request
+  /** A recovered commit vote's UnackedCommits lookups (see Tx.needsUnackedCheck). Each lookup has its own request
     * id, from a counter of this Frontend's lookups, and its answer names it.
     *
     * @param latest the id of the latest lookup made
@@ -265,14 +265,14 @@ class Frontend(val storeId: StoreId,
     * @param startedAt when the latest lookup was made (System.nanoTime)
     * @param firstCounting the first id whose answer finding no entry counts: lookups made before the latest abort
     *                      arrived do not, since the entry may have been written after they read the tree
-    * @param failed the latest lookup failed: retryTracelessLookups makes another
+    * @param failed the latest lookup failed: retryUnackedLookups makes another
     * @param failures lookups failed in a row, for logging
     */
-  private final class TracelessLookup(var latest: Long, var inFlight: Boolean, var startedAt: Long,
+  private final class UnackedLookup(var latest: Long, var inFlight: Boolean, var startedAt: Long,
                                       var firstCounting: Long, var failed: Boolean, var failures: Int)
   // Before recoverTransactions: a recovered transaction that loads at once requests its lookup inside it
-  private val tracelessLookups = scala.collection.mutable.HashMap[TransactionId, TracelessLookup]()
-  private var nextTracelessRequest: Long = 0L
+  private val unackedLookups = scala.collection.mutable.HashMap[TransactionId, UnackedLookup]()
+  private var nextUnackedRequest: Long = 0L
 
   // Undeferred (tests only), the state is read here, which may block on the CRL
   if deferRecovery then awaitRecovery() else recoverTransactions(crl.getFullRecoveryState(storeId))
@@ -335,82 +335,82 @@ class Frontend(val storeId: StoreId,
     awaitingCrl = false
     releaseHeldMessages()
 
-  // ---- TracelessCommits lookups of recovered commit votes (Tx.needsTracelessCheck) ----
+  // ---- UnackedCommits lookups of recovered commit votes (Tx.needsUnackedCheck) ----
 
-  /** `tx` needs a TracelessCommits lookup started now: it has loaded, or an abort arrived. Only lookups made from now
+  /** `tx` needs a UnackedCommits lookup started now: it has loaded, or an abort arrived. Only lookups made from now
     * on can show the entry absent. One already in flight is not repeated: if it finds no entry, another is made
     */
-  def requestTracelessLookup(tx: Tx): Unit =
-    tracelessLookups.get(tx.transactionId) match
+  def requestUnackedLookup(tx: Tx): Unit =
+    unackedLookups.get(tx.transactionId) match
       case Some(l) =>
-        l.firstCounting = nextTracelessRequest
+        l.firstCounting = nextUnackedRequest
         if !l.inFlight then
-          startTracelessLookup(tx.transactionId, l)
+          startUnackedLookup(tx.transactionId, l)
       case None =>
-        val l = new TracelessLookup(-1L, false, 0L, nextTracelessRequest, false, 0)
-        tracelessLookups(tx.transactionId) = l
-        startTracelessLookup(tx.transactionId, l)
+        val l = new UnackedLookup(-1L, false, 0L, nextUnackedRequest, false, 0)
+        unackedLookups(tx.transactionId) = l
+        startUnackedLookup(tx.transactionId, l)
 
-  private def startTracelessLookup(txid: TransactionId, l: TracelessLookup): Unit =
-    val requestId = nextTracelessRequest
-    nextTracelessRequest += 1
+  private def startUnackedLookup(txid: TransactionId, l: UnackedLookup): Unit =
+    val requestId = nextUnackedRequest
+    nextUnackedRequest += 1
     l.latest = requestId
     l.inFlight = true
     l.startedAt = System.nanoTime()
     l.failed = false
     // Through `post`, so a store replaced meanwhile drops the answer rather than handing it to its successor
-    tracelessLookup.lookup(storeId, txid, requestId,
-      result => post(() => tracelessLookupComplete(txid, requestId, result)))
+    unackedLookup.lookup(storeId, txid, requestId,
+      result => post(() => unackedLookupComplete(txid, requestId, result)))
 
-  /** The answer to TracelessCommits lookup `requestId`, delivered on the store's executor.
+  /** The answer to UnackedCommits lookup `requestId`, delivered on the store's executor.
     *
     * An entry found concludes the Tx as committed, whichever lookup found it. None found releases the aborts it held,
     * if the lookup was made after the latest of them arrived; otherwise, if it was the latest lookup, another is made.
-    * A failure of the latest lookup keeps the aborts held, and retryTracelessLookups tries again. Ignored once the Tx
+    * A failure of the latest lookup keeps the aborts held, and retryUnackedLookups tries again. Ignored once the Tx
     * no longer needs it (it learned its outcome another way), and for a lookup this Frontend did not make
     */
-  def tracelessLookupComplete(txid: TransactionId, requestId: Long, result: Try[Boolean]): Unit =
-    tracelessLookups.get(txid).filter(_.latest >= requestId).foreach: l =>
-      transactions.get(txid).filter(_.needsTracelessCheck) match
-        case None => tracelessLookups.remove(txid)
+  def unackedLookupComplete(txid: TransactionId, requestId: Long, result: Try[Boolean]): Unit =
+    unackedLookups.get(txid).filter(_.latest >= requestId).foreach: l =>
+      transactions.get(txid).filter(_.needsUnackedCheck) match
+        case None => unackedLookups.remove(txid)
         case Some(tx) =>
           val isLatest = requestId == l.latest
           if isLatest then
             l.inFlight = false
           result match
             case Success(true) =>
-              tracelessLookups.remove(txid)
-              tx.tracelessCommitFound()
+              unackedLookups.remove(txid)
+              tx.unackedCommitFound()
               tx.releaseObjects() // Already done unless some of its objects had not loaded
               transactions -= txid
             case Success(false) if requestId >= l.firstCounting =>
-              tracelessLookups.remove(txid)
-              tx.tracelessCommitAbsent().foreach(handleTransactionMessage)
+              unackedLookups.remove(txid)
+              tx.unackedCommitAbsent().foreach(handleTransactionMessage)
             case Success(false) =>
               if isLatest then
-                startTracelessLookup(txid, l)
+                startUnackedLookup(txid, l)
             case Failure(err) =>
               if isLatest then
                 l.failed = true
                 l.failures += 1
                 if l.failures == 1 || l.failures % 60 == 0 then
-                  logger.warn(s"Store $storeId: TracelessCommits lookup of recovered transaction $txid failed " +
+                  logger.warn(s"Store $storeId: UnackedCommits lookup of recovered transaction $txid failed " +
                     s"(${l.failures} in a row), retrying at heartbeat: $err")
 
   /** Store heartbeat: makes another lookup for each one that failed, and for each unanswered after
-    * `Frontend.TracelessLookupTimeout`, whose answer may have been lost
+    * `Frontend.UnackedLookupTimeout`, whose answer may have been lost
     */
-  def retryTracelessLookups(now: Long = System.nanoTime()): Unit =
-    tracelessLookups.toList.foreach: (txid, l) =>
-      val timedOut = l.inFlight && now - l.startedAt >= TracelessLookupTimeout.toNanos
+  def retryUnackedLookups(now: Long = System.nanoTime()): Unit =
+    unackedLookups.toList.foreach: (txid, l) =>
+      val timedOut = l.inFlight && now - l.startedAt >= UnackedLookupTimeout.toNanos
       if l.failed || timedOut then
-        if transactions.get(txid).exists(_.needsTracelessCheck) then
+        if transactions.get(txid).exists(_.needsUnackedCheck) then
           if timedOut then
-            logger.warn(s"Store $storeId: TracelessCommits lookup of recovered transaction $txid went unanswered " +
-              s"for $TracelessLookupTimeout, looking up again")
-          startTracelessLookup(txid, l)
+            logger.warn(s"Store $storeId: UnackedCommits lookup of recovered transaction $txid went unanswered " +
+              s"for $UnackedLookupTimeout, looking up again")
+          startUnackedLookup(txid, l)
         else
-          tracelessLookups.remove(txid)
+          unackedLookups.remove(txid)
 
   private def releaseHeldMessages(): Unit =
     if !holding then
@@ -632,7 +632,7 @@ class Frontend(val storeId: StoreId,
     case m: TxFinalized =>
       transactions.get(m.transactionId) match
         case Some(tx) =>
-          // Not if the Tx holds the abort for a TracelessCommits lookup
+          // Not if the Tx holds the abort for a UnackedCommits lookup
           if tx.receiveFinalized(m) then
             tx.releaseObjects() // Already done unless some of its objects had not loaded
             transactions -= m.transactionId

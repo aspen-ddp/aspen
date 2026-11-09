@@ -232,6 +232,11 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     horizon ago, is proven committed if an object shows its update, and otherwise votes abort with `TransactionTooOld`
     without checking requirements or taking locks, so a forgotten transaction is never replayed. The cache warns,
     rate-limited, when it evicts an entry younger than the horizon for size
+  - A rebuilt store lost its Paxos acceptor state. `RebuildingStore.finish` writes `acceptor-since` (finish time plus
+    `AcceptorSinceMargin`, 10 s) into its directory; `Frontend.acceptorSince` mutes a prepare for an unknown
+    transaction started earlier (`Tx.muted`): proven committed if an object shows its update, otherwise forgotten
+    with no promise, vote, accept or CRL save, as if the store were offline. Its old incarnation may have accepted in
+    such a transaction, and a fresh promise could let a quorum choose against the chosen value
   - A driver's data-less prepare can overtake the client's prepare carrying a store's data. The store withholds its
     vote until the data, a client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes:
     missing data then gets an abort vote. A vote given stands, but later data is still used to apply a commit

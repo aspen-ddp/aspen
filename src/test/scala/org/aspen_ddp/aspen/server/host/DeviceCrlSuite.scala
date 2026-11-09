@@ -874,6 +874,29 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // Nothing on it is deleted
       os.exists(storeDir / StoreConfig.configFilename) should be(true)
 
+  atest("a store directory carrying acceptor-since loads with that acceptor start, and one without with none"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val since = HLCTimestamp(HLCTimestamp.now.asLong + (60000L << 16))
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      _ = os.write.over(storeDir / RebuildingStore.AcceptorSinceFile, since.asLong.toString)
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      loaded = host.control.router.loaded(storeId).frontend.acceptorSince
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = factory.shutdownAll()
+      _ = os.remove(storeDir / RebuildingStore.AcceptorSinceFile)
+      second = newFactory()
+      restarted = newCrlHost(hostRoot, second)
+      _ <- pumpUntil(restarted, restarted.control.router.loaded.contains(storeId))
+      reloaded = restarted.control.router.loaded(storeId).frontend.acceptorSince
+      _ <- restarted.control.router.loaded(storeId).backend.close()
+      _ = second.shutdownAll()
+    yield
+      loaded should be(Some(since))
+      reloaded should be(None)
+
   atest("a network transfer out of an unloaded store ships its device-CRL entries in its crl_save.log"):
     given ExecutionContext = executionContext
     val factory = newFactory()

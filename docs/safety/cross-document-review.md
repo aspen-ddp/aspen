@@ -33,6 +33,18 @@ scanning (fencing by pool entry, not by network); on `isFailed` relinquish like 
 when the tree is reachable.
 
 ### X2. Blank rebuilt acceptor vs a transaction that is stuck unresolved (rebuild F14 x CRL F18 x paxos P9 x transaction-recovery)
+
+> **FIXED.** Fixed 2026-11-09. A rebuilt store's acceptor covers only transactions started at or after the HLC time in its
+> `acceptor-since` file (`RebuildingStore.AcceptorSinceFile`), written when the rebuild finishes: finish time plus a
+> 10 s margin for client clocks running fast. `Frontend.acceptorSince` mutes a prepare for an unknown older transaction
+> (`Tx.muted`): it is still proven committed if an object shows its update, and otherwise forgotten with no promise,
+> vote, accept or CRL save. The store is then offline for every transaction its old incarnation might have joined, so
+> any later quorum meets the surviving holder of a chosen value. Accepted costs: such a transaction cannot be decided
+> if it needs the rebuilt store for its quorum, which is correct Paxos behaviour; a split tally waits on the muted
+> store, a stall and not a split (paxos F8); new transactions within the margin after promotion are muted there too.
+> Not covered: a zombie old copy on a partitioned host (X1 residual), or a client clock fast by more than the rebuild's
+> duration plus the margin. Tests: FrontendSuite "a rebuilt store ..." (6), RebuildingStoreSuite "a rebuilt store
+> records ...", DeviceCrlSuite "a store directory carrying acceptor-since ..."
 Verdict: PLAUSIBLE.  Severity: split-decision (commit vs abort).
 Rebuild F14 says amnesia "is safe only within the pool's failure tolerance". That is not a Paxos property: a chosen value held by exactly
 `t` acceptors survives a later quorum only through the `2t-w` intersection. For Replication(3,2), `2t-w = 1`, so ONE amnesiac acceptor can be

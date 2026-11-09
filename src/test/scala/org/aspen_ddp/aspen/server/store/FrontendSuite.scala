@@ -4,7 +4,7 @@ import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, OpportunisticRebuild, ReadResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, OpportunisticRebuild, ReadResponse, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, FullObject, Insert, Key, KeySet, KeyValueOperation, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -782,6 +782,89 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
       resolvedMessages(net) shouldBe Nil
+  }
+
+  // ---- A rebuilt store's acceptor start (Frontend.acceptorSince) ----
+  //
+  // A rebuilt store lost the Paxos state of its old incarnation. A transaction that started before its acceptor existed
+  // may have been chosen with the old incarnation's accept, so the store gives it no promise, vote or accept.
+
+  private def withAcceptorSince(statusCache: TransactionStatusCache = new TransactionStatusCache())
+                               (f: (Frontend, MapBackend, TestNet, TestCrl) => Unit): Unit =
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val crl = new TestCrl
+    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, horizon = horizon,
+      acceptorSince = Some(ago(FiniteDuration(2, SECONDS))))
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    f(frontend, backend, net, crl)
+
+  private def acceptResponses(net: TestNet): List[TxAcceptResponse] =
+    net.sentTx.collect { case r: TxAcceptResponse => r }
+
+  test("a rebuilt store gives a transaction older than its acceptor no promise or vote, and saves nothing") {
+    withAcceptorSince(): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(3, SECONDS)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      votes(net) shouldBe Nil
+      resolvedMessages(net) shouldBe Nil
+      crl.txSaved shouldBe false
+      frontend.transactions.contains(txid1) shouldBe false
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
+  }
+
+  test("a rebuilt store gives an older transaction's data-less driver prepare no promise or vote") {
+    withAcceptorSince(): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(3, SECONDS)))
+      frontend.receiveTransactionMessage(driverPrepare(txd))
+
+      votes(net) shouldBe Nil
+      crl.txSaved shouldBe false
+      frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("a rebuilt store accepts nothing for a transaction older than its acceptor") {
+    withAcceptorSince(): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(3, SECONDS)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.receiveTransactionMessage(TxAccept(storeId, StoreId(poolId, txd.designatedLeaderUID), txid1,
+        ProposalId.initialProposal(txd.designatedLeaderUID), true))
+
+      acceptResponses(net) shouldBe Nil
+      crl.txSaved shouldBe false
+  }
+
+  test("a rebuilt store still proves committed a transaction older than its acceptor whose update it shows") {
+    withAcceptorSince(): (frontend, backend, net, _) =>
+      appliedKVPrepare(frontend, backend, FiniteDuration(3, SECONDS))
+
+      resolvedMessages(net).map(_.committed) shouldBe List(true)
+      votes(net) shouldBe Nil
+  }
+
+  test("a rebuilt store votes on a transaction started after its acceptor") {
+    withAcceptorSince(): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(1, SECONDS)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      crl.txSaved shouldBe true
+  }
+
+  test("a rebuilt store gives no promise for an older transaction cached as resolved, and keeps the cached outcome") {
+    val statusCache = new TransactionStatusCache()
+    statusCache.updateStatus(txid1, TransactionStatus.Committed)
+    withAcceptorSince(statusCache): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(3, SECONDS)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      votes(net) shouldBe Nil
+      crl.txSaved shouldBe false
+      frontend.transactions.contains(txid1) shouldBe false
+      statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
   }
 
   test("a late client prepare with data inside the status cache is answered from the cache") {

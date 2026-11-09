@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.rebuild
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
-import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectType}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -13,6 +13,7 @@ import scribe.Logging
 
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.duration.{FiniteDuration, SECONDS}
 import scala.util.control.NonFatal
 
 object RebuildingStore:
@@ -36,6 +37,30 @@ object RebuildingStore:
   /** In a store directory being discarded: the store's device-CRL entries, saved by CrashRecoveryLog.saveStoreState
    *  before they are dropped from the device CRL, which a rebuild onto the same device would otherwise recover */
   val LostCrlStateFile = "lost-crl-state.log"
+
+  /** In a rebuilt store's directory: the HLC timestamp from which its Paxos acceptor state is complete
+   *  (Frontend.acceptorSince). Written by finish before the store moves into place, and kept for good (a network
+   *  transfer carries it with the directory). The old incarnation stopped before the rebuild began, so every
+   *  transaction it took part in started earlier, unless a client's clock ran more than AcceptorSinceMargin fast */
+  val AcceptorSinceFile = "acceptor-since"
+
+  /** Added to the finish time: a client stamps its transactions' start with its own clock */
+  val AcceptorSinceMargin: FiniteDuration = FiniteDuration(10, SECONDS)
+
+  private def acceptorSinceAfter(now: HLCTimestamp): HLCTimestamp =
+    HLCTimestamp(now.asLong + (AcceptorSinceMargin.toMillis << 16))
+
+  def writeAcceptorSince(storePath: os.Path): Unit =
+    DurableFiles.write(storePath / AcceptorSinceFile, acceptorSinceAfter(HLCTimestamp.now).asLong.toString)
+
+  /** The store's acceptor start, if it was rebuilt. A file that cannot be read counts as now plus the margin: later
+   *  than the truth, which only mutes more transactions */
+  def readAcceptorSince(storePath: os.Path): Option[HLCTimestamp] =
+    val file = storePath / AcceptorSinceFile
+    if !os.exists(file) then
+      None
+    else
+      Some(scala.util.Try(HLCTimestamp(os.read(file).trim.toLong)).getOrElse(acceptorSinceAfter(HLCTimestamp.now)))
 
   /** Objects between checkpoints. Small enough that a crash costs little, large enough that
    *  the flush is not the dominant cost. */
@@ -468,6 +493,8 @@ class RebuildingStore(client: AspenClient,
       // only survives if this pass never checkpointed. Dropping it here keeps it out of the
       // directory that is about to become a live store.
       RebuildState.removeAll(stagingPath)
+      // The rebuilt store has no Paxos state: it takes no part in transactions started before now (plus the margin)
+      writeAcceptorSince(stagingPath)
 
       os.move(stagingPath, finalPath)
       // Durable before the store is reported in place: a device shut down and moved after this

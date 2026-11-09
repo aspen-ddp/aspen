@@ -42,7 +42,13 @@ class Tx( trs: TransactionRecoveryState,
           /** A prepare for a transaction its store did not know, older than the store's horizon (Frontend.horizon):
             * proven committed or voted abort, never checked. Never set for a recovered transaction
             */
-          val tooOld: Boolean = false) extends Logging {
+          val tooOld: Boolean = false,
+          /** A prepare for a transaction that started before its rebuilt store's acceptor existed
+            * (Frontend.acceptorSince): the store may have promised or accepted in it before its Paxos state was lost, so
+            * it takes no part. Proven committed as tooOld is, or forgotten with no promise, vote, accept or CRL save.
+            * Implies tooOld
+            */
+          val muted: Boolean = false) extends Logging {
 
   val transactionId: TransactionId = txd.transactionId
 
@@ -156,6 +162,9 @@ class Tx( trs: TransactionRecoveryState,
     * voted commit and recovered after. See proveCommitted
     */
   private var provenCommitted: Boolean = false
+
+  /** A muted Tx answered a prepare before its objects loaded: it is forgotten once they have, unless proven committed */
+  private var mutedAwaitingLoad: Boolean = false
 
   /** The commit decision can overtake the client's prepare too. Applying now would lose the object update, so the
     * commit waits, without a TxCommitted, and the driver sees the store's TxCommitted when the data arrives instead of
@@ -418,7 +427,12 @@ class Tx( trs: TransactionRecoveryState,
   }
 
   private def sendDelayedPrepare(): Unit = {
-    delayedPrepare.foreach { response =>
+    if muted then
+      if mutedAwaitingLoad && allObjectsLoaded then
+        mutedAwaitingLoad = false
+        if !provenCommitted then
+          frontend.forgetMuted(this)
+    else delayedPrepare.foreach { response =>
       logger.trace(s"AllObjectsLoaded. Saving to CRL before sending PrepareResponse for tx ${transactionId}")
       val r = response.copy(disposition=disposition, collisions=collisions)
       delayedPrepare = None
@@ -727,7 +741,17 @@ class Tx( trs: TransactionRecoveryState,
         respondToPrepare(m)
   }
 
-  private def respondToPrepare(m: TxPrepare): Unit = {
+  private def respondToPrepare(m: TxPrepare): Unit =
+    if muted then
+      // No promise and no vote: see muted. Decided once the objects are loaded, which the proof of commit needs
+      if allObjectsLoaded then
+        frontend.forgetMuted(this)
+      else
+        mutedAwaitingLoad = true
+    else
+      answerPrepareAsAcceptor(m)
+
+  private def answerPrepareAsAcceptor(m: TxPrepare): Unit = {
     val result = acceptor.receivePrepare(Prepare(m.proposalId)) match {
       case Right(p) => Right(TxPrepareResponse.Promise(p.lastAccepted))
       case Left(n) => Left(TxPrepareResponse.Nack(n.promisedProposalId))
@@ -748,7 +772,7 @@ class Tx( trs: TransactionRecoveryState,
       delayedPrepare = Some(txr)
   }
 
-  def receiveAccept(m: TxAccept): Unit = {
+  def receiveAccept(m: TxAccept): Unit = if !muted then {
     updateLastEvent()
 
     val result = acceptor.receiveAccept(Accept(m.proposalId, m.value)) match {

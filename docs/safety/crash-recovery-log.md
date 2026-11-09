@@ -936,6 +936,9 @@ CLAUDE.md and not re-verified here.
 
 ### F18. A rebuilt store has no memory of the Paxos state it lost (open question; low confidence)
 
+> **RESOLVED (2026-11-09)** by the X2 fix (cross-document-review.md): the rebuilt store takes no part in any
+> transaction started before its `acceptor-since` time.
+
 **Verification: OPEN, not a CRL code defect; PLAUSIBLE only under correlated loss.** Safe in practice by timing: a rebuild takes long enough that every transaction in flight at the loss has been finalized at the other stores, and old prepares vote `TransactionTooOld`. Belongs to the Paxos documents.
 
 After a lost CRL the store's directory is discarded and the store rebuilt under the same `StoreId`. A transaction in

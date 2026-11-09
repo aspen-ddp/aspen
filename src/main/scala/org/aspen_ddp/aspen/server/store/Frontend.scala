@@ -72,6 +72,13 @@ class Frontend(val storeId: StoreId,
                  * Host.txHorizon in hosts; infinite (off) by default
                  */
                val horizon: Duration = Duration.Inf,
+               /** Set for a rebuilt store (RebuildingStore.AcceptorSinceFile): its Paxos acceptor state covers only
+                 * transactions started at or after it. Its old incarnation may have promised or accepted in an older
+                 * one before that state was lost, and a fresh promise or vote could then let a quorum choose against
+                 * the value already chosen. A prepare for an older transaction it does not know is muted (Tx.muted):
+                 * proven committed, or forgotten unanswered, as if the store were offline. None: an ordinary store
+                 */
+               val acceptorSince: Option[HLCTimestamp] = None,
                /** Recovers nothing at construction: transaction messages are held until recover is called. For
                  * stores whose backend's completion handler is set after they are built (StoreLoader), where a read
                  * a recovered transaction issued in the constructor would never complete
@@ -478,6 +485,15 @@ class Frontend(val storeId: StoreId,
     admitted.remove(txid).foreach(a => admission.release(a.bytes))
 
   /** Deletes a transaction's CRL entry and releases its admission */
+  /** Drops a muted Tx that was not proven committed (Tx.muted): it holds no locks and saved nothing */
+  def forgetMuted(tx: Tx): Unit =
+    if transactions.get(tx.transactionId).exists(_ eq tx) then
+      logger.info(s"Store $storeId takes no part in transaction ${tx.transactionId}: it started before this rebuilt " +
+                  s"store's acceptor existed")
+      transactions -= tx.transactionId
+      tx.releaseObjects()
+      releaseAdmission(tx.transactionId)
+
   def deleteTransactionState(txid: TransactionId): Unit =
     crl.deleteTransaction(storeId, txid)
     releaseAdmission(txid)
@@ -652,14 +668,18 @@ class Frontend(val storeId: StoreId,
       val known = cached.filter(_.status != TransactionStatus.Unresolved)
       // Measured with the HLC from the client-assigned start, so a client clock running behind makes it look older. An
       // Unresolved entry counts as none: another store's Tx on this host wrote it, which says nothing of the outcome
-      val tooOld = known.isEmpty && HLCTimestamp.now - m.txd.startTimestamp > horizon
+      val muted = acceptorSince.exists(m.txd.startTimestamp < _)
+      val tooOld = muted || (known.isEmpty && HLCTimestamp.now - m.txd.startTimestamp > horizon)
       val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates, takeSerializedTxd(m.txd.transactionId))
       val pointers = m.txd.allHostedObjects(m.to)
-      val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers, tooOld = tooOld)
+      val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers, tooOld = tooOld,
+        muted = muted)
       transactions += (m.txd.transactionId -> tx)
       tx.receivePrepare(m)
       known.foreach { entry =>
-        tx.outcomeDecided()
+        // A muted Tx takes no part, a cached outcome included
+        if !muted then
+          tx.outcomeDecided()
         statusCache.updateStatus(m.txd.transactionId, entry.status) // The new Tx recorded itself as Unresolved
       }
       pointers.foreach(ptr => readObjectForTransaction(tx, ptr))

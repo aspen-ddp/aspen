@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.rebuild
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.scalatest.compatible
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectId, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -110,6 +110,35 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // Every allocated object was reconstructed and is readable from the rebuilt store.
       readResults.size should be(20)
       readResults.forall(_.isDefined) should be(true)
+
+  atest("a rebuilt store records that its acceptor covers only transactions started after its rebuild"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    for
+      _ <- populate(3)
+      _ <- net.waitForTransactionsToComplete()
+      before = HLCTimestamp.now
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends)
+      _ <- rebuild.complete
+      after = HLCTimestamp.now
+    yield
+      val since = RebuildingStore.readAcceptorSince(dev / storeId.directoryName)
+      since.isDefined should be(true)
+      // At least the margin past the start of the rebuild, and no more than the margin past its end
+      (since.get - before) should be >= RebuildingStore.AcceptorSinceMargin.asInstanceOf[scala.concurrent.duration.Duration]
+      (since.get - after) should be <= RebuildingStore.AcceptorSinceMargin.asInstanceOf[scala.concurrent.duration.Duration]
+
+  atest("an unreadable acceptor-since file reads as now plus the margin, and an absent one as none"):
+    given ExecutionContext = executionContext
+    val dir = deviceDir()
+    val absent = RebuildingStore.readAcceptorSince(dir)
+    os.write.over(dir / RebuildingStore.AcceptorSinceFile, "not a timestamp")
+    val before = HLCTimestamp.now
+    val unreadable = RebuildingStore.readAcceptorSince(dir)
+    Future.successful:
+      absent should be(None)
+      unreadable.isDefined should be(true)
+      (unreadable.get - before) should be >= RebuildingStore.AcceptorSinceMargin.asInstanceOf[scala.concurrent.duration.Duration]
 
   atest("a pre-existing final directory skips straight to completion"):
     given ExecutionContext = executionContext

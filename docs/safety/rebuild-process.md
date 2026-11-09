@@ -734,6 +734,9 @@ device this host did not adopt; its rightful owner then reads them as lost store
 
 **Verification: REFUTED as a harm.** The marker is written in the prepare closure (`DeviceMetadata.scala:540-546`) but `crlLostStores(devicePath, state)` is derived from the disk's own contents, so the CRL state really is gone whichever host ends up owning the device; a retry that returns Changed/Unclean leaves markers that are true statements about the disk. The comment at `:541-542` says exactly that. (It is still impure code in a retried closure, doc-only.) Strike from the active list; systemic-loss-protection.md D4 note updated accordingly.
 
+> **F14 FIXED (2026-11-09)** with cross-document X2: a rebuilt store mutes prepares for transactions started before
+> its `acceptor-since` time. See cross-document-review.md X2.
+
 **F14 (Low) The rebuilt store is a blank acceptor.**
 Promotion creates a `Frontend` with no transactions (`StoreLoader.scala:304-359`); `TxAccept`/`TxHeartbeat` for
 unknown transactions are ignored and a `TxPrepare` creates a fresh `Tx` (`server/store/Frontend.scala:608-650`),

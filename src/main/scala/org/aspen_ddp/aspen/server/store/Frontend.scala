@@ -16,6 +16,7 @@ import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 
 import scala.concurrent.duration.{Duration, SECONDS}
 import scala.concurrent.{Future, Promise}
+import scala.util.{Failure, Success, Try}
 
 
 object Frontend {
@@ -46,7 +47,9 @@ class Frontend(val storeId: StoreId,
                val maxSliceSize: Option[Long] = None,
                val missingDataWait: Duration = Frontend.MissingDataWait,
                /** The admission of the store's device's CRL: see admitPrepare */
-               val admission: CrlAdmission = CrlAdmission.Unlimited) extends Logging {
+               val admission: CrlAdmission = CrlAdmission.Unlimited,
+               /** Looks up recovered commit votes in the pool's TracelessCommits tree: see requestTracelessLookup */
+               val tracelessLookup: TracelessCommitLookup = TracelessCommitLookup.Never) extends Logging {
 
   import Frontend._
 
@@ -207,6 +210,19 @@ class Frontend(val storeId: StoreId,
   // Before recoverTransactions, which counts what it recovers (see admitPrepare)
   private val admitted = scala.collection.mutable.HashMap[TransactionId, Admitted]()
 
+  /** A recovered commit vote's TracelessCommits lookup (see Tx.needsTracelessCheck).
+    *
+    * @param inFlight a lookup has been made and not answered
+    * @param again an abort arrived while it was in flight: an answer finding no entry does not count, and another
+    *              lookup is made
+    * @param failed the last lookup failed: retryTracelessLookups makes another
+    * @param failures lookups failed in a row, for logging
+    */
+  private final class TracelessLookup(var inFlight: Boolean, var again: Boolean, var failed: Boolean,
+                                      var failures: Int)
+  // Before recoverTransactions: a recovered transaction that loads at once requests its lookup inside it
+  private val tracelessLookups = scala.collection.mutable.HashMap[TransactionId, TracelessLookup]()
+
   recoverTransactions()
 
   /** Recreates the transactions the CRL holds for this store that are not already known.
@@ -263,6 +279,61 @@ class Frontend(val storeId: StoreId,
     awaitingCrl = false
     recoverTransactions()
     releaseHeldMessages()
+
+  // ---- TracelessCommits lookups of recovered commit votes (Tx.needsTracelessCheck) ----
+
+  /** `tx` needs a TracelessCommits lookup started now: it has loaded, or an abort arrived. A lookup already in flight
+    * is not repeated, but its answer counts only if it found the entry
+    */
+  def requestTracelessLookup(tx: Tx): Unit =
+    tracelessLookups.get(tx.transactionId) match
+      case Some(l) if l.inFlight => l.again = true
+      case _ => startTracelessLookup(tx.transactionId)
+
+  private def startTracelessLookup(txid: TransactionId): Unit =
+    val l = tracelessLookups.getOrElseUpdate(txid, new TracelessLookup(false, false, false, 0))
+    l.inFlight = true
+    l.again = false
+    l.failed = false
+    tracelessLookup.lookup(storeId, txid)
+
+  /** The answer to a TracelessCommits lookup, delivered on the store's executor. An entry found concludes the Tx as
+    * committed. None found releases the aborts it held, unless one arrived after the lookup started. A failure keeps
+    * them held, and retryTracelessLookups tries again. Ignored once the Tx no longer needs it (it learned its outcome
+    * another way) and for a lookup this Frontend did not make
+    */
+  def tracelessLookupComplete(txid: TransactionId, result: Try[Boolean]): Unit =
+    tracelessLookups.get(txid).filter(_.inFlight).foreach: l =>
+      l.inFlight = false
+      transactions.get(txid).filter(_.needsTracelessCheck) match
+        case None => tracelessLookups.remove(txid)
+        case Some(tx) =>
+          result match
+            case Success(true) =>
+              tracelessLookups.remove(txid)
+              tx.tracelessCommitFound()
+              tx.releaseObjects() // Already done unless some of its objects had not loaded
+              transactions -= txid
+            case Success(false) if l.again =>
+              startTracelessLookup(txid)
+            case Success(false) =>
+              tracelessLookups.remove(txid)
+              tx.tracelessCommitAbsent().foreach(handleTransactionMessage)
+            case Failure(err) =>
+              l.failed = true
+              l.failures += 1
+              if l.failures == 1 || l.failures % 60 == 0 then
+                logger.warn(s"Store $storeId: TracelessCommits lookup of recovered transaction $txid failed " +
+                  s"(${l.failures} in a row), retrying at heartbeat: $err")
+
+  /** Store heartbeat: makes another lookup for each one that failed */
+  def retryTracelessLookups(): Unit =
+    tracelessLookups.toList.foreach: (txid, l) =>
+      if l.failed then
+        if transactions.get(txid).exists(_.needsTracelessCheck) then
+          startTracelessLookup(txid)
+        else
+          tracelessLookups.remove(txid)
 
   private def releaseHeldMessages(): Unit =
     if !holding then
@@ -470,11 +541,12 @@ class Frontend(val storeId: StoreId,
     case m: TxFinalized =>
       transactions.get(m.transactionId) match
         case Some(tx) =>
-          tx.receiveFinalized(m)
-          tx.releaseObjects() // Already done unless some of its objects had not loaded
+          // Not if the Tx holds the abort for a TracelessCommits lookup
+          if tx.receiveFinalized(m) then
+            tx.releaseObjects() // Already done unless some of its objects had not loaded
+            transactions -= m.transactionId
         // Remembered for a prepare that arrives after this. See receivePrepare
         case None => statusCache.updateStatus(m.transactionId, statusOf(m.committed), finalized = true)
-      transactions -= m.transactionId
     case m: TxHeartbeat => transactions.get(m.transactionId).foreach(tx => tx.receiveHeartbeat(m))
     case m: TxStatusRequest => transactions.get(m.transactionId).foreach(tx => tx.receiveStatusRequest(m))
     case _ => // Other TxMessages are not relevant

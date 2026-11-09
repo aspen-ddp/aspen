@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.internal.transaction.TracelessCommitEntry
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.ObjectId
@@ -12,7 +13,7 @@ import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDevice
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
-import org.aspen_ddp.aspen.server.store.Store
+import org.aspen_ddp.aspen.server.store.{Store, TracelessCommitLookup}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler, DefaultBackendOpener}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
@@ -190,6 +191,16 @@ class Host(val client: AspenClient,
 
   private val hostMetadata: DeviceMetadata = seams.metadata.getOrElse(clientMetadata)
 
+  /** Stores have no client, so a recovered commit vote's TracelessCommits lookup reads its pool's tree through the
+   *  host's, on `ec`. The answer is posted to the store's executor, and dropped if the store is gone by then. */
+  private val tracelessLookup: TracelessCommitLookup = (storeId, txid) =>
+    given ExecutionContext = ec
+    Future.unit
+      .flatMap(_ => client.getStoragePool(storeId.poolId))
+      .flatMap(_.tracelessCommitsTree.get(TracelessCommitEntry.key(storeId, txid)))
+      .onComplete: result =>
+        deviceControl.router.post(storeId)(_.frontend.tracelessLookupComplete(txid, result.map(_.isDefined)))
+
   private val deviceControl: DeviceControl = new DeviceControl(
     metadata = seams.wrapMetadata.fold(hostMetadata)(wrap => wrap(hostMetadata)),
     scheduler = controlScheduler,
@@ -231,7 +242,8 @@ class Host(val client: AspenClient,
       (_, fn) => controlScheduler.schedule(shutdownWorkTimeout)(fn())),
     scheduleEndpointRetry = fn => controlScheduler.schedule(Duration(5, SECONDS))(fn()),
     ec = ec,
-    writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker))
+    writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker),
+    tracelessLookup = tracelessLookup)
 
   private val shutdownPromise: Promise[Unit] = Promise()
 

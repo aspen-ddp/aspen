@@ -32,11 +32,13 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** The store's effective slice size limit (StoreConfig.effectiveMaxSliceSize). None means unlimited. */
             val maxSliceSize: Option[Long],
             /** The admission of the store's device's CRL, shared by the device's stores */
-            val admission: CrlAdmission = CrlAdmission.Unlimited) extends Logging {
+            val admission: CrlAdmission = CrlAdmission.Unlimited,
+            /** Looks up recovered commit votes in the pool's TracelessCommits tree (Frontend.requestTracelessLookup) */
+            val tracelessLookup: TracelessCommitLookup = TracelessCommitLookup.Never) extends Logging {
 
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
-    admission = admission)
+    admission = admission, tracelessLookup = tracelessLookup)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's
@@ -54,6 +56,7 @@ class Store(val storageDeviceId: StorageDeviceId,
       td.heartbeat()
     }
     frontend.transactions.values.foreach(_.checkCollisionWait())
+    frontend.retryTracelessLookups()
     frontend.transactions.values.foreach { tx =>
       tx.reportIfStuck()
       if (tx.durationSinceLastEvent > txHeartbeatTimeout && !transactionDrivers.contains(tx.transactionId))

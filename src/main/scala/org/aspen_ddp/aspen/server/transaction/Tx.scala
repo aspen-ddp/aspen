@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.transaction
 
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
+import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -59,7 +59,7 @@ class Tx( trs: TransactionRecoveryState,
   private def pointerOf(objectId: ObjectId): ObjectPointer = pointersById(objectId)
   private var disposition = trs.disposition
   private var collisions: List[TransactionId] = Nil
-  private var status = trs.status
+  private var txStatus = trs.status
   private var oresolution: Option[Boolean] = None
   private var ofinalized: Option[Boolean] = None
   private var objects: Map[ObjectId, ObjectState] = Map()
@@ -97,9 +97,29 @@ class Tx( trs: TransactionRecoveryState,
   /** TxFinalized arrived while the commit was held for its turn: the Frontend is told once the commit is issued */
   private var finalizeDeferred = false
 
-  statusCache.updateStatus(transactionId, status)
+  /** Abort resolutions held, oldest first, until a TracelessCommits lookup started after them completes. See
+    * needsTracelessCheck
+    */
+  private var heldAborts: List[TxMessage] = Nil
+  /** A lookup started after the held aborts found no entry: they, and later ones, are accepted */
+  private var abortsAccepted = false
+
+  statusCache.updateStatus(transactionId, txStatus)
 
   private def allObjectsLoaded: Boolean = pendingObjectLoads == 0
+
+  def status: TransactionStatus.Value = txStatus
+
+  /** A commit vote recovered from the CRL whose outcome is unknown. Its transaction may have committed and been
+    * finalized and forgotten while this store was down: a recovery driver could then decide abort, and the store would
+    * drop an update that counted towards the write threshold. If the change leaves no trace (a refcount change or a key
+    * delete), the finalizer recorded the miss in the pool's TracelessCommits tree, so the Tx looks up its entry once
+    * it has loaded, and holds every abort until a lookup started after the abort finds none. An entry found means the
+    * transaction committed: the Tx applies its update and is forgotten as if finalized. See Frontend.requestTracelessLookup
+    */
+  def needsTracelessCheck: Boolean =
+    recovered && disposition == TransactionDisposition.VoteCommit && txStatus == TransactionStatus.Unresolved &&
+      oresolution.isEmpty
 
   private def missingObjectData: Boolean =
     val have = objectUpdates.iterator.map(_.objectId).toSet
@@ -175,7 +195,8 @@ class Tx( trs: TransactionRecoveryState,
       s"Locked: $locked. CommitHeld: $commitHeld. Committing: $committing. Committed: $committed. " +
       s"PendingLoads: $pendingObjectLoads. PendingCommits: $pendingObjectCommits. ClientPrepared: $clientPrepared. " +
       s"Recovered: $recovered. Waiting on: $waitingOn. Awaiting commits of: $awaitingCommits. " +
-      s"Commit queued: $commitQueued. Last proposer: $lastProposer. Object revisions: $revisions"
+      s"Commit queued: $commitQueued. Held aborts: ${heldAborts.size}. Last proposer: $lastProposer. " +
+      s"Object revisions: $revisions"
 
   private var lastStuckReport: Option[Long] = None
 
@@ -214,7 +235,7 @@ class Tx( trs: TransactionRecoveryState,
     * resolved status of a Tx recovered from the CRL.
     */
   private def lock(): Unit =
-    if !locked && !outcomeKnown && status == TransactionStatus.Unresolved &&
+    if !locked && !outcomeKnown && txStatus == TransactionStatus.Unresolved &&
       disposition == TransactionDisposition.VoteCommit then
       locked = true
       lockedWrites = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
@@ -384,6 +405,9 @@ class Tx( trs: TransactionRecoveryState,
     // out a collision, or waiting for in-flight commits, answers when the wait ends
     if !withholdingVote then
       sendDelayedPrepare()
+
+    if needsTracelessCheck then
+      frontend.requestTracelessLookup(this)
   }
 
   private def sendDelayedPrepare(): Unit = {
@@ -392,7 +416,7 @@ class Tx( trs: TransactionRecoveryState,
       val r = response.copy(disposition=disposition, collisions=collisions)
       delayedPrepare = None
       val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
-        disposition, status, acceptor.persistentState)
+        disposition, txStatus, acceptor.persistentState)
       crl.save(txd.transactionId, state, () =>
         logger.trace(s"AllObjectsLoaded. CRL Save Complete. Sending PrepareResponse for tx ${transactionId}")
         net.sendTransactionMessage(r)
@@ -615,12 +639,12 @@ class Tx( trs: TransactionRecoveryState,
       frontend.stopAwaitingCommits(awaitingCommits, this)
       awaitingCommits = Set()
 
-    status = if (committed)
+    txStatus = if (committed)
       TransactionStatus.Committed
     else
       TransactionStatus.Aborted
 
-    statusCache.updateStatus(transactionId, status)
+    statusCache.updateStatus(transactionId, txStatus)
 
     if (allObjectsLoaded)
       resolvedAndAllObjectsLoaded(committed)
@@ -699,7 +723,7 @@ class Tx( trs: TransactionRecoveryState,
 
     if allObjectsLoaded then
       val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
-        disposition, status, acceptor.persistentState)
+        disposition, txStatus, acceptor.persistentState)
       crl.save(txd.transactionId, state, () =>
         logger.trace(s"CRL Transaction save complete. Sending PrepareResponse: ${m.transactionId}")
         net.sendTransactionMessage(txr)
@@ -718,7 +742,7 @@ class Tx( trs: TransactionRecoveryState,
     }
     val tar = TxAcceptResponse(m.from, storeId, transactionId, m.proposalId, result)
     val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
-      disposition, status, acceptor.persistentState)
+      disposition, txStatus, acceptor.persistentState)
 
     crl.save(txd.transactionId, state, () =>
       logger.trace(s"CRL Accept save completed for tx: ${tar.transactionId}. Sending AcceptResponse")
@@ -729,14 +753,28 @@ class Tx( trs: TransactionRecoveryState,
   def receiveResolved(m: TxResolved): Unit = {
     reportLateOutcome("TxResolved", m.from)
     updateLastEvent()
-    resolved(m.committed)
+    if m.committed || !holdAbort(m) then
+      resolved(m.committed)
   }
 
-  def receiveFinalized(m: TxFinalized): Unit = if (ofinalized.isEmpty) {
-    reportLateOutcome("TxFinalized", m.from)
-    updateLastEvent()
-    resolved(m.committed)
-    ofinalized = Some(m.committed)
+  /** Returns false if the finalization is held for a TracelessCommits lookup (see needsTracelessCheck): the Tx is then
+    * still live
+    */
+  def receiveFinalized(m: TxFinalized): Boolean =
+    if ofinalized.nonEmpty then
+      true
+    else
+      reportLateOutcome("TxFinalized", m.from)
+      updateLastEvent()
+      if !m.committed && holdAbort(m) then
+        false
+      else
+        finalized(m.committed)
+        true
+
+  private def finalized(committed: Boolean): Unit =
+    resolved(committed)
+    ofinalized = Some(committed)
     releaseHeldCommit()
     // Whatever the outcome: a prepare after an abort, or from a recovery driver, may have saved this Tx again. Deferred
     // while backend commits of a committed transaction are outstanding or failed, or still held for their turn
@@ -744,8 +782,42 @@ class Tx( trs: TransactionRecoveryState,
       finalizeDeferred = true
     else
       frontend.transactionFinalized(transactionId)
-    statusCache.updateStatus(transactionId, status, finalized = true)
-  }
+    statusCache.updateStatus(transactionId, txStatus, finalized = true)
+
+  /** Holds an abort resolution of a recovered commit vote until a TracelessCommits lookup started after it completes.
+    * A lookup already in flight does not count: the entry may have been written after it read the tree
+    */
+  private def holdAbort(m: TxMessage): Boolean =
+    if needsTracelessCheck && !abortsAccepted then
+      heldAborts = heldAborts :+ m
+      frontend.requestTracelessLookup(this)
+      true
+    else
+      false
+
+  /** The pool's TracelessCommits tree holds this store's entry for the transaction: it committed, and was finalized
+    * and forgotten while this store was down. The saved update is applied through the normal commit path, its
+    * requirements re-checked so nothing is applied twice, and the Tx is concluded as if finalized: no TxFinalized will
+    * come. The Frontend then forgets it. The tree entry is left for the repair scan
+    */
+  def tracelessCommitFound(): Unit =
+    if needsTracelessCheck then
+      heldAborts = Nil
+      updateLastEvent()
+      finalized(true)
+      val changed = RequirementsApplyer.changedObjects(requirements).intersect(pointersById.keySet)
+      logger.info(s"Store $storeId applied committed transaction $transactionId learned from the TracelessCommits " +
+        s"tree (objects: ${changed.map(_.uuid).mkString(", ")})")
+
+  /** A TracelessCommits lookup started after the held aborts found no entry: either the transaction did not commit, or
+    * this store applied it durably. Returns the held aborts, for the Frontend to handle again; they are accepted now
+    */
+  def tracelessCommitAbsent(): List[TxMessage] =
+    val held = heldAborts
+    heldAborts = Nil
+    if held.nonEmpty then
+      abortsAccepted = true
+    held
 
   def receiveHeartbeat(m: TxHeartbeat): Unit = {
     updateLastEvent()
@@ -753,7 +825,7 @@ class Tx( trs: TransactionRecoveryState,
 
   def receiveStatusRequest(m: TxStatusRequest): Unit = {
     val r = TxStatusResponse(m.from, storeId, transactionId, m.requestUUID,
-      Some(TxStatusResponse.TxStatus(status, ofinalized.nonEmpty)))
+      Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty)))
     net.sendTransactionMessage(r)
   }
 

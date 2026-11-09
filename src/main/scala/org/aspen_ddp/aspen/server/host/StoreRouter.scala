@@ -3,12 +3,12 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.*
-import org.aspen_ddp.aspen.common.objects.{ObjectId, ReadError}
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionStatus
 import org.aspen_ddp.aspen.server.DurableFiles
 import org.aspen_ddp.aspen.server.repair.StoreNotHosted
-import org.aspen_ddp.aspen.server.store.Store
+import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store}
 import org.aspen_ddp.aspen.server.store.backend.CompletionHandler
 import scribe.Logging
 
@@ -174,15 +174,23 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
           val r = TransactionCompletionResponse(s.fromClient, s.toStore, s.queryUUID, isComplete)
           ctx.net.sendClientResponse(r)
 
-  def repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
+  // A repair aimed at a store that left between the sweep selecting it and the task running fails. Leaving the
+  // promise open would strand the scan that awaits it, and with it the sweep's single-flight slot -- repair would
+  // stop host-wide until the process restarts. Failing also leaves the errorTree entry in place for the store's new
+  // host.
+
+  def snapshotForRepair(storeId: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
     val notHosted: () => Unit = () =>
-      // The store left between the sweep selecting it and this task running. Leaving
-      // the promise open would strand the scan that awaits it, and with it the sweep's
-      // single-flight slot -- repair would stop host-wide until the process restarts.
-      // Failing also leaves the errorTree entry in place for the store's new host.
-      logger.debug(s"Ignoring repair of ${os.pointer.id}: store $storeId is not hosted here")
-      completion.failure(StoreNotHosted(storeId))
-    route(storeId, notHosted)(_.repair(os, completion))
+      logger.debug(s"Ignoring repair snapshot of ${pointer.id}: store $storeId is not hosted here")
+      p.failure(StoreNotHosted(storeId))
+    route(storeId, notHosted)(_.snapshotForRepair(pointer, p))
+
+  def reconcileForRepair(storeId: StoreId, snapshot: RepairSnapshot, read: ClientObjectState,
+                         p: Promise[ReconcileResult]): Unit =
+    val notHosted: () => Unit = () =>
+      logger.debug(s"Ignoring repair of ${read.pointer.id}: store $storeId is not hosted here")
+      p.failure(StoreNotHosted(storeId))
+    route(storeId, notHosted)(_.reconcileForRepair(snapshot, read, p))
 
   def repairDelete(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte], completion: Promise[Unit]): Unit =
     val notHosted: () => Unit = () =>

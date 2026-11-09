@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.{AspenClient, ObjectState as ClientObjectState
 import org.aspen_ddp.aspen.client.internal.transaction.TracelessCommitEntry
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.*
-import org.aspen_ddp.aspen.common.objects.ObjectId
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDevice
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
-import org.aspen_ddp.aspen.server.store.{Store, TracelessCommitLookup}
+import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store, TracelessCommitLookup}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler, DefaultBackendOpener}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
@@ -373,8 +373,12 @@ class Host(val client: AspenClient,
   def receiveHostMessage(msg: HostMessage): Unit =
     post(HostMsg(msg))
 
-  def repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
-    deviceControl.router.repair(storeId, os, completion)
+  def snapshot(storeId: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+    deviceControl.router.snapshotForRepair(storeId, pointer, p)
+
+  def reconcile(storeId: StoreId, snapshot: RepairSnapshot, read: ClientObjectState,
+                p: Promise[ReconcileResult]): Unit =
+    deviceControl.router.reconcileForRepair(storeId, snapshot, read, p)
 
   /** Repairs a missed deletion on the given store. Used when the object is gone from the rest
     * of the system, leaving only the ObjectId and the storePointer bytes recorded in the pool's

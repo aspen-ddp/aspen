@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import com.github.blemale.scaffeine.Scaffeine
 import org.aspen_ddp.aspen.common.network.*
-import org.aspen_ddp.aspen.common.objects.ObjectId
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
@@ -82,9 +82,11 @@ class Store(val storageDeviceId: StorageDeviceId,
     }
   }
 
-  def repair(os: ClientObjectState, completion: Promise[Unit]): Unit = {
-    frontend.readObjectForRepair(os, completion)
-  }
+  def snapshotForRepair(pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+    frontend.snapshotForRepair(pointer, p)
+
+  def reconcileForRepair(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult]): Unit =
+    frontend.reconcileForRepair(snapshot, read, p)
 
   def repairDelete(objectId: ObjectId,
                    storePointer: Array[Byte],

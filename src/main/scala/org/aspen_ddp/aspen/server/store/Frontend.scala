@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit,
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
 import scribe.Logging
-import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
+import org.aspen_ddp.aspen.client.{ReadLocks, ObjectState as ClientObjectState}
 
 import scala.concurrent.duration.{Duration, FiniteDuration, SECONDS}
 import scala.concurrent.{Future, Promise}
@@ -39,7 +39,12 @@ object Frontend {
 
   case class OpportuneRebuild(or: OpportunisticRebuild) extends ReadKind
 
-  case class RepairRead(cos: ClientObjectState, completion: Promise[Unit]) extends ReadKind
+  /** A repair's snapshot of the store's copy, taken before the repair reads the object */
+  case class SnapshotRead(pointer: ObjectPointer, p: Promise[RepairSnapshot]) extends ReadKind
+
+  /** A repair's install of `read`, checked against `snapshot` */
+  case class ReconcileRead(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult])
+    extends ReadKind
 }
 
 class Frontend(val storeId: StoreId,
@@ -720,24 +725,37 @@ class Frontend(val storeId: StoreId,
     }
   }
 
-  def readObjectForRepair(current: ClientObjectState, completion: Promise[Unit]): Unit = {
-    val objectId = current.pointer.id
-    servableState(objectId) match {
-      case Some(os) => repair(current, completion, os)
-      // A repair would write the repairer's state after the deletion, resurrecting the slice
-      case None if deleting.contains(objectId) => completion.success(())
-      case None =>
-        if current.pointer.poolId == storeId.poolId then
-          pendingReads.get(objectId) match {
-            case Some(lst) =>
-              pendingReads += (objectId -> (RepairRead(current, completion) :: lst))
+  /** Records the store's copy of the object for a repair (Reconcile): first step, before the repair reads it. An
+    * object the store does not hold, or is deleting, gives an empty snapshot
+    */
+  def snapshotForRepair(pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+    val objectId = pointer.id
+    servableState(objectId) match
+      case Some(os) => p.success(RepairSnapshot.of(os))
+      case None if deleting.contains(objectId) => p.success(RepairSnapshot.missing(objectId))
+      case None if pointer.poolId != storeId.poolId =>
+        p.failure(new IllegalArgumentException(s"Store $storeId cannot repair object $objectId of pool ${pointer.poolId}"))
+      case None => readForRepair(pointer, SnapshotRead(pointer, p))
 
-            case None =>
-              pendingReads += (objectId -> (RepairRead(current, completion) :: Nil))
-              backend.read(current.pointer)
-          }
-    }
-  }
+  /** Makes the store's copy agree with `read` (Reconcile.plan), changing only what is still as `snapshot` recorded.
+    * `p` completes with what was left undone once the backend has the change
+    */
+  def reconcileForRepair(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult]): Unit =
+    val objectId = read.pointer.id
+    servableState(objectId) match
+      case Some(os) => reconcile(snapshot, read, p, Some(os))
+      // A repair would write the repairer's state after the deletion, resurrecting the slice. Left for a later pass
+      case None if deleting.contains(objectId) => p.success(ReconcileResult(Set(), false, stale = true))
+      case None if read.pointer.poolId != storeId.poolId =>
+        p.failure(new IllegalArgumentException(s"Store $storeId cannot repair object $objectId of pool ${read.pointer.poolId}"))
+      case None => readForRepair(read.pointer, ReconcileRead(snapshot, read, p))
+
+  private def readForRepair(pointer: ObjectPointer, kind: ReadKind): Unit =
+    pendingReads.get(pointer.id) match
+      case Some(lst) => pendingReads += (pointer.id -> (kind :: lst))
+      case None =>
+        pendingReads += (pointer.id -> (kind :: Nil))
+        backend.read(pointer)
 
   /** Repairs a missed deletion by dropping the object from this store.
     *
@@ -806,24 +824,46 @@ class Frontend(val storeId: StoreId,
     }
   }
 
-  private def repair(current: ClientObjectState, completion: Promise[Unit], os: ObjectState): Unit =
-    if current.timestamp <= os.metadata.timestamp then
-      completion.success(())
+  /** Applies Reconcile.plan to `loaded`, the store's copy (None when it holds none), and hands the result to the
+    * backend. Keys and object-level parts this store holds locked are deferred along with those the read reports: a
+    * store that did not answer the read may hold locks of its own, and its locked states must keep them
+    */
+  private def reconcile(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult],
+                        loaded: Option[ObjectState]): Unit =
+    val current = loaded.map(RepairSnapshot.of).getOrElse(RepairSnapshot.missing(read.pointer.id))
+    val locks = loaded match
+      case None => read.readLocks
+      case Some(os) =>
+        ReadLocks(read.readLocks.keys ++ os.lockedKeys, read.readLocks.objectLevel || os.objectLevelLocked)
+    val plan = Reconcile.plan(snapshot, current, read, storeId, locks)
+
+    if plan.changesNothing then
+      p.success(plan.result)
     else
-      current.getRebuildDataForStore(storeId) match
-        case None => completion.success(())
-        case Some(storeData) =>
-          os.metadata = Metadata(current.revision, current.refcount, current.timestamp)
-          os.data = storeData
-          val cs = CommitState(current.pointer, os.metadata,
-            current.pointer.objectType, os.data)
-          val txid = TransactionId(current.revision.lastUpdateTxUUID)
-          backend.repair(cs, completion)
-
-
-  /** Repairs an object this store cannot read: failure to read probably means a repair is required */
-  private def repairMissing(current: ClientObjectState, completion: Promise[Unit]): Unit =
-    repair(current, completion, new ObjectState(current.pointer.id, Metadata.Zeroed, ObjectType.Data, DataBuffer.Empty))
+      val os = loaded.getOrElse(
+        new ObjectState(read.pointer.id, Metadata.Zeroed, read.pointer.objectType, DataBuffer.Empty))
+      os.kvState.foreach { kvs =>
+        plan.installs.foreach { (key, vs) =>
+          kvs.content += key -> new ValueState(vs.value, vs.revision, vs.timestamp, None)
+        }
+        kvs.content --= plan.deletes
+        plan.objectLevel.foreach { level =>
+          kvs.min = level.min
+          kvs.max = level.max
+          kvs.left = level.left
+          kvs.right = level.right
+        }
+        os.data = kvs.encode()
+      }
+      plan.data.foreach(d => os.data = d)
+      val md = os.metadata
+      os.metadata = Metadata(plan.revision.getOrElse(md.revision), plan.refcount.getOrElse(md.refcount),
+        plan.timestamp.getOrElse(md.timestamp))
+      logger.trace(s"Store $storeId: repair of ${os.objectId} installs ${plan.installs.size} keys, deletes " +
+        s"${plan.deletes.size}, leaves ${plan.result}")
+      val done = Promise[Unit]()
+      p.completeWith(done.future.map(_ => plan.result)(using scala.concurrent.ExecutionContext.parasitic))
+      backend.repair(CommitState(read.pointer, os.metadata, os.objectType, os.data), done)
 
   def backendReadComplete(objectId: ObjectId,
                           result: Either[ReadState, ReadError.Value]): Unit = {
@@ -869,9 +909,11 @@ class Frontend(val storeId: StoreId,
               logger.trace(s"Completed read for OpportuneRebuild. Object: ${os.objectId}")
               opportunisticRebuild(op, os)
 
-            case RepairRead(cos, completion) =>
+            case SnapshotRead(_, p) => p.success(RepairSnapshot.of(os))
+
+            case ReconcileRead(snapshot, read, p) =>
               logger.trace(s"Completed read for repair. Object: ${os.objectId}")
-              repair(cos, completion, os)
+              reconcile(snapshot, read, p, Some(os))
           }
         }
 
@@ -887,9 +929,12 @@ class Frontend(val storeId: StoreId,
 
             case _: OpportuneRebuild => // Can't guarantee correctness so we need to ignore this
 
-            case RepairRead(cos, completion) =>
+            case SnapshotRead(_, p) => p.success(RepairSnapshot.missing(objectId))
+
+            case ReconcileRead(snapshot, read, p) =>
               // Not found because a deletion's commit is in flight: a repair would resurrect the slice
-              if deleting.contains(objectId) then completion.success(()) else repairMissing(cos, completion)
+              if deleting.contains(objectId) then p.success(ReconcileResult(Set(), false, stale = true))
+              else reconcile(snapshot, read, p, None)
           }
         }
     }

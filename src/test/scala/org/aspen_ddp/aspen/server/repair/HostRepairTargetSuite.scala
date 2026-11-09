@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
+import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
@@ -23,11 +24,19 @@ class HostRepairTargetSuite extends IntegrationTestSuite:
       ids should contain (StoreId(PoolId.BootstrapPoolId, 0.toByte))
       ids should not contain unhostedStore
 
-  test("a repair for an unhosted store fails rather than hanging"):
+  test("a repair snapshot for an unhosted store fails rather than hanging"):
+    val p = Promise[RepairSnapshot]()
+    net.smgr.snapshot(unhostedStore, radicle, p)
+    net.handleEvents()
+    p.future.transform(t => Success(t)).map: result =>
+      result.isFailure shouldBe true
+      result.failed.get shouldBe a [StoreNotHosted]
+
+  test("a reconcile for an unhosted store fails rather than hanging"):
     for
       kvos <- client.read(radicle, "unhosted repair")
-      p = Promise[Unit]()
-      _ = net.smgr.repair(unhostedStore, kvos, p)
+      p = Promise[ReconcileResult]()
+      _ = net.smgr.reconcile(unhostedStore, RepairSnapshot.missing(radicle.id), kvos, p)
       _ = net.handleEvents()
       result <- p.future.transform(t => Success(t))
     yield

@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer,
                                            ObjectId, ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import scribe.Logging
@@ -29,7 +30,9 @@ object ScanResult:
 /** Repairs one store, once. Walks the store's slice of its pool's errorTree, brings each
   * recorded object back into agreement with the rest of the system, and removes the entry.
   */
-class StoreRepairer(client: AspenClient, target: RepairTarget)
+class StoreRepairer(client: AspenClient, target: RepairTarget,
+                    /** Test seam: runs between a repair's read and its install */
+                    testingOnlyBeforeReconcile: (StoreId, ObjectPointer) => Future[Unit] = (_, _) => Future.unit)
                    (using ec: ExecutionContext) extends Logging:
 
   import StoreRepairer.*
@@ -77,8 +80,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget)
           _ <- oAllocation match
             case Some(allocation) =>
               repairUpdate(storeId, ObjectPointer(allocation.value.bytes), missedTimestamp,
-                           value.revision, node, key).map: current =>
-                if current then
+                           value.revision, node, key).map: result =>
+                if result.complete then
                   repaired.incrementAndGet()
                 else
                   deferred.incrementAndGet()
@@ -104,31 +107,38 @@ class StoreRepairer(client: AspenClient, target: RepairTarget)
                 Future.unit
         yield ()
 
-  /** Installs the object's current state on the store. The result is false when that state
-    * predates the missed update the entry records, so the entry was left for the next pass.
+  /** Reconciles the store's copy of the object with a read of it (Reconcile): snapshot the store, read, then install
+    * what still matches the snapshot. The entry is deleted only when nothing was left undone and the read is at least
+    * as new as the missed update. A read older than that comes back as a stale result, so `complete` says exactly
+    * whether the entry was dropped. Deferred keys and object-level parts are reported for later passes.
     */
   private def repairUpdate(storeId: StoreId, ptr: ObjectPointer, missedTimestamp: HLCTimestamp,
                            entryRevision: ObjectRevision,
-                           node: KeyValueListNode, key: Key): Future[Boolean] =
-    val fos = ptr match
-      case kp: KeyValueObjectPointer => client.read(kp)
-      case dp: DataObjectPointer => client.read(dp)
-
-    val completion = Promise[Unit]()
+                           node: KeyValueListNode, key: Key): Future[ReconcileResult] =
+    val snapshot = Promise[RepairSnapshot]()
+    target.snapshot(storeId, ptr, snapshot)
 
     for
-      os <- fos
-      _ = target.repair(storeId, os, completion)
-      _ <- completion.future
-      current = os.timestamp >= missedTimestamp
-      _ <- (if current then deleteErrorEntryIfUnchanged(entryRevision, node, key) else Future.unit)
+      snap <- snapshot.future
+      // A full read: only full reads report the stores' locks
+      os <- ptr match
+        case kp: KeyValueObjectPointer => client.read(kp)
+        case dp: DataObjectPointer => client.read(dp)
+      _ <- testingOnlyBeforeReconcile(storeId, ptr)
+      reconciled = Promise[ReconcileResult]()
+      _ = target.reconcile(storeId, snap, os, reconciled)
+      installed <- reconciled.future
+      result = if os.timestamp >= missedTimestamp then installed else installed.copy(stale = true)
+      _ <- (if result.complete then deleteErrorEntryIfUnchanged(entryRevision, node, key) else Future.unit)
     yield
-      if current then
+      if result.complete then
         logger.info(s"Repair complete for object ${ptr.id} on store $storeId")
+      else if !installed.complete then
+        logger.info(s"Repair of object ${ptr.id} on store $storeId left $installed. Leaving the entry for the next pass")
       else
         logger.info(s"Repair of object ${ptr.id} on store $storeId installed a state older than " +
                     s"its missed update. Leaving the entry for the next pass")
-      current
+      result
 
   private def repairDeletion(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte],
                              node: KeyValueListNode, key: Key): Future[Unit] =

@@ -4,8 +4,10 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, Transaction}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
-import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, Value}
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectId,
+                                           ObjectPointer, ObjectRefcount, Value}
+import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 
@@ -55,9 +57,13 @@ class StoreRepairerSuite extends IntegrationTestSuite:
 
     def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
 
-    def repair(sid: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
+    def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+      p.success(RepairSnapshot.missing(pointer.id))
+
+    def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
+                  p: Promise[ReconcileResult]): Unit =
       synchronized { repairs = repairs :+ os.pointer.id }
-      completion.completeWith(duringRepair(os.pointer.id))
+      p.completeWith(duringRepair(os.pointer.id).map(_ => ReconcileResult(Set(), false, false)))
 
     def repairDelete(sid: StoreId, objectId: ObjectId,
                      storePointer: Array[Byte], completion: Promise[Unit]): Unit =
@@ -240,8 +246,11 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     val failing = new RepairTarget:
       def repairableStoreIds: List[StoreId] = List(storeId)
       def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
-      def repair(sid: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
-        completion.failure(StoreNotHosted(sid))
+      def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+        p.failure(StoreNotHosted(sid))
+      def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
+                    p: Promise[ReconcileResult]): Unit =
+        p.failure(StoreNotHosted(sid))
       def repairDelete(sid: StoreId, oid: ObjectId,
                        sp: Array[Byte], completion: Promise[Unit]): Unit =
         completion.failure(StoreNotHosted(sid))
@@ -258,8 +267,11 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     val failing = new RepairTarget:
       def repairableStoreIds: List[StoreId] = List(storeId)
       def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
-      def repair(sid: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
-        completion.failure(StoreNotHosted(sid))
+      def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+        p.failure(StoreNotHosted(sid))
+      def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
+                    p: Promise[ReconcileResult]): Unit =
+        p.failure(StoreNotHosted(sid))
       def repairDelete(sid: StoreId, oid: ObjectId,
                        sp: Array[Byte], completion: Promise[Unit]): Unit =
         completion.failure(StoreNotHosted(sid))
@@ -314,6 +326,197 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       result.seen shouldBe 2
       result.repaired shouldBe 1
       validEntryStillThere shouldBe false
+
+  // ---- Repair through the live host -----------------------------------------------------------
+  //
+  // TestNetwork can make a store miss a transaction outright: while its transaction messages are dropped it hears
+  // nothing of the transaction, so the finalizer marks it in the errorTree. Dropping another store for the next
+  // transaction makes the first one part of that transaction's write threshold, so it applies it.
+
+  private def sid(i: Int): StoreId = net.stores(i).storeId
+
+  /** The state store `i` has persisted for an object */
+  private def stored(i: Int, id: ObjectId): Option[org.aspen_ddp.aspen.server.store.ObjectState] =
+    net.stores(i).m.get(id)
+
+  private def storeKeys(i: Int, ptr: KeyValueObjectPointer): Set[Key] =
+    stored(i, ptr.id).flatMap(_.kvState).map(_.content.keySet).getOrElse(Set())
+
+  private def storeRefcount(i: Int, ptr: DataObjectPointer): Option[ObjectRefcount] =
+    stored(i, ptr.id).map(_.metadata.refcount)
+
+  /** The keys of store `i`'s errorTree entries */
+  private def errorEntries(i: Int): Future[List[Key]] =
+    @volatile var keys: List[Key] = Nil
+    val min = Key(Array[Byte](i.toByte))
+    val max = Key(Array[Byte]((i + 1).toByte))
+    for
+      tree <- errorTree
+      _ <- tree.foreachInRange(min, max, (_, key, _) => { synchronized { keys = key :: keys }; Future.unit })
+    yield keys
+
+  /** Completes with `f`, draining the host's events while it is pending: the host only queues repair work */
+  private def pump[T](f: Future[T], deadline: Long): Future[T] =
+    if f.isCompleted then
+      f
+    else if System.nanoTime() > deadline then
+      net.printTransactionStatus()
+      Future.failed(new AssertionError("Timed out pumping events"))
+    else
+      Future { Thread.sleep(1); net.handleEvents() }.flatMap(_ => pump(f, deadline))
+
+  private def deadline(): Long = System.nanoTime() + Duration(30, SECONDS).toNanos
+
+  /** Completes once no host has transactions, draining the host's events meanwhile. Finalization actions, the
+    * errorTree marks among them, need events drained after their last message
+    */
+  private def settle(until: Long = deadline()): Future[Unit] =
+    net.handleEvents()
+    if !net.hasTransactions then
+      Future.unit
+    else if System.nanoTime() > until then
+      net.printTransactionStatus()
+      Future.failed(new AssertionError("Transactions never completed"))
+    else
+      Future { Thread.sleep(1); net.handleEvents() }.flatMap(_ => settle(until))
+
+  /** Commits a transaction built by `build` that store `i` misses outright: none of its messages reach the store.
+    * The store is reported offline meanwhile, so it is not chosen as the transaction's designated leader
+    */
+  private def missedBy(i: Int)(build: Transaction => Unit): Future[Unit] =
+    net.offlineStores = Set(sid(i))
+    val tx = client.newTransaction()
+    build(tx)
+    net.droppedTx = net.droppedTx + ((sid(i), tx.id))
+    pump(tx.commit(), deadline()).transformWith: committed =>
+      settle().transform: settled =>
+        net.droppedTx = net.droppedTx - ((sid(i), tx.id))
+        net.offlineStores = Set()
+        committed.flatMap(_ => settled)
+
+  /** Scans store `i` through the live host until its errorTree range is empty */
+  private def scanUntilQuiet(i: Int, repairer: StoreRepairer = StoreRepairer(client, net.smgr),
+                             passes: Int = 20): Future[Unit] =
+    for
+      _ <- settle()
+      _ <- pump(repairer.scan(sid(i), RepairPolicy.Default), deadline())
+      _ <- settle()
+      remaining <- errorEntries(i)
+      _ <- if remaining.isEmpty then Future.unit
+           else if passes <= 1 then Future.failed(new AssertionError(s"store $i never went quiet: $remaining"))
+           else scanUntilQuiet(i, repairer, passes - 1)
+    yield ()
+
+  private def scanAllUntilQuiet(): Future[Unit] =
+    (0 until net.stores.size).foldLeft(Future.unit)((f, i) => f.flatMap(_ => scanUntilQuiet(i)))
+
+  private val k0 = Key(Array[Byte](0))
+  private val k1 = Key(Array[Byte](1))
+  private val k2 = Key(Array[Byte](2))
+  private val k3 = Key(Array[Byte](3))
+
+  /** A KeyValue object every store holds, with `initial` as its content */
+  private def sharedKVObject(initial: Map[Key, Value]): Future[KeyValueObjectPointer] =
+    for
+      ptr <- client.transactUntilSuccessful: tx =>
+               given Transaction = tx
+               for
+                 pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+                 p <- new PoolObjectAllocator(client, pool).allocateKeyValueObject(initial)
+               yield p
+      _ <- scanAllUntilQuiet()
+    yield
+      withClue("every store holds the object before the scenario: "):
+        (0 until net.stores.size).foreach(i => storeKeys(i, ptr) shouldBe initial.keySet)
+      ptr
+
+  private def kvUpdate(ptr: KeyValueObjectPointer, ops: List[org.aspen_ddp.aspen.common.objects.KeyValueOperation])
+                      (tx: Transaction): Unit =
+    tx.update(ptr, None, None, Nil, ops)
+
+  test("a store that missed a KV insert and then applied a later update to another key gets the missed key"):
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
+      _ <- missedBy(0)(kvUpdate(kvPtr, List(Insert(k2, Array[Byte](2)))))
+      marked <- errorEntries(2)
+      _ = withClue("store 2 missed only the first insert: "):
+            storeKeys(2, kvPtr) shouldBe Set(k0, k2)
+            marked should not be empty
+      _ <- scanUntilQuiet(2)
+      remaining <- errorEntries(2)
+    yield
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1, k2)
+      remaining shouldBe empty
+
+  test("a store that missed a KV delete and then applied a later update to another key loses the deleted key"):
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(org.aspen_ddp.aspen.common.objects.Delete(k1))))
+      _ <- missedBy(0)(kvUpdate(kvPtr, List(Insert(k2, Array[Byte](2)))))
+      marked <- errorEntries(2)
+      _ = withClue("store 2 missed only the delete: "):
+            storeKeys(2, kvPtr) shouldBe Set(k0, k1, k2)
+            marked should not be empty
+      _ <- scanUntilQuiet(2)
+      remaining <- errorEntries(2)
+    yield
+      storeKeys(2, kvPtr) should not contain k1
+      storeKeys(2, kvPtr) shouldBe Set(k0, k2)
+      remaining shouldBe empty
+
+  test("a store that missed a refcount change on a DataObject and then applied a later data write gets the refcount"):
+    for
+      dataPtr <- client.transactUntilSuccessful: tx =>
+                   given Transaction = tx
+                   for
+                     pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+                     p <- new PoolObjectAllocator(client, pool).allocateDataObject(DataBuffer(Array[Byte](1)))
+                   yield p
+      _ <- scanAllUntilQuiet()
+      before <- client.read(dataPtr)
+      expected = before.refcount.setCount(before.refcount.count + 1)
+      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, expected))
+      _ <- missedBy(0)(_.overwrite(dataPtr, before.revision, DataBuffer(Array[Byte](2))))
+      marked <- errorEntries(2)
+      _ = withClue("store 2 missed only the refcount change: "):
+            storeRefcount(2, dataPtr) shouldBe Some(before.refcount)
+            stored(2, dataPtr.id).map(_.data.getByteArray.toSeq) shouldBe Some(Seq[Byte](2))
+            marked should not be empty
+      _ <- scanUntilQuiet(2)
+      remaining <- errorEntries(2)
+    yield
+      storeRefcount(2, dataPtr) shouldBe Some(expected)
+      remaining shouldBe empty
+
+  test("a commit applied between the snapshot and the install survives and is retried next pass"):
+    // The repair reads the object before k3 is inserted, so the read lacks k3. The store applies the insert before
+    // the install: only the snapshot check keeps the install from deleting it
+    @volatile var target: Option[KeyValueObjectPointer] = None
+    @volatile var paused = false
+    val repairer = StoreRepairer(client, net.smgr, testingOnlyBeforeReconcile = (s, ptr) =>
+      if !paused && s == sid(2) && target.exists(_.id == ptr.id) then
+        paused = true
+        missedBy(0)(kvUpdate(target.get, List(Insert(k3, Array[Byte](3)))))
+      else
+        Future.unit)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      _ = target = Some(kvPtr)
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
+      _ <- pump(repairer.scan(sid(2), RepairPolicy.Default), deadline())
+      _ <- settle()
+      afterFirstPass <- errorEntries(2)
+      keysAfterFirstPass = storeKeys(2, kvPtr)
+      _ <- scanUntilQuiet(2, repairer)
+      remaining <- errorEntries(2)
+    yield
+      paused shouldBe true
+      keysAfterFirstPass should contain (k3)
+      keysAfterFirstPass should contain (k1)
+      afterFirstPass should not be empty
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1, k3)
+      remaining shouldBe empty
 
   test("a future dated entry is never eligible for deletion repair"):
     Future.successful:

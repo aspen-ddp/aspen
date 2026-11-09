@@ -3,10 +3,11 @@ package org.aspen_ddp.aspen.server.repair
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 import org.aspen_ddp.aspen.common.metadata.HostId
-import org.aspen_ddp.aspen.common.objects.ObjectId
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
+import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 import scala.concurrent.{Future, Promise}
@@ -21,8 +22,11 @@ class RepairServiceSuite extends IntegrationTestSuite:
   private class FixedTarget extends RepairTarget:
     def repairableStoreIds: List[StoreId] = storeIds
     def isRepairable(storeId: StoreId): Boolean = storeIds.contains(storeId)
-    def repair(sid: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
-      completion.success(())
+    def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+      p.success(RepairSnapshot.missing(pointer.id))
+    def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
+                  p: Promise[ReconcileResult]): Unit =
+      p.success(ReconcileResult(Set(), false, false))
     def repairDelete(sid: StoreId, oid: ObjectId,
                      sp: Array[Byte], completion: Promise[Unit]): Unit =
       completion.success(())
@@ -85,8 +89,11 @@ class RepairServiceSuite extends IntegrationTestSuite:
     val target = new RepairTarget:
       def repairableStoreIds: List[StoreId] = hosted
       def isRepairable(storeId: StoreId): Boolean = hosted.contains(storeId)
-      def repair(sid: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
-        completion.success(())
+      def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+        p.success(RepairSnapshot.missing(pointer.id))
+      def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
+                    p: Promise[ReconcileResult]): Unit =
+        p.success(ReconcileResult(Set(), false, false))
       def repairDelete(sid: StoreId, oid: ObjectId,
                        sp: Array[Byte], completion: Promise[Unit]): Unit =
         completion.success(())

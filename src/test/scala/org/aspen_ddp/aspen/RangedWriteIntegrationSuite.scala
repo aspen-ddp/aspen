@@ -118,7 +118,7 @@ trait RangedWriteIntegrationTests:
           bytesShouldMatch(s.data.getByteArray, expected)
     reads.map(_ => ())
 
-  /** Host.repair queues its work for the harness's event pump, which is drained by repeatedly running net.handleEvents() on the global execution context until `f` completes */
+  /** Host repair work is queued for the harness's event pump, which is drained by repeatedly running net.handleEvents() on the global execution context until `f` completes */
   private def pumpUntilComplete[T](f: Future[T]): Future[T] =
     if f.isCompleted then
       f

@@ -1,8 +1,9 @@
 package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
-import org.aspen_ddp.aspen.common.objects.ObjectId
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 
 import scala.concurrent.Promise
 
@@ -32,10 +33,16 @@ trait RepairTarget:
     */
   def isRepairable(storeId: StoreId): Boolean
 
-  /** Brings the store's copy of the object up to date. Completes `completion` with
+  /** Records the store's copy of the object, the first step of a repair (`Reconcile`). Completes `p` with
     * Failure(StoreNotHosted) if the store has left this host.
     */
-  def repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit
+  def snapshot(storeId: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit
+
+  /** Makes the store's copy agree with `read`, a full read taken after `snapshot`, deferring what `read.readLocks`
+    * reports locked and leaving alone anything changed since `snapshot`. Completes `p` with what was left undone, or
+    * with Failure(StoreNotHosted) if the store has left this host.
+    */
+  def reconcile(storeId: StoreId, snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult]): Unit
 
   /** Deletes the store's copy of an object that is gone from the rest of the system. An empty
     * `storePointer` means "delete by ObjectId alone". Completes `completion` with

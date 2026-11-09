@@ -12,6 +12,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{Host, StoreConfig}
 import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler, FsifConfig}
 import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifRecovery}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -233,7 +234,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
   private def sequentially[A](items: List[A])(f: A => Future[Unit]): Future[Unit] =
     items.foldLeft(Future.unit)((acc, item) => acc.flatMap(_ => f(item)))
 
-  /** Completes with `f`, draining every host's events while it is pending: Host.repair only queues its work */
+  /** Completes with `f`, draining every host's events while it is pending: Host.snapshot and Host.reconcile only queue their work */
   private def pumpUntilComplete[T](f: Future[T], deadline: Long): Future[T] =
     if f.isCompleted then
       f
@@ -243,22 +244,28 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
       net.handleEvents()
       delay(1).flatMap(_ => pumpUntilComplete(f, deadline))
 
-  /** Brings every store of the pool to the current state of `dp` through Host.repair, the path StoreRepairer uses.
+  /** Brings every store of the pool to the current state of `dp` through Host.snapshot and Host.reconcile, the path
+    * StoreRepairer uses.
     *
     * The TestNetwork delivers messages synchronously, so a transaction can resolve before its prepare reaches the
     * last stores, and those stores miss the update. Reads with stores silenced need every remaining store current,
     * so tests repair first, as the in-memory integration suites do. Repairing a current store rewrites the same
-    * state: Frontend.repair skips a store whose copy is not older. No other writer runs meanwhile.
+    * state: Reconcile installs a DataObject's contents only over an older copy. No other writer runs meanwhile.
     */
   private def repairEveryStore(dp: DataObjectPointer, timeout: FiniteDuration = 30.seconds): Future[Unit] =
     val deadline = System.nanoTime() + timeout.toNanos
     for
       _ <- waitForTransactionsToComplete()
-      state <- client.read(dp)
       _ <- sequentially(storeIds): sid =>
-             val done = Promise[Unit]()
-             host.repair(sid, state, done)
-             pumpUntilComplete(done.future, deadline)
+             val snapshot = Promise[RepairSnapshot]()
+             host.snapshot(sid, dp, snapshot)
+             for
+               snap <- pumpUntilComplete(snapshot.future, deadline)
+               state <- client.read(dp)
+               done = Promise[ReconcileResult]()
+               _ = host.reconcile(sid, snap, state, done)
+               _ <- pumpUntilComplete(done.future, deadline)
+             yield ()
     yield ()
 
   /** Reads `dp` once for every set of stores that can be silenced while the rest still restore it, never silencing

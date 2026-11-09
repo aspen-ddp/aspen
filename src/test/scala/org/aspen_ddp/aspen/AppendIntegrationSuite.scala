@@ -365,7 +365,7 @@ trait AppendIntegrationTests:
       bytesShouldMatch(after.data.getByteArray, content ++ Array[Byte](1, 2, 3))
       succeed
 
-  /** Host.repair queues its work for the harness's event pump, which must run on the test thread */
+  /** Host repair work is queued for the harness's event pump, which must run on the test thread */
   private def pumpUntilComplete[T](f: Future[T]): Future[T] =
     if f.isCompleted then
       f

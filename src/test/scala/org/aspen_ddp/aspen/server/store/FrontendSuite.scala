@@ -1837,17 +1837,40 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     resolve(frontend, net, txid1, committed = true)
     backend.heldCommits shouldBe 1
 
-    val done = Promise[Unit]()
-    frontend.readObjectForRepair(repairState(), done)
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(RepairSnapshot.missing(oid1), repairState(), done)
     done.isCompleted shouldBe true
+    done.future.value.get.get.complete shouldBe false
     backend.repairs shouldBe 0
+  }
+
+  test("a repair reconciles the keys of a KV object but leaves a key this store holds locked") {
+    val (frontend, backend, net) = lockFixture()
+    prepare(frontend, net, lockTxd(txid1, List(keyRevision(1)))).disposition shouldBe TransactionDisposition.VoteCommit
+
+    val snapshot = Promise[RepairSnapshot]()
+    frontend.snapshotForRepair(kvPtr, snapshot)
+    // The read saw key 1 rewritten, key 3 deleted and key 4 inserted, and (not having asked this store) no locks
+    def vs(n: Int, r: ObjectRevision) =
+      org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState(Value(Array[Byte](n.toByte)), r, HLCTimestamp(9))
+    val read = new org.aspen_ddp.aspen.client.KeyValueObjectState(kvPtr, rev0, ObjectRefcount(1, 1),
+      HLCTimestamp(9), HLCTimestamp(9), ida, Some(k(0)), None, None, None,
+      Map(k(1) -> vs(10, ObjectRevision(txid2)), k(2) -> vs(2, rev0), k(4) -> vs(4, ObjectRevision(txid2))))
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(snapshot.future.value.get.get, read, done)
+
+    done.future.value.get.get shouldBe ReconcileResult(Set(k(1)), false, false)
+    val stored = backend.m(oid2).kvState.get.content
+    stored.keySet shouldBe Set(k(1), k(2), k(4))
+    stored(k(1)).revision shouldBe rev0
+    stored(k(4)).revision shouldBe ObjectRevision(txid2)
   }
 
   test("a repair whose read completes during a deletion's commit is not applied") {
     val (frontend, backend, _, _) = commitWindowFixture()
     backend.deferReads = true
-    val done = Promise[Unit]()
-    frontend.readObjectForRepair(repairState(), done)
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(RepairSnapshot.missing(oid1), repairState(), done)
     backend.reads shouldBe 1
 
     val metadata = Metadata(ObjectRevision(txid1), ObjectRefcount(2, 0), HLCTimestamp(200))

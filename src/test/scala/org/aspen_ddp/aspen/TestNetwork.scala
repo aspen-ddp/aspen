@@ -166,6 +166,17 @@ class TestNetwork(executionContext: ExecutionContext,
   /** Hosts the client messenger reports offline. Everything is online unless a test says otherwise. */
   @volatile var offlineHostIds: Set[HostId] = Set.empty
 
+  /** Transaction messages dropped, by destination store and transaction: the store misses that transaction
+   *  outright, as an unreachable store does, while every other transaction (missed-update marks included) reaches it */
+  @volatile var droppedTx: Set[(StoreId, TransactionId)] = Set()
+
+  /** Stores the client messenger reports offline, so no transaction chooses one as its designated leader: a leader
+   *  whose messages are dropped would stall a transaction, as clients here do not recover them */
+  @volatile var offlineStores: Set[StoreId] = Set()
+
+  private def dropped(msg: TxMessage): Boolean =
+    droppedTx.contains((msg.to, msg.transactionId))
+
   /** Hosts other than smgr, each serving every store of the pools mapped to it. Messages to the stores of an
    *  unmapped pool go to smgr. handleEvents drains every mapped host, and a test remaps a pool to model a restart.
    */
@@ -214,7 +225,8 @@ class TestNetwork(executionContext: ExecutionContext,
 
     def sendTransactionMessage(msg: TxMessage): Unit = {
       handleEvents()
-      hostFor(msg.to).receiveTransactionMessage(msg)
+      if !dropped(msg) then
+        hostFor(msg.to).receiveTransactionMessage(msg)
       handleEvents()
     }
 
@@ -226,6 +238,8 @@ class TestNetwork(executionContext: ExecutionContext,
     def dropCacheForStore(storeId: StoreId): Unit = ()
 
     override def isHostOnline(hostId: HostId): Boolean = !offlineHostIds.contains(hostId)
+
+    override def isStoreOffline(storeId: StoreId): Boolean = offlineStores.contains(storeId)
   }
 
   val client: AspenClient = new TClient(executionContext, cliMessenger, radicle, ida, userTypeFactories)
@@ -427,13 +441,14 @@ class TestNetwork(executionContext: ExecutionContext,
 
   override def sendTransactionMessage(msg: TxMessage): Unit = {
     handleEvents()
-    hostFor(msg.to).receiveTransactionMessage(msg)
+    if !dropped(msg) then
+      hostFor(msg.to).receiveTransactionMessage(msg)
     handleEvents()
   }
 
   override def sendTransactionMessages(msg: List[TxMessage]): Unit = {
     handleEvents()
-    msg.foreach(m => hostFor(m.to).receiveTransactionMessage(m))
+    msg.foreach(m => if !dropped(m) then hostFor(m.to).receiveTransactionMessage(m))
     handleEvents()
   }
 

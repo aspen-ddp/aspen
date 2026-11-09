@@ -613,10 +613,11 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       net.smgr.repairDelete(storeId, objectId, storePointer, completion)
 
   /** One scan of store `i`, then settle */
-  private def pass(i: Int, repairer: StoreRepairer, deferral: DeferralState): Future[ScanResult] =
+  private def pass(i: Int, repairer: StoreRepairer, deferral: DeferralState,
+                   policy: RepairPolicy = RepairPolicy.Default): Future[ScanResult] =
     for
       _ <- settle()
-      result <- pump(repairer.scan(sid(i), RepairPolicy.Default, deferral), deadline())
+      result <- pump(repairer.scan(sid(i), policy, deferral), deadline())
       _ <- settle()
     yield result
 
@@ -680,13 +681,37 @@ class StoreRepairerSuite extends IntegrationTestSuite:
             storeHasObject(2, dataPtr.id) shouldBe true
             storeHasObject(0, dataPtr.id) shouldBe false
       marked <- tracelessEntries(2)
-      _ <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
+      _ <- pass(2, StoreRepairer(client, net.smgr), DeferralState(), noDeletionAge)
       remaining <- tracelessEntries(2)
     yield
       marked should not be empty
       storeHasObject(2, dataPtr.id) shouldBe false
       stored(2, dataPtr.id) shouldBe None
       remaining shouldBe empty
+
+  /** A policy treating any entry whose object has no allocation as a deletion, however young */
+  private val noDeletionAge: RepairPolicy = RepairPolicy.Default.copy(minErrorEntryAgeForDeletion = Duration(0, SECONDS))
+
+  test("a young TracelessCommits entry whose object has no allocation yet does not delete the live object"):
+    // An allocation's RefcountUpdate is traceless, so a store missing it gets an entry before
+    // AllocationFinalizationAction records the allocation: absent from the allocation tree is not yet a deletion
+    val oid = ObjectId(new UUID(7, 70))
+    val ptr = DataObjectPointer(oid, PoolId.BootstrapPoolId, Array[Byte]())
+    val txid = TransactionId(new UUID(7, 71))
+    net.stores(2).bootstrapAllocate(oid, org.aspen_ddp.aspen.common.objects.ObjectType.Data,
+      org.aspen_ddp.aspen.common.objects.Metadata(org.aspen_ddp.aspen.common.objects.ObjectRevision(txid),
+        ObjectRefcount(1, 1), HLCTimestamp.now), DataBuffer(Array[Byte](3)))
+    for
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      tx = client.newRepairTransaction()
+      _ <- pool.tracelessCommitsTree.set(TracelessCommitEntry.key(sid(2), txid),
+             Value(TracelessCommitEntry(HLCTimestamp.now, List(ptr)).encode))(using tx)
+      _ <- pump(tx.commit(), deadline())
+      _ <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
+      remaining <- tracelessEntries(2)
+    yield
+      storeHasObject(2, oid) shouldBe true
+      remaining shouldBe List(TracelessCommitEntry.key(sid(2), txid))
 
   // A rebuild drops the store's CRL, so it holds none of its entries' transactions live, and rebuilds its copies from
   // current reads: no hook in rebuild is needed, the first scan passes every entry at once. Stood in for here by a

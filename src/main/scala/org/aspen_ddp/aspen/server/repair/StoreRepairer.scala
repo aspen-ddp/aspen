@@ -187,9 +187,11 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
 
   /** A TracelessCommits entry: the store missed transaction T, whose change to the entry's objects left nothing for
     * an errorTree comparison to see. Skipped while the store holds T live: its Tx applies T (recovery). Otherwise each
-    * object is reconciled, or deleted from the store when its allocation is gone (T committed and is finalized, so
-    * no age wait is needed: the store's errorTree entry for the object, written with this one, still guards a live
-    * object whose allocation is not yet recorded). The entry is deleted once every object is complete.
+    * object is reconciled, or deleted from the store when its allocation is gone. As for errorTree entries, that
+    * needs the entry to be older than `policy.minErrorEntryAgeForDeletion`: an allocation's RefcountUpdate is
+    * traceless, so a store that missed it gets an entry before AllocationFinalizationAction records the allocation,
+    * and an object absent from the allocation tree meanwhile is live. A younger one is left for a later pass. The
+    * entry is deleted once every object is complete.
     */
   private def repairTracelessEntry(pool: StoragePool, storeId: StoreId, policy: RepairPolicy,
                                    deferral: DeferralState, counts: Counts)
@@ -214,8 +216,13 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
             val (ptr, entryKey) = objectEntry
             f.flatMap: allComplete =>
               pool.allocationTree.get(Key(ptr.id.toBytes)).flatMap:
-                case None =>
+                case None if errorEntryMayBeDeleted(value.timestamp, HLCTimestamp.now,
+                                                    policy.minErrorEntryAgeForDeletion) =>
                   repairDeletion(storeId, ptr.id, ptr.storePointer).map(_ => allComplete)
+                case None =>
+                  logger.debug(s"Deferring repair of ${ptr.id} on $storeId: absent from the allocation tree but its " +
+                               s"TracelessCommits entry is too recent to treat as a deletion")
+                  Future.successful(false)
                 case Some(_) =>
                   repairUpdate(storeId, ptr, entry.timestamp, entryKey, policy, deferral)
                     .map(result => allComplete && result.complete)

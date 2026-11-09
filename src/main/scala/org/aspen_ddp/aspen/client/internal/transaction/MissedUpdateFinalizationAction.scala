@@ -4,7 +4,6 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedUnackedCommit, MissedUpdate}
-import org.aspen_ddp.aspen.server.store.RequirementsApplyer
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -12,6 +11,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, SerializedFinalizationAction, TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
+import org.aspen_ddp.aspen.server.store.RequirementsApplyer
 
 import scala.concurrent.duration.{Duration, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -86,10 +86,11 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
           } ++ l
     }
 
-    // A commit voter that sent no TxCommitted may have crashed holding its saved vote. If it recovers after the
-    // transaction is forgotten, this entry is how it learns the transaction committed. A store that never voted
-    // holds no vote to recover: the ErrorTree marks above repair it, so it gets no entry. The entry means the store
-    // owes the transaction, whether or not its change leaves a trace
+    // A counted commit voter that sent no TxCommitted had not acknowledged applying the transaction when it was
+    // finalized, so it owes it: it may have crashed holding its saved vote, and if it recovers after the transaction
+    // is forgotten this entry is how it learns the transaction committed. The entry is written whether or not the
+    // change leaves a trace. A store that never voted holds no vote to recover: the ErrorTree marks above repair it,
+    // so it gets no entry
     val changed = RequirementsApplyer.changedObjects(txd.requirements)
     val unacked = txd.allDataStores.toList.flatMap: storeId =>
       if commitErrors.contains(storeId) || voters.exists(!_.contains(storeId)) then

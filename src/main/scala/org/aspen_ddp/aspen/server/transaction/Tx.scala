@@ -125,10 +125,11 @@ class Tx( trs: TransactionRecoveryState,
 
   /** A commit vote recovered from the CRL whose outcome is unknown. Its transaction may have committed and been
     * finalized and forgotten while this store was down: a recovery driver could then decide abort, and the store would
-    * drop an update that counted towards the write threshold. If the change leaves no trace (a refcount change or a key
-    * delete), the finalizer recorded the miss in the pool's UnackedCommits tree, so the Tx looks up its entry once
-    * it has loaded, and holds every abort until a lookup started after the abort finds none. An entry found means the
-    * transaction committed: the Tx applies its update and is forgotten as if finalized. See Frontend.requestUnackedLookup
+    * drop an update that counted towards the write threshold. So every recovered unresolved commit vote looks up its
+    * UnackedCommits entry once it has loaded, and again before accepting any abort (held until a lookup started after
+    * the abort finds none). An entry means the store cast a counted commit vote and had not acknowledged applying T
+    * when T was finalized, i.e. it owes T: the Tx applies its update and is forgotten as if finalized. See
+    * Frontend.requestUnackedLookup
     */
   def needsUnackedCheck: Boolean =
     recovered && disposition == TransactionDisposition.VoteCommit && txStatus == TransactionStatus.Unresolved &&

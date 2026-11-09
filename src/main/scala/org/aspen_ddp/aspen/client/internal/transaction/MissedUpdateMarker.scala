@@ -24,7 +24,7 @@ object MissedUpdateMarker:
                                 missedTimestamp: HLCTimestamp,
                                 storePointer: Array[Byte])
 
-  /** A store missed a transaction's traceless change to some of its objects */
+  /** A store owes a commit it voted on and did not acknowledge, for some of its objects */
   final case class MissedUnackedCommit(store: StoreId, transactionId: TransactionId, entry: UnackedCommitEntry)
 
   private[transaction] def errorKey(store: StoreId, objectId: ObjectId): Key =

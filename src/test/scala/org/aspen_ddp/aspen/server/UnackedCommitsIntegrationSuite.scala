@@ -23,7 +23,7 @@ import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 
 /** A store that voted commit, crashed before learning the outcome, and is restarted after the transaction was
   * finalized and forgotten (its status cache entry gone) still applies the committed update: from the pool's
-  * UnackedCommits tree for a change that leaves no trace, and through proof-of-commit for one that does.
+  * UnackedCommits tree for any change, and through proof-of-commit as well for one that leaves a trace.
   *
   * The bootstrap host records its stores' CRL state, so restarting a store recovers its commit vote, and its recovery
   * drivers send. Its heartbeat is short so the status cache expires quickly. Its time (heartbeats and driver timers)

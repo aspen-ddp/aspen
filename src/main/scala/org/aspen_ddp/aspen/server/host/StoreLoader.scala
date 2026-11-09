@@ -333,7 +333,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 ctx.net, ctx.backgroundTasks, crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
                 Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize,
                 ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited),
-                ctx.tracelessLookup)
+                ctx.tracelessLookup, Some(router.post(backend.storeId)))
               madeStore = Some(store)
               val entry = new StoreRouter.Entry(store, executor)
               // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any

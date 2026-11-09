@@ -136,9 +136,18 @@ object FrontendSuite {
       heldReads = Nil
       ptrs.foreach(super.read)
 
+    /** With `deferRepairs`, repair writes are held until deliverRepairs */
+    var deferRepairs: Boolean = false
+    private var heldRepairs: List[(CommitState, Promise[Unit])] = Nil
+
     override def repair(state: CommitState, complete: Promise[Unit]): Unit =
       repairs += 1
-      super.repair(state, complete)
+      if deferRepairs then heldRepairs = heldRepairs :+ (state, complete) else super.repair(state, complete)
+
+    def deliverRepairs(): Unit =
+      val held = heldRepairs
+      heldRepairs = Nil
+      held.foreach((state, complete) => super.repair(state, complete))
 
     /** The transactions of the commits received, in the order received */
     var issued: List[TransactionId] = Nil
@@ -1864,6 +1873,67 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     stored.keySet shouldBe Set(k(1), k(2), k(4))
     stored(k(1)).revision shouldBe rev0
     stored(k(4)).revision shouldBe ObjectRevision(txid2)
+  }
+
+  /** A read of op1 newer than anything the fixtures commit, at revision txid2 */
+  def newerRepairState(): DataObjectState =
+    val ts = HLCTimestamp((System.currentTimeMillis() + 3_600_000L) << 16)
+    new DataObjectState(op1, ObjectRevision(txid2), ObjectRefcount(1, 1), ts, ts, ida, 1, DataBuffer(Array[Byte](5)))
+
+  def repairSnapshot(frontend: Frontend, ptr: ObjectPointer): RepairSnapshot =
+    val p = Promise[RepairSnapshot]()
+    frontend.snapshotForRepair(ptr, p)
+    p.future.value.get.get
+
+  test("a repair during an in-flight commit is stale and writes nothing") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, op1), newerRepairState(), done)
+    done.future.value.get.get.stale shouldBe true
+    backend.repairs shouldBe 0
+  }
+
+  test("a prepare arriving while a repair write is pending withholds its vote until the write completes") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    backend.deferRepairs = true
+    val done = Promise[ReconcileResult]()
+    val read = newerRepairState()
+    frontend.reconcileForRepair(repairSnapshot(frontend, op1), read, done)
+    backend.repairs shouldBe 1
+    done.isCompleted shouldBe false
+
+    // Built on the repaired state, and started after it
+    val update = DataUpdate(op1, ObjectRevision(txid2), DataUpdateOperation.Overwrite)
+    val txd = lockTxd(txid1, List(update)).copy(startTimestamp = HLCTimestamp.happensAfter(read.timestamp))
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
+    prepareResponses(net, txid1) shouldBe empty
+
+    backend.deliverRepairs()
+    done.future.value.get.get.complete shouldBe true
+    prepareResponses(net, txid1).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+  }
+
+  test("a repair whose read completes during a backend commit of the object is stale and writes nothing") {
+    val (frontend, backend, _, _) = commitWindowFixture()
+    // As the snapshot would record the committed state, so the snapshot check alone would let the write through
+    val snapshot = RepairSnapshot(oid1, ObjectRevision(txid1), ObjectRefcount(1, 1), HLCTimestamp(200), Map(), None)
+    backend.deferReads = true
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(snapshot, newerRepairState(), done)
+    backend.reads shouldBe 1
+
+    // A rebuild's commit: the read may return the state it replaces, which is then not the state served
+    val metadata = Metadata(ObjectRevision(txid1), ObjectRefcount(1, 1), HLCTimestamp(200))
+    frontend.commit(new ObjectState(oid1, metadata, ObjectType.Data, DataBuffer(Array[Byte](3))),
+      CommitState(op1, metadata, ObjectType.Data, DataBuffer(Array[Byte](3))), txid1)
+    backend.deliverReads()
+    done.future.value.get.get.stale shouldBe true
+    backend.repairs shouldBe 0
   }
 
   test("a repair whose read completes during a deletion's commit is not applied") {

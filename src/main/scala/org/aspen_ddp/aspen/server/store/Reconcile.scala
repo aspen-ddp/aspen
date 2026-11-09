@@ -96,8 +96,11 @@ object Reconcile:
            locks: ReadLocks): ReconcilePlan =
     if storeId.poolId != read.pointer.poolId then
       ReconcilePlan.nothing(ReconcileResult(Set(), false, stale = true))
+    else if current.isMissing && !snapshot.isMissing then
+      // Deleted on the store since the snapshot: installing the read would resurrect the slice
+      ReconcilePlan.nothing(ReconcileResult(Set(), false, stale = true))
     else
-      read match
+      val p = read match
         case kv: KeyValueObjectState if !kv.partial && storeId.poolIndex < kv.ida.width =>
           planKeyValue(snapshot, current, kv, storeId, locks)
         case d: DataObjectState if storeId.poolIndex < d.ida.width =>
@@ -105,6 +108,11 @@ object Reconcile:
         case _ =>
           // Partial or metadata-only reads cannot rebuild the store's copy
           ReconcilePlan.nothing(ReconcileResult(Set(), false, stale = true))
+      // A copy is created only with its refcount: without one it would hold the zero count of a deleted object
+      if current.isMissing && p.refcount.isEmpty && !p.changesNothing then
+        ReconcilePlan.nothing(p.result.copy(stale = true))
+      else
+        p
 
   /** The read's refcount when its serial is higher than the store's, or when the store holds no copy. None when it
     * is not taken, and whether the store's refcount changed since the snapshot (left alone, so stale)
@@ -128,11 +136,11 @@ object Reconcile:
       val (refcount, refcountStale) =
         if locks.objectLevel then (None, false) else planRefcount(snapshot, current, read)
 
-      // HLC timestamps are per transaction, so a read no older than the store's copy reflects every transaction the
+      // Deferred under an object-level lock, as KeyValue object-level parts are. HLC timestamps are per transaction, so a read no older than the store's copy reflects every transaction the
       // store applied. A refcount change advances the timestamp without the revision, so equal timestamps with
       // differing revisions mean the store missed a data write: the revision, not the timestamp, decides
       val (data, dataStale) =
-        if read.revision == current.revision || read.timestamp < current.timestamp then
+        if locks.objectLevel || read.revision == current.revision || read.timestamp < current.timestamp then
           (None, false)
         else if current.revision != snapshot.revision then
           (None, true)

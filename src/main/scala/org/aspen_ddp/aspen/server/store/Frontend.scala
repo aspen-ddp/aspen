@@ -59,7 +59,12 @@ class Frontend(val storeId: StoreId,
                /** The admission of the store's device's CRL: see admitPrepare */
                val admission: CrlAdmission = CrlAdmission.Unlimited,
                /** Looks up recovered commit votes in the pool's TracelessCommits tree: see requestTracelessLookup */
-               val tracelessLookup: TracelessCommitLookup = TracelessCommitLookup.Never) extends Logging {
+               val tracelessLookup: TracelessCommitLookup = TracelessCommitLookup.Never,
+               /** Runs a task on this store's executor: how completions arriving on other threads, such as a repair's
+                 * backend write, get back to the Frontend's state. Inline by default, for tests with synchronous
+                 * backends
+                 */
+               val post: (() => Unit) => Unit = task => task()) extends Logging {
 
   import Frontend._
 
@@ -88,7 +93,7 @@ class Frontend(val storeId: StoreId,
   // followers. An object a transaction only checks or locks gets no commit and so is never in flight
 
   /** Outstanding backend commits of transactions' changes, deletions included, by object: commit with
-    * `forTransaction = true`. Rebuild and repair commits are not counted
+    * `forTransaction = true`, and repair writes (see reconcile). Rebuild commits are not counted
     */
   private val txCommitsInFlight = scala.collection.mutable.HashMap[ObjectId, Int]()
 
@@ -809,7 +814,8 @@ class Frontend(val storeId: StoreId,
               backend.read(pointer)
 
   private def opportunisticRebuild(op: OpportunisticRebuild, os: ObjectState): Unit = {
-    if (os.metadata.revision == op.revision) {
+    // Backend writes of one object are unordered: skipped while another is outstanding
+    if (os.metadata.revision == op.revision && !commitInFlight(op.pointer.id)) {
       val rc = if (op.refcount.updateSerial > os.metadata.refcount.updateSerial)
         op.refcount
       else
@@ -830,6 +836,24 @@ class Frontend(val storeId: StoreId,
     */
   private def reconcile(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult],
                         loaded: Option[ObjectState]): Unit =
+    val objectId = read.pointer.id
+    // Backend writes of one object are unordered, so a repair writes only while no other write of the object is
+    // outstanding, and only over the state the store serves. Otherwise it is left for a later pass: this is rare
+    val served = servableState(objectId)
+    val unsettled = commitInFlight(objectId) || commitFailed(objectId) || committing.contains(objectId) ||
+      deleting.contains(objectId) ||
+      (loaded match
+        // Another in-memory state is the one served or locked: the loaded copy may be stale. With no cache, an
+        // uncached load is the store's state
+        case Some(os) => referenced.get(objectId).exists(r => !(r eq os)) || served.exists(c => !(c eq os))
+        case None => served.nonEmpty)
+    if unsettled then
+      p.success(ReconcileResult(Set(), false, stale = true))
+    else
+      reconcileSettled(snapshot, read, p, loaded)
+
+  private def reconcileSettled(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult],
+                               loaded: Option[ObjectState]): Unit =
     val current = loaded.map(RepairSnapshot.of).getOrElse(RepairSnapshot.missing(read.pointer.id))
     val locks = loaded match
       case None => read.readLocks
@@ -861,9 +885,31 @@ class Frontend(val storeId: StoreId,
         plan.timestamp.getOrElse(md.timestamp))
       logger.trace(s"Store $storeId: repair of ${os.objectId} installs ${plan.installs.size} keys, deletes " +
         s"${plan.deletes.size}, leaves ${plan.result}")
+
+      // Counted as an in-flight commit: transactions on the object wait behind the write as behind a transaction's
+      // backend commit, and are released when it completes or fails
+      val objectId = os.objectId
+      txCommitsInFlight(objectId) = txCommitsInFlight.getOrElse(objectId, 0) + 1
       val done = Promise[Unit]()
-      p.completeWith(done.future.map(_ => plan.result)(using scala.concurrent.ExecutionContext.parasitic))
+      done.future.onComplete { result =>
+        post(() => repairWriteComplete(objectId, result.isSuccess))
+        p.complete(result.map(_ => plan.result))
+      }(using scala.concurrent.ExecutionContext.parasitic)
       backend.repair(CommitState(read.pointer, os.metadata, os.objectType, os.data), done)
+
+  /** A repair's backend write completed. A failed one leaves memory ahead of the backend, so the state is dropped and
+    * reloaded
+    */
+  private def repairWriteComplete(objectId: ObjectId, succeeded: Boolean): Unit =
+    if !succeeded then
+      logger.warn(s"Store $storeId: repair write of object $objectId failed. Its state is reloaded from the backend")
+      discard(objectId)
+    val n = txCommitsInFlight.getOrElse(objectId, 1) - 1
+    if n == 0 then
+      txCommitsInFlight.remove(objectId)
+      commitTurnFree(objectId)
+    else
+      txCommitsInFlight(objectId) = n
 
   def backendReadComplete(objectId: ObjectId,
                           result: Either[ReadState, ReadError.Value]): Unit = {

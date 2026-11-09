@@ -131,7 +131,7 @@ class ReconcileSuite extends AnyFunSuite with Matchers:
     p.refcount shouldBe None
     p.result.stale shouldBe true
 
-  test("a DataObject keeps the timestamp rule for its data, while its refcount follows the serial"):
+  test("a DataObject's data follows a differing revision from a read no older than the store, while its refcount follows the serial"):
     val store = RepairSnapshot(oid, rev(1), ObjectRefcount(1, 1), ts(10), Map(), None)
     def read(revision: ObjectRevision, refcount: ObjectRefcount, timestamp: HLCTimestamp): DataObjectState =
       DataObjectState(dataPtr, revision, refcount, timestamp, timestamp, ida, 0, DataBuffer(value(30).bytes))
@@ -183,6 +183,26 @@ class ReconcileSuite extends AnyFunSuite with Matchers:
     stale.data shouldBe None
     stale.revision shouldBe None
     stale.result.stale shouldBe true
+
+  test("an object deleted on the store since the snapshot is not recreated"):
+    val snapshot = kvStore(Map(k0 -> rev(1)))
+    val p = plan(snapshot, RepairSnapshot.missing(oid), kvRead(Map(k0 -> rev(1), k1 -> rev(2))))
+    p.changesNothing shouldBe true
+    p.result.stale shouldBe true
+    val data = RepairSnapshot(oid, rev(1), ObjectRefcount(1, 1), ts(10), Map(), None)
+    val d = plan(data, RepairSnapshot.missing(oid),
+      DataObjectState(dataPtr, rev(2), ObjectRefcount(1, 1), ts(20), ts(20), ida, 0, DataBuffer(value(30).bytes)))
+    d.changesNothing shouldBe true
+    d.result.stale shouldBe true
+
+  test("an object-level lock defers a DataObject's data and revision"):
+    val store = RepairSnapshot(oid, rev(1), ObjectRefcount(1, 1), ts(10), Map(), None)
+    val read = DataObjectState(dataPtr, rev(2), ObjectRefcount(2, 1), ts(20), ts(20), ida, 0,
+      DataBuffer(value(30).bytes))
+    val p = plan(store, store, read, ReadLocks(Set(), objectLevel = true))
+    p.changesNothing shouldBe true
+    p.result.objectLevelDeferred shouldBe true
+    p.result.complete shouldBe false
 
   test("the object timestamp becomes the larger of the two"):
     val store = kvStore(Map(k0 -> rev(1)), timestamp = ts(10))

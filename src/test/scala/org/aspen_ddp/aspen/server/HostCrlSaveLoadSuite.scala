@@ -15,9 +15,12 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading}
+import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
+
+import org.scalatest.compatible
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
@@ -120,6 +123,52 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       val store = storeOf(host).get
       store.frontend.transactions.keySet should be (Set(txid))
       store.objectCache.get(oid).flatMap(_.lockedToTransaction) should be (Some(txid))
+
+  /** A RecordingCRL whose reads of a store's recovery state throw once `failing`, as a corrupt entry would make it */
+  private class ThrowingCRL extends TestNetwork.RecordingCRL:
+    @volatile var failing = false
+    override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+      if failing then throw new IllegalStateException("injected recovery failure")
+      else super.getFullRecoveryState(storeId)
+
+  /** The store's backend holding the object, in a directory of its own, with no crl_save.log */
+  private def storeInDir(): (MapBackend, os.Path) =
+    val root = os.temp.dir()
+    tempRoots += root
+    val storeDir = root / "store"
+    os.makeDir.all(storeDir)
+    val backend = new MapBackend(crlStoreId):
+      override def path: os.Path = storeDir
+    backend.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
+      DataBuffer(Array[Byte](0)))
+    (backend, storeDir)
+
+  private def assertRetired(host: Host, loaded: Future[Unit], storeDir: os.Path): Future[compatible.Assertion] =
+    given ExecutionContext = executionContext
+    def retired: Boolean =
+      host.testingOnlyHandleEvents()
+      loaded.isCompleted && storeOf(host).isEmpty
+    for
+      _ <- yieldUntil(retired)
+    yield
+      withClue("a store that failed to recover part of its transactions is not served: "):
+        storeOf(host) should be (None)
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be (true)
+
+  atest("a store whose device-CRL recovery throws is not served, and is marked for rebuild"):
+    val crl = new ThrowingCRL
+    crl.save(txid, commitVote(), () => ())
+    crl.failing = true
+    val (backend, storeDir) = storeInDir()
+    val host = newCrlHost(crl)
+    assertRetired(host, host.loadStore(deviceId, backend, None), storeDir)
+
+  atest("a store whose recovery from its crl_save.log throws is not served, and is marked for rebuild"):
+    val crl = new ThrowingCRL
+    crl.failing = true
+    val backend = storeWithSaveFile()
+    val host = newCrlHost(crl)
+    assertRetired(host, host.loadStore(deviceId, backend, None), backend.path)
 
   atest("a prepare that arrives while the crl_save.log loads is handled after the recovered transactions lock"):
     given ExecutionContext = executionContext

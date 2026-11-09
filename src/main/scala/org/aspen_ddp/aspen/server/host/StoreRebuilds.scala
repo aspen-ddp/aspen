@@ -61,6 +61,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   def handleBackendFailed(e: Host.BackendFailed): Unit =
     backendFailed(e.storeId, Option(e.backend.get), e.err)
 
+  /** A served store failed to recover its CRL transactions: it may be missing some of their votes and locks, so it
+   *  can no longer be trusted, and is fail-stopped and rebuilt as a failed backend is */
+  def handleRecoveryFailed(e: Host.StoreRecoveryFailed): Unit =
+    backendFailed(e.store.storeId, Some(e.store.backend), e.err, "failed to recover its transactions from its CRL")
+
   /** Creates and loads an Initializing store, then flips its entry out of Initializing.
    *
    *  The flip writes serviceStatus: Active normally, Offline when the device has been asked to
@@ -388,12 +393,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  Rebuilding. The mark is written before the close, so a crash meanwhile still never serves it. Nothing is
    *  awaited: the close completes in the background. A backend not (or no longer) served is ignored: either its
    *  LoadStore is still queued, and retires it on seeing it failed, or it was closed and replaced. */
-  private def backendFailed(storeId: StoreId, backend: Option[Backend], err: Throwable): Unit =
+  private def backendFailed(storeId: StoreId, backend: Option[Backend], err: Throwable,
+                            what: String = "failed on an I/O error"): Unit =
     // Store.backend and Backend.path are immutable, so the control side may read them while the store is served
     ctx.router.entry(storeId) match
       case Some(entry) if backend.exists(_ eq entry.store.backend) =>
         val store = entry.store
-        logger.error(s"Store $storeId failed on an I/O error and can no longer be trusted. Taking it offline and " +
+        logger.error(s"Store $storeId $what and can no longer be trusted. Taking it offline and " +
                      s"rebuilding it. Error: $err")
         ctx.router.remove(storeId)
         ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>

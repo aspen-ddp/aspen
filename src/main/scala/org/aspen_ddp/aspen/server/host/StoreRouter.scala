@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionId, TransactionStatus}
-import org.aspen_ddp.aspen.server.DurableFiles
+import org.aspen_ddp.aspen.server.{DurableFiles, Host}
 import org.aspen_ddp.aspen.server.repair.StoreNotHosted
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store}
 import org.aspen_ddp.aspen.server.store.backend.CompletionHandler
@@ -210,7 +210,18 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private[host] def recoverDeferred(store: Store): Unit =
     route(store.storeId, () => ()): installed =>
       if installed eq store then
-        installed.frontend.recover()
+        recoverOrFail(installed)
+
+  /** Recovers `store`'s transactions, on its executor. A recovery that throws may have recreated only some of them:
+   *  the store keeps holding its messages and dropping reads (Frontend.awaitRecovery stays set) and is fail-stopped
+   *  on the control thread (StoreRebuilds.handleRecoveryFailed) */
+  private def recoverOrFail(store: Store): Unit =
+    try
+      store.frontend.recover()
+    catch
+      case NonFatal(err) =>
+        logger.error(s"Store ${store.storeId} failed to recover its transactions from its CRL: $err")
+        ctx.post(Host.StoreRecoveryFailed(store, err))
 
   /** The CRL holds the state loaded from `store`'s crl_save.log. On its executor, if it is still the store
    *  installed: removes the save file and recovers its transactions. `p` is completed either way. A store closed
@@ -220,7 +231,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
       if installed eq store then
         // Durably: a save file brought back by a crash would be loaded again over newer device-CRL state
         DurableFiles.remove(saveFile)
-        installed.frontend.recover()
+        recoverOrFail(installed)
       p.success(())
 
   def get(storeId: StoreId): Option[Store] = Option(stores.get(storeId)).map(_.store)

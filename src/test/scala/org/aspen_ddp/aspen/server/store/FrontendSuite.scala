@@ -1388,6 +1388,74 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     r.collisions shouldBe List(txid1)
   }
 
+  /** The ReadResponse sent last, if any, taken */
+  def takeReadResponse(net: TestNet): Option[ReadResponse] =
+    net.clientMessage().collect { case rr: ReadResponse => rr }
+
+  test("a read of a recovered commit vote's object, arriving before the vote has locked, is not answered unlocked") {
+    // A read that joined the recovered transaction's load was answered before the load took its locks: a voter that
+    // has not applied the transaction reported the state it replaces, unlocked, and a repair trusting that read could
+    // undo the commit on a store that applied it
+    val backend = new DeferredReadBackend
+    populate(backend)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+        List(commitVote(txid1, List(overwrite(op1))))
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
+      new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+
+    frontend.readObjectForNetwork(clientId, new UUID(1, 1), op1, FullObject())
+    backend.deliver()
+    backend.deliver()
+    takeReadResponse(net).foreach(_.result.toOption.get.lockedWriteTransactions should contain (txid1))
+
+    // Once recovered, reads are answered, with the recovered vote's lock
+    frontend.readObjectForNetwork(clientId, new UUID(1, 2), op1, FullObject())
+    backend.deliver()
+    takeReadResponse(net).map(_.result.toOption.get.lockedWriteTransactions) shouldBe Some(Set(txid1))
+  }
+
+  test("a repair does not reconcile a store while it holds for recovered transactions") {
+    val backend = new DeferredReadBackend
+    populate(backend)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+        List(commitVote(txid1, List(overwrite(op1))))
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
+      crl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+
+    val snap = RepairSnapshot.missing(oid1)
+    val read = new DataObjectState(op1, ObjectRevision(txid2), ObjectRefcount(1, 1), HLCTimestamp(500), HLCTimestamp(500),
+      ida, 1, DataBuffer(Array[Byte](9)))
+    val p = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(snap, read, p)
+    backend.deliver()
+    backend.deliver()
+    p.future.value.flatMap(_.toOption).map(_.stale) shouldBe Some(true)
+  }
+
+  test("a network read reports a held key lock and an object-level lock") {
+    val (frontend, _, net) = lockFixture()
+
+    val keyLock = lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(1), rev0)))))
+    prepare(frontend, net, keyLock).disposition shouldBe TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+
+    def state(ptr: ObjectPointer): ReadResponse.CurrentState =
+      frontend.readObjectForNetwork(clientId, new UUID(1, 1), ptr, FullObject())
+      takeReadResponse(net).get.result.toOption.get
+
+    val kv = state(kvPtr)
+    kv.lockedKeys shouldBe Set(k(1))
+    kv.objectLocked shouldBe false
+    val data = state(op1)
+    data.objectLocked shouldBe true
+    data.lockedWriteTransactions shouldBe Set(txid2)
+  }
+
   test("a recovered commit vote is kept although its requirements no longer hold") {
     // It required a revision the object no longer has, as when its vote was persisted before another commit
     val stale = DataUpdate(op1, new ObjectRevision(new UUID(0, 10)), DataUpdateOperation.Overwrite)

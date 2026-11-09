@@ -707,7 +707,17 @@ class Frontend(val storeId: StoreId,
     val rest = before ++ after.drop(1)
     if rest.isEmpty then committing.remove(os.objectId) else committing(os.objectId) = rest
 
-  def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType): Unit = {
+  /** Answers a client's read. Dropped while holding for recovered transactions, as a loading store is silent: until a
+    * recovered commit vote has loaded its objects and taken its locks, this store would report the state the vote's
+    * transaction replaces, unlocked, and a repair trusting the read could undo that commit on a store that applied it
+    */
+  def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType): Unit =
+    if holding then
+      logger.trace(s"Store $storeId dropped read $readUUID: holding for recovered transactions")
+    else
+      readForNetwork(clientId, readUUID, pointer, readType)
+
+  private def readForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType): Unit = {
     val objectId = pointer.id
 
     servableState(objectId) match
@@ -866,7 +876,9 @@ class Frontend(val storeId: StoreId,
     // Backend writes of one object are unordered, so a repair writes only while no other write of the object is
     // outstanding, and only over the state the store serves. Otherwise it is left for a later pass: this is rare
     val served = servableState(objectId)
-    val unsettled = commitInFlight(objectId) || commitFailed(objectId) || committing.contains(objectId) ||
+    // While holding for recovered transactions, their locks are not all taken: the store's own locks would not defer
+    // what they cover
+    val unsettled = holding || commitInFlight(objectId) || commitFailed(objectId) || committing.contains(objectId) ||
       deleting.contains(objectId) ||
       (loaded match
         // Another in-memory state is the one served or locked: the loaded copy may be stale. With no cache, an
@@ -979,11 +991,15 @@ class Frontend(val storeId: StoreId,
 
         waiting.foreach { lpr =>
           lpr.foreach {
+            // Dropped, as at arrival, if recovery started meanwhile (see readObjectForNetwork)
+            case netRead: NetworkRead if holding =>
+              logger.trace(s"Store $storeId dropped read ${netRead.requestUUID}: holding for recovered transactions")
+
             case netRead: NetworkRead =>
               logger.trace(s"Completed backend load for read ${netRead.requestUUID}. SUCCESS. Sending read response")
               val cs = ReadResponse.CurrentState(os.metadata.revision, os.metadata.refcount, os.metadata.timestamp,
                 os.data.size, PartialRead.filter(os.objectType, os.data, netRead.readType), os.lockedWriteTransactions,
-          os.lockedKeys, os.objectLevelLocked)
+                os.lockedKeys, os.objectLevelLocked)
 
               val rr = ReadResponse(netRead.clientId, storeId, netRead.requestUUID, HLCTimestamp.now, Right(cs) )
               net.sendClientResponse(rr)
@@ -1007,6 +1023,9 @@ class Frontend(val storeId: StoreId,
       case Right(err) =>
         waiting.foreach { lpr =>
           lpr.foreach {
+            case netRead: NetworkRead if holding =>
+              logger.trace(s"Store $storeId dropped read ${netRead.requestUUID}: holding for recovered transactions")
+
             case netRead: NetworkRead =>
               logger.trace(s"Completed backend load for read ${netRead.requestUUID}. ERROR $err. Sending read response")
               val rr = ReadResponse(netRead.clientId, storeId, netRead.requestUUID, HLCTimestamp.now, Left(err) )

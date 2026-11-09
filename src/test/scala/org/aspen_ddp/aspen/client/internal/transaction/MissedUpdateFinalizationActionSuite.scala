@@ -380,12 +380,15 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
 
   // TracelessCommits entries
 
-  private def tracelessEntries(poolId: PoolId): Future[Map[Key, TracelessCommitEntry]] =
+  /** The pool's TracelessCommits entries for `txids`. Only those: the system's own transactions write entries too
+    * when a store misses one under load
+    */
+  private def tracelessEntries(poolId: PoolId, txids: TransactionId*): Future[Map[Key, TracelessCommitEntry]] =
     for
       pool <- client.getStoragePool(poolId)
       all <- pool.tracelessCommitsTree.foldLeft(Map[Key, TracelessCommitEntry]()): (acc, contents) =>
         acc ++ contents.map((k, vs) => k -> TracelessCommitEntry.decode(vs.value.bytes))
-    yield all
+    yield all.filter((k, _) => txids.contains(TracelessCommitEntry.decodeTransactionId(k)))
 
   private def refcountTxd(ptr: ObjectPointer): TransactionDescription =
     txdFor(ptr).copy(requirements = List(RefcountUpdate(ptr, ObjectRefcount(0, 1), ObjectRefcount(1, 0))))
@@ -405,7 +408,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     val txd = refcountTxd(ptr)
     for
       _ <- runMark(txd, Map(net.storeId0 -> Nil, net.storeId1 -> Nil))
-      entries <- tracelessEntries(Radicle.poolId)
+      entries <- tracelessEntries(Radicle.poolId, txd.transactionId)
     yield
       entries shouldBe Map(TracelessCommitEntry.key(net.storeId2, txd.transactionId) ->
         TracelessCommitEntry(txd.startTimestamp, List(ptr)))
@@ -419,7 +422,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     for
       _ <- runMark(deleteTx, seen)
       _ <- runMark(insertTx, seen)
-      entries <- tracelessEntries(Radicle.poolId)
+      entries <- tracelessEntries(Radicle.poolId, deleteTx.transactionId, insertTx.transactionId)
     yield
       entries.keySet shouldBe Set(TracelessCommitEntry.key(net.storeId2, deleteTx.transactionId))
 
@@ -428,7 +431,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     val txd = refcountTxd(ptr)
     for
       _ <- runMark(txd, Map(net.storeId0 -> Nil, net.storeId1 -> Nil, net.storeId2 -> List(ptr.id)))
-      entries <- tracelessEntries(Radicle.poolId)
+      entries <- tracelessEntries(Radicle.poolId, txd.transactionId)
     yield entries.isEmpty shouldBe true
 
   atest("a transaction spanning two pools writes each store's entry to its own pool's tree, naming only its objects"):
@@ -442,8 +445,8 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
                             RefcountUpdate(ptrB, ObjectRefcount(0, 1), ObjectRefcount(1, 0))),
         poolIDAMap = Map(Radicle.poolId -> net.ida, poolB -> Replication(1, 1)))
       _ <- runMark(txd, Map.empty)
-      a <- tracelessEntries(Radicle.poolId)
-      b <- tracelessEntries(poolB)
+      a <- tracelessEntries(Radicle.poolId, txd.transactionId)
+      b <- tracelessEntries(poolB, txd.transactionId)
     yield
       a.values.toList shouldBe List.fill(3)(TracelessCommitEntry(txd.startTimestamp, List(ptrA)))
       b shouldBe Map(TracelessCommitEntry.key(StoreId(poolB, 0.toByte), txd.transactionId) ->
@@ -456,7 +459,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     for
       _ <- marker.mark(List(missed(net.storeId0), missed(net.storeId1)),
                        List(MissedTracelessCommit(net.storeId0, txid, entry), MissedTracelessCommit(net.storeId1, txid, entry)))
-      entries <- tracelessEntries(Radicle.poolId)
+      entries <- tracelessEntries(Radicle.poolId, txid)
     yield
       marker.commits shouldBe 1
       entries.keySet shouldBe Set(TracelessCommitEntry.key(net.storeId0, txid), TracelessCommitEntry.key(net.storeId1, txid))

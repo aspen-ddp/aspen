@@ -28,34 +28,38 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
                              earlyEvictionAge: Option[FiniteDuration] = None) extends Logging {
   import TransactionStatusCache._
 
-  // Guarded by `this`: the removal listener runs on the cache's maintenance executor
+  // Guarded by `this`: the eviction listener runs on whichever thread performs the cache's maintenance
   private var evictedEarly: Long = 0L
   private var evictedSinceWarning: Long = 0L
   private var lastWarning: Option[Long] = None
 
-  private def evicted(entry: Entry, cause: RemovalCause): Unit =
-    earlyEvictionAge.foreach: age =>
-      val now = System.nanoTime()
-      if cause == RemovalCause.SIZE && now - entry.insertedAt < age.toNanos then
-        val warnCount = synchronized:
-          evictedEarly += 1
-          evictedSinceWarning += 1
-          if lastWarning.forall(last => now - last >= EarlyEvictionWarnEvery.toNanos) then
-            lastWarning = Some(now)
-            val n = evictedSinceWarning
-            evictedSinceWarning = 0
-            Some(n)
-          else
-            None
-        warnCount.foreach: n =>
-          logger.warn(s"Transaction status cache evicted $n entries younger than $age for size (max $maxEntries " +
-            s"entries) since the last warning: late prepares for those transactions are no longer answered from it")
+  private def evicted(age: FiniteDuration, entry: Entry, cause: RemovalCause): Unit =
+    val now = System.nanoTime()
+    if cause == RemovalCause.SIZE && now - entry.insertedAt < age.toNanos then
+      val warnCount = synchronized:
+        evictedEarly += 1
+        evictedSinceWarning += 1
+        if lastWarning.forall(last => now - last >= EarlyEvictionWarnEvery.toNanos) then
+          lastWarning = Some(now)
+          val n = evictedSinceWarning
+          evictedSinceWarning = 0
+          Some(n)
+        else
+          None
+      warnCount.foreach: n =>
+        logger.warn(s"Transaction status cache evicted $n entries younger than $age for size (max $maxEntries " +
+          s"entries) since the last warning: late prepares for those transactions are no longer answered from it")
 
-  private val cache: Cache[TransactionId,Entry] = Scaffeine()
-    .expireAfterWrite(cacheDuration)
-    .maximumSize(maxEntries)
-    .removalListener[TransactionId, Entry]((_, entry, cause) => evicted(entry, cause))
-    .build[TransactionId, Entry]()
+  // An eviction listener runs synchronously, inside the maintenance that evicts, and sees evictions only (not
+  // replacements or explicit removals). It is registered only when there is an age to check, so other caches, the
+  // client's included, pay nothing per write
+  private val cache: Cache[TransactionId,Entry] =
+    val base = Scaffeine().expireAfterWrite(cacheDuration).maximumSize(maxEntries)
+    earlyEvictionAge match
+      case Some(age) =>
+        base.evictionListener[TransactionId, Entry]((_, entry, cause) => evicted(age, entry, cause))
+          .build[TransactionId, Entry]()
+      case None => base.build[TransactionId, Entry]()
 
   def updateStatus(txid: TransactionId, status: TransactionStatus.Value, finalized: Boolean=false): Unit = {
     cache.put(txid, Entry(status, finalized))

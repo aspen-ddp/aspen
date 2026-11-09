@@ -773,6 +773,33 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.transactions.contains(txid1) shouldBe false
   }
 
+  test("a prepare older than the horizon for a transaction cached as resolved uses the cached outcome") {
+    val statusCache = new TransactionStatusCache()
+    statusCache.updateStatus(txid1, TransactionStatus.Committed)
+    withHorizon(statusCache): (frontend, _, net) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(6500, MILLISECONDS)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      // Checked as usual, not refused as too old, and the outcome known: no locks, the cached status kept
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      frontend.transactions(txid1).holdsLocks shouldBe false
+      statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
+  }
+
+  test("a prepare older than the horizon for a transaction cached as resolved is not refused when it hosts no objects") {
+    // No objects to load, so the vote is decided inside the first prepare, before the cached outcome is applied to the
+    // new Tx: only the cache check in the horizon test keeps it from a TransactionTooOld abort vote
+    val statusCache = new TransactionStatusCache()
+    statusCache.updateStatus(txid1, TransactionStatus.Committed)
+    withHorizon(statusCache): (frontend, _, net) =>
+      val txd = lockTxd(txid1, List(overwrite(otherPtr))).copy(startTimestamp = ago(FiniteDuration(6500, MILLISECONDS)))
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true))
+
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
+  }
+
   test("an unknown prepare younger than the horizon is handled as today") {
     withHorizon(): (frontend, _, net) =>
       val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(1, SECONDS)))

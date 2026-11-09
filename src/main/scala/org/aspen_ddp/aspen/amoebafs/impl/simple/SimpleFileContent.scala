@@ -280,7 +280,7 @@ object SimpleFileContent:
   object DeleteFileContentTask extends DurableTaskFactory:
     private val RootPointerKey: Key = Key(1)
 
-    val typeUUID: UUID = UUID.fromString("c1fb782f-7f13-4921-8ddf-155123445730")
+    val typeUUID: UUID = UUID.fromString("6f1c2a9e-3b7d-4e58-9a41-d2c0b8e7f310")
 
     override def createTask(client: AspenClient,
                             pointer: DurableTaskPointer,

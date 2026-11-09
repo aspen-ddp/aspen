@@ -1234,7 +1234,8 @@ object Main {
    *  the client runs -- amoebafs runs indefinitely -- keep the cached host list current too.
    */
   def createAspenClient(session: ClientSession,
-                        onetworkCacheDir: Option[os.Path] = None): (AspenClient, NetworkPlugin, KeyValueObjectPointer) =
+                        onetworkCacheDir: Option[os.Path] = None,
+                        userTypeFactories: List[RegisteredTypeFactory] = Nil): (AspenClient, NetworkPlugin, KeyValueObjectPointer) =
     // Compared against what was last written rather than what the session started with, so a
     // host set that moves and then moves back is written both times. Refreshes are serialized
     // on the reference so two cannot both compare against the same stale config.
@@ -1248,7 +1249,7 @@ object Main {
                                      session.clientConfig.credentials.certificate,
                                      session.clientConfig.credentials.privateKey)
 
-    createAspenClient(session.bootstrapConfig, onRefresh, tls, None, onetworkCacheDir, Nil)
+    createAspenClient(session.bootstrapConfig, onRefresh, tls, None, onetworkCacheDir, userTypeFactories)
 
   def createAspenClient(bootstrapConfig: BootstrapConfig.Config,
                         onRefresh: (String, BootstrapConfig.Config) => Unit,
@@ -1557,7 +1558,8 @@ object Main {
   def run_amoebafs(session: ClientSession, fsName: String, onetworkCacheDir: Option[os.Path] = None): Int = {
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(session, onetworkCacheDir)
+    val (client, network, radicle) = createAspenClient(session, onetworkCacheDir,
+      org.aspen_ddp.aspen.amoebafs.impl.StaticTypeRegistry.factories)
 
     network.startIoThread(client)
 

@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAlloc
 import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, DurableTaskFactory, TaskExecutor}
+import scribe.Logging
 import org.aspen_ddp.aspen.common.util.{uuid2byte, byte2uuid}
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -38,7 +39,7 @@ object SimpleTaskExecutor:
 
 class SimpleTaskExecutor(val client: AspenClient,
                          val taskStateAllocator: ObjectAllocator,
-                         kvos: KeyValueObjectState) extends TaskExecutor:
+                         kvos: KeyValueObjectState) extends TaskExecutor with Logging:
 
   import SimpleTaskExecutor._
 
@@ -65,7 +66,9 @@ class SimpleTaskExecutor(val client: AspenClient,
 
             client.typeRegistry.getType[DurableTaskFactory](taskType) match
               case None =>
-                inactive = taskPointer :: inactive
+                // Neither resumed nor reusable: the task is pending state this client cannot interpret,
+                // and reusing it would overwrite that state.
+                logger.error(s"Task ${taskPointer.kvPointer} has unregistered type $taskType; it is neither resumed nor reused")
 
               case Some(dtt) =>
                 val task = dtt.createTask(client, taskPointer, kvos.revision, kvos.contents, this)

@@ -1,6 +1,8 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.client.RegisteredTypeFactory
+import org.aspen_ddp.aspen.amoebafs.impl.StaticTypeRegistry
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.amoebafs.FileSystem
 import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleFileSystem
@@ -10,6 +12,8 @@ import scala.language.implicitConversions
 
 class FilesSystemTestSuite  extends IntegrationTestSuite {
   var fs: FileSystem = scala.compiletime.uninitialized
+
+  override def userTypeFactories: List[RegisteredTypeFactory] = StaticTypeRegistry.factories
 
   // Each test gets a fresh TestNetwork from IntegrationTestSuite.withFixture, so a fixed name
   // cannot collide across tests. The parameter is here for tests that want more than one.

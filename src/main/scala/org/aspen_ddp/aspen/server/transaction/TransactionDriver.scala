@@ -457,6 +457,17 @@ abstract class TransactionDriver(
     nextRound()
   }
 
+  /** The stores this driver received commit votes from, when they reach the write threshold of every object; None
+    * otherwise (the outcome came from another driver or a recovered accepted value). Only these voters can hold a
+    * saved commit vote that the commit relied on, so only they need a TracelessCommits entry
+    */
+  private def countedCommitVoters: Option[Set[StoreId]] =
+    val voters = peerDispositions.collect { case (s, TransactionDisposition.VoteCommit) => s }.toSet
+    val enough = allObjects.forall: ptr =>
+      val ida = txd.poolIDAMap(ptr.poolId)
+      (0 until ida.width).count(i => voters.contains(StoreId(ptr.poolId, i.toByte))) >= ida.writeThreshold
+    Option.when(enough)(voters)
+
   protected def onResolution(committed: Boolean, sendResolutionMessage: Boolean): Unit = synchronized {
     if (!resolved) {
 
@@ -475,6 +486,8 @@ abstract class TransactionDriver(
 
         logger.trace(s"Running finalization actions for transaction ${txd.transactionId}")
         val f = finalizerFactory.create(txd, messenger)
+
+        f.commitVoters(countedCommitVoters)
 
         // Update with initial commitErrors. This avoids problems when all TxCommit messages arrive
         // before we notice that resolution has been achieved

@@ -22,6 +22,8 @@ object RegisteredTransactionFinalizerFactory {
       actions.foreach(_.updateCommitErrors(commitErrors))
     }
 
+    override def commitVoters(voters: Option[Set[StoreId]]): Unit = actions.foreach(_.commitVoters(voters))
+
     def debugStatus: List[(String, Boolean)] = {
       actions.map(f => (f.getClass.getSimpleName, f.complete.isCompleted))
     }

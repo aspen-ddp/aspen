@@ -413,6 +413,37 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entries shouldBe Map(TracelessCommitEntry.key(net.storeId2, txd.transactionId) ->
         TracelessCommitEntry(txd.startTimestamp, List(ptr)))
 
+  /** Marks `txd` as a driver that counted `voters` reports them, with every store in `commitErrors` having replied */
+  private def runMarkWithVoters(txd: TransactionDescription, voters: Set[StoreId],
+                                commitErrors: Map[StoreId, List[ObjectId]]): Future[Unit] =
+    val fa = new MissedUpdateFinalizationAction(client, txd)
+    fa.commitVoters(Some(voters))
+    fa.updateCommitErrors(commitErrors)
+    fa.markMissedUpdates()
+    fa.complete
+
+  atest("a store that never voted commit gets an ErrorTree mark but no TracelessCommits entry"):
+    // store2 was offline throughout: it holds no commit vote to recover, so repair through the ErrorTree is enough
+    val ptr = pointerWith(Array[Byte](4, 3))
+    val txd = refcountTxd(ptr)
+    for
+      _ <- runMarkWithVoters(txd, Set(net.storeId0, net.storeId1), Map(net.storeId0 -> Nil, net.storeId1 -> Nil))
+      entries <- tracelessEntries(Radicle.poolId, txd.transactionId)
+      marked <- markedStores(ptr, List(net.storeId0, net.storeId1, net.storeId2))
+    yield
+      entries shouldBe empty
+      marked shouldBe List(net.storeId2)
+
+  atest("a commit voter that sent no TxCommitted gets a TracelessCommits entry"):
+    // store1 voted commit and then crashed before applying: on recovery it looks for this entry
+    val ptr = pointerWith(Array[Byte](4, 4))
+    val txd = refcountTxd(ptr)
+    for
+      _ <- runMarkWithVoters(txd, Set(net.storeId0, net.storeId1), Map(net.storeId0 -> Nil))
+      entries <- tracelessEntries(Radicle.poolId, txd.transactionId)
+    yield
+      entries.keySet shouldBe Set(TracelessCommitEntry.key(net.storeId1, txd.transactionId))
+
   atest("a flagged KV delete without a required revision gets an entry; an insert-only update does not"):
     val delPtr = KeyValueObjectPointer(ObjectId(UUID.randomUUID()), Radicle.poolId)
     val insPtr = KeyValueObjectPointer(ObjectId(UUID.randomUUID()), Radicle.poolId)

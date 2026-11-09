@@ -22,6 +22,13 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
   private var commitErrors: Map[StoreId, List[ObjectId]] = Map()
 
+  // The commit voters the driver counted, if it counted them. None: unknown, so every silent store may hold one
+  private var voters: Option[Set[StoreId]] = None
+
+  override def commitVoters(voters: Option[Set[StoreId]]): Unit = synchronized {
+    this.voters = voters
+  }
+
   private var markTask: Option[ScheduledTask] = None
 
   private val completionPromise: Promise[Unit] = Promise()
@@ -78,9 +85,11 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
           } ++ l
     }
 
-    // A store that sent no TxCommitted may also have missed a change that leaves no trace on its objects
+    // A commit voter that sent no TxCommitted may have crashed holding its saved vote. If it recovers after the
+    // transaction is forgotten, this entry is how it learns the transaction committed. A store that never voted
+    // holds no vote to recover: the ErrorTree marks above repair it, so it gets no entry
     val traceless = txd.allDataStores.toList.flatMap: storeId =>
-      if commitErrors.contains(storeId) then
+      if commitErrors.contains(storeId) || voters.exists(!_.contains(storeId)) then
         None
       else
         val objects = txd.allHostedObjects(storeId).filter(ptr => txd.tracelessObjects.contains(ptr.id))

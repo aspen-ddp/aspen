@@ -82,6 +82,13 @@ object TransactionDriverSuite {
     def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = synchronized {
       peers = commitErrors.keySet
     }
+
+    /** None until the driver reports its commit voters */
+    var voters: Option[Option[Set[StoreId]]] = None
+
+    override def commitVoters(voters: Option[Set[StoreId]]): Unit = synchronized {
+      this.voters = Some(voters)
+    }
   }
 
 }
@@ -489,6 +496,36 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     driver.mayBeDiscarded should be (true)
     completed should be (true)
     finalizer.cancelled should be (true)
+  }
+
+  test("A driver that counted a write threshold of commit votes gives the finalizer those voters") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val finalizer = new TFinalizer(false)
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), finalizer, _ => ())
+
+    for from <- List(ds0, ds1) do
+      driver.receiveTxPrepareResponse(TxPrepareResponse(ds0, from, txd.transactionId,
+        Right(TxPrepareResponse.Promise(None)), ProposalId(1, 0), TransactionDisposition.VoteCommit, Nil))
+    for from <- List(ds0, ds1) do
+      driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
+        Right(TxAcceptResponse.Accepted(true))))
+
+    finalizer.created should be (true)
+    finalizer.voters should be (Some(Some(Set(ds0, ds1))))
+  }
+
+  test("A driver that learned the commit without counting a write threshold of votes reports no voters") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val finalizer = new TFinalizer(false)
+    val driver = new TTD(ds0, new TMessenger(), mkprep(2, 0, 0, txd), finalizer, _ => ())
+
+    driver.receiveTxPrepareResponse(TxPrepareResponse(ds0, ds0, txd.transactionId,
+      Right(TxPrepareResponse.Promise(None)), ProposalId(1, 0), TransactionDisposition.VoteCommit, Nil))
+    driver.receiveTxResolved(org.aspen_ddp.aspen.common.network.TxResolved(ds0, ds1, txd.transactionId,
+      committed = true))
+
+    finalizer.created should be (true)
+    finalizer.voters should be (Some(None))
   }
 
   test("Simple AcceptResponse Handling - Ignore invalid acceptor") {

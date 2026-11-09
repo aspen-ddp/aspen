@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server.repair
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, ReadLocks, Transaction}
 import org.aspen_ddp.aspen.client.internal.transaction.TracelessCommitEntry
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedTracelessCommit
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -433,6 +434,19 @@ class StoreRepairerSuite extends IntegrationTestSuite:
         net.offlineStores = Set()
         committed.flatMap(_ => settled).map(_ => tx.id)
 
+  /** missedByTx, standing in for a commit voter that crashed holding its vote and dropped it on recovery: its copies
+    * lack the change, and it has the TracelessCommits entry the finalizer writes for a voter that sent no TxCommitted,
+    * naming `objects`. A store that missed the transaction outright gets no entry: it never voted
+    */
+  private def missedByCrashedVoter(i: Int, objects: ObjectPointer*)(build: Transaction => Unit): Future[TransactionId] =
+    val start = HLCTimestamp.now
+    for
+      txid <- missedByTx(i)(build)
+      entry = MissedTracelessCommit(sid(i), txid, TracelessCommitEntry(start, objects.toList))
+      _ <- pump(client.missedUpdateMarker.mark(Nil, List(entry)), deadline())
+      _ <- settle()
+    yield txid
+
   /** Scans store `i` through the live host until its errorTree and TracelessCommits ranges are empty */
   private def scanUntilQuiet(i: Int, repairer: StoreRepairer = StoreRepairer(client, net.smgr),
                              passes: Int = 20): Future[Unit] =
@@ -640,7 +654,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     val repairer = StoreRepairer(client, target)
     for
       kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
-      txid <- missedByTx(2)(kvUpdate(kvPtr, List(Delete(k1))))
+      txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
       _ <- dropErrorEntries(2)
       before <- tracelessEntries(2)
       _ = target.live += (sid(2) -> txid)
@@ -657,7 +671,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     val repairer = StoreRepairer(client, target)
     for
       kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
-      txid <- missedByTx(2)(kvUpdate(kvPtr, List(Delete(k1))))
+      txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
       _ <- dropErrorEntries(2)
       _ = target.live += (sid(2) -> txid)
       _ <- pass(2, repairer, DeferralState())
@@ -675,7 +689,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       dataPtr <- sharedDataObject()
       before <- client.read(dataPtr)
-      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, before.refcount.setCount(0)))
+      _ <- missedByCrashedVoter(2, dataPtr)(_.setRefcount(dataPtr, before.refcount, before.refcount.setCount(0)))
       _ <- dropErrorEntries(2)
       _ = withClue("store 2 missed the deletion: "):
             storeHasObject(2, dataPtr.id) shouldBe true
@@ -722,8 +736,8 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       dataPtr <- sharedDataObject()
       before <- client.read(dataPtr)
       expected = before.refcount.setCount(before.refcount.count + 1)
-      _ <- missedBy(2)(kvUpdate(kvPtr, List(Delete(k1))))
-      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, expected))
+      _ <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
+      _ <- missedByCrashedVoter(2, dataPtr)(_.setRefcount(dataPtr, before.refcount, expected))
       _ <- dropErrorEntries(2)
       marked <- tracelessEntries(2)
       result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
@@ -742,7 +756,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1)),
                                   k2 -> Value(Array[Byte](2))))
-      txid <- missedByTx(2)(kvUpdate(kvPtr, List(Delete(k1), Delete(k2))))
+      txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1), Delete(k2))))
       _ <- dropErrorEntries(2)
       _ = target.lockedKeys += kvPtr.id -> Set(k2)
     yield
@@ -826,7 +840,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       dataPtr <- sharedDataObject()
       before <- client.read(dataPtr)
       expected = before.refcount.setCount(before.refcount.count + 1)
-      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, expected))
+      _ <- missedByCrashedVoter(2, dataPtr)(_.setRefcount(dataPtr, before.refcount, expected))
       _ <- dropErrorEntries(2)
       _ = target.objectLocked += dataPtr.id
       first <- pass(2, repairer, deferral)

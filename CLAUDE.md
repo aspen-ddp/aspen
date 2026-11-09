@@ -217,8 +217,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     decide abort on votes against the commit's own result and drop the update the recovering store holds. Past the
     horizon this check comes first; younger prepares make it only on the abort path
   - Changes that leave no trace (a `RefcountUpdate`, or a KV update without a required revision whose
-    `KeyValueUpdate.deletesKeys` is set; stores reject an unflagged Delete) cannot be proven that way. For a store
-    that sent no TxCommitted, the finalizer also writes `TracelessCommitEntry(timestamp, objects)` to its pool's
+    `KeyValueUpdate.deletesKeys` is set; stores reject an unflagged Delete) cannot be proven that way. For a commit voter
+    that sent no TxCommitted (any such store when the driver did not count the votes; `FinalizationAction.commitVoters`),
+    the finalizer also writes `TracelessCommitEntry(timestamp, objects)` to its pool's
     TracelessCommits tree (`StoragePoolState.TracelessCommitsTreeKey`, key `TracelessCommitEntry.key(store, txid)`), in
     the ErrorTree batch. A recovered unresolved commit vote looks its entry up (`TracelessCommitLookup`, from the Host)
     once loaded and again before accepting any abort; an entry found means it committed: the Tx applies its saved

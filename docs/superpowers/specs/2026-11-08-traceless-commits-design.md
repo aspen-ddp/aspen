@@ -106,6 +106,14 @@ if any object T changes on that store has a traceless change:
 Stores that did send `TxCommitted`, even with object errors, get no entry: they applied T durably and cannot recover
 a pending vote for it.
 
+Only commit voters get one. When the deciding driver counted commit votes reaching the write threshold of every object,
+it hands those voters to the finalizer (`FinalizationAction.commitVoters`), and only they get entries. A store that
+never voted, such as one offline throughout, holds no vote to recover, and its ErrorTree marks repair it. A voter the
+driver did not count is not one the commit relied on: if it drops T it is no different from a store that missed T.
+When the driver learned the outcome without counting (another driver's `TxResolved`, a recovered accepted value), it
+passes None and every store that sent no `TxCommitted` gets an entry, as before. (Amended after implementation: an
+offline store otherwise grew the tree by one entry per traceless transaction for the length of its outage.)
+
 The entries go into the same per-pool batch transaction `MissedUpdateMarker` already writes, so marking stays one
 transaction per pool. Tracking disabled by `limitTracking` disables these entries too.
 
@@ -297,8 +305,8 @@ Each step is test-first, per the project's rules.
 Unit-level, in the style of `FrontendSuite`, `TransactionDriverSuite` and the repair suites:
 
 - **Finalizer:** a store with no `TxCommitted` for a transaction with a refcount change or a flagged KV delete gets a
-  TracelessCommits entry in the same batch as its ErrorTree marks. Insert-only KV updates, data updates, and stores
-  that sent `TxCommitted` with errors get none.
+  TracelessCommits entry in the same batch as its ErrorTree marks. Insert-only KV updates, data updates, stores
+  that sent `TxCommitted` with errors, and stores outside known commit voters get none.
 - **Flag:** the builder sets `deletesKeys` for any `Delete`; a store votes abort on a `Delete` with the flag false.
 - **Recovery:** a recovered `VoteCommit` with an entry applies its update, logs at info, deletes its CRL state, and
   is forgotten. Without an entry an abort is accepted. An abort arriving before the entry is visible is held until a
@@ -339,7 +347,7 @@ My calls, for review:
 - The tree's name, `TracelessCommits`.
 - A one-bit `deletesKeys` flag set automatically by `TransactionBuilder`, rather than recording every KV update without
   a required revision.
-- Entries only for stores that sent no `TxCommitted`.
+- Entries only for commit voters (all stores when the voters are unknown) that sent no `TxCommitted`.
 - Deferral state kept in memory on the repairing host.
 - A fallback bound of 10 passes, which is 5 minutes at the 30 s scan floor.
 - A horizon of the cache duration minus 1 s.

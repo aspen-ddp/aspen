@@ -23,6 +23,9 @@ trait TransactionFinalizer {
     */
   def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit
 
+  /** See FinalizationAction.commitVoters */
+  def commitVoters(voters: Option[Set[StoreId]]): Unit = ()
+
   /**
     * @return List of (test-class-name, is-complete)
     */

@@ -11,9 +11,9 @@ CRL thread. Move it off the store thread: read the store's state on the control 
 the store with its recovery.
 
 Traceless commits follow-ups (minor, from the 2026-11-08 reviews):
-- TracelessCommits entries are one per transaction (not merged per object like ErrorTree entries), and every missed
-  allocation adds one. A store that keeps missing errorTimeout under allocation-heavy load grows the tree, and the
-  scan pays a read and a delete per entry. Watch the volume.
+- TracelessCommits entries are one per transaction (not merged per object like ErrorTree entries), but only for
+  commit voters that sent no TxCommitted (all silent stores when the driver did not count the votes), so an offline
+  store gets none. A voter that keeps missing errorTimeout under allocation-heavy load still grows the tree. Watch it.
 - proveObjectLevel moves the object revision. Prefer a proof that changes nothing.
 - A proof pass records only the pre-proof result in DeferralState; overlapping scans share one DeferralState; the
   traceless deferral branch does not count `deferred` in the scan result.

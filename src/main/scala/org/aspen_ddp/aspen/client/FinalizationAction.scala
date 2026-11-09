@@ -24,6 +24,12 @@ trait FinalizationAction extends Logging {
     */
   def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = ()
 
+  /** Called once, right after creation, with the stores whose commit votes the driver counted towards a write
+    * threshold of every object, or None when it learned the outcome without counting them (another driver's
+    * resolution, or a recovered accepted value)
+    */
+  def commitVoters(voters: Option[Set[StoreId]]): Unit = ()
+
   def debugStatus: (String, Boolean) = synchronized {
     (this.getClass.toString, complete.isCompleted)
   }

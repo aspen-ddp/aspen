@@ -71,7 +71,7 @@ class StreamWriter(val maxSizeInBytes: Long,
         case w: WriterThread.Write =>
           streams.get(w.streamId).foreach: channel =>
             channel.position(w.offset)
-            channel.write(w.buffers)
+            writeFully(channel, w.buffers)
             w.onWriteComplete()
             
         case WriterThread.Shutdown(completionHandler) =>
@@ -79,6 +79,15 @@ class StreamWriter(val maxSizeInBytes: Long,
           exitLoop = true
           completionHandler()
         
+  /** A gathering write may write less than all of its buffers: Linux takes at most IOV_MAX (1024) per call, and an
+   *  entry has a few buffers per transaction. Loops until every buffer is written, so completion means all of it is */
+  private def writeFully(channel: FileChannel, buffers: Array[ByteBuffer]): Unit =
+    var first = 0
+    while first < buffers.length do
+      channel.write(buffers, first, buffers.length - first)
+      while first < buffers.length && !buffers(first).hasRemaining do
+        first += 1
+
   def shutdown(completionHandler: () => Unit = () => ()): Unit =
     queue.add(WriterThread.Shutdown(completionHandler))
     // Checked after the add: either the dying thread's completeShutdowns finds this Shutdown, or this check sees it dead

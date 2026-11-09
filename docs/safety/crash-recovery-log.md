@@ -679,6 +679,10 @@ separately where it matters.
 
 ### F1. Large entries are silently truncated; acknowledged saves are lost (reproduced, high confidence, severe)
 
+> **FIXED (2026-11-09).** `StreamWriter.writeFully` loops the gathering write until every buffer is written. Covered by
+> the SimpleCRLSuite tests "StreamWriter writes every buffer of a write with more buffers than IOV_MAX" and "An entry
+> holding more transactions than IOV_MAX buffers recovers, including the re-save at open".
+
 **Verification (adversarial pass): CONFIRMED, severity data-loss.** Re-ran `iov/T.java` (1025 buffers wrote 10240 of 10250; 3000 wrote 10240 of 30000) and `Exp` E1 (1 of 501 recovered). `StreamWriter.scala:74` indeed discards the return value and `Stream.writeEntry` always hands over one array. Buffer count per entry is 1 header + (1 txd + 1 per update with data) per transaction + 1 static + at most 1 pad (`LogEntry.scala:84-121`), so about 340 two-update or about 510 one-update transactions overflow IOV_MAX. Triggers that need no slow disk: (a) the open-time re-save `SimpleCRL.scala:132-136` puts every recovered transaction into one entry (`initializing` suppresses `startWrite`), so a device recovering more than about 340-510 live transactions writes an unreadable entry on every start, and every entry written after it is lost with it (`findHighestEntry` stops at it); (b) a rotation that copy-forwards that many (`SimpleCRL.scala:178-182`); (c) batching behind a slow DSYNC (E1 forces this by blocking the writer in a completion handler, so (c) is the least likely). The F1 text above is otherwise accurate. Fix sketch: loop `while buffers.exists(_.hasRemaining)` (or coalesce into chunks of at most 1024 buffers and check the return value), and assert the byte count equals the entry size.
 
 `Stream.writeEntry` builds one buffer per transaction description, one per object update, a header, a static region and
@@ -701,6 +705,10 @@ Effect: forgotten promises and accepts (split-decision risk) and lost object dat
 under load. The tests use few transactions per entry and did not hit it.
 
 ### F2. After recovery spanning two streams, the active stream gets the wrong UUID; later acknowledged entries are lost (reproduced, high confidence, severe)
+
+> **FIXED (2026-11-09).** `Recovery.recover` takes the active stream's UUID from the newest entry and the walk over
+> older entries no longer changes it. This also fixes F20. Covered by the SimpleCRLSuite test "Saves acknowledged after
+> a recovery that spanned two streams survive the next recoveries".
 
 **Verification: CONFIRMED, severity data-loss, and it escalates (new experiment `verify-crl/Exp3.scala`).** Re-ran E2 (Z lost). `Recovery.scala:81` assigns the UUID for each visited entry and the last assignment is the oldest visited entry's, returned at `:106` and given to the active stream at `SimpleCRL.scala:126-128`. The open-time re-save (`:132-136`) is itself written with the wrong UUID when the walk crossed a stream, so even with no new traffic the first entry of every such run is unreadable. Escalation: after the restart, keep saving until the ring rotates into the next stream (fresh random UUID, readable), shut down and reopen. The walk from the newest entry follows its previous-entry link into the wrong-UUID entries, `readEntry` returns None, and recovery throws `BrokenEntryChain` (Exp3 output: `no entry can be read at StreamLocation(StreamId(1),8192,4096)`). `openDeviceCrl` then marks every store on the device rebuild-required (F6). So F2 is not only lost acknowledged saves: one ordinary restart in the state "oldest needed entry in an earlier stream" followed by a rotation and a second restart destroys the device. Fix sketch: return `readers(activeStreamId.number).currentUUID` as the active stream's UUID; add a regression test that restarts twice across a stream boundary.
 
@@ -931,6 +939,8 @@ depend on serial numbers starting at 0.
 
 
 ### F20 (new). F2 turns a routine restart into a device-wide rebuild (see F2; Exp3)
+
+> **FIXED (2026-11-09)** with F2.
 
 Not a separate bug but a separate consequence worth tracking: with F2 a second restart after a rotation throws
 `BrokenEntryChain`, F6 converts that into `rebuild-required` on every store of the device, and the reconcile then

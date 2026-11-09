@@ -58,6 +58,10 @@ object Recovery extends Logging:
           initialPreviousEntryLocation = lastEntryLocation
           initialNextEntrySerialNumber = lastEntry.entrySerialNumber + 1
           initialOldestEntryNeeded = lastEntry.oldestEntryNeeded
+          // New entries continue the active stream, so they carry its UUID. The walk below visits older entries,
+          // possibly in other streams, and must not change it: entries written under another stream's UUID would not
+          // be readable from the active stream at the next recovery
+          currentStreamUUID = lastEntry.streamUUID
 
           // Walks from the newest entry back to the oldest one needed. Each step must reach an entry older than the
           // last, so a broken chain throws rather than looping
@@ -78,7 +82,6 @@ object Recovery extends Logging:
                   previousEntryLocation.offset + LogEntry.StaticEntryHeaderSize + h.dynamicDataSize,
                   h.staticDataSize.toInt)
                 LogEntry.loadStaticEntryContent(h, bb, rs)
-                currentStreamUUID = h.streamUUID
                 if h.entrySerialNumber > lastEntry.oldestEntryNeeded then
                   loadPrevious(h.previousEntryStreamLocation, h.entrySerialNumber)
 

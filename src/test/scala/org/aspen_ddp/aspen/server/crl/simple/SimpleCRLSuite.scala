@@ -1220,4 +1220,78 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i2.crl.shutdown()
   }
+
+  private def mkTx(n: Long, numUpdates: Int): (TransactionId, TransactionRecoveryState) =
+    val tid = TransactionId(new UUID(7, n))
+    val d = TransactionDescription(tid, timestamp, op1, 1.toByte,
+      List(DataUpdate(op1, ObjectRevision(tid), DataUpdateOperation.Overwrite)),
+      List(), None, List(), List(), ida, Map(poolId -> ida))
+    val ous = (0 until numUpdates).map(i => ObjectUpdate(ObjectId(new UUID(9, i)), DataBuffer(Array[Byte](1, 2, 3)))).toList
+    (tid, TransactionRecoveryState(storeId, d.serialize(), ous, disp, status, pax))
+
+  test("StreamWriter writes every buffer of a write with more buffers than IOV_MAX") {
+    val sw = StreamWriter(1024 * 1024, streams(1))
+    val buffers = (0 until 3000).map(i => ByteBuffer.wrap(Array[Byte]((i % 127).toByte, 1))).toArray
+    val done = new CountDownLatch(1)
+    sw.write(stream0, 10, buffers, () => done.countDown())
+    assert(done.await(10, TimeUnit.SECONDS))
+    val shut = new CountDownLatch(1)
+    sw.shutdown(() => shut.countDown())
+    assert(shut.await(10, TimeUnit.SECONDS))
+
+    val bytes = os.read.bytes(tdir / "0.log")
+    for i <- 0 until 3000 do
+      assert(bytes(10 + 2 * i) == (i % 127).toByte, s"buffer $i")
+      assert(bytes(10 + 2 * i + 1) == 1.toByte, s"buffer $i")
+  }
+
+  test("An entry holding more transactions than IOV_MAX buffers recovers, including the re-save at open") {
+    val count = 600
+    val i1 = SimpleCRL(tdir, 3, 64L * 1024 * 1024)
+    val done = new CountDownLatch(count)
+    for n <- 1 to count do
+      val t = mkTx(n, 2)
+      i1.crl.save(t._1, t._2, () => done.countDown())
+    assert(done.await(30, TimeUnit.SECONDS))
+    i1.crl.shutdown()
+
+    // The open re-saves every recovered transaction in one entry, about three buffers each. A torn write of it hides
+    // every entry written after it, so the save acknowledged next must survive the reopen
+    val i2 = SimpleCRL(tdir, 3, 64L * 1024 * 1024)
+    assert(i2.trsList.length == count)
+    val late = mkTx(count + 1, 2)
+    saveAndWait(i2.crl, late._1, late._2)
+    i2.crl.shutdown()
+
+    val i3 = SimpleCRL(tdir, 3, 64L * 1024 * 1024)
+    assert(i3.trsList.length == count + 1)
+    i3.crl.shutdown()
+  }
+
+  test("Saves acknowledged after a recovery that spanned two streams survive the next recoveries") {
+    val size = 4096L * 3
+    val x = mkTx(1, 2)
+    val y = mkTx(2, 2)
+    val z = mkTx(3, 2)
+
+    val i1 = SimpleCRL(tdir, 3, size)
+    saveAndWait(i1.crl, x._1, x._2)
+    for _ <- 1 to 3 do saveAndWait(i1.crl, y._1, y._2)
+    i1.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, size)
+    assert(i2.trsList.length == 2)
+    saveAndWait(i2.crl, z._1, z._2)
+    i2.crl.shutdown()
+
+    val i3 = SimpleCRL(tdir, 3, size)
+    assert(i3.trsList.map(_.txd).toSet.size == 3)
+    // Rotate into another stream before the next restart
+    for _ <- 1 to 5 do saveAndWait(i3.crl, y._1, y._2)
+    i3.crl.shutdown()
+
+    val i4 = SimpleCRL(tdir, 3, size)
+    assert(i4.trsList.length == 3)
+    i4.crl.shutdown()
+  }
 }

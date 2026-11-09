@@ -333,14 +333,14 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 ctx.net, ctx.backgroundTasks, crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
                 Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize,
                 ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited),
-                ctx.tracelessLookup, Some(router.post(backend.storeId)), Host.txHorizon(ctx.heartbeatPeriod))
+                ctx.tracelessLookup, Some(router.post(backend.storeId)), Host.txHorizon(ctx.heartbeatPeriod),
+                // Its backend's completion handler is set below, after the Store is built: recovered transactions read
+                // their objects once it is installed (awaitCrlLoad)
+                deferRecovery = true)
               madeStore = Some(store)
               val entry = new StoreRouter.Entry(store, executor)
               // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any
               backend.setCompletionHandler(ctx.wrapCompletionHandler(router.completionHandler(entry)))
-              // Its transactions are recreated, and its transaction messages handled, once the CRL holds them
-              if trs.isDefined then
-                store.frontend.awaitRecovery()
               entry
             built match
               case Failure(err) =>
@@ -377,12 +377,16 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     catch case NonFatal(t) => logger.warn(s"Failed to close the unserved backend of store $storeId: $t")
     p.tryFailure(err)
 
-  /** The rest of a LoadStore once its store is installed: completes `p` at once with no saved state, or once the CRL
-   *  holds `trs` and the store has recovered from it. */
+  /** The rest of a LoadStore once its store is installed: with no saved state, recovers it from the device CRL and
+   *  completes `p` at once; otherwise completes `p` once the CRL holds `trs` and the store has recovered from it. Its
+   *  transactions are recreated, and its transaction messages handled, only once it has recovered. */
   private def awaitCrlLoad(store: Store, trs: Option[List[TransactionRecoveryState]], p: Promise[Unit]): Unit =
     val storeId = store.storeId
     trs match
-      case None => p.success(())
+      // The device CRL already holds its state: recovered on its executor, ahead of any message it holds
+      case None =>
+        router.recoverDeferred(store)
+        p.success(())
       case Some(trs) =>
         store.crl.loadStore(storeId, trs).onComplete:
           case Success(_) =>

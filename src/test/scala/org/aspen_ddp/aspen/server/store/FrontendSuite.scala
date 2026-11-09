@@ -800,6 +800,20 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
   }
 
+  test("an unknown prepare older than the horizon for a transaction cached only as unresolved votes TransactionTooOld") {
+    // Another store's Tx records itself in the host-wide cache as Unresolved (a recovered commit vote of a co-hosted
+    // store, say). That says nothing of the outcome, so the prepare is no less likely to replay a forgotten transaction
+    val statusCache = new TransactionStatusCache()
+    statusCache.updateStatus(txid1, TransactionStatus.Unresolved)
+    withHorizon(statusCache): (frontend, _, net) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(7, SECONDS)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+      frontend.transactions(txid1).holdsLocks shouldBe false
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
+  }
+
   test("an unknown prepare younger than the horizon is handled as today") {
     withHorizon(): (frontend, _, net) =>
       val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(1, SECONDS)))

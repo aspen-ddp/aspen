@@ -43,6 +43,9 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
   /** Override to run the TestNetwork's bootstrap host on another threading than lockstep (ThreadedHostSuite). */
   def testThreading: ExecutionContext => HostThreading = new LockstepThreading(_)
 
+  /** Override to give the TestNetwork's bootstrap host CRL recovery, recovery drivers or a shorter heartbeat */
+  def testHostOptions: TestNetwork.HostOptions = TestNetwork.HostOptions()
+
   def subFixtureSetup(): Unit = {}
   def subFixtureTeardown(): Unit = ()
 
@@ -55,7 +58,7 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
 
   override def withFixture(test: NoArgAsyncTest): FutureOutcome = {
     net = new TestNetwork(executionContext, userTypeFactories, testIda, testPoolMaxSliceSize, testStoreMaxSliceSize,
-      testBackendMaxSliceSize, testThreading)
+      testBackendMaxSliceSize, testThreading, testHostOptions)
     client = net.client
     testName = test.name
     radicle = net.radicle

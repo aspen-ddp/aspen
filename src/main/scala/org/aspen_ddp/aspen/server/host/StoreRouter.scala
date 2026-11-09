@@ -204,6 +204,14 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   /** One dispatch step that posts `store.heartbeat()` to each loaded store's executor. */
   def heartbeat(): Unit = postToEachStore(_.heartbeat())
 
+  /** `store` was built with its recovery deferred (Frontend.deferRecovery) and the CRL holds its state. On its
+   *  executor, if it is still the store installed: recovers its transactions. Its transaction messages are held
+   *  until then */
+  private[host] def recoverDeferred(store: Store): Unit =
+    route(store.storeId, () => ()): installed =>
+      if installed eq store then
+        installed.frontend.recover()
+
   /** The CRL holds the state loaded from `store`'s crl_save.log. On its executor, if it is still the store
    *  installed: removes the save file and recovers its transactions. `p` is completed either way. A store closed
    *  meanwhile keeps its save file, which its close rewrote, and recovers from it when next loaded. */

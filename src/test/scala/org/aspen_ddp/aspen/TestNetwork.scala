@@ -27,7 +27,7 @@ import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache as StoreObjectCache}
-import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
+import org.aspen_ddp.aspen.server.transaction.{SimpleTransactionDriver, TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.common.ida.IDA
 
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
@@ -52,6 +52,69 @@ object TestNetwork {
 
     override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = ()
   }
+
+  /** A CRL that keeps what it is given in memory, so a store loaded again recovers its transactions from it */
+  class RecordingCRL extends CrashRecoveryLog:
+    private var states: Map[StoreId, Map[TransactionId, TransactionRecoveryState]] = Map()
+
+    def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = synchronized:
+      states.getOrElse(storeId, Map()).values.toList
+
+    def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
+      synchronized:
+        states += state.storeId -> (states.getOrElse(state.storeId, Map()) + (txid -> state))
+      completionHandler()
+
+    def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit = ()
+
+    def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = synchronized:
+      states += storeId -> (states.getOrElse(storeId, Map()) - txid)
+
+    /** Rewrites the state held for `txid` of `storeId`: what a crash between two of its saves leaves */
+    def rewrite(storeId: StoreId, txid: TransactionId)(f: TransactionRecoveryState => TransactionRecoveryState): Unit =
+      synchronized:
+        val held = states.getOrElse(storeId, Map())
+        require(held.contains(txid), s"store $storeId holds no state for $txid")
+        states += storeId -> (held + (txid -> f(held(txid))))
+
+  /** Tasks run only by runDue, on its caller's thread: timers a lockstep test drives itself */
+  class ManualTimers extends BackgroundTaskManager(ExecutionContext.parasitic):
+    private final class Task(val due: Long, fn: () => Unit) extends BackgroundTaskManager.ScheduledTask:
+      @volatile var cancelled = false
+      def cancel(): Unit = cancelled = true
+      def run(): Unit = if !cancelled then fn()
+
+    private var tasks: List[Task] = Nil
+
+    override def schedule(delay: Duration)(fn: => Unit): BackgroundTaskManager.ScheduledTask = synchronized:
+      val t = new Task(System.nanoTime() + delay.toNanos, () => fn)
+      tasks = t :: tasks
+      t
+
+    override def schedulePeriodic(period: Duration, callNow: Boolean)(fn: => Unit): BackgroundTaskManager.ScheduledTask =
+      throw new UnsupportedOperationException("ManualTimers runs one-shot tasks only")
+
+    /** Runs the tasks whose delay has passed */
+    def runDue(): Unit =
+      val now = System.nanoTime()
+      val due = synchronized:
+        val (d, rest) = tasks.partition(_.due <= now)
+        tasks = rest
+        d
+      due.reverse.foreach(_.run())
+
+  /** What the bootstrap host recovers with. The defaults recover nothing: no CRL state, and store-side drivers that
+    * never send (TransactionDriver.noErrorRecoveryFactory)
+    *
+    * @param heartbeatPeriod the host's, from which its status cache duration and horizon follow. Nothing calls the
+    *                        heartbeat on its own: TestNetwork.heartbeat does
+    * @param recordCrl the stores' CRL is a RecordingCRL, so restartStore recovers their transactions
+    * @param recoveryDrivers drivers of transactions a store is not the designated leader of (recovery drivers) are
+    *                        SimpleTransactionDrivers on TestNetwork.driverTimers
+    */
+  final case class HostOptions(heartbeatPeriod: Duration = Duration(5, SECONDS),
+                               recordCrl: Boolean = false,
+                               recoveryDrivers: Boolean = false)
 
   /** Opens a fresh no-op CRL for each device, creating the crl directory a real one would, so discovery does not
     * take the device's stores to have lost theirs */
@@ -98,7 +161,8 @@ class TestNetwork(executionContext: ExecutionContext,
                   storeMaxSliceSize: Option[Long] = None,
                   backendMaxSliceSize: Option[Int] = None,
                   /** The bootstrap host's threading. Only ThreadedHostSuite passes anything but lockstep. */
-                  threading: ExecutionContext => HostThreading = new LockstepThreading(_)) extends ServerMessenger {
+                  threading: ExecutionContext => HostThreading = new LockstepThreading(_),
+                  hostOptions: TestNetwork.HostOptions = TestNetwork.HostOptions()) extends ServerMessenger {
   import TestNetwork._
 
   /** A new cache on each call. A HostObjectCache must not be shared between Hosts */
@@ -174,8 +238,11 @@ class TestNetwork(executionContext: ExecutionContext,
    *  whose messages are dropped would stall a transaction, as clients here do not recover them */
   @volatile var offlineStores: Set[StoreId] = Set()
 
+  /** Further transaction messages to drop, as a test chooses (a store missing a transaction's outcome, say) */
+  @volatile var dropTxMessage: TxMessage => Boolean = _ => false
+
   private def dropped(msg: TxMessage): Boolean =
-    droppedTx.contains((msg.to, msg.transactionId))
+    droppedTx.contains((msg.to, msg.transactionId)) || dropTxMessage(msg)
 
   /** Hosts other than smgr, each serving every store of the pools mapped to it. Messages to the stores of an
    *  unmapped pool go to smgr. handleEvents drains every mapped host, and a test remaps a pool to model a restart.
@@ -245,6 +312,27 @@ class TestNetwork(executionContext: ExecutionContext,
   val client: AspenClient = new TClient(executionContext, cliMessenger, radicle, ida, userTypeFactories)
   FinalizerFactory.client = client
 
+  /** The CRL of every store the bootstrap host loads */
+  val crl: CrashRecoveryLog = if hostOptions.recordCrl then new RecordingCRL() else new TestCRL()
+
+  /** The timers of recovery drivers (HostOptions.recoveryDrivers), run by heartbeat */
+  val driverTimers: ManualTimers = new ManualTimers
+
+  private val txDriverFactory: TransactionDriver.Factory =
+    if !hostOptions.recoveryDrivers then
+      TransactionDriver.noErrorRecoveryFactory
+    else
+      val recovery = SimpleTransactionDriver.factory(Duration(10, MILLISECONDS), Duration(100, MILLISECONDS))
+      new TransactionDriver.Factory:
+        def create(ec: ExecutionContext, storeId: StoreId, messenger: ServerMessenger,
+                   backgroundTasks: BackgroundTaskManager, txd: TransactionDescription,
+                   finalizerFactory: TransactionFinalizer.Factory): TransactionDriver =
+          if txd.designatedLeaderUID == storeId.poolIndex then
+            TransactionDriver.noErrorRecoveryFactory.create(ec, storeId, messenger, backgroundTasks, txd,
+              finalizerFactory)
+          else
+            recovery.create(ec, storeId, messenger, driverTimers, txd, finalizerFactory)
+
   val smgr = new Host(
     client,
     HostId.BootstrapHostId,
@@ -257,11 +345,11 @@ class TestNetwork(executionContext: ExecutionContext,
     BackgroundTaskManager.NoBackgroundTaskManager,
     TestCRL,
     FinalizerFactory,
-    TransactionDriver.noErrorRecoveryFactory,
-    Duration(5, SECONDS),
+    txDriverFactory,
+    hostOptions.heartbeatPeriod,
     Duration(60, SECONDS),
     // Its stores are loaded directly (below), onto a device it never loads
-    seams = Host.Seams(unloadedDeviceCrl = Some(new TestCRL())))
+    seams = Host.Seams(unloadedDeviceCrl = Some(crl)))
 
   // Stands in for each store's StoreConfig.effectiveMaxSliceSize, which Host reads from the store config file
   private val storesLoaded = (stores ++ metadataStores).map(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))
@@ -270,6 +358,27 @@ class TestNetwork(executionContext: ExecutionContext,
   if !lockstep then
     smgr.start()
     storesLoaded.foreach(loaded => Await.result(loaded, Duration(10, SECONDS)))
+
+  /** Crash-only restart of bootstrap-host store `backend`: a new Store replaces the loaded one, dropping everything it
+    * held in memory, and recovers its transactions from `crl` (HostOptions.recordCrl). Completes once loaded; the
+    * caller drains events meanwhile
+    */
+  def restartStore(backend: MapBackend): Future[Unit] = smgr.loadStore(storageDeviceId, backend, storeMaxSliceSize)
+
+  private var lastHeartbeat: Long = System.nanoTime()
+
+  /** One step of the time a lockstep host does not keep itself: the heartbeat of its stores but those of `except`,
+    * once a heartbeat period has passed since the last, then the recovery drivers' due timers. Then drains events
+    */
+  def heartbeat(except: Set[StoreId] = Set()): Unit =
+    val now = System.nanoTime()
+    if now - lastHeartbeat >= hostOptions.heartbeatPeriod.toNanos then
+      lastHeartbeat = now
+      val router = smgr.control.router
+      router.loaded.keys.filterNot(except.contains).foreach(id => router.post(id)(_.heartbeat()))
+    handleEvents()
+    driverTimers.runDue()
+    handleEvents()
 
   // ---- Rebalancing test helpers -------------------------------------------------
 

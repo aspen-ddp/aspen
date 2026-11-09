@@ -23,23 +23,6 @@ import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.{Duration, SECONDS}
 
-/** A CRL that keeps what it is given in memory, so that recovery state written by loadStore can be recovered */
-private class RecordingCRL extends CrashRecoveryLog:
-  private var states: Map[StoreId, Map[TransactionId, TransactionRecoveryState]] = Map()
-
-  def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = synchronized:
-    states.getOrElse(storeId, Map()).values.toList
-
-  def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
-    synchronized:
-      states += state.storeId -> (states.getOrElse(state.storeId, Map()) + (txid -> state))
-    completionHandler()
-
-  def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit = ()
-
-  def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = synchronized:
-    states += storeId -> (states.getOrElse(storeId, Map()) - txid)
-
 class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
 
   private val poolId = PoolId(new UUID(7, 1))
@@ -73,10 +56,22 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     TransactionDescription(id, HLCTimestamp(100), ptr, leader,
       List(DataUpdate(ptr, rev0, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida, Map(poolId -> ida))
 
-  private def newCrlHost(): Host =
+  /** The store's backend holding the object, with no crl_save.log */
+  private def storeWithObject(): MapBackend =
+    val backend = new MapBackend(crlStoreId)
+    backend.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
+      DataBuffer(Array[Byte](0)))
+    backend
+
+  /** txid's commit vote on an overwrite of the object, as the device CRL holds it */
+  private def commitVote(): TransactionRecoveryState =
+    TransactionRecoveryState(crlStoreId, overwriteTxd(txid, 0).serialize(),
+      List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), TransactionDisposition.VoteCommit,
+      TransactionStatus.Unresolved, PersistentState.initial)
+
+  private def newCrlHost(crl: CrashRecoveryLog = new TestNetwork.RecordingCRL): Host =
     val hostRoot = os.temp.dir()
     tempRoots += hostRoot
-    val crl = new RecordingCRL
     new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net,
       BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
@@ -104,6 +99,27 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       store.frontend.transactions.keySet should be (Set(txid))
       store.objectCache.get(oid).flatMap(_.lockedToTransaction) should be (Some(txid))
       os.exists(backend.crlSaveFile) should be (false)
+
+  atest("a store loaded with transactions in its device CRL recreates them and their locks"):
+    given ExecutionContext = executionContext
+    val crl = new TestNetwork.RecordingCRL
+    crl.save(txid, commitVote(), () => ())
+    // MapBackend reads complete at once: a read issued before the backend's completion handler is set is lost
+    val backend = storeWithObject()
+    val host = newCrlHost(crl)
+    val loaded = host.loadStore(deviceId, backend, None)
+
+    def locked: Boolean =
+      host.testingOnlyHandleEvents()
+      loaded.isCompleted && storeOf(host).exists(_.objectCache.get(oid).flatMap(_.lockedToTransaction).contains(txid))
+
+    for
+      _ <- yieldUntil(locked)
+      _ <- loaded
+    yield
+      val store = storeOf(host).get
+      store.frontend.transactions.keySet should be (Set(txid))
+      store.objectCache.get(oid).flatMap(_.lockedToTransaction) should be (Some(txid))
 
   atest("a prepare that arrives while the crl_save.log loads is handled after the recovered transactions lock"):
     given ExecutionContext = executionContext

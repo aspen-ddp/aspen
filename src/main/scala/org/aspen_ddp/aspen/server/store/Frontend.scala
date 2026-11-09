@@ -65,13 +65,18 @@ class Frontend(val storeId: StoreId,
                  * backends
                  */
                val post: (() => Unit) => Unit = task => task(),
-               /** A prepare for a transaction this store does not know, and the host's status cache does not hold,
+               /** A prepare for a transaction this store does not know, and the host's status cache holds no outcome for,
                  * that started longer ago than this votes abort with TransactionTooOld without its requirements being
                  * checked, unless an object already shows its update (Tx.proveCommitted). The cache may have forgotten
                  * that it finalized, so checking it afresh could vote commit on, and replay, a finished transaction.
                  * Host.txHorizon in hosts; infinite (off) by default
                  */
-               val horizon: Duration = Duration.Inf) extends Logging {
+               val horizon: Duration = Duration.Inf,
+               /** Recovers nothing at construction: transaction messages are held until recover is called. For
+                 * stores whose backend's completion handler is set after they are built (StoreLoader), where a read
+                 * a recovered transaction issued in the constructor would never complete
+                 */
+               deferRecovery: Boolean = false) extends Logging {
 
   import Frontend._
 
@@ -217,7 +222,7 @@ class Frontend(val storeId: StoreId,
   /** Transaction messages held, newest first, until recovery completes. See awaitRecovery and recoverTransactions */
   private var heldMessages: List[TxMessage] = Nil
 
-  /** The store's CRL state is still being loaded (from a crl_save.log). See awaitRecovery. `@volatile` for
+  /** The store's CRL state is still being loaded (from a crl_save.log), or its recovery is deferred. See awaitRecovery. `@volatile` for
     * mayHoldTransaction
     */
   @volatile private var awaitingCrl: Boolean = false
@@ -259,7 +264,7 @@ class Frontend(val storeId: StoreId,
   private val tracelessLookups = scala.collection.mutable.HashMap[TransactionId, TracelessLookup]()
   private var nextTracelessRequest: Long = 0L
 
-  recoverTransactions()
+  if deferRecovery then awaitRecovery() else recoverTransactions()
 
   /** Recreates the transactions the CRL holds for this store that are not already known.
     *
@@ -302,8 +307,8 @@ class Frontend(val storeId: StoreId,
       undecided.foreach(_.completeLoad())
     releaseHeldMessages()
 
-  /** The store's CRL state is being loaded after this Frontend was created (from a crl_save.log). Until recover is
-    * called, transaction messages are held: started without their recovery state, transactions would hold no locks
+  /** The store's CRL state is being loaded after this Frontend was created (from a crl_save.log), or its recovery is
+    * deferred (deferRecovery). Until recover is called, transaction messages are held: started without their recovery state, transactions would hold no locks
     * and a prepare would replace the recovered Paxos acceptor state with an initial one.
     */
   def awaitRecovery(): Unit = awaitingCrl = true
@@ -631,8 +636,9 @@ class Frontend(val storeId: StoreId,
       logger.trace(s"**** CREATING NEW TX: ${m.txd.transactionId}")
       val cached = statusCache.getStatus(m.txd.transactionId)
       val known = cached.filter(_.status != TransactionStatus.Unresolved)
-      // Measured with the HLC from the client-assigned start, so a client clock running behind makes it look older
-      val tooOld = cached.isEmpty && HLCTimestamp.now - m.txd.startTimestamp > horizon
+      // Measured with the HLC from the client-assigned start, so a client clock running behind makes it look older. An
+      // Unresolved entry counts as none: another store's Tx on this host wrote it, which says nothing of the outcome
+      val tooOld = known.isEmpty && HLCTimestamp.now - m.txd.startTimestamp > horizon
       val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates, takeSerializedTxd(m.txd.transactionId))
       val pointers = m.txd.allHostedObjects(m.to)
       val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers, tooOld = tooOld)

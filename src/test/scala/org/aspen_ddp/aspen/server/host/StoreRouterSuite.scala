@@ -426,6 +426,8 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       val first = bootstrappedBackend(s0)
       await(fx.load(first))
       val executor = fx.ctx.router.entry(s0).get.executor
+      // Recovered from the device CRL on the store's executor, after the load completes
+      fx.awaitExecutor(executor)
       val once = admission.admittedBytes
       once should be > 0L
       val second = bootstrappedBackend(s0)

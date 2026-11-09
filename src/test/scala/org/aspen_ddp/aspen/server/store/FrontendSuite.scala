@@ -77,9 +77,15 @@ object FrontendSuite {
   /** Records the TracelessCommits lookups a Frontend makes, and answers them when the test says */
   class ManualLookup extends TracelessCommitLookup:
     var frontend: Option[Frontend] = None
-    var requests: List[TransactionId] = Nil
-    def lookup(storeId: StoreId, transactionId: TransactionId): Unit = requests = requests :+ transactionId
-    def answer(txid: TransactionId, result: Try[Boolean]): Unit = frontend.get.tracelessLookupComplete(txid, result)
+    /** The lookups made, oldest first, with their request ids */
+    var made: List[(TransactionId, Long)] = Nil
+    def requests: List[TransactionId] = made.map(_._1)
+    def lookup(storeId: StoreId, transactionId: TransactionId, requestId: Long): Unit =
+      made = made :+ (transactionId -> requestId)
+    /** Answers the lookup `requestId` of `txid`, by default the latest made */
+    def answer(txid: TransactionId, result: Try[Boolean], requestId: Option[Long] = None): Unit =
+      val id = requestId.getOrElse(made.filter(_._1 == txid).last._2)
+      frontend.get.tracelessLookupComplete(txid, id, result)
 
   class TestCrl extends CrashRecoveryLog {
 
@@ -1508,6 +1514,28 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.contains(tracelessTxid) shouldBe false
     kvKeys(backend) should contain (k(2))
     crl.deleted should contain (tracelessTxid)
+  }
+
+  test("a TracelessCommits lookup whose answer is lost is made again at heartbeat once it times out") {
+    val (frontend, backend, _, _, lookup) = tracelessFixture()
+    val lost = lookup.made.last._2 // the recovery's lookup, whose answer never arrives
+    frontend.receiveTransactionMessage(TxResolved(storeId, tracelessDriver, tracelessTxid, committed = false))
+    lookup.requests.count(_ == tracelessTxid) shouldBe 1
+
+    val now = System.nanoTime()
+    frontend.retryTracelessLookups(now)
+    lookup.requests.count(_ == tracelessTxid) shouldBe 1
+    frontend.retryTracelessLookups(now + Frontend.TracelessLookupTimeout.toNanos + 1)
+    lookup.requests.count(_ == tracelessTxid) shouldBe 2
+
+    // The lost lookup read the tree before the abort arrived: its late answer finding no entry does not count
+    lookup.answer(tracelessTxid, Success(false), Some(lost))
+    frontend.transactions(tracelessTxid).status shouldBe TransactionStatus.Unresolved
+    lookup.requests.count(_ == tracelessTxid) shouldBe 2
+
+    lookup.answer(tracelessTxid, Success(true))
+    kvKeys(backend) should not contain k(2)
+    frontend.transactions.contains(tracelessTxid) shouldBe false
   }
 
   test("a TracelessCommits lookup answering after the Tx resolved committed is ignored") {

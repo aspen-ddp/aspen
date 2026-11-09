@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
 import scribe.Logging
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 
-import scala.concurrent.duration.{Duration, SECONDS}
+import scala.concurrent.duration.{Duration, FiniteDuration, SECONDS}
 import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success, Try}
 
@@ -25,6 +25,11 @@ object Frontend {
     * Several client retransmissions long, since the only cost of a late abort is a client retry.
     */
   val MissingDataWait: Duration = Duration(5, SECONDS)
+
+  /** How long a TracelessCommits lookup may go unanswered before the store heartbeat makes another. An answer can be
+    * lost: one completing before its store is installed in the StoreRouter is dropped
+    */
+  val TracelessLookupTimeout: FiniteDuration = FiniteDuration(5, SECONDS)
 
   sealed abstract class ReadKind
 
@@ -210,18 +215,22 @@ class Frontend(val storeId: StoreId,
   // Before recoverTransactions, which counts what it recovers (see admitPrepare)
   private val admitted = scala.collection.mutable.HashMap[TransactionId, Admitted]()
 
-  /** A recovered commit vote's TracelessCommits lookup (see Tx.needsTracelessCheck).
+  /** A recovered commit vote's TracelessCommits lookups (see Tx.needsTracelessCheck). Each lookup has its own request
+    * id, from a counter of this Frontend's lookups, and its answer names it.
     *
-    * @param inFlight a lookup has been made and not answered
-    * @param again an abort arrived while it was in flight: an answer finding no entry does not count, and another
-    *              lookup is made
-    * @param failed the last lookup failed: retryTracelessLookups makes another
+    * @param latest the id of the latest lookup made
+    * @param inFlight the latest lookup has not been answered
+    * @param startedAt when the latest lookup was made (System.nanoTime)
+    * @param firstCounting the first id whose answer finding no entry counts: lookups made before the latest abort
+    *                      arrived do not, since the entry may have been written after they read the tree
+    * @param failed the latest lookup failed: retryTracelessLookups makes another
     * @param failures lookups failed in a row, for logging
     */
-  private final class TracelessLookup(var inFlight: Boolean, var again: Boolean, var failed: Boolean,
-                                      var failures: Int)
+  private final class TracelessLookup(var latest: Long, var inFlight: Boolean, var startedAt: Long,
+                                      var firstCounting: Long, var failed: Boolean, var failures: Int)
   // Before recoverTransactions: a recovered transaction that loads at once requests its lookup inside it
   private val tracelessLookups = scala.collection.mutable.HashMap[TransactionId, TracelessLookup]()
+  private var nextTracelessRequest: Long = 0L
 
   recoverTransactions()
 
@@ -282,56 +291,76 @@ class Frontend(val storeId: StoreId,
 
   // ---- TracelessCommits lookups of recovered commit votes (Tx.needsTracelessCheck) ----
 
-  /** `tx` needs a TracelessCommits lookup started now: it has loaded, or an abort arrived. A lookup already in flight
-    * is not repeated, but its answer counts only if it found the entry
+  /** `tx` needs a TracelessCommits lookup started now: it has loaded, or an abort arrived. Only lookups made from now
+    * on can show the entry absent. One already in flight is not repeated: if it finds no entry, another is made
     */
   def requestTracelessLookup(tx: Tx): Unit =
     tracelessLookups.get(tx.transactionId) match
-      case Some(l) if l.inFlight => l.again = true
-      case _ => startTracelessLookup(tx.transactionId)
+      case Some(l) =>
+        l.firstCounting = nextTracelessRequest
+        if !l.inFlight then
+          startTracelessLookup(tx.transactionId, l)
+      case None =>
+        val l = new TracelessLookup(-1L, false, 0L, nextTracelessRequest, false, 0)
+        tracelessLookups(tx.transactionId) = l
+        startTracelessLookup(tx.transactionId, l)
 
-  private def startTracelessLookup(txid: TransactionId): Unit =
-    val l = tracelessLookups.getOrElseUpdate(txid, new TracelessLookup(false, false, false, 0))
+  private def startTracelessLookup(txid: TransactionId, l: TracelessLookup): Unit =
+    val requestId = nextTracelessRequest
+    nextTracelessRequest += 1
+    l.latest = requestId
     l.inFlight = true
-    l.again = false
+    l.startedAt = System.nanoTime()
     l.failed = false
-    tracelessLookup.lookup(storeId, txid)
+    tracelessLookup.lookup(storeId, txid, requestId)
 
-  /** The answer to a TracelessCommits lookup, delivered on the store's executor. An entry found concludes the Tx as
-    * committed. None found releases the aborts it held, unless one arrived after the lookup started. A failure keeps
-    * them held, and retryTracelessLookups tries again. Ignored once the Tx no longer needs it (it learned its outcome
-    * another way) and for a lookup this Frontend did not make
+  /** The answer to TracelessCommits lookup `requestId`, delivered on the store's executor.
+    *
+    * An entry found concludes the Tx as committed, whichever lookup found it. None found releases the aborts it held,
+    * if the lookup was made after the latest of them arrived; otherwise, if it was the latest lookup, another is made.
+    * A failure of the latest lookup keeps the aborts held, and retryTracelessLookups tries again. Ignored once the Tx
+    * no longer needs it (it learned its outcome another way), and for a lookup this Frontend did not make
     */
-  def tracelessLookupComplete(txid: TransactionId, result: Try[Boolean]): Unit =
-    tracelessLookups.get(txid).filter(_.inFlight).foreach: l =>
-      l.inFlight = false
+  def tracelessLookupComplete(txid: TransactionId, requestId: Long, result: Try[Boolean]): Unit =
+    tracelessLookups.get(txid).filter(_.latest >= requestId).foreach: l =>
       transactions.get(txid).filter(_.needsTracelessCheck) match
         case None => tracelessLookups.remove(txid)
         case Some(tx) =>
+          val isLatest = requestId == l.latest
+          if isLatest then
+            l.inFlight = false
           result match
             case Success(true) =>
               tracelessLookups.remove(txid)
               tx.tracelessCommitFound()
               tx.releaseObjects() // Already done unless some of its objects had not loaded
               transactions -= txid
-            case Success(false) if l.again =>
-              startTracelessLookup(txid)
-            case Success(false) =>
+            case Success(false) if requestId >= l.firstCounting =>
               tracelessLookups.remove(txid)
               tx.tracelessCommitAbsent().foreach(handleTransactionMessage)
+            case Success(false) =>
+              if isLatest then
+                startTracelessLookup(txid, l)
             case Failure(err) =>
-              l.failed = true
-              l.failures += 1
-              if l.failures == 1 || l.failures % 60 == 0 then
-                logger.warn(s"Store $storeId: TracelessCommits lookup of recovered transaction $txid failed " +
-                  s"(${l.failures} in a row), retrying at heartbeat: $err")
+              if isLatest then
+                l.failed = true
+                l.failures += 1
+                if l.failures == 1 || l.failures % 60 == 0 then
+                  logger.warn(s"Store $storeId: TracelessCommits lookup of recovered transaction $txid failed " +
+                    s"(${l.failures} in a row), retrying at heartbeat: $err")
 
-  /** Store heartbeat: makes another lookup for each one that failed */
-  def retryTracelessLookups(): Unit =
+  /** Store heartbeat: makes another lookup for each one that failed, and for each unanswered after
+    * `Frontend.TracelessLookupTimeout`, whose answer may have been lost
+    */
+  def retryTracelessLookups(now: Long = System.nanoTime()): Unit =
     tracelessLookups.toList.foreach: (txid, l) =>
-      if l.failed then
+      val timedOut = l.inFlight && now - l.startedAt >= TracelessLookupTimeout.toNanos
+      if l.failed || timedOut then
         if transactions.get(txid).exists(_.needsTracelessCheck) then
-          startTracelessLookup(txid)
+          if timedOut then
+            logger.warn(s"Store $storeId: TracelessCommits lookup of recovered transaction $txid went unanswered " +
+              s"for $TracelessLookupTimeout, looking up again")
+          startTracelessLookup(txid, l)
         else
           tracelessLookups.remove(txid)
 

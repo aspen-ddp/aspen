@@ -193,13 +193,14 @@ class Host(val client: AspenClient,
 
   /** Stores have no client, so a recovered commit vote's TracelessCommits lookup reads its pool's tree through the
    *  host's, on `ec`. The answer is posted to the store's executor, and dropped if the store is gone by then. */
-  private val tracelessLookup: TracelessCommitLookup = (storeId, txid) =>
+  private val tracelessLookup: TracelessCommitLookup = (storeId, txid, requestId) =>
     given ExecutionContext = ec
     Future.unit
       .flatMap(_ => client.getStoragePool(storeId.poolId))
       .flatMap(_.tracelessCommitsTree.get(TracelessCommitEntry.key(storeId, txid)))
       .onComplete: result =>
-        deviceControl.router.post(storeId)(_.frontend.tracelessLookupComplete(txid, result.map(_.isDefined)))
+        deviceControl.router.post(storeId)(_.frontend.tracelessLookupComplete(txid, requestId,
+          result.map(_.isDefined)))
 
   private val deviceControl: DeviceControl = new DeviceControl(
     metadata = seams.wrapMetadata.fold(hostMetadata)(wrap => wrap(hostMetadata)),

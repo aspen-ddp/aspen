@@ -113,7 +113,8 @@ class Frontend(val storeId: StoreId,
   // followers. An object a transaction only checks or locks gets no commit and so is never in flight
 
   /** Outstanding backend commits of transactions' changes, deletions included, by object: commit with
-    * `forTransaction = true`, and repair writes (see reconcile). Rebuild commits are not counted
+    * `forTransaction = true` or `ordered = true` (opportunistic rebuilds), and repair writes (see reconcile). Other
+    * rebuild commits are not counted
     */
   private val txCommitsInFlight = scala.collection.mutable.HashMap[ObjectId, Int]()
 
@@ -178,7 +179,9 @@ class Frontend(val storeId: StoreId,
     * the backend reports it complete, so the state is served and checked from memory rather than read from a backend
     * that may not have it yet. `start` times the commit as the store sees it: BackendTiming
     */
-  private case class InFlight(os: ObjectState, start: Long, deletes: Boolean, forTransaction: Boolean)
+  /** @param counted counted in txCommitsInFlight: transactions on the object wait behind it */
+  private case class InFlight(os: ObjectState, start: Long, deletes: Boolean, forTransaction: Boolean,
+                              counted: Boolean)
   private val inFlight = scala.collection.mutable.HashMap[(ObjectId, TransactionId), List[InFlight]]()
 
   /** Outstanding backend commits deleting each object. Reads that would reach the backend get the answer it will give
@@ -495,8 +498,11 @@ class Frontend(val storeId: StoreId,
   /** Hands `os` to the backend and keeps it in memory until the backend reports the commit complete.
     *
     * @param forTransaction the commit applies a transaction's committed update, rather than a rebuild
+    * @param ordered a rebuild's write that transactions and repairs on the object wait behind, as behind a
+    *                transaction's commit (counted in txCommitsInFlight)
     */
-  def commit(os: ObjectState, cs: CommitState, txid: TransactionId, forTransaction: Boolean = false): Unit =
+  def commit(os: ObjectState, cs: CommitState, txid: TransactionId, forTransaction: Boolean = false,
+             ordered: Boolean = false): Unit =
     val deletes = os.metadata.refcount.count == 0
     if deletes then
       // Deleted: the state is no longer served, nor checked by transactions that still reference it
@@ -508,7 +514,8 @@ class Frontend(val storeId: StoreId,
     val lockedOther = referenced.get(os.objectId).exists(r => !(r eq os) && r.reloadRequired && r.lockHolders.nonEmpty)
     retain(os, shared = !lockedOther)
     val key = (cs.objectId, txid)
-    inFlight(key) = inFlight.getOrElse(key, Nil) :+ InFlight(os, System.nanoTime(), deletes, forTransaction)
+    val counted = forTransaction || ordered
+    inFlight(key) = inFlight.getOrElse(key, Nil) :+ InFlight(os, System.nanoTime(), deletes, forTransaction, counted)
     if deletes then
       deleting(os.objectId) = deleting.getOrElse(os.objectId, 0) + 1
     else
@@ -516,6 +523,7 @@ class Frontend(val storeId: StoreId,
     // Before the backend commit: a synchronous backend completes inside it
     if forTransaction then
       txCommits.getOrElseUpdate(txid, new TxCommits(0, false, false)).outstanding += 1
+    if counted then
       txCommitsInFlight(os.objectId) = txCommitsInFlight.getOrElse(os.objectId, 0) + 1
     backend.commit(cs, txid)
 
@@ -675,6 +683,7 @@ class Frontend(val storeId: StoreId,
             transactionCommitComplete(c.transactionId, c.result.isLeft)
             if c.result.isRight then
               failedCommits += c.objectId
+          if f.counted then
             val n = txCommitsInFlight.getOrElse(c.objectId, 1) - 1
             if n == 0 then
               txCommitsInFlight.remove(c.objectId)
@@ -865,8 +874,8 @@ class Frontend(val storeId: StoreId,
       os.data = op.data
       val cs = CommitState(op.pointer, os.metadata, os.objectType, os.data)
       val txid = TransactionId(op.revision.lastUpdateTxUUID)
-      // No need to wait for this to complete
-      commit(os, cs, txid)
+      // Not awaited, but ordered: transactions and repairs on the object wait behind the write
+      commit(os, cs, txid, ordered = true)
     }
   }
 

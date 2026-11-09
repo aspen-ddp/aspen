@@ -101,8 +101,8 @@ class Tx( trs: TransactionRecoveryState,
   /** TxFinalized arrived while the commit was held for its turn: the Frontend is told once the commit is issued */
   private var finalizeDeferred = false
 
-  /** Abort resolutions held, oldest first, until a TracelessCommits lookup started after them completes. See
-    * needsTracelessCheck
+  /** The latest abort resolution held until a TracelessCommits lookup started after the first completes. See
+    * needsTracelessCheck and holdAbort
     */
   private var heldAborts: List[TxMessage] = Nil
   /** A lookup started after the held aborts found no entry: they, and later ones, are accepted */
@@ -796,12 +796,16 @@ class Tx( trs: TransactionRecoveryState,
     statusCache.updateStatus(transactionId, txStatus, finalized = true)
 
   /** Holds an abort resolution of a recovered commit vote until a TracelessCommits lookup started after it completes.
-    * A lookup already in flight does not count: the entry may have been written after it read the tree
+    * A lookup already in flight does not count: the entry may have been written after it read the tree. Only the
+    * first held abort starts the wait: a later one (a driver's retransmit) replaces the held message, and moving the
+    * wait forward again would let retransmits keep every lookup from counting
     */
   private def holdAbort(m: TxMessage): Boolean =
     if needsTracelessCheck && !abortsAccepted then
-      heldAborts = heldAborts :+ m
-      frontend.requestTracelessLookup(this)
+      val first = heldAborts.isEmpty
+      heldAborts = List(m)
+      if first then
+        frontend.requestTracelessLookup(this)
       true
     else
       false

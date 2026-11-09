@@ -1673,6 +1673,21 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     crl.deleted should contain (tracelessTxid)
   }
 
+  test("a retransmitted abort does not push back the lookup a held abort waits for") {
+    // A driver resends its resolution until it hears back: each copy moving the counting window forward would keep a
+    // lookup in flight from ever counting, and the Tx holding its locks
+    val (frontend, _, _, _, lookup) = tracelessFixture()
+    lookup.answer(tracelessTxid, Success(false))
+
+    frontend.receiveTransactionMessage(TxResolved(storeId, tracelessDriver, tracelessTxid, committed = false))
+    frontend.receiveTransactionMessage(TxResolved(storeId, tracelessDriver, tracelessTxid, committed = false))
+    lookup.requests.count(_ == tracelessTxid) shouldBe 2
+    lookup.answer(tracelessTxid, Success(false))
+
+    frontend.transactions.get(tracelessTxid).map(_.status).forall(_ == TransactionStatus.Aborted) shouldBe true
+    frontend.transactions.get(tracelessTxid).map(_.holdsLocks) shouldBe Some(false)
+  }
+
   test("an abort arriving before the TracelessCommits entry is visible waits for a later lookup and then commits") {
     val (frontend, backend, _, _, lookup) = tracelessFixture()
     lookup.answer(tracelessTxid, Success(false))
@@ -1949,6 +1964,24 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.deliverCommits()
     cache.pinnedCount shouldBe 0
     cache.sizeInBytes shouldBe HostObjectCache.EntryOverhead + 1
+  }
+
+  test("a transaction on an object waits behind an opportunistic rebuild's backend write") {
+    // Backend writes of one object are unordered: a transaction's commit issued while the rebuild's write is
+    // outstanding could land first and be overwritten by it
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
+    frontend.readObjectForNetwork(clientId, new UUID(1, 1), op1, FullObject())
+    net.clientMessage() should not be empty
+    val os = mkObjectState(oid1)
+    frontend.readObjectForOpportunisticRebuild(OpportunisticRebuild(storeId, clientId, op1, rev0,
+      os.metadata.refcount, HLCTimestamp(50), DataBuffer(Array[Byte](4))))
+    backend.heldCommits shouldBe 1
+
+    sendPrepare(frontend, lockTxd(txid1, List(overwrite(op1))))
+    prepareResponses(net, txid1) shouldBe Nil
+
+    backend.deliverCommits()
+    prepareResponses(net, txid1).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
   }
 
   test("a commit of a fresh state does not replace a discarded state whose locks are held") {

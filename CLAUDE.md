@@ -27,9 +27,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     with `IDAPolicy.ExactMatch`, is a floor: members must have no limit or one at least as large, and an unlimited
     group accepts only unlimited members
   - `maxSliceSize` is the source of truth for pools and groups; every `maxObjectSize` is derived from it and the IDA
-  - Metadata layout: an ordinary pool's ErrorTree/AllocationTree live in a metadata pool reached through a metadata
-    group; metadata pools' trees live in the bootstrap pool; the bootstrap pool's live in itself. All pool state
-    objects stay in the bootstrap pool
+  - Metadata layout: an ordinary pool's ErrorTree/AllocationTree/TracelessCommits trees live in a metadata pool reached
+    through a metadata group; metadata pools' trees live in the bootstrap pool; the bootstrap pool's live in itself.
+    All pool state objects stay in the bootstrap pool
   - `StoragePoolState.isMetadataPool` / `AllocationGroupState.isMetadataGroup` are fixed at creation. A pool or child
     group may join a group only when its flag equals the group's (`MetadataMembershipMismatch`)
   - Bootstrap creates `aspen-initial-storage-pool-metadata` and `aspen-default-storage-pool-metadata`; the group id is
@@ -212,7 +212,22 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     a key's for a KeyValueUpdate without a required revision: `RequirementsApplyer.appliedBy`), proves it committed.
     The store answers `TxResolved(committed)` instead of a vote (`Tx.proveCommitted`) and applies nothing again, so a
     recovery driver for a recovered commit vote, after the other stores finalized and forgot the transaction, cannot
-    decide abort on votes against the commit's own result and drop the update the recovering store holds
+    decide abort on votes against the commit's own result and drop the update the recovering store holds. Past the
+    horizon this check comes first; younger prepares make it only on the abort path
+  - Changes that leave no trace (a `RefcountUpdate`, or a KV update without a required revision whose
+    `KeyValueUpdate.deletesKeys` is set; stores reject an unflagged Delete) cannot be proven that way. For a store
+    that sent no TxCommitted, the finalizer also writes `TracelessCommitEntry(timestamp, objects)` to its pool's
+    TracelessCommits tree (`StoragePoolState.TracelessCommitsTreeKey`, key `TracelessCommitEntry.key(store, txid)`), in
+    the ErrorTree batch. A recovered unresolved commit vote looks its entry up (`TracelessCommitLookup`, from the Host)
+    once loaded and again before accepting any abort; an entry found means it committed: the Tx applies its saved
+    update locally, logs it at info and is forgotten as if finalized. A failed or unanswered lookup holds the abort and
+    retries at heartbeat (`Frontend.TracelessLookupTimeout`, 5 s).
+    Design: `docs/superpowers/specs/2026-11-08-traceless-commits-design.md`
+  - Horizon (`Host.txHorizon`: `txStatusCacheDuration` - 1 s, 6 s): a prepare for a transaction the store does not
+    know and the host's status cache holds no outcome for (an Unresolved entry counts as none), started more than the
+    horizon ago, is proven committed if an object shows its update, and otherwise votes abort with `TransactionTooOld`
+    without checking requirements or taking locks, so a forgotten transaction is never replayed. The cache warns,
+    rate-limited, when it evicts an entry younger than the horizon for size
   - A driver's data-less prepare can overtake the client's prepare carrying a store's data. The store withholds its
     vote until the data, a client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes:
     missing data then gets an abort vote. A vote given stands, but later data is still used to apply a commit
@@ -222,7 +237,14 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - A store that misses `errorTimeout` is marked in its pool's ErrorTree for every object it hosts that the transaction
     changes (a lock changes nothing, so there is nothing to repair and the object's timestamp would not catch up). A client's
     `MissedUpdateMarker` writes one batch per pool at a time and merges waiting entries by key, so a slow spell makes
-    batches larger rather than adding colliding writes
+    batches larger rather than adding colliding writes. Repair reconciles exactly (`server.store.Reconcile`): it
+    snapshots the store's copy, reads the object, then installs on the executor only what still matches the
+    snapshot: KV objects key by key, refcounts by the higher serial (never lowered), DataObject data by revision when
+    the read's timestamp is at least the store's. Keys and object-level parts a read reports locked (`ReadLocks`) are
+    deferred; nothing is written while the object has a commit in flight. One `StoreRepairer` scan walks the store's
+    ErrorTree range, then its TracelessCommits range (skipping transactions the store holds live). After
+    `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op transaction
+    proving the read state, and reconciles from it
   - A lost TxFinalized is recovered by the store itself: a Tx idle for `Host.txHeartbeatTimeout` gets a driver, which
     learns the outcome from the stores' status caches, so `Host.txStatusCacheDuration` must outlast that timeout. At high volume the cache is costly (about 175 bytes
     per transaction, capped at `DefaultMaxEntries`), so these stay short: 5 s and 7 s with the host's 1 s heartbeat

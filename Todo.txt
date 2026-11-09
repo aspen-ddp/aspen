@@ -1,23 +1,10 @@
 TODO
 ====
 
-Recovered commit votes of forgotten transactions (closed 2026-11-08 by Tx.proveCommitted, which answers TxResolved
-when an object already shows the update). Still unproven, so a recovery driver may still decide abort: a transaction
-whose only changes here are a RefcountUpdate or KeyValue deletes without a required revision (they leave no trace).
-Examine the existing object read implementation. I believe RefcountUpdate losses are okay as the all transactions
-updating objects are required to have a timestamp higher than that of the object being updated (verify this). If
-that is true and refcounts are only ever updated as the result of a commit or rebuild from committed state, then the
-Refcount with the highest timestamp from a quorum is guaranteed to be the most recent. With respect to deletes,
-I'm not entirely sure how to handle this. In the scenario where a transaction commits, the store in question doesn't
-votes to commit but crashes before it learns the commit/abort decision and recovers after the transaction has been
-forgotten and enough other stores are offline to the point where the commit should be applied to the recovering store,
-the current implementation will result in an abort decision. In that case, the other read-threshold - 1 stores will
-contain no entry for the key (or will contain a re-written key who's revision will not match that of the recovering
-store. Check my logic but I think it is safe to abort the transaction and discard the delete because there are two
-cases, in one, the other stores have no key. In which case the key is unrecoverable which is what the delete intended.
-In the second, the key has been re-written with a new revision number and the recovering store's state is simply
-behind and will be marked in the error tree for recovery. The read stalls until an up-to-date store comes back online
-which is intended behavior. If that logic holds, then nothing needs to be done.
+Recovered commit votes of forgotten transactions (closed 2026-11-08). Changes that leave no trace (RefcountUpdates,
+KeyValue deletes without a required revision) are recorded in each pool's TracelessCommits tree for stores that miss
+them, and a recovered commit vote applies a commit found there. Repair reconciles exactly, and late prepares past the
+status cache horizon vote TransactionTooOld. See docs/superpowers/specs/2026-11-08-traceless-commits-design.md.
 
 Store commit delay FSIF commits seem to be taking longer than they should when backed by NVMe media. Investigate the
 timing of commits.

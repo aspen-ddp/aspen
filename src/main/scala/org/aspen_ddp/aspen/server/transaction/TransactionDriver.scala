@@ -468,6 +468,18 @@ abstract class TransactionDriver(
       (0 until ida.width).count(i => voters.contains(StoreId(ptr.poolId, i.toByte))) >= ida.writeThreshold
     Option.when(enough)(voters)
 
+  /** Starts the finalizer of a committed transaction, or finalizes an aborted one at once.
+    *
+    * Ordering: this driver sends TxFinalized only from onFinalized, which a commit reaches only once the finalizer
+    * completes (`f.complete foreach onFinalized`), or on a TxFinalized from another driver, sent under the same rule.
+    * A store forgets a committed transaction only on TxFinalized (Frontend.receiveTransactionMessage via
+    * Tx.receiveFinalized) or when the TracelessCommits tree holds its entry (Frontend.tracelessLookupComplete via
+    * Tx.tracelessCommitFound). So everything the finalizer writes, its TracelessCommits entries included, is durable
+    * before any store forgets the transaction. A muted Tx (Frontend.forgetMuted) is dropped without either, but it
+    * never voted. Caveat: tracelessCommitFound marks the transaction finalized in its host's status cache, and Store
+    * answers a later prepare to that host with TxFinalized, so another driver can then finalize before the original
+    * finalizer's remaining actions complete.
+    */
   protected def onResolution(committed: Boolean, sendResolutionMessage: Boolean): Unit = synchronized {
     if (!resolved) {
 

@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, SetMax, SetRight, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, AppendMismatch, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, MissingObject, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, AppendMismatch, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -410,6 +410,17 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     expected += (o.objectId -> RevisionMismatch())
     assert(oerrs == expected)
     assert(errs.isEmpty)
+  }
+
+  // A deleted object has no ObjectState on its stores, so a replay that pins it cannot pass there
+  test("a revision requirement on an object absent from the store fails") {
+    for req <- List(RevisionLock(p1, rev1), DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)) do
+      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), HashMap[ObjectId, ObjectState](),
+        HashMap[ObjectId, DataBuffer](oid1 -> DataBuffer.Empty))
+      withClue(s"$req: ") {
+        oerrs shouldBe Map(oid1 -> MissingObject())
+        errs shouldBe empty
+      }
   }
 
   test("VersionBump failure on revision mismatch") {

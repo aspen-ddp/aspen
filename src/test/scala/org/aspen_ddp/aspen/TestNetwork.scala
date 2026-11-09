@@ -242,8 +242,30 @@ class TestNetwork(executionContext: ExecutionContext,
   /** Further transaction messages to drop, as a test chooses (a store missing a transaction's outcome, say) */
   @volatile var dropTxMessage: TxMessage => Boolean = _ => false
 
+  /** Transaction messages to record, sent by the client or by a store, whether or not they are then dropped */
+  @volatile var recordTxMessage: TxMessage => Boolean = _ => false
+
+  private var recordedTx: List[TxMessage] = Nil
+
+  /** The messages recorded since the last call, oldest first */
+  def takeRecordedTxMessages(): List[TxMessage] = synchronized:
+    val taken = recordedTx.reverse
+    recordedTx = Nil
+    taken
+
   private def dropped(msg: TxMessage): Boolean =
+    if recordTxMessage(msg) then
+      synchronized:
+        recordedTx = msg :: recordedTx
     droppedTx.contains((msg.to, msg.transactionId)) || dropTxMessage(msg)
+
+  /** Delivers `msg` to its store as the client messenger does, bypassing the drop rules and the recording: a message
+    * re-delivered late, as a network replay does
+    */
+  def deliverTransactionMessage(msg: TxMessage): Unit =
+    handleEvents()
+    hostFor(msg.to).receiveTransactionMessage(msg)
+    handleEvents()
 
   /** Hosts other than smgr, each serving every store of the pools mapped to it. Messages to the stores of an
    *  unmapped pool go to smgr. handleEvents drains every mapped host, and a test remaps a pool to model a restart.

@@ -463,7 +463,18 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     yield
       entries.keySet shouldBe Set(UnackedCommitEntry.key(net.storeId1, txd.transactionId))
 
-  atest("a flagged KV delete without a required revision gets an entry; an insert-only update does not"):
+  atest("a voter without TxCommitted gets a UnackedCommits entry for a data overwrite too"):
+    val ptr = pointerWith(Array[Byte](4, 5))
+    val txd = txdFor(ptr).copy(requirements =
+      List(DataUpdate(ptr, ObjectRevision(TransactionId(UUID.randomUUID())), DataUpdateOperation.Overwrite)))
+    for
+      _ <- runMarkWithVoters(txd, Set(net.storeId0, net.storeId1), Map(net.storeId0 -> Nil))
+      entries <- unackedEntries(Radicle.poolId, txd.transactionId)
+    yield
+      entries shouldBe Map(UnackedCommitEntry.key(net.storeId1, txd.transactionId) ->
+        UnackedCommitEntry(txd.startTimestamp, List(ptr)))
+
+  atest("a flagged KV delete without a required revision gets an entry, and so does an insert-only update"):
     val delPtr = KeyValueObjectPointer(ObjectId(UUID.randomUUID()), Radicle.poolId)
     val insPtr = KeyValueObjectPointer(ObjectId(UUID.randomUUID()), Radicle.poolId)
     val deleteTx = kvTxd(delPtr, deletes = true)
@@ -474,7 +485,8 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       _ <- runMark(insertTx, seen)
       entries <- unackedEntries(Radicle.poolId, deleteTx.transactionId, insertTx.transactionId)
     yield
-      entries.keySet shouldBe Set(UnackedCommitEntry.key(net.storeId2, deleteTx.transactionId))
+      entries.keySet shouldBe Set(UnackedCommitEntry.key(net.storeId2, deleteTx.transactionId),
+                                  UnackedCommitEntry.key(net.storeId2, insertTx.transactionId))
 
   atest("a store that sent TxCommitted with object errors gets no UnackedCommits entry"):
     val ptr = pointerWith(Array[Byte](1))

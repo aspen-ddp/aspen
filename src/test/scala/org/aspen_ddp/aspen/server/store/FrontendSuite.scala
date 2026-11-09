@@ -1763,6 +1763,34 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       text.contains("applying its update to objects")) shouldBe true
   }
 
+  test("a recovered commit vote of a non-traceless transaction applies on load when its entry exists") {
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val os = mkObjectState(oid1)
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    cache.insert(mkKVObjectState())
+    cache.insert(os)
+    val reqs = List(DataUpdate(op1, os.metadata.revision, DataUpdateOperation.Overwrite))
+    val trs = TransactionRecoveryState(storeId, lockTxd(unackedTxid, reqs).serialize(),
+      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](9)))), TransactionDisposition.VoteCommit,
+      TransactionStatus.Unresolved, PersistentState.initial)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+    val lookup = new ManualLookup
+    val frontend = new Frontend(storeId, backend, cache, new TestNet, crl, new TransactionStatusCache(),
+      unackedLookup = lookup)
+    lookup.frontend = Some(frontend)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    lookup.requests shouldBe List(unackedTxid)
+
+    lookup.answer(unackedTxid, Success(true))
+
+    backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](9)
+    frontend.transactions.contains(unackedTxid) shouldBe false
+    crl.deleted should contain (unackedTxid)
+  }
+
   test("a recovered commit vote without a UnackedCommits entry accepts an abort") {
     val (frontend, backend, _, crl, lookup) = unackedFixture()
     lookup.answer(unackedTxid, Success(false))

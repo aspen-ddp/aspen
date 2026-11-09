@@ -4,6 +4,7 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedUnackedCommit, MissedUpdate}
+import org.aspen_ddp.aspen.server.store.RequirementsApplyer
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -87,18 +88,20 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
     // A commit voter that sent no TxCommitted may have crashed holding its saved vote. If it recovers after the
     // transaction is forgotten, this entry is how it learns the transaction committed. A store that never voted
-    // holds no vote to recover: the ErrorTree marks above repair it, so it gets no entry
-    val traceless = txd.allDataStores.toList.flatMap: storeId =>
+    // holds no vote to recover: the ErrorTree marks above repair it, so it gets no entry. The entry means the store
+    // owes the transaction, whether or not its change leaves a trace
+    val changed = RequirementsApplyer.changedObjects(txd.requirements)
+    val unacked = txd.allDataStores.toList.flatMap: storeId =>
       if commitErrors.contains(storeId) || voters.exists(!_.contains(storeId)) then
         None
       else
-        val objects = txd.allHostedObjects(storeId).filter(ptr => txd.tracelessObjects.contains(ptr.id))
+        val objects = txd.allHostedObjects(storeId).filter(ptr => changed.contains(ptr.id))
         Option.when(objects.nonEmpty):
           MissedUnackedCommit(storeId, txd.transactionId, UnackedCommitEntry(txd.startTimestamp, objects))
 
     reportMarks(errors.map(_.store))
 
-    client.missedUpdateMarker.mark(errors, traceless).foreach { _ =>
+    client.missedUpdateMarker.mark(errors, unacked).foreach { _ =>
       synchronized {
         if (!completionPromise.isCompleted)
           completionPromise.success(())

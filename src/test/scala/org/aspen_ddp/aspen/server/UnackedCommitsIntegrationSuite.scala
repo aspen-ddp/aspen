@@ -255,10 +255,10 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
                 Future.unit
       _ = neverAccepted(2, txid)
       marked <- unackedEntries(txid)
-      _ = withClue("only store 2 lacks the overwrite, and a data write leaves no UnackedCommits entry: "):
+      _ = withClue("only store 2 lacks the overwrite, and store 2 owes the transaction, so it has an UnackedCommits entry: "):
             storeRevision(2, dataPtr) shouldBe Some(before.revision)
             List(0, 1, 3, 4).foreach(i => storeRevision(i, dataPtr) shouldBe Some(ObjectRevision(txid)))
-            marked shouldBe empty
+            marked.keySet should contain (2)
       _ <- restartAfterForgotten(txid, List(2))
       // Its recovery driver starts once the Tx is idle for Host.txHeartbeatTimeout. The other stores no longer know the
       // transaction, and prove its commit from the revision they show

@@ -85,24 +85,36 @@ class Store(val storageDeviceId: StorageDeviceId,
     .maximumSize(1000)
     .build[TransactionId, List[TxPrepareResponse]]()
 
+  /** Starts a driver for `txd`, unless one runs or the store cannot yet know whether it owes the transaction.
+    *
+    * A recovered unresolved commit vote waiting for its first UnackedCommits lookup (Tx.awaitsFirstUnackedLookup), or
+    * any transaction while the store's CRL state is still being loaded (Frontend.recoveryPending: such a vote may be
+    * among it), gets no driver yet. The other stores may have finalized and forgotten the transaction, and a driver
+    * without the proof an entry gives could decide abort on their votes, a decision a later proof cannot undo. The
+    * heartbeat starts the driver once the lookup has answered (Ruling 20). A lookup that never completes leaves the Tx
+    * waiting, holding its locks, as the design intends for an unavailable lookup
+    */
   def driveTransaction(txd: TransactionDescription): Unit = {
-    if (!transactionDrivers.contains(txd.transactionId)) {
+    val awaitsLookup = frontend.recoveryPending ||
+      frontend.transactions.get(txd.transactionId).exists(_.awaitsFirstUnackedLookup)
+    if (!transactionDrivers.contains(txd.transactionId) && !awaitsLookup) {
 
       val driver = txDriverFactory.create(executionContext, storeId, net, backgroundTasks, txd, finalizerFactory)
 
       transactionDrivers += txd.transactionId -> driver
 
+      // A recovered commit vote that found its UnackedCommits entry knows the transaction committed: its driver holds
+      // that proof from the start, exactly as if a prover had sent it (Tx.foundUnackedEntry). The other stores may
+      // have forgotten the transaction, so deciding abort on their votes would be wrong. Given before the cached
+      // prepare responses below, which could otherwise complete a tally at the initial proposal first
+      if frontend.transactions.get(txd.transactionId).exists(_.provesCommitToItsDriver) then
+        driver.receiveTxResolved(TxResolved(storeId, storeId, txd.transactionId, committed = true, late = false,
+          proof = true))
+
       prepareResponseCache.getIfPresent(txd.transactionId).foreach { lst =>
         lst.foreach(driver.receiveTxPrepareResponse(_))
         prepareResponseCache.invalidate(txd.transactionId)
       }
-
-      // A recovered commit vote that found its UnackedCommits entry knows the transaction committed: its driver holds
-      // that proof from the start, exactly as if a prover had sent it (Tx.foundUnackedEntry). The other stores may
-      // have forgotten the transaction, so deciding abort on their votes would be wrong
-      if frontend.transactions.get(txd.transactionId).exists(_.provesCommitToItsDriver) then
-        driver.receiveTxResolved(TxResolved(storeId, storeId, txd.transactionId, committed = true, late = false,
-          proof = true))
     }
   }
 

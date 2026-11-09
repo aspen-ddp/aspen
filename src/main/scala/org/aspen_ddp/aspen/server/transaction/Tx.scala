@@ -131,6 +131,17 @@ class Tx( trs: TransactionRecoveryState,
   /** See foundUnackedEntry */
   def provesCommitToItsDriver: Boolean = foundUnackedEntry && ofinalized.isEmpty
 
+  /** Some UnackedCommits lookup of this Tx has been answered, finding the entry or not */
+  private var unackedAnswered = false
+
+  def unackedLookupAnswered(): Unit = unackedAnswered = true
+
+  /** A recovered unresolved commit vote whose first UnackedCommits lookup has not been answered: its store gives it no
+    * driver yet (Store.driveTransaction, Ruling 20). Found, its driver holds the proof (foundUnackedEntry); absent, it
+    * is driven as usual
+    */
+  def awaitsFirstUnackedLookup: Boolean = needsUnackedCheck && !unackedAnswered
+
   /** This Tx's outcome is a late commit: its status cache entry and status answers say so */
   private var lateOutcome = false
 
@@ -995,10 +1006,10 @@ class Tx( trs: TransactionRecoveryState,
         finalized(true)
       else
         resolved(true, record = false)
+        // Its store's driver for it holds the proof (Store.driveTransaction). No driver can already be running
+        // unresolved here: none starts before the first lookup answers (awaitsFirstUnackedLookup), and a later lookup
+        // follows a held abort, which the store's driver received too and resolved on
         foundUnackedEntry = true
-        // A driver already running for it holds a proof from now on; one started later is given it (Store.driveTransaction)
-        net.sendTransactionMessage(TxResolved(storeId, storeId, transactionId, committed = true, late = false,
-          proof = true))
       val changed = RequirementsApplyer.changedObjects(requirements).intersect(pointersById.keySet)
       def ids(objects: Iterable[ObjectId]) = objects.map(_.uuid).mkString(", ")
       val outcome =

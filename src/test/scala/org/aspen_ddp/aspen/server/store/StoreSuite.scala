@@ -146,6 +146,15 @@ class StoreSuite extends AnyFunSuite with Matchers:
     * entry is found, then its heartbeat starts its driver
     */
   private def foundEntryStore(): (Store, RecordingNet, StubFinalizer) =
+    val (store, net, finalizer, lookup, backend) = recoveredVoteStore()
+    lookup.answer(foundTxid, scala.util.Success(true))
+    KVObjectState.decode(backend.get(oid2).get.data).content.keySet should not contain k(2)
+    store.heartbeat() // The Tx has been idle for the zero heartbeat timeout: its store drives it
+    store.hasTransactions shouldBe true
+    (store, net, finalizer)
+
+  /** The store of foundEntryStore before its recovered vote's lookup is answered */
+  private def recoveredVoteStore(): (Store, RecordingNet, StubFinalizer, ManualLookup, MapBackend) =
     val backend = new MapBackend(storeId)
     val kv = mkKVObjectState()
     backend.bootstrapAllocate(oid2, kv.objectType, kv.metadata, kv.data)
@@ -166,11 +175,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
       BackgroundTaskManager.NoBackgroundTaskManager, crl, new TransactionStatusCache(), finalizer,
       TransactionDriver.noErrorRecoveryFactory, Duration.Zero, None, unackedLookup = lookup)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
-    lookup.answer(foundTxid, scala.util.Success(true))
-    KVObjectState.decode(backend.get(oid2).get.data).content.keySet should not contain k(2)
-    store.heartbeat() // The Tx has been idle for the zero heartbeat timeout: its store drives it
-    store.hasTransactions shouldBe true
-    (store, net, finalizer)
+    (store, net, finalizer, lookup, backend)
 
   private val initialProposal = ProposalId.initialProposal(mktxd().designatedLeaderUID)
 
@@ -215,5 +220,51 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
     finalizer.created shouldBe 1
     net.sentTx.collect { case f: TxFinalized => (f.committed, f.late) }.distinct shouldBe List((true, false))
+  }
+
+  // ---- Ruling 20: no driver for a recovered commit vote until its first UnackedCommits lookup answers ----
+
+  test("a recovered vote whose lookup is unanswered or failing gets no driver, and once found its driver holds the proof") {
+    val (store, net, finalizer, lookup, _) = recoveredVoteStore()
+    store.heartbeat() // Idle past the zero heartbeat timeout, but the lookup is unanswered
+    store.hasTransactions shouldBe false
+    // Nor does a prepare reaching its designated leader start one
+    store.receiveTransactionMessage(TxPrepare(storeId, StoreId(poolId, 1), store.frontend.transactions(foundTxid).txd,
+      ProposalId(5, 1), Nil, Nil, fromClient = false))
+    store.hasTransactions shouldBe false
+
+    lookup.answer(foundTxid, scala.util.Failure(new Exception("metadata pool down")))
+    store.heartbeat() // Retries the lookup, still no driver
+    store.hasTransactions shouldBe false
+    lookup.requests.count(_ == foundTxid) shouldBe 2
+
+    lookup.answer(foundTxid, scala.util.Success(true))
+    store.heartbeat()
+    store.hasTransactions shouldBe true
+
+    val p = currentProposal(net)
+    promise(store, 1, p, None)
+    promise(store, 2, p, None)
+    net.sentTx.collect { case a: TxAccept => a.value } shouldBe Nil
+    net.sentTx.collect { case f: TxFinalized => (f.committed, f.late) }.distinct shouldBe List((true, true))
+    finalizer.created shouldBe 0
+  }
+
+  test("a recovered vote whose first lookup finds no entry is driven as usual, without a proof") {
+    val (store, net, _, lookup, _) = recoveredVoteStore()
+    lookup.answer(foundTxid, scala.util.Success(false))
+    store.heartbeat()
+    store.hasTransactions shouldBe true
+
+    // A later lookup follows an abort, which reaches the store's driver too: the driver resolves on it, so no proof
+    // could reach it unresolved (why Tx.unackedCommitFound sends none)
+    store.receiveTransactionMessage(TxResolved(storeId, StoreId(poolId, 1), foundTxid, committed = false,
+      late = false, proof = false))
+    lookup.requests.count(_ == foundTxid) shouldBe 2 // The Tx holds the abort for a fresh lookup
+    // The driver finalized the abort at once
+    net.sentTx.collect { case f: TxFinalized if f.from == storeId => f.committed }.distinct shouldBe List(false)
+
+    lookup.answer(foundTxid, scala.util.Success(true))
+    store.frontend.transactions(foundTxid).status shouldBe TransactionStatus.Committed
   }
 

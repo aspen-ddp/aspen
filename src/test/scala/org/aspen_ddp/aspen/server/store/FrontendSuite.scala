@@ -1939,9 +1939,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       lookup.answer(unackedTxid, Success(true))
 
     kvKeys(backend) should not contain k(2)
-    // Ruling 15: it proves the commit to a driver its store may already run for it
-    net.sentTx.collect { case r: TxResolved => (r.to, r.committed, r.late, r.proof) } shouldBe
-      List((storeId, true, false, true))
+    frontend.transactions(unackedTxid).provesCommitToItsDriver shouldBe true
+    frontend.transactions(unackedTxid).awaitsFirstUnackedLookup shouldBe false
     // Ruling 9: still live, its CRL and acceptor state kept until TxFinalized. Ruling 12: no status cache entry
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
     crl.deleted should not contain (unackedTxid)

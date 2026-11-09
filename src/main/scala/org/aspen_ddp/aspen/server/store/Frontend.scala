@@ -102,6 +102,9 @@ class Frontend(val storeId: StoreId,
     */
   def mayHoldTransaction(txid: TransactionId): Boolean = awaitingCrl || transactions.contains(txid)
 
+  /** The store's CRL state is still to be recovered (awaitRecovery): see Store.driveTransaction */
+  def recoveryPending: Boolean = awaitingCrl
+
   def awaitLocksReleased(holder: TransactionId, waiter: Tx): Unit =
     val others = collisionWaiters.getOrElse(holder, Nil).filterNot(_ eq waiter)
     collisionWaiters(holder) = waiter :: others
@@ -378,6 +381,8 @@ class Frontend(val storeId: StoreId,
           val isLatest = requestId == l.latest
           if isLatest then
             l.inFlight = false
+          if result.isSuccess then
+            tx.unackedLookupAnswered() // Its store may now drive it: see Store.driveTransaction
           result match
             case Success(true) =>
               unackedLookups.remove(txid)

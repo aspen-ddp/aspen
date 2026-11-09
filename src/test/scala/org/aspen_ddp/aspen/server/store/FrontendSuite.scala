@@ -1368,6 +1368,26 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     r.collisions shouldBe List(txid1)
   }
 
+  test("a store recovering from a crl_save.log may hold its transactions throughout recover") {
+    // mayHoldTransaction is read from other threads (the repair scan) while recover runs on the store's
+    var frontend: Option[Frontend] = None
+    var seenDuringRecovery: List[Boolean] = Nil
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+        frontend.foreach(f => seenDuringRecovery = f.mayHoldTransaction(txid1) :: seenDuringRecovery)
+        List(commitVote(txid1, List(overwrite(op1))))
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val f = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet, crl,
+      new TransactionStatusCache(), deferRecovery = true)
+    backend.setCompletionHandler(op => f.backendOperationComplete(op))
+    frontend = Some(f)
+
+    f.recover()
+    seenDuringRecovery shouldBe List(true)
+    f.mayHoldTransaction(txid1) shouldBe true
+  }
+
   test("a prepare arriving during startup recovery is handled after the recovered transactions take their locks") {
     val backend = new DeferredReadBackend
     populate(backend)

@@ -222,8 +222,8 @@ class Frontend(val storeId: StoreId,
   /** Transaction messages held, newest first, until recovery completes. See awaitRecovery and recoverTransactions */
   private var heldMessages: List[TxMessage] = Nil
 
-  /** The store's CRL state is still being loaded (from a crl_save.log), or its recovery is deferred. See awaitRecovery. `@volatile` for
-    * mayHoldTransaction
+  /** The store's CRL state is still being loaded (from a crl_save.log), or its recovery is deferred. See
+    * awaitRecovery. `@volatile` for mayHoldTransaction
     */
   @volatile private var awaitingCrl: Boolean = false
 
@@ -308,17 +308,19 @@ class Frontend(val storeId: StoreId,
     releaseHeldMessages()
 
   /** The store's CRL state is being loaded after this Frontend was created (from a crl_save.log), or its recovery is
-    * deferred (deferRecovery). Until recover is called, transaction messages are held: started without their recovery state, transactions would hold no locks
-    * and a prepare would replace the recovered Paxos acceptor state with an initial one.
+    * deferred (deferRecovery). Until recover is called, transaction messages are held: started without their
+    * recovery state, transactions would hold no locks and a prepare would replace the recovered Paxos acceptor state
+    * with an initial one.
     */
   def awaitRecovery(): Unit = awaitingCrl = true
 
   /** The CRL now holds the store's recovery state: recreates its transactions. Held messages are handled, in arrival
-    * order, once those transactions have loaded their objects
+    * order, once those transactions have loaded their objects. The flag is cleared only once they are registered, so
+    * mayHoldTransaction, read from other threads, never reads false in between
     */
   def recover(): Unit =
-    awaitingCrl = false
     recoverTransactions()
+    awaitingCrl = false
     releaseHeldMessages()
 
   // ---- TracelessCommits lookups of recovered commit votes (Tx.needsTracelessCheck) ----

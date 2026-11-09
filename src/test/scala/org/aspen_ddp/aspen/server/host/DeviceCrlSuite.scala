@@ -194,7 +194,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
   private def overwriteTxd(id: TransactionId, leader: Byte, pool: PoolId = poolId): TransactionDescription =
     val p = DataObjectPointer(oid, pool, Array[Byte]())
-    TransactionDescription(id, HLCTimestamp(100), p, leader,
+    TransactionDescription(id, HLCTimestamp.now, p, leader,
       List(DataUpdate(p, rev0, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida, Map(pool -> ida))
 
   /** As pumpUntil, also letting the client's transactions complete each round */

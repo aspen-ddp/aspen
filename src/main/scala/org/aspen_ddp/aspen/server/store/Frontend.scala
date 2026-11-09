@@ -64,7 +64,14 @@ class Frontend(val storeId: StoreId,
                  * backend write, get back to the Frontend's state. Inline by default, for tests with synchronous
                  * backends
                  */
-               val post: (() => Unit) => Unit = task => task()) extends Logging {
+               val post: (() => Unit) => Unit = task => task(),
+               /** A prepare for a transaction this store does not know, and the host's status cache does not hold,
+                 * that started longer ago than this votes abort with TransactionTooOld without its requirements being
+                 * checked, unless an object already shows its update (Tx.proveCommitted). The cache may have forgotten
+                 * that it finalized, so checking it afresh could vote commit on, and replay, a finished transaction.
+                 * Host.txHorizon in hosts; infinite (off) by default
+                 */
+               val horizon: Duration = Duration.Inf) extends Logging {
 
   import Frontend._
 
@@ -622,10 +629,13 @@ class Frontend(val storeId: StoreId,
 
     case None =>
       logger.trace(s"**** CREATING NEW TX: ${m.txd.transactionId}")
-      val known = statusCache.getStatus(m.txd.transactionId).filter(_.status != TransactionStatus.Unresolved)
+      val cached = statusCache.getStatus(m.txd.transactionId)
+      val known = cached.filter(_.status != TransactionStatus.Unresolved)
+      // Measured with the HLC from the client-assigned start, so a client clock running behind makes it look older
+      val tooOld = cached.isEmpty && HLCTimestamp.now - m.txd.startTimestamp > horizon
       val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates, takeSerializedTxd(m.txd.transactionId))
       val pointers = m.txd.allHostedObjects(m.to)
-      val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers)
+      val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers, tooOld = tooOld)
       transactions += (m.txd.transactionId -> tx)
       tx.receivePrepare(m)
       known.foreach { entry =>

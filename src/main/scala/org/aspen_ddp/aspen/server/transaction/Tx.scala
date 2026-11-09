@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, KeyValueUpdate, ObjectUpdate, RevisionLock, SharedRevisionLock, VersionBump, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, KeyValueUpdate, ObjectUpdate, RevisionLock, SharedRevisionLock, VersionBump, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionTooOld, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -38,7 +38,11 @@ class Tx( trs: TransactionRecoveryState,
           private val preTxRebuilds: List[PreTransactionOpportunisticRebuild],
           private val objectPointers: List[ObjectPointer],
           /** Recreated from persisted recovery state. See onAllObjectsLoaded */
-          val recovered: Boolean = false) extends Logging {
+          val recovered: Boolean = false,
+          /** A prepare for a transaction its store did not know, older than the store's horizon (Frontend.horizon):
+            * proven committed or voted abort, never checked. Never set for a recovered transaction
+            */
+          val tooOld: Boolean = false) extends Logging {
 
   val transactionId: TransactionId = txd.transactionId
 
@@ -135,7 +139,7 @@ class Tx( trs: TransactionRecoveryState,
     * Checked only as prepares arrive, since a vote is of use only to a driver that is still asking for it.
     */
   private def awaitingData: Boolean =
-    disposition == TransactionDisposition.Undetermined && !recovered && !clientPrepared && !outcomeKnown &&
+    disposition == TransactionDisposition.Undetermined && !recovered && !tooOld && !clientPrepared && !outcomeKnown &&
       oresolution.isEmpty && missingObjectData && System.nanoTime() - startNanos < frontend.missingDataWait.toNanos &&
       !(allObjectsLoaded && appliedHere.nonEmpty) // A proven commit needs no data: see proveCommitted
 
@@ -424,16 +428,23 @@ class Tx( trs: TransactionRecoveryState,
     }
   }
 
-  /** Decides the vote, or withholds it. An object whose backend commit failed on this store gets an abort vote. One with
-    * a commit in flight, whether or not this transaction builds on it, makes the transaction wait with its vote
-    * withheld and no locks taken (see Frontend.commitInFlight); the requirements are checked against the state as it is
-    * once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
+  /** Decides the vote, or withholds it. A transaction past the horizon (tooOld) is proven committed or votes abort with
+    * TransactionTooOld, its requirements unchecked. An object whose backend commit failed on this store gets an abort
+    * vote. One with a commit in flight, whether or not this transaction builds on it, makes the transaction wait with
+    * its vote withheld and no locks taken (see Frontend.commitInFlight); the requirements are checked against the state
+    * as it is once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
     */
   private def determineDisposition(): Unit = {
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
     val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet
 
-    if failed.nonEmpty then
+    if tooOld && oresolution.isEmpty && !outcomeKnown then
+      // Not checked and so not waiting on anything: decideDisposition proves the commit if an object shows it, and
+      // otherwise votes abort
+      waitingOn = Set()
+      awaitingCommits = Set()
+      decideDisposition(Map(), List(TransactionTooOld()))
+    else if failed.nonEmpty then
       waitingOn = Set()
       awaitingCommits = Set()
       decideDisposition(failed.map(_ -> BackendCommitFailed()).toMap, Nil)

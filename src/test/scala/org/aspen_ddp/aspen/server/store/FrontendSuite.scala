@@ -25,7 +25,9 @@ import org.aspen_ddp.aspen.client.DataObjectState
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-import scala.concurrent.duration.{Duration, SECONDS}
+import org.aspen_ddp.aspen.server.Host
+
+import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS, SECONDS}
 import scala.concurrent.{Await, Future, Promise}
 import scala.language.implicitConversions
 import scala.util.{Failure, Success, Try}
@@ -709,6 +711,79 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
       resolvedMessages(net) shouldBe Nil
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+  }
+
+  // ---- The horizon rule: a prepare for an unknown transaction that started too long ago ----
+  //
+  // Once the host's status cache has forgotten a finalized transaction, a late prepare for it must not be checked
+  // afresh: the store could vote commit and replay it. Past the horizon it is proven committed or votes abort.
+
+  private val horizon = FiniteDuration(6, SECONDS)
+
+  private def ago(d: FiniteDuration): HLCTimestamp = HLCTimestamp((HLCTimestamp.now.wallTime - d.toMillis) << 16)
+
+  private def withHorizon(statusCache: TransactionStatusCache = new TransactionStatusCache())
+                         (f: (Frontend, MapBackend, TestNet) => Unit): Unit =
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, statusCache, horizon = horizon)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    f(frontend, backend, net)
+
+  test("an unknown prepare older than the horizon gets a TransactionTooOld abort vote and takes no locks") {
+    withHorizon(): (frontend, _, net) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(7, SECONDS)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+      resolvedMessages(net) shouldBe Nil
+      frontend.transactions(txid1).holdsLocks shouldBe false
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
+  }
+
+  test("an unknown driver prepare older than the horizon votes abort without waiting for its object data") {
+    withHorizon(): (frontend, _, net) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(7, SECONDS)))
+      frontend.receiveTransactionMessage(driverPrepare(txd))
+
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+  }
+
+  test("an unknown prepare older than the horizon whose update an object shows is answered TxResolved(committed)") {
+    withHorizon(): (frontend, backend, net) =>
+      backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
+        DataBuffer(appliedData))
+      frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd.copy(
+        startTimestamp = ago(FiniteDuration(7, SECONDS)))))
+
+      resolvedMessages(net).map(_.committed) shouldBe List(true)
+      votes(net) shouldBe Nil
+  }
+
+  test("a late client prepare with data inside the status cache is answered from the cache") {
+    val statusCache = new TransactionStatusCache()
+    statusCache.updateStatus(txid1, TransactionStatus.Committed, finalized = true)
+    withHorizon(statusCache): (frontend, _, net) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(6500, MILLISECONDS)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      votes(net) shouldBe Nil
+      frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("an unknown prepare younger than the horizon is handled as today") {
+    withHorizon(): (frontend, _, net) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(1, SECONDS)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      frontend.transactions(txid1).holdsLocks shouldBe true
+  }
+
+  test("Host.txHorizon is the status cache duration minus one second") {
+    Host.txHorizon(Duration(1, SECONDS)) shouldBe FiniteDuration(6, SECONDS)
   }
 
   // ---- Write locks are held until a commit is applied ----

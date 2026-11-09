@@ -38,7 +38,9 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** Posts a task to the executor of the store installed under this store's id (StoreRouter.post). None
               * runs tasks inline, for tests with synchronous backends
               */
-            val postToStore: Option[(Store => Unit) => Unit] = None) extends Logging {
+            val postToStore: Option[(Store => Unit) => Unit] = None,
+            /** Unknown prepares older than this vote abort unchecked (Frontend.horizon). Infinite: off */
+            val horizon: Duration = Duration.Inf) extends Logging {
 
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
@@ -46,7 +48,8 @@ class Store(val storageDeviceId: StorageDeviceId,
     // A reload installs a new Store under the same id: a task of this one's is dropped then
     post = postToStore match
       case None => task => task()
-      case Some(postTo) => task => postTo(s => if s eq this then task()))
+      case Some(postTo) => task => postTo(s => if s eq this then task()),
+    horizon = horizon)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's

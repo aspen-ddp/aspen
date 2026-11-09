@@ -17,8 +17,10 @@ import scala.util.control.NonFatal
   * scan reconciles them from it (still under the snapshot check). An abort means they were changing; a later pass
   * tries again.
   *
-  * Every proof disables missed-update tracking (`AspenClient.newRepairTransaction`), so it cannot create repair
-  * entries. Each completes with true when the proof committed, false otherwise.
+  * The key and refcount proofs change nothing, so they disable missed-update tracking
+  * (`AspenClient.newRepairTransaction`) and cannot create repair entries. The object-level proof writes the object
+  * (its update moves the revision), so it keeps tracking on: a store that misses it is marked like any other.
+  * Each completes with true when the proof committed, false otherwise.
   */
 object RepairProofs extends Logging:
 
@@ -37,7 +39,7 @@ object RepairProofs extends Logging:
     */
   def proveObjectLevel(client: AspenClient, read: KeyValueObjectState): Future[Boolean] =
     val lock = FullContentLock(read.contents.iterator.map((k, vs) => KeyRevision(k, vs.revision)).toList)
-    prove(client, s"object level of ${read.pointer.id}"):
+    prove(client, s"object level of ${read.pointer.id}", tracked = true):
       _.update(read.pointer, Some(read.revision), Some(lock), Nil, Nil)
 
   /** A RefcountUpdate requiring `refcount` and setting that same refcount. Its exclusive object lock is the one every
@@ -46,14 +48,16 @@ object RepairProofs extends Logging:
   def proveRefcount(client: AspenClient, ptr: ObjectPointer, refcount: ObjectRefcount): Future[Boolean] =
     prove(client, s"refcount of ${ptr.id}")(_.setRefcount(ptr, refcount, refcount))
 
-  /** The transaction every proof is built on: missed-update tracking is disabled */
-  private[repair] def newProofTransaction(client: AspenClient): Transaction = client.newRepairTransaction()
+  /** The transaction a proof is built on: missed-update tracking disabled, unless `tracked` (a proof that writes) */
+  private[repair] def newProofTransaction(client: AspenClient, tracked: Boolean = false): Transaction =
+    if tracked then client.newTransaction() else client.newRepairTransaction()
 
-  private def prove(client: AspenClient, what: String)(build: Transaction => Unit): Future[Boolean] =
+  private def prove(client: AspenClient, what: String, tracked: Boolean = false)
+                   (build: Transaction => Unit): Future[Boolean] =
     given ExecutionContext = client.clientContext
     Future.unit
       .flatMap: _ =>
-        val tx = newProofTransaction(client)
+        val tx = newProofTransaction(client, tracked)
         build(tx)
         tx.commit()
       .map: _ =>

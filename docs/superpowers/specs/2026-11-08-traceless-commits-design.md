@@ -228,7 +228,8 @@ other stores.
 
 Deferred object-level parts use the same fallback, with a different proof:
 - KV revision, min, max, left and right: a `FullContentLock` of the read's contents with the read's required revision
-  and no operations.
+  and no operations. Its update moves the object's revision, so unlike the other proofs it keeps missed-update
+  tracking on: a store that misses it is marked like any other.
 - A refcount, on either object type: a `RefcountUpdate` that requires the read's refcount and sets that same refcount.
 
 Every proof is an ordinary transaction from the repairing host's client (`StoreRepairer`'s `AspenClient`). An update

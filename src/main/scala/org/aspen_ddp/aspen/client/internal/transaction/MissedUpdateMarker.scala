@@ -148,7 +148,7 @@ class MissedUpdateMarker(client: AspenClient,
       for
         pool <- client.getStoragePool(poolId)
         tx = client.newTransaction()
-        _ <- pool.errorTree.prepareUpdates(inserts, Nil)(using tx)
+        _ <- if inserts.isEmpty then Future.unit else pool.errorTree.prepareUpdates(inserts, Nil)(using tx)
         _ <- if tracelessInserts.isEmpty then Future.unit
              else pool.tracelessCommitsTree.prepareUpdates(tracelessInserts, Nil)(using tx)
         _ = MissedUpdateFinalizationAction.limitTracking(poolId, tx)

@@ -99,6 +99,48 @@ class RepairProofsSuite extends IntegrationTestSuite:
       after.revision shouldBe read.revision
       stale shouldBe false
 
-  test("proof transactions disable missed-update tracking"):
+  private def errorKey(i: Int, objectId: org.aspen_ddp.aspen.common.objects.ObjectId): Key =
+    val bb = java.nio.ByteBuffer.allocate(17)
+    bb.put(i.toByte).putLong(objectId.uuid.getMostSignificantBits).putLong(objectId.uuid.getLeastSignificantBits)
+    Key(bb.array())
+
+  /** Whether the pool's errorTree marks store `i` for `objectId` */
+  private def marked(i: Int, objectId: org.aspen_ddp.aspen.common.objects.ObjectId): Future[Boolean] =
+    client.getStoragePool(PoolId.BootstrapPoolId).flatMap(_.errorTree.get(errorKey(i, objectId))).map(_.isDefined)
+
+  /** Deletes store `i`'s errorTree entry for `objectId`, if any: the test network's stores can miss the allocation */
+  private def unmark(i: Int, objectId: org.aspen_ddp.aspen.common.objects.ObjectId): Future[Unit] =
+    for
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      present <- pool.errorTree.get(errorKey(i, objectId))
+      _ <- if present.isEmpty then Future.unit
+           else
+             val tx = client.newRepairTransaction()
+             pool.errorTree.delete(errorKey(i, objectId))(using tx).flatMap(_ => tx.commit()).map(_ => ())
+      _ <- net.waitForTransactionsToComplete()
+    yield ()
+
+  test("an object-level proof missed by a store marks it: the proof moves the object's revision"):
+    val s2 = net.storeId2
+    for
+      ptr <- kvObject()
+      read <- client.read(ptr)
+      _ <- unmark(2, ptr.id)
+      markedBefore <- marked(2, ptr.id)
+      _ = markedBefore shouldBe false
+      _ = net.offlineStores = Set(s2)
+      _ = net.dropTxMessage = m => m.to == s2
+      proven <- RepairProofs.proveObjectLevel(client, read)
+      _ <- net.waitForTransactionsToComplete()
+      _ = net.dropTxMessage = _ => false
+      _ = net.offlineStores = Set()
+      after <- client.read(ptr)
+      isMarked <- marked(2, ptr.id)
+    yield
+      proven shouldBe true
+      after.revision should not be read.revision
+      isMarked shouldBe true
+
+  test("proof transactions that change nothing disable missed-update tracking"):
     Future.successful:
       RepairProofs.newProofTransaction(client).missedUpdateTrackingEnabled shouldBe false

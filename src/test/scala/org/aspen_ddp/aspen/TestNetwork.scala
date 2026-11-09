@@ -24,7 +24,7 @@ import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, Host, 
 import org.aspen_ddp.aspen.server.host.{HostThreading, LockstepThreading}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
-import org.aspen_ddp.aspen.server.store.Bootstrap
+import org.aspen_ddp.aspen.server.store.{Bootstrap, TracelessCommitLookup}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache as StoreObjectCache}
 import org.aspen_ddp.aspen.server.transaction.{SimpleTransactionDriver, TransactionDriver, TransactionFinalizer}
@@ -114,7 +114,8 @@ object TestNetwork {
     */
   final case class HostOptions(heartbeatPeriod: Duration = Duration(5, SECONDS),
                                recordCrl: Boolean = false,
-                               recoveryDrivers: Boolean = false)
+                               recoveryDrivers: Boolean = false,
+                               wrapTracelessLookup: Option[TracelessCommitLookup => TracelessCommitLookup] = None)
 
   /** Opens a fresh no-op CRL for each device, creating the crl directory a real one would, so discovery does not
     * take the device's stores to have lost theirs */
@@ -349,7 +350,7 @@ class TestNetwork(executionContext: ExecutionContext,
     hostOptions.heartbeatPeriod,
     Duration(60, SECONDS),
     // Its stores are loaded directly (below), onto a device it never loads
-    seams = Host.Seams(unloadedDeviceCrl = Some(crl)))
+    seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapTracelessLookup = hostOptions.wrapTracelessLookup))
 
   // Stands in for each store's StoreConfig.effectiveMaxSliceSize, which Host reads from the store config file
   private val storesLoaded = (stores ++ metadataStores).map(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))

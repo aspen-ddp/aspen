@@ -81,13 +81,15 @@ object FrontendSuite {
     var frontend: Option[Frontend] = None
     /** The lookups made, oldest first, with their request ids */
     var made: List[(TransactionId, Long)] = Nil
+    private var answers: Map[(TransactionId, Long), Try[Boolean] => Unit] = Map()
     def requests: List[TransactionId] = made.map(_._1)
-    def lookup(storeId: StoreId, transactionId: TransactionId, requestId: Long): Unit =
+    def lookup(storeId: StoreId, transactionId: TransactionId, requestId: Long, answer: Try[Boolean] => Unit): Unit =
       made = made :+ (transactionId -> requestId)
+      answers += (transactionId, requestId) -> answer
     /** Answers the lookup `requestId` of `txid`, by default the latest made */
     def answer(txid: TransactionId, result: Try[Boolean], requestId: Option[Long] = None): Unit =
       val id = requestId.getOrElse(made.filter(_._1 == txid).last._2)
-      frontend.get.tracelessLookupComplete(txid, id, result)
+      answers((txid, id))(result)
 
   class TestCrl extends CrashRecoveryLog {
 

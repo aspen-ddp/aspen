@@ -346,7 +346,9 @@ class Frontend(val storeId: StoreId,
     l.inFlight = true
     l.startedAt = System.nanoTime()
     l.failed = false
-    tracelessLookup.lookup(storeId, txid, requestId)
+    // Through `post`, so a store replaced meanwhile drops the answer rather than handing it to its successor
+    tracelessLookup.lookup(storeId, txid, requestId,
+      result => post(() => tracelessLookupComplete(txid, requestId, result)))
 
   /** The answer to TracelessCommits lookup `requestId`, delivered on the store's executor.
     *

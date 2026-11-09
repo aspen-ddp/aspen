@@ -14,9 +14,11 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.repair.{RepairPolicy, StoreRepairer}
+import org.aspen_ddp.aspen.server.store.TracelessCommitLookup
 
 import java.nio.{ByteBuffer, ByteOrder}
 import scala.concurrent.Future
+import scala.util.Try
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 
 /** A store that voted commit, crashed before learning the outcome, and is restarted after the transaction was
@@ -36,8 +38,26 @@ class TracelessCommitsIntegrationSuite extends IntegrationTestSuite:
 
   override def testIda: IDA = ReedSolomon(5, 3, 4)
 
+  /** Holds the host's TracelessCommits lookups while `holding`, for the test to answer: through the real lookup, or
+    * with a given result. Each is answered through the Frontend's own `answer`, as the host's lookup answers
+    */
+  class HoldingLookup(inner: TracelessCommitLookup) extends TracelessCommitLookup:
+    final class Held(val storeId: StoreId, val transactionId: TransactionId, val requestId: Long,
+                     val answer: Try[Boolean] => Unit):
+      def release(): Unit = inner.lookup(storeId, transactionId, requestId, answer)
+    @volatile var holding = false
+    @volatile var pending: List[Held] = Nil
+    @volatile var made: Int = 0
+    def lookup(storeId: StoreId, transactionId: TransactionId, requestId: Long, answer: Try[Boolean] => Unit): Unit =
+      made += 1
+      if holding then pending = pending :+ Held(storeId, transactionId, requestId, answer)
+      else inner.lookup(storeId, transactionId, requestId, answer)
+
+  @volatile private var lookups: HoldingLookup = scala.compiletime.uninitialized
+
   override def testHostOptions: TestNetwork.HostOptions =
-    TestNetwork.HostOptions(heartbeatPeriod = Duration(300, MILLISECONDS), recordCrl = true, recoveryDrivers = true)
+    TestNetwork.HostOptions(heartbeatPeriod = Duration(300, MILLISECONDS), recordCrl = true, recoveryDrivers = true,
+      wrapTracelessLookup = Some(inner => { lookups = new HoldingLookup(inner); lookups }))
 
   private val k = Key(Array[Byte](1))
 
@@ -250,3 +270,42 @@ class TracelessCommitsIntegrationSuite extends IntegrationTestSuite:
       (0 until 5).foreach(i => storeRevision(i, dataPtr) shouldBe Some(ObjectRevision(txid)))
       after.revision shouldBe ObjectRevision(txid)
       after.data.getByteArray.toSeq shouldBe Seq[Byte](2)
+
+  test("a TracelessCommits lookup answer for a replaced store is not taken by its successor"):
+    for
+      (tree, nodePtr) <- treeHoldingK()
+      txid <- commitHeldBy(Set(sid(2)))(tx => tree.delete(k)(using tx))
+      _ = lookups.holding = true
+      _ <- restartAfterForgotten(txid, List(2))
+      _ <- eventually("the first store's lookup", clock = false)(Future.successful(lookups.pending.size == 1))
+      // Restarted again before its lookup is answered: the replacement makes its own
+      _ <- pump(net.restartStore(net.stores(2)), clock = false)
+      _ <- eventually("the replacement's lookup", clock = false)(Future.successful(lookups.pending.size == 2))
+      List(first, second) = lookups.pending: @unchecked
+      _ = first.requestId shouldBe second.requestId
+      // The first store's answer, that the entry is there, arrives after it was replaced
+      _ = first.answer(scala.util.Success(true))
+      _ = net.handleEvents()
+      _ = withClue("the replacement does not take its predecessor's answer: "):
+            storeKeys(2, nodePtr) should contain (k)
+      _ = second.release()
+      _ <- eventually("the replacement applied the delete on its own answer", clock = false):
+             Future.successful(!storeKeys(2, nodePtr).contains(k))
+    yield succeed
+
+  test("a TracelessCommits lookup that fails is made again at the store heartbeat, and then applies"):
+    for
+      (tree, nodePtr) <- treeHoldingK()
+      txid <- commitHeldBy(Set(sid(2)))(tx => tree.delete(k)(using tx))
+      _ = lookups.holding = true
+      _ <- restartAfterForgotten(txid, List(2))
+      _ <- eventually("the recovered store's lookup", clock = true)(Future.successful(lookups.pending.size == 1))
+      _ = lookups.holding = false
+      _ = lookups.pending.head.answer(scala.util.Failure(new java.io.IOException("injected lookup failure")))
+      _ = net.handleEvents()
+      _ = storeKeys(2, nodePtr) should contain (k)
+      // The heartbeat makes another, through the host's real lookup, which finds the entry
+      _ <- eventually("store 2 applied the delete after a heartbeat retry", clock = true):
+             Future.successful(!storeKeys(2, nodePtr).contains(k))
+    yield
+      lookups.made should be >= 2

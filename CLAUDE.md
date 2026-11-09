@@ -355,7 +355,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   store with `extractCrl`, copying its state from the device CRL into `crl_save.log` to travel with it. Such a file is
   then the only copy of that state: if it fails to load (missing, truncated, or naming another store) the store is
   never served. It gets a `rebuild-required` marker, its entry is flipped to Rebuilding by the reconcile, and the
-  directory is discarded before the rebuild. Adoption of a device does the same for a `transferring-out` store
+  directory is moved to `pending-delete/` before the rebuild. Adoption of a device does the same for a `transferring-out` store
   without a valid save file instead of refusing the device, and adopts any `rebuild-required` directory as Rebuilding
   whatever its other markers. A network transfer validates the staged copy's save file before promotion and retries on
   failure, since the source still holds the state
@@ -367,12 +367,22 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   `crl_save.log`). Such a store is never transferred: its transfer is aborted so it is rebuilt
 - A store's device-CRL entries are dropped for good (`CrashRecoveryLog.dropStore`, durable) only once it cannot be
   served: when a rebuild discards a `rebuild-required` directory (`StoreRebuilds.discardLostStore`: marker durable,
-  then drop durable, then the directory removed and the rebuild started), or when an unloaded store's save file still
+  then the entries saved into the directory's `lost-crl-state.log`, then the drop durable, then the directory moved
+  to `<device>/pending-delete/` and the rebuild started), or when an unloaded store's save file still
   holds them, or when the reconcile deletes the directory of a store transferred away (`DeviceReconciler`, retried
   on failure). Without the marker on disk, entries stay in the device CRL. A transfer out reads them
   (`readStoreState`, leaving them live) into `crl_save.log` (loaded or not, `StoreTransfers.closeForTransferOut`)
   and deletes them from the device CRL (`deleteTransactions`) only once that file is durable: a crash or failed save
   before that leaves the device CRL holding them
+- Nothing of a lost store is destroyed before its rebuild succeeds: its `pending-delete/` copy (data plus saved CRL
+  entries) is deleted by the device's reconcile only once the store is Active again, on this device by its own
+  entry, elsewhere by the pool's entry and that device's state; a failed read keeps it. A fail-stopped backend's CRL
+  entries likewise stay live until that discard saves them
+- A device the tree records Failed is retired by its host's reconcile (`DeviceShutdown.retireFailedDevice`): a
+  durable `failed` marker (`DeviceMarkers`), then unloaded as a relinquished device is. A device with the marker is
+  never loaded or claimed; nothing on it is deleted. The tombstone (`FailedStorageDeviceDurableTask`) nudges the
+  former host with `CheckStorageDevice`. A repair scan runs only while the store's pool entry names this host
+  (`StoreRepairer`), so a superseded copy never consumes the current copy's ErrorTree entries
 - `server.DurableFiles` forces files and their directories so markers and moves survive a pulled disk. That durability
   holds on Linux only, the supported host platform: directory fsync is a no-op on Windows and a plain fsync on macOS,
   each logging one warning

@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Ke
                                            ObjectPointer, ObjectRefcount, Value}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
+import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 
@@ -135,6 +136,24 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       target.repairs should contain (ptr.id)
       result.repaired shouldBe 1
       result.deferred shouldBe 0
+      stillThere shouldBe false
+
+  test("a store whose pool records it on another host is not scanned, so its entries stay for that host"):
+    val target = RecordingTarget(List(storeId))
+    for
+      ptr <- allocateObjectPointer()
+      os <- client.read(ptr)
+      _ <- seedErrorEntry(ptr.id, Array[Byte](1, 2, 3), os.timestamp)
+      elsewhere <- StoreRepairer(client, target, Some(HostId(new UUID(5, 5)))).scan(storeId, RepairPolicy.Default)
+      keptForOwner <- errorEntryExists(ptr.id)
+      repairsElsewhere = target.repairs
+      owned <- StoreRepairer(client, target, Some(HostId.BootstrapHostId)).scan(storeId, RepairPolicy.Default)
+      stillThere <- errorEntryExists(ptr.id)
+    yield
+      elsewhere.seen shouldBe 0
+      repairsElsewhere shouldBe Nil
+      keptForOwner shouldBe true
+      owned.repaired shouldBe 1
       stillThere shouldBe false
 
   test("an entry is removed when its object was updated again after the miss"):

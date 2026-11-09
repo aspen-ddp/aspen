@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.Host
+import org.aspen_ddp.aspen.server.{Host, StoreConfig}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
@@ -27,10 +27,14 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   // Devices with a re-check waiting out TransferOutRecheckDelay. At most one each.
   private var scheduledRechecks: Set[StorageDeviceId] = Set()
   private var deferredChecks: Set[StorageDeviceId] = Set()
+  // Pending-delete copies whose store's state is being read elsewhere (clearPendingDeletes)
+  private var pendingDeleteLookups: Set[os.Path] = Set()
   // Stores whose leftover device-CRL entries are being dropped (dropLeftoverCrlState)
   private var crlDropsRunning: Set[StoreId] = Set()
 
   private[server] def activeDeviceChecks: Set[StorageDeviceId] = activeChecks
+
+  private[server] def pendingDeleteLookupsInFlight: Set[os.Path] = pendingDeleteLookups
 
   private[server] def scheduledDeviceRechecks: Set[StorageDeviceId] = scheduledRechecks
 
@@ -113,8 +117,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  was pulled from this running host and plugged in there. Reconciling against another host's
    *  records could delete or create stores that are not ours, and serving them would compete
    *  with the host that now does.
-   *  A device the tree records as failed is ignored outright: it is neither claimed nor
-   *  reconciled, and its stores are being rebuilt elsewhere.
+   *  A device the tree records as failed is retired (DeviceShutdown.retireFailedDevice): marked so it
+   *  is never loaded again, and unloaded. Its stores are being rebuilt elsewhere.
    *  A device the tree records as ShuttingDown (or Shutdown) is handed to shutDownDevice instead
    *  of any of the passes, so nothing new starts on a disk about to be shelved.
    */
@@ -123,8 +127,9 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     if remote.isFailed then
       // An operator has declared this device dead. Its directory can still mount -- a dead
       // controller rather than a dead platter -- and its zeroed host id must not be mistaken for
-      // another owner by the branch below. Its stores are being rebuilt elsewhere.
-      logger.info(s"Ignoring failed storage device ${local.storageDeviceId}")
+      // another owner by the branch below. Its stores are being rebuilt elsewhere, so it stops
+      // serving them, for good
+      ctx.shutdown.retireFailedDevice(local, remote)
     else if remote.hostId != ctx.hostId then
       ctx.shutdown.relinquishDevice(local, remote)
     else if remote.status == StorageDeviceState.DeviceStatus.ShuttingDown ||
@@ -334,6 +339,64 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         entry.status == StorageDeviceState.StoreStatus.Rebuilding
       ).keys.toList.sortBy(_.poolIndex).foreach: storeId =>
         ctx.rebuilds.startRebuild(local, storeId)
+
+      //----------------------
+      // Pending Deletes
+      //
+      clearPendingDeletes(local, remote)
+
+  /** Deletes each store copy discardLostStore kept in the device's pending-delete directory once its store is Active
+   *  again, wherever it was rebuilt: on this device by its own entry, elsewhere by the pool's entry for the store and
+   *  that device's state. Anything else, a failed read included, keeps the copy for a later check: a rebuild that
+   *  cannot finish must not cost the old copy. A directory with no store config is what an interrupted delete leaves,
+   *  and is deleted. */
+  private def clearPendingDeletes(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    val pendingDir = local.devicePath / RebuildingStore.PendingDeleteDirectory
+    val copies =
+      try
+        if os.isDir(pendingDir) then os.list(pendingDir).filter(os.isDir(_)).toList else Nil
+      catch
+        case t: Throwable =>
+          logger.warn(s"Failed to list $pendingDir: $t")
+          Nil
+
+    def delete(copy: os.Path, why: String): Unit =
+      logger.info(s"Deleting $copy: $why")
+      try os.remove.all(copy)
+      catch case t: Throwable => logger.warn(s"Failed to delete $copy. Retrying at a later check. Error: $t")
+
+    copies.filterNot(pendingDeleteLookups.contains).foreach: copy =>
+      val config = copy / StoreConfig.configFilename
+      scala.util.Try(StoreConfig.loadStoreConfig(config)) match
+        case Failure(_) =>
+          delete(copy, "it holds no store config, as an interrupted delete leaves it")
+        case Success(cfg) =>
+          val storeId = cfg.storeId
+          remote.stores.get(storeId) match
+            case Some(entry) =>
+              if entry.status == StorageDeviceState.StoreStatus.Active then
+                delete(copy, s"store $storeId is Active again on this device")
+            case None =>
+              pendingDeleteLookups += copy
+              val factive =
+                try
+                  for
+                    pool <- ctx.client.getStoragePoolState(storeId.poolId)
+                    holder = pool.stores(storeId.poolIndex)
+                    state <- ctx.metadata.lookupStorageDeviceState(holder.storageDeviceId)
+                  yield
+                    state.storageDeviceId == holder.storageDeviceId &&
+                    state.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active)
+                catch case NonFatal(t) => Future.failed(t)
+              factive.onComplete: result =>
+                pendingDeleteLookups -= copy
+                result match
+                  case Success(true) =>
+                    if os.exists(copy) then
+                      delete(copy, s"store $storeId is Active again on another device")
+                  case Success(false) => ()
+                  case Failure(t) =>
+                    logger.info(s"Keeping $copy: the state of store $storeId could not be read. Error: $t")
 
   /** Checks `storageDeviceId` again after TransferOutRecheckDelay, so a store left offline behind
    *  a transfer-out marker is reinstated soon after an aborted transfer's send ends rather than at

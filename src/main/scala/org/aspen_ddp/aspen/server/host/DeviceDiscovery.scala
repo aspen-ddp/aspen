@@ -231,6 +231,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                              s"host ${state.hostId}. $why")
 
             if state.isFailed then
+              try DeviceMarkers.writeFailed(path)
+              catch case t: Throwable => logger.warn(s"Failed to write the failed marker of $path: $t")
               refuse("It has been declared failed. Not loading it")
             else if previousHost == ctx.hostId then
               state.status match
@@ -471,6 +473,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     if ctx.devices.closingCrls.contains(storageDevicePath) then
       logger.debug(s"Not loading the device at $storageDevicePath yet: its CRL is still shutting down")
       None
+    else if os.isDir(storageDevicePath) && os.exists(sdCfgPath) && DeviceMarkers.isFailed(storageDevicePath) then
+      warnOnce(storageDevicePath, s"Storage device at $storageDevicePath has been declared failed. Not loading or " +
+                                  s"claiming it")
+      None
     else if os.isDir(storageDevicePath) && os.exists(sdCfgPath) then
       try
         val sdCfg = StorageDeviceConfig.loadStorageDeviceConfig(sdCfgPath)
@@ -571,11 +577,6 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         try os.remove.all(staging)
         catch case t: Throwable =>
           logger.warn(s"Failed to remove stale transfer staging directory $staging: $t")
-        // Likewise a store copy discardLostStore had moved aside but not yet deleted.
-        val discarded = storageDevicePath / RebuildingStore.DiscardDirectory
-        try os.remove.all(discarded)
-        catch case t: Throwable =>
-          logger.warn(s"Failed to remove discarded store directory $discarded: $t")
         Try(os.list(storageDevicePath)) match
           case Failure(t) =>
             // Same hazard as the scan in checkForNewDevices: listing can fail with an IO

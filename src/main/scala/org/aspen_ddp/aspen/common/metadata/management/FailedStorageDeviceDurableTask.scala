@@ -227,8 +227,14 @@ class FailedStorageDeviceDurableTask(
             devKvos.contents(StorageDeviceState.StateKey).revision)),
           List(Insert(StorageDeviceState.StateKey, tombstoned.encode())))
 
+        // The host that owned the device, which the tombstone no longer names
+        state.hostId
+
     done.transformWith:
-      case Success(_) =>
+      case Success(previousHost) =>
+        // Best-effort: wakes the device's former host, which retires the device on reading it Failed instead of
+        // serving its stores until its next periodic check. Its restart retires it too, as does that check.
+        client.sendBestEffortHostMessage(CheckStorageDevice(previousHost, client.clientId, deviceId))
         // scheduleRecheck, not run(): run()'s single-flight flag is still held by this pass, so
         // a direct call would be dropped.
         scheduleRecheck()

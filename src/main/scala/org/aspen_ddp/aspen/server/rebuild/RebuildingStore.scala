@@ -26,11 +26,16 @@ object RebuildingStore:
    *  Rebuilding and the directory is discarded before the rebuild starts. */
   val RebuildRequiredMarkerFile = "rebuild-required"
 
-  /** Device-root directory a marked store directory is renamed into before it is deleted, so
-   *  a crash part-way through the delete never leaves a partial directory at the store's path
-   *  (which a rebuild would take for a store already in place). Invisible to Host.tryLoadStore
-   *  for the same reason as RebuildDirectory. */
-  val DiscardDirectory = "discarded"
+  /** Device-root directory a marked store directory is renamed into before its rebuild starts, which clears the
+   *  store's path (a rebuild takes a directory there for a store already in place). The copy is kept, with its former
+   *  device-CRL entries in LostCrlStateFile, until the store is Active again wherever it was rebuilt: a rebuild that
+   *  cannot finish destroys nothing. The device's reconcile then deletes it (DeviceReconciler). Invisible to
+   *  Host.tryLoadStore for the same reason as RebuildDirectory. */
+  val PendingDeleteDirectory = "pending-delete"
+
+  /** In a store directory being discarded: the store's device-CRL entries, saved by CrashRecoveryLog.saveStoreState
+   *  before they are dropped from the device CRL, which a rebuild onto the same device would otherwise recover */
+  val LostCrlStateFile = "lost-crl-state.log"
 
   /** Objects between checkpoints. Small enough that a crash costs little, large enough that
    *  the flush is not the dominant cost. */

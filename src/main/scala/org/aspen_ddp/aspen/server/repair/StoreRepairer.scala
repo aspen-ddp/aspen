@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server.repair
 
+import org.aspen_ddp.aspen.common.metadata.HostId
+
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ReadLocks, StoragePool,
                                    ObjectState as ClientObjectState}
 import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateFinalizationAction, TracelessCommitEntry}
@@ -99,6 +101,10 @@ object DeferralState:
   * them with a transaction (RepairProofs) and, if it commits, reconciles them from the read the proof used.
   */
 class StoreRepairer(client: AspenClient, target: RepairTarget,
+                    /** The host the scans run on. When given, a store is scanned only while its pool's entry names
+                     *  this host: a copy left on a device declared failed, or otherwise superseded, must not consume
+                     *  the entries the store's current copy needs. None (tests driving one network) skips the check */
+                    hostId: Option[HostId] = None,
                     /** Test seam: runs between a repair's read and its install */
                     testingOnlyBeforeReconcile: (StoreId, ObjectPointer) => Future[Unit] = (_, _) => Future.unit,
                     /** Test seam: told the parts each proof run proved */
@@ -126,14 +132,26 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     val min = Key(Array[Byte](storeId.poolIndex))
     val max = Key(Array[Byte]((storeId.poolIndex + 1).toByte))
 
-    for
-      pool <- client.getStoragePool(storeId.poolId)
-      _ <- pool.errorTree.foreachInRange(min, max, repairErrorEntry(pool, storeId, policy, deferral, counts))
-      _ <- pool.tracelessCommitsTree.foreachInRange(min, max,
-             repairTracelessEntry(pool, storeId, policy, deferral, counts))
-    yield
-      deferral.retain(counts.touchedKeys)
-      counts.result
+    ownedHere(storeId).flatMap: owned =>
+      if !owned then
+        logger.warn(s"Not repairing store $storeId: its pool records it on another host")
+        Future.successful(counts.result)
+      else
+        for
+          pool <- client.getStoragePool(storeId.poolId)
+          _ <- pool.errorTree.foreachInRange(min, max, repairErrorEntry(pool, storeId, policy, deferral, counts))
+          _ <- pool.tracelessCommitsTree.foreachInRange(min, max,
+                 repairTracelessEntry(pool, storeId, policy, deferral, counts))
+        yield
+          deferral.retain(counts.touchedKeys)
+          counts.result
+
+  /** Whether the pool's entry for the store names this host, read fresh for each scan */
+  private def ownedHere(storeId: StoreId): Future[Boolean] = hostId match
+    case None => Future.successful(true)
+    case Some(h) =>
+      client.getStoragePoolState(storeId.poolId).map: pool =>
+        storeId.poolIndex < pool.stores.length && pool.stores(storeId.poolIndex).hostId == h
 
   /** The store left this host mid-scan. foreachInRange has no early exit so the remaining tree-node reads still
     * happen, but those are cheap next to the per-object read and transactions each remaining entry would otherwise

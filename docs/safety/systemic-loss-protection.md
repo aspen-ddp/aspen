@@ -81,7 +81,8 @@ These are facts about the code, each checked. They define the problem; none is a
   `rebuildingStores.size < maxConcurrentRebuilds` and then calls `discardLostStore`
   (`server/host/StoreRebuilds.scala:167-169`); `rebuildingStores` is populated only after `discardLostStore` returns
   true, so one reconcile pass starts the discard of every marked Rebuilding store on the device at once.
-* **S4 Destruction precedes reconstruction.** `discardLostStore` drops the store's device-CRL entries and deletes its
+* **S4 Destruction precedes reconstruction.** *Fixed 2026-11-09:* the discard now moves the copy, with its saved CRL
+  entries, to `pending-delete/`, deleted only once the store is Active again (rebuild-process.md F2). Was: `discardLostStore` drops the store's device-CRL entries and deletes its
   directory before the rebuild reads anything (`StoreRebuilds.scala:499-540`). There is no feasibility check.
 * **S5 Errors are classified coarsely.** CRL open: `catch case t: Throwable` flags the device
   (`DeviceDiscovery.scala:508-515`). Save file: `catch case t: Throwable => Left(InvalidSaveFile)`
@@ -155,7 +156,7 @@ are retained or are a derived copy of data that still exists elsewhere (and the 
 |---|---|---|---|---|
 | X1 | Device CRL directory renamed to `crl.lost-<uuid>` | `DeviceDiscovery.scala:517-518` | **Recoverable (by hand)**; never used or reclaimed by code | the whole old CRL (votes, Paxos state of every store of the device). Not useful without the store directories (X3) |
 | X2 | `dropStore` on fail-stop of a served store: device-CRL entries removed durably | `StoreRebuilds.scala:421` ► `StoreLoader.scala:421-434`, `server/crl/CrashRecoveryLog.scala:159` | **Destructive** for the store's transaction state | the store's backend files (until X3) |
-| X3 | `discardLostStore`: `dropStore` again, rename the store directory to `discarded/`, `os.remove.all` it | `StoreRebuilds.scala:499-540` | **Destructive** for the store's object slices and transaction state | nothing local. Peers hold the data if their count permits (section 2) |
+| X3 | `discardLostStore` (before 2026-11-09): `dropStore` again, rename the store directory to `discarded/`, `os.remove.all` it. Now: entries saved into the directory, dropped, the directory moved to `pending-delete/` and deleted only once the store is Active again | `StoreRebuilds.scala:499-540` | **Destructive** for the store's object slices and transaction state | nothing local. Peers hold the data if their count permits (section 2) |
 | X4 | `discarded/` and the transfer staging directory deleted at device load | `DeviceDiscovery.scala:544-552` | Destructive for already-discarded copies; staging is derived | |
 | X5 | `crl_save.log` removed after a fail-stop during close | `StoreRebuilds.scala:385` | **Destructive** (it may be the only copy of the transfer-time state) | |
 | X6 | Reconcile "Deleted Stores": directory of an offline store whose entry is absent from the tree | `server/host/DeviceReconciler.scala:146-161` | **Destructive** local copy; intended after a completed transfer, where the destination holds the data | the destination's copy, only if the transfer really completed. Triggered by the tree not listing the store; a wrong tree read or a wrong tree write would delete a live offline store's directory |

@@ -170,6 +170,14 @@ device); the candidate must be Operational and have free space of at least the s
 
 ### 4.3 The destructive prelude to every rebuild of a marked store
 
+> **Changed 2026-11-09 (F2 fix).** The prelude is no longer destructive. `discardLostStore` saves the store's
+> device-CRL entries into `<storeDir>/lost-crl-state.log`, drops them from the device CRL (a rebuild onto the same
+> device would recover them otherwise), and moves the directory to `<device>/pending-delete/<dir>-<uuid>`. Nothing
+> is deleted there. The device's reconcile deletes the copy only once the store is Active again, wherever it was
+> rebuilt; a failed read keeps it. A fail-stopped backend no longer drops its entries at close: the discard saves
+> them. With nothing destroyed before reconstruction, the cap's gap below no longer matters. The text below
+> describes the code before the fix.
+
 `StoreRebuilds.startRebuild` evaluates, in order, `!rebuildingStores.contains(storeId)`,
 `rebuildingStores.size < maxConcurrentRebuilds` (default 2, `server/Host.scala:179`), device not shutting down, and
 `discardLostStore` (`StoreRebuilds.scala:167-169`). `discardLostStore` (`:499-521`), if the directory has the marker:
@@ -590,6 +598,12 @@ Each item carries a **Verification** paragraph from an independent adversarial p
 
 Each item: scenario, reference, confidence.
 
+> **F1 FIXED (2026-11-09)** together with cross-document X1: the reconcile retires a device it reads Failed (a durable
+> `failed` marker, then unloaded like a relinquished device), a device with the marker is never loaded, the tombstone
+> nudges the former host, and a repair scan runs only while the pool's entry names the scanning host. Residual: until
+> its first successful reconcile, a restarted or partition-healed old host may still answer peers holding a stale
+> store-to-host mapping (the no-fencing trade-off accepted for adoption).
+
 **F1 (Medium-High) A device declared Failed is never taken out of service on its host; a stale replica of the same
 StoreId can run beside the rebuilt one.**
 Scenario: the operator runs `fail-storage-device D1` on a device whose host H1 is up and whose media is healthy (a
@@ -607,6 +621,11 @@ adoption design states the lack of fencing as a conscious decision for adoption
 statement and its anti-goals (`:36-40`) list only adoption of a Failed device.
 
 **Verification (adversarial pass): CONFIRMED mechanism; trigger is an operator `fail-storage-device` (or a partition) on a live, healthy device; severity stale-replica / split-decision risk.** `DeviceReconciler.reconcileDeviceState` tests `remote.isFailed` first (`:123-127`) and only logs, so neither the relinquish path (`:128-129`) nor any unload runs; grep shows `unloadDevice`/`relinquishDevice` have no caller on the Failed path. On restart `tryLoadDevice` loads by `owning-host` with no lookup (`DeviceDiscovery.scala:471-478`), and `tryLoadStore` (`StoreLoader.scala:67-97`) checks only markers. The zombie's store stays in `HostStoreView.repairable` (only offline/rebuilding/transferring-out are removed), so its `StoreRepairer.scan` consumes ErrorTree entries for the shared pool index (`StoreRepairer.scala:142-165`, `deleteEntryIfUnchanged` after its own repair), which the rebuilt copy then never sees. Message routing reaches it whenever a peer or client still maps the StoreId to the old HostId (the envelope check is on HostId, not store ownership). Fix sketch: when the reconcile reads Failed, unload the device and its stores (`relinquishDevice`-style) and delete/keep the `owning-host` marker so a restart does not load it; longer term a per-store epoch on messages.
+
+> **F2 FIXED (2026-11-09).** The old copy and its saved CRL entries are kept in `pending-delete/` until the store
+> is Active again (section 4.3). Covered by the DeviceCrlSuite tests "a discarded store is kept in pending-delete with
+> its CRL entries until the store is Active again" and "a pending-delete copy of a store rebuilt on another device
+> goes once that device has it Active".
 
 **F2 (High) The old store state is destroyed before any check that the pool can supply the replacement.**
 Scenario: a transient detection (see systemic-loss-protection.md) marks a store; `startRebuild` runs `discardLostStore`

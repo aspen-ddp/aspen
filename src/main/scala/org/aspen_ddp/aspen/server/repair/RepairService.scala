@@ -36,7 +36,7 @@ class RepairService(client: AspenClient,
 
   import RepairService.*
 
-  private val repairer = StoreRepairer(client, target)
+  private val repairer = StoreRepairer(client, target, Some(hostId))
   private val rand = Random()
 
   private var scanStates: Map[StoreId, ScanState] = Map()

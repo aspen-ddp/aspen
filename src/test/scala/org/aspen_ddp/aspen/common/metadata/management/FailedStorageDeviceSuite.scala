@@ -150,6 +150,26 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       set.memberDevices should not contain net.secondDeviceId
       host.storageDevices should not contain net.secondDeviceId
 
+  atest("step 1 wakes the device's former host, which retires the device on reading it failed"):
+    given ExecutionContext = executionContext
+    def nudgesUntilFound(acc: List[CheckStorageDevice], rounds: Int): Future[List[CheckStorageDevice]] =
+      val all = acc ++ net.takeCapturedHostMessages().collect { case m: CheckStorageDevice => m }
+      if all.exists(_.deviceId == net.secondDeviceId) || rounds == 0 then
+        Future.successful(all)
+      else
+        delay(Duration(10, MILLISECONDS)).flatMap(_ => nudgesUntilFound(all, rounds - 1))
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ = net.takeCapturedHostMessages()
+      _ <- client.failStorageDevice(net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ <- taskForEnrolled(net.secondDeviceId)
+      _ <- awaitTombstone(net.secondDeviceId, Duration(120000, MILLISECONDS))
+      nudges <- nudgesUntilFound(Nil, 1000)
+    yield
+      nudges should contain(CheckStorageDevice(HostId.BootstrapHostId, client.clientId, net.secondDeviceId))
+
   atest("step 1 removes the device from the set it is in now, not the one it was in at enrollment"):
     given ExecutionContext = executionContext
     val bootstrapSet = StorageDeviceSetId.BootstrapStorageDeviceSetId

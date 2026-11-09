@@ -658,6 +658,20 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(CrashRecoveryLog.deviceCrlDir(deviceDir) / "0.crl") should be(true)
       os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
 
+  /** Points the pool's entry for `sid` at `device` on the bootstrap host */
+  private def setPoolEntry(sid: StoreId, device: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = executionContext
+    client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStoragePoolPointer(sid.poolId)
+        kvos <- client.read(ptr)
+      yield
+        val cfg = StoragePoolState(kvos)
+        cfg.stores(sid.poolIndex) = StoragePoolState.StoreEntry(HostId.BootstrapHostId, device)
+        tx.update(ptr, None, None,
+          List(KeyRevision(StoragePoolState.ConfigKey, kvos.contents(StoragePoolState.ConfigKey).revision)),
+          List(Insert(StoragePoolState.ConfigKey, cfg.encode())))
+
   /** The transactions `crl` holds for `sid`. Blocks on the CRL thread, which never waits on this one */
   private def held(crl: CrashRecoveryLog, sid: StoreId): Set[TransactionId] =
     crl.getFullRecoveryState(sid).map(_.txd.transactionId).toSet
@@ -764,6 +778,101 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       recoveredByCopy should be(Set())
       // Deleted from the files too, so a later restart does not recover them either
       heldOnDisk(deviceDir, storeId) should be(Set())
+
+  atest("a discarded store is kept in pending-delete with its CRL entries until the store is Active again"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      _ = os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
+      restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
+      copies = os.list(deviceDir / RebuildingStore.PendingDeleteDirectory).toList
+      saved = copies.map(c => CrashRecoveryLog.loadValidStoreState(c / RebuildingStore.LostCrlStateFile, storeId))
+      leftInCrl = held(second.opened.head, storeId)
+      // Checks while the entry is Rebuilding keep it
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
+      keptWhileRebuilding = copies.forall(os.exists(_))
+      _ <- writeRocksStore(deviceDir, storeId)
+      _ = rebuilds.created.head.promise.success(())
+      _ <- pumpWithTx(restarted, restarted.control.router.loaded.contains(storeId) && copies.forall(!os.exists(_)))
+      deletedOnceActive = copies.forall(!os.exists(_))
+      _ <- restarted.control.router.loaded(storeId).backend.close()
+      _ = second.shutdownAll()
+    yield
+      copies.size should be(1)
+      saved.map(_.map(_.map(_.txd.transactionId))) should be(List(Right(List(txid))))
+      leftInCrl should be(Set())
+      keptWhileRebuilding should be(true)
+      deletedOnceActive should be(true)
+
+  atest("a pending-delete copy of a store rebuilt on another device goes once that device has it Active"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val factory = newFactory()
+    def checked(host: Host): Future[Unit] =
+      host.control.reconciler.checkStorageDevice(deviceA)
+      pumpWithTx(host, host.control.reconciler.activeDeviceChecks.isEmpty &&
+                       host.control.reconciler.pendingDeleteLookupsInFlight.isEmpty)
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- net.createDevice(deviceB)
+      pool <- client.createNewStoragePool("pending-delete-pool", Replication(1, 1), None, RocksDBConfig(),
+                StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      elsewhere = StoreId(pool, 0.toByte)
+      copy = deviceDir / RebuildingStore.PendingDeleteDirectory / s"${elsewhere.directoryName}-old"
+      _ <- setPoolEntry(elsewhere, deviceB)
+      _ <- setDeviceState(deviceB)(_.copy(stores = Map(
+             elsewhere -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None))))
+      _ <- waitForTransactionsToComplete()
+      _ = os.makeDir.all(copy)
+      _ = os.write.over(copy / StoreConfig.configFilename,
+            StoreConfig(elsewhere, StoreConfig.RocksDB(None), None).yamlConfig)
+      host = newCrlHost(hostRoot, factory)
+      _ <- checked(host)
+      keptWhileRebuilding = os.exists(copy)
+      _ <- setDeviceState(deviceB)(_.copy(stores = Map(
+             elsewhere -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+      _ <- waitForTransactionsToComplete()
+      _ <- checked(host)
+      _ = factory.shutdownAll()
+    yield
+      keptWhileRebuilding should be(true)
+      os.exists(copy) should be(false)
+
+  atest("a device the tree records as failed is unloaded, marked, and not loaded again by a restart"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- setDeviceState(deviceA)(_.copy(status = StorageDeviceState.DeviceStatus.Failed))
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.reconciler.checkStorageDevice(deviceA)
+      _ <- pumpWithTx(host, !host.control.devices.devices.contains(deviceA) &&
+                            host.control.devices.closingCrls.isEmpty)
+      unloaded = !host.control.devices.devices.contains(deviceA)
+      storeServed = host.control.router.loaded.contains(storeId)
+      restarted = newCrlHost(hostRoot, newFactory())
+    yield
+      unloaded should be(true)
+      storeServed should be(false)
+      os.exists(deviceDir / DeviceMarkers.FailedFile) should be(true)
+      restarted.control.devices.devices.contains(deviceA) should be(false)
+      restarted.control.router.loaded.contains(storeId) should be(false)
+      // Nothing on it is deleted
+      os.exists(storeDir / StoreConfig.configFilename) should be(true)
 
   atest("a network transfer out of an unloaded store ships its device-CRL entries in its crl_save.log"):
     given ExecutionContext = executionContext

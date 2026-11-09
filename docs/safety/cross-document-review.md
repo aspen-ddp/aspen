@@ -7,6 +7,14 @@ found; trigger may still be rare), PLAUSIBLE (mechanism real, trigger/reachabili
 ## 1. Interaction flaws
 
 ### X1. Failed-device zombie replica consumes the new store's ErrorTree entries (rebuild F1 x repair x metadata)
+
+> **FIXED (2026-11-09).** `DeviceShutdown.retireFailedDevice` writes a durable `failed` marker and unloads a device the
+> reconcile reads Failed; `tryLoadDevice` never loads a device carrying it; the tombstone sends the former host a
+> `CheckStorageDevice`; `StoreRepairer.scan` runs only while the pool's entry for the store names the scanning host.
+> Residual: until its first successful reconcile, a restarted or partition-healed old host may answer peers with a
+> stale store-to-host mapping. Tests: DeviceCrlSuite "a device the tree records as failed is unloaded, marked, and
+> not loaded again by a restart", StoreRepairerSuite "a store whose pool records it on another host is not scanned,
+> so its entries stay for that host", FailedStorageDeviceSuite "step 1 wakes the device's former host".
 Docs: rebuild-process F1, repair-process 4.4/12.6, systemic-loss-protection X11.  Verdict: CONFIRMED (mechanism); trigger = operator
 `fail-storage-device` on a healthy device, or a partition that heals, then a restart of the old host.  Severity: stale-replica,
 split-decision (two acceptors for one index).

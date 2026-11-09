@@ -240,11 +240,30 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  The directory is disowned first, so a scan meanwhile, or after the unload, does not load it again. One sequence
    *  at a time per device; a failure leaves the device loaded for the next check to try again. */
   def relinquishDevice(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    stopServing(local, remote,
+      s"is now owned by host ${remote.hostId}. Unloading it without writing to it",
+      s"owned by host ${remote.hostId}")
+
+  /** Stops serving a loaded device that the storage-devices tree records as Failed: an operator declared it dead and
+   *  its stores are being rebuilt elsewhere, so a copy served here would be a second replica of each. The durable
+   *  `failed` marker (DeviceMarkers) keeps a restart from loading it again; then it is unloaded as relinquishDevice
+   *  unloads a device. Nothing else on it is written or deleted: a healthy disk failed by mistake keeps its data. */
+  def retireFailedDevice(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    if ! relinquishingDevices.contains(local.storageDeviceId) then
+      try DeviceMarkers.writeFailed(local.devicePath)
+      catch case t: Throwable =>
+        // Unloaded for the life of this process either way; a restart loads it and retires it again
+        logger.error(s"Failed to write the failed marker of storage device ${local.storageDeviceId} at " +
+                     s"${local.devicePath}: $t")
+      stopServing(local, remote, "has been declared failed. Unloading it", "declared failed")
+
+  /** relinquishDevice's sequence, logging that the device `what` */
+  private def stopServing(local: LocalStorageDeviceState, remote: StorageDeviceState, what: String,
+                          unloadedAs: String): Unit =
     val deviceId = local.storageDeviceId
     if ! relinquishingDevices.contains(deviceId) then
       relinquishingDevices += deviceId
-      logger.warn(s"Storage device $deviceId at ${local.devicePath} is now owned by host ${remote.hostId}. " +
-                  s"Unloading it without writing to it")
+      logger.warn(s"Storage device $deviceId at ${local.devicePath} $what")
       ctx.discovery.disown(local.devicePath)
       val frelinquish =
         try
@@ -260,9 +279,9 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
           case Success(_) =>
             if ctx.devices.devices.get(deviceId).exists(_ eq local) then
               unloadDevice(deviceId)
-              logger.info(s"Storage device $deviceId, owned by host ${remote.hostId}, is unloaded")
+              logger.info(s"Storage device $deviceId, $unloadedAs, is unloaded")
           case Failure(t) =>
-            logger.warn(s"Failed to unload storage device $deviceId, owned by host ${remote.hostId}. The next " +
+            logger.warn(s"Failed to unload storage device $deviceId, $unloadedAs. The next " +
                         s"check of the device will try again. Error: $t")
 
   /** Closes every store open on a relinquished device, one at a time, until none is left: one loaded meanwhile is

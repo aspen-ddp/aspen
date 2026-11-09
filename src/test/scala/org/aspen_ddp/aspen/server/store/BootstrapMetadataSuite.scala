@@ -10,7 +10,10 @@ import org.aspen_ddp.aspen.common.metadata.{IDAPolicy, StorageDeviceId, StorageD
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 
-import scala.concurrent.ExecutionContext
+import org.aspen_ddp.aspen.common.objects.{Key, Value}
+import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
+
+import scala.concurrent.{ExecutionContext, Future}
 
 class BootstrapMetadataSuite extends IntegrationTestSuite:
 
@@ -50,6 +53,35 @@ class BootstrapMetadataSuite extends IntegrationTestSuite:
         root.rootKeyValuePointer.get.poolId should be(Radicle.poolId)
         root.nodeAllocator.tiers.head._1 should be(PoolObjectAllocatorId(Radicle.poolId))
       succeed
+
+  private def insertAndGet(tree: TieredKeyValueList, key: Key, value: Value): Future[Unit] =
+    given ExecutionContext = executionContext
+    val tx = client.newTransaction()
+    for
+      _ <- tree.set(key, value)(using tx)
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      got <- tree.get(key)
+    yield
+      got.map(_.value.bytes.toList) should be(Some(value.bytes.toList))
+      ()
+
+  atest("the bootstrap and initial metadata pools have a TracelessCommits tree"):
+    given ExecutionContext = executionContext
+    Future.sequence(List(PoolId.BootstrapPoolId, PoolId.InitialMetadataPoolId).map: poolId =>
+      client.getStoragePool(poolId).flatMap: pool =>
+        insertAndGet(pool.tracelessCommitsTree, Key(Array[Byte](1, 2)), Value(Array[Byte](3)))
+    ).map(_ => succeed)
+
+  atest("a new storage pool has a TracelessCommits tree"):
+    given ExecutionContext = executionContext
+    for
+      poolId <- client.createNewStoragePool("ordinary-tc", Replication(1, 1), None, RocksDBConfig(),
+                  StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      _ <- waitForTransactionsToComplete()
+      pool <- client.getStoragePool(poolId)
+      _ <- insertAndGet(pool.tracelessCommitsTree, Key(Array[Byte](1, 2)), Value(Array[Byte](3)))
+    yield succeed
 
   atest("the bootstrap device set lists the initial metadata pool"):
     given ExecutionContext = executionContext

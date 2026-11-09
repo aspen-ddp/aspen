@@ -36,6 +36,9 @@ class SimpleStoragePool(val client: AspenClient,
   
   val errorTree: TieredKeyValueList = new TieredKeyValueList(client,
     new KVObjectRootManager(client, StoragePoolState.ErrorTreeKey, kvos.pointer))
+
+  val tracelessCommitsTree: TieredKeyValueList = new TieredKeyValueList(client,
+    new KVObjectRootManager(client, StoragePoolState.TracelessCommitsTreeKey, kvos.pointer))
   
   private val allocStrategy: Option[UUID] = kvos.contents.get(StoragePoolState.AllocationStrategyKey).map: vs =>
     byte2uuid(vs.value.bytes)

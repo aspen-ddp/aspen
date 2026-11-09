@@ -171,24 +171,31 @@ object Bootstrap:
 
     val errTreeRoot = allocate()
     val allocTreeRoot = allocate()
+    val tracelessRoot = allocate()
     val errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), bootstrapNodeAllocator).encode()
     val allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), bootstrapNodeAllocator).encode()
+
+    val tracelessTree = Root(0, ByteArrayKeyOrdering, Some(tracelessRoot), bootstrapNodeAllocator).encode()
 
     val poolPointer = allocate(List(
       StoragePoolState.ConfigKey -> poolState,
       StoragePoolState.ErrorTreeKey -> errorTree,
-      StoragePoolState.AllocationTreeKey -> allocTree
+      StoragePoolState.AllocationTreeKey -> allocTree,
+      StoragePoolState.TracelessCommitsTreeKey -> tracelessTree
     ))
 
     // A metadata pool's own trees live in the bootstrap pool
     val metadataErrTreeRoot = allocate()
     val metadataAllocTreeRoot = allocate()
+    val metadataTracelessRoot = allocate()
     val metadataPoolPointer = allocate(List(
       StoragePoolState.ConfigKey -> metadataPoolState.encode(),
       StoragePoolState.ErrorTreeKey ->
         Root(0, ByteArrayKeyOrdering, Some(metadataErrTreeRoot), bootstrapNodeAllocator).encode(),
       StoragePoolState.AllocationTreeKey ->
-        Root(0, ByteArrayKeyOrdering, Some(metadataAllocTreeRoot), bootstrapNodeAllocator).encode()
+        Root(0, ByteArrayKeyOrdering, Some(metadataAllocTreeRoot), bootstrapNodeAllocator).encode(),
+      StoragePoolState.TracelessCommitsTreeKey ->
+        Root(0, ByteArrayKeyOrdering, Some(metadataTracelessRoot), bootstrapNodeAllocator).encode()
     ))
 
     val metadataGroupPtr = allocateData(metadataGroupState.toBytes)

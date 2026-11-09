@@ -29,6 +29,8 @@ trait StoragePool:
   private[aspen] def allocationTree: TieredKeyValueList
 
   private[aspen] def errorTree: TieredKeyValueList
+
+  private[aspen] def tracelessCommitsTree: TieredKeyValueList
   
   /** Supplies ObjectPointers for objects allocated in this pool and is told of their deletion.
     * Created on first use and cached.

@@ -17,6 +17,7 @@ object StoragePoolState:
   private [aspen] val AllocationStrategyKey = Key(Array[Byte](3))
   private [aspen] val AllocationStrategyConfigKey = Key(Array[Byte](4))
   private [aspen] val RepairPolicyKey = Key(Array[Byte](5))
+  private [aspen] val TracelessCommitsTreeKey = Key(Array[Byte](6))
 
   val BootstrapPoolId: PoolId = fixed_ids.BootstrapPoolId
 

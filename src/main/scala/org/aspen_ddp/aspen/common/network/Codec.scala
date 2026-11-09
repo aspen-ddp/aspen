@@ -589,12 +589,14 @@ object Codec extends Logging:
       to = Some(encode(o.to)),
       from = Some(encode(o.from)),
       transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
-      committed = o.committed
+      committed = o.committed,
+      late = o.late,
+      proof = o.proof
     )
 
   def decode(m: codec.TxResolved): TxResolved =
     TxResolved(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
-      m.committed)
+      m.committed, m.late, m.proof)
 
 
   def encode(o: TxUnknownStore): codec.TxUnknownStore =
@@ -643,12 +645,13 @@ object Codec extends Logging:
       to = Some(encode(o.to)),
       from = Some(encode(o.from)),
       transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
-      committed = o.committed
+      committed = o.committed,
+      late = o.late
     )
 
   def decode(m: codec.TxFinalized): TxFinalized =
     TxFinalized(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
-      m.committed)
+      m.committed, m.late)
 
 
   def encode(o: TxHeartbeat): codec.TxHeartbeat =
@@ -676,9 +679,9 @@ object Codec extends Logging:
 
 
   def encode(o: TxStatusResponse): codec.TxStatusResponse =
-    val (haveStatus, isFinalized, status) = o.status match
-      case None => (false, false, codec.TransactionStatus.TRANSACTION_STATUS_UNRESOLVED)
-      case Some(stat) => (true, stat.finalized, encodeTransactionStatus(stat.status))
+    val (haveStatus, isFinalized, late, status) = o.status match
+      case None => (false, false, false, codec.TransactionStatus.TRANSACTION_STATUS_UNRESOLVED)
+      case Some(stat) => (true, stat.finalized, stat.late, encodeTransactionStatus(stat.status))
 
     codec.TxStatusResponse(
       to = Some(encode(o.to)),
@@ -687,12 +690,13 @@ object Codec extends Logging:
       requestUuid = Some(encodeUUID(o.requestUUID)),
       haveStatus = haveStatus,
       isFinalized = isFinalized,
+      late = late,
       status = status
     )
 
   def decode(m: codec.TxStatusResponse): TxStatusResponse =
     val status = if m.haveStatus then
-      Some(TxStatusResponse.TxStatus(decodeTransactionStatus(m.status), m.isFinalized))
+      Some(TxStatusResponse.TxStatus(decodeTransactionStatus(m.status), m.isFinalized, m.late))
     else
       None
 

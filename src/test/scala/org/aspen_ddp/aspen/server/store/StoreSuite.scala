@@ -66,13 +66,13 @@ class StoreSuite extends AnyFunSuite with Matchers:
     val (store, _, crl) = mkStore(storeId, new TransactionStatusCache(), Duration.Zero)
 
     store.receiveTransactionMessage(prepare(storeId, leader))
-    store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true))
+    store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true, late = false, proof = false))
     store.frontend.transactions.contains(txid1) shouldBe true
 
     store.heartbeat()
     store.hasTransactions shouldBe true
 
-    store.receiveTransactionMessage(TxFinalized(storeId, peer, txid1, committed = true))
+    store.receiveTransactionMessage(TxFinalized(storeId, peer, txid1, committed = true, late = false))
     store.frontend.transactions.contains(txid1) shouldBe false
     store.hasTransactions shouldBe false
     crl.txDel shouldBe true
@@ -84,8 +84,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
     store.receiveTransactionMessage(prepare(storeId, leader).copy(fromClient = true,
       objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
-    store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true))
-    store.receiveTransactionMessage(TxFinalized(storeId, leader, txid1, committed = true))
+    store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true, late = false, proof = false))
+    store.receiveTransactionMessage(TxFinalized(storeId, leader, txid1, committed = true, late = false))
     backend.heldCommits shouldBe 1
     crl.deleted shouldBe Nil
 

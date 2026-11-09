@@ -343,9 +343,12 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decodedAccepted.response.toOption.get.value shouldBe true
 
   test("TxResolved round-trip"):
-    val original = TxResolved(storeId(1), storeId(2), TransactionId(uuid(3)), committed = true)
-    val decoded = Codec.decode(Codec.encode(original))
-    decoded shouldBe original
+    for
+      late <- List(true, false)
+      proof <- List(true, false)
+    do
+      val original = TxResolved(storeId(1), storeId(2), TransactionId(uuid(3)), committed = true, late = late, proof = proof)
+      Codec.decode(Codec.encode(original)) shouldBe original
 
   test("TxCommitted round-trip"):
     val original = TxCommitted(storeId(1), storeId(2), TransactionId(uuid(3)),
@@ -359,9 +362,9 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     Codec.decode(Codec.encode(noErrors)).objectCommitErrors shouldBe empty
 
   test("TxFinalized round-trip"):
-    val original = TxFinalized(storeId(1), storeId(2), TransactionId(uuid(3)), committed = true)
-    val decoded = Codec.decode(Codec.encode(original))
-    decoded shouldBe original
+    for late <- List(true, false) do
+      val original = TxFinalized(storeId(1), storeId(2), TransactionId(uuid(3)), committed = true, late = late)
+      Codec.decode(Codec.encode(original)) shouldBe original
 
   test("TxHeartbeat round-trip"):
     val original = TxHeartbeat(storeId(1), storeId(2), TransactionId(uuid(3)))
@@ -376,12 +379,16 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
   test("TxStatusResponse round-trip"):
     val withStatus = TxStatusResponse(
       storeId(1), storeId(2), TransactionId(uuid(3)), uuid(4),
-      Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = true))
+      Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = true, late = false))
     )
     val decoded = Codec.decode(Codec.encode(withStatus))
     decoded.status.isDefined shouldBe true
     decoded.status.get.status shouldBe TransactionStatus.Committed
     decoded.status.get.finalized shouldBe true
+    decoded.status.get.late shouldBe false
+
+    val lateStatus = withStatus.copy(status = Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = true, late = true)))
+    Codec.decode(Codec.encode(lateStatus)) shouldBe lateStatus
 
     val noStatus = TxStatusResponse(storeId(1), storeId(2), TransactionId(uuid(3)), uuid(4), None)
     Codec.decode(Codec.encode(noStatus)).status shouldBe None

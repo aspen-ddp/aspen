@@ -304,8 +304,11 @@ final case class TxResolved(
                              to: StoreId,
                              from: StoreId,
                              transactionId: TransactionId,
-                             committed: Boolean) extends TxMessage:
-  override def toString: String = f"TxResolved to $to from $from tx $transactionId committed $committed"
+                             committed: Boolean,
+                             late: Boolean,
+                             proof: Boolean) extends TxMessage:
+  override def toString: String =
+    f"TxResolved to $to from $from tx $transactionId committed $committed late $late proof $proof"
 
 final case class TxCommitted(
                               to: StoreId,
@@ -319,8 +322,9 @@ final case class TxFinalized(
                               to: StoreId,
                               from: StoreId,
                               transactionId: TransactionId,
-                              committed: Boolean) extends TxMessage:
-  override def toString: String = f"TxFinalized to $to from $from tx $transactionId committed $committed"
+                              committed: Boolean,
+                              late: Boolean) extends TxMessage:
+  override def toString: String = f"TxFinalized to $to from $from tx $transactionId committed $committed late $late"
 
 final case class TxHeartbeat(
                               to: StoreId,
@@ -344,6 +348,6 @@ final case class TxStatusResponse(
   override def toString: String = f"TxStatusResponse to $to from $from tx $transactionId request $requestUUID status $status"
 
 object TxStatusResponse {
-  case class TxStatus(status: TransactionStatus.Value, finalized: Boolean)
+  case class TxStatus(status: TransactionStatus.Value, finalized: Boolean, late: Boolean)
 }
 

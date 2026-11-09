@@ -254,6 +254,8 @@ message TxResolved {
   StoreId from = 2;
   UUID transaction_uuid = 3;
   bool committed = 4;
+  bool late = 5;
+  bool proof = 6;
 }
 
 message TxCommitted {
@@ -268,6 +270,7 @@ message TxFinalized {
   StoreId from = 2;
   UUID transaction_uuid = 3;
   bool committed = 4;
+  bool late = 5;
 }
 
 message TxHeartbeat {
@@ -291,6 +294,7 @@ message TxStatusResponse {
   TransactionStatus status = 5;
   bool have_status = 6;
   bool is_finalized = 7;
+  bool late = 8;
 }
 
 message TxUnknownStore {

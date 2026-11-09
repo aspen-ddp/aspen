@@ -26,6 +26,15 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     cache.getStatus(txid) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed, true))
   }
 
+  test("the late flag is remembered") {
+    val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), maxEntries = 100)
+    val txid = TransactionId(new UUID(0, 1))
+    cache.updateStatus(txid, TransactionStatus.Committed, finalized = true, late = true)
+    cache.getStatus(txid).get.late shouldBe true
+    cache.updateStatus(txid, TransactionStatus.Committed, finalized = true)
+    cache.getStatus(txid).get.late shouldBe false
+  }
+
   test("a size eviction of an entry younger than the early-eviction age is counted and warned") {
     val cache = new TransactionStatusCache(FiniteDuration(7, SECONDS), maxEntries = 1,
       earlyEvictionAge = Some(FiniteDuration(6, SECONDS)))

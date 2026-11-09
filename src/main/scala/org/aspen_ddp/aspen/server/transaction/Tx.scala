@@ -537,7 +537,7 @@ class Tx( trs: TransactionRecoveryState,
     resolved(true)
 
   private def sendProvenResolution(to: StoreId): Unit =
-    net.sendTransactionMessage(TxResolved(to, storeId, transactionId, committed = true))
+    net.sendTransactionMessage(TxResolved(to, storeId, transactionId, committed = true, late = false, proof = false))
 
   private def doCommit(): Unit = if (!committed && !committing && allObjectsLoaded) {
     committing = true
@@ -882,7 +882,7 @@ class Tx( trs: TransactionRecoveryState,
 
   def receiveStatusRequest(m: TxStatusRequest): Unit = {
     val r = TxStatusResponse(m.from, storeId, transactionId, m.requestUUID,
-      Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty)))
+      Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = false)))
     net.sendTransactionMessage(r)
   }
 

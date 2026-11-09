@@ -8,7 +8,7 @@ import scribe.Logging
 import scala.concurrent.duration.{Duration, FiniteDuration, MINUTES, SECONDS}
 
 object TransactionStatusCache {
-  case class Entry(status: TransactionStatus.Value, finalized: Boolean):
+  case class Entry(status: TransactionStatus.Value, finalized: Boolean, late: Boolean = false):
     /** When the entry was made, and so written (System.nanoTime), for the early-eviction warning. Not part of equality */
     val insertedAt: Long = System.nanoTime()
 
@@ -61,8 +61,8 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
           .build[TransactionId, Entry]()
       case None => base.build[TransactionId, Entry]()
 
-  def updateStatus(txid: TransactionId, status: TransactionStatus.Value, finalized: Boolean=false): Unit = {
-    cache.put(txid, Entry(status, finalized))
+  def updateStatus(txid: TransactionId, status: TransactionStatus.Value, finalized: Boolean=false, late: Boolean=false): Unit = {
+    cache.put(txid, Entry(status, finalized, late))
   }
 
   def getStatus(txid: TransactionId): Option[Entry] = {

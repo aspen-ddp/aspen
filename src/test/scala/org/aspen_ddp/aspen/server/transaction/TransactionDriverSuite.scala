@@ -177,7 +177,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     messenger.messages.collect { case a: TxAccept => a } should be (Nil)
 
     driver.receiveTxResolved(org.aspen_ddp.aspen.common.network.TxResolved(ds0, ds1, txd.transactionId,
-      committed = true))
+      committed = true, late = false, proof = false))
 
     // The finalizer completes on another thread
     scala.concurrent.Await.result(finalizedSent.future, scala.concurrent.duration.Duration(5, "s"))
@@ -491,7 +491,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     finalizer.created should be (true)
     finalizer.cancelled should be (false)
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds0, txd.transactionId, true))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds0, txd.transactionId, true, late = false))
 
     driver.mayBeDiscarded should be (true)
     completed should be (true)
@@ -522,7 +522,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     driver.receiveTxPrepareResponse(TxPrepareResponse(ds0, ds0, txd.transactionId,
       Right(TxPrepareResponse.Promise(None)), ProposalId(1, 0), TransactionDisposition.VoteCommit, Nil))
     driver.receiveTxResolved(org.aspen_ddp.aspen.common.network.TxResolved(ds0, ds1, txd.transactionId,
-      committed = true))
+      committed = true, late = false, proof = false))
 
     finalizer.created should be (true)
     finalizer.voters should be (Some(None))

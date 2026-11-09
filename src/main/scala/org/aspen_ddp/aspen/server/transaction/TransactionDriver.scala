@@ -184,7 +184,7 @@ abstract class TransactionDriver(
   def heartbeat(): Unit = {
     reportIfStuck()
     if (finalized)
-      messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, resolvedValue)))
+      messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, resolvedValue, late = false)))
     else if (heartbeatDue)
       messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxHeartbeat(toStoreId, storeId, txd.transactionId)))
     heartbeatDue = true
@@ -383,7 +383,7 @@ abstract class TransactionDriver(
           clientFinalized = Some(TransactionFinalized(client, storeId, txd.transactionId, committed))
         })
 
-        val messages = allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed))
+        val messages = allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed, late = false))
 
         logger.trace(s"Sending TxFinalized(${txd.transactionId}) to ${messages.head.to.poolId}:(${messages.map(_.to.poolIndex)})")
 
@@ -410,7 +410,7 @@ abstract class TransactionDriver(
 
     // Send TxResolved if resolution has been achieved, otherwise Prepare messages
     val messages = ofinal match {
-      case Some(result) => txd.allDataStores.map(TxResolved(_, storeId, txd.transactionId, result))
+      case Some(result) => txd.allDataStores.map(TxResolved(_, storeId, txd.transactionId, result, late = false, proof = false))
       case None => txd.allDataStores.filter(!alreadyPrepared.contains(_)).map(to =>
         TxPrepare(to, storeId, txd, proposalId, Nil, Nil, fromClient = false))
     }
@@ -427,7 +427,7 @@ abstract class TransactionDriver(
     ofinal match {
       case Some(result) =>
         //logger.trace(s"Sending TxResolved(${txd.transactionId}) committed = $result to $toStoreId")
-        messenger.sendTransactionMessage(TxResolved(toStoreId, storeId, txd.transactionId, result))
+        messenger.sendTransactionMessage(TxResolved(toStoreId, storeId, txd.transactionId, result, late = false, proof = false))
 
       case None =>
         //logger.trace(s"Sending TxPrepare(${txd.transactionId}) to $toStoreId")
@@ -516,7 +516,7 @@ abstract class TransactionDriver(
 
       if (sendResolutionMessage) {
         val messages = (allDataStores.iterator ++ txd.notifyOnResolution.iterator).map { toStoreId =>
-          TxResolved(toStoreId, storeId, txd.transactionId, committed)
+          TxResolved(toStoreId, storeId, txd.transactionId, committed, late = false, proof = false)
         }.toList
 
         //logger.trace(s"Sending TxResolved(${txd.transactionId}) committed = $committed to ${messages.head.to.poolId}:(${messages.map(_.to.poolIndex)})")

@@ -138,15 +138,15 @@ class Store(val storageDeviceId: StorageDeviceId,
           val (r, committed: Boolean) = entry.status match {
             case TransactionStatus.Unresolved => (None, false)
             case TransactionStatus.Aborted =>
-              (Some(TxResolved(msg.to, msg.from, m.txd.transactionId, committed = false)), false)
+              (Some(TxResolved(msg.to, msg.from, m.txd.transactionId, committed = false, late = false, proof = false)), false)
             case TransactionStatus.Committed =>
-              (Some(TxResolved(msg.to, msg.from, m.txd.transactionId, committed = true)), true)
+              (Some(TxResolved(msg.to, msg.from, m.txd.transactionId, committed = true, late = false, proof = false)), true)
           }
 
           r.foreach(resolved => net.sendTransactionMessage(resolved))
 
           if (entry.finalized) {
-            net.sendTransactionMessage(TxFinalized(msg.from, msg.to, m.txd.transactionId, committed))
+            net.sendTransactionMessage(TxFinalized(msg.from, msg.to, m.txd.transactionId, committed, late = false))
 
             m.txd.originatingClient.foreach { client =>
               net.sendClientResponse(TransactionFinalized(client, msg.to, m.txd.transactionId, committed))

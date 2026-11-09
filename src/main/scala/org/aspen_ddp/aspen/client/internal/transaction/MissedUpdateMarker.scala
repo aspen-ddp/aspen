@@ -36,16 +36,21 @@ object MissedUpdateMarker:
     bb.putLong(objectId.uuid.getLeastSignificantBits)
     Key(keyBytes)
 
-/** Records missed updates in their pools' ErrorTrees through one write at a time per pool.
+/** Records missed updates in their pools' ErrorTrees, and missed traceless commits in their TracelessCommits trees,
+  * through one write at a time per pool. A write covers both trees in one transaction and holds at most
+  * `maxEntriesPerBatch` entries of the two together.
   *
-  * A slow commit misses every object on every store at once, and all of a pool's entries go to one tree. Writing them
-  * separately floods that tree's objects with reads and colliding transactions faster than they can complete, which
+  * A slow commit misses every object on every store at once, and all of a pool's entries go to its trees. Writing them
+  * separately floods those trees' objects with reads and colliding transactions faster than they can complete, which
   * makes further commits slower. Entries that arrive during a write wait for the next one, so the writes never overlap
-  * and a backlog makes each one larger rather than adding more of them.
+  * and a backlog makes each one larger (up to the cap) rather than adding more of them.
   */
 class MissedUpdateMarker(client: AspenClient,
                          maxEntriesPerBatch: Int = MissedUpdateMarker.DefaultMaxEntriesPerBatch) extends Logging:
   import MissedUpdateMarker.*
+
+  // Room for one entry of each kind, so neither can starve the other
+  require(maxEntriesPerBatch >= 2, s"maxEntriesPerBatch must be at least 2: $maxEntriesPerBatch")
 
   private given ExecutionContext = client.clientContext
 
@@ -106,9 +111,14 @@ class MissedUpdateMarker(client: AspenClient,
     if queue.writing || (queue.pending.isEmpty && queue.tracelessPending.isEmpty) then
       None
     else
-      val batch = queue.pending.take(maxEntriesPerBatch).toList
+      // The cap covers both kinds. Each gets up to half of it first, so a backlog of one cannot starve the other, and
+      // whatever one leaves unused goes to the other
+      val tracelessShare = math.min(queue.tracelessPending.size, maxEntriesPerBatch / 2)
+      val updatesCount = math.min(queue.pending.size, maxEntriesPerBatch - tracelessShare)
+      val tracelessCount = math.min(queue.tracelessPending.size, maxEntriesPerBatch - updatesCount)
+      val batch = queue.pending.take(updatesCount).toList
       batch.foreach((key, _) => queue.pending.remove(key))
-      val traceless = queue.tracelessPending.take(maxEntriesPerBatch).toList
+      val traceless = queue.tracelessPending.take(tracelessCount).toList
       traceless.foreach((key, _) => queue.tracelessPending.remove(key))
       queue.writing = true
       Some(Batch(batch.map(_._2), traceless.map(_._2)))
@@ -119,7 +129,9 @@ class MissedUpdateMarker(client: AspenClient,
 
   private def finished(poolId: PoolId, batch: Batch, result: Try[Unit]): Unit =
     result match
-      case Failure(err) => logger.warn(s"Gave up recording ${batch.updates.size + batch.traceless.size} missed updates for pool $poolId: $err")
+      case Failure(err) =>
+        logger.warn(s"Gave up recording ${batch.updates.size} missed updates (ErrorTree) and " +
+                    s"${batch.traceless.size} missed traceless commits (TracelessCommits) for pool $poolId: $err")
       case _ =>
     batch.updates.foreach(_.written.complete(result))
     batch.traceless.foreach(_.written.complete(result))

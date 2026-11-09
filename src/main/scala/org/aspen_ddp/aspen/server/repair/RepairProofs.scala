@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectPointer, ObjectRefcount, ObjectRevision}
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, FullContentLock, KeyRevision}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
 import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -17,10 +17,9 @@ import scala.util.control.NonFatal
   * scan reconciles them from it (still under the snapshot check). An abort means they were changing; a later pass
   * tries again.
   *
-  * The key and refcount proofs change nothing, so they disable missed-update tracking
-  * (`AspenClient.newRepairTransaction`) and cannot create repair entries. The object-level proof writes the object
-  * (its update moves the revision), so it keeps tracking on: a store that misses it is marked like any other.
-  * Each completes with true when the proof committed, false otherwise.
+  * The object-level proof is a pure lock and changes nothing. The key and refcount proofs change no content (only the
+  * object's timestamp moves). So all of them disable missed-update tracking (`AspenClient.newRepairTransaction`) and
+  * cannot create repair entries. Each completes with true when the proof committed, false otherwise.
   */
 object RepairProofs extends Logging:
 
@@ -34,13 +33,13 @@ object RepairProofs extends Logging:
       case None => DoesNotExist(key)
     prove(client, s"key of ${ptr.id}")(_.update(ptr, None, None, List(requirement), Nil))
 
-  /** A FullContentLock of the read's contents with the read's revision required, and no operations: proves the
-    * revision, min, max, left and right along with every key
+  /** A RevisionLock of the read's revision. It takes the exclusive object lock, which collides with every lock a
+    * write of the object level or of any key holds, and changes nothing: no revision, timestamp or backend commit.
+    * Keys and the refcount have proofs of their own
     */
   def proveObjectLevel(client: AspenClient, read: KeyValueObjectState): Future[Boolean] =
-    val lock = FullContentLock(read.contents.iterator.map((k, vs) => KeyRevision(k, vs.revision)).toList)
-    prove(client, s"object level of ${read.pointer.id}", tracked = true):
-      _.update(read.pointer, Some(read.revision), Some(lock), Nil, Nil)
+    prove(client, s"object level of ${read.pointer.id}"):
+      _.lockRevision(read.pointer, read.revision)
 
   /** A RefcountUpdate requiring `refcount` and setting that same refcount. Its exclusive object lock is the one every
     * refcount change takes
@@ -48,16 +47,14 @@ object RepairProofs extends Logging:
   def proveRefcount(client: AspenClient, ptr: ObjectPointer, refcount: ObjectRefcount): Future[Boolean] =
     prove(client, s"refcount of ${ptr.id}")(_.setRefcount(ptr, refcount, refcount))
 
-  /** The transaction a proof is built on: missed-update tracking disabled, unless `tracked` (a proof that writes) */
-  private[repair] def newProofTransaction(client: AspenClient, tracked: Boolean = false): Transaction =
-    if tracked then client.newTransaction() else client.newRepairTransaction()
+  /** The transaction a proof is built on: missed-update tracking disabled */
+  private[repair] def newProofTransaction(client: AspenClient): Transaction = client.newRepairTransaction()
 
-  private def prove(client: AspenClient, what: String, tracked: Boolean = false)
-                   (build: Transaction => Unit): Future[Boolean] =
+  private def prove(client: AspenClient, what: String)(build: Transaction => Unit): Future[Boolean] =
     given ExecutionContext = client.clientContext
     Future.unit
       .flatMap: _ =>
-        val tx = newProofTransaction(client, tracked)
+        val tx = newProofTransaction(client)
         build(tx)
         tx.commit()
       .map: _ =>

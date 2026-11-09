@@ -315,6 +315,25 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       marker.commits shouldBe 3
       entries.forall(_.isDefined) shouldBe true
 
+  atest("a batch holds at most maxEntriesPerBatch entries of the two trees together, half for each when both wait"):
+    // Three of each kind with a cap of two: one of each per write, so three writes. Capping each tree separately took
+    // two of each per write, and two writes
+    val marker = new ObservedMarker(maxEntries = 2)
+    val updates = List.fill(3)(missed(net.storeId0))
+    val entry = TracelessCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
+    val txids = List.fill(3)(TransactionId(UUID.randomUUID()))
+    val traceless = txids.map(MissedTracelessCommit(net.storeId0, _, entry))
+
+    for
+      _ <- marker.mark(updates, traceless)
+      pool <- client.getStoragePool(Radicle.poolId)
+      entries <- Future.sequence(updates.map(u => pool.errorTree.get(buildErrorKey(u.store, u.objectId))))
+      written <- tracelessEntries(Radicle.poolId, txids*)
+    yield
+      marker.commits shouldBe 3
+      entries.forall(_.isDefined) shouldBe true
+      written.size shouldBe 3
+
   private def revision = ObjectRevision(TransactionId(UUID.randomUUID()))
 
   /** Which of these stores have an entry for the object */

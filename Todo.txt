@@ -5,14 +5,9 @@ Traceless commits follow-ups (minor, from the 2026-11-08 reviews):
 - TracelessCommits entries are one per transaction (not merged per object like ErrorTree entries), but only for
   commit voters that sent no TxCommitted (all silent stores when the driver did not count the votes), so an offline
   store gets none. A voter that keeps missing errorTimeout under allocation-heavy load still grows the tree. Watch it.
-- proveObjectLevel moves the object revision. Prefer a proof that changes nothing.
-- A proof pass records only the pre-proof result in DeferralState; overlapping scans share one DeferralState; the
-  traceless deferral branch does not count `deferred` in the scan result.
-- MissedUpdateMarker: traceless entries are capped separately (a batch can hold 2x maxEntriesPerBatch); its scaladoc
-  and give-up warning still speak only of the ErrorTree.
-- The recovery info line says "applied" even when the commit is held or skips every object.
-- Test gaps: the aborted-proof test does not show a proof ran; "after a rebuild" does not rebuild; the TxResolved
-  horizon-proof test passes without the horizon change; no createNewMetadataPool tree test.
+- No repair proof compares a KV object's min/max/left/right (the object-level proof is a RevisionLock), and a
+  SetMin/DeleteMin/... without a required revision is a traceless change that `deletesKeys` does not flag. Check
+  whether such updates occur and, if so, how a store that misses one is repaired.
 
 Currently the correctness guarantees for transaction requirements checking, transaction commit ordering,
 transaction recovery, and missed transaction repairs are embedded solely within the code. Ideally, they should come from

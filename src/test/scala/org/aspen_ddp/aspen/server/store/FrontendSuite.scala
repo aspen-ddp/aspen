@@ -753,15 +753,35 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
   }
 
+  /** Sends a client prepare, started `age` ago, of txid1: an insert of key 1 with only `MayExist(k(1))` required, to
+    * kvPtr whose key 1 already carries txid1's revision. Its requirements pass, so only the proof that runs first
+    * past the horizon answers it TxResolved(committed)
+    */
+  private def appliedKVPrepare(frontend: Frontend, backend: MapBackend, age: FiniteDuration): Unit =
+    val contents = Map(k(1) -> new ValueState(Value(Array[Byte](1)), provenRev, HLCTimestamp(100), None))
+    backend.bootstrapAllocate(oid2, ObjectType.KeyValue, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(100)),
+      KVObjectState.encode(None, None, None, None, contents))
+    val insert = KeyValueOperation.encode(List(new Insert(k(1), Array[Byte](1))), ida)(0)
+    val update = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.MayExist(k(1))))
+    val txd = lockTxd(txid1, List(update)).copy(startTimestamp = ago(age))
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid2, insert))))
+
   test("an unknown prepare older than the horizon whose update an object shows is answered TxResolved(committed)") {
     withHorizon(): (frontend, backend, net) =>
-      backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
-        DataBuffer(appliedData))
-      frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd.copy(
-        startTimestamp = ago(FiniteDuration(7, SECONDS)))))
+      appliedKVPrepare(frontend, backend, FiniteDuration(7, SECONDS))
 
       resolvedMessages(net).map(_.committed) shouldBe List(true)
       votes(net) shouldBe Nil
+  }
+
+  test("an unknown prepare younger than the horizon whose requirements pass is voted on, though an object shows it") {
+    // The counterpart of the test above: inside the horizon the proof runs only on the abort path
+    withHorizon(): (frontend, backend, net) =>
+      appliedKVPrepare(frontend, backend, FiniteDuration(1, SECONDS))
+
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      resolvedMessages(net) shouldBe Nil
   }
 
   test("a late client prepare with data inside the status cache is answered from the cache") {
@@ -1656,7 +1676,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.contains(tracelessTxid) shouldBe false
     crl.deleted should contain (tracelessTxid)
     log.exists((level, text) => level == scribe.Level.Info &&
-      text.contains(s"applied committed transaction $tracelessTxid")) shouldBe true
+      text.contains(s"learned committed transaction $tracelessTxid") &&
+      text.contains("applying its update to objects")) shouldBe true
   }
 
   test("a recovered commit vote without a TracelessCommits entry accepts an abort") {

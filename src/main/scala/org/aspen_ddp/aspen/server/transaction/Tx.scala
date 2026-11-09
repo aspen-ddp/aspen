@@ -87,6 +87,9 @@ class Tx( trs: TransactionRecoveryState,
   private var lastProposer: StoreId = StoreId(txd.primaryObject.poolId, txd.designatedLeaderUID)
   private var objectCommitErrors: List[ObjectId] = Nil
 
+  /** The objects doCommit issued backend commits for */
+  private var issuedCommits: Set[ObjectId] = Set()
+
   // Waiting out a collision instead of voting abort: see awaitableHolders
   private var waitingOn: Set[TransactionId] = Set()
   private var collisionWaitStart: Long = 0L // when the first wait began, or 0
@@ -571,6 +574,7 @@ class Tx( trs: TransactionRecoveryState,
       .filter(os => changed.contains(os.objectId) && !result.uncommittable.contains(os.objectId)).toList
 
     pendingObjectCommits = toCommit.size
+    issuedCommits = toCommit.iterator.map(_.objectId).toSet
 
     // Assigned before the commit loop: a synchronous backend completes inside it
     objectCommitErrors = uncommittable.toList
@@ -824,8 +828,18 @@ class Tx( trs: TransactionRecoveryState,
       updateLastEvent()
       finalized(true)
       val changed = RequirementsApplyer.changedObjects(requirements).intersect(pointersById.keySet)
-      logger.info(s"Store $storeId applied committed transaction $transactionId learned from the TracelessCommits " +
-        s"tree (objects: ${changed.map(_.uuid).mkString(", ")})")
+      def ids(objects: Iterable[ObjectId]) = objects.map(_.uuid).mkString(", ")
+      val outcome =
+        if commitHeld then
+          s"its commit is held until its object data or earlier commits of its objects arrive (objects: ${ids(changed)})"
+        else if !committing then
+          s"it is applied once its objects load (objects: ${ids(changed)})"
+        else if issuedCommits.isEmpty then
+          s"no object took its update: already applied or uncommittable (objects: ${ids(changed)})"
+        else
+          s"applying its update to objects ${ids(issuedCommits)}" +
+            (if issuedCommits.size < changed.size then s", skipping ${ids(changed -- issuedCommits)}" else "")
+      logger.info(s"Store $storeId learned committed transaction $transactionId from the TracelessCommits tree: $outcome")
 
   /** A TracelessCommits lookup started after the held aborts found no entry: either the transaction did not commit, or
     * this store applied it durably. Returns the held aborts, for the Frontend to handle again; they are accepted now

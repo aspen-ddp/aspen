@@ -65,14 +65,18 @@ class RepairProofsSuite extends IntegrationTestSuite:
       absent shouldBe true
       present shouldBe false
 
-  test("an object-level proof commits on an unchanged object and aborts after a change"):
+  test("an object-level proof commits on an unchanged object and aborts after an object-level change"):
     for
       ptr <- kvObject()
       read <- client.read(ptr)
       unchanged <- RepairProofs.proveObjectLevel(client, read)
       _ <- net.waitForTransactionsToComplete()
       fresh <- client.read(ptr)
-      _ <- insert(ptr, k1)
+      // An object-level change moves the revision
+      _ <- client.transactUntilSuccessful: tx =>
+             tx.update(ptr, Some(fresh.revision), None, Nil, List(Insert(k1, Array[Byte](9))))
+             Future.unit
+      _ <- net.waitForTransactionsToComplete()
       changed <- RepairProofs.proveObjectLevel(client, fresh)
     yield
       unchanged shouldBe true
@@ -120,7 +124,7 @@ class RepairProofsSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
     yield ()
 
-  test("an object-level proof missed by a store marks it: the proof moves the object's revision"):
+  test("an object-level proof changes nothing, so a store that misses it is not marked"):
     val s2 = net.storeId2
     for
       ptr <- kvObject()
@@ -138,8 +142,11 @@ class RepairProofsSuite extends IntegrationTestSuite:
       isMarked <- marked(2, ptr.id)
     yield
       proven shouldBe true
-      after.revision should not be read.revision
-      isMarked shouldBe true
+      after.revision shouldBe read.revision
+      after.timestamp shouldBe read.timestamp
+      after.refcount shouldBe read.refcount
+      after.contents.keySet shouldBe read.contents.keySet
+      isMarked shouldBe false
 
   test("proof transactions that change nothing disable missed-update tracking"):
     Future.successful:

@@ -83,6 +83,16 @@ class BootstrapMetadataSuite extends IntegrationTestSuite:
       _ <- insertAndGet(pool.tracelessCommitsTree, Key(Array[Byte](1, 2)), Value(Array[Byte](3)))
     yield succeed
 
+  atest("a new metadata pool has a TracelessCommits tree"):
+    given ExecutionContext = executionContext
+    for
+      poolId <- client.createNewMetadataPool("metadata-tc", Replication(1, 1), None, RocksDBConfig(),
+                  StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      _ <- waitForTransactionsToComplete()
+      pool <- client.getStoragePool(poolId)
+      _ <- insertAndGet(pool.tracelessCommitsTree, Key(Array[Byte](1, 2)), Value(Array[Byte](3)))
+    yield succeed
+
   atest("the bootstrap device set lists the initial metadata pool"):
     given ExecutionContext = executionContext
     for

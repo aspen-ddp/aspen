@@ -61,6 +61,18 @@ final class DeferralState:
       entries += entryKey -> DeferralState.Deferral(count, only)
       count
 
+  /** Records the result of the reconcile that followed a proof on the same pass, in place of that pass's pre-proof
+    * result: the count is kept (the pass was already counted), the entry is forgotten if nothing is left deferred by a
+    * lock, and otherwise the next pass reconciles only what is still deferred
+    */
+  def afterProof(entryKey: Key, result: ReconcileResult): Unit = synchronized:
+    if result.deferredKeys.isEmpty && !result.objectLevelDeferred then
+      entries -= entryKey
+    else
+      entries.get(entryKey).foreach: d =>
+        val only = Option.when(!result.objectLevelDeferred && !result.stale)(result.deferredKeys)
+        entries += entryKey -> d.copy(only = only)
+
   def clear(entryKey: Key): Unit = synchronized:
     entries -= entryKey
 
@@ -88,7 +100,9 @@ object DeferralState:
   */
 class StoreRepairer(client: AspenClient, target: RepairTarget,
                     /** Test seam: runs between a repair's read and its install */
-                    testingOnlyBeforeReconcile: (StoreId, ObjectPointer) => Future[Unit] = (_, _) => Future.unit)
+                    testingOnlyBeforeReconcile: (StoreId, ObjectPointer) => Future[Unit] = (_, _) => Future.unit,
+                    /** Test seam: told the parts each proof run proved */
+                    testingOnlyOnProof: (StoreId, ObjectPointer, ReadLocks) => Unit = (_, _, _) => ())
                    (using ec: ExecutionContext) extends Logging:
 
   import StoreRepairer.*
@@ -272,8 +286,11 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           logger.info(s"Repair of object ${ptr.id} on store $storeId deferred by locks for $passes passes " +
                       s"($first): proving the deferred parts")
           prove(os, first).flatMap: proven =>
+            testingOnlyOnProof(storeId, ptr, proven)
             if proven.keys.isEmpty && !proven.objectLevel then Future.successful(first)
-            else reconcile(snap.copy(proven = proven), os)
+            else reconcile(snap.copy(proven = proven), os).map: afterProof =>
+              deferral.afterProof(entryKey, afterProof)
+              afterProof
     yield
       if result.complete then
         logger.info(s"Repair complete for object ${ptr.id} on store $storeId")

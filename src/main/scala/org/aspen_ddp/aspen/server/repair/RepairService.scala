@@ -192,6 +192,13 @@ class RepairService(client: AspenClient,
         result.foundEntries
 
     val recovered = fFound.recover:
+      case t: ScanTimedOut =>
+        // The abandoned scan keeps running and recording deferrals. The next scan gets a fresh DeferralState rather
+        // than share one with it, losing the counts as a host restart does
+        synchronized:
+          deferrals -= storeId
+        logger.warn(s"Repair scan of $storeId failed: $t")
+        false
       case t: Throwable =>
         logger.warn(s"Repair scan of $storeId failed: $t")
         false

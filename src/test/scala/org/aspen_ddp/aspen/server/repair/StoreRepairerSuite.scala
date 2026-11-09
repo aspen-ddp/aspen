@@ -664,6 +664,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       before shouldBe List(TracelessCommitEntry.key(sid(2), txid))
       after shouldBe before
       result.tracelessSeen shouldBe 1
+      result.deferred shouldBe 1
       storeKeys(2, kvPtr) shouldBe Set(k0, k1)
 
   test("a TracelessCommits entry is reconciled and deleted once the store no longer holds it"):
@@ -721,16 +722,15 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- pool.tracelessCommitsTree.set(TracelessCommitEntry.key(sid(2), txid),
              Value(TracelessCommitEntry(HLCTimestamp.now, List(ptr)).encode))(using tx)
       _ <- pump(tx.commit(), deadline())
-      _ <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
+      result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
       remaining <- tracelessEntries(2)
     yield
       storeHasObject(2, oid) shouldBe true
       remaining shouldBe List(TracelessCommitEntry.key(sid(2), txid))
+      result.tracelessSeen shouldBe 1
+      result.deferred shouldBe 1
 
-  // A rebuild drops the store's CRL, so it holds none of its entries' transactions live, and rebuilds its copies from
-  // current reads: no hook in rebuild is needed, the first scan passes every entry at once. Stood in for here by a
-  // store holding no live transactions whose copies are still behind, which that same scan also brings up to date.
-  test("after a rebuild, the first scan clears the store's TracelessCommits entries"):
+  test("a store holding none of its entries' transactions live clears every TracelessCommits entry in one scan"):
     for
       kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
       dataPtr <- sharedDataObject()
@@ -748,6 +748,39 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       remaining shouldBe empty
       storeKeys(2, kvPtr) shouldBe Set(k0)
       storeRefcount(2, dataPtr) shouldBe Some(expected)
+
+  // A rebuild drops the store's CRL, so it holds none of its entries' transactions live, and rebuilds its copies from
+  // current reads: no hook in rebuild is needed, the first scan passes every entry at once and changes nothing. The
+  // rebuild's end state is stood in for by store 2 restarted with no CRL state and a peer's copies (Replication, so
+  // the slices are the same)
+  test("after a rebuild, the first scan clears the store's TracelessCommits entries and changes nothing"):
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
+      dataPtr <- sharedDataObject()
+      before <- client.read(dataPtr)
+      expected = before.refcount.setCount(before.refcount.count + 1)
+      _ <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
+      _ <- missedByCrashedVoter(2, dataPtr)(_.setRefcount(dataPtr, before.refcount, expected))
+      _ <- dropErrorEntries(2)
+      marked <- tracelessEntries(2)
+      _ = net.stores(2).m = net.stores(0).m.map: (id, os) =>
+            id -> new org.aspen_ddp.aspen.server.store.ObjectState(id, os.metadata, os.objectType, os.data)
+      _ <- pump(net.restartStore(net.stores(2)), deadline())
+      _ <- settle()
+      rebuilt = Map(kvPtr.id -> stored(2, kvPtr.id).map(_.metadata), dataPtr.id -> stored(2, dataPtr.id).map(_.metadata))
+      result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
+      remaining <- tracelessEntries(2)
+    yield
+      withClue("the rebuilt store holds the transactions' changes: "):
+        storeKeys(2, kvPtr) shouldBe Set(k0)
+        storeRefcount(2, dataPtr) shouldBe Some(expected)
+      marked.size shouldBe 2
+      result.tracelessSeen shouldBe 2
+      result.repaired shouldBe 2
+      remaining shouldBe empty
+      Map(kvPtr.id -> stored(2, kvPtr.id).map(_.metadata), dataPtr.id -> stored(2, dataPtr.id).map(_.metadata)) shouldBe
+        rebuilt
+      storeKeys(2, kvPtr) shouldBe Set(k0)
 
   /** An object every store holds with k0, k1 and k2, and a transaction store 2 missed that deletes k1 and k2. Every
     * read reports k2 locked. Completes with the object and the deferral key of the missed transaction's entry
@@ -803,7 +836,9 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     // saw it, and aborts
     val target = SeamTarget()
     @volatile var writeK2: Option[KeyValueObjectPointer] = None
-    val repairer = StoreRepairer(client, target, testingOnlyBeforeReconcile = (s, ptr) =>
+    @volatile var proofs: List[ReadLocks] = Nil
+    val repairer = StoreRepairer(client, target, testingOnlyOnProof = (_, _, proven) => proofs = proofs :+ proven,
+                                 testingOnlyBeforeReconcile = (s, ptr) =>
       writeK2.filter(p => s == sid(2) && p.id == ptr.id) match
         case Some(p) =>
           writeK2 = None
@@ -816,8 +851,10 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       (kvPtr, entryKey) <- lockedKeyScenario(target)
       _ <- passes(n - 1, 2, repairer, deferral)
+      proofsBefore = proofs
       _ = writeK2 = Some(kvPtr)
       _ <- pass(2, repairer, deferral)
+      proofsOnAbortPass = proofs
       afterAbort <- tracelessEntries(2)
       keysAfterAbort = storeKeys(2, kvPtr)
       deferredAfterAbort = deferral.deferredKeys(entryKey)
@@ -825,6 +862,9 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       remaining <- tracelessEntries(2)
     yield
       writeK2 shouldBe None
+      proofsBefore shouldBe empty
+      withClue("the n-th pass ran a proof, which aborted and proved nothing: "):
+        proofsOnAbortPass shouldBe List(ReadLocks(Set(), false))
       afterAbort should not be empty
       deferredAfterAbort shouldBe Some(Set(k2))
       keysAfterAbort shouldBe Set(k0, k2)

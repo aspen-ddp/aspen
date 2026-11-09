@@ -54,8 +54,11 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
         completionPromise.success(())
   }
 
+  /** Runs after the transaction's other finalization actions complete (RegisteredTransactionFinalizerFactory.Finalizer).
+    * Commit errors and voters given before then are kept. Nothing is scheduled once every store reported clean
+    */
   def execute(): Unit = synchronized {
-    markTask = Some(client.backgroundTaskManager.schedule(MissedUpdateFinalizationAction.errorTimeout) {
+    if !completionPromise.isCompleted then markTask = Some(client.backgroundTaskManager.schedule(MissedUpdateFinalizationAction.errorTimeout) {
       markMissedUpdates()
     })
   }

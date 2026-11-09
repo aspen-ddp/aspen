@@ -849,4 +849,38 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     finalizer.cancelled should be (false)
     messenger.messages.collect { case f: TxFinalized => f } should be (Nil)
   }
+
+  test("a proof reaching a finalized driver starts no round") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false))
+    val round = driver.testProposalId
+    messenger.clear()
+
+    proofFrom(driver, txd, ds2)
+
+    driver.testProposalId should be (round)
+    messenger.messages.collect { case p: TxPrepare => p } should be (Nil)
+  }
+
+  test("a resolved driver holding a proof sends no accepts for an adopted value") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer(autoComplete = false)
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => ())
+
+    // Resolved by another driver; the proof then arrives, and the driver holds it without a new round
+    driver.receiveTxResolved(TxResolved(ds0, ds1, txd.transactionId, committed = true, late = false, proof = false))
+    proofFrom(driver, txd, ds2)
+    messenger.clear()
+
+    promise(driver, txd, ds0, TransactionDisposition.VoteCommit, Some((ProposalId(1, 2), true)))
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+
+    messenger.messages.collect { case a: TxAccept => a } should be (Nil)
+    finalizer.createCount should be (1)
+    finalizer.cancelled should be (false)
+  }
 }

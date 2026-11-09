@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory}
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateFinalizationAction
 import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
@@ -11,10 +12,32 @@ import org.aspen_ddp.aspen.server.transaction.TransactionFinalizer
 import scala.concurrent.{ExecutionContext, Future}
 
 object RegisteredTransactionFinalizerFactory {
-  class Finalizer(val client: AspenClient, val actions: List[FinalizationAction]) extends TransactionFinalizer {
-    given ExecutionContext = client.clientContext
 
-    actions.foreach(_.execute())
+  /** Runs a committed transaction's finalization actions. Every action executes at once except the
+    * MissedUpdateFinalizationAction, which executes only once every other action's `complete` has succeeded.
+    * `complete` covers all of them, and `cancel` cancels all of them, including a marker not yet started.
+    *
+    * Invariant: a transaction's UnackedCommits entries (written by the MissedUpdateFinalizationAction) become durable
+    * only after every other finalization action of the transaction completed, and its driver sends TxFinalized only
+    * after all of them did. So an acceptor that forgot the transaction, on TxFinalized or on finding its UnackedCommits
+    * entry (Tx.unackedCommitFound), implies the transaction's other finalization actions are done. A late commit
+    * (TransactionDriver.resolveLate) relies on this when it runs none of them.
+    *
+    * The marker receives `updateCommitErrors` and `commitVoters` from the start, before it executes, and keeps them.
+    */
+  class Finalizer(val actions: List[FinalizationAction],
+                  runsLast: FinalizationAction => Boolean = Finalizer.isMissedUpdateMarker)
+                 (using ec: ExecutionContext) extends TransactionFinalizer {
+
+    private val (last, first) = actions.partition(runsLast)
+    private var cancelled = false
+
+    first.foreach(_.execute())
+
+    Future.sequence(first.map(_.complete)).foreach { _ =>
+      val start = synchronized { !cancelled }
+      if start then last.foreach(_.execute())
+    }
 
     def complete: Future[Unit] = Future.sequence(actions.map(_.complete)).map(_=>())
 
@@ -28,8 +51,13 @@ object RegisteredTransactionFinalizerFactory {
       actions.map(f => (f.getClass.getSimpleName, f.complete.isCompleted))
     }
 
-    def cancel(): Unit = actions.foreach(_.cancel())
+    def cancel(): Unit =
+      synchronized { cancelled = true }
+      actions.foreach(_.cancel())
   }
+
+  object Finalizer:
+    def isMissedUpdateMarker(action: FinalizationAction): Boolean = action.isInstanceOf[MissedUpdateFinalizationAction]
 }
 
 class RegisteredTransactionFinalizerFactory(val client: AspenClient) extends TransactionFinalizer.Factory {
@@ -39,6 +67,6 @@ class RegisteredTransactionFinalizerFactory(val client: AspenClient) extends Tra
       f.createFinalizationAction(client, txd, sfa.data)
     }
 
-    new server.RegisteredTransactionFinalizerFactory.Finalizer(client, actions)
+    new server.RegisteredTransactionFinalizerFactory.Finalizer(actions)(using client.clientContext)
   }
 }

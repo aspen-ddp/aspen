@@ -1,14 +1,6 @@
 TODO
 ====
 
-Traceless commits follow-ups (minor, from the 2026-11-08 reviews):
-- TracelessCommits entries are one per transaction (not merged per object like ErrorTree entries), but only for
-  commit voters that sent no TxCommitted (all silent stores when the driver did not count the votes), so an offline
-  store gets none. A voter that keeps missing errorTimeout under allocation-heavy load still grows the tree. Watch it.
-- No repair proof compares a KV object's min/max/left/right (the object-level proof is a RevisionLock), and a
-  SetMin/DeleteMin/... without a required revision is a traceless change that `deletesKeys` does not flag. Check
-  whether such updates occur and, if so, how a store that misses one is repaired.
-
 Currently the correctness guarantees for transaction requirements checking, transaction commit ordering,
 transaction recovery, and missed transaction repairs are embedded solely within the code. Ideally, they should come from
 specifications that can be independently reviewed for correctness and completeness from which the code can then be

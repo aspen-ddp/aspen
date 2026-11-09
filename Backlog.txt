@@ -217,3 +217,11 @@ Full storage devices: keep stores serving and route around them system-wide
       migrate off the device. Frozen writes then resume, followed by repair of the missed updates.
   - FSIF (docs/superpowers/specs/2026-10-29-fsif-backend-design.md) implements only the backend side: freeze
     writes on ENOSPC, keep serving reads, retry until space returns.
+
+Traceless commits follow-ups (minor, from the 2026-11-08 reviews):
+- TracelessCommits entries are one per transaction (not merged per object like ErrorTree entries), but only for
+  commit voters that sent no TxCommitted (all silent stores when the driver did not count the votes), so an offline
+  store gets none. A voter that keeps missing errorTimeout under allocation-heavy load still grows the tree. Watch it.
+- No repair proof compares a KV object's min/max/left/right (the object-level proof is a RevisionLock), and a
+  SetMin/DeleteMin/... without a required revision is a traceless change that `deletesKeys` does not flag. Check
+  whether such updates occur and, if so, how a store that misses one is repaired.

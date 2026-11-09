@@ -23,6 +23,69 @@ Traceless commits follow-ups (minor, from the 2026-11-08 reviews):
 - Test gaps: the aborted-proof test does not show a proof ran; "after a rebuild" does not rebuild; the TxResolved
   horizon-proof test passes without the horizon change; no createNewMetadataPool tree test.
 
+Currently the correctness guarantees for transaction requirements checking, transaction commit ordering,
+transaction recovery, and missed transaction repairs are embedded solely within the code. Ideally, they should come from
+specifications that can be independently reviewed for correctness and completeness from which the code can then be
+derived and checked for adherence. The goal of this task is to derive the specifications from the code which can then
+be used to check for logical completeness and then derive fixes which can then be applied to the implementation. These
+specifications will also serve as documentation for developers seeking to understand the model and provide additional
+oversight. The documents to generate:
+  - docs/safety/paxos-transactions.md: How Paxos is used to achieve 1RTT commits in the error-free case. How the
+    VoteCommit/VoteAborts are handled, how transaction state and object data are persisted to disk alongside Paxos
+    state, and how aborts require starting a new paxos round due to the commit decision being tied to round 1 (which
+    provides the 1RTT commit in the error free case).
+  - docs/safety/crash-recovery-log.md: The pluggable CRL interface and its guarantees that ensure Paxos state and
+    required transaction data are preserved in the face of crashes. It should describe how the CRL fits into the
+    overall transaction handling workflow and then go on to describe the design and implementation of SimpleCRL as
+    a reference implementation. It should additionally describe the benefits and drawbacks for storing the CRL on the
+    same physical device as the stores it serves (doubling the IO and reducing the bandwidth. Point out the increased
+    drawbacks for spinning disks). Additionally mention the pros and cons to the planned but not yet implemented
+    off-device CRL implementations and what that means for practical use (faster IO to slow devices but failure modes
+    cross two physical devices and device transfer requires clean shutdown and writing the CRL to the device).
+  - docs/safety/transaction-requirements.md: The requirements that a transaction can specify and how the checks and
+    locking work across stores to ensure correct commit/abort decisions. Also mention that the window between commit
+    decision and the completion of the write to the backing store delay the handling of new transactions.
+  - docs/safety/transaction-recovery.md: How transactions recover from crashes. There are two (verify this) primary
+    failure recovery modes. 1) crashes of the transaction driver. 2) crashes of a transaction participant. Document
+    the driver failure and takeover process and how successful transactions with suspected store commit failures feed
+    into the missed update finalization action that writes entries to the error tree and traceless tree to allow the
+    repair process to bring the objects modified by the transaction back into sync with their peers. The details of
+    this process will be covered by the docs/safety/repair-process.md document.
+  - docs/safety/repair-process.md: Document the scanning process done over the error tree and traceless commits trees.
+    This should focus on the overall structure and content of the trees and how the scanning process repairs transient
+    errors from missed transactions that modified object state while the store was unavailable. It should also
+    explicitly outline how race conditions between repair operations and in-flight transactions and commits are
+    mitigated.
+  - docs/safety/rebuild-process.md: When a store is lost due to the failure of the underlying storage or media
+    corruption that results in an invalid CRL or store media, this document describes how the entire store is
+    reconstructed from peer stores. It describes walking the allocation tree and rebuilding objects as well as the
+    reassignment of the rebuild operation to a new storage device (and probably a new host). It should also mention
+    that no attempt is made to process active transactions while the store is being rebuilt. The error trees track
+    missed updates and deletes and only after the store is fully reconstructed are the missed operations during the
+    rebuild process handled.
+  - docs/safety/systemtic-loss-protection.md: This is a placeholder for systematic protection against bugs that could
+    artificially flag stores as lost and requiring rebuild from inducing an irrecoverable data loss scenario.
+    For example, a bug that causes the CRL of a device to appear corrupted and unrecoverable could cause all of the
+    stores on that device to be flagged as requiring rebuild. If this happens just once, it's likely not a problem. If
+    it happens as part of an upgrade that is rolled out to the entire system and every upgraded node encounters this
+    issue, it would trigger an unrecoverable loss of entire storage pools and this system cannot tolerate such loss.
+    Protections must be put into place that prevent such situations form occurring. This is a large and as yet unsolved
+    problem with this architecture. Document the potential problem and explicitly call out that a solution has yet
+    to be identified.
+
+The design documents under docs/safety must be perfectly complete and cover all possible failure scenarios. Review
+the designs and look for any logical flaws that could lead to data loss or inconsistencies such as successfully deleted
+objects or keys being ressurected or key/object updates yielding unrecoverable objects or any other patterns of
+updates or deletes that could result in unrecoverable data loss. These could occur from within the context of any one
+of the design documents or from across the interactions possible between the actions carried out by those design
+documents. Use the most capable model for doing these analyses as they must take into account network, device, and
+slow-responding clients and crash-recovery processes at every step in the process. Race conditions, locks, and
+implementation design are all critical to correctness.
+
+CRL expansion. If sufficient free disk space is available, add another file to the CRL rather than slowing down
+the transactions. This needs to be capped though. Do not add another file if the total size of all files would
+exceed 3% of the device's size.
+
 Store commit delay FSIF commits seem to be taking longer than they should when backed by NVMe media. Investigate the
 timing of commits.
 

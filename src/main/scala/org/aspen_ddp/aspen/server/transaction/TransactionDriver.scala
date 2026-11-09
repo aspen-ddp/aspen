@@ -100,6 +100,14 @@ abstract class TransactionDriver(
   protected var knownResolved: Set[StoreId] = Set()
   protected var resolvedValue: Boolean = false
 
+  /** A store proved the commit (a `TxResolved` with `proof = true`): this driver never proposes abort, and resolves
+    * late once a prepare quorum of the current round remembers nothing of the transaction. See `resolveLate`
+    */
+  private var holdsProof: Boolean = false
+
+  /** The commit is late (see `resolveLate`): every TxResolved and TxFinalized this driver sends carries `late = true` */
+  protected var late: Boolean = false
+
   // Stores IDs of objects that could not be updated on stores as part of a successful commit
   protected var commitErrors: Map[StoreId, List[ObjectId]] = Map()
 
@@ -184,7 +192,7 @@ abstract class TransactionDriver(
   def heartbeat(): Unit = {
     reportIfStuck()
     if (finalized)
-      messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, resolvedValue, late = false)))
+      messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, resolvedValue, late)))
     else if (heartbeatDue)
       messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxHeartbeat(toStoreId, storeId, txd.transactionId)))
     heartbeatDue = true
@@ -251,7 +259,14 @@ abstract class TransactionDriver(
           if (isValidAcceptor(msg.from))
             proposer.receivePromise(paxos.Promise(msg.from.poolIndex, msg.proposalId, promise.lastAccepted))
 
-          if (proposer.prepareQuorumReached && !proposer.haveLocalProposal) {
+          if (holdsProof && !resolved && proposer.prepareQuorumWithoutAcceptedValue)
+            resolveLate()
+          else if (holdsProof && proposer.prepareQuorumReached && !proposer.haveLocalProposal &&
+                   proposer.proposalValue.isDefined)
+            // An accepted value to adopt: Paxos proposes it as usual. The vote tally only picks a local proposal,
+            // which a proof holder needs none of, and the prover never votes, so the tally could wait forever
+            shouldSendAcceptMessages = true
+          else if (proposer.prepareQuorumReached && !proposer.haveLocalProposal) {
 
             var canCommitTransaction = true
             var cantAttempt = false
@@ -298,8 +313,9 @@ abstract class TransactionDriver(
             if (cantAttempt)
               return
 
-            if !proposer.haveLocalProposal then
-              // If we get here, we've made our decision
+            // If we get here, we've made our decision. A driver holding a proof never proposes abort: it leaves the
+            // proposal unset, so only an accepted value (adopted by Paxos as usual) or a later round decides
+            if !proposer.haveLocalProposal && (canCommitTransaction || !holdsProof) then
               proposer.setLocalProposal(canCommitTransaction)
 
             shouldSendAcceptMessages = true
@@ -343,13 +359,30 @@ abstract class TransactionDriver(
   }
 
   def receiveTxResolved(msg: TxResolved): Unit = {
-    synchronized {
+    val startedPostProofRound = synchronized {
       knownResolved += msg.from
-      onResolution(msg.committed, sendResolutionMessage=false)
+      if (msg.committed && msg.late) {
+        resolveLate()
+        false
+      } else if (msg.committed && msg.proof) {
+        // The first proof starts a new round: promises to prepares sent before it may predate the choice of commit
+        // (see resolveLate), so they never count. Every later round is post-proof too. A driver that already
+        // resolved learned the outcome by Paxos, and its own finalizer must complete
+        val start = !holdsProof && !resolved
+        holdsProof = true
+        if (start)
+          nextRound()
+        start
+      } else {
+        onResolution(msg.committed, sendResolutionMessage=false)
+        false
+      }
     }
 
     // call outside synchronization block
     sendMessages()
+    if (startedPostProofRound)
+      sendPrepareMessages()
   }
 
   def receiveTxCommitted(msg: TxCommitted): Unit = {
@@ -363,8 +396,12 @@ abstract class TransactionDriver(
   def receiveTxFinalized(msg: TxFinalized): Unit = {
     synchronized {
       knownResolved += msg.from
-      finalizer.foreach( _.cancel() )
-      onFinalized(msg.committed)
+      if (msg.committed && msg.late)
+        resolveLate()
+      else {
+        finalizer.foreach( _.cancel() )
+        onFinalized(msg.committed)
+      }
     }
 
     // call outside synchronization block
@@ -377,13 +414,14 @@ abstract class TransactionDriver(
     synchronized {
       if (!finalized) {
         finalized = true
+        resolvedValue = committed
 
         txd.originatingClient.foreach(client => {
           logger.trace(s"Sending TxFinalized(${txd.transactionId}) to originating client $client. Committed: $committed")
           clientFinalized = Some(TransactionFinalized(client, storeId, txd.transactionId, committed))
         })
 
-        val messages = allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed, late = false))
+        val messages = allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed, late))
 
         logger.trace(s"Sending TxFinalized(${txd.transactionId}) to ${messages.head.to.poolId}:(${messages.map(_.to.poolIndex)})")
 
@@ -405,12 +443,17 @@ abstract class TransactionDriver(
     proposer.nextRound()
   }
 
+  /** The outcome to send in place of prepares: a late commit, or the value the learner learned */
+  private def knownOutcome: Option[Boolean] = if late then Some(true) else learner.finalValue
+
   protected def sendPrepareMessages(): Unit = {
-    val (proposalId, alreadyPrepared, ofinal) = synchronized { (proposer.currentProposalId, peerDispositions, learner.finalValue) }
+    val (proposalId, alreadyPrepared, ofinal, isLate) = synchronized {
+      (proposer.currentProposalId, peerDispositions, knownOutcome, late)
+    }
 
     // Send TxResolved if resolution has been achieved, otherwise Prepare messages
     val messages = ofinal match {
-      case Some(result) => txd.allDataStores.map(TxResolved(_, storeId, txd.transactionId, result, late = false, proof = false))
+      case Some(result) => txd.allDataStores.map(TxResolved(_, storeId, txd.transactionId, result, isLate, proof = false))
       case None => txd.allDataStores.filter(!alreadyPrepared.contains(_)).map(to =>
         TxPrepare(to, storeId, txd, proposalId, Nil, Nil, fromClient = false))
     }
@@ -422,12 +465,12 @@ abstract class TransactionDriver(
   }
 
   protected def sendPrepareMessage(toStoreId: StoreId): Unit = {
-    val (proposalId, ofinal) = synchronized { (proposer.currentProposalId, learner.finalValue) }
+    val (proposalId, ofinal, isLate) = synchronized { (proposer.currentProposalId, knownOutcome, late) }
 
     ofinal match {
       case Some(result) =>
         //logger.trace(s"Sending TxResolved(${txd.transactionId}) committed = $result to $toStoreId")
-        messenger.sendTransactionMessage(TxResolved(toStoreId, storeId, txd.transactionId, result, late = false, proof = false))
+        messenger.sendTransactionMessage(TxResolved(toStoreId, storeId, txd.transactionId, result, isLate, proof = false))
 
       case None =>
         //logger.trace(s"Sending TxPrepare(${txd.transactionId}) to $toStoreId")
@@ -470,16 +513,49 @@ abstract class TransactionDriver(
 
   /** Starts the finalizer of a committed transaction, or finalizes an aborted one at once.
     *
-    * Ordering: this driver sends TxFinalized only from onFinalized, which a commit reaches only once the finalizer
-    * completes (`f.complete foreach onFinalized`), or on a TxFinalized from another driver, sent under the same rule.
-    * A store forgets a committed transaction only on TxFinalized (Frontend.receiveTransactionMessage via
-    * Tx.receiveFinalized) or when the UnackedCommits tree holds its entry (Frontend.unackedLookupComplete via
-    * Tx.unackedCommitFound). So everything the finalizer writes, its UnackedCommits entries included, is durable
-    * before any store forgets the transaction. A muted Tx (Frontend.forgetMuted) is dropped without either, but it
-    * never voted. Caveat: unackedCommitFound marks the transaction finalized in its host's status cache, and Store
-    * answers a later prepare to that host with TxFinalized, so another driver can then finalize before the original
-    * finalizer's remaining actions complete.
+    * Ordering premise: this driver sends TxFinalized only from onFinalized, which a commit reaches only once the
+    * finalizer completes (`f.complete foreach onFinalized`), or on a TxFinalized from another driver, sent under the
+    * same rule, or on a late commit (`resolveLate`), which follows a finalization that already completed. A store
+    * forgets a committed transaction only on TxFinalized (Frontend.receiveTransactionMessage via Tx.receiveFinalized)
+    * or when the UnackedCommits tree holds its entry (Frontend.unackedLookupComplete via Tx.unackedCommitFound). So
+    * everything the finalizer writes, its UnackedCommits entries included, is durable before any store forgets the
+    * transaction. A muted Tx (Frontend.forgetMuted) is dropped without either, but it never voted. Tx.unackedCommitFound
+    * records the transaction Committed, not finalized, in its host's status cache (replay-pins design, section 1c), so
+    * a finalized status, and the TxFinalized a store relays from it, always stems from a real TxFinalized.
     */
+  /** Resolves a late commit: one this driver reaches only after the transaction was finalized and forgotten
+    * (docs/superpowers/specs/2026-11-09-replay-pins-design.md, 1b and 1c). Reached on:
+    *  - a proof (`TxResolved` with `proof = true`) held together with a prepare quorum of valid acceptors, in a round
+    *    started after the proof arrived, none of whose promises carries an accepted value. The proof shows the commit
+    *    was chosen, so a quorum Q accepted it before the proof was sent, and so before any post-proof prepare. That
+    *    quorum intersects the responding one, and an acceptor drops its state only on TxFinalized (a rebuilt one is
+    *    muted and does not answer), so the transaction was finalized. Promises to earlier rounds never count: they
+    *    may have been given before Q accepted, at a higher proposal of another driver, and then prove nothing (the
+    *    prover may be a muted rebuilt store while that driver's finalizer still runs). The first proof therefore
+    *    starts a new round (`receiveTxResolved`);
+    *  - a `TxResolved` or `TxFinalized` with `late = true`: another driver, or a store's finalized relay, already
+    *    knows it is late. A store's status cache marks a transaction finalized only on a real TxFinalized.
+    *
+    * The original finalization completed (see the ordering premise on `onResolution`): its UnackedCommits entries are
+    * durable, so this runs no finalizer (and cancels any it started: re-running them would itself be a replay) and
+    * finalizes at once. Every TxResolved and TxFinalized sent from here on carries `late = true`, so receiving stores
+    * apply the commit only where an UnackedCommits entry says it is owed. A late commit sends no accepts.
+    */
+  private def resolveLate(): Unit = synchronized {
+    if (!finalized) {
+      if (resolved && !resolvedValue)
+        logger.error(s"Tx ${txd.transactionId} on store $storeId: late commit after an abort resolution; ignored")
+      else {
+        logger.info(s"Tx ${txd.transactionId} on store $storeId: late commit, finalization actions already ran")
+        late = true
+        resolved = true
+        resolvedValue = true
+        finalizer.foreach(_.cancel())
+        onFinalized(true)
+      }
+    }
+  }
+
   protected def onResolution(committed: Boolean, sendResolutionMessage: Boolean): Unit = synchronized {
     if (!resolved) {
 
@@ -516,7 +592,7 @@ abstract class TransactionDriver(
 
       if (sendResolutionMessage) {
         val messages = (allDataStores.iterator ++ txd.notifyOnResolution.iterator).map { toStoreId =>
-          TxResolved(toStoreId, storeId, txd.transactionId, committed, late = false, proof = false)
+          TxResolved(toStoreId, storeId, txd.transactionId, committed, late, proof = false)
         }.toList
 
         //logger.trace(s"Sending TxResolved(${txd.transactionId}) committed = $committed to ${messages.head.to.poolId}:(${messages.map(_.to.poolIndex)})")

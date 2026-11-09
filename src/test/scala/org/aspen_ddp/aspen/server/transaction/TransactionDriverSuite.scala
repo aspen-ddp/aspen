@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.transaction
 import scala.concurrent.ExecutionContext.Implicits.global
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.network.{ClientResponse, TxAccept, TxAcceptResponse, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse}
+import org.aspen_ddp.aspen.common.network.{ClientResponse, TxAccept, TxAcceptResponse, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -61,6 +61,11 @@ object TransactionDriverSuite {
       super.onFinalized(committed)
       onComplete(txd.transactionId)
     }
+
+    def testResendPrepares(): Unit = sendPrepareMessages()
+    def testResendPrepare(to: StoreId): Unit = sendPrepareMessage(to)
+    def testHaveLocalProposal: Boolean = synchronized { proposer.haveLocalProposal }
+    def testProposalId: ProposalId = synchronized { proposer.currentProposalId }
   }
 
   class TFinalizer(autoComplete: Boolean = true) extends TransactionFinalizer with TransactionFinalizer.Factory {
@@ -74,8 +79,11 @@ object TransactionDriverSuite {
 
     def debugStatus: List[(String, Boolean)] = Nil
 
+    var createCount = 0
+
     override def create(txd: TransactionDescription, messenger: Messenger): TransactionFinalizer = {
       created = true
+      createCount += 1
       this
     }
 
@@ -566,5 +574,279 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
     driver.mayBeDiscarded should be (true)
     completed should be (true)
+  }
+
+  // Late commits (docs/superpowers/specs/2026-11-09-replay-pins-design.md, 1b and 1c)
+
+  private def promise(driver: TTD, txd: TransactionDescription, from: StoreId, disposition: TransactionDisposition.Value,
+                      lastAccepted: Option[(ProposalId, Boolean)] = None): Unit =
+    driver.receiveTxPrepareResponse(TxPrepareResponse(ds0, from, txd.transactionId,
+      Right(TxPrepareResponse.Promise(lastAccepted)), driver.testProposalId, disposition, Nil))
+
+  private def accepted(driver: TTD, txd: TransactionDescription, from: StoreId): Unit =
+    driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, driver.testProposalId,
+      Right(TxAcceptResponse.Accepted(true))))
+
+  private def proofFrom(driver: TTD, txd: TransactionDescription, from: StoreId): Unit =
+    driver.receiveTxResolved(TxResolved(ds0, from, txd.transactionId, committed = true, late = false, proof = true))
+
+  private def outcomes(messenger: TMessenger): List[TxMessage] =
+    messenger.messages.filter(m => m.isInstanceOf[TxResolved] || m.isInstanceOf[TxFinalized])
+
+  private def allLate(messages: List[TxMessage]): Boolean = messages.forall {
+    case r: TxResolved => r.late && r.committed
+    case f: TxFinalized => f.late && f.committed
+    case _ => true
+  }
+
+  private def abortAccepts(messenger: TMessenger): List[TxAccept] =
+    messenger.messages.collect { case a: TxAccept if !a.value => a }
+
+  test("a proof with a quorum of memoryless promises resolves late, runs no finalizer, and sends late everywhere") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+
+    proofFrom(driver, txd, ds1)
+    completed should be (false)
+    outcomes(messenger) should be (Nil)
+
+    promise(driver, txd, ds0, TransactionDisposition.VoteAbort)
+    completed should be (false)
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+
+    completed should be (true)
+    driver.mayBeDiscarded should be (true)
+    finalizer.createCount should be (0)
+    abortAccepts(messenger) should be (Nil)
+    messenger.messages.collect { case f: TxFinalized => f.to }.toSet should be (txd.allDataStores.toSet)
+    allLate(outcomes(messenger)) should be (true)
+
+    messenger.clear()
+    driver.heartbeat()
+    driver.testResendPrepares()
+    driver.testResendPrepare(ds1)
+    messenger.messages.collect { case p: TxPrepare => p } should be (Nil)
+    outcomes(messenger).collect { case r: TxResolved => r.to }.toSet should be (txd.allDataStores.toSet)
+    outcomes(messenger).collect { case f: TxFinalized => f.to }.toSet should be (txd.allDataStores.toSet)
+    allLate(outcomes(messenger)) should be (true)
+  }
+
+  // The counterexample to counting pre-proof promises: they may predate another driver's choice of commit at a higher
+  // proposal, which an unfinalized prover (a muted rebuilt store) then shows. Only a post-proof round counts
+  test("memoryless promises received before the proof do not make it late; a post-proof round's quorum does") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+
+    // Votes reach a quorum but cannot decide: one commit vote, one abort vote, of three stores
+    promise(driver, txd, ds0, TransactionDisposition.VoteCommit)
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+    messenger.messages.collect { case a: TxAccept => a } should be (Nil)
+    val preProofRound = driver.testProposalId
+    messenger.clear()
+
+    proofFrom(driver, txd, ds1)
+
+    completed should be (false)
+    outcomes(messenger) should be (Nil)
+    driver.testProposalId should be > preProofRound
+    messenger.messages.collect { case p: TxPrepare => p.proposalId }.toSet should be (Set(driver.testProposalId))
+
+    // A late answer to the pre-proof round is discarded
+    driver.receiveTxPrepareResponse(TxPrepareResponse(ds0, ds1, txd.transactionId,
+      Right(TxPrepareResponse.Promise(None)), preProofRound, TransactionDisposition.VoteAbort, Nil))
+    completed should be (false)
+
+    promise(driver, txd, ds0, TransactionDisposition.VoteCommit)
+    completed should be (false)
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+
+    completed should be (true)
+    finalizer.createCount should be (0)
+    abortAccepts(messenger) should be (Nil)
+    outcomes(messenger) should not be (Nil)
+    allLate(outcomes(messenger)) should be (true)
+  }
+
+  test("memoryless promises before the proof, then a post-proof round remembering the commit, commit normally") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    val finalizedSent = Promise[Unit]()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => finalizedSent.trySuccess(()))
+
+    promise(driver, txd, ds0, TransactionDisposition.VoteCommit)
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+
+    // Meanwhile another driver chose commit at a higher proposal and a store shows it
+    proofFrom(driver, txd, ds1)
+    promise(driver, txd, ds0, TransactionDisposition.VoteCommit, Some((ProposalId(1, 2), true)))
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort, Some((ProposalId(1, 2), true)))
+
+    finalizer.createCount should be (0)
+    outcomes(messenger) should be (Nil)
+    messenger.messages.collect { case a: TxAccept => a.value }.toSet should be (Set(true))
+
+    for from <- List(ds0, ds2) do accepted(driver, txd, from)
+
+    // The finalizer completes on another thread
+    scala.concurrent.Await.result(finalizedSent.future, scala.concurrent.duration.Duration(5, "s"))
+    finalizer.createCount should be (1)
+    outcomes(messenger) should not be (Nil)
+    outcomes(messenger).forall {
+      case r: TxResolved => !r.late && r.committed
+      case f: TxFinalized => !f.late && f.committed
+      case _ => true
+    } should be (true)
+  }
+
+  test("a proof with an accepted commit among the promises resolves normally and runs the finalizer") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    val finalizedSent = Promise[Unit]()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => finalizedSent.trySuccess(()))
+
+    proofFrom(driver, txd, ds1)
+    promise(driver, txd, ds0, TransactionDisposition.VoteCommit, Some((ProposalId(1, 2), true)))
+    promise(driver, txd, ds2, TransactionDisposition.VoteCommit)
+
+    finalizer.createCount should be (0)
+    messenger.messages.collect { case a: TxAccept => a.value }.toSet should be (Set(true))
+    outcomes(messenger) should be (Nil)
+
+    for from <- List(ds0, ds2) do accepted(driver, txd, from)
+
+    // The finalizer completes on another thread
+    scala.concurrent.Await.result(finalizedSent.future, scala.concurrent.duration.Duration(5, "s"))
+    finalizer.createCount should be (1)
+    outcomes(messenger) should not be (Nil)
+    outcomes(messenger).forall {
+      case r: TxResolved => !r.late && r.committed
+      case f: TxFinalized => !f.late && f.committed
+      case _ => true
+    } should be (true)
+  }
+
+  test("a driver holding a proof never proposes abort, even when votes say abort") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => ())
+
+    proofFrom(driver, txd, ds1)
+    // A quorum of abort votes, one remembering an accepted commit: Paxos adopts the accepted value
+    promise(driver, txd, ds0, TransactionDisposition.VoteAbort, Some((ProposalId(1, 2), true)))
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+
+    driver.testHaveLocalProposal should be (false)
+    abortAccepts(messenger) should be (Nil)
+    messenger.messages.collect { case a: TxAccept => a.value }.toSet should be (Set(true))
+    finalizer.createCount should be (0)
+    driver.mayBeDiscarded should be (false)
+  }
+
+  test("a driver holding a proof without a prepare quorum neither resolves nor proposes") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+
+    proofFrom(driver, txd, ds1)
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+    // Not an acceptor: does not count toward the quorum
+    promise(driver, txd, ds3, TransactionDisposition.VoteAbort)
+
+    completed should be (false)
+    driver.mayBeDiscarded should be (false)
+    driver.testHaveLocalProposal should be (false)
+    finalizer.createCount should be (0)
+    messenger.messages.collect { case a: TxAccept => a } should be (Nil)
+    outcomes(messenger) should be (Nil)
+  }
+
+  test("a finalized-committed late TxFinalized resolves late") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true))
+
+    completed should be (true)
+    finalizer.createCount should be (0)
+    outcomes(messenger) should not be (Nil)
+    allLate(outcomes(messenger)) should be (true)
+
+    messenger.clear()
+    driver.heartbeat()
+    outcomes(messenger) should not be (Nil)
+    allLate(outcomes(messenger)) should be (true)
+  }
+
+  test("a late TxFinalized cancels a finalizer already started") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer(autoComplete = false)
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+
+    for from <- List(ds0, ds1) do
+      driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
+        Right(TxAcceptResponse.Accepted(true))))
+    finalizer.createCount should be (1)
+    messenger.clear()
+
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true))
+
+    completed should be (true)
+    finalizer.cancelled should be (true)
+    messenger.messages.collect { case f: TxFinalized => f } should not be (Nil)
+    allLate(outcomes(messenger)) should be (true)
+  }
+
+  test("a late TxResolved resolves late at once") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+
+    driver.receiveTxResolved(TxResolved(ds0, ds1, txd.transactionId, committed = true, late = true, proof = false))
+
+    completed should be (true)
+    finalizer.createCount should be (0)
+    abortAccepts(messenger) should be (Nil)
+    messenger.messages.collect { case f: TxFinalized => f.to }.toSet should be (txd.allDataStores.toSet)
+    allLate(outcomes(messenger)) should be (true)
+  }
+
+  test("a proof reaching a driver that already resolved commit leaves its finalizer running") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer(autoComplete = false)
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+
+    for from <- List(ds0, ds1) do
+      promise(driver, txd, from, TransactionDisposition.VoteCommit)
+    for from <- List(ds0, ds1) do
+      driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
+        Right(TxAcceptResponse.Accepted(true))))
+    finalizer.createCount should be (1)
+
+    proofFrom(driver, txd, ds2)
+    promise(driver, txd, ds2, TransactionDisposition.VoteCommit)
+
+    completed should be (false)
+    finalizer.cancelled should be (false)
+    messenger.messages.collect { case f: TxFinalized => f } should be (Nil)
   }
 }

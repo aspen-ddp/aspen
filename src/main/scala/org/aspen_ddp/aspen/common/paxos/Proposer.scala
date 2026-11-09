@@ -14,8 +14,14 @@ class Proposer(
 
   private val promisesReceived = new java.util.BitSet(numPeers)
   private val nacksReceived = new java.util.BitSet(numPeers)
+  private var roundHasAcceptedValue = false
 
   def prepareQuorumReached: Boolean = promisesReceived.cardinality() >= quorumSize
+
+  /** True when the promises of the current round reach a quorum and none of them carries an accepted value.
+    * Unlike `proposalValue`, accepted values reported in earlier rounds do not count
+    */
+  def prepareQuorumWithoutAcceptedValue: Boolean = prepareQuorumReached && !roundHasAcceptedValue
 
   def haveLocalProposal: Boolean = localProposal.isDefined
 
@@ -50,6 +56,7 @@ class Proposer(
     highestProposalId = proposalId
     promisesReceived.clear()
     nacksReceived.clear()
+    roundHasAcceptedValue = false
 
   def currentProposalId: ProposalId = proposalId
 
@@ -78,6 +85,7 @@ class Proposer(
 
     if promise.proposalId == proposalId then
       promisesReceived.set(promise.fromPeer)
+      if promise.lastAccepted.isDefined then roundHasAcceptedValue = true
 
       promise.lastAccepted.foreach: t =>
         highestAccepted match

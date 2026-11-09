@@ -107,3 +107,17 @@ class ProposerSuite extends AnyFunSuite with Matchers:
     p.currentAcceptMessage() should be (None)
     p.receivePromise(Promise(1, ProposalId(2,0), Some((ProposalId(1,1),false))))
     p.currentAcceptMessage() should be (Some(Accept(ProposalId(2,0), false)))
+  test("A quorum without accepted values counts only the current round's promises"):
+    val p = new Proposer(0, 3, 2)
+
+    p.receivePromise(Promise(1, ProposalId(1,0), None))
+    p.prepareQuorumWithoutAcceptedValue should be (false)
+    p.receivePromise(Promise(2, ProposalId(1,0), Some((ProposalId(1,1), true))))
+    p.prepareQuorumReached should be (true)
+    p.prepareQuorumWithoutAcceptedValue should be (false)
+
+    p.nextRound()
+    p.receivePromise(Promise(1, p.currentProposalId, None))
+    p.receivePromise(Promise(2, p.currentProposalId, None))
+    p.prepareQuorumWithoutAcceptedValue should be (true)
+    p.proposalValue should be (Some(true)) // Paxos value adoption still keeps the earlier accepted value

@@ -712,6 +712,79 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       List((TransactionDisposition.VoteAbort, Right(TxPrepareResponse.Promise(None))))
   }
 
+  test("a prover is kept, recording nothing, on a non-late resolution, and forgotten on TxFinalized") {
+    val statusCache = new TransactionStatusCache()
+    val backend = new MapBackend(storeId)
+    val net = new TestNet
+    val crl = new TestCrl
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
+      statusCache)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
+      DataBuffer(appliedData))
+    frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd))
+    frontend.receiveTransactionMessage(TxResolved(storeId, recoveryDriver, txid1, committed = true, late = false,
+      proof = false))
+
+    // An acceptor forgets only on TxFinalized or a late outcome (Ruling 16)
+    frontend.transactions.contains(txid1) shouldBe true
+    crl.txDel shouldBe false
+    statusCache.getStatus(txid1).map(_.status).forall(_ == TransactionStatus.Unresolved) shouldBe true
+
+    frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = true, late = false))
+    frontend.transactions.contains(txid1) shouldBe false
+    committedMessages(net) shouldBe Nil
+    crl.txDel shouldBe true
+  }
+
+  test("a recovered Tx whose acceptor accepted a value does not prove, and promises what it accepted") {
+    // Ruling 16: only a memoryless acceptor proves. An accept has no disposition guard, so an undecided Tx may hold one
+    val accepted = (ProposalId(2, 2), true)
+    val backend = new MapBackend(storeId)
+    val os = new ObjectState(oid1, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)), ObjectType.Data,
+      DataBuffer(appliedData))
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    cache.insert(os) // So the recovered transaction loads during construction
+    val trs = TransactionRecoveryState(storeId, dataUpdateTxd.serialize(), Nil, TransactionDisposition.Undetermined,
+      TransactionStatus.Unresolved, PersistentState(Some(accepted._1), Some(accepted)))
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+
+    val p = driverPrepare(dataUpdateTxd)
+    frontend.receiveTransactionMessage(p.copy(proposalId = ProposalId(3, 2)))
+
+    resolvedMessages(net) shouldBe Nil
+    votes(net).map(v => (v.disposition, v.response)) shouldBe
+      List((TransactionDisposition.VoteAbort, Right(TxPrepareResponse.Promise(Some(accepted)))))
+
+    // A non-late resolution is an ordinary one for it, not a prover's: it is kept until TxFinalized
+    frontend.receiveTransactionMessage(TxResolved(storeId, recoveryDriver, txid1, committed = true, late = false,
+      proof = false))
+    frontend.transactions.contains(txid1) shouldBe true
+  }
+
+  test("a live Tx that accepted a value before its objects loaded does not prove") {
+    val backend = new DeferredCommitBackend
+    backend.deferReads = true
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
+      new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
+      DataBuffer(appliedData))
+    frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+    frontend.receiveTransactionMessage(TxAccept(storeId, StoreId(poolId, dataUpdateTxd.designatedLeaderUID), txid1,
+      ProposalId.initialProposal(dataUpdateTxd.designatedLeaderUID), true))
+    backend.deliverReads()
+
+    resolvedMessages(net) shouldBe Nil
+    votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+  }
+
   test("a prover records nothing in the status cache") {
     val statusCache = new TransactionStatusCache()
     val backend = new MapBackend(storeId)
@@ -1858,7 +1931,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("a recovered commit vote with a UnackedCommits entry applies its update and is forgotten on TxFinalized") {
     val statusCache = new TransactionStatusCache()
-    val (frontend, backend, _, crl, lookup) = unackedFixture(statusCache = statusCache)
+    val (frontend, backend, net, crl, lookup) = unackedFixture(statusCache = statusCache)
     lookup.requests shouldBe List(unackedTxid)
     kvKeys(backend) should contain (k(2))
 
@@ -1866,6 +1939,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       lookup.answer(unackedTxid, Success(true))
 
     kvKeys(backend) should not contain k(2)
+    // Ruling 15: it proves the commit to a driver its store may already run for it
+    net.sentTx.collect { case r: TxResolved => (r.to, r.committed, r.late, r.proof) } shouldBe
+      List((storeId, true, false, true))
     // Ruling 9: still live, its CRL and acceptor state kept until TxFinalized. Ruling 12: no status cache entry
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
     crl.deleted should not contain (unackedTxid)
@@ -2202,12 +2278,13 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       finalized = true, late = true))
   }
 
-  test("a late TxResolved for an unknown transaction is cached as committed and late, not finalized") {
+  test("a late TxResolved for an unknown transaction is cached as finalized, committed and late") {
+    // A late outcome implies the transaction was finalized, as the Tx paths record it (Ruling 18)
     val statusCache = new TransactionStatusCache()
     val (frontend, _, _, _, _) = lateFixture(statusCache)
     lateCommit(frontend, finalized = false)
     statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
-      finalized = false, late = true))
+      finalized = true, late = true))
   }
 
   test("a proof is no outcome: neither a live Tx nor the status cache takes it") {

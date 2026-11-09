@@ -525,7 +525,8 @@ abstract class TransactionDriver(
     *    rebuilt store while that driver's finalizer still runs). The first proof therefore starts a new round
     *    (`receiveTxResolved`);
     *  - a `TxResolved` or `TxFinalized` with `late = true`: another driver, or a store's finalized relay, already
-    *    knows it is late. A store's status cache marks a transaction finalized only on a real TxFinalized.
+    *    knows it is late. A store's status cache marks a transaction finalized only from a real TxFinalized or a late
+    *    outcome.
     *
     * Either way the original finalization's other actions completed, by the invariant of
     * RegisteredTransactionFinalizerFactory.Finalizer: UnackedCommits entries become durable only after every other
@@ -561,7 +562,8 @@ abstract class TransactionDriver(
     * it. So everything the finalizer writes, in every pool, is durable before any voter forgets the transaction. A
     * muted Tx (Frontend.forgetMuted) and a prover (Tx.proveCommitted) are dropped without TxFinalized, but neither
     * voted commit. Tx.unackedCommitFound and Tx.proveCommitted record nothing in the host's status cache, so a
-    * finalized status, and the TxFinalized(late = true) a store relays from it, always stems from a real TxFinalized.
+    * finalized status, and the TxFinalized(late = true) a store relays from it, always stems from a real TxFinalized
+    * or a late outcome.
     */
   protected def onResolution(committed: Boolean, sendResolutionMessage: Boolean): Unit = synchronized {
     if (!resolved) {

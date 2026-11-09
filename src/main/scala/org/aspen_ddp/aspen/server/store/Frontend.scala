@@ -394,7 +394,7 @@ class Frontend(val storeId: StoreId,
                 l.failed = true
                 l.failures += 1
                 if l.failures == 1 || l.failures % 60 == 0 then
-                  logger.warn(s"Store $storeId: UnackedCommits lookup of recovered transaction $txid failed " +
+                  logger.warn(s"Store $storeId: UnackedCommits lookup of transaction $txid failed " +
                     s"(${l.failures} in a row), retrying at heartbeat: $err")
 
   /** Store heartbeat: makes another lookup for each one that failed, and for each unanswered after
@@ -406,7 +406,7 @@ class Frontend(val storeId: StoreId,
       if l.failed || timedOut then
         if transactions.get(txid).exists(_.awaitsUnackedLookup) then
           if timedOut then
-            logger.warn(s"Store $storeId: UnackedCommits lookup of recovered transaction $txid went unanswered " +
+            logger.warn(s"Store $storeId: UnackedCommits lookup of transaction $txid went unanswered " +
               s"for $UnackedLookupTimeout, looking up again")
           startUnackedLookup(txid, l)
         else
@@ -631,11 +631,12 @@ class Frontend(val storeId: StoreId,
     case m: TxResolved =>
       transactions.get(m.transactionId) match
         case Some(tx) => tx.receiveResolved(m)
-        // Remembered for a prepare that arrives after this, late included (see receivePrepare). Not a proof: it is
-        // meant for drivers and is no outcome (Tx.proveCommitted)
+        // Remembered for a prepare that arrives after this (see receivePrepare). A late outcome implies the
+        // transaction was finalized, so it is recorded finalized, as the Tx paths do (Tx.applyNothing). Not a proof:
+        // it is meant for drivers and is no outcome (Tx.proveCommitted)
         case None =>
           if !m.proof && !statusCache.getStatus(m.transactionId).exists(_.finalized) then
-            statusCache.updateStatus(m.transactionId, statusOf(m.committed), late = m.late)
+            statusCache.updateStatus(m.transactionId, statusOf(m.committed), finalized = m.late, late = m.late)
     case m: TxFinalized =>
       transactions.get(m.transactionId) match
         case Some(tx) =>

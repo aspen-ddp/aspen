@@ -96,6 +96,13 @@ class Store(val storageDeviceId: StorageDeviceId,
         lst.foreach(driver.receiveTxPrepareResponse(_))
         prepareResponseCache.invalidate(txd.transactionId)
       }
+
+      // A recovered commit vote that found its UnackedCommits entry knows the transaction committed: its driver holds
+      // that proof from the start, exactly as if a prover had sent it (Tx.foundUnackedEntry). The other stores may
+      // have forgotten the transaction, so deciding abort on their votes would be wrong
+      if frontend.transactions.get(txd.transactionId).exists(_.provesCommitToItsDriver) then
+        driver.receiveTxResolved(TxResolved(storeId, storeId, txd.transactionId, committed = true, late = false,
+          proof = true))
     }
   }
 
@@ -136,7 +143,8 @@ class Store(val storageDeviceId: StorageDeviceId,
 
         // The finalized relay. A committed transaction finalized here is reported late: the prepare is for a transaction
         // whose finalization completed, so its driver runs no finalization actions and stores apply the commit only where
-        // it is owed (TransactionDriver.resolveLate). A cached entry is finalized only on a real TxFinalized
+        // it is owed (TransactionDriver.resolveLate). A cached entry is finalized only from a real TxFinalized or a late
+        // outcome
         val notFinalized = txStatusCache.getStatus(m.txd.transactionId).forall { entry =>
           val late = entry.late || entry.finalized
           val (r, committed: Boolean) = entry.status match {

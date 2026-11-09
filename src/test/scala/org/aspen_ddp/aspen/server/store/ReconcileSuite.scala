@@ -131,7 +131,8 @@ class ReconcileSuite extends AnyFunSuite with Matchers:
     p.refcount shouldBe None
     p.result.stale shouldBe true
 
-  test("a DataObject's data follows a differing revision from a read no older than the store, while its refcount follows the serial"):
+  test("a DataObject's data follows a differing revision from a read no older than the store, " +
+       "while its refcount follows the serial"):
     val store = RepairSnapshot(oid, rev(1), ObjectRefcount(1, 1), ts(10), Map(), None)
     def read(revision: ObjectRevision, refcount: ObjectRefcount, timestamp: HLCTimestamp): DataObjectState =
       DataObjectState(dataPtr, revision, refcount, timestamp, timestamp, ida, 0, DataBuffer(value(30).bytes))

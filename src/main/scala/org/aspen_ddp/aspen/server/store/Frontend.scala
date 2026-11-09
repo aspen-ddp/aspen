@@ -886,21 +886,33 @@ class Frontend(val storeId: StoreId,
       logger.trace(s"Store $storeId: repair of ${os.objectId} installs ${plan.installs.size} keys, deletes " +
         s"${plan.deletes.size}, leaves ${plan.result}")
 
-      // Counted as an in-flight commit: transactions on the object wait behind the write as behind a transaction's
-      // backend commit, and are released when it completes or fails
+      // Held as commit holds an in-flight commit's state: pinned, referenced and served from memory, so nothing reads
+      // the pre-repair state from the backend meanwhile. Counted as an in-flight commit too: transactions on the
+      // object wait behind the write as behind a transaction's backend commit, and are released when it completes
       val objectId = os.objectId
+      objectCache.insert(os)
+      retain(os, shared = true)
+      committing(objectId) = os :: committing.getOrElse(objectId, Nil)
       txCommitsInFlight(objectId) = txCommitsInFlight.getOrElse(objectId, 0) + 1
       val done = Promise[Unit]()
       done.future.onComplete { result =>
-        post(() => repairWriteComplete(objectId, result.isSuccess))
+        post(() => repairWriteComplete(os, result.isSuccess))
         p.complete(result.map(_ => plan.result))
       }(using scala.concurrent.ExecutionContext.parasitic)
       backend.repair(CommitState(read.pointer, os.metadata, os.objectType, os.data), done)
 
-  /** A repair's backend write completed. A failed one leaves memory ahead of the backend, so the state is dropped and
-    * reloaded
+  /** A repair's backend write of `os` completed: its state is no longer held in memory for the write, and the
+    * transactions waiting behind it may proceed.
+    *
+    * A failed write leaves memory ahead of the backend, so the state is only discarded: the next use reloads the
+    * pre-repair state from the backend, and the repair's promise fails, so its entry is kept for a later pass. Unlike
+    * a failed transaction commit it is not recorded in failedCommits, so later transactions on the object are not
+    * refused: no transaction relied on the repaired state being durable
     */
-  private def repairWriteComplete(objectId: ObjectId, succeeded: Boolean): Unit =
+  private def repairWriteComplete(os: ObjectState, succeeded: Boolean): Unit =
+    val objectId = os.objectId
+    committingComplete(os)
+    release(os)
     if !succeeded then
       logger.warn(s"Store $storeId: repair write of object $objectId failed. Its state is reloaded from the backend")
       discard(objectId)

@@ -1918,6 +1918,40 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     prepareResponses(net, txid1).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
   }
 
+  test("a transaction prepared during a repair write is checked against, and commits on top of, the repaired state") {
+    // No cache: only the Frontend's own pinning keeps the repaired state in memory while its write is pending
+    val backend = new DeferredCommitBackend
+    populate(backend)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, ObjectCache.NoCache, net, new TestCrl,
+      new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    backend.deferRepairs = true
+
+    // The read has key 4, which the store missed
+    def vs(n: Int) = org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState(Value(Array[Byte](n.toByte)), rev0,
+      HLCTimestamp(n.toLong))
+    val read = new org.aspen_ddp.aspen.client.KeyValueObjectState(kvPtr, rev0, ObjectRefcount(1, 1),
+      HLCTimestamp(50), HLCTimestamp(50), ida, Some(k(0)), None, None, None, (1 to 4).map(n => k(n) -> vs(n)).toMap)
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr), read, done)
+    backend.repairs shouldBe 1
+
+    // An insert of key 5 with only a key-level requirement, prepared while the repair write is pending
+    val insert = KeyValueOperation.encode(List(new Insert(k(5), Array[Byte](5))), ida)(0)
+    val update = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.DoesNotExist(k(5))))
+    frontend.receiveTransactionMessage(mkPrepare(lockTxd(txid1, List(update)), fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid2, insert))))
+    prepareResponses(net, txid1) shouldBe empty
+
+    backend.deliverRepairs()
+    done.future.value.get.get.complete shouldBe true
+    prepareResponses(net, txid1).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+    resolve(frontend, net, txid1, committed = true)
+    backend.deliverCommits()
+    backend.m(oid2).kvState.get.content.keySet shouldBe (1 to 5).map(k).toSet
+  }
+
   test("a repair whose read completes during a backend commit of the object is stale and writes nothing") {
     val (frontend, backend, _, _) = commitWindowFixture()
     // As the snapshot would record the committed state, so the snapshot check alone would let the write through

@@ -136,9 +136,10 @@ object Reconcile:
       val (refcount, refcountStale) =
         if locks.objectLevel then (None, false) else planRefcount(snapshot, current, read)
 
-      // Deferred under an object-level lock, as KeyValue object-level parts are. HLC timestamps are per transaction, so a read no older than the store's copy reflects every transaction the
-      // store applied. A refcount change advances the timestamp without the revision, so equal timestamps with
-      // differing revisions mean the store missed a data write: the revision, not the timestamp, decides
+      // Deferred under an object-level lock, as KeyValue object-level parts are. HLC timestamps are per
+      // transaction, so a read no older than the store's copy reflects every transaction the store applied. A
+      // refcount change advances the timestamp without the revision, so equal timestamps with differing revisions
+      // mean the store missed a data write: the revision, not the timestamp, decides
       val (data, dataStale) =
         if locks.objectLevel || read.revision == current.revision || read.timestamp < current.timestamp then
           (None, false)

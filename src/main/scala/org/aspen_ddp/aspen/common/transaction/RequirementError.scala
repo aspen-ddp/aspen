@@ -33,6 +33,11 @@ case class StaleObjectState() extends RequirementError
   */
 case class BackendCommitFailed() extends RequirementError
 
+/** A KeyValueUpdate's operations contain a key Delete but the update's deletesKeys flag is not set. Purely local,
+  * like RequirementCheckFailure.
+  */
+case class UnflaggedDelete() extends RequirementError
+
 /** An Append delta does not apply to the store's current slice.
   *
   * Either the payload could not be decoded or its expected slice length or trailer differs from

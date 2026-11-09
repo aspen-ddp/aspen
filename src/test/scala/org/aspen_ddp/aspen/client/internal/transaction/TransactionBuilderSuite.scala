@@ -7,7 +7,9 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.network.ClientId
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, DeleteLeft, DeleteMax, DeleteMin, DeleteRight, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectId, ObjectRevision}
+import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.scalatest.funsuite.AnyFunSuite
@@ -32,6 +34,24 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
 
   private def build(bldr: TransactionBuilder, ida: IDA) =
     bldr.buildTranaction(OpportunisticRebuildManager.None, Map(p1.poolId -> ida), Map(p1.poolId -> None), Map())
+
+  private val kvp = KeyValueObjectPointer(ObjectId(new UUID(0, 9)), PoolId(new UUID(0, 0)), Array[Byte]())
+
+  private def kvDeletesKeys(ops: List[KeyValueOperation]): Boolean =
+    val bldr = mkBuilder()
+    bldr.update(kvp, None, None, Nil, ops)
+    val (txd, _, _) = bldr.buildTranaction(OpportunisticRebuildManager.None, Map(kvp.poolId -> Replication(3, 2)),
+      Map(kvp.poolId -> None), Map())
+    txd.requirements.collectFirst { case r: KeyValueUpdate => r.deletesKeys }.get
+
+  test("an update with a key Delete sets deletesKeys") {
+    kvDeletesKeys(List(Delete(Key(Array[Byte](1))), Insert(Key(Array[Byte](2)), Array[Byte](1)))) shouldBe true
+  }
+
+  test("an update without a key Delete leaves deletesKeys false") {
+    kvDeletesKeys(List(Insert(Key(Array[Byte](2)), Array[Byte](1)), DeleteRight(), DeleteLeft(), DeleteMin(),
+      DeleteMax())) shouldBe false
+  }
 
   test("append adds an Append DataUpdate with the position's revision") {
     val bldr = mkBuilder()

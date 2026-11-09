@@ -104,7 +104,8 @@ class TransactionBuilder(
           keyValueUpdates += (kvptr -> KVUpdate(kvptr, None, None, Nil, Nil))
 
     keyValueUpdates.valuesIterator.foreach: kvu =>
-      requirements = KeyValueUpdate(kvu.pointer, kvu.requiredRevision, kvu.contentLock, kvu.requirements) :: requirements
+      requirements = KeyValueUpdate(kvu.pointer, kvu.requiredRevision, kvu.contentLock, kvu.requirements,
+        deletesKeys = kvu.operations.exists(_.isInstanceOf[Delete])) :: requirements
 
     // Ensure the transaction has at least one requirement
     require(requirements.nonEmpty)

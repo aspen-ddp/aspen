@@ -195,6 +195,11 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decodedMin.contentLock shouldBe None
     decodedMin.requirements shouldBe empty
 
+  test("KeyValueUpdate round-trips deletesKeys"):
+    val r = KeyValueUpdate(kvPtr(11), None, None, Nil, deletesKeys = true)
+    Codec.decode(Codec.encode(r)) shouldBe r
+    Codec.decode(Codec.encode(r.copy(deletesKeys = false))).deletesKeys shouldBe false
+
   test("LocalTimeRequirement round-trip"):
     val lt = LocalTimeRequirement(HLCTimestamp(1000L), LocalTimeRequirement.Requirement.LessThan)
     Codec.decode(Codec.encode(lt)).tsRequirement shouldBe LocalTimeRequirement.Requirement.LessThan

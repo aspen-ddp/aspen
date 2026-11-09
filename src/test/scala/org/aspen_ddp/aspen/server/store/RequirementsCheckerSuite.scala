@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, SetMax, SetRight, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, AppendMismatch, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, AppendMismatch, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -1049,7 +1049,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   private def checkKVSized(kvos: KVObjectState, ops: List[KeyValueOperation], maxSliceSize: Option[Long]) =
     val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, kvos.encode())
     o.kvState = Some(kvos)
-    val req = KeyValueUpdate(kp1, Some(rev1), None, Nil)
+    val req = KeyValueUpdate(kp1, Some(rev1), None, Nil, deletesKeys = ops.exists(_.isInstanceOf[Delete]))
     val payload = KeyValueOperation.encode(ops, Replication(3, 2))(0)
     RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), HashMap(oid1 -> o), HashMap(oid1 -> payload),
       maxSliceSize)
@@ -1203,7 +1203,8 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   /** A KeyValueUpdate of oid1 with no requirements beyond `reqs`, and its object data */
   private case class KVTx(txid: TransactionId, reqs: List[KeyValueUpdate.KeyRequirement], ops: List[KeyValueOperation],
                           requiredRevision: Option[ObjectRevision] = None):
-    val requirements: List[TransactionRequirement] = List(KeyValueUpdate(kp1, requiredRevision, None, reqs))
+    val requirements: List[TransactionRequirement] = List(KeyValueUpdate(kp1, requiredRevision, None, reqs,
+      deletesKeys = ops.exists(_.isInstanceOf[Delete])))
     val updates: Map[ObjectId, DataBuffer] = Map(oid1 -> kvData(ops))
     def writes: Map[ObjectId, KVWrites] = KVWrites.from(requirements, updates)
     def check(objects: Map[ObjectId, ObjectState], applying: Boolean = false): Map[ObjectId, RequirementError] =
@@ -1249,6 +1250,20 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     for (mk, req, write) <- pairs do
       lockThenCheckKV(mk(), req(tx1), write(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
       lockThenCheckKV(mk(), write(tx1), req(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
+  }
+
+  test("a key Delete without deletesKeys is rejected") {
+    val (objErrors, _) = RequirementsChecker.check(tx1, HLCTimestamp.now,
+      List(KeyValueUpdate(kp1, None, None, Nil, deletesKeys = false)), kvObjectWithKey(),
+      Map(oid1 -> kvData(List(Delete(kk1)))))
+    objErrors(oid1) shouldBe UnflaggedDelete()
+  }
+
+  test("a flagged key Delete passes") {
+    val (objErrors, _) = RequirementsChecker.check(tx1, HLCTimestamp.now,
+      List(KeyValueUpdate(kp1, None, None, Nil, deletesKeys = true)), kvObjectWithKey(),
+      Map(oid1 -> kvData(List(Delete(kk1)))))
+    objErrors shouldBe empty
   }
 
   test("a blind delete collides with a lock on its key") {

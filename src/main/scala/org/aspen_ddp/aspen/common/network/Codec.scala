@@ -334,7 +334,8 @@ object Codec extends Logging:
       objectPointer = Some(encode(o.objectPointer)),
       requiredRevision = o.requiredRevision.map(encode),
       contentLock = o.contentLock.map(lck => lck.fullContents.map(encode)).getOrElse(Seq.empty),
-      requirements = o.requirements.map(encode)
+      requirements = o.requirements.map(encode),
+      deletesKeys = o.deletesKeys
     )
 
   def decode(m: codec.KeyValueUpdate): KeyValueUpdate =
@@ -349,7 +350,7 @@ object Codec extends Logging:
 
     val requirements = m.requirements.map(decode).toList
 
-    KeyValueUpdate(objectPointer, requiredRevision, contentLock, requirements)
+    KeyValueUpdate(objectPointer, requiredRevision, contentLock, requirements, m.deletesKeys)
 
 
   def encodeLocalTimeRequirementEnum(o: LocalTimeRequirement.Requirement.Value): codec.LocalTimeRequirementEnum = o match

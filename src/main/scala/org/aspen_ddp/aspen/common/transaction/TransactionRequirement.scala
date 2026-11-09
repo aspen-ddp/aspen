@@ -61,11 +61,16 @@ sealed abstract class KeyValueTransactionRequirement extends TransactionObjectRe
   override val objectPointer: KeyValueObjectPointer
 }
 
+/** @param deletesKeys Set when the operations contain a key `Delete`. `DeleteMin`/`DeleteMax`/`DeleteLeft`/
+  *                    `DeleteRight` do not set it, and a use of them without a required revision is a traceless
+  *                    change this flag does not cover.
+  */
 case class KeyValueUpdate(
                            objectPointer: KeyValueObjectPointer,
                            requiredRevision: Option[ObjectRevision],
                            contentLock: Option[KeyValueUpdate.FullContentLock],
-                           requirements: List[KeyValueUpdate.KeyRequirement]) extends KeyValueTransactionRequirement
+                           requirements: List[KeyValueUpdate.KeyRequirement],
+                           deletesKeys: Boolean = false) extends KeyValueTransactionRequirement
 
 object KeyValueUpdate {
 

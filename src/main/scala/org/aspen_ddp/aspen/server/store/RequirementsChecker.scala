@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.ida.EncodedAppendDelta
-import org.aspen_ddp.aspen.common.objects.{KeyValueOperation, ObjectId, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{Delete, KeyValueOperation, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -124,6 +124,8 @@ object RequirementsChecker extends Logging {
             val ops = objectUpdates.get(r.objectPointer.id).map { data =>
               KeyValueOperation.decode(data, ObjectRevision(transactionId), txTimestamp)
             }
+            if ops.exists(_.exists(_.isInstanceOf[Delete])) && !r.deletesKeys then
+              throw ObjectErr(r.objectPointer.id, UnflaggedDelete())
             val writes = ops.map(KVWrites.of)
 
             // Requirements and operations that lock the whole object, rather than only the keys they name

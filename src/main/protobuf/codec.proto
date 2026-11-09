@@ -144,6 +144,7 @@ message KeyValueUpdate {
   ObjectRevision required_revision = 2;
   repeated KeyRevision content_lock = 3;
   repeated KVReq requirements = 4;
+  bool deletes_keys = 5;
 }
 
 enum LocalTimeRequirementEnum {

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.read
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{CorruptedObject, InvalidObject, MetadataObjectState, ObjectState, ReadError => ClientReadError}
+import org.aspen_ddp.aspen.client.{ReadLocks, CorruptedObject, InvalidObject, MetadataObjectState, ObjectState, ReadError => ClientReadError}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.ReadResponse
@@ -100,7 +100,9 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
 
         case Right(cs) =>
           try {
-            responses += response.fromStore -> Right(createObjectState(response.fromStore, response.readTime, cs))
+            val ss = createObjectState(response.fromStore, response.readTime, cs)
+            ss.readLocks = ReadLocks(cs.lockedKeys, cs.objectLocked)
+            responses += response.fromStore -> Right(ss)
           } catch {
             case _: ObjectEncodingError =>
               responses += response.fromStore -> Left(CommonReadError.CorruptedObject)
@@ -189,6 +191,9 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
           
           // Check if the object was recently deleted but the state hasn't yet been
           // flushed out of the backends
+          restoredObject.readLocks = allStoreStates.foldLeft(ReadLocks.None): (acc, ss) =>
+            ReadLocks(acc.keys ++ ss.readLocks.keys, acc.objectLevel || ss.readLocks.objectLevel)
+
           if restoredObject.refcount.count > 0 then
             Some(Right(restoredObject))
           else

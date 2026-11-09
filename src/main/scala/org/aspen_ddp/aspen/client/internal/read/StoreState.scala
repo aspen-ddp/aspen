@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.read
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.KeyValueObjectState
+import org.aspen_ddp.aspen.client.{KeyValueObjectState, ReadLocks}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRefcount, ObjectRevision, Value}
@@ -18,6 +18,9 @@ sealed abstract class StoreState(
                                   val readTimestamp: HLCTimestamp) {
 
   var rereadRequired: Boolean = false
+
+  /** Keys and object-level write locks this store reported with its response */
+  var readLocks: ReadLocks = ReadLocks.None
 
   def lastUpdateTimestamp: HLCTimestamp
 

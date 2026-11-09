@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
 
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
@@ -171,7 +171,9 @@ object ReadResponse {
                            timestamp: HLCTimestamp,
                            sizeOnStore: Int,
                            objectData: Option[DataBuffer],
-                           lockedWriteTransactions: Set[TransactionId]) {
+                           lockedWriteTransactions: Set[TransactionId],
+                           lockedKeys: Set[Key] = Set(),
+                           objectLocked: Boolean = false) {
 
     override def equals(other: Any): Boolean = other match {
       case rhs: CurrentState =>
@@ -182,13 +184,14 @@ object ReadResponse {
           case _ => false
         }
 
-        revision == rhs.revision && refcount == rhs.refcount && dmatch && lockedWriteTransactions == rhs.lockedWriteTransactions
+        revision == rhs.revision && refcount == rhs.refcount && dmatch && lockedWriteTransactions == rhs.lockedWriteTransactions &&
+          lockedKeys == rhs.lockedKeys && objectLocked == rhs.objectLocked
 
       case _ => false
     }
 
     /** Excludes timestamp and sizeOnStore, matching equals */
-    override def hashCode: Int = (revision, refcount, objectData, lockedWriteTransactions).##
+    override def hashCode: Int = (revision, refcount, objectData, lockedWriteTransactions, lockedKeys, objectLocked).##
   }
 }
 

@@ -820,7 +820,9 @@ object Codec extends Logging:
           timestamp = r.timestamp.asLong,
           hasObjectData = r.objectData.isDefined,
           objectData = r.objectData.map(data => ByteString.copyFrom(data.asReadOnlyBuffer())).getOrElse(ByteString.EMPTY),
-          lockedWriteTransactions = ByteString.copyFrom(arr)
+          lockedWriteTransactions = ByteString.copyFrom(arr),
+          lockedKeys = r.lockedKeys.toSeq.map(k => ByteString.copyFrom(k.bytes)),
+          objectLocked = r.objectLocked
         )
 
   def decode(m: codec.ReadResponse): ReadResponse =
@@ -848,7 +850,8 @@ object Codec extends Logging:
         lockedTx = TransactionId(new UUID(msb, lsb)) :: lockedTx
       }
 
-      Right(ReadResponse.CurrentState(revision, refcount, timestamp, sizeOnStore, data, lockedTx.toSet))
+      Right(ReadResponse.CurrentState(revision, refcount, timestamp, sizeOnStore, data, lockedTx.toSet,
+        m.lockedKeys.iterator.map(b => Key(b.toByteArray)).toSet, m.objectLocked))
 
     ReadResponse(toClient, fromStore, readUuid, readTime, result)
 

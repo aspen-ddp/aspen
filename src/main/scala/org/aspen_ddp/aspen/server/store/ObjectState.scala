@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectType}
+import org.aspen_ddp.aspen.common.objects.{Key, Metadata, ObjectId, ObjectType}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 
 class ObjectState(val objectId: ObjectId,
@@ -54,6 +54,18 @@ class ObjectState(val objectId: ObjectId,
     }
     s
   }
+
+  /** Keys a write lock covers: present keys locked to a transaction plus absent-key locks */
+  def lockedKeys: Set[Key] =
+    kvState match
+      case None => Set()
+      case Some(kvs) =>
+        kvs.content.iterator.collect { case (k, vs) if vs.lockedToTransaction.nonEmpty => k }.toSet ++
+          kvs.absentKeyLocks.keySet
+
+  /** True when a write lock covers the whole object */
+  def objectLevelLocked: Boolean =
+    lockedToTransaction.nonEmpty || kvState.exists(kvs => kvs.contentLocked.nonEmpty || kvs.rangeLocks.nonEmpty)
 
   /** Every transaction holding any lock on this object, shared locks included */
   def lockHolders: Set[TransactionId] = lockedWriteTransactions ++ sharedLocks

@@ -461,6 +461,19 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
       Right(ReadResponse.CurrentState(rev(4), ObjectRefcount(1, 5), HLCTimestamp(2000L), 0, Some(DataBuffer()), Set.empty)))
     Codec.decode(Codec.encode(emptyDataResp)).result.toOption.get.objectData.map(_.size) shouldBe Some(0)
 
+  test("ReadResponse round-trips lockedKeys and objectLocked"):
+    def rr(lockedKeys: Set[Key], objectLocked: Boolean) =
+      ReadResponse(ClientId(uuid(1)), storeId(2), uuid(3), HLCTimestamp(1000L),
+        Right(ReadResponse.CurrentState(rev(4), ObjectRefcount(1, 5), HLCTimestamp(2000L), 0, None, Set.empty,
+          lockedKeys, objectLocked)))
+    val k1 = Key(Array[Byte](1))
+    val k2 = Key(Array[Byte](2, 3))
+    val sent = rr(Set(k1, k2), true)
+    Codec.decode(Codec.encode(sent)) shouldBe sent
+    val back = Codec.decode(Codec.encode(sent)).result.toOption.get
+    back.lockedKeys shouldBe Set(k1, k2)
+    back.objectLocked shouldBe true
+
   test("OpportunisticRebuild round-trip"):
     val original = OpportunisticRebuild(
       storeId(1), ClientId(uuid(2)), dataPtr(3), rev(4),

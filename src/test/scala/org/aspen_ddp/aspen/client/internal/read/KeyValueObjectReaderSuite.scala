@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.internal.read
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.KeyValueObjectState
+import org.aspen_ddp.aspen.client.{KeyValueObjectState, ReadLocks}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
@@ -103,7 +103,14 @@ object KeyValueObjectReaderSuite {
     def ok(store: Int,
            oversion: (ObjectRevision, HLCTimestamp),
            locks: Set[ObjectRevision],
-           ops: KVOp*): Unit = {
+           ops: KVOp*): Unit = okLocked(store, oversion, locks, Set(), false, ops*)
+
+    def okLocked(store: Int,
+                 oversion: (ObjectRevision, HLCTimestamp),
+                 locks: Set[ObjectRevision],
+                 lockedKeys: Set[Key],
+                 objectLocked: Boolean,
+                 ops: KVOp*): Unit = {
 
       var min: Option[Key] = None
       var max: Option[Key] = None
@@ -129,7 +136,8 @@ object KeyValueObjectReaderSuite {
         oversion._2,
         odata.map(_.size).getOrElse(0),
         odata,
-        locks.map(r => TransactionId(r.lastUpdateTxUUID)))
+        locks.map(r => TransactionId(r.lastUpdateTxUUID)),
+        lockedKeys, objectLocked)
 
       receiveReadResponse(ReadResponse(client, StoreId(pool, store.toByte), this.readUUID, HLCTimestamp.Zero, Right(cs)))
     }
@@ -142,6 +150,15 @@ object KeyValueObjectReaderSuite {
 
 class KeyValueObjectReaderSuite extends AnyFunSuite with Matchers {
   import KeyValueObjectReaderSuite._
+
+  test("a restored object's readLocks is the union of every responder's locks") {
+    val r = TestReader(ida3)
+    r.okLocked(0, v0, Set(), Set(kfoo), false, a0)
+    r.okLocked(1, v0, Set(), Set(kbar), true, a0)
+    r.okLocked(2, v0, Set(), Set(), false, a0)
+    val state = r.result.get.toOption.get
+    state.readLocks should be (ReadLocks(Set(kfoo, kbar), objectLevel = true))
+  }
 
   test("Resolve empty object") {
     val r = TestReader(ida3)

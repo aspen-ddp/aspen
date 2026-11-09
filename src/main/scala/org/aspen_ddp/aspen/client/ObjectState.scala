@@ -9,6 +9,12 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.util.Varint
 
+/** Write locks stores reported when the object was read: locked keys and whether an object-level write lock is held */
+final case class ReadLocks(keys: Set[Key], objectLevel: Boolean)
+
+object ReadLocks:
+  val None: ReadLocks = ReadLocks(Set(), false)
+
 sealed abstract class ObjectState(
                                    val pointer: ObjectPointer,
                                    val revision: ObjectRevision,
@@ -17,6 +23,9 @@ sealed abstract class ObjectState(
                                    val readTimestamp: HLCTimestamp) {
 
   def id: ObjectId = pointer.id
+
+  /** Union of the locks reported by every successful store response, set by the reader */
+  private[aspen] var readLocks: ReadLocks = ReadLocks.None
 
   def canEqual(other: Any): Boolean
 

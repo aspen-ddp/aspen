@@ -351,6 +351,8 @@ message ReadResponse {
   bytes locked_write_transactions = 11; // Sequence of UUIDs
   ObjectReadError readError = 12;
   bool has_object_data = 13; // object_data is present, possibly empty
+  repeated bytes locked_keys = 14; // Keys write-locked on the store
+  bool object_locked = 15; // An object-level write lock is held
 }
 
 message OpportunisticRebuild {

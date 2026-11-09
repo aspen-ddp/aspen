@@ -688,6 +688,55 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
   }
 
+  // ---- Write locks are held until a commit is applied ----
+
+  test("a commit held for missing data has no vote and so no write locks; it applies when the data arrives") {
+    // A commit vote requires the data (Tx.commitAwaitsData), so a commit held for data never has locks to keep
+    withDataless(): (frontend, backend, net, _) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      frontend.transactions(txid1).holdsLocks shouldBe false
+      backend.get(oid1).get.metadata.revision shouldBe rev0
+
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
+      frontend.transactions.get(txid1).forall(!_.holdsLocks) shouldBe true
+  }
+
+  test("a commit held behind an in-flight commit of its object keeps its write locks until applied") {
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
+    def locksOn(ptr: ObjectPointer): Set[TransactionId] =
+      frontend.readObjectForNetwork(clientId, new UUID(1, 1), ptr, FullObject())
+      net.clientMessage() match
+        case Some(rr: ReadResponse) => rr.result.toOption.get.lockedWriteTransactions
+        case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
+
+    // txid2 votes commit and locks op1 and the fence
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1), overwrite(fencePtr))))
+      .disposition shouldBe TransactionDisposition.VoteCommit
+    // txid1 collides on the fence but is committed by the other stores' votes; its backend commit is held
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(fencePtr)))).disposition shouldBe TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+
+    // txid2 is committed too, but its commit waits for txid1's to persist
+    resolve(frontend, net, txid2, committed = true)
+    backend.heldCommits shouldBe 1
+    backend.issued shouldBe List(txid1)
+    frontend.transactions(txid2).holdsLocks shouldBe true
+    locksOn(op1) shouldBe Set(txid2)
+    locksOn(fencePtr) shouldBe Set(txid2)
+
+    // txid1 persists: txid2 is applied in memory, and only then are its locks released
+    backend.deliverOne()
+    backend.issued shouldBe List(txid1, txid2)
+    locksOn(op1) shouldBe Set()
+    locksOn(fencePtr) shouldBe Set()
+    frontend.transactions.get(txid2).forall(!_.holdsLocks) shouldBe true
+    readData(frontend, net, op1) shouldBe Right(List[Byte](1))
+  }
+
   // ---- Requirement locks held between a commit vote and resolution ----
 
   val txid3 = TransactionId(new UUID(0, 11))

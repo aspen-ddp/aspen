@@ -20,18 +20,26 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   * @param minErrorEntryAgeForDeletion  how long an errorTree entry must sit before its object's
   *                                     absence from the allocationTree is taken as proof of
   *                                     deletion
+  * @param proofAfterDeferrals          consecutive passes a repair entry's object may have parts deferred by a lock
+  *                                     before the scan proves them with a transaction instead of waiting for the
+  *                                     lock to clear (RepairProofs)
   */
 case class RepairPolicy(scanIntervalFloor: Duration,
                         scanIntervalCap: Duration,
-                        minErrorEntryAgeForDeletion: Duration):
+                        minErrorEntryAgeForDeletion: Duration,
+                        proofAfterDeferrals: Int = RepairPolicy.DefaultProofAfterDeferrals):
 
   def encode(): Array[Byte] = codec.RepairPolicy(
     scanIntervalFloorSeconds = scanIntervalFloor.toSeconds.toInt,
     scanIntervalCapSeconds = scanIntervalCap.toSeconds.toInt,
-    minErrorEntryAgeForDeletionSeconds = minErrorEntryAgeForDeletion.toSeconds.toInt
+    minErrorEntryAgeForDeletionSeconds = minErrorEntryAgeForDeletion.toSeconds.toInt,
+    proofAfterDeferrals = proofAfterDeferrals
   ).toByteArray
 
 object RepairPolicy:
+
+  /** 5 minutes of deferral at the 30 s scan floor */
+  val DefaultProofAfterDeferrals: Int = 10
 
   val Default: RepairPolicy = RepairPolicy(
     scanIntervalFloor = Duration(30, SECONDS),
@@ -51,7 +59,8 @@ object RepairPolicy:
     RepairPolicy(
       seconds(m.scanIntervalFloorSeconds, Default.scanIntervalFloor),
       seconds(m.scanIntervalCapSeconds, Default.scanIntervalCap),
-      seconds(m.minErrorEntryAgeForDeletionSeconds, Default.minErrorEntryAgeForDeletion))
+      seconds(m.minErrorEntryAgeForDeletionSeconds, Default.minErrorEntryAgeForDeletion),
+      if m.proofAfterDeferrals <= 0 then Default.proofAfterDeferrals else m.proofAfterDeferrals)
 
   /** Reads the pool's policy. An absent key yields Default -- no pool has this key today and
     * nothing is required to write one, so repair works with zero administration. A failed read

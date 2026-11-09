@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 
@@ -22,6 +23,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
   private class FixedTarget extends RepairTarget:
     def repairableStoreIds: List[StoreId] = storeIds
     def isRepairable(storeId: StoreId): Boolean = storeIds.contains(storeId)
+    def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
     def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
       p.success(RepairSnapshot.missing(pointer.id))
     def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
@@ -89,6 +91,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
     val target = new RepairTarget:
       def repairableStoreIds: List[StoreId] = hosted
       def isRepairable(storeId: StoreId): Boolean = hosted.contains(storeId)
+      def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
       def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
         p.success(RepairSnapshot.missing(pointer.id))
       def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
@@ -138,6 +141,43 @@ class RepairServiceSuite extends IntegrationTestSuite:
       val s = svc.testingOnlyScanStates(storeIds.head)
       s.currentInterval shouldBe RepairPolicy.Default.scanIntervalFloor
       s.nextDue should be > 60_000L
+
+  test("a scan that finds only TracelessCommits entries is not quiet"):
+    Future.successful:
+      ScanResult(seen = 0, repaired = 0, deferred = 0, tracelessSeen = 1).foundEntries shouldBe true
+      ScanResult.Empty.foundEntries shouldBe false
+
+  test("a store's deferral state is kept across its scans and dropped when the store departs"):
+    val clock = AtomicLong(0L)
+    @volatile var hosted = storeIds
+
+    class Target extends FixedTarget:
+      override def repairableStoreIds: List[StoreId] = hosted
+      override def isRepairable(storeId: StoreId): Boolean = hosted.contains(storeId)
+
+    class RecordingService extends RepairService(client, HostId.BootstrapHostId, Target(),
+                                                 BackgroundTaskManager.NoBackgroundTaskManager, () => clock.get):
+      @volatile var seen: List[(StoreId, DeferralState)] = Nil
+      override protected def scanStore(storeId: StoreId, policy: RepairPolicy): Future[ScanResult] =
+        synchronized { seen = (storeId -> deferralOf(storeId)) :: seen }
+        Future.successful(ScanResult.Empty)
+
+    val svc = RecordingService()
+    val first = storeIds.head
+    for
+      _ <- svc.sweep()
+      _ = clock.set(60_000L)
+      _ <- svc.sweep()
+      _ = clock.set(300_000L)
+      _ <- svc.sweep()
+      kept = svc.seen.filter(_._1 == first).map(_._2)
+      _ = hosted = storeIds.drop(1)
+      _ = clock.set(600_000L)
+      _ <- svc.sweep()
+    yield
+      kept.size shouldBe 2
+      kept.distinct.size shouldBe 1
+      svc.testingOnlyDeferrals.keySet should not contain first
 
   test("a scan that never completes does not wedge the sweep"):
     val clock = AtomicLong(0L)

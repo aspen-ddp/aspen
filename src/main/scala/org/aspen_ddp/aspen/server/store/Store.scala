@@ -105,6 +105,9 @@ class Store(val storageDeviceId: StorageDeviceId,
   /** Callable from any thread: reads one snapshot of `transactionDrivers` */
   def hasTransactions: Boolean = transactionDrivers.nonEmpty
 
+  /** Callable from any thread: see Frontend.mayHoldTransaction */
+  def holdsTransaction(txid: TransactionId): Boolean = frontend.mayHoldTransaction(txid)
+
   /** Callable from any thread: reads one snapshot of `transactionDrivers`; printState takes each driver's own lock */
   def logTransactionStatus(log: String => Unit): Unit =
     transactionDrivers.values.foreach(_.printState(log))

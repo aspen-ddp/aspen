@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.TransactionStatus
+import org.aspen_ddp.aspen.common.transaction.{TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.DurableFiles
 import org.aspen_ddp.aspen.server.repair.StoreNotHosted
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store}
@@ -225,6 +225,12 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   def isLoading(storeId: StoreId): Boolean = loading.contains(storeId)
 
   def isAwaitingDevice(storeId: StoreId): Boolean = awaitingDevice.contains(storeId)
+
+  /** Callable from any thread (the repair scan): Store.holdsTransaction reads volatile snapshots. False for a store not
+    * loaded here, whose repair fails with StoreNotHosted anyway
+    */
+  def holdsTransaction(storeId: StoreId, txid: TransactionId): Boolean =
+    Option(stores.get(storeId)).exists(_.store.holdsTransaction(txid))
 
   /** Callable from any thread (TestNetwork's checker thread): Store.hasTransactions reads a volatile snapshot. */
   def hasTransactions: Boolean = stores.values.asScala.exists(_.store.hasTransactions)

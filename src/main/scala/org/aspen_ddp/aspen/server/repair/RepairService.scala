@@ -40,6 +40,8 @@ class RepairService(client: AspenClient,
   private val rand = Random()
 
   private var scanStates: Map[StoreId, ScanState] = Map()
+  /** Each store's lock deferrals, kept across its scans and dropped with its ScanState when it leaves */
+  private var deferrals: Map[StoreId, DeferralState] = Map()
   private var policyCache: Map[PoolId, RepairPolicy] = Map()
   private var limits: HostRepairLimits = HostRepairLimits.Default
 
@@ -50,7 +52,19 @@ class RepairService(client: AspenClient,
 
   /** Overridable so tests can count concurrency without doing I/O. */
   protected def scanStore(storeId: StoreId, policy: RepairPolicy): Future[ScanResult] =
-    repairer.scan(storeId, policy)
+    repairer.scan(storeId, policy, deferralOf(storeId))
+
+  /** The store's DeferralState, created on first use */
+  protected def deferralOf(storeId: StoreId): DeferralState = synchronized {
+    deferrals.get(storeId) match
+      case Some(d) => d
+      case None =>
+        val d = DeferralState()
+        deferrals += storeId -> d
+        d
+  }
+
+  private[repair] def testingOnlyDeferrals: Map[StoreId, DeferralState] = synchronized { deferrals }
 
   /** Overridable so the deadline can be tested without waiting for it. */
   protected def scanDeadline: FiniteDuration = ScanDeadline
@@ -152,6 +166,7 @@ class RepairService(client: AspenClient,
   private def selectDue(repairable: List[StoreId], now: Long): List[StoreId] = synchronized {
     val live = repairable.toSet
     scanStates = scanStates.filter((storeId, _) => live.contains(storeId))
+    deferrals = deferrals.filter((storeId, _) => live.contains(storeId))
 
     repairable.filter: storeId =>
       scanStates.get(storeId) match
@@ -171,9 +186,9 @@ class RepairService(client: AspenClient,
       .flatMap(_ => withDeadline(scanDeadline, ScanTimedOut(storeId, scanDeadline)):
         scanStore(storeId, policy))
       .map: result =>
-        if result.seen > 0 then
-          logger.info(s"Repair scan of $storeId: ${result.seen} seen, ${result.repaired} " +
-                      s"repaired, ${result.deferred} deferred")
+        if result.foundEntries then
+          logger.info(s"Repair scan of $storeId: ${result.seen} seen, ${result.tracelessSeen} TracelessCommits " +
+                      s"seen, ${result.repaired} repaired, ${result.deferred} deferred")
         result.foundEntries
 
     val recovered = fFound.recover:

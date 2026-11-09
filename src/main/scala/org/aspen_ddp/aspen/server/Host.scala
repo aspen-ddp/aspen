@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDevi
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
@@ -372,6 +373,10 @@ class Host(val client: AspenClient,
 
   def receiveHostMessage(msg: HostMessage): Unit =
     post(HostMsg(msg))
+
+  /** Called from the repair scan's thread: reads the router's concurrent map and the store's volatile snapshots */
+  def holdsTransaction(storeId: StoreId, txid: TransactionId): Boolean =
+    deviceControl.router.holdsTransaction(storeId, txid)
 
   def snapshot(storeId: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
     deviceControl.router.snapshotForRepair(storeId, pointer, p)

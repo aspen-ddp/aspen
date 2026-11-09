@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server.repair
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 
 import scala.concurrent.Promise
@@ -15,7 +16,7 @@ import scala.concurrent.Promise
 case class StoreNotHosted(storeId: StoreId)
   extends Exception(s"Store $storeId is not hosted here")
 
-/** The three operations the repair service needs from a Host.
+/** The operations the repair service needs from a Host.
   *
   * Host is a large class with an event loop and a device-discovery constructor. Depending on
   * this trait instead lets StoreRepairer and RepairService be tested against a recording fake.
@@ -32,6 +33,12 @@ trait RepairTarget:
     * repairable on this host. Must agree with `repairableStoreIds.contains(storeId)` exactly.
     */
   def isRepairable(storeId: StoreId): Boolean
+
+  /** Whether the store holds transaction `txid` live (recovered or active), or may once the CRL state it is loading
+    * is recovered. A TracelessCommits entry for such a transaction is skipped: the store's Tx applies it. Callable
+    * from any thread: it reads `@volatile` snapshots, as `Host.hasTransactions` does
+    */
+  def holdsTransaction(storeId: StoreId, txid: TransactionId): Boolean
 
   /** Records the store's copy of the object, the first step of a repair (`Reconcile`). Completes `p` with
     * Failure(StoreNotHosted) if the store has left this host.

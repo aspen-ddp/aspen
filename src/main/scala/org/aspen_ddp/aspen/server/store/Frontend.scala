@@ -68,12 +68,20 @@ class Frontend(val storeId: StoreId,
 
   import Frontend._
 
-  var transactions: Map[TransactionId, Tx] = Map()
+  /** Written only on the store's executor. `@volatile` so that `mayHoldTransaction` may read one snapshot of it from
+    * another thread (the repair scan), as Store.hasTransactions reads `transactionDrivers`
+    */
+  @volatile var transactions: Map[TransactionId, Tx] = Map()
 
   /** Transactions waiting for a lock holder, by holder. See Tx.awaitableHolders */
   private val collisionWaiters = scala.collection.mutable.HashMap[TransactionId, List[Tx]]()
 
   def holdsLocks(txid: TransactionId): Boolean = transactions.get(txid).exists(_.holdsLocks)
+
+  /** Callable from any thread: whether the store holds `txid` live (recovered or active), or may once the CRL state it
+    * is loading is recovered. Reads one snapshot of each `@volatile` field and touches no other state
+    */
+  def mayHoldTransaction(txid: TransactionId): Boolean = awaitingCrl || transactions.contains(txid)
 
   def awaitLocksReleased(holder: TransactionId, waiter: Tx): Unit =
     val others = collisionWaiters.getOrElse(holder, Nil).filterNot(_ eq waiter)
@@ -202,8 +210,10 @@ class Frontend(val storeId: StoreId,
   /** Transaction messages held, newest first, until recovery completes. See awaitRecovery and recoverTransactions */
   private var heldMessages: List[TxMessage] = Nil
 
-  /** The store's CRL state is still being loaded (from a crl_save.log). See awaitRecovery */
-  private var awaitingCrl: Boolean = false
+  /** The store's CRL state is still being loaded (from a crl_save.log). See awaitRecovery. `@volatile` for
+    * mayHoldTransaction
+    */
+  @volatile private var awaitingCrl: Boolean = false
 
   /** Recovered transactions whose objects have not all loaded yet, and whether each has a persisted vote */
   private var recoveringTransactions: Map[TransactionId, Boolean] = Map()
@@ -855,10 +865,13 @@ class Frontend(val storeId: StoreId,
   private def reconcileSettled(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult],
                                loaded: Option[ObjectState]): Unit =
     val current = loaded.map(RepairSnapshot.of).getOrElse(RepairSnapshot.missing(read.pointer.id))
+    // A proof transaction showed the read current on the proven parts, so the locks it reports there are ignored
+    val reported = ReadLocks(read.readLocks.keys -- snapshot.proven.keys,
+                             read.readLocks.objectLevel && !snapshot.proven.objectLevel)
     val locks = loaded match
-      case None => read.readLocks
+      case None => reported
       case Some(os) =>
-        ReadLocks(read.readLocks.keys ++ os.lockedKeys, read.readLocks.objectLevel || os.objectLevelLocked)
+        ReadLocks(reported.keys ++ os.lockedKeys, reported.objectLevel || os.objectLevelLocked)
     val plan = Reconcile.plan(snapshot, current, read, storeId, locks)
 
     if plan.changesNothing then

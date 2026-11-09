@@ -101,6 +101,20 @@ class ReconcileSuite extends AnyFunSuite with Matchers:
     p.result.objectLevelDeferred shouldBe false
     p.result.complete shouldBe false
 
+  test("a pass of only the deferred keys reconciles them and leaves the rest of the object alone"):
+    val store = kvStore(Map(k0 -> rev(1), k1 -> rev(2), k2 -> rev(3)))
+    // Differing everywhere: only k1 and k2 are in scope, and k2 is still locked
+    val read = kvRead(Map(k0 -> rev(9)), revision = rev(8), refcount = ObjectRefcount(2, 3), timestamp = ts(20),
+      min = Some(k0))
+    val p = plan(store.copy(only = Some(Set(k1, k2))), store, read, ReadLocks(Set(k2, k3), objectLevel = true))
+    p.installs shouldBe empty
+    p.deletes shouldBe Set(k1)
+    p.refcount shouldBe None
+    p.objectLevel shouldBe None
+    p.revision shouldBe None
+    p.timestamp shouldBe None
+    p.result shouldBe ReconcileResult(Set(k2), objectLevelDeferred = false, stale = false)
+
   test("an object-level lock defers revision, min, max, left, right and refcount"):
     val store = kvStore(Map(k0 -> rev(1)))
     val read = kvRead(Map(k0 -> rev(1), k1 -> rev(2)), revision = rev(8), refcount = ObjectRefcount(2, 3),

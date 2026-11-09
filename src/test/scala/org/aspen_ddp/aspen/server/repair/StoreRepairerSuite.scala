@@ -1,12 +1,14 @@
 package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, Transaction}
+import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, ReadLocks, Transaction}
+import org.aspen_ddp.aspen.client.internal.transaction.TracelessCommitEntry
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectId,
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Key, KeyValueObjectPointer, ObjectId,
                                            ObjectPointer, ObjectRefcount, Value}
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -56,6 +58,8 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     def repairableStoreIds: List[StoreId] = if departed.get then Nil else hosted
 
     def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
+
+    def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
 
     def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
       p.success(RepairSnapshot.missing(pointer.id))
@@ -246,6 +250,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     val failing = new RepairTarget:
       def repairableStoreIds: List[StoreId] = List(storeId)
       def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
+      def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
       def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
         p.failure(StoreNotHosted(sid))
       def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
@@ -267,6 +272,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     val failing = new RepairTarget:
       def repairableStoreIds: List[StoreId] = List(storeId)
       def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
+      def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
       def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
         p.failure(StoreNotHosted(sid))
       def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
@@ -339,6 +345,11 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   private def stored(i: Int, id: ObjectId): Option[org.aspen_ddp.aspen.server.store.ObjectState] =
     net.stores(i).m.get(id)
 
+  /** Whether store `i` holds a live copy. MapBackend keeps a deleted object's zero-refcount state; repairDelete drops
+    * it
+    */
+  private def storeHasObject(i: Int, id: ObjectId): Boolean = stored(i, id).exists(_.metadata.refcount.count > 0)
+
   private def storeKeys(i: Int, ptr: KeyValueObjectPointer): Set[Key] =
     stored(i, ptr.id).flatMap(_.kvState).map(_.content.keySet).getOrElse(Set())
 
@@ -354,6 +365,31 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       tree <- errorTree
       _ <- tree.foreachInRange(min, max, (_, key, _) => { synchronized { keys = key :: keys }; Future.unit })
     yield keys
+
+  /** The keys of store `i`'s TracelessCommits entries */
+  private def tracelessEntries(i: Int): Future[List[Key]] =
+    @volatile var keys: List[Key] = Nil
+    val min = Key(Array[Byte](i.toByte))
+    val max = Key(Array[Byte]((i + 1).toByte))
+    for
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      _ <- pool.tracelessCommitsTree.foreachInRange(min, max,
+             (_, key, _) => { synchronized { keys = key :: keys }; Future.unit })
+    yield keys
+
+  /** Deletes store `i`'s errorTree entries, so that only its TracelessCommits entries drive its repair */
+  private def dropErrorEntries(i: Int): Future[Unit] =
+    for
+      keys <- errorEntries(i)
+      tree <- errorTree
+      _ <- keys.foldLeft(Future.unit): (f, key) =>
+             f.flatMap: _ =>
+               val tx = client.newRepairTransaction()
+               tree.delete(key)(using tx).flatMap(_ => pump(tx.commit(), deadline())).map(_ => ())
+      _ <- settle()
+      remaining <- errorEntries(i)
+    yield
+      remaining shouldBe empty
 
   /** Completes with `f`, draining the host's events while it is pending: the host only queues repair work */
   private def pump[T](f: Future[T], deadline: Long): Future[T] =
@@ -383,7 +419,10 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   /** Commits a transaction built by `build` that store `i` misses outright: none of its messages reach the store.
     * The store is reported offline meanwhile, so it is not chosen as the transaction's designated leader
     */
-  private def missedBy(i: Int)(build: Transaction => Unit): Future[Unit] =
+  private def missedBy(i: Int)(build: Transaction => Unit): Future[Unit] = missedByTx(i)(build).map(_ => ())
+
+  /** missedBy, completing with the missed transaction's id */
+  private def missedByTx(i: Int)(build: Transaction => Unit): Future[TransactionId] =
     net.offlineStores = Set(sid(i))
     val tx = client.newTransaction()
     build(tx)
@@ -392,16 +431,18 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       settle().transform: settled =>
         net.droppedTx = net.droppedTx - ((sid(i), tx.id))
         net.offlineStores = Set()
-        committed.flatMap(_ => settled)
+        committed.flatMap(_ => settled).map(_ => tx.id)
 
-  /** Scans store `i` through the live host until its errorTree range is empty */
+  /** Scans store `i` through the live host until its errorTree and TracelessCommits ranges are empty */
   private def scanUntilQuiet(i: Int, repairer: StoreRepairer = StoreRepairer(client, net.smgr),
                              passes: Int = 20): Future[Unit] =
     for
       _ <- settle()
       _ <- pump(repairer.scan(sid(i), RepairPolicy.Default), deadline())
       _ <- settle()
-      remaining <- errorEntries(i)
+      errors <- errorEntries(i)
+      traceless <- tracelessEntries(i)
+      remaining = errors ++ traceless
       _ <- if remaining.isEmpty then Future.unit
            else if passes <= 1 then Future.failed(new AssertionError(s"store $i never went quiet: $remaining"))
            else scanUntilQuiet(i, repairer, passes - 1)
@@ -543,6 +584,237 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       keysAfterFirstPass should contain (k1)
       afterFirstPass should not be empty
       storeKeys(2, kvPtr) shouldBe Set(k0, k1, k3)
+      remaining shouldBe empty
+
+  // ---- TracelessCommits entries, deferral and proofs ---------------------------------------------------------------
+
+  /** The live host, with test seams: `live` stands in for transactions a store still holds live, `lockedKeys` and
+    * `objectLocked` for locks every read of an object reports. Only a proof transaction gets past those locks: the
+    * reconciliation that follows a committed proof ignores what the read reported on the proven parts
+    */
+  private class SeamTarget extends RepairTarget:
+    @volatile var live: Set[(StoreId, TransactionId)] = Set()
+    @volatile var lockedKeys: Map[ObjectId, Set[Key]] = Map()
+    @volatile var objectLocked: Set[ObjectId] = Set()
+
+    def repairableStoreIds: List[StoreId] = net.smgr.repairableStoreIds
+    def isRepairable(storeId: StoreId): Boolean = net.smgr.isRepairable(storeId)
+    def holdsTransaction(storeId: StoreId, txid: TransactionId): Boolean =
+      live.contains((storeId, txid)) || net.smgr.holdsTransaction(storeId, txid)
+    def snapshot(storeId: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+      net.smgr.snapshot(storeId, pointer, p)
+    def reconcile(storeId: StoreId, snapshot: RepairSnapshot, read: ClientObjectState,
+                  p: Promise[ReconcileResult]): Unit =
+      val id = read.pointer.id
+      read.readLocks = ReadLocks(read.readLocks.keys ++ lockedKeys.getOrElse(id, Set()),
+                                 read.readLocks.objectLevel || objectLocked.contains(id))
+      net.smgr.reconcile(storeId, snapshot, read, p)
+    def repairDelete(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte], completion: Promise[Unit]): Unit =
+      net.smgr.repairDelete(storeId, objectId, storePointer, completion)
+
+  /** One scan of store `i`, then settle */
+  private def pass(i: Int, repairer: StoreRepairer, deferral: DeferralState): Future[ScanResult] =
+    for
+      _ <- settle()
+      result <- pump(repairer.scan(sid(i), RepairPolicy.Default, deferral), deadline())
+      _ <- settle()
+    yield result
+
+  private def passes(n: Int, i: Int, repairer: StoreRepairer, deferral: DeferralState): Future[Unit] =
+    (1 to n).foldLeft(Future.unit)((f, _) => f.flatMap(_ => pass(i, repairer, deferral).map(_ => ())))
+
+  private def sharedDataObject(): Future[DataObjectPointer] =
+    for
+      ptr <- client.transactUntilSuccessful: tx =>
+               given Transaction = tx
+               for
+                 pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+                 p <- new PoolObjectAllocator(client, pool).allocateDataObject(DataBuffer(Array[Byte](1)))
+               yield p
+      _ <- scanAllUntilQuiet()
+    yield ptr
+
+  test("a TracelessCommits entry for a transaction the store holds live is skipped"):
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
+      txid <- missedByTx(2)(kvUpdate(kvPtr, List(Delete(k1))))
+      _ <- dropErrorEntries(2)
+      before <- tracelessEntries(2)
+      _ = target.live += (sid(2) -> txid)
+      result <- pass(2, repairer, DeferralState())
+      after <- tracelessEntries(2)
+    yield
+      before shouldBe List(TracelessCommitEntry.key(sid(2), txid))
+      after shouldBe before
+      result.tracelessSeen shouldBe 1
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1)
+
+  test("a TracelessCommits entry is reconciled and deleted once the store no longer holds it"):
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
+      txid <- missedByTx(2)(kvUpdate(kvPtr, List(Delete(k1))))
+      _ <- dropErrorEntries(2)
+      _ = target.live += (sid(2) -> txid)
+      _ <- pass(2, repairer, DeferralState())
+      held <- tracelessEntries(2)
+      _ = target.live = Set()
+      _ <- scanUntilQuiet(2, repairer)
+      remaining <- tracelessEntries(2)
+    yield
+      held should not be empty
+      remaining shouldBe empty
+      storeKeys(2, kvPtr) should not contain k1
+      storeKeys(2, kvPtr) shouldBe Set(k0)
+
+  test("a TracelessCommits entry for a deleted object deletes it from the store"):
+    for
+      dataPtr <- sharedDataObject()
+      before <- client.read(dataPtr)
+      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, before.refcount.setCount(0)))
+      _ <- dropErrorEntries(2)
+      _ = withClue("store 2 missed the deletion: "):
+            storeHasObject(2, dataPtr.id) shouldBe true
+            storeHasObject(0, dataPtr.id) shouldBe false
+      marked <- tracelessEntries(2)
+      _ <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
+      remaining <- tracelessEntries(2)
+    yield
+      marked should not be empty
+      storeHasObject(2, dataPtr.id) shouldBe false
+      stored(2, dataPtr.id) shouldBe None
+      remaining shouldBe empty
+
+  // A rebuild drops the store's CRL, so it holds none of its entries' transactions live, and rebuilds its copies from
+  // current reads: no hook in rebuild is needed, the first scan passes every entry at once. Stood in for here by a
+  // store holding no live transactions whose copies are still behind, which that same scan also brings up to date.
+  test("after a rebuild, the first scan clears the store's TracelessCommits entries"):
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
+      dataPtr <- sharedDataObject()
+      before <- client.read(dataPtr)
+      expected = before.refcount.setCount(before.refcount.count + 1)
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Delete(k1))))
+      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, expected))
+      _ <- dropErrorEntries(2)
+      marked <- tracelessEntries(2)
+      result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
+      remaining <- tracelessEntries(2)
+    yield
+      marked.size shouldBe 2
+      result.tracelessSeen shouldBe 2
+      remaining shouldBe empty
+      storeKeys(2, kvPtr) shouldBe Set(k0)
+      storeRefcount(2, dataPtr) shouldBe Some(expected)
+
+  /** An object every store holds with k0, k1 and k2, and a transaction store 2 missed that deletes k1 and k2. Every
+    * read reports k2 locked. Completes with the object and the deferral key of the missed transaction's entry
+    */
+  private def lockedKeyScenario(target: SeamTarget): Future[(KeyValueObjectPointer, Key)] =
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1)),
+                                  k2 -> Value(Array[Byte](2))))
+      txid <- missedByTx(2)(kvUpdate(kvPtr, List(Delete(k1), Delete(k2))))
+      _ <- dropErrorEntries(2)
+      _ = target.lockedKeys += kvPtr.id -> Set(k2)
+    yield
+      withClue("store 2 missed the deletes: "):
+        storeKeys(2, kvPtr) shouldBe Set(k0, k1, k2)
+      (kvPtr, StoreRepairer.tracelessDeferralKey(TracelessCommitEntry.key(sid(2), txid), kvPtr.id))
+
+  test("one permanently locked key is deferred while every other key of the object is reconciled at once"):
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target)
+    val deferral = DeferralState()
+    for
+      (kvPtr, entryKey) <- lockedKeyScenario(target)
+      result <- pass(2, repairer, deferral)
+      remaining <- tracelessEntries(2)
+    yield
+      storeKeys(2, kvPtr) shouldBe Set(k0, k2)
+      deferral.deferredKeys(entryKey) shouldBe Some(Set(k2))
+      result.deferred shouldBe 1
+      remaining should not be empty
+
+  test("a key deferred for proofAfterDeferrals passes is proven and reconciled"):
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target)
+    val deferral = DeferralState()
+    val n = RepairPolicy.Default.proofAfterDeferrals
+    for
+      (kvPtr, entryKey) <- lockedKeyScenario(target)
+      _ <- passes(n - 1, 2, repairer, deferral)
+      keysBeforeProof = storeKeys(2, kvPtr)
+      entriesBeforeProof <- tracelessEntries(2)
+      _ <- pass(2, repairer, deferral)
+      remaining <- tracelessEntries(2)
+    yield
+      keysBeforeProof shouldBe Set(k0, k2)
+      entriesBeforeProof should not be empty
+      storeKeys(2, kvPtr) shouldBe Set(k0)
+      (0 until net.stores.size).foreach(i => storeKeys(i, kvPtr) shouldBe Set(k0))
+      remaining shouldBe empty
+      deferral.deferredKeys(entryKey) shouldBe None
+
+  test("an aborted proof leaves the key deferred for a later pass"):
+    // On the proof's pass, k2 is written between the read and the proof: the proof requires k2 absent, as the read
+    // saw it, and aborts
+    val target = SeamTarget()
+    @volatile var writeK2: Option[KeyValueObjectPointer] = None
+    val repairer = StoreRepairer(client, target, testingOnlyBeforeReconcile = (s, ptr) =>
+      writeK2.filter(p => s == sid(2) && p.id == ptr.id) match
+        case Some(p) =>
+          writeK2 = None
+          val tx = client.newTransaction()
+          kvUpdate(p, List(Insert(k2, Array[Byte](7))))(tx)
+          pump(tx.commit(), deadline()).flatMap(_ => settle())
+        case None => Future.unit)
+    val deferral = DeferralState()
+    val n = RepairPolicy.Default.proofAfterDeferrals
+    for
+      (kvPtr, entryKey) <- lockedKeyScenario(target)
+      _ <- passes(n - 1, 2, repairer, deferral)
+      _ = writeK2 = Some(kvPtr)
+      _ <- pass(2, repairer, deferral)
+      afterAbort <- tracelessEntries(2)
+      keysAfterAbort = storeKeys(2, kvPtr)
+      deferredAfterAbort = deferral.deferredKeys(entryKey)
+      _ <- pass(2, repairer, deferral)
+      remaining <- tracelessEntries(2)
+    yield
+      writeK2 shouldBe None
+      afterAbort should not be empty
+      deferredAfterAbort shouldBe Some(Set(k2))
+      keysAfterAbort shouldBe Set(k0, k2)
+      (0 until net.stores.size).foreach(i => storeKeys(i, kvPtr) shouldBe Set(k0, k2))
+      remaining shouldBe empty
+
+  test("a refcount under an object lock is deferred and then proven"):
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target)
+    val deferral = DeferralState()
+    val n = RepairPolicy.Default.proofAfterDeferrals
+    for
+      dataPtr <- sharedDataObject()
+      before <- client.read(dataPtr)
+      expected = before.refcount.setCount(before.refcount.count + 1)
+      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, expected))
+      _ <- dropErrorEntries(2)
+      _ = target.objectLocked += dataPtr.id
+      first <- pass(2, repairer, deferral)
+      _ <- passes(n - 2, 2, repairer, deferral)
+      refcountBeforeProof = storeRefcount(2, dataPtr)
+      entriesBeforeProof <- tracelessEntries(2)
+      _ <- pass(2, repairer, deferral)
+      remaining <- tracelessEntries(2)
+    yield
+      first.deferred shouldBe 1
+      refcountBeforeProof shouldBe Some(before.refcount)
+      entriesBeforeProof should not be empty
+      storeRefcount(2, dataPtr) shouldBe Some(expected)
       remaining shouldBe empty
 
   test("a future dated entry is never eligible for deletion repair"):

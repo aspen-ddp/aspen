@@ -12,10 +12,18 @@ import org.aspen_ddp.aspen.common.store.StoreId
   *
   * @param objectLevel min, max, left and right, as the store holds them (left and right are the store's IDA slices).
   *                    None for DataObjects and for objects the store does not hold
+  * @param only set by the repairer, not the store: a later pass of a KeyValue object whose earlier pass deferred only
+  *             these keys reconciles only them, leaving the rest of the object (refcount, object-level parts,
+  *             timestamp and other keys) as it is. None reconciles the whole object
+  * @param proven set by the repairer: parts a committed proof transaction showed the read to be current on
+  *               (RepairProofs). The locks the read reports on them are ignored; the store's own locks still defer
+  *               them
   */
 final case class RepairSnapshot(objectId: ObjectId, revision: ObjectRevision, refcount: ObjectRefcount,
                                 timestamp: HLCTimestamp, keyRevisions: Map[Key, ObjectRevision],
-                                objectLevel: Option[KVObjectLevel]):
+                                objectLevel: Option[KVObjectLevel],
+                                only: Option[Set[Key]] = None,
+                                proven: ReadLocks = ReadLocks.None):
 
   /** The store holds no copy: a live object never has a zero count */
   def isMissing: Boolean = refcount.count == 0
@@ -166,7 +174,8 @@ object Reconcile:
       var installs = Map[Key, ClientValueState]()
       var deletes = Set[Key]()
 
-      val keys = current.keyRevisions.keySet ++ read.contents.keySet ++ snapshot.keyRevisions.keySet
+      val allKeys = current.keyRevisions.keySet ++ read.contents.keySet ++ snapshot.keyRevisions.keySet
+      val keys = snapshot.only.fold(allKeys)(allKeys.intersect)
       keys.iterator.filterNot(locks.keys.contains).foreach { key =>
         val have = current.keyRevisions.get(key)
         val want = read.contents.get(key)
@@ -179,11 +188,15 @@ object Reconcile:
               case None => deletes += key
       }
 
+      // A pass of only the keys an earlier pass deferred leaves the rest of the object as it is: it was reconciled then
+      val wholeObject = snapshot.only.isEmpty
+      val objectLevelLeft = locks.objectLevel || !wholeObject
+
       val (refcount, refcountStale) =
-        if locks.objectLevel then (None, false) else planRefcount(snapshot, current, read)
+        if objectLevelLeft then (None, false) else planRefcount(snapshot, current, read)
 
       val (objectLevel, revision) =
-        if locks.objectLevel then
+        if objectLevelLeft then
           (None, None)
         else
           val have = current.objectLevel.getOrElse(KVObjectLevel.Empty)
@@ -196,7 +209,8 @@ object Reconcile:
           else
             (Some(want), Some(read.revision))
 
-      val timestamp = if read.timestamp > current.timestamp then Some(read.timestamp) else None
+      val timestamp = if wholeObject && read.timestamp > current.timestamp then Some(read.timestamp) else None
 
       ReconcilePlan(installs, deletes, refcount, objectLevel, revision, None, timestamp,
-        ReconcileResult(locks.keys, locks.objectLevel, stale || refcountStale))
+        ReconcileResult(snapshot.only.fold(locks.keys)(locks.keys.intersect), locks.objectLevel && wholeObject,
+          stale || refcountStale))

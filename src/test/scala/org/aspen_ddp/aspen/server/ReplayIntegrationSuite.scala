@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
-import org.aspen_ddp.aspen.client.Transaction
+import org.aspen_ddp.aspen.client.{TestTransactions, Transaction}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
 import org.aspen_ddp.aspen.common.network.{TxFinalized, TxMessage, TxPrepare, TxResolved}
@@ -9,7 +9,8 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Ke
   ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionDisposition, TransactionId,
+  TransactionStatus}
 import org.aspen_ddp.aspen.server.repair.{RepairPolicy, StoreRepairer}
 
 import java.nio.{ByteBuffer, ByteOrder}
@@ -90,7 +91,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       assert(prepares.nonEmpty, s"no client prepare of $txid was recorded")
       // The designated leader's last: its prepare starts its driver, which here never retransmits
       // (TestNetwork.HostOptions.recoveryDrivers). A store that gets the driver's data-less prepare before its own
-      // client prepare withholds its vote for the data and answers only a later prepare (Tx.awaitingData), so a
+      // client prepare withholds its vote for it and answers only a later prepare (Tx.awaitingClientPrepare), so a
       // driver that never asks again would wait forever. A host's drivers retransmit
       val (leader, others) = prepares.partition(m => m.to.poolIndex == m.txd.designatedLeaderUID)
       (others ++ leader).foreach(net.deliverTransactionMessage)
@@ -300,3 +301,70 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
     yield
       (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
       yAfter.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))
+
+  test("an aborted data-less transaction re-driven by a recovered commit vote aborts again"):
+    val voter = 1
+    val blocked = Set(3, 4).map(sid)
+    // Whether `m` is an outcome of `txid` (TxResolved or TxFinalized) sent to one of `to`
+    def outcomeTo(txid: TransactionId, to: Set[StoreId])(m: TxMessage): Boolean =
+      m.transactionId == txid && to.contains(m.to) && (m.isInstanceOf[TxResolved] || m.isInstanceOf[TxFinalized])
+    for
+      (x, _) <- allocateXY(Map())
+      xBefore <- client.read(x)
+      // T0 exclusively locks x and commits, but stores 3 and 4 never hear its outcome yet, so they keep its lock. They
+      // are reported offline meanwhile, so neither leads it
+      t0Outcomes <- {
+        val tx = TestTransactions.replaySafe(client.newTransaction())
+        net.offlineStores = blocked
+        net.dropTxMessage = outcomeTo(tx.id, blocked)
+        net.recordTxMessage = outcomeTo(tx.id, blocked)
+        tx.lockRevision(x, xBefore.revision)
+        for
+          _ <- pump(tx.commit(), clock = false)
+          _ <- settle(clock = false)
+        yield
+          net.recordTxMessage = _ => false
+          net.takeRecordedTxMessages()
+      }
+      // T: a data-less refcount change of x. Stores 3 and 4 vote abort on the collision with T0's lock, so T aborts.
+      // Store 1 votes commit and never hears the outcome, as a store that crashed right after voting does. The client's
+      // prepares to stores 3 and 4 are held until store 1 has voted: on the host's shared status cache, a prepare
+      // reaching store 1 after the abort would be answered from it, with no vote
+      tx = TestTransactions.replaySafe(client.newTransaction())
+      _ = net.offlineStores = blocked + sid(voter)
+      _ = net.dropTxMessage = outcomeTo(tx.id, Set(sid(voter)))
+      _ = net.droppedTx = blocked.map(_ -> tx.id)
+      _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id && blocked.contains(m.to) &&
+            (m match { case p: TxPrepare => p.fromClient; case _ => false })
+      _ = tx.setRefcount(x, xBefore.refcount, xBefore.refcount.increment())
+      commit = tx.commit()
+      voterVote = () => net.crl.getFullRecoveryState(sid(voter)).find(_.txd.transactionId == tx.id)
+                    .map(s => (s.disposition, s.status))
+      _ <- eventually("store 1 voted on T", clock = false)(Future.successful(voterVote().nonEmpty))
+      _ = net.droppedTx = Set()
+      _ = net.recordTxMessage = _ => false
+      _ = net.takeRecordedTxMessages().foreach(net.deliverTransactionMessage)
+      aborted <- pump(commit, clock = false).transform(r => scala.util.Success(r.isFailure))
+      _ <- settle(clock = false)
+      _ = withClue("T aborted, and store 1 holds its unresolved commit vote: "):
+            aborted shouldBe true
+            voterVote() shouldBe Some((TransactionDisposition.VoteCommit, TransactionStatus.Unresolved))
+      // The collision clears: T0's outcome reaches stores 3 and 4
+      _ = net.offlineStores = Set()
+      _ = withClue("T0's outcomes to stores 3 and 4 were recorded: ")(t0Outcomes should not be empty)
+      _ = t0Outcomes.foreach(net.deliverTransactionMessage)
+      _ <- eventually("the status cache forgot T", clock = false):
+             Future.successful(net.smgr.control.txStatusCache.getStatus(tx.id).isEmpty)
+      _ = (0 until 5).filter(_ != voter).foreach: i =>
+            net.smgr.control.router.loaded.get(sid(i)).exists(_.frontend.transactions.contains(tx.id)) shouldBe false
+      // Store 1 restarts crash-only and recovers its commit vote. Its recovery driver re-prepares T to stores that
+      // forgot it, and whose requirement on x now holds again
+      _ = net.dropTxMessage = _ => false
+      _ <- pump(net.restartStore(net.stores(voter)), clock = true)
+      _ <- forgottenByStores(tx.id)
+      _ <- settle(clock = true)
+      xAfter <- client.read(x)
+    yield
+      withClue("no store applied T's refcount change: "):
+        (0 until 5).foreach(i => net.stores(i).m(x.id).metadata.refcount shouldBe xBefore.refcount)
+      xAfter.refcount shouldBe xBefore.refcount

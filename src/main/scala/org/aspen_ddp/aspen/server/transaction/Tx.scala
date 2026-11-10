@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, KeyValueUpdate, ObjectUpdate, RevisionLock, SharedRevisionLock, VersionBump, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, NoClientPrepare, KeyValueUpdate, ObjectUpdate, RevisionLock, SharedRevisionLock, VersionBump, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -171,16 +171,22 @@ class Tx( trs: TransactionRecoveryState,
       case r: KeyValueUpdate => !have.contains(r.objectPointer.id)
       case _ => false
 
-  /** A driver's small prepare can overtake the client's prepare carrying this store's data, and the missing data would
-    * force an abort vote on a healthy transaction. So the vote is withheld: no reply is always allowed by Paxos, and
-    * the drivers retransmit. The wait ends with the data, with a client's prepare (it is all the data the client will
-    * send), with the outcome (the vote no longer matters), or after `missingDataWait`, which covers a dead client.
-    * Checked only as prepares arrive, since a vote is of use only to a driver that is still asking for it.
+  /** Prefer-abort: a prepare from a store-side driver (TxPrepare.fromClient = false) never gathers a fresh commit vote.
+    * Such a driver may re-drive a transaction that aborted and was forgotten everywhere (a recovered commit vote's
+    * driver, say), whose requirements may hold again; votes from stores that forgot it would let it commit after its
+    * client was told it aborted. So a Tx with no vote that has seen no client prepare never checks its requirements:
+    * it proves the commit at once if it may (see proveCommitted), and otherwise withholds its vote, waiting for the
+    * client's prepare, which also carries this store's object data. No reply is always allowed by Paxos, and drivers
+    * retransmit. The wait ends with a client's prepare (checked as usual), with the outcome (the vote no longer
+    * matters), or after `missingDataWait`, which covers a dead client: the Tx then votes abort (NoClientPrepare, see
+    * determineDisposition). A driver's prepare that merely overtakes the client's therefore never aborts a healthy
+    * transaction. A Tx recovered with a vote answers with that vote. Checked only as prepares arrive, since a vote is
+    * of use only to a driver that is still asking for it.
     */
-  private def awaitingData: Boolean =
-    disposition == TransactionDisposition.Undetermined && !recovered && !muted && !clientPrepared && !outcomeKnown &&
-      oresolution.isEmpty && missingObjectData && System.nanoTime() - startNanos < frontend.missingDataWait.toNanos &&
-      !(allObjectsLoaded && mayProve && appliedHere.nonEmpty) // A proven commit needs no data: see proveCommitted
+  private def awaitingClientPrepare: Boolean =
+    disposition == TransactionDisposition.Undetermined && !muted && !clientPrepared && !outcomeKnown &&
+      oresolution.isEmpty && System.nanoTime() - startNanos < frontend.missingDataWait.toNanos &&
+      !(allObjectsLoaded && mayProve && appliedHere.nonEmpty) // A proof never waits: see proveCommitted
 
   /** The loaded objects that already show this transaction's update, proving that it committed. See
     * RequirementsApplyer.appliedBy
@@ -422,8 +428,12 @@ class Tx( trs: TransactionRecoveryState,
     else
       completeLoad()
 
+  /** completeLoad has run: for a recovered transaction the Frontend may call it after the objects loaded */
+  private var loadCompleted = false
+
   /** Runs once all objects have loaded (or failed to). Called by Frontend for a recovered transaction */
   def completeLoad(): Unit = {
+    loadCompleted = true
     logger.trace(s"AllObjectsLoaded for tx ${transactionId}. Have delayedPrepare: ${delayedPrepare.nonEmpty}")
 
     // Apply pre-transaction rebuilds
@@ -447,7 +457,7 @@ class Tx( trs: TransactionRecoveryState,
     // proveCommitted) never resolves itself
     val resolution = oresolution
 
-    if !(recovered && disposition != TransactionDisposition.Undetermined) && !awaitingData then
+    if !(recovered && disposition != TransactionDisposition.Undetermined) && !awaitingClientPrepare then
       determineDisposition()
 
     lock()
@@ -487,7 +497,8 @@ class Tx( trs: TransactionRecoveryState,
   }
 
   /** Decides the vote, or withholds it. A muted transaction is proven committed or takes no part, its requirements
-    * unchecked. An object whose backend commit failed on this store gets an abort
+    * unchecked. One that has seen no client prepare votes abort, or proves the commit, its requirements unchecked
+    * (prefer-abort, see awaitingClientPrepare). An object whose backend commit failed on this store gets an abort
     * vote. One with a commit in flight, whether or not this transaction builds on it, makes the transaction wait with
     * its vote withheld and no locks taken (see Frontend.commitInFlight); the requirements are checked against the state
     * as it is once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
@@ -504,6 +515,12 @@ class Tx( trs: TransactionRecoveryState,
       disposition = TransactionDisposition.VoteAbort
       if mayProve && appliedHere.nonEmpty then
         proveCommitted()
+    else if !clientPrepared then
+      // Prefer-abort (see awaitingClientPrepare): only driver prepares were seen and the wait for the client's is over,
+      // or the outcome is known. The requirements are not checked; an object showing the update still proves the commit
+      waitingOn = Set()
+      awaitingCommits = Set()
+      decideDisposition(Map(), List(NoClientPrepare()))
     else if failed.nonEmpty then
       waitingOn = Set()
       awaitingCommits = Set()
@@ -786,12 +803,12 @@ class Tx( trs: TransactionRecoveryState,
     if provenCommitted then
       // See proveCommitted. Allowed by Paxos: the vote was decided (abort) and the acceptor has no state to report
       if muted then sendProof(m.from) else answerPrepareAsAcceptor(m)
-    else if awaitingData then
-      logger.trace(s"Withholding the vote on ${m.transactionId} until its object data arrives")
+    else if awaitingClientPrepare then
+      logger.trace(s"Withholding the vote on ${m.transactionId} until the client's prepare arrives")
     else
-      // completeLoad left the vote undecided if the Tx was waiting for data then. A wait for in-flight commits ends
-      // only when they persist
-      if allObjectsLoaded && !recovered && oresolution.isEmpty && disposition == TransactionDisposition.Undetermined &&
+      // completeLoad left the vote undecided if the Tx was waiting for the client's prepare then. A wait for in-flight
+      // commits ends only when they persist. A recovered Tx left undecided decides here too, once completeLoad ran
+      if loadCompleted && oresolution.isEmpty && disposition == TransactionDisposition.Undetermined &&
         awaitingCommits.isEmpty then
         determineDisposition()
         lock()

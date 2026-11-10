@@ -33,6 +33,12 @@ case class StaleObjectState() extends RequirementError
   */
 case class BackendCommitFailed() extends RequirementError
 
+/** A transaction prepared on this store only by store-side drivers (TxPrepare.fromClient = false) got no client
+  * prepare within Frontend.missingDataWait. A driver's prepare never gathers a fresh commit vote (prefer-abort), so
+  * the store votes abort without checking the requirements. Purely local, like RequirementCheckFailure.
+  */
+case class NoClientPrepare() extends RequirementError
+
 /** A KeyValueUpdate's operations contain a key Delete but the update's deletesKeys flag is not set. Purely local,
   * like RequirementCheckFailure.
   */

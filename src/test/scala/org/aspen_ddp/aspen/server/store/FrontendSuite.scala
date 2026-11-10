@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.paxos.PersistentState
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, RevisionLock, SharedRevisionLock, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, RevisionLock, SharedRevisionLock, VersionBump, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.TempDirManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, TransactionRecoveryState}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
@@ -508,10 +508,45 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       expectVote(net, TransactionDisposition.VoteAbort)
   }
 
-  test("a driver's prepare needing no data from this store gets its vote at once") {
+  // ---- Prefer-abort: a driver's prepare never gathers a fresh commit vote ----
+  //
+  // A store-side driver's prepare (fromClient = false) may re-drive a transaction that aborted and was forgotten: the
+  // store then has no vote, and its requirements may hold again. It waits for the client's prepare, and votes abort
+  // without checking them if none comes.
+
+  /** A data-less refcount change of op1 whose requirement holds on this store */
+  private def refcountTxd = mktxd().copy(requirements =
+    List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 1))))
+
+  test("a data-less transaction prepared only by a driver gets an abort vote after the wait, requirements unchecked") {
+    withDataless(missingDataWait = Duration.Zero): (frontend, backend, net, _) =>
+      frontend.receiveTransactionMessage(mkPrepare(refcountTxd, fromClient = false))
+      // The requirement holds, so a check would have voted commit
+      expectVote(net, TransactionDisposition.VoteAbort)
+      frontend.transactions(txid1).holdsLocks shouldBe false
+      // A later client prepare does not change the vote given
+      frontend.receiveTransactionMessage(mkPrepare(refcountTxd, fromClient = true))
+      expectVote(net, TransactionDisposition.VoteAbort)
+  }
+
+  test("a client prepare arriving within the wait is checked normally and can vote commit") {
+    withDataless(): (frontend, _, net, crl) =>
+      frontend.receiveTransactionMessage(mkPrepare(refcountTxd, fromClient = false))
+      frontend.receiveTransactionMessage(mkPrepare(refcountTxd, fromClient = false)) // A retransmission
+      net.txMessage() shouldBe None
+      crl.txSaved shouldBe false
+
+      frontend.receiveTransactionMessage(mkPrepare(refcountTxd, fromClient = true))
+      expectVote(net, TransactionDisposition.VoteCommit)
+      frontend.transactions(txid1).holdsLocks shouldBe true
+  }
+
+  test("a lock-only transaction prepared only by a driver waits for the client's prepare") {
     withDataless(): (frontend, _, net, _) =>
       val txd = mktxd().copy(requirements = List(SharedRevisionLock(op1, rev0)))
       frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      net.txMessage() shouldBe None
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true))
       expectVote(net, TransactionDisposition.VoteCommit)
   }
 
@@ -653,6 +688,16 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.transactions(txid1).holdsLocks shouldBe false
   }
 
+  test("a driver prepare reaching a store whose object shows the update proves at once") {
+    withApplied(): (frontend, _, net, _) =>
+      // Data-less, so no data wait applies either: only the wait for the client's prepare, which a proof skips
+      val txd = mktxd().copy(requirements = List(VersionBump(op1, rev0)))
+      frontend.receiveTransactionMessage(driverPrepare(txd))
+
+      resolvedMessages(net) shouldBe List(TxResolved(recoveryDriver, storeId, txid1, committed = true, late = false, proof = true))
+      votes(net) shouldBe Nil
+  }
+
   test("a prover answers a later prepare as a memoryless acceptor with an abort vote, saved to the CRL") {
     withApplied(): (frontend, _, net, crl) =>
       frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd))
@@ -751,7 +796,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val crl = new TestCrl:
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    // No vote and no client prepare: it answers a driver's prepare only once the wait for the client's is over
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), None, Duration.Zero)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
 
     val p = driverPrepare(dataUpdateTxd)
@@ -885,7 +931,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a forgotten transaction whose object is at another revision still gets an abort vote") {
     withApplied(): (frontend, _, net, _) =>
       val other = TransactionId(new UUID(0, 98))
-      frontend.receiveTransactionMessage(driverPrepare(lockTxd(other, List(overwrite(op1)))).copy(
+      frontend.receiveTransactionMessage(driverPrepare(lockTxd(other, List(overwrite(op1)))).copy(fromClient = true,
         objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](7))))))
 
       resolvedMessages(net) shouldBe Nil
@@ -1371,6 +1417,13 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lookup.answer(txid1, Success(false))
     lookup.answer(txid1, Success(false))
     prepare(frontend, net, lockTxd(txid3, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("a recovered commit vote answers a driver prepare with its vote") {
+    val (frontend, net) = recoveredFrontend(TransactionStatus.Unresolved)
+    frontend.receiveTransactionMessage(mkPrepare(lockTxd(txid1, List(overwrite(op1))), fromClient = false))
+    net.sentTx.collect { case r: TxPrepareResponse if r.transactionId == txid1 => r.disposition } shouldBe
+      List(TransactionDisposition.VoteCommit)
   }
 
   test("a committed transaction is applied while another transaction holds a lock on its object") {

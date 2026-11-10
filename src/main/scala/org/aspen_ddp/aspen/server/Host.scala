@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDevice
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
-import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store, UnackedCommitLookup}
+import org.aspen_ddp.aspen.server.store.{Frontend, ReconcileResult, RepairSnapshot, Store, UnackedCommitLookup}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler, DefaultBackendOpener}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
@@ -138,7 +138,10 @@ object Host:
                           *  tests of a write that fails and leaves nothing behind */
                          writeRebuildRequiredMarker: Option[os.Path => Unit] = None,
                          /** Wraps the host's UnackedCommits lookup, for tests that hold, fail or replay lookups */
-                         wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None)
+                         wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None,
+                         /** How long the stores' Txs wait for a client's prepare (Frontend.missingDataWait), for
+                          *  tests that would otherwise wait the full default in real time */
+                         missingDataWait: Duration = Frontend.MissingDataWait)
 
   object Seams:
     val default: Seams = Seams()
@@ -247,7 +250,8 @@ class Host(val client: AspenClient,
     scheduleEndpointRetry = fn => controlScheduler.schedule(Duration(5, SECONDS))(fn()),
     ec = ec,
     writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker),
-    unackedLookup = seams.wrapUnackedLookup.fold(unackedLookup)(wrap => wrap(unackedLookup)))
+    unackedLookup = seams.wrapUnackedLookup.fold(unackedLookup)(wrap => wrap(unackedLookup)),
+    missingDataWait = seams.missingDataWait)
 
   private val shutdownPromise: Promise[Unit] = Promise()
 

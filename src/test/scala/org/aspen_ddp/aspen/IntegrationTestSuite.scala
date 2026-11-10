@@ -46,6 +46,9 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
   /** Override to give the TestNetwork's bootstrap host CRL recovery, recovery drivers or a shorter heartbeat */
   def testHostOptions: TestNetwork.HostOptions = TestNetwork.HostOptions()
 
+  /** The host options of the test named `name`. Override to change them for some tests only */
+  def testHostOptionsFor(name: String): TestNetwork.HostOptions = testHostOptions
+
   def subFixtureSetup(): Unit = {}
   def subFixtureTeardown(): Unit = ()
 
@@ -58,7 +61,7 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
 
   override def withFixture(test: NoArgAsyncTest): FutureOutcome = {
     net = new TestNetwork(executionContext, userTypeFactories, testIda, testPoolMaxSliceSize, testStoreMaxSliceSize,
-      testBackendMaxSliceSize, testThreading, testHostOptions)
+      testBackendMaxSliceSize, testThreading, testHostOptionsFor(test.name))
     client = net.client
     testName = test.name
     radicle = net.radicle

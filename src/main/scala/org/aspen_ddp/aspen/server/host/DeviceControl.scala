@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
-import org.aspen_ddp.aspen.server.store.UnackedCommitLookup
+import org.aspen_ddp.aspen.server.store.{Frontend, UnackedCommitLookup}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
@@ -76,7 +76,9 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           /** Writes a store directory's rebuild-required marker (a test seam) */
                           val writeRebuildRequiredMarker: os.Path => Unit = StoreRebuilds.writeRebuildRequiredMarker,
                           /** Looks up recovered commit votes in their pools' UnackedCommits trees, for the stores */
-                          val unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never):
+                          val unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
+                          /** How long the stores' Txs wait for a client's prepare (Frontend.missingDataWait) */
+                          val missingDataWait: Duration = Frontend.MissingDataWait):
   given ExecutionContext = threading.control
 
   lazy val router: StoreRouter = new StoreRouter(this)

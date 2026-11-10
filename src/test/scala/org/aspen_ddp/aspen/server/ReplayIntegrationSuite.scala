@@ -31,6 +31,17 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
   override def testHostOptions: TestNetwork.HostOptions =
     TestNetwork.HostOptions(heartbeatPeriod = Duration(300, MILLISECONDS), recordCrl = true, recoveryDrivers = true)
 
+  /** The prefer-abort test waits out the missing-data wait of every store its recovery driver prepares: a short one
+    * keeps it fast (Ruling 9). Other tests keep the default, which no step of theirs should reach
+    */
+  private val reDrivenAbortTest = "an aborted data-less transaction re-driven by a recovered commit vote aborts again"
+
+  override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
+    if name == reDrivenAbortTest then
+      testHostOptions.copy(missingDataWait = Duration(200, MILLISECONDS))
+    else
+      testHostOptions
+
   private val k = Key(Array[Byte](1))
 
   private def deadline(): Long = System.nanoTime() + Duration(30, SECONDS).toNanos
@@ -311,7 +322,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
       yAfter.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))
 
-  test("an aborted data-less transaction re-driven by a recovered commit vote aborts again"):
+  test(reDrivenAbortTest):
     val voter = 1
     val blocked = Set(3, 4).map(sid)
     // Whether `m` is an outcome of `txid` (TxResolved or TxFinalized) sent to one of `to`

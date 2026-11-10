@@ -44,11 +44,13 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** A rebuilt store's acceptor start (Frontend.acceptorSince). None: an ordinary store */
             val acceptorSince: Option[HLCTimestamp] = None,
             /** Recover the CRL's transactions only when frontend.recover is called (Frontend.deferRecovery) */
-            deferRecovery: Boolean = false) extends Logging {
+            deferRecovery: Boolean = false,
+            /** How long a Tx waits for its client's prepare (Frontend.missingDataWait). A test seam */
+            missingDataWait: Duration = Frontend.MissingDataWait) extends Logging {
 
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
-    admission = admission, unackedLookup = unackedLookup,
+    missingDataWait = missingDataWait, admission = admission, unackedLookup = unackedLookup,
     // A reload installs a new Store under the same id: a task of this one's is dropped then
     post = postToStore match
       case None => task => task()

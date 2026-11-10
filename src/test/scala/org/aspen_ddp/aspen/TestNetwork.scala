@@ -24,7 +24,7 @@ import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, Host, 
 import org.aspen_ddp.aspen.server.host.{HostThreading, LockstepThreading}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
-import org.aspen_ddp.aspen.server.store.{Bootstrap, UnackedCommitLookup}
+import org.aspen_ddp.aspen.server.store.{Bootstrap, Frontend, UnackedCommitLookup}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache as StoreObjectCache}
 import org.aspen_ddp.aspen.server.transaction.{SimpleTransactionDriver, TransactionDriver, TransactionFinalizer}
@@ -133,11 +133,13 @@ object TestNetwork {
     * @param recordCrl the stores' CRL is a RecordingCRL, so restartStore recovers their transactions
     * @param recoveryDrivers drivers of transactions a store is not the designated leader of (recovery drivers) are
     *                        SimpleTransactionDrivers on TestNetwork.driverTimers
+    * @param missingDataWait how long the stores' Txs wait for a client's prepare (Frontend.missingDataWait)
     */
   final case class HostOptions(heartbeatPeriod: Duration = Duration(5, SECONDS),
                                recordCrl: Boolean = false,
                                recoveryDrivers: Boolean = false,
-                               wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None)
+                               wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None,
+                               missingDataWait: Duration = Frontend.MissingDataWait)
 
   /** Opens a fresh no-op CRL for each device, creating the crl directory a real one would, so discovery does not
     * take the device's stores to have lost theirs */
@@ -400,7 +402,8 @@ class TestNetwork(executionContext: ExecutionContext,
     hostOptions.heartbeatPeriod,
     Duration(60, SECONDS),
     // Its stores are loaded directly (below), onto a device it never loads
-    seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup))
+    seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
+      missingDataWait = hostOptions.missingDataWait))
 
   // Stands in for each store's StoreConfig.effectiveMaxSliceSize, which Host reads from the store config file
   private val storesLoaded = (stores ++ metadataStores).map(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))

@@ -727,14 +727,45 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     yield
       hasStub(2, txid) shouldBe false
 
-  test("a stub with no entry is dropped by the next scan"):
+  // Ruling 8: a stub may be written before its entry is durable (Ruling 7), so one scan finding no entry is not enough
+  test("an orphan stub survives one scan and is dropped by the second"):
     val repairer = StoreRepairer(client, SeamTarget())
+    val deferral = DeferralState()
     val orphan = TransactionId(new UUID(77, 1))
     for
       _ <- writeStub(2, orphan)
-      _ <- pass(2, repairer, DeferralState())
+      _ <- pass(2, repairer, deferral)
+      afterFirst = hasStub(2, orphan)
+      _ <- pass(2, repairer, deferral)
     yield
+      afterFirst shouldBe true
       hasStub(2, orphan) shouldBe false
+
+  test("a stub whose entry lands between two scans is kept"):
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target)
+    val deferral = DeferralState()
+    val txid = TransactionId(new UUID(77, 3))
+    for
+      _ <- writeStub(2, txid)
+      _ <- pass(2, repairer, deferral) // No entry yet: the stub is suspected
+      // The planned entry lands. The store holds the transaction live, so the scan leaves the entry alone
+      _ <- pump(client.missedUpdateMarker.mark(Nil,
+             List(MissedUnackedCommit(sid(2), txid, UnackedCommitEntry(HLCTimestamp.now, Nil)))), deadline())
+      _ <- settle()
+      _ = target.live += (sid(2) -> txid)
+      _ <- pass(2, repairer, deferral)
+      afterSecond = hasStub(2, txid)
+      // The entry gone again: the suspicion restarts, so one more scan keeps the stub
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      tx = TestTransactions.replaySafe(client.newRepairTransaction())
+      _ <- pool.unackedCommitsTree.delete(UnackedCommitEntry.key(sid(2), txid))(using tx)
+      _ <- pump(tx.commit(), deadline())
+      _ = target.live = Set()
+      _ <- pass(2, repairer, deferral)
+    yield
+      afterSecond shouldBe true
+      hasStub(2, txid) shouldBe true
 
   test("a stub whose entry is still present is kept"):
     val target = SeamTarget()
@@ -751,7 +782,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       entries should not be empty
       hasStub(2, txid) shouldBe true
 
-  test("a stub written during the walk is kept, and dropped by the next scan"):
+  test("a stub written during the walk is kept, and dropped two scans later"):
     val late = TransactionId(new UUID(77, 2))
     var written: Future[Unit] = Future.unit
     // The hook runs inside the walk, when the scan asks whether the store holds the walked entry's transaction
@@ -769,9 +800,14 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- written
       keptDuringScan = hasStub(2, late)
       _ = target.live = Set()
-      _ <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState())
+      next = StoreRepairer(client, SeamTarget())
+      deferral = DeferralState()
+      _ <- pass(2, next, deferral) // First scan to see the stub: suspected only (Ruling 8)
+      keptByNext = hasStub(2, late)
+      _ <- pass(2, next, deferral)
     yield
       keptDuringScan shouldBe true
+      keptByNext shouldBe true
       hasStub(2, late) shouldBe false
 
   test("a UnackedCommits entry is reconciled and deleted once the store no longer holds it"):

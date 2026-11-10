@@ -35,8 +35,9 @@ case class ScanResult(seen: Int, repaired: Int, deferred: Int, unackedSeen: Int 
 object ScanResult:
   val Empty: ScanResult = ScanResult(0, 0, 0)
 
-/** Lock deferrals of one store's repair entries, kept in memory across its scans by RepairService. A host restart
-  * forgets them: the next pass then reconciles each whole object again and restarts the count.
+/** Lock deferrals of one store's repair entries, and its suspected orphan stubs (`confirmOrphans`), kept in memory
+  * across its scans by RepairService. A host restart forgets them: the next pass then reconciles each whole object
+  * again and restarts the count, and an orphan stub needs two more scans to be dropped.
   *
   * Keyed per entry and object (StoreRepairer.errorDeferralKey, unackedDeferralKey). Only parts deferred by a lock
   * count: `deferredKeys` and `objectLevelDeferred`, the latter including a refcount deferred under an object lock. A
@@ -89,6 +90,18 @@ final class DeferralState:
     entries = entries.filter((k, _) => entryKeys.contains(k))
 
   private[repair] def size: Int = synchronized(entries.size)
+
+  /** The store's applied stubs the last successful scan found with no UnackedCommits entry (Ruling 8) */
+  private var orphanSuspects = Set[TransactionId]()
+
+  /** Records the stubs a successful scan found with no entry, and returns those to drop: the ones the previous
+    * successful scan found with no entry too. The rest are suspected until the next scan; a stub no longer found
+    * orphaned (its entry landed, or it is gone) is no longer suspected
+    */
+  private[repair] def confirmOrphans(found: Set[TransactionId]): Set[TransactionId] = synchronized:
+    val confirmed = found.intersect(orphanSuspects)
+    orphanSuspects = found -- confirmed
+    confirmed
 
 object DeferralState:
   private final case class Deferral(count: Int, only: Option[Set[Key]])
@@ -149,37 +162,42 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           _ <- pool.errorTree.foreachInRange(min, max, repairErrorEntry(pool, storeId, policy, deferral, counts))
           _ <- pool.unackedCommitsTree.foreachInRange(min, max,
                  repairUnackedEntry(pool, storeId, policy, deferral, counts))
-          _ <- dropOrphanStubs(pool, storeId, stubs, counts)
+          _ <- dropOrphanStubs(pool, storeId, stubs, deferral, counts)
         yield
           deferral.retain(counts.touchedKeys)
           counts.result
 
-  /** Drops the stubs of the store that no UnackedCommits entry needs any more: those in `before`, the store's stubs
-    * read before the walk, whose transaction had no entry in the walk.
+  /** Drops the stubs of the store that no UnackedCommits entry needs any more: those that this scan and the
+    * previous successful one of the store both found orphaned (Ruling 8). A scan finds a stub orphaned when it is in
+    * `before`, the store's stubs read before the walk, its transaction had no entry in the walk, and a point lookup
+    * of its own entry finds nothing.
     *
-    * The order is what makes this safe. A stub is written only after its entry is durable (TxFinalized lists `owed`
-    * after the marker's writes commit, and the fallback lookup writes a stub only after finding the entry). So a stub
-    * in `before` has had its entry durable since before the walk began, and the walk did not miss it unless the entry
-    * was deleted meanwhile. A stub written during the walk is not in `before` and survives to the next scan: its entry
-    * may sit behind the walk's cursor.
+    * A stub may be written before its entry is durable: a driver finalized by another driver's TxFinalized lists the
+    * stores its own cancelled mark planned, without waiting for that write (Ruling 7). Two consecutive scans give such
+    * an entry a whole scan period to land; once it has, the stub is no longer orphaned and the suspicion is dropped.
+    * The suspicions live in the store's DeferralState, in memory on the repairing host: a restart, or a scan
+    * abandoned when the store left the host, starts them again, which only delays a drop.
     *
-    * An entry can also leave a walk unseen without being gone, if the tree is restructured under the walk, and one
-    * deleted by another scan is rightly gone. So each candidate gets a point lookup of its own entry, and is dropped
-    * only if that finds nothing. The drop names the txid exactly, so a stub is never dropped for another's entry.
-    * Skipped when the store left this host mid-walk: the entries were then not handled.
+    * The pre-walk snapshot still matters. A stub written during the walk is not in `before`, so this scan neither
+    * suspects nor drops it: its entry may sit behind the walk's cursor. An entry can also leave a walk unseen
+    * without being gone, if the tree is restructured under the walk, and one deleted by another scan is rightly
+    * gone: hence the point lookup. The drop names the txid exactly, so a stub is never dropped for another's entry.
+    * A scan that fails part way changes no suspicion; one whose store left this host mid-walk does nothing here.
     */
   private def dropOrphanStubs(pool: StoragePool, storeId: StoreId, before: Set[TransactionId],
-                              counts: Counts): Future[Unit] =
-    val orphans = before -- counts.unackedTxidsSeen
-    if orphans.isEmpty || abandoned(storeId) then
+                              deferral: DeferralState, counts: Counts): Future[Unit] =
+    val candidates = before -- counts.unackedTxidsSeen
+    if abandoned(storeId) then
       Future.unit
     else
-      orphans.foldLeft(Future.unit): (f, txid) =>
-        f.flatMap: _ =>
+      val found = candidates.foldLeft(Future.successful(Set[TransactionId]())): (f, txid) =>
+        f.flatMap: orphans =>
           pool.unackedCommitsTree.get(UnackedCommitEntry.key(storeId, txid)).map: entry =>
-            if entry.isEmpty then
-              logger.info(s"Dropping the applied stub of $txid on $storeId: no UnackedCommits entry needs it")
-              target.dropAppliedStub(storeId, txid)
+            if entry.isEmpty then orphans + txid else orphans
+      found.map: orphans =>
+        deferral.confirmOrphans(orphans).foreach: txid =>
+          logger.info(s"Dropping the applied stub of $txid on $storeId: two scans found no UnackedCommits entry for it")
+          target.dropAppliedStub(storeId, txid)
 
   /** Whether the pool's entry for the store names this host, read fresh for each scan */
   private def ownedHere(storeId: StoreId): Future[Boolean] = hostId match

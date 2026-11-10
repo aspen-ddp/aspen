@@ -141,6 +141,19 @@ class Tx( trs: TransactionRecoveryState,
   /** This Tx's outcome is a late commit: its status cache entry and status answers say so */
   private var lateOutcome = false
 
+  /** An UnackedCommits entry naming this store for the committed transaction may exist, and the store holds the
+    * update (or must never take it through that entry): TxFinalized listed it in `owed`, or it applied the update
+    * through its entry. Its CRL state is then replaced by an applied stub, where it would be deleted
+    * (Frontend.transactionFinalized), so a replay never applies the transaction here again (replay-pins addendum A)
+    */
+  private var stubDue = false
+
+  /** A late commit reached this Tx after it resolved committed and applied the update, with no TxFinalized listing
+    * `owed`: it looks up its own UnackedCommits entry before it is forgotten, and writes an applied stub if found
+    * (replay-pins addendum A, case 3). See lateCommit
+    */
+  private var forgetLookupHeld = false
+
   statusCache.updateStatus(transactionId, txStatus)
 
   private def allObjectsLoaded: Boolean = pendingObjectLoads == 0
@@ -162,7 +175,8 @@ class Tx( trs: TransactionRecoveryState,
   /** Whether an UnackedCommits lookup answer still matters: a recovered commit vote's check (needsUnackedCheck), or a
     * late commit held for its lookup (lateCommit)
     */
-  def awaitsUnackedLookup: Boolean = needsUnackedCheck || (lateCommitHeld && oresolution.isEmpty)
+  def awaitsUnackedLookup: Boolean =
+    needsUnackedCheck || (lateCommitHeld && oresolution.isEmpty) || (forgetLookupHeld && ofinalized.isEmpty)
 
   private def missingObjectData: Boolean =
     val have = objectUpdates.iterator.map(_.objectId).toSet
@@ -618,6 +632,31 @@ class Tx( trs: TransactionRecoveryState,
 
     unlock()
 
+    // An applied stub: the store already holds this transaction's update (or must never take it through its
+    // UnackedCommits entry), so nothing is applied again, as for a recovered commit vote whose entry was found
+    if frontend.hasAppliedStub(transactionId) then
+      logger.info(s"Tx $transactionId. Store $storeId holds an applied stub for it: nothing is applied again")
+      pendingObjectCommits = 0
+      issuedCommits = Set()
+      objectCommitErrors = Nil
+    else
+      issueCommits()
+
+    // After the commits are issued, so that they are what the next transactions on these objects wait for
+    if commitQueued then
+      commitQueued = false
+      frontend.heldCommitIssued(changedHere, this)
+    if finalizeDeferred then
+      finalizeDeferred = false
+      frontend.transactionFinalized(transactionId, writeStub = stubDue)
+
+    // Nothing was committed, so no commit completions will arrive to trigger the notification.
+    // Without this the proposer never learns this store's outcome.
+    if pendingObjectCommits == 0 then
+      allObjectCommitsComplete()
+  }
+
+  private def issueCommits(): Unit = {
     val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
     // An object whose earlier backend commit failed is neither changed nor committed: missing from the objects applied
@@ -675,19 +714,6 @@ class Tx( trs: TransactionRecoveryState,
 
       frontend.commit(os, cs, transactionId, forTransaction = true)
     }
-
-    // After the commits are issued, so that they are what the next transactions on these objects wait for
-    if commitQueued then
-      commitQueued = false
-      frontend.heldCommitIssued(changedHere, this)
-    if finalizeDeferred then
-      finalizeDeferred = false
-      frontend.transactionFinalized(transactionId)
-
-    // Nothing was committed, so no commit completions will arrive to trigger the notification.
-    // Without this the proposer never learns this store's outcome.
-    if pendingObjectCommits == 0 then
-      allObjectCommitsComplete()
   }
 
   private def allObjectCommitsComplete(): Unit = {
@@ -894,6 +920,9 @@ class Tx( trs: TransactionRecoveryState,
     else
       reportLateOutcome("TxFinalized", m.from)
       updateLastEvent()
+      // Remembered until the CRL state would be deleted, which may wait for backend commits (Ruling 1)
+      if m.committed && !m.late && m.owed.contains(storeId) then
+        stubDue = true
       if provenCommitted then
         applyNothing(m.committed, finalMessage = true, late = m.late)
         false
@@ -915,34 +944,48 @@ class Tx( trs: TransactionRecoveryState,
     if commitHeld then
       finalizeDeferred = true
     else
-      frontend.transactionFinalized(transactionId)
+      frontend.transactionFinalized(transactionId, writeStub = stubDue)
     statusCache.updateStatus(transactionId, txStatus, finalized = true, late = lateOutcome)
 
   /** A late commit: the driver learned the commit only after the transaction was finalized and forgotten
     * (docs/superpowers/specs/2026-11-09-replay-pins-design.md, 1c). Every other acceptor forgot it on TxFinalized, so
     * its finalization completed, and a store is owed the commit only if its UnackedCommits entry says so.
-    *  - Already resolved committed: the commit was learned normally and is applied, or held, as usual. It finalizes.
-    *  - Undecided with its own commit vote, recovered or live: held for a lookup started now (one per hold, so a
+    *  - Already resolved committed: the commit was learned normally and is applied, or held, as usual. It finalizes,
+    *    replacing its CRL state by an applied stub if TxFinalized listed this store in `owed` or it applied the update
+    *    through its entry. Otherwise no TxFinalized listing `owed` reached it, so an entry may still name it: it looks
+    *    the entry up first (addendum A, case 3), writes a stub if found and is forgotten either way; a failed or
+    *    unanswered lookup is retried at heartbeat.
+    *  - Undecided with its own commit vote, recovered or live: an applied stub means the store already holds the
+    *    update, so it applies nothing. Otherwise held for a lookup started now (one per hold, so a
     *    retransmit does not push the lookup that counts further away). An entry applies the update
     *    (unackedCommitFound), none applies nothing (unackedCommitAbsent). A failed or unanswered lookup is retried at
     *    heartbeat (Frontend.retryUnackedLookups).
     *  - Otherwise (an abort vote, no vote, a muted Tx, or an abort already learned): applies nothing.
     * The Tx concludes itself: the Frontend forgets it here, not on the message.
     *
-    * Known residual (Ruling 17, corrected by Ruling 32; no closure implemented): a store that cast a counted commit
-    * vote and acknowledged after errorTimeout has an entry, and keeps it after applying T until its repair scan
-    * reconciles it, 30 s to 15 min later. A replayed client prepare reaching it meanwhile with a passing commit vote
-    * finds the entry and applies T's writes again there. Only writes in a pool where T has no pin of its own pass:
-    * blind or replaySafe writes, ABA-prone DoesNotExist inserts, and allocations in another pool; a per-write
-    * KeyRevision-checked write is itself a pin in its pool and fails. When the whole pool acknowledged late, every
-    * store holds an entry, so the replay can reach a quorum, and reconcile then follows the corrupted quorum
+    * Applied stubs (docs/superpowers/specs/2026-11-09-replay-pins-addendum-design.md, A) close the residual of Rulings
+    * 17 and 32: a store that cast a counted commit vote and acknowledged after errorTimeout has an entry until its
+    * repair scan reconciles it, but it wrote a stub when it forgot T, so a replayed client prepare reaching it with a
+    * passing commit vote applies nothing. What remains is a store named in `owed` that never received that TxFinalized
+    * and holds no Tx for T: it never saw T, at most width - writeThreshold of the pool, which repair restores
     */
   private def lateCommit(): Unit =
     lateOutcome = true
     oresolution match
-      case Some(true) =>
+      case Some(true) if stubDue || frontend.hasAppliedStub(transactionId) =>
         finalized(true)
         frontend.forget(this)
+      case Some(true) =>
+        // Applied here, and forgotten without a TxFinalized listing `owed` (lost, and its heartbeat driver resolved it
+        // through a late or relay path): an entry may name this store, so it looks first (addendum A, case 3)
+        if !forgetLookupHeld then
+          forgetLookupHeld = true
+          logger.info(s"Tx $transactionId on store $storeId: late commit of an applied transaction, looking up its " +
+            s"UnackedCommits entry before forgetting it")
+          frontend.requestUnackedLookup(this)
+      case None if disposition == TransactionDisposition.VoteCommit && frontend.hasAppliedStub(transactionId) =>
+        // The store already holds the update: whatever the tree says, nothing is applied again
+        applyNothing(committed = true, finalMessage = true, late = true)
       case None if disposition == TransactionDisposition.VoteCommit =>
         if !lateCommitHeld then
           lateCommitHeld = true
@@ -973,7 +1016,8 @@ class Tx( trs: TransactionRecoveryState,
       txStatus = if committed then TransactionStatus.Committed else TransactionStatus.Aborted
     ofinalized = Some(committed)
     lateOutcome = late
-    frontend.deleteTransactionState(transactionId)
+    // Nothing was committed here, so nothing waits for backend commits
+    frontend.transactionFinalized(transactionId, writeStub = committed && stubDue)
     unlock()
     releaseObjects()
     statusCache.updateStatus(transactionId,
@@ -1012,10 +1056,28 @@ class Tx( trs: TransactionRecoveryState,
     * abort or late commit concludes it without applying anything again.
     *
     * Found for a held late commit, it applies its update and is forgotten as finalized: every other acceptor forgot
-    * the transaction on TxFinalized. The tree entry is left for the repair scan either way
+    * the transaction on TxFinalized. The tree entry is left for the repair scan either way.
+    *
+    * Either way an applied stub replaces its CRL state when it is forgotten, so a replay never applies the update here
+    * again through the entry. A stub already held means the store has the update: a held late commit applies nothing,
+    * and a recovered vote resolves committed without applying anything (doCommit), kept until TxFinalized as above.
+    * Found for a late commit of a transaction already applied here (lateCommit), it writes the stub and is forgotten
     */
   def unackedCommitFound(): Unit =
-    if awaitsUnackedLookup then
+    if forgetLookupHeld && ofinalized.isEmpty then
+      // A late commit of a transaction applied here (lateCommit): the store already holds the update
+      forgetLookupHeld = false
+      stubDue = true
+      logger.info(s"Store $storeId found its UnackedCommits entry for applied transaction $transactionId: an " +
+        s"applied stub replaces its state")
+      finalized(true)
+      frontend.forget(this)
+    else if lateCommitHeld && oresolution.isEmpty && frontend.hasAppliedStub(transactionId) then
+      applyNothing(committed = true, finalMessage = true, late = true)
+    else if awaitsUnackedLookup then
+      // Applied through the entry: the stub replaces the CRL state when the Tx is forgotten (addendum A, case 2). A
+      // stub already held means the store has the update, and doCommit applies nothing
+      stubDue = true
       val late = lateCommitHeld
       lateCommitHeld = false
       heldAborts = Nil
@@ -1050,7 +1112,12 @@ class Tx( trs: TransactionRecoveryState,
     * this store applied it durably: returns the held aborts, for the Frontend to handle again; they are accepted now
     */
   def unackedCommitAbsent(): List[TxMessage] =
-    if lateCommitHeld then
+    if forgetLookupHeld && ofinalized.isEmpty then
+      forgetLookupHeld = false
+      finalized(true)
+      frontend.forget(this)
+      Nil
+    else if lateCommitHeld then
       applyNothing(committed = true, finalMessage = true, late = true)
       Nil
     else

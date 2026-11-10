@@ -4,7 +4,8 @@ import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.{TestTransactions, Transaction}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
-import org.aspen_ddp.aspen.common.network.{TxFinalized, TxMessage, TxPrepare, TxResolved}
+import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
+import org.aspen_ddp.aspen.common.network.{TxCommitted, TxFinalized, TxMessage, TxPrepare, TxResolved}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Key, KeyValueObjectPointer, ObjectId,
   ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -80,7 +81,8 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
   /** Waits until the host has forgotten `txid` (its status cache entry expired, so every store forgot it), then
     * delivers again every client prepare of it recorded
     */
-  private def replayClientPrepares(txid: TransactionId): Future[Unit] =
+  private def replayClientPrepares(txid: TransactionId,
+                                   order: List[TxPrepare] => List[TxPrepare] = leaderLast): Future[Unit] =
     for
       _ <- eventually("the status cache forgot the transaction", clock = false):
              Future.successful(net.smgr.control.txStatusCache.getStatus(txid).isEmpty)
@@ -89,12 +91,19 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       val prepares = recorded.collect:
         case m: TxPrepare if m.fromClient && m.transactionId == txid => m
       assert(prepares.nonEmpty, s"no client prepare of $txid was recorded")
-      // The designated leader's last: its prepare starts its driver, which here never retransmits
-      // (TestNetwork.HostOptions.recoveryDrivers). A store that gets the driver's data-less prepare before its own
-      // client prepare withholds its vote for it and answers only a later prepare (Tx.awaitingClientPrepare), so a
-      // driver that never asks again would wait forever. A host's drivers retransmit
-      val (leader, others) = prepares.partition(m => m.to.poolIndex == m.txd.designatedLeaderUID)
-      (others ++ leader).foreach(net.deliverTransactionMessage)
+      order(prepares).foreach(net.deliverTransactionMessage)
+
+  private def isLeader(m: TxPrepare): Boolean =
+    m.to.poolId == m.txd.primaryObject.poolId && m.to.poolIndex == m.txd.designatedLeaderUID
+
+  /** The designated leader's last: its prepare starts its driver, which here never retransmits
+    * (TestNetwork.HostOptions.recoveryDrivers). A store that gets the driver's data-less prepare before its own client
+    * prepare withholds its vote for it and answers only a later prepare (Tx.awaitingClientPrepare), so a driver that
+    * never asks again would wait forever. A host's drivers retransmit
+    */
+  private def leaderLast(prepares: List[TxPrepare]): List[TxPrepare] =
+    val (leader, others) = prepares.partition(isLeader)
+    others ++ leader
 
   /** Completes once no store of the bootstrap pool holds a Tx for `txid` */
   private def forgottenByStores(txid: TransactionId): Future[Unit] =
@@ -368,3 +377,75 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       withClue("no store applied T's refcount change: "):
         (0 until 5).foreach(i => net.stores(i).m(x.id).metadata.refcount shouldBe xBefore.refcount)
       xAfter.refcount shouldBe xBefore.refcount
+
+  test("a replay at a pool whose stores all acknowledged late leaves every store unchanged"):
+    // Pool A (the bootstrap pool) holds T's pin, x; pool B (the initial metadata pool) only T's DoesNotExist insert of
+    // k into y, which nothing pins there. Every pool-B store applies T but acknowledges it too late, so the finalizer
+    // writes each an UnackedCommits entry and lists it in TxFinalized's owed: each writes an applied stub
+    val poolB = PoolId.InitialMetadataPoolId
+    val bStores = net.metadataStores
+    def bKeyRevision(i: Int, ptr: KeyValueObjectPointer): Option[ObjectRevision] =
+      bStores(i).m.get(ptr.id).flatMap(_.kvState).flatMap(_.content.get(k)).map(_.revision)
+    def bFrontend(i: Int) = net.smgr.control.router.loaded.get(bStores(i).storeId).map(_.frontend)
+    for
+      poolA <- client.getStoragePool(Radicle.poolId)
+      pb <- client.getStoragePool(poolB)
+      (x, y) <- client.transactUntilSuccessful: tx =>
+                  given Transaction = tx
+                  tx.replaySafe("test")
+                  for
+                    x <- poolA.allocator.allocateDataObject(DataBuffer(Array[Byte](1)))
+                    y <- pb.allocator.allocateKeyValueObject(Map())
+                  yield (x, y)
+      _ <- settle(clock = false)
+      xBefore <- client.read(x)
+      t <- {
+        val tx = client.newTransaction()
+        net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id && m.isInstanceOf[TxPrepare]
+        // Never acknowledged in time: as a TxCommitted that arrives after errorTimeout
+        net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id && m.isInstanceOf[TxCommitted] &&
+          m.from.poolId == poolB
+        tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+        tx.update(y, None, None, List(KeyValueUpdate.DoesNotExist(k)), List(Insert(k, Array[Byte](2))))
+        for
+          _ <- pump(tx.commit(), clock = false)
+          _ <- settle(clock = false)
+        yield
+          net.recordTxMessage = _ => false
+          net.dropTxMessage = _ => false
+          tx.id
+      }
+      entries <- pb.unackedCommitsTree.foldLeft(Set[Int]()): (acc, contents) =>
+                   acc ++ contents.keysIterator.filter(key => UnackedCommitEntry.decodeTransactionId(key) == t)
+                     .map(_.bytes(0).toInt)
+      _ = withClue("every pool-B store applied T, and a write threshold of them is marked owed: "):
+            // The designated leader's store may get the client's prepare only after the resolution (lockstep delivery
+            // order): its vote is then not counted, so it is owed nothing
+            entries.size should be >= 4
+            (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe Some(ObjectRevision(t)))
+      // T2: k is deleted, at T's revision of it
+      _ <- client.transactUntilSuccessful: tx =>
+             tx.update(y, None, None, List(KeyValueUpdate.KeyRevision(k, ObjectRevision(t))), List(Delete(k)))
+             Future.successful(tx.id)
+      _ <- settle(clock = false)
+      _ = (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe None)
+      // The replay: every pool-B store's DoesNotExist(k) passes again and it votes commit; pool A proves T committed
+      // from x, so the replay's driver resolves late, and each pool-B store finds its entry still there. T's
+      // designated leader is in pool B (its primary object is y), and a proof reaching its store before its driver
+      // starts is lost. So pool B's prepares go first, the leader's last of them: its driver then prepares pool A,
+      // whose stores prove at once and tell it. Pool A's client prepares follow
+      _ <- replayClientPrepares(t, prepares =>
+             val (b, a) = prepares.partition(_.to.poolId == poolB)
+             val (leader, others) = b.partition(isLeader)
+             withClue("T's designated leader is a pool-B store: ")(leader should not be empty)
+             others ++ leader ++ a)
+      _ <- settle(clock = true)
+      _ <- forgottenByStores(t)
+      _ <- eventually("every pool-B store forgot the transaction", clock = true):
+             Future.successful((0 until 5).forall(i => bFrontend(i).forall(!_.transactions.contains(t))))
+      yAfterReplay <- client.read(y)
+    yield
+      withClue("no pool-B store applied T again: "):
+        (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe None)
+      yAfterReplay.contents.keySet should not contain k
+      entries.forall(i => bFrontend(i).exists(_.hasAppliedStub(t))) shouldBe true

@@ -208,8 +208,10 @@ class Frontend(val storeId: StoreId,
     * @param outstanding commits not yet reported complete by the backend
     * @param failed some commit failed
     * @param finalized TxFinalized arrived while commits were outstanding: the CRL deletion waits for them
+    * @param writeStub the CRL state is replaced by an applied stub rather than deleted (see transactionFinalized)
     */
-  private final class TxCommits(var outstanding: Int, var failed: Boolean, var finalized: Boolean)
+  private final class TxCommits(var outstanding: Int, var failed: Boolean, var finalized: Boolean,
+                                var writeStub: Boolean = false)
   private val txCommits = scala.collection.mutable.HashMap[TransactionId, TxCommits]()
 
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
@@ -276,6 +278,9 @@ class Frontend(val storeId: StoreId,
 
   /** What the stubs are charged to the device's admission (CrlAdmission.AppliedStubBytes each), until released */
   private var stubBytesCharged: Long = 0L
+
+  /** What the transactions whose CRL state a stub replaces were admitted for, released once the stub is durable */
+  private val stubReplacedAdmissions = scala.collection.mutable.HashMap[TransactionId, Long]()
 
   private def chargeStubs(n: Int): Unit =
     val bytes = n * CrlAdmission.AppliedStubBytes
@@ -364,8 +369,11 @@ class Frontend(val storeId: StoreId,
 
   /** Records that the store holds `txid`'s update: an applied stub, saved in the CRL in place of the transaction's
     * state, for a transaction the store is forgetting. `onDurable` runs on the store's executor once the stub is
-    * durable, after what the transaction was admitted for is released (its CRL state is replaced), unless a Tx for it
-    * is live again by then, which then holds that admission.
+    * durable, after what the transaction was admitted for is released (its CRL state is replaced).
+    *
+    * That admission is taken from the transaction now, unless `keepAdmission` (a newer Tx for it is live and holds the
+    * same record, see concludeTransactionState): a prepare arriving before the stub is durable is then admitted
+    * afresh, never through the record of the state being replaced.
     *
     * The stub is charged to the device's admission without a check (CrlAdmission.AppliedStubBytes), so it is never
     * dropped or held back, while new prepares feel its bytes: the CRL's copy-forward carries stubs too. Released by
@@ -375,16 +383,18 @@ class Frontend(val storeId: StoreId,
     * (object data included) is what a reloaded store recovers the transaction from. Stubs are written only where
     * deleteTransactionState would run.
     */
-  def recordAppliedStub(txid: TransactionId)(onDurable: => Unit): Unit =
+  def recordAppliedStub(txid: TransactionId, keepAdmission: Boolean = false)(onDurable: => Unit): Unit =
     require(!txCommits.contains(txid),
       s"Store $storeId: an applied stub cannot replace transaction $txid's CRL state while its backend commits are " +
       s"outstanding or failed")
     if !stubs.contains(txid) then
       chargeStubs(1)
       stubs += txid
+    if !keepAdmission then
+      admitted.remove(txid).foreach: a =>
+        stubReplacedAdmissions(txid) = stubReplacedAdmissions.getOrElse(txid, 0L) + a.bytes
     crl.saveAppliedStub(storeId, txid, () => post { () =>
-      if !transactions.contains(txid) then
-        releaseAdmission(txid)
+      stubReplacedAdmissions.remove(txid).foreach(admission.release)
       onDurable
     })
 
@@ -571,14 +581,19 @@ class Frontend(val storeId: StoreId,
   def releaseAllAdmissions(): Unit =
     admitted.valuesIterator.foreach(a => admission.release(a.bytes))
     admitted.clear()
+    stubReplacedAdmissions.valuesIterator.foreach(admission.release)
+    stubReplacedAdmissions.clear()
     admission.release(stubBytesCharged)
     stubBytesCharged = 0L
 
   /** Closes the store. Its entries stay live in the CRL unless the closer takes them out, so what its transactions
     * were admitted for stays counted, retained for the store (CrlAdmission.retain) */
   def close(): Future[Unit] =
-    admission.retain(storeId, admitted.valuesIterator.map(_.bytes).sum + stubBytesCharged)
+    // A stub not yet durable has not replaced its transaction's state: that stays counted too
+    admission.retain(storeId, admitted.valuesIterator.map(_.bytes).sum + stubReplacedAdmissions.valuesIterator.sum +
+      stubBytesCharged)
     admitted.clear()
+    stubReplacedAdmissions.clear()
     stubBytesCharged = 0L
     backend.close()
 
@@ -620,11 +635,33 @@ class Frontend(val storeId: StoreId,
     * outstanding or failed: the store deletes a committed transaction's CRL state only once every backend commit it
     * issued for that transaction has succeeded (see TxCommits). A reloaded store recovers the rest from the CRL, and its
     * transaction driver concludes them. Aborted transactions, and those that committed nothing here, are deleted at once.
+    *
+    * With `writeStub` the state is replaced by an applied stub instead (recordAppliedStub), at the same point: the
+    * store holds the committed transaction's update and an UnackedCommits entry naming it may exist (replay-pins
+    * addendum A), so it must never apply the transaction again through that entry. A failed backend commit keeps the
+    * CRL state while the store is loaded, so no stub replaces it; a reloaded store recovers the transaction from it.
+    * Called by the Tx as it is forgotten, and by a TxFinalized for a transaction the store holds no Tx for
     */
-  def transactionFinalized(txid: TransactionId): Unit =
+  def transactionFinalized(txid: TransactionId, writeStub: Boolean = false): Unit =
     txCommits.get(txid) match
-      case Some(r) => r.finalized = true
-      case None => deleteTransactionState(txid)
+      case Some(r) =>
+        r.finalized = true
+        r.writeStub ||= writeStub
+      case None => concludeTransactionState(txid, writeStub, keepAdmission = false)
+
+  /** Deletes the CRL state of a finalized transaction, or replaces it by an applied stub. A stub already held
+    * suffices: the state is only deleted.
+    *
+    * @param keepAdmission a newer Tx for the transaction (a replay's) is live and shares its admission record: it
+    *                      keeps it, and releases it when it is forgotten
+    */
+  private def concludeTransactionState(txid: TransactionId, writeStub: Boolean, keepAdmission: Boolean): Unit =
+    if writeStub && !stubs.contains(txid) then
+      recordAppliedStub(txid, keepAdmission)(())
+    else
+      crl.deleteTransaction(storeId, txid)
+      if !keepAdmission then
+        releaseAdmission(txid)
 
   private def transactionCommitComplete(txid: TransactionId, succeeded: Boolean): Unit =
     txCommits.get(txid).foreach { r =>
@@ -634,7 +671,8 @@ class Frontend(val storeId: StoreId,
       if r.outstanding == 0 && !r.failed then
         txCommits.remove(txid)
         if r.finalized then
-          deleteTransactionState(txid)
+          // The Tx that finalized it was forgotten then: a live one is a later Tx for the same transaction
+          concludeTransactionState(txid, r.writeStub, keepAdmission = transactions.contains(txid))
     }
 
   /** Called when a transaction takes `os` for one of its objects, and by commit for the commit's duration. A state that
@@ -710,8 +748,15 @@ class Frontend(val storeId: StoreId,
           if tx.receiveFinalized(m) then
             tx.releaseObjects() // Already done unless some of its objects had not loaded
             transactions -= m.transactionId
-        // Remembered for a prepare that arrives after this. See receivePrepare
-        case None => statusCache.updateStatus(m.transactionId, statusOf(m.committed), finalized = true, late = m.late)
+        case None =>
+          // Remembered for a prepare that arrives after this. See receivePrepare
+          statusCache.updateStatus(m.transactionId, statusOf(m.committed), finalized = true, late = m.late)
+          // Named as owed an UnackedCommits entry, with no Tx: the store applied the transaction and forgot it (on an
+          // earlier TxFinalized that did not list it, or with its backend commits still outstanding), or never saw it.
+          // Either way it must not apply it through that entry: one that never saw it is restored by ErrorTree repair
+          // from the majority (replay-pins addendum A, case 1)
+          if m.committed && !m.late && m.owed.contains(storeId) && !stubs.contains(m.transactionId) then
+            transactionFinalized(m.transactionId, writeStub = true)
     case m: TxHeartbeat => transactions.get(m.transactionId).foreach(tx => tx.receiveHeartbeat(m))
     case m: TxStatusRequest => transactions.get(m.transactionId).foreach(tx => tx.receiveStatusRequest(m))
     case _ => // Other TxMessages are not relevant

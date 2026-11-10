@@ -1942,7 +1942,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   /** A Frontend recovering T, a commit vote of `reqs` deleting key 2 of kvPtr, with its lookups made through `lookup` */
   private def unackedFixture(reqs: List[TransactionRequirement] = List(deleteK2),
-                             statusCache: TransactionStatusCache = new TransactionStatusCache())
+                             statusCache: TransactionStatusCache = new TransactionStatusCache(),
+                             stubs: Set[TransactionId] = Set())
       : (Frontend, MapBackend, TestNet, TestCrl, ManualLookup) =
     val backend = new MapBackend(storeId)
     populate(backend)
@@ -1955,6 +1956,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       PersistentState.initial)
     val crl = new TestCrl:
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+      override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = stubs
     val net = new TestNet
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup)
@@ -2001,7 +2003,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false, owed = Set()))
     frontend.transactions.contains(unackedTxid) shouldBe false
-    crl.deleted should contain (unackedTxid)
+    crl.stubsSaved should contain (unackedTxid) // An applied stub replaces its state (replay-pins addendum A)
     log.exists((level, text) => level == scribe.Level.Info &&
       text.contains(s"learned committed transaction $unackedTxid") &&
       text.contains("applying its update to objects")) shouldBe true
@@ -2035,7 +2037,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.receiveTransactionMessage(TxFinalized(storeId, StoreId(poolId, 2), unackedTxid, committed = true,
       late = false, owed = Set()))
     frontend.transactions.contains(unackedTxid) shouldBe false
-    crl.deleted should contain (unackedTxid)
+    crl.stubsSaved should contain (unackedTxid) // An applied stub replaces its state (replay-pins addendum A)
   }
 
   test("a recovered commit vote without a UnackedCommits entry accepts an abort") {
@@ -2136,7 +2138,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     kvKeys(backend) should contain (k(2))
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false, owed = Set()))
     frontend.transactions.contains(unackedTxid) shouldBe false
-    crl.deleted should contain (unackedTxid)
+    crl.stubsSaved should contain (unackedTxid) // An applied stub replaces its state (replay-pins addendum A)
   }
 
   test("a UnackedCommits lookup whose answer is lost is made again at heartbeat once it times out") {
@@ -2186,7 +2188,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.contains(unackedTxid) shouldBe false
     kvKeys(backend) should not contain k(2)
     committedMessages(net).size shouldBe committedBefore
-    crl.deleted should contain (unackedTxid)
+    crl.stubsSaved should contain (unackedTxid) // An applied stub replaces its state (replay-pins addendum A)
   }
 
   test("a recovered commit vote that found its entry is forgotten on a late commit without applying it again") {
@@ -2208,12 +2210,14 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   // ---- Late commits (replay-pins design, 1c): applied only by a commit vote whose UnackedCommits entry exists ----
 
   /** A live Frontend over populated objects, whose op1 commit vote for txid1 is in place, with lookups through `lookup` */
-  private def lateFixture(statusCache: TransactionStatusCache = new TransactionStatusCache())
+  private def lateFixture(statusCache: TransactionStatusCache = new TransactionStatusCache(),
+                          stubs: Set[TransactionId] = Set())
       : (Frontend, MapBackend, TestNet, TestCrl, ManualLookup) =
     val backend = new MapBackend(storeId)
     populate(backend)
     val net = new TestNet
-    val crl = new TestCrl
+    val crl = new TestCrl:
+      override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = stubs
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
       statusCache, unackedLookup = lookup)
@@ -2242,7 +2246,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
     frontend.transactions.contains(txid1) shouldBe false
     committedMessages(net).map(_.objectCommitErrors).distinct shouldBe List(Nil)
-    crl.deleted should contain (txid1)
+    crl.stubsSaved should contain (txid1) // An applied stub replaces its state (replay-pins addendum A)
     statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
       finalized = true, late = true))
   }
@@ -2307,7 +2311,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       finalized = true, late = true))
   }
 
-  test("a Tx that learned its commit normally finalizes on a late commit") {
+  test("a Tx that learned its commit normally finalizes on a late commit once no entry names it") {
     val (frontend, backend, net, crl, lookup) = lateFixture()
     frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
     frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, txid1, committed = true, late = false,
@@ -2315,11 +2319,14 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val committedBefore = committedMessages(net).size
     lateCommit(frontend, finalized = false)
 
-    lookup.requests shouldBe Nil
+    // Forgotten without a TxFinalized listing owed: it looks up its entry first (replay-pins addendum A, case 3)
+    lookup.requests shouldBe List(txid1)
+    lookup.answer(txid1, Success(false))
     backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
     committedMessages(net).size shouldBe committedBefore
     frontend.transactions.contains(txid1) shouldBe false
     crl.deleted should contain (txid1)
+    crl.stubsSaved shouldBe Nil
   }
 
   test("a late TxFinalized for an unknown transaction is cached as finalized, committed and late") {
@@ -2337,6 +2344,195 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lateCommit(frontend, finalized = false)
     statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
       finalized = true, late = true))
+  }
+
+  // ---- Applied stubs (replay-pins addendum A): a store that applied T never applies it again ----
+
+  /** A non-late committed TxFinalized of `txid` listing `owed` */
+  private def owedFinalized(txid: TransactionId, owed: Set[StoreId] = Set(storeId)): TxFinalized =
+    TxFinalized(storeId, unackedDriver, txid, committed = true, late = false, owed = owed)
+
+  test("a TxFinalized naming this store in owed writes a stub before deleting the transaction's state") {
+    val (frontend, backend, net, crl, _) = lateFixture()
+    frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+    expectVote(net, TransactionDisposition.VoteCommit)
+
+    frontend.receiveTransactionMessage(owedFinalized(txid1))
+
+    backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+    frontend.transactions.contains(txid1) shouldBe false
+    frontend.hasAppliedStub(txid1) shouldBe true
+    // The stub's save replaces the transaction's state: it is not deleted first
+    crl.stubsSaved shouldBe List(txid1)
+    crl.deleted should not contain (txid1)
+
+    // Not named: deleted, with no stub
+    val (other, _, otherNet, otherCrl, _) = lateFixture()
+    other.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+    expectVote(otherNet, TransactionDisposition.VoteCommit)
+    other.receiveTransactionMessage(owedFinalized(txid1, owed = Set(StoreId(poolId, 1))))
+    otherCrl.stubsSaved shouldBe Nil
+    otherCrl.deleted should contain (txid1)
+    other.hasAppliedStub(txid1) shouldBe false
+  }
+
+  test("a stub owed by TxFinalized waits for the backend commits, and a failed commit writes none") {
+    val crl = new TestCrl
+    val (frontend, backend, _) = heldCommit(crl)
+    frontend.receiveTransactionMessage(owedFinalized(txid1))
+    frontend.transactions.contains(txid1) shouldBe false
+    crl.stubsSaved shouldBe Nil
+    backend.deliverCommits()
+    crl.stubsSaved shouldBe List(txid1)
+    crl.deleted shouldBe Nil
+
+    // A failed commit keeps the CRL state (object data included) while the store is loaded: no stub replaces it
+    val failedCrl = new TestCrl
+    val (failed, failedBackend, _) = heldCommit(failedCrl)
+    failed.receiveTransactionMessage(owedFinalized(txid1))
+    failedBackend.deliverCommits(Right(CommitError.IOFailure))
+    failedCrl.stubsSaved shouldBe Nil
+    failedCrl.deleted shouldBe Nil
+    failed.hasAppliedStub(txid1) shouldBe false
+  }
+
+  test("a TxFinalized naming this store with no Tx writes a stub") {
+    val (frontend, _, _, crl, _) = lateFixture()
+    frontend.receiveTransactionMessage(owedFinalized(txid1, owed = Set(StoreId(poolId, 1))))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, txid1, committed = true, late = true,
+      owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, txid3, committed = false, late = false,
+      owed = Set(storeId)))
+    crl.stubsSaved shouldBe Nil
+
+    frontend.receiveTransactionMessage(owedFinalized(txid2))
+    crl.stubsSaved shouldBe List(txid2)
+    frontend.hasAppliedStub(txid2) shouldBe true
+    frontend.transactions.contains(txid2) shouldBe false
+    // A retransmit writes nothing more
+    frontend.receiveTransactionMessage(owedFinalized(txid2))
+    crl.stubsSaved shouldBe List(txid2)
+
+    // A second driver's TxFinalized naming this store after its Tx was forgotten with its backend commit outstanding:
+    // the stub waits for the commit
+    val heldCrl = new TestCrl
+    val (held, heldBackend, _) = heldCommit(heldCrl)
+    finalizeTx1(held)
+    held.receiveTransactionMessage(owedFinalized(txid1))
+    heldCrl.stubsSaved shouldBe Nil
+    heldBackend.deliverCommits()
+    heldCrl.stubsSaved shouldBe List(txid1)
+    heldCrl.deleted shouldBe Nil
+  }
+
+  test("applying through a found entry writes a stub") {
+    // A recovered commit vote: kept until TxFinalized (Ruling 9), which writes the stub though it lists no one
+    val (frontend, backend, _, crl, lookup) = unackedFixture()
+    lookup.answer(unackedTxid, Success(true))
+    kvKeys(backend) should not contain k(2)
+    crl.stubsSaved shouldBe Nil
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false,
+      owed = Set()))
+    frontend.transactions.contains(unackedTxid) shouldBe false
+    crl.stubsSaved shouldBe List(unackedTxid)
+    crl.deleted should not contain (unackedTxid)
+
+    // A held late commit
+    val (late, lateBackend, lateNet, lateCrl, lateLookup) = lateFixture()
+    late.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+    expectVote(lateNet, TransactionDisposition.VoteCommit)
+    lateCommit(late, finalized = true)
+    lateLookup.answer(txid1, Success(true))
+    lateBackend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+    late.transactions.contains(txid1) shouldBe false
+    lateCrl.stubsSaved shouldBe List(txid1)
+    lateCrl.deleted should not contain (txid1)
+  }
+
+  test("a Tx forgotten after a late resolution looks up its entry and writes a stub when found") {
+    val statusCache = new TransactionStatusCache()
+    val (frontend, backend, net, crl, lookup) = lateFixture(statusCache)
+    frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+    frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, txid1, committed = true, late = false,
+      proof = false))
+    backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+    val committedBefore = committedMessages(net).size
+
+    // Its TxFinalized was lost; a late outcome lists no owed stores, so the store asks the tree
+    lateCommit(frontend, finalized = false)
+    lookup.requests shouldBe List(txid1)
+    frontend.transactions.contains(txid1) shouldBe true
+    lateCommit(frontend, finalized = true) // A retransmit makes no second lookup
+    lookup.requests shouldBe List(txid1)
+
+    // A failed lookup holds it, and is retried at heartbeat
+    lookup.answer(txid1, Failure(new Exception("metadata pool down")))
+    frontend.transactions.contains(txid1) shouldBe true
+    frontend.retryUnackedLookups()
+    lookup.requests shouldBe List(txid1, txid1)
+
+    lookup.answer(txid1, Success(true))
+    frontend.transactions.contains(txid1) shouldBe false
+    crl.stubsSaved shouldBe List(txid1)
+    crl.deleted should not contain (txid1)
+    committedMessages(net).size shouldBe committedBefore
+    backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+    statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
+      finalized = true, late = true))
+  }
+
+  test("a late commit whose entry is found applies nothing when a stub exists") {
+    val statusCache = new TransactionStatusCache()
+    val (frontend, backend, net, crl, lookup) = lateFixture(statusCache, stubs = Set(txid1))
+    frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+    expectVote(net, TransactionDisposition.VoteCommit)
+
+    lateCommit(frontend, finalized = true)
+    // Whatever the tree holds: the stub already says the store holds the update
+    lookup.requests shouldBe Nil
+    backend.get(oid1).get.data.size shouldBe 0
+    committedMessages(net) shouldBe Nil
+    frontend.transactions.contains(txid1) shouldBe false
+    lockedWriteTransactions(frontend, net, op1) shouldBe empty
+    statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
+      finalized = true, late = true))
+
+    // A stub recorded while the lookup is in flight is honoured when the entry is found
+    val (inFlight, inFlightBackend, inFlightNet, _, inFlightLookup) = lateFixture()
+    inFlight.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+    expectVote(inFlightNet, TransactionDisposition.VoteCommit)
+    lateCommit(inFlight, finalized = true)
+    inFlightLookup.requests shouldBe List(txid1)
+    inFlight.recordAppliedStub(txid1)(())
+    inFlightLookup.answer(txid1, Success(true))
+    inFlightBackend.get(oid1).get.data.size shouldBe 0
+    committedMessages(inFlightNet) shouldBe Nil
+    inFlight.transactions.contains(txid1) shouldBe false
+  }
+
+  test("a recovered commit vote with a stub applies nothing") {
+    val (frontend, backend, net, crl, lookup) = unackedFixture(stubs = Set(unackedTxid))
+    frontend.hasAppliedStub(unackedTxid) shouldBe true
+    lookup.answer(unackedTxid, Success(true))
+
+    kvKeys(backend) should contain (k(2))
+    // Still an acceptor: it is forgotten only on TxFinalized, as a recovered vote that found its entry is (Ruling 9)
+    frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
+    frontend.transactions(unackedTxid).provesCommitToItsDriver shouldBe true
+    lockedWriteTransactions(frontend, net, kvPtr) should not contain (unackedTxid)
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false,
+      owed = Set()))
+    frontend.transactions.contains(unackedTxid) shouldBe false
+    kvKeys(backend) should contain (k(2))
+    crl.deleted should contain (unackedTxid)
+
+    // A late commit reaching it applies nothing either
+    val (late, lateBackend, _, _, lateLookup) = unackedFixture(stubs = Set(unackedTxid))
+    late.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = true,
+      owed = Set()))
+    lateLookup.answer(unackedTxid, Success(true))
+    kvKeys(lateBackend) should contain (k(2))
+    late.transactions.contains(unackedTxid) shouldBe false
   }
 
   test("a proof is no outcome: neither a live Tx nor the status cache takes it") {
@@ -3294,6 +3490,55 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("a finalized transaction releases its admission: abort") {
     checkReleasedAtFinalization(committed = false, finalizeBeforePersisted = false)
+  }
+
+  test("a transaction whose state an owed stub replaces releases its admission once the stub is durable") {
+    for finalizeBeforePersisted <- List(false, true) do
+      val admission = new CrlAdmission(Long.MaxValue)
+      val crl = new TestCrl
+      crl.holdStubSaves = true
+      val (store, backend, _) = admissionStore(admission, crl)
+      val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+      store.receiveTransactionMessage(p1)
+      store.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+      val owed = TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(storeId))
+      if finalizeBeforePersisted then
+        store.receiveTransactionMessage(owed)
+        backend.deliverCommits()
+      else
+        backend.deliverCommits()
+        store.receiveTransactionMessage(owed)
+      store.frontend.transactions.contains(txid1) shouldBe false
+      crl.stubsSaved shouldBe List(txid1)
+      admission.admittedBytes shouldBe admissionBytes(p1) + CrlAdmission.AppliedStubBytes
+      crl.heldStubSaves.foreach(_())
+      admission.admittedBytes shouldBe CrlAdmission.AppliedStubBytes
+  }
+
+  test("a prepare arriving before a stub is durable is admitted afresh, not through the replaced state's record") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val crl = new TestCrl
+    crl.holdStubSaves = true
+    val (store, _, _) = admissionStore(admission, crl)
+    val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+    store.frontend.admitPrepare(p1) shouldBe true
+    store.frontend.recordAppliedStub(txid1)(())
+    // A replayed prepare: charged for itself, while the replaced state stays counted until the stub is durable
+    store.frontend.admitPrepare(p1) shouldBe true
+    admission.admittedBytes shouldBe 2 * admissionBytes(p1) + CrlAdmission.AppliedStubBytes
+    crl.heldStubSaves.foreach(_())
+    admission.admittedBytes shouldBe admissionBytes(p1) + CrlAdmission.AppliedStubBytes
+    store.frontend.releaseAdmission(txid1)
+    admission.admittedBytes shouldBe CrlAdmission.AppliedStubBytes
+
+    // Closed before the stub is durable, the replaced state stays counted, retained for the store
+    crl.heldStubSaves = Nil
+    store.frontend.admitPrepare(p1) shouldBe true
+    store.frontend.recordAppliedStub(txid1)(())
+    store.frontend.close()
+    admission.retainedBytes(storeId) shouldBe admissionBytes(p1) + CrlAdmission.AppliedStubBytes
+    crl.heldStubSaves.foreach(_())
+    admission.admittedBytes shouldBe admissionBytes(p1) + CrlAdmission.AppliedStubBytes
   }
 
   test("object data arriving after a data-less prepare is charged once, and returned at finalization") {

@@ -569,6 +569,9 @@ Ruling 4 is omitted (superseded by 12); Ruling 16 is included as read by Ruling 
   newly created Tx, can no longer downgrade a finalized entry and make the finalized relay answer non-late (X3).
 - **31 (closed store's drivers).** `Store.close` shuts down the store's transaction drivers, so their timers stop
   re-preparing transactions for a store that is gone. Other stores' heartbeat recovery takes over.
+- **Addendum.** Applied stubs (closing residual 17's late-acknowledged re-apply to a self-healing minority) and
+  prefer-abort driver prepares are specified in `2026-11-09-replay-pins-addendum-design.md`, with its own amendments.
+  Where it conflicts with residual 17 or the missing-data wait above, it wins.
 
 Residuals recorded by the amendments:
 - **17 (corrected by 32).** A store that applied T but acknowledged after errorTimeout keeps its UnackedCommits entry

@@ -240,3 +240,27 @@ My calls, for review:
 - How the marker reports the stores it wrote entries for (`FinalizationAction` API).
 - How the scan finds orphan stubs.
 - Exact scaladoc wording, within the meaning above.
+
+## Amendments during implementation
+
+Decisions made while building that refined the text above. Where they conflict, these win.
+
+- **1 (stub write point).** A stub is written where the Tx's CRL state would be deleted today (after its backend commits
+  persist), never at TxFinalized receipt while commits are outstanding or failed. The Tx remembers TxFinalized's owed
+  membership until then.
+- **2 (hand-off).** `MissedUpdateFinalizationAction` sets `handedOff` when it hands a mark to `MissedUpdateMarker`;
+  after that only the write callback (which sets `owed` first) may complete the action. Everything the finalizer writes
+  is durable before TxFinalized.
+- **3 (second driver).** A driver finalized by another driver's non-late commit TxFinalized, whose own finalizer has
+  handed off a mark, waits for that mark and sends its own TxFinalized with owed = received owed union its own (first
+  send and heartbeat resends). The store does not discard such a driver on the other TxFinalized until it has sent its
+  own. Stores that already forgot T write stubs from it. Residual: the second driver's host crashing after its entries
+  commit but before its TxFinalized reaches the stores leaves a rare replay exposure at stores that applied T.
+- **4 (owed atomic).** `owed` is passed into `onFinalized` atomically, so a late TxFinalized never carries a non-empty
+  owed.
+- **5 (recovered stub holder).** A recovered non-late commit vote holding a stub resolves committed and stays until
+  TxFinalized (`doCommit` applies nothing), rather than applying nothing and being forgotten, preserving "acceptors
+  forget only on TxFinalized or a late outcome".
+- **6 (scan snapshot).** The repair scan snapshots the store's stub set before walking its UnackedCommits range and
+  drops only snapshot stubs whose txid had no entry in the walk. A stub written mid-walk survives to the next scan;
+  stubs are written after their entry is durable, so a pre-walk stub's entry is visible to the walk.

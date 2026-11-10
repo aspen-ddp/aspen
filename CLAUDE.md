@@ -245,9 +245,19 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     transaction started earlier (`Tx.muted`): proven committed if an object shows its update, otherwise forgotten
     with no promise, vote, accept or CRL save, as if the store were offline. Its old incarnation may have accepted in
     such a transaction, and a fresh promise could let a quorum choose against the chosen value
-  - A driver's data-less prepare can overtake the client's prepare carrying a store's data. The store withholds its
-    vote until the data, a client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes:
-    missing data then gets an abort vote. A vote given stands, but later data is still used to apply a commit
+  - Driver prepares are prefer-abort (`fromClient == false`): a Tx with no vote and no client prepare never checks
+    requirements on one. It proves at once if it can (`appliedBy`), else withholds its whole response until the data, a
+    client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes: then it votes abort
+    (`NoClientPrepare`). This holds for data-less transactions too, so their late resolution may take 5 s longer. A vote
+    given stands, but later data is still used to apply a commit. Accepted corner case: a delayed duplicate client
+    prepare of an aborted transaction (see the `Transaction.commit` scaladoc)
+  - Applied stubs: a durable (store, txid) record in the device CRL, charged to `CrlAdmission`, meaning the store holds
+    that transaction's update. Written where the Tx's CRL state would be deleted, after its commits persist: on an
+    owed-listing `TxFinalized` (`owed`, unioned by a second driver), on applying through an UnackedCommits entry, and
+    by a lookup when the Tx is forgotten without a listing one. A late commit at a store with a stub applies nothing and
+    reports its objects in `objectCommitErrors`. The repair scan drops a stub with its entry, and orphan stubs by a
+    pre-walk snapshot. Residuals: a store that never saw T and missed its TxFinalized (below a quorum, self-heals), and a
+    second driver's host crashing after its entries commit but before its TxFinalized arrives
   - A commit decision can overtake the data too. The store holds the commit until the data, a client's prepare, or
     TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
     if the data beat the finalizer's `errorTimeout` (2 s)

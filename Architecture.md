@@ -160,6 +160,14 @@ because the DataStore driving the transaction does not have the full data for ev
 modified, it cannot re-transmit Prepare messages with the local object updates for each DataStore. 
 Thus it always tries to Abort.
 
+Recovery and every other store-side driver send prefer-abort prepares: a DataStore that has not yet voted
+never checks the transaction's requirements on such a prepare. It proves the commit at once if an object it hosts
+already shows the transaction's update. Otherwise it waits (up to 5 seconds) for the client's own prepare, and
+votes abort if none arrives. Recovery therefore never gathers fresh commit votes, so it cannot commit a
+transaction that was already aborted and forgotten. The one accepted corner case is a delayed duplicate of the
+client's own prepare that reaches enough stores after all of them forgot an aborted transaction while its
+requirements hold again; a client that successfully retries the transaction closes it.
+
 One reason transactions are intended to commit/abort as fast as possible is that once a DataStore 
 votes to commit a transaction, the objects it hosts are locked to that transaction until the 
 transaction completes with a commit/abort decision. If two transactions simultaneously try to update 

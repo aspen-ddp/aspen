@@ -48,12 +48,14 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
   }
 
   /** A leader for stores 0 to 2 whose transaction has committed and whose finalization never completes */
-  def resolvedDriver(): (SimpleTransactionDriver, TMessenger, ManualTasks) =
+  def resolvedDriver(handedOff: Set[StoreId] = Set()): (SimpleTransactionDriver, TMessenger, ManualTasks) =
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
     val tasks = new ManualTasks(summon[ExecutionContext])
+    val finalizer = new TFinalizer(autoComplete = false)
+    finalizer.handedOff = handedOff
     val driver = new SimpleTransactionDriver(summon[ExecutionContext], 100.milliseconds, 3.seconds, ds0, messenger, tasks,
-      txd, new TFinalizer(autoComplete = false))
+      txd, finalizer)
     val proposal = ProposalId(1, 0)
 
     for from <- List(ds0, ds1, ds2) do
@@ -94,6 +96,21 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
 
     tasks.fireAll()
     resolvedSentTo(messenger) shouldBe empty
+  }
+
+  // Ruling 7: a driver whose own mark is in flight finalizes on another driver's TxFinalized at once. Retransmitting
+  // non-late TxResolved meanwhile could reach a replay's fresh Tx after the status cache forgot the transaction
+  test("a driver whose mark was handed off sends no TxResolved after another driver's TxFinalized") {
+    val (driver, messenger, tasks) = resolvedDriver(handedOff = Set(ds2))
+
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, driver.txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+    val finals = messenger.messages.collect { case f: TxFinalized => (f.owed, f.late) }.toSet
+    finals shouldBe Set((Set(ds1, ds2), false))
+    messenger.clear()
+
+    tasks.fireAll(ignoreCancel = true)
+    resolvedSentTo(messenger) shouldBe empty
+    tasks.pending shouldBe 0
   }
 
   // Ruling 31: Store.close shuts its drivers down. A timer already firing must not restart the retry loop

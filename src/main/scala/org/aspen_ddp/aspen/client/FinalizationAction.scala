@@ -30,14 +30,12 @@ trait FinalizationAction extends Logging {
     */
   def commitVoters(voters: Option[Set[StoreId]]): Unit = ()
 
-  /** The stores for which this action wrote UnackedCommits entries. Meaningful once `complete` has succeeded */
-  def owedStores: Set[StoreId] = Set()
-
-  /** Once this action has handed UnackedCommits entries to be written: a future of the stores they are for, completed
-    * when the entries are durable (failed if the write gave up). None while nothing has been handed off. Unlike
-    * `complete`, it is unaffected by `cancel`
+  /** The stores this action has handed UnackedCommits entries for to be written (the planned set), whatever the write's
+    * outcome. Empty until it hands them off, and for good if `cancel` came first: from then on nothing is written. So a
+    * caller that cancels and then reads this has every store that may get an entry. Once `complete` has succeeded,
+    * the entries are durable
     */
-  def pendingOwed: Option[Future[Set[StoreId]]] = None
+  def handedOffStores: Set[StoreId] = Set()
 
   def debugStatus: (String, Boolean) = synchronized {
     (this.getClass.toString, complete.isCompleted)

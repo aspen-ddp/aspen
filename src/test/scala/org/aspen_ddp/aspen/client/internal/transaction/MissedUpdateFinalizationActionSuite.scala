@@ -463,16 +463,16 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     yield
       entries.keySet shouldBe Set(UnackedCommitEntry.key(net.storeId1, txd.transactionId))
 
-  atest("a finalizer that wrote entries for stores 1 and 2 reports owedStores == {1, 2}"):
+  atest("a finalizer that wrote entries for stores 1 and 2 reports handedOffStores == {1, 2}"):
     val ptr = pointerWith(Array[Byte](4, 6))
     val txd = refcountTxd(ptr)
     val fa = new MissedUpdateFinalizationAction(client, txd)
     fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)))
     fa.updateCommitErrors(Map(net.storeId0 -> Nil))
-    fa.owedStores shouldBe empty
+    fa.handedOffStores shouldBe empty
     fa.markMissedUpdates()
     for _ <- fa.complete yield
-      fa.owedStores shouldBe Set(net.storeId1, net.storeId2)
+      fa.handedOffStores shouldBe Set(net.storeId1, net.storeId2)
 
   atest("a cancelled marker that wrote nothing owes nothing"):
     val ptr = pointerWith(Array[Byte](4, 7))
@@ -481,7 +481,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     fa.updateCommitErrors(Map(net.storeId0 -> Nil))
     fa.cancel()
     fa.markMissedUpdates()
-    fa.owedStores shouldBe empty
+    fa.handedOffStores shouldBe empty
 
   atest("a voter without TxCommitted gets a UnackedCommits entry for a data overwrite too"):
     val ptr = pointerWith(Array[Byte](4, 5))
@@ -641,20 +641,31 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     val fa = new PendingWriteMarker(txd)
     fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)))
     fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil))
-    fa.pendingOwed shouldBe None
+    fa.handedOffStores shouldBe empty
     fa.markMissedUpdates()
-    val pending = fa.pendingOwed.get
-    pending.isCompleted shouldBe false
+    // The planned set is known from the hand-off, before the write lands (Ruling 7)
+    fa.handedOffStores shouldBe Set(net.storeId2)
 
     // The store whose entry is being written now reports in
     fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil, net.storeId2 -> Nil))
     fa.complete.isCompleted shouldBe false
-    fa.owedStores shouldBe empty
 
     fa.write.success(())
-    for
-      _ <- fa.complete
-      stores <- pending
-    yield
-      fa.owedStores shouldBe Set(net.storeId2)
-      stores shouldBe Set(net.storeId2)
+    for _ <- fa.complete yield
+      fa.handedOffStores shouldBe Set(net.storeId2)
+
+  // R-N7 variant 2: a mark of several pools whose write fails part way (one pool's batch committed, another gave up)
+  // fails as a whole. The planned set still lists every store, cancelled or not
+  for cancelAfter <- List(false, true) do
+    atest(s"a partially failed mark still lists every planned store (cancelled after hand-off: $cancelAfter)"):
+      val txd = refcountTxd(pointerWith(Array[Byte](7, 5)))
+      val fa = new PendingWriteMarker(txd)
+      fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)))
+      fa.updateCommitErrors(Map(net.storeId0 -> Nil))
+      fa.markMissedUpdates()
+      if cancelAfter then fa.cancel()
+      fa.write.failure(new Exception("one pool's batch gave up"))
+      for _ <- fa.write.future.failed yield
+        fa.handedOffStores shouldBe Set(net.storeId1, net.storeId2)
+        // A failed write never completes the action: TxFinalized is not sent for entries that did not land
+        fa.complete.isCompleted shouldBe false

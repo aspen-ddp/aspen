@@ -50,11 +50,7 @@ object RegisteredTransactionFinalizerFactory {
 
     override def commitVoters(voters: Option[Set[StoreId]]): Unit = actions.foreach(_.commitVoters(voters))
 
-    override def owedStores: Set[StoreId] = actions.flatMap(_.owedStores).toSet
-
-    override def pendingOwed: Option[Future[Set[StoreId]]] =
-      val pending = actions.flatMap(_.pendingOwed)
-      Option.when(pending.nonEmpty)(Future.sequence(pending).map(_.flatten.toSet))
+    override def handedOffStores: Set[StoreId] = actions.flatMap(_.handedOffStores).toSet
 
     def debugStatus: List[(String, Boolean)] = {
       actions.map(f => (f.getClass.getSimpleName, f.complete.isCompleted))

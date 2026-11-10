@@ -37,7 +37,9 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
   /** The transaction was finalized another way (a late resolution, or TxFinalized from another driver), whose
     * finalization already wrote what this would. Stops a scheduled mark and any later execute; a mark already handed
-    * to the MissedUpdateMarker is not recalled. `complete` stays pending, as for the other actions
+    * to the MissedUpdateMarker is not recalled, and `handedOffStores` lists its stores. Shares the lock with the
+    * hand-off, so a caller that cancels and then reads `handedOffStores` sees every store that may get an entry.
+    * `complete` stays pending, as for the other actions
     */
   override def cancel(): Unit = synchronized {
     cancelled = true
@@ -45,20 +47,18 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     markTask = None
   }
 
-  /** Set once the UnackedCommits entries are durable; empty until then, and if the marker is cancelled before writing */
-  private var owed: Set[StoreId] = Set()
+  /** The stores the hand-off planned UnackedCommits entries for (Ruling 7), set with `handedOff` whatever the write's
+    * outcome; empty before, and for good if cancelled first
+    */
+  private var planned: Set[StoreId] = Set()
 
-  override def owedStores: Set[StoreId] = synchronized(owed)
+  override def handedOffStores: Set[StoreId] = synchronized(planned)
 
-  /** Set when the marks are handed to the marker. From then on only the write's callback completes the action, with
-    * `owed` already set: a late TxCommitted making every store clean must not complete it before the writes land
+  /** Set when the marks are handed to the marker. From then on only the write's success completes the action: a late
+    * TxCommitted making every store clean must not complete it before the writes land. A failed write (the marker gave
+    * up on a pool) never completes it, as before
     */
   private var handedOff = false
-
-  private val pendingPromise: Promise[Set[StoreId]] = Promise()
-
-  override def pendingOwed: Option[Future[Set[StoreId]]] = synchronized:
-    Option.when(handedOff)(pendingPromise.future)
 
   private val completionPromise: Promise[Unit] = Promise()
 
@@ -138,17 +138,12 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     reportMarks(errors.map(_.store))
 
     handedOff = true
+    planned = unacked.map(_.store).toSet
     markTask = None
-    writeMarks(errors, unacked).onComplete:
-      case scala.util.Success(_) =>
-        val stores = unacked.map(_.store).toSet
-        synchronized:
-          owed = stores
-          if !completionPromise.isCompleted then
-            completionPromise.success(())
-        pendingPromise.trySuccess(stores)
-      case scala.util.Failure(err) =>
-        pendingPromise.tryFailure(err)
+    writeMarks(errors, unacked).foreach: _ =>
+      synchronized:
+        if !completionPromise.isCompleted then
+          completionPromise.success(())
   }
 
   /** Where the mark timer and the report are scheduled. A seam for tests */

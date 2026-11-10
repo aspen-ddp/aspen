@@ -104,9 +104,6 @@ abstract class TransactionDriver(
     * entries (a non-late commit), or a TxFinalized from another driver, which reported them, finalized it
     */
   private var owed: Set[StoreId] = Set()
-
-  /** The `owed` of a commit TxFinalized from another driver, which this driver's TxFinalized must list too */
-  private var receivedOwed: Set[StoreId] = Set()
   protected var knownResolved: Set[StoreId] = Set()
   protected var resolvedValue: Boolean = false
 
@@ -417,20 +414,14 @@ abstract class TransactionDriver(
       if (msg.committed && msg.late)
         resolveLate()
       else {
+        // Ruling 7: finalizes at once, inside the status-cache window, never waiting for this driver's own mark. The
+        // cancel comes first: a marker not yet handed off then writes nothing, and one already handed off is not
+        // recalled and lists the stores it may still write (handedOffStores), whatever that write's outcome. So the
+        // TxFinalized this driver sends lists every store that may get an entry from either driver. A stub may then be
+        // written before its entry is durable; the repair scan allows for that (Ruling 8)
         finalizer.foreach( _.cancel() )
-        // A cancelled marker may already have handed entries to the MissedUpdateMarker. They are written whatever the
-        // cancel, so the TxFinalized this driver sends must list their stores too, once they are durable. The store
-        // keeps the driver until it has sent that (Store: only a finalized driver is dropped)
-        // Recorded before waiting: the cancelled marker's write also completes the finalizer's `complete`, whose
-        // callback finalizes with the finalizer's own set, so every path to onFinalized unions this in
-        if msg.committed && !finalized then receivedOwed = receivedOwed ++ msg.owed
-        val own = if msg.committed && !finalized then finalizer.flatMap(_.pendingOwed) else None
-        own match
-          case Some(pending) =>
-            pending.onComplete: result =>
-              onFinalized(true, msg.owed ++ result.getOrElse(Set()))
-          case None =>
-            onFinalized(msg.committed, msg.owed)
+        val planned = if msg.committed then finalizer.fold(Set[StoreId]())(_.handedOffStores) else Set[StoreId]()
+        onFinalized(msg.committed, msg.owed ++ planned)
       }
     }
 
@@ -447,7 +438,7 @@ abstract class TransactionDriver(
   private def onFinalized(committed: Boolean, owedStores: Set[StoreId]): Unit =
     synchronized:
       if !finalized then
-        owed = if committed && !late then owedStores ++ receivedOwed else Set()
+        owed = if committed && !late then owedStores else Set()
       onFinalized(committed)
 
   protected def onFinalized(committed: Boolean): Unit = {
@@ -601,7 +592,9 @@ abstract class TransactionDriver(
     * UnackedCommits marker already completed. A store forgets a committed transaction it voted on only on TxFinalized
     * (Frontend.receiveTransactionMessage via Tx.receiveFinalized), or on a late commit, which follows TxFinalized
     * (Tx.lateCommit). Finding its UnackedCommits entry (Tx.unackedCommitFound) applies the update but does not forget
-    * it. So everything the finalizer writes, in every pool, is durable before any voter forgets the transaction. A
+    * it. So everything the first finalizer to complete writes, in every pool, is durable before any voter forgets the
+    * transaction. A second driver finalized by its TxFinalized does not wait for its own cancelled mark: entries that
+    * mark had already handed off may land after its TxFinalized, which lists their stores (Ruling 7). A
     * muted Tx (Frontend.forgetMuted) and a prover (Tx.proveCommitted) are dropped without TxFinalized, but neither
     * voted commit. Tx.unackedCommitFound and Tx.proveCommitted record nothing in the host's status cache, so a
     * finalized status, and the TxFinalized(late = true) a store relays from it, always stems from a real TxFinalized
@@ -634,7 +627,7 @@ abstract class TransactionDriver(
 
         f.complete foreach { _ =>
           logger.trace(s"Finalization actions completed for transaction ${txd.transactionId}")
-          onFinalized(committed, f.owedStores)
+          onFinalized(committed, f.handedOffStores)
         }
 
         finalizer = Some(f)

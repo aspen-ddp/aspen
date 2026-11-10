@@ -174,9 +174,9 @@ class StoreSuite extends AnyFunSuite with Matchers:
       created += 1
       this
     var completion: scala.concurrent.Promise[Unit] = scala.concurrent.Promise.successful(())
-    var pending: Option[scala.concurrent.Promise[Set[StoreId]]] = None
+    var handedOff: Set[StoreId] = Set()
     def complete: scala.concurrent.Future[Unit] = completion.future
-    override def pendingOwed = pending.map(_.future)
+    override def handedOffStores: Set[StoreId] = handedOff
     def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = ()
     def debugStatus: List[(String, Boolean)] = Nil
     def cancel(): Unit = ()
@@ -264,11 +264,10 @@ class StoreSuite extends AnyFunSuite with Matchers:
     net.sentTx.collect { case f: TxFinalized => (f.committed, f.late) }.distinct shouldBe List((true, false))
   }
 
-  test("another driver's TxFinalized does not discard a driver whose cancelled marker is still writing") {
+  test("another driver's TxFinalized finalizes a driver whose cancelled marker is still writing, listing its stores") {
     val (store, net, finalizer) = foundEntryStore()
-    val inFlight = scala.concurrent.Promise[Set[StoreId]]()
-    finalizer.pending = Some(inFlight)
-    finalizer.completion = scala.concurrent.Promise() // Never completes: the marker was cancelled
+    finalizer.handedOff = Set(leader)
+    finalizer.completion = scala.concurrent.Promise() // Never completes: the mark is still being written
     val p = currentProposal(net)
     promise(store, 1, p, Some((initialProposal, true)))
     promise(store, 2, p, None)
@@ -277,17 +276,10 @@ class StoreSuite extends AnyFunSuite with Matchers:
       store.receiveTransactionMessage(TxAcceptResponse(storeId, StoreId(poolId, i.toByte), foundTxid,
         accepts.head.proposalId, Right(TxAcceptResponse.Accepted(true))))
     finalizer.created shouldBe 1
-    // The driver's own finalizer is cancelled but its entries are in flight
     net.sentTx = Nil
 
     store.receiveTransactionMessage(TxFinalized(storeId, peer, foundTxid, committed = true, late = false, owed = Set(peer)))
-    store.hasTransactions shouldBe true
-    net.sentTx.collect { case f: TxFinalized => f } shouldBe Nil
-
-    inFlight.success(Set(leader))
-    val sent = net.sentTx.collect { case f: TxFinalized => f.owed }.distinct
-    sent shouldBe List(Set(peer, leader))
-    store.receiveTransactionMessage(TxFinalized(storeId, storeId, foundTxid, committed = true, late = false, owed = Set(peer, leader)))
+    net.sentTx.collect { case f: TxFinalized => (f.owed, f.late) }.distinct shouldBe List((Set(peer, leader), false))
     store.hasTransactions shouldBe false
   }
 

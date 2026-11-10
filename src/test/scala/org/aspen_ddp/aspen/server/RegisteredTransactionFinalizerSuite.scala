@@ -40,7 +40,7 @@ object RegisteredTransactionFinalizerSuite:
     var errors: List[Map[StoreId, List[ObjectId]]] = Nil
     var voters: List[Option[Set[StoreId]]] = Nil
     var owed: Set[StoreId] = Set()
-    override def owedStores: Set[StoreId] = owed
+    override def handedOffStores: Set[StoreId] = owed
     override def complete: Future[Unit] = done.future
     override def execute(): Unit = executed = true
     override def cancel(): Unit = cancelled = true
@@ -103,8 +103,8 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     val m = new StubMarker
     m.owed = Set(TransactionDriverSuite.ds0, TransactionDriverSuite.ds1)
     val f = new Finalizer(List(new StubAction, m))
-    f.owedStores should be (m.owed)
-    new Finalizer(List(new StubAction)).owedStores should be (Set())
+    f.handedOffStores should be (m.owed)
+    new Finalizer(List(new StubAction)).handedOffStores should be (Set())
   }
 
   test("without a marker, every action executes at once") {

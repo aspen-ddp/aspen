@@ -75,12 +75,14 @@ object TransactionDriverSuite {
 
     override def cancel(): Unit = cancelled = true
 
-    var owed: Set[StoreId] = Set()
-    override def owedStores: Set[StoreId] = owed
+    /** The stores a handed-off mark plans entries for */
+    var handedOff: Set[StoreId] = Set()
 
-    /** Set to simulate a marker whose entries were handed off and are still being written */
-    var pending: Option[Promise[Set[StoreId]]] = None
-    override def pendingOwed: Option[Future[Set[StoreId]]] = pending.map(_.future)
+    /** Whether the finalizer was cancelled when `handedOffStores` was last read */
+    var readCancelled: Option[Boolean] = None
+    override def handedOffStores: Set[StoreId] =
+      readCancelled = Some(cancelled)
+      handedOff
 
     /** When set, `complete` is this promise: models a marker whose write completes it though it was cancelled */
     var completion: Option[Promise[Unit]] = None
@@ -902,7 +904,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     // own finalizer
     val messenger = new TMessenger()
     val finalizer = new TFinalizer()
-    finalizer.owed = Set(ds1)
+    finalizer.handedOff = Set(ds1)
     val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => ())
     for from <- List(ds0, ds1) do
       driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
@@ -928,81 +930,79 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     owedSent(m3) should be (Set(Set[StoreId]()))
   }
 
-  test("another driver's TxFinalized waits for an in-flight mark; the sent TxFinalized carries the union") {
+  for handedOff <- List(Set[StoreId](), Set(ds0, ds2)) do
+    test(s"another driver's TxFinalized finalizes at once with received owed and the planned set (planned: ${handedOff.map(_.poolIndex)})") {
+      val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+      val messenger = new TMessenger()
+      val finalizer = new TFinalizer(autoComplete = false) // The mark's write never lands
+      finalizer.handedOff = handedOff
+      var completed = false
+      val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+      for from <- List(ds0, ds1) do
+        driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
+          Right(TxAcceptResponse.Accepted(true))))
+      finalizer.createCount should be (1)
+      messenger.clear()
+
+      driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+
+      // Cancelled first, so no mark is handed off after the planned set is read
+      finalizer.cancelled should be (true)
+      finalizer.readCancelled should be (Some(true))
+      completed should be (true)
+      driver.mayBeDiscarded should be (true)
+      val sent = messenger.messages.collect { case f: TxFinalized => (f.owed, f.late) }.toSet
+      sent should be (Set((handedOff + ds1, false)))
+      messenger.clear()
+      driver.heartbeat()
+      messenger.messages.collect { case f: TxFinalized => (f.owed, f.late) }.toSet should be (Set((handedOff + ds1, false)))
+    }
+
+  test("a driver finalized by another driver's TxFinalized sends no TxResolved, and a later late message changes nothing") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
     val finalizer = new TFinalizer(autoComplete = false)
-    val inFlight = Promise[Set[StoreId]]()
-    finalizer.pending = Some(inFlight)
-    var completed = false
-    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+    finalizer.handedOff = Set(ds0)
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => ())
     for from <- List(ds0, ds1) do
       driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
         Right(TxAcceptResponse.Accepted(true))))
-    finalizer.createCount should be (1)
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
     messenger.clear()
 
+    // Late messages reach a finalized driver: nothing they do can drop the planned stores or send late
+    driver.receiveTxResolved(TxResolved(ds0, ds2, txd.transactionId, committed = true, late = true, proof = false))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds2, txd.transactionId, committed = true, late = true, owed = Set()))
+    driver.heartbeat()
+    messenger.messages.collect { case r: TxResolved => r } should be (Nil)
+    messenger.messages.collect { case f: TxFinalized => (f.owed, f.late) }.toSet should be (Set((Set(ds0, ds1), false)))
+  }
+
+  test("a cancelled marker whose write completes the finalizer later changes nothing") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer(autoComplete = false)
+    val done = Promise[Unit]()
+    finalizer.completion = Some(done)
+    finalizer.handedOff = Set(ds0)
+    val calls = new java.util.concurrent.atomic.AtomicInteger()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => calls.incrementAndGet())
+    for from <- List(ds0, ds1) do
+      driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
+        Right(TxAcceptResponse.Accepted(true))))
     driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
-
-    finalizer.cancelled should be (true)
-    completed should be (false)
-    driver.mayBeDiscarded should be (false)
-    messenger.messages.collect { case f: TxFinalized => f } should be (Nil)
-
-    inFlight.success(Set(ds0))
-
-    // The in-flight mark's callback runs on the driver's execution context
-    val waitUntil = System.nanoTime() + 5_000_000_000L
-    while !driver.mayBeDiscarded && System.nanoTime() < waitUntil do Thread.sleep(5)
-    completed should be (true)
     driver.mayBeDiscarded should be (true)
-    val sent = messenger.messages.collect { case f: TxFinalized => f.owed }.toSet
-    sent should be (Set(Set(ds0, ds1)))
+    calls.get should be (1)
+
+    // The completion callback, on the global context, reaches onFinalized again: it must change nothing
+    done.success(())
+    val deadline = System.nanoTime() + 5_000_000_000L
+    while calls.get < 2 && System.nanoTime() < deadline do Thread.sleep(1)
+    calls.get should be (2)
     messenger.clear()
     driver.heartbeat()
     messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set(ds0, ds1)))
   }
-
-  for completeFirst <- List(true, false) do
-    test(s"a cancelled marker whose write also completes the finalizer still sends received and own owed (complete first: $completeFirst)") {
-      val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
-      val messenger = new TMessenger()
-      val finalizer = new TFinalizer(autoComplete = false)
-      val inFlight = Promise[Set[StoreId]]()
-      val done = Promise[Unit]()
-      finalizer.pending = Some(inFlight)
-      finalizer.completion = Some(done)
-      finalizer.owed = Set(ds0)
-      val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => ())
-      for from <- List(ds0, ds1) do
-        driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
-          Right(TxAcceptResponse.Accepted(true))))
-      messenger.clear()
-
-      driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
-      driver.mayBeDiscarded should be (false)
-
-      // The write lands: the real marker completes `complete` and then the pending future
-      if completeFirst then
-        // Deterministic: the complete callback has finalized the driver before the pending future completes
-        done.success(())
-        val first = System.nanoTime() + 5_000_000_000L
-        while !driver.mayBeDiscarded && System.nanoTime() < first do Thread.sleep(5)
-        inFlight.success(Set(ds0))
-      else
-        inFlight.success(Set(ds0))
-        val first = System.nanoTime() + 5_000_000_000L
-        while !driver.mayBeDiscarded && System.nanoTime() < first do Thread.sleep(5)
-        done.success(())
-
-      val waitUntil = System.nanoTime() + 5_000_000_000L
-      while !driver.mayBeDiscarded && System.nanoTime() < waitUntil do Thread.sleep(5)
-      driver.mayBeDiscarded should be (true)
-      messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set(ds0, ds1)))
-      messenger.clear()
-      driver.heartbeat()
-      messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set(ds0, ds1)))
-    }
 
   test("a late resolution after the owed set is chosen still sends an empty owed") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)

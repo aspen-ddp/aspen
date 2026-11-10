@@ -322,7 +322,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     transactions.get(txid).foreach: tx =>
       removeFromQueue(tx)
       transactions -= txid
-      currentLogEntry.deleteTx(txid)
+      currentLogEntry.deleteTxForStub(txid)
     val stub = stubs.get(txid) match
       case Some(stub) => stub
       case None =>

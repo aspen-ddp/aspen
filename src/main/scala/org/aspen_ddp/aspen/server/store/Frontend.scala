@@ -274,10 +274,25 @@ class Frontend(val storeId: StoreId,
     * recovery. Written only on the store's executor; `@volatile` so appliedStubs may be read from any thread */
   @volatile private var stubs: Set[TransactionId] = Set()
 
+  /** What the stubs are charged to the device's admission (CrlAdmission.AppliedStubBytes each), until released */
+  private var stubBytesCharged: Long = 0L
+
+  private def chargeStubs(n: Int): Unit =
+    val bytes = n * CrlAdmission.AppliedStubBytes
+    admission.charge(bytes)
+    stubBytesCharged += bytes
+
+  private def releaseStub(): Unit =
+    val bytes = math.min(CrlAdmission.AppliedStubBytes, stubBytesCharged)
+    admission.release(bytes)
+    stubBytesCharged -= bytes
+
   // Undeferred (tests only), the state is read here, which may block on the CRL
   if deferRecovery then awaitRecovery() else recoverState(Await.result(crl.readStoreState(storeId), Duration.Inf))
 
   private def recoverState(state: StoreRecoveryState): Unit =
+    // Counted without a check, as recovered transactions are: the CRL already holds them
+    chargeStubs((state.appliedStubs -- stubs).size)
     stubs ++= state.appliedStubs
     recoverTransactions(state.transactions)
 
@@ -348,18 +363,36 @@ class Frontend(val storeId: StoreId,
   def appliedStubs: Set[TransactionId] = stubs
 
   /** Records that the store holds `txid`'s update: an applied stub, saved in the CRL in place of the transaction's
-    * state, for a transaction the store is forgetting. `onDurable` runs on the store's executor once the stub is durable.
-    * What the transaction was admitted for is released (its CRL state is replaced). Never subject to CrlAdmission
+    * state, for a transaction the store is forgetting. `onDurable` runs on the store's executor once the stub is
+    * durable, after what the transaction was admitted for is released (its CRL state is replaced), unless a Tx for it
+    * is live again by then, which then holds that admission.
+    *
+    * The stub is charged to the device's admission without a check (CrlAdmission.AppliedStubBytes), so it is never
+    * dropped or held back, while new prepares feel its bytes: the CRL's copy-forward carries stubs too. Released by
+    * dropAppliedStub, or retained at close until the store's entries leave the CRL.
+    *
+    * It must not replace the state of a transaction whose backend commits here are outstanding or failed: that state
+    * (object data included) is what a reloaded store recovers the transaction from. Stubs are written only where
+    * deleteTransactionState would run.
     */
   def recordAppliedStub(txid: TransactionId)(onDurable: => Unit): Unit =
-    stubs += txid
-    releaseAdmission(txid)
-    crl.saveAppliedStub(storeId, txid, () => post(() => onDurable))
+    require(!txCommits.contains(txid),
+      s"Store $storeId: an applied stub cannot replace transaction $txid's CRL state while its backend commits are " +
+      s"outstanding or failed")
+    if !stubs.contains(txid) then
+      chargeStubs(1)
+      stubs += txid
+    crl.saveAppliedStub(storeId, txid, () => post { () =>
+      if !transactions.contains(txid) then
+        releaseAdmission(txid)
+      onDurable
+    })
 
-  /** Drops the applied stub for `txid`, if the store holds one, and deletes it from the CRL */
+  /** Drops the applied stub for `txid`, if the store holds one, deletes it from the CRL and releases its charge */
   def dropAppliedStub(txid: TransactionId): Unit =
     if stubs.contains(txid) then
       stubs -= txid
+      releaseStub()
       crl.deleteAppliedStub(storeId, txid)
 
   // ---- UnackedCommits lookups of recovered commit votes and held late commits (Tx.awaitsUnackedLookup) ----
@@ -538,12 +571,15 @@ class Frontend(val storeId: StoreId,
   def releaseAllAdmissions(): Unit =
     admitted.valuesIterator.foreach(a => admission.release(a.bytes))
     admitted.clear()
+    admission.release(stubBytesCharged)
+    stubBytesCharged = 0L
 
   /** Closes the store. Its entries stay live in the CRL unless the closer takes them out, so what its transactions
     * were admitted for stays counted, retained for the store (CrlAdmission.retain) */
   def close(): Future[Unit] =
-    admission.retain(storeId, admitted.valuesIterator.map(_.bytes).sum)
+    admission.retain(storeId, admitted.valuesIterator.map(_.bytes).sum + stubBytesCharged)
     admitted.clear()
+    stubBytesCharged = 0L
     backend.close()
 
   def path: os.Path = backend.path

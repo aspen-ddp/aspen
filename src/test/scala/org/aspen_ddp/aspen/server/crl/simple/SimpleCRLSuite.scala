@@ -1408,12 +1408,61 @@ class SimpleCRLSuite extends FileBasedTests {
     i2.crl.shutdown()
   }
 
+  /** Saves `transactionId2`'s state and holds the writer until the returned latch is counted down: requests queued
+    * meanwhile are batched into a single log entry */
+  private def holdWriter(crl: CrashRecoveryLog): CountDownLatch =
+    val first = new LinkedBlockingQueue[String]()
+    val gate = new CountDownLatch(1)
+    crl.save(transactionId2, trsValidTxd2, () => { first.put(""); gate.await() })
+    first.take()
+    gate
+
   test("an applied stub written after its transaction's deletion in the same entry is kept") {
+    val q = new LinkedBlockingQueue[String]()
     val i = SimpleCRL(tdir, 3, 1024 * 1024)
     saveAndWait(i.crl, transactionId, trsValidTxd)
-    // Both queued before the CRL thread takes either, so they normally share an entry
+    val gate = holdWriter(i.crl)
     i.crl.deleteTransaction(storeId, transactionId)
-    stubAndWait(i.crl, storeId, transactionId)
+    i.crl.saveAppliedStub(storeId, transactionId, () => q.put("stub"))
+    gate.countDown()
+    q.poll(5, TimeUnit.SECONDS) shouldBe "stub"
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    i2.crl.shutdown()
+  }
+
+  test("a transaction saved after its applied stub in the same entry is written beside it") {
+    val q = new LinkedBlockingQueue[String]()
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    val gate = holdWriter(i.crl)
+    // All in one entry: the stub's replacement of the state does not make the later save's deletion final
+    i.crl.save(transactionId, trsUndetermined, () => q.put("first save"))
+    i.crl.saveAppliedStub(storeId, transactionId, () => q.put("stub"))
+    i.crl.save(transactionId, trsValidTxd, () => q.put("save"))
+    gate.countDown()
+    Set(q.poll(5, TimeUnit.SECONDS), q.poll(5, TimeUnit.SECONDS), q.poll(5, TimeUnit.SECONDS)) shouldBe
+      Set("first save", "stub", "save")
+    readState(i.crl, storeId) shouldBe StoreRecoveryState(List(trsValidTxd), Set(transactionId))
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    readState(i2.crl, storeId) shouldBe StoreRecoveryState(List(trsValidTxd), Set(transactionId))
+    i2.crl.shutdown()
+  }
+
+  test("a deletion after a stub and a later save in the same entry stays final") {
+    val q = new LinkedBlockingQueue[String]()
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    val gate = holdWriter(i.crl)
+    i.crl.save(transactionId, trsUndetermined, () => q.put("first save"))
+    i.crl.saveAppliedStub(storeId, transactionId, () => q.put("stub"))
+    i.crl.save(transactionId, trsValidTxd, () => q.put("save"))
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.save(transactionId, trsValidTxd, () => q.put("late save"))
+    gate.countDown()
+    (1 to 4).map(_ => q.poll(5, TimeUnit.SECONDS)).toSet shouldBe Set("first save", "stub", "save", "late save")
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)

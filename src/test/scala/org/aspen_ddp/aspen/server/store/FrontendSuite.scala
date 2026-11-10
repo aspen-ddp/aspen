@@ -3157,29 +3157,82 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("a stub write is not subject to CrlAdmission backpressure") {
-    // Below the limit until tx1 is admitted, which crosses it
-    val admission = new CrlAdmission(1)
-    val crl = new TestCrl
-    val (store, _, net) = admissionStore(admission, crl)
-    val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
-    store.receiveTransactionMessage(p1)
-    prepareResponses(net, txid1).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+    val admission = new CrlAdmission(100)
+    admission.tryAdmit(100) shouldBe true
     admission.full shouldBe true
+    val crl = new TestCrl
+    val (store, _, _) = admissionStore(admission, crl)
 
-    // Written past the mark; the stub replaces txid1's CRL state, so what it was admitted for is released
+    // Written past the mark, and charged without a check
     var durable = false
     store.frontend.recordAppliedStub(txid1) { durable = true }
     durable shouldBe true
     crl.stubsSaved shouldBe List(txid1)
+    store.frontend.hasAppliedStub(txid1) shouldBe true
+    admission.admittedBytes shouldBe 100 + CrlAdmission.AppliedStubBytes
+    // Saved again, it is charged once
+    store.frontend.recordAppliedStub(txid1)(())
+    crl.stubsSaved shouldBe List(txid1, txid1)
+    admission.admittedBytes shouldBe 100 + CrlAdmission.AppliedStubBytes
+  }
+
+  test("stubs count toward the device's admission until they leave the CRL") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val crl = new TestCrl
+    val (store, _, _) = admissionStore(admission, crl)
+    store.frontend.recordAppliedStub(txid1)(())
+    store.frontend.recordAppliedStub(txid2)(())
+    admission.admittedBytes shouldBe 2 * CrlAdmission.AppliedStubBytes
+
+    store.frontend.dropAppliedStub(txid2)
+    admission.admittedBytes shouldBe CrlAdmission.AppliedStubBytes
+    // Only a stub held is released
+    store.frontend.dropAppliedStub(txid2)
+    admission.admittedBytes shouldBe CrlAdmission.AppliedStubBytes
+
+    // Closed, its stubs stay counted, retained for it until its entries leave the CRL (extraction, dropStore)
+    store.frontend.close()
+    admission.retainedBytes(storeId) shouldBe CrlAdmission.AppliedStubBytes
+    admission.admittedBytes shouldBe CrlAdmission.AppliedStubBytes
+    admission.releaseRetained(storeId)
     admission.admittedBytes shouldBe 0
 
-    // And with the admission full of other transactions' bytes
-    admission.tryAdmit(1) shouldBe true
-    admission.full shouldBe true
-    store.frontend.recordAppliedStub(txid2)(())
-    crl.stubsSaved shouldBe List(txid1, txid2)
-    store.frontend.hasAppliedStub(txid2) shouldBe true
-    admission.admittedBytes shouldBe 1
+    // Recovered stubs are counted again, without a check
+    val full = new CrlAdmission(1)
+    full.tryAdmit(1) shouldBe true
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val recovering = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
+      new TestCrl, new TransactionStatusCache(), admission = full, deferRecovery = true)
+    recovering.recover(StoreRecoveryState(Nil, Set(txid1, txid2)))
+    full.admittedBytes shouldBe 1 + 2 * CrlAdmission.AppliedStubBytes
+    recovering.releaseAllAdmissions()
+    full.admittedBytes shouldBe 1
+  }
+
+  test("a stub releases what its transaction was admitted for only once it is durable") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val crl = new TestCrl
+    crl.holdStubSaves = true
+    val (store, _, _) = admissionStore(admission, crl)
+    val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+    // Admitted, as a forgotten transaction whose CRL state the stub replaces would be
+    store.frontend.admitPrepare(p1) shouldBe true
+    store.frontend.transactions.contains(txid1) shouldBe false
+    admission.admittedBytes shouldBe admissionBytes(p1)
+
+    store.frontend.recordAppliedStub(txid1)(())
+    admission.admittedBytes shouldBe admissionBytes(p1) + CrlAdmission.AppliedStubBytes
+    crl.heldStubSaves.foreach(_())
+    admission.admittedBytes shouldBe CrlAdmission.AppliedStubBytes
+  }
+
+  test("an applied stub cannot replace a transaction whose backend commits are outstanding or failed") {
+    val (frontend, backend, _) = heldCommit(new TestCrl)
+    an[IllegalArgumentException] should be thrownBy frontend.recordAppliedStub(txid1)(())
+    backend.deliverCommits(Right(CommitError.IOFailure))
+    an[IllegalArgumentException] should be thrownBy frontend.recordAppliedStub(txid1)(())
+    frontend.hasAppliedStub(txid1) shouldBe false
   }
 
   test("a known transaction's retransmitted prepare is answered past the mark") {

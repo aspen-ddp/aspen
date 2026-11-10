@@ -17,6 +17,8 @@ class LogEntry(val previousEntryLocation: StreamLocation,
   private var txDelSet: Set[TxId] = Set()
   private var stubs: HashMap[TxId, Stub] = new HashMap()
   private var stubDeletions: Set[TxId] = Set()
+  /** Transactions whose deletion in this entry a stub's save made, and nothing else (deleteTxForStub) */
+  private var stubReplaced: Set[TxId] = Set()
 
 
   def isEmpty: Boolean =
@@ -50,6 +52,14 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     // Deletions are final. A save of a transaction deleted earlier in this same entry is a timing
     // artifact and is skipped, but it still reports success once the entry (and thus the delete)
     // is durable.
+    //
+    // A deletion made by a stub's save (deleteTxForStub) is not final: the stub replaced the state, and a save after
+    // it is a new state of the transaction, live beside the stub. The save cancels that deletion, so it is written;
+    // recovery takes the newest save
+    if stubReplaced.contains(tx.id) then
+      stubReplaced -= tx.id
+      txDelSet -= tx.id
+      txDeletions = txDeletions.filterNot(_ == tx.id)
     if !txDelSet.contains(tx.id) then
       txs += (tx.id -> tx)
     completionHandlers = completionHandler :: completionHandlers
@@ -61,6 +71,15 @@ class LogEntry(val previousEntryLocation: StreamLocation,
   def deleteTx(txid: TxId): Unit =
     txDeletions = txid :: txDeletions
     txDelSet = txDelSet + txid
+    stubReplaced -= txid
+
+  /** Deletes the transaction state a stub's save replaces. Unlike deleteTx, a later save of it in this entry cancels
+    * the deletion (addTx) */
+  def deleteTxForStub(txid: TxId): Unit =
+    val alreadyDeleted = txDelSet.contains(txid)
+    deleteTx(txid)
+    if !alreadyDeleted then
+      stubReplaced += txid
 
   /** Unlike a transaction's save, a stub's save after its deletion in this entry is written: the newer of the two
     * wins, so an entry never holds both for one id */

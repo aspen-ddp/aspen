@@ -52,6 +52,8 @@ object TransactionDriver {
         }
       }
 
+      override def shutdown(): Unit = hangCheckTask.cancel()
+
       override protected def onFinalized(committed: Boolean): Unit = {
         super.onFinalized(committed)
         synchronized {
@@ -100,8 +102,9 @@ abstract class TransactionDriver(
   protected var knownResolved: Set[StoreId] = Set()
   protected var resolvedValue: Boolean = false
 
-  /** A store proved the commit (a `TxResolved` with `proof = true`): this driver never proposes abort, and resolves
-    * late once a prepare quorum of the current round remembers nothing of the transaction. See `resolveLate`
+  /** A store proved the commit (a `TxResolved` with `proof = true`): this driver never proposes abort, adopts only an
+    * accepted commit, and resolves late once a prepare quorum of the current round reports no accepted commit
+    * (Ruling 29). See `resolveLate`
     */
   private var holdsProof: Boolean = false
 
@@ -191,11 +194,17 @@ abstract class TransactionDriver(
     */
   def heartbeat(): Unit = {
     reportIfStuck()
-    if (finalized)
-      messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, resolvedValue, late)))
-    else if (heartbeatDue)
+    // One snapshot under the lock, sent outside it: onFinalized, on another thread, writes `finalized` before the
+    // outcome, so unlocked reads could send TxFinalized(committed = false) for a committed transaction
+    val (isFinalized, committed, isLate, due) = synchronized {
+      val d = heartbeatDue
+      heartbeatDue = true
+      (finalized, resolvedValue, late, d)
+    }
+    if (isFinalized)
+      messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed, isLate)))
+    else if (due)
       messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxHeartbeat(toStoreId, storeId, txd.transactionId)))
-    heartbeatDue = true
   }
 
   // Must be called outside a syncrhonized block. Doing so avoids a race condition within the unit test
@@ -259,14 +268,16 @@ abstract class TransactionDriver(
           if (isValidAcceptor(msg.from))
             proposer.receivePromise(paxos.Promise(msg.from.poolIndex, msg.proposalId, promise.lastAccepted))
 
-          if (holdsProof && !resolved && proposer.prepareQuorumWithoutAcceptedValue)
+          // A proof holder (Ruling 29) adopts only an accepted commit of the current, post-proof round: commit was
+          // chosen at some ballot c and every value accepted at c or higher is commit, so an accepted abort predates c.
+          // A quorum reporting no accepted commit is memoryless and resolves late. Neither case uses the vote tally,
+          // which picks only a local proposal (a proof holder needs none, and the prover never votes, so the tally
+          // could wait forever); Proposer.commitProven makes the proposal commit or none
+          if (holdsProof && !resolved && proposer.prepareQuorumWithoutAcceptedCommit)
             resolveLate()
-          else if (holdsProof && !resolved && proposer.prepareQuorumReached && !proposer.haveLocalProposal &&
-                   proposer.proposalValue.isDefined)
-            // An accepted value to adopt: Paxos proposes it as usual. The vote tally only picks a local proposal,
-            // which a proof holder needs none of, and the prover never votes, so the tally could wait forever
+          else if (holdsProof && !resolved && proposer.prepareQuorumReached && proposer.proposalValue.isDefined)
             shouldSendAcceptMessages = true
-          else if (proposer.prepareQuorumReached && !proposer.haveLocalProposal) {
+          else if (!holdsProof && proposer.prepareQuorumReached && !proposer.haveLocalProposal) {
 
             var canCommitTransaction = true
             var cantAttempt = false
@@ -313,10 +324,8 @@ abstract class TransactionDriver(
             if (cantAttempt)
               return
 
-            // If we get here, we've made our decision. A driver holding a proof never proposes abort: it leaves the
-            // proposal unset, so only an accepted value (adopted by Paxos as usual) or a later round decides
-            if !proposer.haveLocalProposal && (canCommitTransaction || !holdsProof) then
-              proposer.setLocalProposal(canCommitTransaction)
+            // If we get here, we've made our decision. A driver holding a proof never reaches here
+            proposer.setLocalProposal(canCommitTransaction)
 
             shouldSendAcceptMessages = true
           }
@@ -370,6 +379,7 @@ abstract class TransactionDriver(
         // resolved learned the outcome by Paxos, and its own finalizer must complete
         val start = !holdsProof && !resolved && !finalized
         holdsProof = true
+        proposer.commitProven()
         if (start)
           nextRound()
         start
@@ -514,9 +524,11 @@ abstract class TransactionDriver(
   /** Resolves a late commit: one this driver reaches only after the transaction was finalized and forgotten
     * (docs/superpowers/specs/2026-11-09-replay-pins-design.md, 1b and 1c). Reached on:
     *  - a proof (`TxResolved` with `proof = true`) held together with a prepare quorum of valid acceptors, in a round
-    *    started after the proof arrived, none of whose promises carries an accepted value. The proof shows the commit
-    *    was chosen, so a quorum Q accepted it before the proof was sent, and so before any post-proof prepare. That
-    *    quorum intersects the responding one, so some acceptor in Q forgot the transaction. An acceptor forgets a
+    *    started after the proof arrived, none of whose promises carries an accepted commit (Ruling 29). The proof
+    *    shows the commit was chosen at some ballot c, so a quorum Q accepted it before the proof was sent, and so
+    *    before any post-proof prepare. Every value accepted at c or higher is commit, so a reported accepted abort
+    *    predates c and shows nothing of Q's acceptance. That quorum intersects the responding one, so some acceptor in
+    *    Q forgot the transaction. An acceptor forgets a
     *    committed transaction only on TxFinalized, or on a late commit, which follows it (Tx.unackedCommitFound
     *    applies an owed update but keeps the Tx until then); a rebuilt one is muted and does not answer. A prover
     *    (Tx.proveCommitted) answers the post-proof round with a promise carrying no accepted value: it holds no state

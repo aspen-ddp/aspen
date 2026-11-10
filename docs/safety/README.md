@@ -53,7 +53,7 @@ recovery, `Q-N*` requirements, `RP-N*` repair).
 | X1 / Rebuild F1 | **FIXED** 2026-11-09 (was CONFIRMED) | A Failed device is retired (marker plus unload), never reloaded, its former host nudged, repair scans fenced on the pool entry |
 | CRL F3 | **FIXED** 2026-11-09 (was PLAUSIBLE, reproduced by a torn-write test) | Rotation copy-forward overwrote the stream holding the only copy of live data |
 | CRL F5 | CONFIRMED | There are no checksums on CRL entries. Bit rot or reordered sectors can become Paxos state or object data |
-| Paxos P-N4 | PLAUSIBLE (new) | Pins protect committed transactions only. With the horizon gone, a forgotten *abort* can be re-decided commit by a delayed duplicate prepare (or a zombie driver's, X4) once the requirement that failed has cleared |
+| Paxos P-N4 | PLAUSIBLE (new) | Pins protect committed transactions only. With the horizon gone, a forgotten *abort* can be re-decided commit by a delayed duplicate prepare (a zombie driver's, X4, no longer: Ruling 31) once the requirement that failed has cleared |
 | Paxos P-N2 | PLAUSIBLE (new) | Late condition 1 assumes no acceptor of the choosing quorum forgets a live T silently; a rebuilt store left unmuted by a fast client clock (X2 residual) can make a live T resolve late, skipping finalization and marks |
 
 ### Tier 2: resurrection, overwritten updates, permanently stale replicas
@@ -61,9 +61,12 @@ recovery, `Q-N*` requirements, `RP-N*` repair).
 | Id | Verdict | Finding |
 |---|---|---|
 | Paxos F3 / Recovery F7 | **FIXED** (replay pins) (was CONFIRMED) | The horizon trusted the client clock. It is gone; replay is refused by the client pin rule and the late-commit rule |
-| Recovery R-N1 / X11 | PLAUSIBLE (new) | Ruling 17's residual is not one store: every counted voter that acknowledged after `errorTimeout` keeps an UnackedCommits entry until its repair scan, and a replay's late commit re-applies pin-only blind writes and allocations at all of them, possibly a quorum |
+| Recovery R-N1 / X11 | PLAUSIBLE (new) | Ruling 17's residual is not one store (Ruling 32, docs corrected, no closure): every counted voter that acknowledged after `errorTimeout` keeps an UnackedCommits entry until its repair scan (30 s to 15 min), and a replay's late commit re-applies T's writes in pools where T has no pin of its own (blind or `replaySafe` writes, ABA `DoesNotExist` inserts, allocations in another pool) at all of them, a quorum when the whole pool acked late; reconcile then follows the corrupted quorum |
 | Paxos P-N3 / X12 | PLAUSIBLE (new) | A recovering acceptor holding T's accepted commit makes a post-proof quorum adopt a *non-late* commit even when a proof exists (broader than the design's residual): finalization actions re-run and a concurrent replayed client prepare applies blind writes, `DoesNotExist` inserts after a later delete, and allocations |
-| X3 | **NARROWED** (was PLAUSIBLE) | The no-Tx path no longer downgrades a finalized entry, but `Tx.resolved` still does (`Tx.scala:737-738`); a downgrade turns the finalized relay non-late, so a replay re-runs finalization actions and re-applies a blind write at that store |
+| X3 | **FIXED** (Ruling 30) (was PLAUSIBLE, then NARROWED) | `TransactionStatusCache.updateStatus` is monotone (finalized and late sticky, no revert to Unresolved), so no store's write downgrades a finalized entry and the finalized relay stays late |
+| Recovery R-N6 | PLAUSIBLE (new) | A driver adopting an accepted commit long after finalization re-runs every finalization action (Ruling 13): the marker's blind upsert can regress newer ErrorTree entries and re-create deleted UnackedCommits entries (re-arming R-N1); a re-run allocation action can leave an orphan entry |
+| Repair RP-N4 | PLAUSIBLE (new) | An UnackedCommits entry outlives the store's own late application of T until its scan deletes it; a replay's late commit applies T's unpinned-pool writes there meanwhile (the window of R-N1) |
+| Requirements Q-N4 | CONFIRMED (new; trust model, by design) | The pin rule is enforced only by the client: a client built without the check sends replayable transactions, which get fresh commit votes and commit normally |
 | CRL F13 / Requirements F2 / Recovery F4 | **NARROWED** (was CONFIRMED, narrow) | A crash re-apply of a TKVL write now fails its per-write check; blind writes and `DoesNotExist` inserts after a later delete still re-apply |
 | Requirements F1 | **NARROWED** (was CONFIRMED) | A lagging store skips a stale per-write checked write and is marked; blind writes are still last-arrival-wins with no entry |
 | Requirements F11 | **NARROWED** (was PLAUSIBLE) | A replayed allocation can no longer commit by fresh votes (its pin fails), but still applies where X11 or P-N3 deliver the commit |
@@ -83,7 +86,7 @@ recovery, `Q-N*` requirements, `RP-N*` repair).
 | Recovery R-N3 | CONFIRMED (new) | Every recovered commit vote waits, holding its locks and with no driver, for its UnackedCommits lookup; a metadata-group outage stalls them all |
 | Recovery R-N4 / Repair RP-N3 | CONFIRMED (new) | UnackedCommits entries are one per (store, transaction), never merge, and are now written for every transaction with a silent voter: tree growth, larger marker batches, double reconciles |
 | Recovery F1 / X8 | CONFIRMED | An unknown finalizer type throws after resolution and the transaction never finalizes |
-| Recovery F12 / X4 | CONFIRMED | `Store.close` never stops the store's drivers; their prepares are now checked normally (P-N4) |
+| Recovery F12 / X4 | **FIXED** (Ruling 31) (was CONFIRMED) | `Store.close` shuts down the store's drivers, so no zombie driver keeps re-preparing; P-N4's delayed duplicate client prepare is unaffected |
 | CRL F9 | CONFIRMED | Death of the writer thread only logs, and all dependent futures hang |
 | Requirements F12 | CONFIRMED | `awaitingCommits` has no timer, so an FSIF ENOSPC freeze stalls the object forever |
 | Paxos F8, Rebuild F6 | CONFIRMED | The tally stalls on a silent store, holding locks |

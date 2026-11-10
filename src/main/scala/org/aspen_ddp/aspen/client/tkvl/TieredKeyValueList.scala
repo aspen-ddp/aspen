@@ -79,16 +79,29 @@ class TieredKeyValueList(val client: AspenClient,
   /** KeyValue-object trees only: the requirements are key-value requirements on the containing node */
   def delete(key: Key, 
              requiredRevision: Option[ObjectRevision],
-             requirements: List[KeyValueUpdate.KeyRequirement])(using t: Transaction): Future[Unit] = {
+             requirements: List[KeyValueUpdate.KeyRequirement])(using t: Transaction): Future[Unit] =
+    deleteIfPresent(key, requiredRevision, requirements).map(_ => ())
+
+  /** As `delete`, but the result says whether the key was deleted. False when the node the delete planned against
+    * did not hold the key, as after a concurrent delete of it: nothing was added to the transaction, the
+    * requirements included, so a caller relying on them for its pin must not commit
+    */
+  def deleteIfPresent(key: Key,
+                      requiredRevision: Option[ObjectRevision],
+                      requirements: List[KeyValueUpdate.KeyRequirement])(using t: Transaction): Future[Boolean] = {
     def onJoin(delMinimum: Key, delNode: KeyValueObjectPointer): Future[Unit] = {
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.unit
     }
+    val deleted = new java.util.concurrent.atomic.AtomicBoolean(false)
     engine.deleteFromContainingNode(key, node =>
-      kvNode(node).delete(key, requiredRevision, requirements, onJoin).map { empty =>
-        if empty then
-          TierEngine.prepareEmptyNodeRemoval(rootManager, 0, node)
-      })
+      kvNode(node).deleteIfPresent(key, requiredRevision, requirements, onJoin).map {
+        case None => ()
+        case Some(empty) =>
+          deleted.set(true)
+          if empty then
+            TierEngine.prepareEmptyNodeRemoval(rootManager, 0, node)
+      }).map(_ => deleted.get)
   }
 
   def foldLeft[B](z: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] =

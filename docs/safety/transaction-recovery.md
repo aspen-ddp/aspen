@@ -133,7 +133,7 @@ arbitrates (4.3). The extra drivers cost messages and each runs its own finalize
 
 A driver is discarded only when its store receives a `TxFinalized` for the transaction (`Store.scala:181-184`;
 `onFinalized` also calls `shutdown()` which cancels its timer, `TransactionDriver.scala:392`). There is no timeout, no
-cap, and no cancel on store close (see F12).
+cap. Since Ruling 31 `Store.close` shuts its drivers down (F12).
 
 ### 4.2 How the outcome is learned (without having been the proposer)
 
@@ -534,7 +534,7 @@ Notation: L = designated leader store/driver; S = an arbitrary participant store
   (extra ErrorTree writes, one per driver).
 * **Driver lives but is partitioned from some stores**: stores it cannot reach go idle (no heartbeat), start drivers
   that can reach the others. Two live drivers for one transaction is normal.
-* **Driver on a store that gets closed/transferred**: the driver is not shut down (F12).
+* **Driver on a store that gets closed/transferred**: shut down by `Store.close` since Ruling 31 (F12).
 
 ### 9.4 Status-cache and time (refreshed: the horizon is gone)
 
@@ -585,9 +585,9 @@ or an assumption I could not verify).
 | F7 | **fixed** | The horizon is gone; no clock decides replay | `Frontend.scala:671-691` |
 | F8 | **narrowed** | As paxos F2: a proof-holding driver resolves late and reports committed | `TransactionDriver.scala:318-319,539-552` |
 | F9 | **fixed** | Eviction no longer reopens a replay window: replay is refused by pins, not by the cache; the eviction warning is gone | `TransactionStatusCache.scala:15-24` |
-| F10 | **narrowed** | The no-Tx path skips finalized entries; `Tx.resolved` still downgrades, and a downgrade now costs late evidence (X3) | `Frontend.scala:636-637`; `Tx.scala:737-738` |
+| F10 | **fixed** (Ruling 30) | `updateStatus` is monotone: `finalized`/`late` sticky, no revert to Unresolved, so no write downgrades an entry (X3) | `TransactionStatusCache.scala` `updateStatus` |
 | F11 | unchanged | Proposer peer is the pool index | `TransactionDriver.scala:88` |
-| F12 | unchanged (consequence changed) | Drivers still outlive `Store.close`; their re-sent prepares are now checked normally instead of voting `TooOld`, and can take commit-vote locks (paxos P-N4) | `Store.scala:65` |
+| F12 | **fixed** (Ruling 31) | `Store.close` shuts down the store's drivers and clears its map; a `SimpleTransactionDriver` timer already firing neither sends nor reschedules. A forgotten abort re-decided by a delayed duplicate client prepare (paxos P-N4) is not affected | `Store.scala` `close`; `SimpleTransactionDriver.scala` `shutdown` |
 | F13 | unchanged | Entries only for counted voters when voters are known | `MissedUpdateFinalizationAction.scala:99` |
 | F14 | unchanged (load larger) | Finalization still waits for the marker, which now also carries an entry per silent voter per transaction (R-N4) | `MissedUpdateFinalizationAction.scala:98-114` |
 | F15 | unchanged | Non-voters still get no entry | `MissedUpdateFinalizationAction.scala:99` |
@@ -723,6 +723,7 @@ treated as a fresh transaction. Only a rate-limited warning exists. Practically 
 > *Fix sketch:* Make updateStatus monotone.
 
 > **Refresh (replay pins): NARROWED, impact raised.** See paxos F9 and cross-document X3.
+> **Refresh (Ruling 30): FIXED.** The cache is monotone; see paxos F9.
 
 **F10 (L) Shared host-wide status cache is overwritten by weaker information.** Cache is keyed by txid; each store's `Tx`
 writes `(status, finalized=false)` when it resolves (`Tx.scala:662`), which can overwrite a `finalized=true` entry just
@@ -819,6 +820,13 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > reconcile then reads the regressed state and deletes them. For an allocation the re-apply overwrites the live object
 > (transaction-requirements F11, cross-document X11). Needs a quorum of late acknowledgements, a pin-only blind write
 > (TKVL writes are checked), and a replay before the scans.
+> *Ruling 32 (documentation corrected, no closure implemented; the user chooses):* the exposed write classes are exactly
+> T's writes in a pool where T has no pin of its own: blind or `replaySafe` writes, ABA-prone `DoesNotExist` inserts
+> (the key deleted again since T), and allocations in another pool. A per-write KeyRevision-checked write is itself a
+> pin in its pool and fails. The window is each store's repair scan, 30 s to 15 min after T. When the whole pool
+> acknowledged after `errorTimeout`, every store holds an entry, so a quorum is exposed and reconcile follows the
+> corrupted quorum: neither transient nor masked by quorum reads. The `Tx.lateCommit` scaladoc and the design's
+> Ruling 17 amendment say the same.
 > *Fix sketch:* have a late commit apply only objects whose state still predates T (for KV, keys absent from or older
 > than T), or record "acknowledged late" so the scan, or a late Tx, can tell an owed store from a late one.
 

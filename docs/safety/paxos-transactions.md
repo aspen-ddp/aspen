@@ -525,10 +525,13 @@ The horizon (`Host.txHorizon`, `TransactionTooOld`) was removed. In its place (d
 
 * **Proof holder.** A driver receiving a proof sets `holdsProof`, and the first proof starts a new round
   (`TransactionDriver.scala:361-386`): promises to earlier rounds may predate another driver's choice of commit
-  (Ruling 6). It never sets an abort local proposal (`:318-319`). With a prepare quorum whose promises carry an accepted
-  value it sends accepts for that value without the tally (`:264-268`, Ruling 7), and resolves normally.
+  (Ruling 6). It skips the vote tally and sets no local proposal. Since Ruling 29 it adopts only an accepted *commit*
+  reported in the current round (`Proposer.commitProven`): commit was chosen at some ballot c and every value accepted
+  at c or higher is commit, so an accepted abort predates c and is never adopted. With such a commit it sends accepts
+  for commit without the tally (Ruling 7), and resolves normally.
 * **Late condition 1.** A proof plus a prepare quorum of valid acceptors in the current (post-proof) round, none
-  carrying an accepted value (`Proposer.prepareQuorumWithoutAcceptedValue`, `common/paxos/Proposer.scala:24,54-59,83-88`):
+  carrying an accepted commit (`Proposer.prepareQuorumWithoutAcceptedCommit`; an older accepted abort counts as
+  memoryless, Ruling 29):
   `resolveLate` (`TransactionDriver.scala:262-263`, `:539-552`). Argument: the proof shows commit was chosen by some
   quorum Q; Q intersects the responders; an acceptor forgets a committed T only on `TxFinalized` or a late outcome;
   rebuilt acceptors are muted. So finalization completed.
@@ -542,8 +545,8 @@ The horizon (`Host.txHorizon`, `TransactionTooOld`) was removed. In its place (d
 * **Found entry as a proof** (Ruling 15): a recovered commit vote that found its entry gives its own driver a proof from
   the start (`Store.scala:108-110`).
 
-Residuals: Ruling 17 (a late-acked store with an entry re-applies a replay's blind write; transaction-recovery R-N1
-shows it is not limited to one store), the design's recovering-acceptor residual (P-N3), and a proof delivered to a
+Residuals: Ruling 17 (a late-acked store with an entry re-applies a replay's writes in pools where T has no pin of its
+own; transaction-recovery R-N1 and Ruling 32: it can reach a quorum when the whole pool acked late), the design's recovering-acceptor residual (P-N3), and a proof delivered to a
 driver that never acts on it (P-N1).
 
 ### 10.6 Status cache
@@ -663,7 +666,7 @@ about the finding, not the likelihood of occurrence.
 | F6 | unchanged (reach widened) | Abort still deletes the CRL record at resolution; with no horizon a forgotten abort is re-decidable by any later prepare (P-N4) | `Tx.scala:699`; `Frontend.scala:501-503` |
 | F7 | unchanged | Every non-`VoteCommit` counts as abort | `TransactionDriver.scala:287-292` |
 | F8 | unchanged | Tally still `break()`s on the first short pool (a proof holder adopting an accepted value skips it) | `TransactionDriver.scala:296-304` |
-| F9 | **narrowed** | The no-Tx `TxResolved` path no longer overwrites a finalized entry; `Tx.resolved` and the `Tx` constructor still write unconditionally (X3) | `Frontend.scala:636-637`; `Tx.scala:144,737-738` |
+| F9 | **fixed** (Ruling 30) | `TransactionStatusCache.updateStatus` is monotone (atomic compute): `finalized` and `late` are sticky and a resolved status never reverts to Unresolved, so neither `Tx.resolved` nor the `Tx` constructor can downgrade an entry (X3) | `TransactionStatusCache.scala` `updateStatus` |
 | F10 | unchanged | `lastProposer` still follows client prepares; the proof is sent there too (P-N1) | `Tx.scala:756,594` |
 | F11 | unchanged | Conflicting outcomes are still ignored silently; `resolveLate` logs an error only for late-after-abort | `Tx.scala:722`; `TransactionDriver.scala:541-542,569` |
 | F12 | unchanged | Rounds >= 2 still wait for the timer (the post-proof round sends prepares at once) | `TransactionDriver.scala:318-321,384-385` |
@@ -823,6 +826,12 @@ as soon as any object cannot reach `t` commits.
 > entry (`Tx.scala:737-738`). Finalized entries are now late-commit evidence (`Store.scala:158-171`): a downgrade makes
 > the relay answer a non-late `TxResolved`, so a replay's driver runs the finalization actions again and a fresh Tx at
 > that store applies a blind write again (X3).
+>
+> **Refresh (Ruling 30): FIXED.** `updateStatus` is now monotone by an atomic compute on the cache's map: `finalized`
+> and `late` are sticky and a resolved status never reverts to Unresolved. Every write site (the `Tx` constructor,
+> `Tx.resolved`, `Tx.finalized`, `applyNothing`, Frontend's no-Tx paths) goes through it, so no store's write can
+> downgrade another's. Frontend's two workarounds (the finalized check on the no-Tx `TxResolved` path, and the restore
+> after a new Tx) were removed as redundant.
 
 > **Verification 2026-11-09: CONFIRMED. Severity: stale-replica / hygiene.** TransactionStatusCache.updateStatus is an unconditional put (TransactionStatusCache.scala:64-66); Tx's constructor writes Unresolved (Tx.scala:114) and resolved() writes finalized=false (Tx.scala:662) over an entry another store of the host may have marked finalized (Tx.scala:800). Frontend.receivePrepare restores status for new Txs only (Frontend.scala:660-664).
 > *Fix sketch:* Make updateStatus monotone (never downgrade finalized or a known outcome to Unresolved).
@@ -972,6 +981,9 @@ Nacks (extra rounds under contention).
 > post-proof round (`:495-501`). It waits only for a prepare quorum of the primary pool, which every driver needs; the
 > secondary-pool tally stall (F8) does not apply to it. A competing driver's chosen abort is adopted (Ruling 2). The cost
 > is that a proof holder can never conclude an abort itself, which is correct since a proof implies commit.
+> *Refresh (Ruling 29):* a proof holder no longer adopts an accepted abort: such an abort predates the ballot at which
+> commit was chosen, and adopting it could resolve a committed T as abort. A post-proof quorum reporting no accepted
+> commit resolves late. Liveness is unchanged: every post-proof quorum still resolves.
 
 #### P-N6. The finalized relay reports every finalized commit as late. Confidence: medium
 
@@ -979,7 +991,7 @@ Nacks (extra rounds under contention).
 > only on a real `TxFinalized` (`Tx.scala:902`, `Frontend.scala:646`) or a late outcome (`Tx.scala:959-961`,
 > `Frontend.scala:636-637`); proofs and found entries write nothing (`Tx.scala:1006`). A real `TxFinalized(true)` follows
 > the finalizer (`TransactionDriver.scala:593-596`), so the relayed late claim holds. The weakness runs the other way: a
-> downgraded entry loses the evidence (F9, X3).
+> downgraded entry loses the evidence (F9, X3; fixed by Ruling 30).
 
 ### Verified safe (not flaws, listed so they are not re-investigated)
 

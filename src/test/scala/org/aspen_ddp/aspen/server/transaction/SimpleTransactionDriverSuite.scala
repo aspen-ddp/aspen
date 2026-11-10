@@ -27,10 +27,12 @@ object SimpleTransactionDriverSuite:
       tasks = t :: tasks
       t
 
-    def fireAll(): Unit =
-      val due = tasks.filterNot(_.cancelled)
+    def fireAll(ignoreCancel: Boolean = false): Unit =
+      val due = if ignoreCancel then tasks else tasks.filterNot(_.cancelled)
       tasks = Nil
       due.foreach(_.fn())
+
+    def pending: Int = tasks.count(!_.cancelled)
 
 class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
   import SimpleTransactionDriverSuite.*
@@ -92,5 +94,21 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
 
     tasks.fireAll()
     resolvedSentTo(messenger) shouldBe empty
+  }
+
+  // Ruling 31: Store.close shuts its drivers down. A timer already firing must not restart the retry loop
+  test("a shut-down driver whose timer fires anyway sends nothing and schedules nothing") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val tasks = new ManualTasks(summon[ExecutionContext])
+    val driver = new SimpleTransactionDriver(summon[ExecutionContext], 100.milliseconds, 3.seconds, ds0, messenger, tasks,
+      txd, new TFinalizer(autoComplete = false))
+    messenger.clear()
+
+    driver.shutdown()
+    tasks.fireAll(ignoreCancel = true)
+
+    messenger.messages shouldBe Nil
+    tasks.pending shouldBe 0
   }
 }

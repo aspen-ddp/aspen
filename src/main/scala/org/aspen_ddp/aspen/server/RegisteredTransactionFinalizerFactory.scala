@@ -36,9 +36,10 @@ object RegisteredTransactionFinalizerFactory {
 
     first.foreach(_.execute())
 
+    // The check and the execute share the lock with cancel: a cancel between them would find no marker task to
+    // cancel, and the execute would then schedule its writes regardless
     Future.sequence(first.map(_.complete)).foreach { _ =>
-      val start = synchronized { !cancelled }
-      if start then last.foreach(_.execute())
+      synchronized { if !cancelled then last.foreach(_.execute()) }
     }
 
     def complete: Future[Unit] = Future.sequence(actions.map(_.complete)).map(_=>())

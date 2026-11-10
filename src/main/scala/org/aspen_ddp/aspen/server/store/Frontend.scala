@@ -631,9 +631,10 @@ class Frontend(val storeId: StoreId,
         case Some(tx) => tx.receiveResolved(m)
         // Remembered for a prepare that arrives after this (see receivePrepare). A late outcome implies the
         // transaction was finalized, so it is recorded finalized, as the Tx paths do (Tx.applyNothing). Not a proof:
-        // it is meant for drivers and is no outcome (Tx.proveCommitted)
+        // it is meant for drivers and is no outcome (Tx.proveCommitted). The cache is monotone, so a finalized entry
+        // stays finalized
         case None =>
-          if !m.proof && !statusCache.getStatus(m.transactionId).exists(_.finalized) then
+          if !m.proof then
             statusCache.updateStatus(m.transactionId, statusOf(m.committed), finalized = m.late, late = m.late)
     case m: TxFinalized =>
       transactions.get(m.transactionId) match
@@ -680,12 +681,11 @@ class Frontend(val storeId: StoreId,
         muted = muted)
       transactions += (m.txd.transactionId -> tx)
       tx.receivePrepare(m)
-      known.foreach { entry =>
+      // The new Tx recorded itself as Unresolved, which the monotone cache does not let replace a known outcome
+      known.foreach { _ =>
         // A muted Tx takes no part, a cached outcome included
         if !muted then
           tx.outcomeDecided()
-        // The new Tx recorded itself as Unresolved
-        statusCache.updateStatus(m.txd.transactionId, entry.status, entry.finalized, entry.late)
       }
       pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
   }

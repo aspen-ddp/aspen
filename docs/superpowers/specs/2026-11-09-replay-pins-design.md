@@ -511,16 +511,17 @@ Ruling 4 is omitted (superseded by 12); Ruling 16 is included as read by Ruling 
 
 - **1 (proof field).** `TxResolved` carries an explicit `proof: Boolean`, set only by `Tx.proveCommitted`. Inferring a
   proof from `(committed, late=false)` misclassifies ordinary resolutions from other drivers.
-- **2 (proof vs Paxos).** "Never propose abort while holding a proof" constrains only the driver's local proposal. An
-  accepted value adopted from promises is not overridable without breaking safety; an adopted abort resolves normally.
+- **2 (proof vs Paxos; refined by 29).** "Never propose abort while holding a proof" constrains only the driver's local
+  proposal. An accepted value adopted from promises is not overridable without breaking safety; an adopted abort
+  resolves normally. Ruling 29 narrows this: a proof holder never adopts an accepted abort.
 - **3 (muted path).** The muted path keeps its behavior (prove or forget, no vote); no new error type.
 - **5 (late via relay).** Late condition 2 ("a store reported T finalized") is the existing finalized relay: a
   `TxFinalized` relayed from a finalized cache entry carries `late = true`. No status-request path was added.
 - **6 (late condition 1).** Late condition 1 counts only promises to prepares sent after the proof arrived. On a proof
   while unresolved the driver starts a new, higher-proposal round and evaluates the memoryless-quorum condition on that
   round alone, since earlier promises could predate another driver's later commit choice.
-- **7 (adopted value).** A proof-holding driver with a prepare quorum whose promises carry an accepted value sends
-  accepts without waiting for the vote tally, since provers never vote.
+- **7 (adopted value; refined by 29).** A proof-holding driver with a prepare quorum whose promises carry an accepted
+  commit sends accepts for commit without waiting for the vote tally, since provers never vote.
 - **8 (finalizer order; amends 1a).** The finalizer runs `MissedUpdateFinalizationAction` only after every other
   finalization action of T, so a durable UnackedCommits entry implies all other actions are done. Forgetting on a found
   entry and skipping actions on a late commit are then safe.
@@ -558,9 +559,24 @@ Ruling 4 is omitted (superseded by 12); Ruling 16 is included as read by Ruling 
   object reads, Checked insert plus `lockRevision`; if not, Checked insert without the lock, `replaySafe`. The split
   action keeps read-first-gone. A read right after resolution can precede the stores applying the allocation.
 
+- **29 (proof holder adopts only commit; refines 2 and 7).** A proof means commit was chosen at some ballot c, and
+  every value accepted at c or higher is commit. So a proof holder adopts only an accepted commit reported in the
+  current, post-proof round (`Proposer.commitProven`: the proposal is then commit or none; neither the local proposal
+  nor an earlier round's value counts). A post-proof quorum reporting no accepted commit, an older accepted abort
+  included, is memoryless and resolves late. Adopting such an abort resolved a committed T as abort.
+- **30 (monotone status cache).** `TransactionStatusCache.updateStatus` is monotone, by an atomic compute: `finalized`
+  and `late` are sticky, and a resolved status never reverts to Unresolved. A sibling store's delayed resolution, or a
+  newly created Tx, can no longer downgrade a finalized entry and make the finalized relay answer non-late (X3).
+- **31 (closed store's drivers).** `Store.close` shuts down the store's transaction drivers, so their timers stop
+  re-preparing transactions for a store that is gone. Other stores' heartbeat recovery takes over.
+
 Residuals recorded by the amendments:
-- **17.** A replay at a store that applied T but acknowledged late (its entry still exists until its repair scan) can
-  re-apply a blind write on that one store via a late commit. Transient, masked by quorum reads; the remaining entry
-  guarantees an exact reconcile.
+- **17 (corrected by 32).** A store that applied T but acknowledged after errorTimeout keeps its UnackedCommits entry
+  until its repair scan reconciles it, 30 s to 15 min later. A replayed client prepare reaching it meanwhile, with a
+  passing commit vote, late-commits there and applies T's writes again, but only writes in a pool where T has no pin
+  of its own: blind or `replaySafe` writes, ABA-prone `DoesNotExist` inserts, and allocations in another pool.
+  Per-write KeyRevision-checked writes are pins in their pool and fail. When the whole pool acked after errorTimeout,
+  every store holds an entry, so a quorum is exposed, and reconcile then follows the corrupted quorum. Not transient
+  and not masked by quorum reads in that case. No closure is implemented; the choice is left to the user.
 - **28.** A doubly-rare re-run of the allocation action after the object's deletion can leave an orphan allocation-tree
   entry.

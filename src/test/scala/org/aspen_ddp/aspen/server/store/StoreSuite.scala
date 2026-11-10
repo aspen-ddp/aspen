@@ -33,13 +33,15 @@ class StoreSuite extends AnyFunSuite with Matchers:
     TxPrepare(to, from, txd, ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient = false)
 
   private def mkStore(id: StoreId, statusCache: TransactionStatusCache, heartbeatTimeout: Duration,
-                      backendOverride: Option[MapBackend] = None) =
+                      backendOverride: Option[MapBackend] = None,
+                      backgroundTasks: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager,
+                      driverFactory: TransactionDriver.Factory = TransactionDriver.noErrorRecoveryFactory) =
     val backend = backendOverride.getOrElse(new MapBackend(id))
     val net = new TestNet
     val crl = new TestCrl
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.global, backend,
-      new HostObjectCache(1024 * 1024).forStore(id), net, BackgroundTaskManager.NoBackgroundTaskManager, crl, statusCache,
-      null, TransactionDriver.noErrorRecoveryFactory, heartbeatTimeout, None)
+      new HostObjectCache(1024 * 1024).forStore(id), net, backgroundTasks, crl, statusCache,
+      null, driverFactory, heartbeatTimeout, None)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     val os = mkObjectState(oid1)
     backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
@@ -87,6 +89,43 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
       net.sentTx.collect { case r: TxResolved => (r.committed, r.late, r.proof) } shouldBe List((true, late, false))
       net.sentTx.collect { case f: TxFinalized => f } shouldBe Nil
+  }
+
+  // X3 (Ruling 30): a sibling store's delayed resolution no longer downgrades the host's finalized entry, so the relay
+  // still answers a replayed prepare with a late, finalized commit
+  test("a sibling store's delayed resolution does not downgrade a finalized late entry") {
+    val statusCache = new TransactionStatusCache()
+    val (sibling, _, _) = mkStore(peer, statusCache, Duration(40, SECONDS))
+    val (store, net, _) = mkStore(storeId, statusCache, Duration(40, SECONDS))
+
+    // The sibling's Tx exists before the transaction is finalized elsewhere on the host, and late
+    sibling.receiveTransactionMessage(prepare(peer, leader))
+    statusCache.updateStatus(txid1, TransactionStatus.Committed, finalized = true, late = true)
+    sibling.receiveTransactionMessage(TxResolved(peer, leader, txid1, committed = true, late = false, proof = false))
+
+    store.receiveTransactionMessage(prepare(storeId, leader))
+
+    net.sentTx.collect { case r: TxResolved => (r.committed, r.late) } shouldBe List((true, true))
+    net.sentTx.collect { case f: TxFinalized => (f.committed, f.late) } shouldBe List((true, true))
+    store.frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  // Ruling 31: a closed store's drivers would otherwise keep re-preparing its transactions from their timers
+  test("closing a store stops its transaction drivers") {
+    val tasks = new org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriverSuite.ManualTasks(ExecutionContext.global)
+    val factory = org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver.factory(100.milliseconds, 3.seconds)
+    val (store, net, _) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS),
+      backgroundTasks = tasks, driverFactory = factory)
+
+    store.receiveTransactionMessage(prepare(leader, leader))
+    store.hasTransactions shouldBe true
+
+    store.close()
+    store.hasTransactions shouldBe false
+    net.sentTx = Nil
+
+    tasks.fireAll()
+    net.sentTx.collect { case m @ (_: TxPrepare | _: TxAccept | _: TxResolved) => m } shouldBe Nil
   }
 
   test("after a lost TxFinalized a held commit ends once a recovery driver learns the outcome") {

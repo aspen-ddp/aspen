@@ -217,8 +217,10 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                 Future.unit
         yield ()
 
-  /** A UnackedCommits entry: the store missed transaction T, whose change to the entry's objects left nothing for
-    * an errorTree comparison to see. Skipped while the store holds T live: its Tx applies T (recovery). Otherwise each
+  /** A UnackedCommits entry: the store cast a commit vote on transaction T and had not acknowledged applying it when
+    * T was finalized, so it may be owed T. The entry names every object of the store that T changes, traced or
+    * traceless; it may also be left over after the store applied T late, and reconciling such objects is a no-op.
+    * Skipped while the store holds T live: its Tx applies T (recovery). Otherwise each
     * object is reconciled, or deleted from the store when its allocation is gone. As for errorTree entries, that
     * needs the entry to be older than `policy.minErrorEntryAgeForDeletion`: an allocation's RefcountUpdate is
     * traceless, so a store that missed it gets an entry before AllocationFinalizationAction records the allocation,

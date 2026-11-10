@@ -32,6 +32,19 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
   private var markTask: Option[ScheduledTask] = None
 
+  /** Set by `cancel`: nothing is scheduled or written from then on */
+  private var cancelled = false
+
+  /** The transaction was finalized another way (a late resolution, or TxFinalized from another driver), whose
+    * finalization already wrote what this would. Stops a scheduled mark and any later execute; a mark already handed
+    * to the MissedUpdateMarker is not recalled. `complete` stays pending, as for the other actions
+    */
+  override def cancel(): Unit = synchronized {
+    cancelled = true
+    markTask.foreach(_.cancel())
+    markTask = None
+  }
+
   private val completionPromise: Promise[Unit] = Promise()
 
   // Never marked: a store that misses a lock has nothing to repair, and since the lock doesn't change the object, its
@@ -58,7 +71,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     * Commit errors and voters given before then are kept. Nothing is scheduled once every store reported clean
     */
   def execute(): Unit = synchronized {
-    if !completionPromise.isCompleted then markTask = Some(client.backgroundTaskManager.schedule(MissedUpdateFinalizationAction.errorTimeout) {
+    if !completionPromise.isCompleted && !cancelled then markTask = Some(scheduler.schedule(MissedUpdateFinalizationAction.errorTimeout) {
       markMissedUpdates()
     })
   }
@@ -71,6 +84,10 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
   // "delete by ObjectId alone" rather than as an error, which RocksDB stores still rely on.
   // See StoreRepairer.repairDeletion in aspen.server.repair.
   def markMissedUpdates(): Unit = synchronized {
+    if !cancelled then writeMissedUpdates()
+  }
+
+  private def writeMissedUpdates(): Unit = {
     // Build a map from ObjectId to ObjectPointer to recover pointers for ids in commitErrors
     val idToPointer = txd.allReferencedObjectsSet.map(ptr => ptr.id -> ptr).toMap
 
@@ -105,13 +122,20 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
     reportMarks(errors.map(_.store))
 
-    client.missedUpdateMarker.mark(errors, unacked).foreach { _ =>
+    writeMarks(errors, unacked).foreach { _ =>
       synchronized {
         if (!completionPromise.isCompleted)
           completionPromise.success(())
       }
     }
   }
+
+  /** Where the mark timer and the report are scheduled. A seam for tests */
+  protected def scheduler: BackgroundTaskManager = client.backgroundTaskManager
+
+  /** Writes the marks and entries. A seam for tests */
+  protected def writeMarks(errors: List[MissedUpdate], unacked: List[MissedUnackedCommit]): Future[Unit] =
+    client.missedUpdateMarker.mark(errors, unacked)
 
   /** Marks are normally trace only, and a burst of them can overwhelm the system, so they're summarized once a second */
   private def reportMarks(stores: List[StoreId]): Unit =
@@ -120,7 +144,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
       val noReply = stores.count(!commitErrors.contains(_))
       val age = (HLCTimestamp.now - txd.startTimestamp).toMillis
       if report.recordMarks(txd.transactionId, stores, noReply, age) then
-        val task = client.backgroundTaskManager.schedule(MissedUpdateFinalizationAction.reportPeriod) {
+        val task = scheduler.schedule(MissedUpdateFinalizationAction.reportPeriod) {
           report.take().foreach(s => logger.warn(s"$s. Entries waiting to be written: ${client.missedUpdateMarker.queued}"))
         }
         if task == BackgroundTaskManager.ShutdownTask then

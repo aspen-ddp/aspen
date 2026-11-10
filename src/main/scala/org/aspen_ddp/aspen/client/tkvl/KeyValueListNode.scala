@@ -136,6 +136,18 @@ class KeyValueListNode(val reader: ObjectReader,
     KeyValueListNode.delete(node, key, requiredRevision, requirements, reader, prepareForJoin)
   }
 
+  /** As `delete`, but None, with nothing added to the transaction, when the containing node does not hold `key` */
+  def deleteIfPresent(key: Key,
+                      requiredRevision: Option[ObjectRevision],
+                      requirements: List[KeyValueUpdate.KeyRequirement],
+                      prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit]
+                     )(using tx: Transaction): Future[Option[Boolean]] = fetchContainingNode(key).flatMap { node =>
+    if node.contents.contains(key) then
+      KeyValueListNode.delete(node, key, requiredRevision, requirements, reader, prepareForJoin).map(Some(_))
+    else
+      Future.successful(None)
+  }
+
   /** Applies a batch of inserts and deletes to this list, scanning right from the node holding the smallest key. Each
     * node is updated once, so keys sharing a node can change together; a node can split into several and a node the
     * batch empties may absorb its right neighbor (see `ListBatch`). A failure once an earlier node is staged aborts

@@ -116,8 +116,11 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
 
         for
           _ <- fcheck
-          // KeyRevision of the entry as read: the pin, and a concurrent change of the entry aborts
-          _ <- tree.delete(key, None, List(KeyValueUpdate.KeyRevision(key, vs.revision)))
+          // KeyRevision of the entry as read: the pin, and a concurrent change of the entry aborts. Gone by the time
+          // the delete reads its node (a concurrent unlink), nothing is deleted and the pin is missing: fail as if
+          // the entry had been absent from the start
+          deleted <- tree.deleteIfPresent(key, None, List(KeyValueUpdate.KeyRevision(key, vs.revision)))
+          _ <- if deleted then Future.unit else Future.failed(DirectoryEntryDoesNotExist(pointer, name))
           ftaskComplete <- if (decref)
             UnlinkFileTask.prepareTask(fs, fptr).map: f =>
               f.map(_ => ())

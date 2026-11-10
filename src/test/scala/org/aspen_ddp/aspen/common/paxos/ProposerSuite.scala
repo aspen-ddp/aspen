@@ -107,17 +107,37 @@ class ProposerSuite extends AnyFunSuite with Matchers:
     p.currentAcceptMessage() should be (None)
     p.receivePromise(Promise(1, ProposalId(2,0), Some((ProposalId(1,1),false))))
     p.currentAcceptMessage() should be (Some(Accept(ProposalId(2,0), false)))
-  test("A quorum without accepted values counts only the current round's promises"):
+  test("A quorum without an accepted commit counts only the current round's promises"):
     val p = new Proposer(0, 3, 2)
 
     p.receivePromise(Promise(1, ProposalId(1,0), None))
-    p.prepareQuorumWithoutAcceptedValue should be (false)
+    p.prepareQuorumWithoutAcceptedCommit should be (false)
     p.receivePromise(Promise(2, ProposalId(1,0), Some((ProposalId(1,1), true))))
     p.prepareQuorumReached should be (true)
-    p.prepareQuorumWithoutAcceptedValue should be (false)
+    p.prepareQuorumWithoutAcceptedCommit should be (false)
 
     p.nextRound()
     p.receivePromise(Promise(1, p.currentProposalId, None))
+    p.receivePromise(Promise(2, p.currentProposalId, Some((ProposalId(1,2), false))))
+    // An accepted abort is not an accepted commit
+    p.prepareQuorumWithoutAcceptedCommit should be (true)
+    p.proposalValue should be (Some(false)) // Paxos value adoption takes the highest accepted value
+
+  test("Once commit is proven, only an accepted commit of the current round is proposed"):
+    val p = new Proposer(0, 3, 2)
+    p.setLocalProposal(false)
+    p.receivePromise(Promise(1, ProposalId(1,0), Some((ProposalId(1,1), true))))
+    p.receivePromise(Promise(2, ProposalId(1,0), None))
+    p.proposalValue should be (Some(true))
+
+    p.commitProven()
+    p.nextRound()
+    p.receivePromise(Promise(1, p.currentProposalId, Some((ProposalId(1,3), false))))
     p.receivePromise(Promise(2, p.currentProposalId, None))
-    p.prepareQuorumWithoutAcceptedValue should be (true)
-    p.proposalValue should be (Some(true)) // Paxos value adoption still keeps the earlier accepted value
+    // Neither the earlier round's commit nor the local abort proposal counts, and the abort is never adopted
+    p.proposalValue should be (None)
+    p.currentAcceptMessage() should be (None)
+
+    p.receivePromise(Promise(0, p.currentProposalId, Some((ProposalId(1,1), true))))
+    p.proposalValue should be (Some(true))
+    p.currentAcceptMessage() should be (Some(Accept(p.currentProposalId, true)))

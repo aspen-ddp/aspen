@@ -673,6 +673,35 @@ class DirectorySuite extends FilesSystemTestSuite:
       outcome should be ("refused")
       entry.map(_.number) should be (Some(targetPtr.number))
 
+  // The planned delete finds nothing: without the entry's KeyRevision the move's half is unpinned, so it fails as an
+  // absent entry rather than with UnpinnedTransaction
+  atest("a delete whose entry a concurrent unlink removed after it was read fails as an absent entry"):
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      targetPtr <- cdir(rootDir, "target", mode=0, uid=1, gid=2)
+      (rootInode, rootRevision) <- rootDir.getInode()
+      seen <- rootDir.getEntry("target")
+      // The concurrent unlink, committed after the deleter's read found the entry
+      _ <- rootDir.delete("target")
+      stale = new SimpleDirectory(rootDir.pointer, rootRevision, rootInode, fs):
+        override def tree: TieredKeyValueList =
+          val real = super.tree
+          new TieredKeyValueList(real.client, real.rootManager):
+            override def get(key: Key): Future[Option[ValueState]] =
+              if key == Key("target") then
+                Future.successful(Some(ValueState(org.aspen_ddp.aspen.common.objects.Value(targetPtr.toArray),
+                  ObjectRevision(org.aspen_ddp.aspen.common.transaction.TransactionId(java.util.UUID.randomUUID())),
+                  org.aspen_ddp.aspen.common.HLCTimestamp.now)))
+              else super.get(key)
+      tx = client.newTransaction()
+      outcome <- stale.prepareDelete("target", decref = false)(using tx)
+        .map(_ => "staged")
+        .recover { case _: DirectoryEntryDoesNotExist => "absent" }
+    yield
+      seen.map(_.number) should be (Some(targetPtr.number))
+      outcome should be ("absent")
+
   atest("a cross-directory move stages its delete and insert before committing"):
     for
       fs <- bootstrap()

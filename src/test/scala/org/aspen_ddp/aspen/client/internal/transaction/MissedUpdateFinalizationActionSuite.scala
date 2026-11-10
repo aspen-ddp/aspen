@@ -556,3 +556,57 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
         case KeyValueUpdate.DoesNotExist(k) => k == errorKey
         case _ => false
       .shouldBe(false)
+
+  // Cancellation (a late resolution, or TxFinalized from another driver): nothing is written once cancelled
+
+  /** Runs tasks only when told to. `runAll(ignoreCancel = true)` also runs cancelled ones: a timer that fires anyway */
+  private class ManualTasks extends org.aspen_ddp.aspen.common.util.BackgroundTaskManager(ExecutionContext.parasitic):
+    private final class Task(fn: () => Unit) extends org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask:
+      @volatile var cancelled = false
+      def cancel(): Unit = cancelled = true
+      def run(ignoreCancel: Boolean): Unit = if ignoreCancel || !cancelled then fn()
+    private var tasks: List[Task] = Nil
+    def scheduled: Int = synchronized(tasks.size)
+    def allCancelled: Boolean = synchronized(tasks.forall(_.cancelled))
+    override def schedule(delay: scala.concurrent.duration.Duration)(fn: => Unit) = synchronized:
+      val t = new Task(() => fn)
+      tasks = t :: tasks
+      t
+    def runAll(ignoreCancel: Boolean = false): Unit =
+      val ts = synchronized { val t = tasks; tasks = Nil; t }
+      ts.reverse.foreach(_.run(ignoreCancel))
+
+  private class RecordingMarker(txd: TransactionDescription, tasks: ManualTasks)
+    extends MissedUpdateFinalizationAction(client, txd):
+    @volatile var writes = 0
+    override protected def scheduler: org.aspen_ddp.aspen.common.util.BackgroundTaskManager = tasks
+    override protected def writeMarks(errors: List[MissedUpdate], unacked: List[MissedUnackedCommit]): Future[Unit] =
+      writes += 1
+      super.writeMarks(errors, unacked)
+
+  atest("an executed marker writes when its timer fires"):
+    val tasks = new ManualTasks
+    val fa = new RecordingMarker(refcountTxd(pointerWith(Array[Byte](7, 1))), tasks)
+    fa.execute()
+    tasks.scheduled shouldBe 1
+    tasks.runAll()
+    fa.complete.map(_ => fa.writes shouldBe 1)
+
+  test("a cancel before the timer fires writes nothing, even if the timer fires anyway"):
+    val tasks = new ManualTasks
+    val fa = new RecordingMarker(refcountTxd(pointerWith(Array[Byte](7, 2))), tasks)
+    fa.execute()
+    fa.cancel()
+    tasks.allCancelled shouldBe true
+    tasks.runAll(ignoreCancel = true)
+    fa.writes shouldBe 0
+
+  // The order a cancel racing the Finalizer's deferred execute produced: the cancel found nothing scheduled to cancel
+  test("a cancel that precedes the deferred execute writes nothing"):
+    val tasks = new ManualTasks
+    val fa = new RecordingMarker(refcountTxd(pointerWith(Array[Byte](7, 3))), tasks)
+    fa.cancel()
+    fa.execute()
+    tasks.scheduled shouldBe 0
+    fa.markMissedUpdates()
+    fa.writes shouldBe 0

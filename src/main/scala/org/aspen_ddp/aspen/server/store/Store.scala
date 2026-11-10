@@ -62,7 +62,14 @@ class Store(val storageDeviceId: StorageDeviceId,
    *  the Store, so those threads never reach its state. */
   @volatile private var transactionDrivers: Map[TransactionId, TransactionDriver] = Map()
 
-  def close(): Future[Unit] = frontend.close()
+  /** Stops the store's transaction drivers first (Ruling 31): left running, their timers would keep re-preparing
+    * transactions for a store that is gone. Drivers on other stores, and their heartbeat recovery, take over
+    */
+  def close(): Future[Unit] =
+    val drivers = transactionDrivers.values
+    transactionDrivers = Map()
+    drivers.foreach(_.shutdown())
+    frontend.close()
 
   def estimateSize(): Long = backend.estimateSize()
 

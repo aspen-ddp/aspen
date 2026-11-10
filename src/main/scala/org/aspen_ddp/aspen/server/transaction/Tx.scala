@@ -912,10 +912,13 @@ class Tx( trs: TransactionRecoveryState,
     *  - Otherwise (an abort vote, no vote, a muted Tx, or an abort already learned): applies nothing.
     * The Tx concludes itself: the Frontend forgets it here, not on the message.
     *
-    * Known residual (accepted, Ruling 17): a store that cast a counted commit vote, missed its acknowledgement and so
-    * has an entry, then applied T late, still has that entry until the repair scan reconciles it. A replay reaching it
-    * meanwhile with a passing commit vote (a blind write) finds the entry and applies T's write again there. The
-    * entry's reconcile against the other stores then restores the object
+    * Known residual (Ruling 17, corrected by Ruling 32; no closure implemented): a store that cast a counted commit
+    * vote and acknowledged after errorTimeout has an entry, and keeps it after applying T until its repair scan
+    * reconciles it, 30 s to 15 min later. A replayed client prepare reaching it meanwhile with a passing commit vote
+    * finds the entry and applies T's writes again there. Only writes in a pool where T has no pin of its own pass:
+    * blind or replaySafe writes, ABA-prone DoesNotExist inserts, and allocations in another pool; a per-write
+    * KeyRevision-checked write is itself a pin in its pool and fails. When the whole pool acknowledged late, every
+    * store holds an entry, so the replay can reach a quorum, and reconcile then follows the corrupted quorum
     */
   private def lateCommit(): Unit =
     lateOutcome = true

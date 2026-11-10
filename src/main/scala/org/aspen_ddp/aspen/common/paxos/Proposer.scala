@@ -14,14 +14,22 @@ class Proposer(
 
   private val promisesReceived = new java.util.BitSet(numPeers)
   private val nacksReceived = new java.util.BitSet(numPeers)
-  private var roundHasAcceptedValue = false
+  private var roundHasAcceptedCommit = false
+  private var provenCommit = false
 
   def prepareQuorumReached: Boolean = promisesReceived.cardinality() >= quorumSize
 
-  /** True when the promises of the current round reach a quorum and none of them carries an accepted value.
-    * Unlike `proposalValue`, accepted values reported in earlier rounds do not count
+  /** True when the promises of the current round reach a quorum and none of them carries an accepted commit.
+    * Accepted values reported in earlier rounds do not count, and neither does an accepted abort
     */
-  def prepareQuorumWithoutAcceptedValue: Boolean = prepareQuorumReached && !roundHasAcceptedValue
+  def prepareQuorumWithoutAcceptedCommit: Boolean = prepareQuorumReached && !roundHasAcceptedCommit
+
+  /** The commit is known to have been chosen (a proof). Commit was then chosen at some ballot c, and every value
+    * accepted at c or higher is commit, so an accepted abort predates c and is never adopted. From now on the
+    * proposal is commit when a promise of the current round carries an accepted commit, and none otherwise: neither
+    * the local proposal nor a value from an earlier round counts. Cannot be undone
+    */
+  def commitProven(): Unit = provenCommit = true
 
   def haveLocalProposal: Boolean = localProposal.isDefined
 
@@ -31,7 +39,9 @@ class Proposer(
   def maySendAccept: Boolean = prepareQuorumReached && (highestAccepted.isDefined || localProposal.isDefined)
 
   def proposalValue: Option[Boolean] =
-    if prepareQuorumReached then
+    if prepareQuorumReached && provenCommit then
+      Option.when(roundHasAcceptedCommit)(true)
+    else if prepareQuorumReached then
       highestAccepted match
         case Some(t) => Some(t._2)
         case None => localProposal match
@@ -56,7 +66,7 @@ class Proposer(
     highestProposalId = proposalId
     promisesReceived.clear()
     nacksReceived.clear()
-    roundHasAcceptedValue = false
+    roundHasAcceptedCommit = false
 
   def currentProposalId: ProposalId = proposalId
 
@@ -85,7 +95,7 @@ class Proposer(
 
     if promise.proposalId == proposalId then
       promisesReceived.set(promise.fromPeer)
-      if promise.lastAccepted.isDefined then roundHasAcceptedValue = true
+      if promise.lastAccepted.exists(_._2) then roundHasAcceptedCommit = true
 
       promise.lastAccepted.foreach: t =>
         highestAccepted match

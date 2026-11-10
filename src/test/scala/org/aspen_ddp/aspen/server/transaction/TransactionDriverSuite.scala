@@ -119,6 +119,23 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     assert(messenger.messages.forall(_.isInstanceOf[org.aspen_ddp.aspen.common.network.TxHeartbeat]))
   }
 
+  // The heartbeat snapshots finalized, the outcome and late under the driver's lock: onFinalized writes finalized before
+  // the outcome, so an unlocked read in between saw a committed transaction as aborted. The window lies between two
+  // writes inside one synchronized block, so it cannot be opened deterministically; this pins the expected outcome
+  test("a driver finalized by another driver's TxFinalized heartbeats the committed outcome") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false))
+    messenger.clear()
+    driver.heartbeat()
+
+    val finals = messenger.messages.collect { case f: TxFinalized => (f.committed, f.late) }
+    finals.size should be (txd.allDataStores.size)
+    finals.toSet should be (Set((true, false)))
+  }
+
   test("A driver that has not finalized is reported as stuck, at intervals") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
@@ -731,6 +748,61 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       case f: TxFinalized => !f.late && f.committed
       case _ => true
     } should be (true)
+  }
+
+  // Ruling 29: a proof means commit was chosen at some ballot c, and every value accepted at c or higher is commit. An
+  // accepted abort can only predate c, so a post-proof quorum reporting no accepted commit is memoryless
+  test("a proof holder whose post-proof quorum reports only an older accepted abort resolves late and sends no abort") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+
+    proofFrom(driver, txd, ds1)
+    promise(driver, txd, ds0, TransactionDisposition.VoteAbort, Some((ProposalId(1, 2), false)))
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+
+    completed should be (true)
+    finalizer.createCount should be (0)
+    abortAccepts(messenger) should be (Nil)
+    outcomes(messenger) should not be (Nil)
+    allLate(outcomes(messenger)) should be (true)
+  }
+
+  test("a proof holder adopts an accepted commit even when an accepted abort has a higher ballot") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => ())
+
+    proofFrom(driver, txd, ds1)
+    promise(driver, txd, ds0, TransactionDisposition.VoteAbort, Some((ProposalId(1, 1), true)))
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort, Some((ProposalId(1, 2), false)))
+
+    abortAccepts(messenger) should be (Nil)
+    messenger.messages.collect { case a: TxAccept => a.value }.toSet should be (Set(true))
+    driver.mayBeDiscarded should be (false)
+    outcomes(messenger) should be (Nil)
+  }
+
+  test("a pre-proof local abort proposal is not sent once the post-proof round reports an accepted commit") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => ())
+
+    // A quorum of abort votes before the proof: the driver proposes abort at its first round
+    for from <- List(ds0, ds1, ds2) do promise(driver, txd, from, TransactionDisposition.VoteAbort)
+    driver.testHaveLocalProposal should be (true)
+    messenger.clear()
+
+    proofFrom(driver, txd, ds1)
+    promise(driver, txd, ds0, TransactionDisposition.VoteAbort, Some((ProposalId(1, 2), true)))
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+
+    abortAccepts(messenger) should be (Nil)
+    messenger.messages.collect { case a: TxAccept => a.value }.toSet should be (Set(true))
   }
 
   test("a driver holding a proof never proposes abort, even when votes say abort") {

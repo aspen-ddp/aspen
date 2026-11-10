@@ -103,16 +103,17 @@ class SimpleTaskExecutorSuite extends IntegrationTestSuite:
       pendingAfter.revision should be (pendingBefore.revision)
       pendingAfter.contents(PendingTaskFactory.MarkerKey).value.bytes.toList should be (List[Byte](1, 2, 3))
 
-  /** Polls until the task object holds nothing, as deallocateTask leaves it, failing after a few seconds */
-  private def awaitDeallocated(ptr: KeyValueObjectPointer, attempts: Int = 200): Future[Unit] =
+  /** Polls until the task object holds nothing, as deallocateTask leaves it, failing after a 30 s deadline */
+  private def awaitDeallocated(ptr: KeyValueObjectPointer,
+                               until: Long = System.nanoTime() + 30_000_000_000L): Future[Unit] =
     given ExecutionContext = executionContext
     client.read(ptr).flatMap: kvos =>
       if kvos.contents.isEmpty then Future.unit
-      else if attempts == 0 then Future.failed(new AssertionError(s"task ${ptr.id} was never deallocated"))
+      else if System.nanoTime() > until then Future.failed(new AssertionError(s"task ${ptr.id} was never deallocated"))
       else
         Future(Thread.sleep(10))(using ExecutionContext.global)
           .flatMap(_ => waitForTransactionsToComplete())
-          .flatMap(_ => awaitDeallocated(ptr, attempts - 1))
+          .flatMap(_ => awaitDeallocated(ptr, until))
 
   atest("allocating, preparing, deallocating and reusing a task object are each pinned"):
     given ExecutionContext = executionContext

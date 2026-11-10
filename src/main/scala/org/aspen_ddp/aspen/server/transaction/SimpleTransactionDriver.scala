@@ -47,15 +47,19 @@ class SimpleTransactionDriver(executionContext: ExecutionContext,
 
   if !designatedLeader then nextRound()
 
+  /** Set by shutdown: a timer already firing neither sends nor schedules again */
+  private var stopped = false
+
   override def shutdown(): Unit = synchronized:
     logger.trace(s"**** Shutting down tx: ${txd.transactionId}")
+    stopped = true
     nextTry.cancel()
 
   private def sendPeerMessages(): Unit = synchronized:
     // Generally this shouldn't be called if finalized=true but a race condition between onFinalized and the next
     // call to sendMessages could do so. We need to prevent execution in this case so we don't start up the the
     // retry loop again
-    if !finalized then
+    if !finalized && !stopped then
 
       if resolved then
         logger.trace(s"*** Sending TxResolved for transaction ${txd.transactionId}")
@@ -95,7 +99,8 @@ class SimpleTransactionDriver(executionContext: ExecutionContext,
     val thisDelay = ThreadLocalRandom.current().nextInt(0, backoffDelay.toMillis.toInt)
 
     nextTry.cancel()
-    nextTry = backgroundTasks.schedule(Duration(thisDelay, MILLISECONDS)):
-      sendPeerMessages()
+    if !stopped then
+      nextTry = backgroundTasks.schedule(Duration(thisDelay, MILLISECONDS)):
+        sendPeerMessages()
 
 }

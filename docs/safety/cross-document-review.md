@@ -72,6 +72,11 @@ completion (or than "now minus horizon" at promotion), answering only TxUnknown/
 
 ### X3. Stray TxResolved writes the host-wide status cache; finalized flag can be downgraded -> re-apply of blind updates (paxos F9 x transaction-recovery F10/F8 x requirements F1/F2)
 
+> **Refresh (Ruling 30): FIXED.** `TransactionStatusCache.updateStatus` is monotone, by an atomic compute: `finalized`
+> and `late` are sticky and a resolved status never reverts to Unresolved. Store B's `Tx.resolved` and a new Tx's
+> constructor can no longer downgrade A's finalized late entry, so the finalized relay keeps answering late
+> (`StoreSuite` "a sibling store's delayed resolution does not downgrade a finalized late entry").
+
 > **Refresh (replay pins): NARROWED, not fixed.** `Frontend`'s no-Tx `TxResolved` path now leaves a finalized entry
 > alone and ignores proofs (`server/store/Frontend.scala:636-637`). But `Tx.resolved` still writes
 > `(status, finalized = false, late = lateOutcome)` unconditionally (`server/transaction/Tx.scala:737-738`), so step 1
@@ -100,6 +105,10 @@ the store has no trace of the transaction (needs the 'applied' record) or compar
 
 ### X4. Stores' drivers are never stopped on close/reload/rebuild/relinquish: zombie proposer with an immortal Accept (recovery F12 x paxos F4/F5 x rebuild/adoption)
 
+> **Refresh (Ruling 31): FIXED for closed stores.** `Store.close` now shuts down the store's drivers and clears its
+> map, and a `SimpleTransactionDriver` timer already firing neither sends nor reschedules, so no zombie driver outlives
+> a close, reload, rebuild or relinquish that goes through it. P-N4's delayed duplicate client prepare remains.
+>
 > **Refresh (replay pins): UNCHANGED, consequence changed.** `Store.close` still only closes the frontend
 > (`Store.scala:65`). The zombie's periodic prepares no longer meet `TooOld`: they create fresh Txs checked against
 > current state, which may take commit-vote locks, and for a data-less transaction whose abort was forgotten can
@@ -192,6 +201,10 @@ Verdict: PLAUSIBLE.  Severity: resurrection / overwrite of a live object.
 3. Each P store with an entry finds it (`Tx.scala:926-930,1003-1004`) and applies the allocation again, overwriting O's
    current state with T's initial content and refcount. With entries at a write threshold of P's stores the overwrite is
    what reads return, and the scans then reconcile to it and delete the entries.
+Ruling 32 corrects Ruling 17's "one store, transient" wording to this quorum reach, for exactly T's writes in a pool
+where T has no pin of its own (blind or `replaySafe` writes, ABA-prone `DoesNotExist` inserts, allocations in another
+pool; KeyRevision-checked writes are pins and fail), within each store's scan window of 30 s to 15 min. No closure is
+implemented.
 Fix sketch: as R-N1; and have an allocating update fail at apply when the backend already holds the object.
 
 ### X12. Recovering acceptor x replay x finalization re-run (paxos P-N3 x recovery R-N6 x requirements Q-N5)
@@ -227,7 +240,7 @@ C2. repair-process 12.8 says marker inserts use `retryUntilSuccessful` and "No e
     and `finished` only logs "Gave up" (`MissedUpdateMarker.scala:127-157`); repair 12.8 is wrong on "no entry is lost".
 C3. rebuild-process F14 ("Paxos acceptor amnesia is safe only within the pool's failure tolerance") contradicts paxos-transactions P8/P9 (state of a possibly chosen value must be retained) and crash-recovery-log F18 (open question). Quorum arithmetic says tolerance
     does not cover amnesia (X2). The three documents give three different answers.
-C4. transaction-recovery F10 and paxos F9 call the status-cache downgrade low impact/"hygiene" and "not unsafe"; requirements F1/F2 and X3 show a re-apply path for blind writes. *(Refresh: resolved in the documents: all three now say the downgrade is narrowed, still present in `Tx.resolved`, and costs late-commit evidence.)* The documents disagree on whether the cache is a safety mechanism (paxos P17 says assumption) or an optimization (recovery F10).
+C4. transaction-recovery F10 and paxos F9 call the status-cache downgrade low impact/"hygiene" and "not unsafe"; requirements F1/F2 and X3 show a re-apply path for blind writes. *(Refresh: resolved in the documents. Since Ruling 30 the downgrade is fixed: the cache is monotone.)* The documents disagree on whether the cache is a safety mechanism (paxos P17 says assumption) or an optimization (recovery F10).
 C5. paxos F2 / recovery F3,F5 say the false-abort is "repaired through the ErrorTree/UnackedCommits entries recorded by the finalizer", but transaction-recovery F13 and requirements F8 say stores that were not counted voters, or traceless changes not covered by `tracelessObjects`, get no entry; the repair-process documents assume an entry always exists. *(Refresh: the traceless half is gone, requirements F8 fixed; the uncounted-voter half, recovery F13, stands.)*
 C6. rebuild-process 8.2 says ErrorTree repair "closes the residual staleness gap"; repair-process 13.2 F1/F2/F3/F4/F13 each describe cases where repair itself leaves the store stale or declares completion early. The rebuild guarantee rests on the repair guarantee that is not established.
 C7. transaction-recovery F6 (persisted `Committed` status is not restored into the recovered Tx; relies on the cache) vs crash-recovery-log 3.1 line 149 ("No decision is saved"): the CRL doc says the resolution is not a record, but recovery F6 says it can be persisted by a re-save; both are true depending on whether a prepare/accept re-saved the Tx after resolution. Should be stated once.

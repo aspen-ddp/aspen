@@ -104,7 +104,7 @@ AllocationTree entry (`client/internal/allocation/DeletionFinalizationAction.sca
 | Field | Format | Code |
 |-------|--------|------|
 | Key | 17 bytes: `poolIndex` then `transactionId` (msb, lsb big-endian). One entry per (store, transaction). | `client/internal/transaction/UnackedCommitEntry.scala:40-46` |
-| Value | `timestamp` (8) = the transaction's start timestamp; `count` (4); then `count` x (`length` (4), `ObjectPointer` bytes). The pointers keep their store pointers and are only the objects of this store with a traceless change. | `UnackedCommitEntry.scala:16-37` |
+| Value | `timestamp` (8) = the transaction's start timestamp; `count` (4); then `count` x (`length` (4), `ObjectPointer` bytes). The pointers keep their store pointers and are the objects of this store that T changes (traced or traceless; see the next row). | `UnackedCommitEntry.scala:16-37` |
 | Which objects | Since the refresh: every object the transaction changes on that store, traced or traceless. Before, only `RefcountUpdate`s and revision-less `KeyValueUpdate`s with `deletesKeys`. | `MissedUpdateFinalizationAction.scala:98-106` |
 | Meaning | The store cast a commit vote the commit may have relied on and had not acknowledged applying T when T was finalized: it is owed T. A recovered commit vote, and any commit voter receiving a late commit, applies T only if its entry exists. | `Tx.scala:158-160,920-932,997-1041` |
 
@@ -154,7 +154,7 @@ read), absent means "deleted, or its allocation has not been recorded yet" (sect
    Lock-only objects (`RevisionLock`/`SharedRevisionLock` without a change) are never marked (`:36-39`).
 4. `MissedUpdateMarker.mark` (`MissedUpdateMarker.scala:302-309`) queues entries per pool. Per pool at most one write
    is outstanding. Entries arriving meanwhile wait; the queue is a `LinkedHashMap` keyed by (poolIndex, objectId) for
-   updates and (poolIndex, txid) for traceless entries, so a store missing one object repeatedly produces one write of
+   updates and (poolIndex, txid) for UnackedCommits entries, so a store missing one object repeatedly produces one write of
    the newest miss (`:316-327`, higher `missedTimestamp` wins *within the queue only*). Batches hold at most 256 entries
    of both kinds with a half-and-half guarantee (`:335-353`).
 5. `writeBatch` (`:369-397`) is one transaction on the pool's ErrorTree and UnackedCommits trees, retried until
@@ -1048,7 +1048,9 @@ dependency is real but sound. Confidence: low.
   store: twice the snapshots, reads and installs per missed object. See transaction-recovery R-N4 for growth.
 * **RP-N4 (resurrection window; PLAUSIBLE).** An entry outlives the store's own late application of T until the scan
   deletes it (`deleteEntryIfUnchanged`, `StoreRepairer.scala:262-266`). Meanwhile a late commit of a replay applies T's
-  pin-only blind writes there again (Ruling 17; transaction-recovery R-N1). Faster scans shrink the window; nothing
+  writes in pools where T has no pin of its own there again: blind or `replaySafe` writes, ABA `DoesNotExist` inserts,
+  allocations in another pool (Ruling 17 as corrected by Ruling 32; transaction-recovery R-N1). When the whole pool
+  acknowledged late this reaches a quorum and the scans' reconcile follows it. Faster scans shrink the window; nothing
   closes it.
 * **RP-N5 (REFUTED).** Deleting an entry while a recovered vote still needs it: the scan skips while
   `mayHoldTransaction` (`awaitingCrl || transactions.contains`, `Frontend.scala:96`), and a found entry's Tx stays live

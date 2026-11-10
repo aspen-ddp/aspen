@@ -109,9 +109,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     and uses whole-node revision checks: intended for single-writer / low-contention use. A second update to one of its
     nodes in a transaction fails with `NodeAlreadyModified`; `getContainingNode`/`TieredKeyValueListNode` are KV-only.
   - `prepareUpdates(inserts: List[TKVLInsert], deletes)` changes many keys in one transaction on either kind, updating
-    each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe. Writes are per-key checked by default;
-    `PutRequirement` (`MustNotExist`, ...) and `TKVLInsert.blind` opt into weaker checks, so a blind write needs a pin
-    elsewhere in the transaction or `replaySafe`.
+    each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe. Writes are per-key
+    checked by default; `PutRequirement` (`MustNotExist`, ...) and `TKVLInsert.blind` opt into weaker checks, so a
+    blind write needs a pin elsewhere in the transaction or `replaySafe`.
   - Each `RootManager` owns a `TierCache` (default `LruTierCache`: 5 nodes per tier >= 1, plus the root when on
     tier >= 1; `NoCache` for tests and finalization actions). Stale entries cost only reads, except that `splitTree`
     through another instance can make warm instances return moved entries. `LruTierCache(anyRoot = true)` also
@@ -236,7 +236,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     finalization action is done. A recovered unresolved commit vote looks its entry up (`UnackedCommitLookup`, from the
     Host) once loaded and again before accepting any abort; no driver starts for it before the first lookup answers or
     while the CRL loads. A found entry proves the commit to its own driver; the Tx applies its saved update locally, logs
-    it at info and stays until TxFinalized, writing no status-cache entry. A failed or unanswered lookup holds the
+    it at info and stays until TxFinalized, writing no status-cache entry (a Tx holding a late commit that finds its
+    entry applies and is forgotten at once). A failed or unanswered lookup holds the
     abort and retries at heartbeat (`Frontend.UnackedLookupTimeout`, 5 s). Designs:
     `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2026-11-08-traceless-commits-design.md`
   - A rebuilt store lost its Paxos acceptor state. `RebuildingStore.finish` writes `acceptor-since` (finish time plus

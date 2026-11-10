@@ -506,8 +506,8 @@ My calls, for review:
 
 ## Amendments during implementation
 
-Decisions made while building that changed or refined the text above. Where they conflict, these win. Superseded
-rulings (4, 6, and 16 as read by 19) are omitted.
+Decisions made while building that changed or refined the text above. Where they conflict, these win. Only
+Ruling 4 is omitted (superseded by 12); Ruling 16 is included as read by Ruling 19.
 
 - **1 (proof field).** `TxResolved` carries an explicit `proof: Boolean`, set only by `Tx.proveCommitted`. Inferring a
   proof from `(committed, late=false)` misclassifies ordinary resolutions from other drivers.
@@ -516,6 +516,9 @@ rulings (4, 6, and 16 as read by 19) are omitted.
 - **3 (muted path).** The muted path keeps its behavior (prove or forget, no vote); no new error type.
 - **5 (late via relay).** Late condition 2 ("a store reported T finalized") is the existing finalized relay: a
   `TxFinalized` relayed from a finalized cache entry carries `late = true`. No status-request path was added.
+- **6 (late condition 1).** Late condition 1 counts only promises to prepares sent after the proof arrived. On a proof
+  while unresolved the driver starts a new, higher-proposal round and evaluates the memoryless-quorum condition on that
+  round alone, since earlier promises could predate another driver's later commit choice.
 - **7 (adopted value).** A proof-holding driver with a prepare quorum whose promises carry an accepted value sends
   accepts without waiting for the vote tally, since provers never vote.
 - **8 (finalizer order; amends 1a).** The finalizer runs `MissedUpdateFinalizationAction` only after every other

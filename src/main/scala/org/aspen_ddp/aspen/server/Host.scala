@@ -66,12 +66,6 @@ object Host:
   def txStatusCacheDuration(heartbeatPeriod: Duration): FiniteDuration =
     FiniteDuration((heartbeatPeriod * 7).toNanos, NANOSECONDS)
 
-  /** How old an unknown transaction's prepare may be before a store refuses to check it afresh (Frontend.horizon): the
-    * status cache duration, less a 1 s margin for clock skew. A prepare that misses the cache is older than the cache
-    * duration, since a transaction is finalized after it starts
-    */
-  def txHorizon(heartbeatPeriod: Duration): FiniteDuration = txStatusCacheDuration(heartbeatPeriod) - 1.second
-
   /** Each tick is a transaction per running system task, so it is not tied to the transaction heartbeat */
   val SystemTaskHeartbeatPeriod: Duration = Duration(5, SECONDS)
 
@@ -189,8 +183,7 @@ class Host(val client: AspenClient,
                    seams: Host.Seams = Host.Seams.default) extends Logging with RepairTarget {
   import Host._
 
-  private val txStatusCache = new TransactionStatusCache(Host.txStatusCacheDuration(heartbeatPeriod),
-    earlyEvictionAge = Some(Host.txHorizon(heartbeatPeriod)))
+  private val txStatusCache = new TransactionStatusCache(Host.txStatusCacheDuration(heartbeatPeriod))
 
   private val localDevices = new LocalDevices()
 

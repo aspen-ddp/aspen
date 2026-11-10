@@ -106,7 +106,7 @@ object TestNetwork {
   /** What the bootstrap host recovers with. The defaults recover nothing: no CRL state, and store-side drivers that
     * never send (TransactionDriver.noErrorRecoveryFactory)
     *
-    * @param heartbeatPeriod the host's, from which its status cache duration and horizon follow. Nothing calls the
+    * @param heartbeatPeriod the host's, from which its status cache duration follows. Nothing calls the
     *                        heartbeat on its own: TestNetwork.heartbeat does
     * @param recordCrl the stores' CRL is a RecordingCRL, so restartStore recovers their transactions
     * @param recoveryDrivers drivers of transactions a store is not the designated leader of (recovery drivers) are

@@ -892,47 +892,26 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
   }
 
-  // ---- The horizon rule: a prepare for an unknown transaction that started too long ago ----
+  // ---- A prepare for an unknown transaction that started long ago ----
   //
-  // Once the host's status cache has forgotten a finalized transaction, a late prepare for it must not be checked
-  // afresh: the store could vote commit and replay it. Past the horizon it is proven committed or votes abort.
-
-  private val horizon = FiniteDuration(6, SECONDS)
+  // There is no age limit: replay safety comes from pins, not from refusing old prepares. Such a prepare is checked
+  // afresh, and proven committed only on the abort path.
 
   private def ago(d: FiniteDuration): HLCTimestamp = HLCTimestamp((HLCTimestamp.now.wallTime - d.toMillis) << 16)
 
-  private def withHorizon(statusCache: TransactionStatusCache = new TransactionStatusCache())
+  private def withPlainFrontend(statusCache: TransactionStatusCache = new TransactionStatusCache())
                          (f: (Frontend, MapBackend, TestNet) => Unit): Unit =
     val backend = new MapBackend(storeId)
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, statusCache, horizon = horizon)
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, statusCache)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
     f(frontend, backend, net)
 
-  test("an unknown prepare older than the horizon gets a TransactionTooOld abort vote and takes no locks") {
-    withHorizon(): (frontend, _, net) =>
-      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(7, SECONDS)))
-      frontend.receiveTransactionMessage(clientPrepare(txd))
-
-      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
-      resolvedMessages(net) shouldBe Nil
-      frontend.transactions(txid1).holdsLocks shouldBe false
-      lockedWriteTransactions(frontend, net, op1) shouldBe empty
-  }
-
-  test("an unknown driver prepare older than the horizon votes abort without waiting for its object data") {
-    withHorizon(): (frontend, _, net) =>
-      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(7, SECONDS)))
-      frontend.receiveTransactionMessage(driverPrepare(txd))
-
-      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
-  }
-
   /** Sends a client prepare, started `age` ago, of txid1: an insert of key 1 with only `MayExist(k(1))` required, to
-    * kvPtr whose key 1 already carries txid1's revision. Its requirements pass, so only the proof that runs first
-    * past the horizon answers it TxResolved(committed)
+    * kvPtr whose key 1 already carries txid1's revision. Its requirements pass, so it is answered
+    * TxResolved(committed) only by a store that proves without checking them: a muted one
     */
   private def appliedKVPrepare(frontend: Frontend, backend: MapBackend, age: FiniteDuration): Unit =
     val contents = Map(k(1) -> new ValueState(Value(Array[Byte](1)), provenRev, HLCTimestamp(100), None))
@@ -944,19 +923,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
       objectUpdates = List(ObjectUpdate(oid2, insert))))
 
-  test("an unknown prepare older than the horizon whose update an object shows is answered TxResolved(committed)") {
-    withHorizon(): (frontend, backend, net) =>
-      appliedKVPrepare(frontend, backend, FiniteDuration(7, SECONDS))
-
-      resolvedMessages(net).map(r => (r.committed, r.proof)) shouldBe List((true, true))
-      // Answered after its objects loaded: the held response goes out as a memoryless abort vote
-      votes(net).map(_.disposition).distinct shouldBe List(TransactionDisposition.VoteAbort)
-  }
-
-  test("an unknown prepare younger than the horizon whose requirements pass is voted on, though an object shows it") {
-    // The counterpart of the test above: inside the horizon the proof runs only on the abort path
-    withHorizon(): (frontend, backend, net) =>
-      appliedKVPrepare(frontend, backend, FiniteDuration(1, SECONDS))
+  test("an old unknown prepare whose requirements pass is voted on, though an object shows it") {
+    // The proof runs only on the abort path, whatever the transaction's age
+    withPlainFrontend(): (frontend, backend, net) =>
+      appliedKVPrepare(frontend, backend, FiniteDuration(60, SECONDS))
 
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
       resolvedMessages(net) shouldBe Nil
@@ -973,7 +943,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
     val crl = new TestCrl
-    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, horizon = horizon,
+    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache,
       acceptorSince = Some(ago(FiniteDuration(2, SECONDS))))
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
@@ -1052,7 +1022,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a late client prepare with data inside the status cache is answered from the cache") {
     val statusCache = new TransactionStatusCache()
     statusCache.updateStatus(txid1, TransactionStatus.Committed, finalized = true)
-    withHorizon(statusCache): (frontend, _, net) =>
+    withPlainFrontend(statusCache): (frontend, _, net) =>
       val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(6500, MILLISECONDS)))
       frontend.receiveTransactionMessage(clientPrepare(txd))
 
@@ -1060,58 +1030,27 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.transactions.contains(txid1) shouldBe false
   }
 
-  test("a prepare older than the horizon for a transaction cached as resolved uses the cached outcome") {
+  test("an unknown prepare for a transaction cached as resolved uses the cached outcome") {
     val statusCache = new TransactionStatusCache()
     statusCache.updateStatus(txid1, TransactionStatus.Committed)
-    withHorizon(statusCache): (frontend, _, net) =>
+    withPlainFrontend(statusCache): (frontend, _, net) =>
       val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(6500, MILLISECONDS)))
       frontend.receiveTransactionMessage(clientPrepare(txd))
 
-      // Checked as usual, not refused as too old, and the outcome known: no locks, the cached status kept
+      // Checked as usual, and the outcome known: no locks, the cached status kept
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
       frontend.transactions(txid1).holdsLocks shouldBe false
       statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
       lockedWriteTransactions(frontend, net, op1) shouldBe empty
   }
 
-  test("a prepare older than the horizon for a transaction cached as resolved is not refused when it hosts no objects") {
-    // No objects to load, so the vote is decided inside the first prepare, before the cached outcome is applied to the
-    // new Tx: only the cache check in the horizon test keeps it from a TransactionTooOld abort vote
-    val statusCache = new TransactionStatusCache()
-    statusCache.updateStatus(txid1, TransactionStatus.Committed)
-    withHorizon(statusCache): (frontend, _, net) =>
-      val txd = lockTxd(txid1, List(overwrite(otherPtr))).copy(startTimestamp = ago(FiniteDuration(6500, MILLISECONDS)))
-      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true))
-
-      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
-      statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
-  }
-
-  test("an unknown prepare older than the horizon for a transaction cached only as unresolved votes TransactionTooOld") {
-    // Another store's Tx records itself in the host-wide cache as Unresolved (a recovered commit vote of a co-hosted
-    // store, say). That says nothing of the outcome, so the prepare is no less likely to replay a forgotten transaction
-    val statusCache = new TransactionStatusCache()
-    statusCache.updateStatus(txid1, TransactionStatus.Unresolved)
-    withHorizon(statusCache): (frontend, _, net) =>
-      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(7, SECONDS)))
-      frontend.receiveTransactionMessage(clientPrepare(txd))
-
-      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
-      frontend.transactions(txid1).holdsLocks shouldBe false
-      lockedWriteTransactions(frontend, net, op1) shouldBe empty
-  }
-
-  test("an unknown prepare younger than the horizon is handled as today") {
-    withHorizon(): (frontend, _, net) =>
-      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(1, SECONDS)))
+  test("an unknown prepare older than the status cache duration is checked afresh") {
+    withPlainFrontend(): (frontend, _, net) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(60, SECONDS)))
       frontend.receiveTransactionMessage(clientPrepare(txd))
 
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
       frontend.transactions(txid1).holdsLocks shouldBe true
-  }
-
-  test("Host.txHorizon is the status cache duration minus one second") {
-    Host.txHorizon(Duration(1, SECONDS)) shouldBe FiniteDuration(6, SECONDS)
   }
 
   // ---- Write locks are held until a commit is applied ----

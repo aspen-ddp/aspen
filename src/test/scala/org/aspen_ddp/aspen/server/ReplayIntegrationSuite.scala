@@ -4,9 +4,15 @@ import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
-import org.aspen_ddp.aspen.common.network.{TxMessage, TxPrepare}
-import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueObjectPointer, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.network.{TxFinalized, TxMessage, TxPrepare, TxResolved}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Key, KeyValueObjectPointer, ObjectId,
+  ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
+import org.aspen_ddp.aspen.server.repair.{RepairPolicy, StoreRepairer}
+
+import java.nio.{ByteBuffer, ByteOrder}
 
 import scala.concurrent.Future
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
@@ -82,7 +88,12 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       val prepares = recorded.collect:
         case m: TxPrepare if m.fromClient && m.transactionId == txid => m
       assert(prepares.nonEmpty, s"no client prepare of $txid was recorded")
-      prepares.foreach(net.deliverTransactionMessage)
+      // The designated leader's last: its prepare starts its driver, which here never retransmits
+      // (TestNetwork.HostOptions.recoveryDrivers). A store that gets the driver's data-less prepare before its own
+      // client prepare withholds its vote for the data and answers only a later prepare (Tx.awaitingData), so a
+      // driver that never asks again would wait forever. A host's drivers retransmit
+      val (leader, others) = prepares.partition(m => m.to.poolIndex == m.txd.designatedLeaderUID)
+      (others ++ leader).foreach(net.deliverTransactionMessage)
 
   /** Completes once no store of the bootstrap pool holds a Tx for `txid` */
   private def forgottenByStores(txid: TransactionId): Future[Unit] =
@@ -93,6 +104,40 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
   /** What store `i` holds for key `k` of `ptr`: the revision of its value */
   private def storeKeyRevision(i: Int, ptr: KeyValueObjectPointer): Option[ObjectRevision] =
     net.stores(i).m.get(ptr.id).flatMap(_.kvState).flatMap(_.content.get(k)).map(_.revision)
+
+  private def sid(i: Int): StoreId = net.stores(i).storeId
+
+  private def storeRevision(i: Int, ptr: DataObjectPointer): Option[ObjectRevision] =
+    net.stores(i).m.get(ptr.id).map(_.metadata.revision)
+
+  private def errorKey(i: Int, objectId: ObjectId): Key =
+    val bb = ByteBuffer.allocate(17)
+    bb.order(ByteOrder.BIG_ENDIAN)
+    bb.put(i.toByte)
+    bb.putLong(objectId.uuid.getMostSignificantBits)
+    bb.putLong(objectId.uuid.getLeastSignificantBits)
+    Key(bb.array())
+
+  /** The stores of `stores` with an ErrorTree entry for `objectId` */
+  private def errorEntries(stores: List[Int], objectId: ObjectId): Future[List[Int]] =
+    for
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      found <- Future.sequence(stores.map(i => pool.errorTree.get(errorKey(i, objectId)).map(o => i -> o.isDefined)))
+    yield found.collect { case (i, true) => i }
+
+  /** A data object x and a KeyValue object y, with `yContent`, every store holding both */
+  private def allocateXY(yContent: Map[Key, Value]): Future[(DataObjectPointer, KeyValueObjectPointer)] =
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      xy <- client.transactUntilSuccessful: tx =>
+              given Transaction = tx
+              tx.replaySafe("test")
+              for
+                x <- pool.allocator.allocateDataObject(DataBuffer(Array[Byte](1)))
+                y <- pool.allocator.allocateKeyValueObject(yContent)
+              yield (x, y)
+      _ <- settle(clock = false)
+    yield xy
 
   test("a replayed pinned transaction does not re-apply its blind delete over a re-inserted key"):
     for
@@ -130,3 +175,128 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       withClue("every store of y still holds k as T2 wrote it: "):
         (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
       yAfterReplay.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))
+
+  test("a replayed pinned KV insert after a later delete of its key changes nothing"):
+    for
+      (x, y) <- allocateXY(Map())
+      xBefore <- client.read(x)
+      // T: the overwrite of x at its revision is the pin; the insert of k into y is blind
+      t <- commitRecorded: tx =>
+             tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+             tx.update(y, None, None, Nil, List(Insert(k, Array[Byte](2))))
+             Future.unit
+      _ = (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t)))
+      // T2: k is deleted, at T's revision of it
+      t2 <- client.transactUntilSuccessful: tx =>
+              tx.update(y, None, None, List(KeyValueUpdate.KeyRevision(k, ObjectRevision(t))), List(Delete(k)))
+              Future.successful(tx.id)
+      _ <- settle(clock = false)
+      _ = (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe None)
+      _ <- replayClientPrepares(t)
+      _ <- settle(clock = true)
+      _ <- forgottenByStores(t)
+      yAfterReplay <- client.read(y)
+      xAfterReplay <- client.read(x)
+    yield
+      // Checked afresh, T fails x's revision; every store proves it committed from x and applies nothing
+      withClue("no store of y holds k again: "):
+        (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe None)
+      (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(ObjectRevision(t)))
+      yAfterReplay.contents.keySet should not contain k
+      xAfterReplay.revision shouldBe ObjectRevision(t)
+
+  test("a replayed pinned data overwrite after a later overwrite changes nothing"):
+    for
+      (x, _) <- allocateXY(Map())
+      xBefore <- client.read(x)
+      t <- commitRecorded: tx =>
+             tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+             Future.unit
+      t2 <- client.transactUntilSuccessful: tx =>
+              tx.overwrite(x, ObjectRevision(t), DataBuffer(Array[Byte](3)))
+              Future.successful(tx.id)
+      _ <- settle(clock = false)
+      _ = (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(ObjectRevision(t2)))
+      _ <- replayClientPrepares(t)
+      _ <- settle(clock = true)
+      _ <- forgottenByStores(t)
+      xAfterReplay <- client.read(x)
+    yield
+      // Checked afresh, T fails x's revision, and no object shows its update: every store votes abort
+      withClue("every store of x still holds T2's overwrite: "):
+        (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(ObjectRevision(t2)))
+      xAfterReplay.revision shouldBe ObjectRevision(t2)
+      xAfterReplay.data.getByteArray.toSeq shouldBe Seq[Byte](3)
+
+  test("a store that missed T's prepare and applied a later write to the key skips T's stale checked write"):
+    val lagging = 4
+    for
+      (x, y) <- allocateXY(Map(k -> Value(Array[Byte](1))))
+      yBefore <- client.read(y)
+      rev0 = yBefore.contents(k).revision
+      xBefore <- client.read(x)
+      // T: k's overwrite is per-write checked (KeyRevision), which pins it. The lagging store gets none of T's
+      // messages (they are recorded) and is reported offline, so it does not lead
+      t <- {
+        val tx = client.newTransaction()
+        net.offlineStores = Set(sid(lagging))
+        net.droppedTx = Set((sid(lagging), tx.id))
+        net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id && m.to == sid(lagging)
+        tx.update(y, None, None, List(KeyValueUpdate.KeyRevision(k, rev0)), List(Insert(k, Array[Byte](2))))
+        for
+          _ <- pump(tx.commit(), clock = false)
+          _ <- settle(clock = false)
+        yield
+          net.recordTxMessage = _ => false
+          net.offlineStores = Set()
+          tx.id
+      }
+      marked <- errorEntries((0 until 5).toList, y.id)
+      _ = withClue("only the lagging store lacks T, and the finalizer marked it: "):
+            (0 until 5).foreach: i =>
+              if i == lagging then storeKeyRevision(i, y) shouldBe Some(rev0)
+              else storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t))
+            // The designated leader's store can be marked too: when the client's prepare reaches it after the
+            // resolution, it applies the commit only at TxFinalized, too late to send TxCommitted in time
+            marked should contain (lagging)
+      // T2: a blind write of k, pinned by x, which every store applies, the lagging one included
+      t2 <- client.transactUntilSuccessful: tx =>
+              tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](3)))
+              tx.update(y, None, None, Nil, List(Insert(k, Array[Byte](3))))
+              Future.successful(tx.id)
+      _ <- settle(clock = false)
+      _ = (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
+      // Once the host forgot T, its client prepare and then its outcome reach the lagging store late
+      _ <- eventually("the status cache forgot T", clock = false):
+             Future.successful(net.smgr.control.txStatusCache.getStatus(t).isEmpty)
+      late = net.takeRecordedTxMessages()
+      prepare = late.collect { case m: TxPrepare if m.fromClient => m }
+      outcome = late.collect { case m: TxResolved if m.committed => m }.take(1) ++
+                late.collect { case m: TxFinalized if m.committed => m }.take(1)
+      _ = withClue("T's client prepare and committed outcome to the lagging store were recorded: "):
+            prepare should not be empty
+            outcome.size shouldBe 2
+      _ = net.droppedTx = Set()
+      _ = prepare.foreach(net.deliverTransactionMessage)
+      _ = withClue("the lagging store checks T's late prepare afresh: "):
+            net.smgr.control.router.loaded.get(sid(lagging)).exists(_.frontend.transactions.contains(t)) shouldBe true
+      _ = outcome.foreach(net.deliverTransactionMessage)
+      _ <- settle(clock = true)
+      _ <- forgottenByStores(t)
+      _ = withClue("the lagging store applied the commit's checked write only if k was still as T read it: "):
+            storeKeyRevision(lagging, y) shouldBe Some(ObjectRevision(t2))
+      stillMarked <- errorEntries((0 until 5).toList, y.id)
+      _ = stillMarked should contain (lagging)
+      repairer = StoreRepairer(client, net.smgr)
+      // Every store's entries: the designated leader's may be marked too
+      _ <- eventually("every entry about y was repaired away", clock = true):
+             for
+               _ <- (0 until 5).foldLeft(Future.unit): (f, i) =>
+                      f.flatMap(_ => pump(repairer.scan(sid(i), RepairPolicy.Default), clock = true)).map(_ => ())
+               _ <- settle(clock = true)
+               errors <- errorEntries((0 until 5).toList, y.id)
+             yield errors.isEmpty
+      yAfter <- client.read(y)
+    yield
+      (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
+      yAfter.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))

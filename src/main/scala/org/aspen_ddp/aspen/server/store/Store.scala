@@ -41,8 +41,6 @@ class Store(val storageDeviceId: StorageDeviceId,
               * runs tasks inline, for tests with synchronous backends
               */
             val postToStore: Option[(Store => Unit) => Unit] = None,
-            /** Unknown prepares older than this vote abort unchecked (Frontend.horizon). Infinite: off */
-            val horizon: Duration = Duration.Inf,
             /** A rebuilt store's acceptor start (Frontend.acceptorSince). None: an ordinary store */
             val acceptorSince: Option[HLCTimestamp] = None,
             /** Recover the CRL's transactions only when frontend.recover is called (Frontend.deferRecovery) */
@@ -55,7 +53,7 @@ class Store(val storageDeviceId: StorageDeviceId,
     post = postToStore match
       case None => task => task()
       case Some(postTo) => task => postTo(s => if s eq this then task()),
-    horizon = horizon, acceptorSince = acceptorSince, deferRecovery = deferRecovery)
+    acceptorSince = acceptorSince, deferRecovery = deferRecovery)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's

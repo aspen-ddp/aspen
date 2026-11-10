@@ -65,13 +65,6 @@ class Frontend(val storeId: StoreId,
                  * backends
                  */
                val post: (() => Unit) => Unit = task => task(),
-               /** A prepare for a transaction this store does not know, and the host's status cache holds no outcome for,
-                 * that started longer ago than this votes abort with TransactionTooOld without its requirements being
-                 * checked, unless an object already shows its update (Tx.proveCommitted). The cache may have forgotten
-                 * that it finalized, so checking it afresh could vote commit on, and replay, a finished transaction.
-                 * Host.txHorizon in hosts; infinite (off) by default
-                 */
-               val horizon: Duration = Duration.Inf,
                /** Set for a rebuilt store (RebuildingStore.AcceptorSinceFile): its Paxos acceptor state covers only
                  * transactions started at or after it. Its old incarnation may have promised or accepted in an older
                  * one before that state was lost, and a fresh promise or vote could then let a quorum choose against
@@ -679,13 +672,11 @@ class Frontend(val storeId: StoreId,
       logger.trace(s"**** CREATING NEW TX: ${m.txd.transactionId}")
       val cached = statusCache.getStatus(m.txd.transactionId)
       val known = cached.filter(_.status != TransactionStatus.Unresolved)
-      // Measured with the HLC from the client-assigned start, so a client clock running behind makes it look older. An
-      // Unresolved entry counts as none: another store's Tx on this host wrote it, which says nothing of the outcome
+      // An Unresolved entry counts as none: another store's Tx on this host wrote it, which says nothing of the outcome
       val muted = acceptorSince.exists(m.txd.startTimestamp < _)
-      val tooOld = muted || (known.isEmpty && HLCTimestamp.now - m.txd.startTimestamp > horizon)
       val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates, takeSerializedTxd(m.txd.transactionId))
       val pointers = m.txd.allHostedObjects(m.to)
-      val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers, tooOld = tooOld,
+      val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers,
         muted = muted)
       transactions += (m.txd.transactionId -> tx)
       tx.receivePrepare(m)

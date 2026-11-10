@@ -34,21 +34,3 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     cache.updateStatus(txid, TransactionStatus.Committed, finalized = true)
     cache.getStatus(txid).get.late shouldBe false
   }
-
-  test("a size eviction of an entry younger than the early-eviction age is counted and warned") {
-    val cache = new TransactionStatusCache(FiniteDuration(7, SECONDS), maxEntries = 1,
-      earlyEvictionAge = Some(FiniteDuration(6, SECONDS)))
-    cache.updateStatus(TransactionId(new UUID(0, 1)), TransactionStatus.Committed)
-    cache.updateStatus(TransactionId(new UUID(0, 2)), TransactionStatus.Committed)
-    // cleanUp drains both buffered writes and evicts, running the listener on this thread
-    cache.cleanUpForTest()
-    cache.earlyEvictions shouldBe 1L
-  }
-
-  test("a size eviction is not counted without an early-eviction age") {
-    val cache = new TransactionStatusCache(FiniteDuration(7, SECONDS), maxEntries = 1)
-    cache.updateStatus(TransactionId(new UUID(0, 1)), TransactionStatus.Committed)
-    cache.updateStatus(TransactionId(new UUID(0, 2)), TransactionStatus.Committed)
-    cache.size shouldBe 1L
-    cache.earlyEvictions shouldBe 0L
-  }

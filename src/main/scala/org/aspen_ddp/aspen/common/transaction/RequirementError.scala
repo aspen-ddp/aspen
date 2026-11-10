@@ -23,12 +23,6 @@ case class WithinRangeError() extends  RequirementError
   */
 case class RequirementCheckFailure() extends RequirementError
 
-/** A prepare for a transaction the store does not know arrived after the store's horizon (Frontend.horizon): the host's
-  * status cache may have forgotten it finalized, so it must not be checked afresh. Its requirements are not checked and
-  * no locks are taken. Purely local, like RequirementCheckFailure.
-  */
-case class TransactionTooOld() extends RequirementError
-
 /** The store's in-memory state of the object was discarded (deleted, or no longer matching the backend) while
   * transactions held locks on it. Purely local, like RequirementCheckFailure.
   */

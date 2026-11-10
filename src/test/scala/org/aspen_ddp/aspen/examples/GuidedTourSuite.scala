@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.examples
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.Radicle
@@ -64,6 +66,10 @@ class GuidedTourSuite extends IntegrationTestSuite:
     def buildStore(): Future[(KeyValueObjectPointer, DataObjectPointer)] =
       client.transact { t =>
         given tx: Transaction = t
+        // Nothing here fails once it has committed, so a replay could apply it twice. A real
+        // application pins its transactions (an update at a required revision); the tour has no
+        // revision to hand, so it states the transaction is safe to replay instead.
+        tx.replaySafe("guided tour")
 
         for
           // Every pool defines its own IDA -- its replication or erasure-coding strategy -- so the
@@ -147,7 +153,7 @@ class GuidedTourSuite extends IntegrationTestSuite:
     // ---------------------------------------------------------------------------------------
 
     def addBookmark(indexPtr: KeyValueObjectPointer, key: Key, url: String): Future[Unit] =
-      val tx = client.newTransaction()
+      val tx = TestTransactions.replaySafe(client.newTransaction())
       tx.update(
         indexPtr,
         None,

@@ -20,6 +20,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
     for
       ptr <- client.transactUntilSuccessful: tx =>
                given Transaction = tx
+               tx.replaySafe("test")
                client.getStoragePool(Radicle.poolId).flatMap: pool =>
                  new PoolObjectAllocator(client, pool).allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](1))))
       _ <- waitForTransactionsToComplete()
@@ -64,7 +65,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       ptr <- allocate()
       _ <- removeEntry(ptr)
       state <- client.read(ptr)
-      audit = new PinAudit(client, enforce = false)
+      audit = new PinAudit(client)
       _ <- run(ptr)
       first = audit.builtExceptMarks
       afterFirst <- entry(ptr)
@@ -91,7 +92,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
       updated <- client.read(ptr)
-      audit = new PinAudit(client, enforce = false)
+      audit = new PinAudit(client)
       _ <- run(ptr)
       _ = audit.stop()
       after <- entry(ptr)
@@ -111,7 +112,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
       gone <- entry(ptr)
-      audit = new PinAudit(client, enforce = false)
+      audit = new PinAudit(client)
       _ <- run(ptr)
       _ = audit.stop()
       after <- entry(ptr)

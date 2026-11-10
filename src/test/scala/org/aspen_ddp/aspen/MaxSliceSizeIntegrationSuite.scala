@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.client.{ObjectSizeLimitExceeded, Transaction}
 import org.aspen_ddp.aspen.client.internal.transaction.UncheckedTransaction
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
@@ -18,7 +20,7 @@ trait MaxSliceSizeHelpers:
   def content(n: Int): Array[Byte] = Array.tabulate[Byte](n)(i => (i % 251).toByte)
 
   def allocate(n: Int): Future[DataObjectPointer] =
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
     for
       pool <- client.getStoragePool(Radicle.poolId)
       dp <- pool.allocator.allocateDataObject(DataBuffer(content(n)))

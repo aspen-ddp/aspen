@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.amoebafs.{DirectoryPointer, FileInode, FilePointer}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.DataBuffer
@@ -15,13 +17,13 @@ class LimitedPoolFileSystemSuite extends FilesSystemTestSuite:
   override def testStoreMaxSliceSize: Option[Long] = Some(4096L)
 
   private def mkdir(dir: Directory, name: String): Future[DirectoryPointer] =
-    given tx: Transaction = dir.fs.client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(dir.fs.client.newTransaction())
     val fprep = dir.prepareCreateDirectory(name, mode = 0, uid = 1, gid = 2)
     fprep.foreach(_ => tx.commit())
     fprep.flatMap(fresult => fresult)
 
   private def mkfile(dir: Directory, name: String): Future[FilePointer] =
-    given tx: Transaction = dir.fs.client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(dir.fs.client.newTransaction())
     val fprep = dir.prepareCreateFile(name, mode = 0, uid = 1, gid = 2)
     fprep.foreach(_ => tx.commit())
     fprep.flatMap(fresult => fresult)

@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server.repair
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, ReadLocks, Transaction}
 import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
@@ -85,8 +87,9 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   private def seedErrorEntry(objectId: ObjectId, storePointer: Array[Byte],
                              missedTimestamp: HLCTimestamp = HLCTimestamp.Zero): Future[Unit] =
     errorTree.flatMap: tree =>
-      val tx: Transaction = client.newRepairTransaction()
+      val tx: Transaction = TestTransactions.replaySafe(client.newRepairTransaction())
       given Transaction = tx
+      tx.replaySafe("test")
       tree.set(buildErrorKey(0.toByte, objectId), buildErrorValue(missedTimestamp, storePointer)).flatMap: _ =>
         tx.commit().map(_ => ())
 
@@ -101,6 +104,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   private def allocateObjectPointer(): Future[KeyValueObjectPointer] =
     val f = client.transactUntilSuccessful: tx =>
       given Transaction = tx
+      tx.replaySafe("test")
       for
         pool <- client.getStoragePool(PoolId.BootstrapPoolId)
         allocator = new PoolObjectAllocator(client, pool)
@@ -117,6 +121,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   private def updateObject(ptr: KeyValueObjectPointer): Future[HLCTimestamp] =
     for
       _ <- client.transactUntilSuccessful: tx =>
+             tx.replaySafe("test")
              tx.update(ptr, None, None, Nil, List(Insert(Key(Array[Byte](9)), Array[Byte](10))))
              Future.unit
       _ <- net.waitForTransactionsToComplete()
@@ -336,7 +341,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       // Seed a too-short key (only 5 bytes instead of 17) directly into the errorTree
       tree <- errorTree
-      tx = client.newRepairTransaction()
+      tx = TestTransactions.replaySafe(client.newRepairTransaction())
       _ <- tree.set(Key(Array[Byte](0, 1, 2, 3, 4)), Value(Array[Byte]()))(using tx)
       _ <- tx.commit()
       // Seed a valid entry after the malformed one to prove the scan continued
@@ -404,7 +409,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       tree <- errorTree
       _ <- keys.foldLeft(Future.unit): (f, key) =>
              f.flatMap: _ =>
-               val tx = client.newRepairTransaction()
+               val tx = TestTransactions.replaySafe(client.newRepairTransaction())
                tree.delete(key)(using tx).flatMap(_ => pump(tx.commit(), deadline())).map(_ => ())
       _ <- settle()
       remaining <- errorEntries(i)
@@ -444,7 +449,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   /** missedBy, completing with the missed transaction's id */
   private def missedByTx(i: Int)(build: Transaction => Unit): Future[TransactionId] =
     net.offlineStores = Set(sid(i))
-    val tx = client.newTransaction()
+    val tx = TestTransactions.replaySafe(client.newTransaction())
     build(tx)
     net.droppedTx = net.droppedTx + ((sid(i), tx.id))
     pump(tx.commit(), deadline()).transformWith: committed =>
@@ -494,6 +499,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       ptr <- client.transactUntilSuccessful: tx =>
                given Transaction = tx
+               tx.replaySafe("test")
                for
                  pool <- client.getStoragePool(PoolId.BootstrapPoolId)
                  p <- new PoolObjectAllocator(client, pool).allocateKeyValueObject(initial)
@@ -543,6 +549,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       dataPtr <- client.transactUntilSuccessful: tx =>
                    given Transaction = tx
+                   tx.replaySafe("test")
                    for
                      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
                      p <- new PoolObjectAllocator(client, pool).allocateDataObject(DataBuffer(Array[Byte](1)))
@@ -567,6 +574,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       dataPtr <- client.transactUntilSuccessful: tx =>
                    given Transaction = tx
+                   tx.replaySafe("test")
                    for
                      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
                      p <- new PoolObjectAllocator(client, pool).allocateDataObject(DataBuffer(Array[Byte](1)))
@@ -661,6 +669,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       ptr <- client.transactUntilSuccessful: tx =>
                given Transaction = tx
+               tx.replaySafe("test")
                for
                  pool <- client.getStoragePool(PoolId.BootstrapPoolId)
                  p <- new PoolObjectAllocator(client, pool).allocateDataObject(DataBuffer(Array[Byte](1)))
@@ -737,7 +746,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
         ObjectRefcount(1, 1), HLCTimestamp.now), DataBuffer(Array[Byte](3)))
     for
       pool <- client.getStoragePool(PoolId.BootstrapPoolId)
-      tx = client.newRepairTransaction()
+      tx = TestTransactions.replaySafe(client.newRepairTransaction())
       _ <- pool.unackedCommitsTree.set(UnackedCommitEntry.key(sid(2), txid),
              Value(UnackedCommitEntry(HLCTimestamp.now, List(ptr)).encode))(using tx)
       _ <- pump(tx.commit(), deadline())
@@ -861,7 +870,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       writeK2.filter(p => s == sid(2) && p.id == ptr.id) match
         case Some(p) =>
           writeK2 = None
-          val tx = client.newTransaction()
+          val tx = TestTransactions.replaySafe(client.newTransaction())
           kvUpdate(p, List(Insert(k2, Array[Byte](7))))(tx)
           pump(tx.commit(), deadline()).flatMap(_ => settle())
         case None => Future.unit)

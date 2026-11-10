@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import java.util.UUID
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
@@ -46,7 +48,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
                        link: Option[NodeLink] = None): Future[DataObjectListNode] =
     for
       alloc <- allocator()
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateDataObject(DataBuffer(enc.encode(entries, minimum, link)))(using tx)
       _ <- tx.commit()
       node <- readNode(ptr, minimum)
@@ -69,7 +71,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
   atest("allocate sorts entries and creates a node with the absolute minimum and no link"):
     for
       alloc <- allocator()
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- enc.allocate(alloc, ordering, Map(key(3) -> vbytes(3), key(1) -> vbytes(1), key(2) -> vbytes(2)))(using tx)
       _ <- tx.commit()
       node <- readNode(ptr)

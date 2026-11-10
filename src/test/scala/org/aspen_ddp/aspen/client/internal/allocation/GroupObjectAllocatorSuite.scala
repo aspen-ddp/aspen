@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.allocation
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.common.metadata.IDAPolicy
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AllocationError, GroupObjectAllocatorId, Transaction}
@@ -68,7 +70,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(groupId))
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1, 2, 3)))(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -92,7 +94,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(groupId))
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateKeyValueObject(Map(key -> value))(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -121,7 +123,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(group1Id))
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](5, 6)))(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -154,7 +156,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(group2Id))
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](9)))(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -176,12 +178,12 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(groupId))
 
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       ptr1 <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx1)
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
 
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       ptr2 <- allocator.allocateDataObject(DataBuffer(Array[Byte](2)))(using tx2)
       _ <- tx2.commit()
       _ <- waitForTransactionsToComplete()
@@ -205,7 +207,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(groupId))
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](10, 20, 30)))(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()

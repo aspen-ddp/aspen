@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{InvalidObject, PoolObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
@@ -31,7 +33,7 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- pool.allocator.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
@@ -46,7 +48,7 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
     for
       host <- rootHost()
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId, maxNodeSize)
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, host, treeKey, treeOrdering, nodeAllocator, Map(), kind)(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -150,7 +152,7 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
     for
       host <- rootHost()
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId, smallNodeSize)
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       root <- Root.create(client, ordering, nodeAllocator, initial, TreeKind.DataObjects)(using tx)
       froot <- KVObjectRootManager.createNewTree(client, host, treeKey, ordering, nodeAllocator, initial,
         TreeKind.DataObjects)(using tx)
@@ -526,7 +528,7 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
     for
       host <- rootHost()
       pool <- client.getStoragePool(Radicle.poolId)
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       // Tier 0 is t0 -> t1, as a committed split of t0 at longKey leaves it. Tier 1 indexes only t0.
       t1 <- pool.allocator.allocateDataObject(DataBuffer(enc.encode(List(longKey -> value(2)), longKey, None)))(using tx0)
       t0 <- pool.allocator.allocateDataObject(DataBuffer(enc.encode(List(k1 -> value(1)), Key.AbsoluteMinimum,
@@ -534,7 +536,7 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       u <- pool.allocator.allocateDataObject(DataBuffer(enc.encode(List(Key.AbsoluteMinimum -> Value(t0.toArray)),
         Key.AbsoluteMinimum, None)))(using tx0)
       _ <- tx0.commit()
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       frm = KVObjectRootManager.setNewRoot(client, host, treeKey, true,
         Root(1, ordering, Some(u), nodeAllocator, TreeKind.DataObjects))(using tx1)
       _ <- tx1.commit()

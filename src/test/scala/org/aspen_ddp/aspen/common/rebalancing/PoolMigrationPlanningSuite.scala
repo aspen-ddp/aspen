@@ -74,6 +74,7 @@ class PoolMigrationPlanningSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     client.transactUntilSuccessful: tx =>
       given Transaction = tx
+      tx.replaySafe("test")
       for
         poolPtr <- client.getStoragePoolPointer(poolId)
         kvos <- client.read(poolPtr, "test migration write")
@@ -136,6 +137,7 @@ class PoolMigrationPlanningSuite extends IntegrationTestSuite:
       // backstop exists for.
       _ <- client.transactUntilSuccessful: tx =>
              given Transaction = tx
+             tx.replaySafe("test")
              for
                setPtr <- client.getStorageDeviceSetPointer(setId)
                dos <- client.read(setPtr)
@@ -162,6 +164,7 @@ class PoolMigrationPlanningSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     client.transactUntilSuccessful: tx =>
       given Transaction = tx
+      tx.replaySafe("test")
       for
         pool <- client.getStoragePool(Radicle.poolId)
         allocator = new PoolObjectAllocator(client, pool)

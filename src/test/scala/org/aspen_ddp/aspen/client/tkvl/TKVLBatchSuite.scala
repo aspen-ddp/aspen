@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.client.TransactionAborted
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
@@ -182,7 +184,7 @@ class TKVLBatchRequirementSuite extends TKVLBatchSuiteSupport:
           .failed
         aborted <- tx.result.failed
         // The key is inserted between the batch's read and its commit
-        raced = client.newTransaction()
+        raced = TestTransactions.replaySafe(client.newTransaction())
         _ <- tree.prepareUpdates(inserts(List(Key(5)), mustNotExist = true), Nil)(using raced)
         _ <- inTransaction(rtx => tree.set(Key(5), value(55))(using rtx))
         racedFailed <- raced.commit().map(_ => false).recover(_ => true)
@@ -197,7 +199,7 @@ class TKVLBatchRequirementSuite extends TKVLBatchSuiteSupport:
       // Each attempt allocates an object and stores its pointer, as callers storing new objects in a tree do. A
       // retry of an attempt that did commit fails rather than storing a second pointer.
       def attempt(tree: Tree): Future[Option[ObjectPointer]] =
-        val tx = client.newTransaction()
+        val tx = TestTransactions.replaySafe(client.newTransaction())
         val f = for
           pool <- client.getStoragePool(Radicle.poolId)
           ptr <- pool.allocator.allocateDataObject(org.aspen_ddp.aspen.common.DataBuffer(Array[Byte](1)))(using tx)
@@ -225,7 +227,7 @@ class TKVLBatchRequirementSuite extends TKVLBatchSuiteSupport:
       client.retryStrategy.retryUntilSuccessful:
         attempts += 1
         val first = attempts == 1
-        val tx = client.newTransaction()
+        val tx = TestTransactions.replaySafe(client.newTransaction())
         val f = for
           _ <- tree.set(k, v)(using tx)
           _ <- if first then race() else Future.unit

@@ -27,6 +27,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       ids <- Future.sequence((0 until 20).toList.map: i =>
                client.transactUntilSuccessful: tx =>
                  given Transaction = tx
+                 tx.replaySafe("test")
                  client.getStoragePool(PoolId.BootstrapPoolId).flatMap: pool =>
                    pool.allocator.allocateDataObject(Array[Byte](i.toByte)).map(_.id))
       _ <- waitForTransactionsToComplete()

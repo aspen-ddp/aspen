@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.client.{InvalidObject, KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -16,7 +18,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
   /** Allocates a KeyValue object holding keys 1 through 5 (value of key n is Array(n * 10)) and links it
     * into the radicle under `radicleKey` */
   def allocateFiveKeyObject(radicleKey: Key): Future[KeyValueObjectPointer] =
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     tx.update(radicle, None, None, List(KeyValueUpdate.DoesNotExist(radicleKey)), List(Insert(radicleKey, Array[Byte](1))))
 
@@ -67,7 +69,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
   }
 
   atest("Read metadata of data object") {
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
     tx.update(radicle, None, None, List(KeyValueUpdate.DoesNotExist(k(104))), List(Insert(k(104), Array[Byte](1))))
 
     for
@@ -172,7 +174,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))
 
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     tx.update(radicle,
       None,
@@ -208,7 +210,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))
 
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     tx.update(radicle,
       None,

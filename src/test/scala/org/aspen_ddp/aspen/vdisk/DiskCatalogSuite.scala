@@ -349,7 +349,7 @@ class DiskCatalogSuite extends IntegrationTestSuite:
       nameVs <- names.get(nameKey)
       idVs <- objects.get(idKey)
       // delete retries every failure, so an unpinned transaction is caught by the assertion, not enforced
-      deleteAudit = new PinAudit(client, enforce = false)
+      deleteAudit = new PinAudit(client)
       _ <- DiskCatalog.delete(client, "d1")
       _ = deleteAudit.stop()
     yield

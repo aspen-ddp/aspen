@@ -28,7 +28,9 @@ class TransactionMaxSizeSuite extends AnyFunSuite with Matchers {
   private val appendable: List[IDA] = List(idas.head, idas.last)
 
   private def mkBuilder(): TransactionBuilder =
-    new TransactionBuilder(tx1, (_, _) => 0.toByte, ClientId(new UUID(0, 4)))
+    val b = new TransactionBuilder(tx1, (_, _) => 0.toByte, ClientId(new UUID(0, 4)))
+    b.replaySafe("test")
+    b
 
   private def build(bldr: TransactionBuilder, ida: IDA, max: Option[Int]) =
     bldr.buildTranaction(OpportunisticRebuildManager.None, Map(pool -> ida), Map(pool -> max), Map())

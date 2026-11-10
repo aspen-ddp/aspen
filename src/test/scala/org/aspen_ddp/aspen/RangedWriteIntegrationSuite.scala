@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.client.{DataObjectState, RangeReadNotSupported, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState, Transaction}
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.transaction.TransactionBuilder
@@ -49,7 +51,7 @@ trait RangedWriteIntegrationTests:
 
   /** Allocates an object holding `content`, linked from the radicle under a key derived from `index` */
   private def allocateWith(index: Int, content: Array[Byte]): Future[DataObjectPointer] =
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
     val radicleKey = Key(Array[Byte](0x52, index.toByte))
     tx.update(radicle, None, None, List(KeyValueUpdate.DoesNotExist(radicleKey)),
               List(Insert(radicleKey, Array[Byte](1))))
@@ -462,7 +464,7 @@ class ClassicReedSolomonRangedWriteRejectionSuite extends IntegrationTestSuite:
   private val content = Array.tabulate[Byte](100)(_.toByte)
 
   private def allocate(): Future[DataObjectPointer] =
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
     for
       pool <- client.getStoragePool(Radicle.poolId)
       dp <- pool.allocator.allocateDataObject(DataBuffer(content))

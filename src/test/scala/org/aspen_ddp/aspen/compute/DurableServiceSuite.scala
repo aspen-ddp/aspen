@@ -143,7 +143,7 @@ class DurableServiceSuite extends IntegrationTestSuite:
     val exec = makeExecutor()
     val svcUUID = UUID.randomUUID()
     // registerService retries every failure, so an unpinned transaction is caught by the assertion, not enforced
-    val audit = new PinAudit(client, enforce = false)
+    val audit = new PinAudit(client)
     for
       _ <- exec.registerService(UUID.randomUUID(), svcUUID, Map.empty)
       _ = audit.stop()

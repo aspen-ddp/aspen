@@ -362,8 +362,6 @@ class TransactionImpl(val client: AspenClient,
             val poolIDAMap = pools.map((poolId, pool) => poolId -> pool.ida)
             val poolMaxObjectSizeMap = pools.map((poolId, pool) => poolId -> pool.maxObjectSize)
             val poolMaxSliceSizeMap = pools.map((poolId, pool) => poolId -> pool.maxSliceSize)
-            if client.testingOnlyEnforcePins then
-              bldr.enforcePinsOverride = Some(true)
             bldr.onBuilt = client.testingOnlyOnBuilt
             val (txd, transactionData, _) = bldr.buildTranaction(client.opportunisticRebuildManager, poolIDAMap,
               poolMaxObjectSizeMap, poolMaxSliceSizeMap)

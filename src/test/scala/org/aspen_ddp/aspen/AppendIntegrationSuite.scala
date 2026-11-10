@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, RangeReadNotSupported, RangedWrite, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.Radicle
@@ -51,7 +53,7 @@ trait AppendIntegrationTests:
 
   /** Allocates an object already holding `content`, linked from the radicle */
   private def allocateWith(index: Int, content: Array[Byte]): Future[DataObjectPointer] =
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
     linkToRadicle(tx, index)
     for
       pool <- client.getStoragePool(Radicle.poolId)
@@ -61,7 +63,7 @@ trait AppendIntegrationTests:
 
   /** Allocates a DataObject with the bare allocateDataObject(), linked from the radicle */
   private def allocateBare(index: Int): Future[DataObjectPointer] =
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
     linkToRadicle(tx, index)
     for
       pool <- client.getStoragePool(Radicle.poolId)
@@ -449,7 +451,7 @@ class ClassicReedSolomonAppendRejectionSuite extends IntegrationTestSuite:
   override def testIda: IDA = ReedSolomon(5, 3, 4)
 
   private def allocate(): Future[DataObjectPointer] =
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
     for
       pool <- client.getStoragePool(Radicle.poolId)
       dp <- pool.allocator.allocateDataObject(DataBuffer(Array.tabulate[Byte](100)(_.toByte)))
@@ -457,7 +459,7 @@ class ClassicReedSolomonAppendRejectionSuite extends IntegrationTestSuite:
     yield dp
 
   atest("bare allocation reads as empty"):
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
     for
       pool <- client.getStoragePool(Radicle.poolId)
       dp <- pool.allocator.allocateDataObject()

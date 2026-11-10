@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
@@ -17,7 +19,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))
 
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     for {
       ikvos <- client.read(radicle)
@@ -58,7 +60,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -72,7 +74,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       lst <- lst.refresh()
 
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       _ <- lst.insert(key2, value2, 100, alloc)(using tx2)
 
       _ <- tx2.commit().map(_=>())
@@ -107,7 +109,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -121,7 +123,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       lst <- lst.refresh()
 
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       _ <- lst.insert(key2, value2, 100, alloc)(using tx2)
 
       _ <- tx2.commit().map(_ => ())
@@ -160,7 +162,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -198,7 +200,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -212,7 +214,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       lst <- lst.refresh()
 
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       _ <- lst.insert(key2, value2, 100, alloc)(using tx2)
 
       _ <- tx2.commit().map(_ => ())
@@ -248,7 +250,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -298,7 +300,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -353,7 +355,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       ptr <- alloc.allocateKeyValueObject()(using tx)
       _ = lptr = ptr
@@ -399,7 +401,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -442,7 +444,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -488,7 +490,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -502,7 +504,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       lst <- lst.refresh()
 
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       _ <- lst.insert(key2, value2, 150, alloc)(using tx2)
 
       _ <- tx2.commit().map(_=>())
@@ -542,7 +544,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -560,7 +562,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
 
-      tx3 = client.newTransaction()
+      tx3 = TestTransactions.replaySafe(client.newTransaction())
       _ <- lst.insert(key3, value3, 210, alloc)(using tx3)
       _ <- tx3.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -613,7 +615,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
 
       lptr <- alloc.allocateKeyValueObject()(using tx)
 
@@ -625,13 +627,13 @@ class KeyValueListSuite extends IntegrationTestSuite {
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
 
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       _ <- lst.insert(key2, value2, 100, alloc)(using tx2)
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
 
-      tx3 = client.newTransaction()
+      tx3 = TestTransactions.replaySafe(client.newTransaction())
       _ <- lst.delete(key)(using tx3)
       _ <- tx3.commit().map(_=>())
       lst <- lst.refresh()

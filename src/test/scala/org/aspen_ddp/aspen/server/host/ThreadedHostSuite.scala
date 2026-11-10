@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
@@ -27,7 +29,7 @@ class ThreadedHostSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
 
     def allocate(): Future[List[DataObjectPointer]] =
-      given tx: Transaction = client.newTransaction()
+      given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
       val key = Key(Array[Byte](15))
       tx.update(radicle, None, None, List(KeyValueUpdate.DoesNotExist(key)), List(Insert(key, Array[Byte](1))))
       for

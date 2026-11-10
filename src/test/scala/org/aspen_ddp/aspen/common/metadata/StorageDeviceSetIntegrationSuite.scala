@@ -289,7 +289,7 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
       pool <- client.getStoragePool(poolId)
       _ <- (0 until 8).foldLeft(Future.unit): (f, i) =>
         f.flatMap: _ =>
-          val tx = TestTransactions.withoutMissedUpdateTracking(client.newTransaction())
+          val tx = TestTransactions.withoutMissedUpdateTracking(TestTransactions.replaySafe(client.newTransaction()))
           for
             _ <- pool.errorTree.set(Key(i), value)(using tx)
             _ <- tx.commit()

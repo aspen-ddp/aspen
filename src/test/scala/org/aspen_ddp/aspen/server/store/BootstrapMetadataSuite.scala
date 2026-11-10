@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{GroupObjectAllocatorId, PoolObjectAllocatorId}
 import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
@@ -56,7 +58,7 @@ class BootstrapMetadataSuite extends IntegrationTestSuite:
 
   private def insertAndGet(tree: TieredKeyValueList, key: Key, value: Value): Future[Unit] =
     given ExecutionContext = executionContext
-    val tx = client.newTransaction()
+    val tx = TestTransactions.replaySafe(client.newTransaction())
     for
       _ <- tree.set(key, value)(using tx)
       _ <- tx.commit()

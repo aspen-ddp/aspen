@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
@@ -90,7 +92,7 @@ abstract class TreeKindSuiteBase extends IntegrationTestSuite:
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- pool.allocator.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
@@ -102,7 +104,7 @@ abstract class TreeKindSuiteBase extends IntegrationTestSuite:
     for
       host <- rootHost()
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId, maxNodeSize)
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, host, treeKey, ordering, nodeAllocator, Map(), kind)(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -114,7 +116,7 @@ abstract class TreeKindSuiteBase extends IntegrationTestSuite:
 
   /** Runs `update` in a transaction of its own, committing it unless it staged nothing (a delete of an absent key) */
   protected def inTransaction(update: Transaction => Future[Unit]): Future[Unit] =
-    val tx = client.newTransaction()
+    val tx = TestTransactions.replaySafe(client.newTransaction())
     update(tx).flatMap: _ =>
       if tx.isEmpty then
         Future.unit

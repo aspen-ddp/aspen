@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.allocation
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, PostCommitTransactionModification, RegisteredTypeFactory, StoragePool, StoragePoolAllocationStrategy, Transaction}
 import org.aspen_ddp.aspen.common.metadata.StoragePoolState
@@ -132,7 +134,7 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
     for
       allocator <- customStrategyAllocator()
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateKeyValueObject(Map(key -> value))(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -148,7 +150,7 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
     for
       allocator <- customStrategyAllocator()
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1, 2, 3)))(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -165,7 +167,7 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
       pool <- client.getStoragePool(Radicle.poolId)
       allocator = new PoolObjectAllocator(client, pool)
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -179,7 +181,7 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
       createdBeforeUse = TestStrategyFactory.createdFor(pool)
       allocator = new PoolObjectAllocator(client, pool)
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1, 2, 3)))(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -205,7 +207,7 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
       pool <- customStrategyPool()
       allocator = new PoolObjectAllocator(client, pool)
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
       _ <- tx.commit()
 
@@ -226,7 +228,7 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
       pool <- customStrategyPool()
       allocator = new PoolObjectAllocator(client, pool)
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
       _ <- tx.commit()
 
@@ -245,7 +247,7 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
       pool <- customStrategyPool()
       allocator = new PoolObjectAllocator(client, pool)
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
       strategy = pool.allocationStrategy.asInstanceOf[TestStrategy]
       entered = Promise[Unit]()
@@ -292,7 +294,7 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
       pool <- customStrategyPool()
       allocator = new PoolObjectAllocator(client, pool)
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
       strategy = pool.allocationStrategy.asInstanceOf[TestStrategy]
       _ = strategy.onPrepare = t =>

@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
@@ -116,7 +118,7 @@ trait ReedSolomonIntegrationTests:
     val content = testContent(n)
     val segmentLength = ida.calculateEncodedSegmentLength(n)
 
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     for
       pool <- client.getStoragePool(Radicle.poolId)
@@ -144,7 +146,7 @@ trait ReedSolomonIntegrationTests:
     // transaction per size would cost far more than it proves.
     val sizes = List(0, 1, 2, 3, 4, 5, 7, 8, 100, 1000, 4096, 65536)
 
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     for
       pool <- client.getStoragePool(Radicle.poolId)
@@ -163,7 +165,7 @@ trait ReedSolomonIntegrationTests:
     val smaller = testContent(7)
     val larger = testContent(5000)
 
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     for
       pool <- client.getStoragePool(Radicle.poolId)
@@ -210,7 +212,7 @@ trait ReedSolomonIntegrationTests:
     val left = Value(testContent(37))
     val right = Value(testContent(300))
 
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     for
       pool <- client.getStoragePool(Radicle.poolId)
@@ -236,7 +238,7 @@ trait ReedSolomonIntegrationTests:
     val original = Value(testContent(101))
     val replacement = Value(testContent(3003))
 
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     for
       pool <- client.getStoragePool(Radicle.poolId)
@@ -253,7 +255,7 @@ trait ReedSolomonIntegrationTests:
 
       afterUpdate <- client.read(kp)
 
-      deleteTx = client.newTransaction()
+      deleteTx = TestTransactions.replaySafe(client.newTransaction())
       _ = deleteTx.update(kp, None, None,
                           List(KeyValueUpdate.Exists(key)),
                           List(Delete(key)))
@@ -271,7 +273,7 @@ trait ReedSolomonIntegrationTests:
       succeed
 
   atest("a key value object is deleted when its refcount drops to zero"):
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     for
       pool <- client.getStoragePool(Radicle.poolId)
@@ -297,7 +299,7 @@ trait ReedSolomonIntegrationTests:
     val n = 7777
     val content = testContent(n)
 
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     for
       pool <- client.getStoragePool(Radicle.poolId)
@@ -326,7 +328,7 @@ trait ReedSolomonIntegrationTests:
     val minimum = Key(Array[Byte](0))
     val maximum = Key(Array[Byte](-1))
 
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
 
     for
       pool <- client.getStoragePool(Radicle.poolId)

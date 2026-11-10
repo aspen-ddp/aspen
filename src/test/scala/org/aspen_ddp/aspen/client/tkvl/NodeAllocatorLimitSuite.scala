@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, GroupObjectAllocatorId, ObjectAllocator, ObjectAllocatorId, PoolObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.common.metadata.AllocationGroupState
@@ -66,7 +68,7 @@ trait NodeFillBehaviour:
     /** Inserts entry i; true if it committed in place, false if the node code chose to split instead */
     def insertOnce(alloc: ObjectAllocator, ptr: KeyValueObjectPointer, i: Int): Future[Boolean] =
       var split = false
-      val tx = client.newTransaction()
+      val tx = TestTransactions.replaySafe(client.newTransaction())
       for
         kvos <- client.read(ptr)
         node = KeyValueListNode(client, KeyValueListPointer(minKey, ptr), ByteArrayKeyOrdering, kvos)
@@ -193,7 +195,7 @@ class NodeAllocatorLimitSuite extends IntegrationTestSuite with NodeFillBehaviou
       kvos0 <- client.read(radicle)
       _ = tx0.bumpVersion(radicle, kvos0.revision)
       _ <- tx0.commit()
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       frm = KVObjectRootManager.setNewRoot(client, host, treeKey, true,
         Root(0, ByteArrayKeyOrdering, Some(rootNode), na))(using tx1)
       _ <- tx1.commit()
@@ -347,11 +349,11 @@ class KeyValueNodeEncodingSuite extends IntegrationTestSuite:
       ptr <- enc.allocate(alloc, ByteArrayKeyOrdering, Map(key(1) -> value(1)))(using tx0)
       _ <- tx0.commit()
       n0 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       _ <- enc.insert(n0, key(2), value(2), 4096, alloc, noSplit, PutRequirement.Checked)(using tx1)
       _ <- tx1.commit()
       n1 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       _ <- enc.delete(n1, key(1), 4096, noJoin)(using tx2)
       _ <- tx2.commit()
       n2 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")

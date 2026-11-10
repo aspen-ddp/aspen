@@ -99,6 +99,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       pool <- client.getStoragePool(Radicle.poolId)
       (x, y) <- client.transactUntilSuccessful: tx =>
                   given Transaction = tx
+                  tx.replaySafe("test")
                   for
                     x <- pool.allocator.allocateDataObject(DataBuffer(Array[Byte](1)))
                     y <- pool.allocator.allocateKeyValueObject(Map(k -> Value(Array[Byte](1))))
@@ -114,6 +115,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       _ = yAfterT.contents.keySet should not contain k
       // T2: k is inserted again
       t2 <- client.transactUntilSuccessful: tx =>
+              tx.replaySafe("test")
               tx.update(y, None, None, List(KeyValueUpdate.DoesNotExist(k)), List(Insert(k, Array[Byte](3))))
               Future.successful(tx.id)
       _ <- settle(clock = false)

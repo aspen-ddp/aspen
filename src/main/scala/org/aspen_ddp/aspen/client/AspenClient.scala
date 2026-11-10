@@ -67,11 +67,6 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   protected var storagePoolCache: Map[PoolId, StoragePool] = Map.empty
 
-  /** Tests only: while true, every transaction this client commits enforces the pin rule and fails with
-    * UnpinnedTransaction without a pin or a replaySafe mark (TransactionBuilder.enforcePinsOverride). Read at commit.
-    */
-  @volatile private[aspen] var testingOnlyEnforcePins: Boolean = false
-
   /** Tests only: handed every transaction this client commits, as built and before the pin check. Read at commit */
   @volatile private[aspen] var testingOnlyOnBuilt: Option[TransactionBuilder.Built => Unit] = None
 

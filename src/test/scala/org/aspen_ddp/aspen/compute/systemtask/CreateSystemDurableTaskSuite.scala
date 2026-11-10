@@ -41,6 +41,7 @@ class CreateSystemDurableTaskSuite extends IntegrationTestSuite:
     for
       _ <- client.transactUntilSuccessful: tx =>
              given org.aspen_ddp.aspen.client.Transaction = tx
+             tx.replaySafe("test")
              client.prepareSystemDurableTask(CountingSystemTask.typeUUID, CountingSystemTask.initialState(0))
       stateVs <- servicesTkvl.get(Key(SystemTaskExecutorService.ServiceUUID))
       statePtr = ServiceEntry.decode(stateVs.get.value.bytes).statePointer
@@ -53,7 +54,7 @@ class CreateSystemDurableTaskSuite extends IntegrationTestSuite:
   atest("createSystemDurableTask and the admin creators are pinned"):
     given ExecutionContext = executionContext
     // createSystemDurableTask retries every failure, so an unpinned transaction is caught by the assertion
-    val audit = new PinAudit(client, enforce = false)
+    val audit = new PinAudit(client)
     for
       _ <- client.createSystemDurableTask(CountingSystemTask.typeUUID, CountingSystemTask.initialState(0))
       _ <- client.createAllocationGroup("pin-group", 0, ida = Some(Replication(3, 2)))

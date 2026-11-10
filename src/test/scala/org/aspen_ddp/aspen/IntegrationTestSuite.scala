@@ -108,6 +108,7 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
         ptr <- client.getStoragePoolPointer(storeId.poolId)
         kvos <- client.read(ptr)
       yield
+        tx.replaySafe("test")
         val req = kvos.contents.get(key) match
           case Some(vs) => KeyRevision(key, vs.revision)
           case None => DoesNotExist(key)

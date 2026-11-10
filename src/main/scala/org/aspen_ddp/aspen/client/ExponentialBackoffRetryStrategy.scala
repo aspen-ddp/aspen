@@ -6,6 +6,7 @@ import scala.concurrent.duration.Duration
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
+/** `UnpinnedTransaction` is a programming error that fails identically on every attempt, so it is never retried */
 class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 60 * 1000, initialRetryDelay: Int = 16) extends RetryStrategy {
 
   private  var exit = false
@@ -43,6 +44,7 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
       def onFail(cause: Throwable): Unit =
         cause match
           case StopRetrying(reason) => p.failure(reason)
+          case e: UnpinnedTransaction => p.failure(e)
           case _ => scheduleNextAttempt(retryCount)
 
       try
@@ -89,6 +91,7 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
       def onFail(cause: Throwable): Unit =
         cause match
           case StopRetrying(reason) => p.failure(reason)
+          case e: UnpinnedTransaction => p.failure(e)
           case _ =>
             try
               onAttemptFailure(cause) onComplete {

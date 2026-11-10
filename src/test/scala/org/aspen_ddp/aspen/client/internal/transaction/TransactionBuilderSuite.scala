@@ -41,6 +41,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
 
   private def kvDeletesKeys(ops: List[KeyValueOperation]): Boolean =
     val bldr = mkBuilder()
+    bldr.replaySafe("test")
     bldr.update(kvp, None, None, Nil, ops)
     val (txd, _, _) = bldr.buildTranaction(OpportunisticRebuildManager.None, Map(kvp.poolId -> Replication(3, 2)),
       Map(kvp.poolId -> None), Map())
@@ -124,7 +125,6 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   private def withPins[T](f: => T): T = f
 
   private def buildPin(bldr: TransactionBuilder) =
-    bldr.enforcePinsOverride = Some(true)
     bldr.buildTranaction(OpportunisticRebuildManager.None, Map(p1.poolId -> Replication(3, 2)),
       Map(p1.poolId -> None), Map())
 

@@ -124,6 +124,7 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
         val key = Key(UUID.randomUUID())
         client.transact: tx =>
           given Transaction = tx
+          tx.replaySafe("test")
           for
             pool <- client.getStoragePool(Radicle.poolId)
             dp <- pool.allocator.allocateDataObject(DataBuffer(data))

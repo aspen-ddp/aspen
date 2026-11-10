@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.registries
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key}
@@ -17,13 +19,13 @@ class NamespacedUUIDRegistrySuite extends IntegrationTestSuite:
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
       nodeAllocator = SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       _ <- KVObjectRootManager.createNewTree(client, ptr, registryTreeKey, ByteArrayKeyOrdering, nodeAllocator, Map())(using tx1)
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -97,7 +99,7 @@ class NamespacedUUIDRegistrySuite extends IntegrationTestSuite:
       registry <- createRegistry()
       _ <- registry.registerObject("storage", "first", UUID.randomUUID())
       // register retries every failure, so an unpinned transaction is caught by the assertion, not enforced
-      audit = new PinAudit(client, enforce = false)
+      audit = new PinAudit(client)
       _ <- registry.registerObject("storage", "second", objectId)
       _ = audit.stop()
       retrieved <- registry.getRegisteredObject("storage", "second")

@@ -18,6 +18,7 @@ class RepairProofsSuite extends IntegrationTestSuite:
     for
       ptr <- client.transactUntilSuccessful: tx =>
                given Transaction = tx
+               tx.replaySafe("test")
                for
                  pool <- client.getStoragePool(PoolId.BootstrapPoolId)
                  p <- new PoolObjectAllocator(client, pool).allocateKeyValueObject(Map(k0 -> Value(Array[Byte](0))))
@@ -28,6 +29,7 @@ class RepairProofsSuite extends IntegrationTestSuite:
   private def insert(ptr: KeyValueObjectPointer, key: Key): Future[Unit] =
     for
       _ <- client.transactUntilSuccessful: tx =>
+             tx.replaySafe("test")
              tx.update(ptr, None, None, Nil, List(Insert(key, Array[Byte](9))))
              Future.unit
       _ <- net.waitForTransactionsToComplete()
@@ -86,6 +88,7 @@ class RepairProofsSuite extends IntegrationTestSuite:
     for
       ptr <- client.transactUntilSuccessful: tx =>
                given Transaction = tx
+               tx.replaySafe("test")
                for
                  pool <- client.getStoragePool(PoolId.BootstrapPoolId)
                  p <- new PoolObjectAllocator(client, pool).allocateDataObject(DataBuffer(Array[Byte](1)))

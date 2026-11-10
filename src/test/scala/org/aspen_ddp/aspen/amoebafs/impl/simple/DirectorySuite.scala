@@ -742,7 +742,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       otargetNode <- tr.getContainingNode(Key(target))
       _ = osourceNode.get.nodeUUID should not be (otargetNode.get.nodeUUID)
       targetRevision = otargetNode.get.get(Key(target)).get.revision
-      audit = new PinAudit(client, enforce = false)
+      audit = new PinAudit(client)
       _ <- d.rename(source, target)
       _ = audit.stop()
       sourceEntry <- d.getEntry(source)

@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.amoebafs.FileInode
 
@@ -13,7 +15,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
 
     rootDir <- fs.loadRoot()
 
-    tx = fs.client.newTransaction()
+    tx = TestTransactions.replaySafe(fs.client.newTransaction())
 
     fdir <- rootDir.prepareCreateFile("testfile", mode=0, uid=1, gid=2)(using tx)
 

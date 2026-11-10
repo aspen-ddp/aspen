@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.allocation
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{KeyValueObjectState, ObjectSizeLimitExceeded, RegisteredTypeFactory, TransactionAborted}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
@@ -52,7 +54,7 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
     for
       poolPtr <- client.getStoragePoolPointer(poolId)
       radiclePool <- client.getStoragePool(Radicle.poolId)
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       entries <- FsifIndexAllocationStrategy.prepareBitmap(indexCount, radiclePool.allocator)(using tx)
       _ = tx.update(poolPtr, None, None, entries.keys.toList.map(DoesNotExist(_)),
             entries.toList.map((k, v) => Insert(k, v.bytes)))
@@ -83,7 +85,7 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
   private def indexOf(ptr: ObjectPointer): Int = byte2int(ptr.storePointer)
 
   private def allocateOne(allocator: PoolObjectAllocator): Future[ObjectPointer] =
-    val tx = client.newTransaction()
+    val tx = TestTransactions.replaySafe(client.newTransaction())
     for
       ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
       _ <- tx.commit()
@@ -222,7 +224,7 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
       (poolId, allocator, bitmap) <- install(16)
       pool <- client.getStoragePool(poolId)
       strategy = pool.allocationStrategy.asInstanceOf[FsifIndexAllocationStrategy.Strategy]
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ <- allocator.createDataObjectPointer()(using tx)
       o <- allocateOne(allocator)
       _ <- strategy.prepareRelease(poolId, Seq(indexOf(o)))(using tx)
@@ -523,7 +525,7 @@ class FsifBitmapSizeLimitSuite extends IntegrationTestSuite:
   atest("a bitmap larger than its allocator's object limit fails with ObjectSizeLimitExceeded"):
     for
       radiclePool <- client.getStoragePool(Radicle.poolId)
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       failure <- FsifIndexAllocationStrategy.prepareBitmap(64 * 1024, radiclePool.allocator)(using tx)
         .flatMap(_ => tx.commit()).failed
     yield

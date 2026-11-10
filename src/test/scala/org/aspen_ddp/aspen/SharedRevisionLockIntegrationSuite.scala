@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.client.{Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key}
@@ -12,7 +14,7 @@ class SharedRevisionLockIntegrationSuite extends IntegrationTestSuite:
 
   /** Allocates a DataObject holding `content`, linked from the radicle under a key derived from `index` */
   private def allocate(index: Int, content: Array[Byte]): Future[DataObjectPointer] =
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
     val radicleKey = Key(Array[Byte](0x53, index.toByte))
     tx.update(radicle, None, None, List(KeyValueUpdate.DoesNotExist(radicleKey)),
       List(Insert(radicleKey, Array[Byte](1))))

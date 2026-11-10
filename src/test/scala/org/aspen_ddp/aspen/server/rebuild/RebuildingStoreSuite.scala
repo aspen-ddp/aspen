@@ -52,6 +52,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     val allocated = (0 until n).toList.map: i =>
       client.transactUntilSuccessful: tx =>
         given Transaction = tx
+        tx.replaySafe("test")
         client.getStoragePool(PoolId.BootstrapPoolId).flatMap: pool =>
           val alloc = pool.allocator
           alloc.allocateDataObject(Array[Byte](i.toByte)).map(_.id)
@@ -320,6 +321,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(20)
       _ <- client.transactUntilSuccessful: tx =>
              given Transaction = tx
+             tx.replaySafe("test")
              client.getStoragePool(PoolId.BootstrapPoolId).flatMap: pool =>
                pool.allocationTree.set(bogusKey, Value(Array[Byte](-1, -1, -1)))
       _ <- net.waitForTransactionsToComplete()

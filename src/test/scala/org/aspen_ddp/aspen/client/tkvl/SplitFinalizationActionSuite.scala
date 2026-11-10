@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{Insert, IntegerKeyOrdering, Key, KeyValueObjectPointer, Value}
@@ -22,7 +24,7 @@ class SplitFinalizationActionSuite extends IntegrationTestSuite:
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       _ = tx0.lockRevision(radicle, ikvos.revision)
       hosting <- alloc.allocateKeyValueObject()(using tx0)
       n1 <- alloc.allocateKeyValueObject(Map(k5 -> Value(Array[Byte](5))), minimum = Some(k5))(using tx0)
@@ -32,7 +34,7 @@ class SplitFinalizationActionSuite extends IntegrationTestSuite:
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
       fmgr = KVObjectRootManager.setNewRoot(client, hosting, Key(Array[Byte](0)), true,
                 Root(1, IntegerKeyOrdering, Some(t), nodeAllocator))(using tx1)
@@ -55,7 +57,7 @@ class SplitFinalizationActionSuite extends IntegrationTestSuite:
     for
       (mgr, t, n1) <- tierOneTree()
       n1State <- client.read(n1)
-      audit = new PinAudit(client, enforce = false)
+      audit = new PinAudit(client)
       _ <- runSplit(mgr, n1)
       first = audit.builtExceptMarks
       afterFirst <- client.read(t)
@@ -81,7 +83,7 @@ class SplitFinalizationActionSuite extends IntegrationTestSuite:
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
       updated <- client.read(n1)
-      audit = new PinAudit(client, enforce = false)
+      audit = new PinAudit(client)
       _ <- runSplit(mgr, n1)
       _ = audit.stop()
       tState <- client.read(t)
@@ -99,7 +101,7 @@ class SplitFinalizationActionSuite extends IntegrationTestSuite:
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
       tBefore <- client.read(t)
-      audit = new PinAudit(client, enforce = false)
+      audit = new PinAudit(client)
       _ <- runSplit(mgr, n1)
       _ = audit.stop()
       tState <- client.read(t)

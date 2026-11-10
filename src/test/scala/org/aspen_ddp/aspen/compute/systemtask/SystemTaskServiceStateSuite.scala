@@ -31,6 +31,7 @@ class SystemTaskServiceStateSuite extends IntegrationTestSuite:
       allocator = new PoolObjectAllocator(client, pool)
       taskStatePtr <- client.transactUntilSuccessful: tx =>
                         given Transaction = tx
+                        tx.replaySafe("test")
                         allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](7))))
       _ <- SystemTaskServiceState.enroll(client, statePtr, taskId, taskStatePtr)
       afterEnroll <- SystemTaskServiceState.scan(client, statePtr)
@@ -51,6 +52,7 @@ class SystemTaskServiceStateSuite extends IntegrationTestSuite:
       // Allocate the task-state object and enroll it in a single transaction.
       _ <- client.transactUntilSuccessful: tx =>
              given Transaction = tx
+             tx.replaySafe("test")
              for
                taskStatePtr <- allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](9))))
                _ <- SystemTaskServiceState.enrollInTx(client, statePtr, taskId, taskStatePtr)
@@ -69,13 +71,15 @@ class SystemTaskServiceStateSuite extends IntegrationTestSuite:
       allocator = new PoolObjectAllocator(client, pool)
       taskStatePtr <- client.transactUntilSuccessful: tx =>
                         given Transaction = tx
+                        tx.replaySafe("test")
                         allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](7))))
       _ <- waitForTransactionsToComplete()
       // enroll and remove retry every failure, so an unpinned transaction is caught by the assertion, not enforced
-      audit = new PinAudit(client, enforce = false)
+      audit = new PinAudit(client)
       _ <- SystemTaskServiceState.enroll(client, statePtr, taskId, taskStatePtr)
       _ <- client.transactUntilSuccessful: tx =>
              given Transaction = tx
+             tx.replaySafe("test")
              for
                p <- allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](9))))
                _ <- SystemTaskServiceState.enrollInTx(client, statePtr, otherId, p, pinned = true)
@@ -112,6 +116,7 @@ class SystemTaskServiceStateSuite extends IntegrationTestSuite:
       // One enrollment first, so the second goes into an existing node rather than the tree's initial node
       _ <- client.transactUntilSuccessful: tx =>
              given Transaction = tx
+             tx.replaySafe("test")
              client.getStoragePool(Radicle.poolId).flatMap: pool =>
                new PoolObjectAllocator(client, pool).allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](1))))
                  .flatMap(p => SystemTaskServiceState.enrollInTx(client, statePtr, UUID.randomUUID(), p, pinned = true))
@@ -119,6 +124,7 @@ class SystemTaskServiceStateSuite extends IntegrationTestSuite:
       allocator = new PoolObjectAllocator(client, pool)
       doomed <- client.transactUntilSuccessful: tx =>
                   given Transaction = tx
+                  tx.replaySafe("test")
                   allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](2))))
       _ <- waitForTransactionsToComplete()
       doomedState <- client.read(doomed)

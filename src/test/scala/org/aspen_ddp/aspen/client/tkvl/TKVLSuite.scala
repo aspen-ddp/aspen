@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{InvalidObject, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
@@ -21,14 +23,14 @@ class TKVLSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key -> value))(using tx1)
 
       _ <- tx1.commit()
@@ -61,14 +63,14 @@ class TKVLSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key -> value))(using tx1)
 
       _ <- tx1.commit()
@@ -77,7 +79,7 @@ class TKVLSuite extends IntegrationTestSuite {
       root <- froot
       tree <- root.getTree()
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key2, value2)(using tx)
       r <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -112,14 +114,14 @@ class TKVLSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, IntegerKeyOrdering, nodeAllocator, Map())(using tx1)
 
       _ <- tx1.commit()
@@ -153,14 +155,14 @@ class TKVLSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key -> value))(using tx1)
 
       r <- tx1.commit()
@@ -169,7 +171,7 @@ class TKVLSuite extends IntegrationTestSuite {
       root <- froot
       tree <- root.getTree()
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key2, value2)(using tx)
       r <- tx.commit()
 
@@ -214,14 +216,14 @@ class TKVLSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key -> value))(using tx1)
 
       r <- tx1.commit()
@@ -230,7 +232,7 @@ class TKVLSuite extends IntegrationTestSuite {
       root <- froot
       tree <- root.getTree()
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key2, value2)(using tx)
       r <- tx.commit()
 
@@ -274,14 +276,14 @@ class TKVLSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key -> value))(using tx1)
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -329,14 +331,14 @@ class TKVLSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key -> value))(using tx1)
 
       _ <- tx1.commit()
@@ -345,7 +347,7 @@ class TKVLSuite extends IntegrationTestSuite {
       root <- froot
       tree <- root.getTree()
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key2, value2)(using tx)
       r <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -358,7 +360,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       _ <- waitForTransactionsToComplete()
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.delete(key2)(using tx)
 
       r <- tx.commit()
@@ -408,7 +410,7 @@ class TKVLSuite extends IntegrationTestSuite {
       remaining match
         case Nil => Future.unit
         case key :: rest =>
-          val tx: Transaction = client.newTransaction()
+          val tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
           for
             _ <- tree.set(key, bigValue)(using tx)
             _ <- tx.commit()
@@ -421,14 +423,14 @@ class TKVLSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, IntegerKeyOrdering,
         nodeAllocator, Map())(using tx1)
       _ <- tx1.commit()
@@ -555,7 +557,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       // deadRoot stands in for a root that tier reduction deleted. x stands in for a node read
       // just before a join deleted its right neighbour, deadRight.
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       _ = tx0.lockRevision(radicle, ikvos.revision)
       deadRoot <- alloc.allocateKeyValueObject(Map[Key, Value]())(using tx0)
       deadRight <- alloc.allocateKeyValueObject(Map[Key, Value]())(using tx0)

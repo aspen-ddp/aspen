@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
@@ -24,7 +26,7 @@ class KVObjectRootManagerSuite extends IntegrationTestSuite:
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- pool.allocator.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
@@ -33,7 +35,7 @@ class KVObjectRootManagerSuite extends IntegrationTestSuite:
       ptr
 
   private def newTree(host: KeyValueObjectPointer, maxNodeSize: Int = 4096): Future[KVObjectRootManager] =
-    val tx = client.newTransaction()
+    val tx = TestTransactions.replaySafe(client.newTransaction())
     for
       froot <- KVObjectRootManager.createNewTree(client, host, treeKey, ByteArrayKeyOrdering,
         new SinglePoolNodeAllocator(client, Radicle.poolId, maxNodeSize), Map())(using tx)
@@ -46,7 +48,7 @@ class KVObjectRootManagerSuite extends IntegrationTestSuite:
   private def newTree(): Future[KVObjectRootManager] = rootHost().flatMap(newTree(_))
 
   private def inTx(update: Transaction => Future[Unit]): Future[Unit] =
-    val tx = client.newTransaction()
+    val tx = TestTransactions.replaySafe(client.newTransaction())
     update(tx).flatMap(_ => tx.commit()).flatMap(_ => waitForTransactionsToComplete())
 
   /** A tree of tier >= 1: small nodes and enough keys to split the root */
@@ -155,7 +157,7 @@ class KVObjectRootManagerSuite extends IntegrationTestSuite:
       rm <- newTree()
       tree <- rm.getTree()
       _ <- inTx(tx => tree.set(Key(1), value(1))(using tx))
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ <- KVObjectRootManager.createNewTree(client, rm.pointer, treeKey, ByteArrayKeyOrdering,
         new SinglePoolNodeAllocator(client, Radicle.poolId), Map())(using tx)
       err <- tx.commit().failed

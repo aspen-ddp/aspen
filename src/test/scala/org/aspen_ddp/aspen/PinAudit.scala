@@ -8,21 +8,16 @@ import org.aspen_ddp.aspen.common.transaction.TransactionObjectRequirement
 import java.util.concurrent.ConcurrentLinkedQueue
 import scala.jdk.CollectionConverters.*
 
-/** Records every transaction `client` commits until `stop`, as built, and with `enforce` makes an unpinned one fail
-  * with UnpinnedTransaction. Tests start it after their setup, so only the transactions of the site under test are
-  * checked. The global switch (`TransactionBuilder.enforcePins`) is never touched: suites run in parallel.
-  *
-  * Finalization actions retry a failed transaction forever, so their tests pass `enforce = false` and assert on
-  * `unpinned`: an unpinned transaction then fails the assertion instead of hanging the test.
+/** Records every transaction `client` commits until `stop`, as built. Tests start it after their setup, so only the
+  * transactions of the site under test are checked. Every unpinned, non-replay-safe transaction fails with
+  * UnpinnedTransaction; `unpinned` also lists them for sites (finalization actions) that retry failures forever.
   */
-class PinAudit(client: AspenClient, enforce: Boolean = true):
+class PinAudit(client: AspenClient):
   private val seen = new ConcurrentLinkedQueue[Built]()
 
   client.testingOnlyOnBuilt = Some(b => seen.add(b))
-  client.testingOnlyEnforcePins = enforce
-
+  
   def stop(): Unit =
-    client.testingOnlyEnforcePins = false
     client.testingOnlyOnBuilt = None
 
   def built: List[Built] = seen.asScala.toList

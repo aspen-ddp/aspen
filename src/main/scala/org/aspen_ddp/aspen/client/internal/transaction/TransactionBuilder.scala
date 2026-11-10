@@ -15,11 +15,6 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.server.store.KVObjectState
 
 object TransactionBuilder {
-  /** Temporary switch: when true, building a transaction without a pin that was not marked replaySafe throws
-    * UnpinnedTransaction. Removed once all sites are converted.
-    */
-  @volatile var enforcePins: Boolean = false
-
   /** A transaction as built, before the pin check. Tests see it through `AspenClient.testingOnlyOnBuilt` */
   final case class Built(description: TransactionDescription,
                          kvOps: Map[ObjectId, List[KeyValueOperation]],
@@ -64,8 +59,6 @@ class TransactionBuilder(
   private  var allocatingObjects = Set[ObjectPointer]()
   private  var notes = List[String]()
   private  var replaySafeFlag = false
-  /** Tests use this to enforce the pin check on one builder without touching the global switch */
-  private[aspen] var enforcePinsOverride: Option[Boolean] = None
   /** Tests use this to see every transaction this builder builds, pinned or not */
   private[aspen] var onBuilt: Option[Built => Unit] = None
   private  var addMissedUpdateTrackingFA = true
@@ -144,7 +137,7 @@ class TransactionBuilder(
 
     val kvOps = keyValueUpdates.map((p, kvu) => p.id -> kvu.operations)
     onBuilt.foreach(_(Built(txd, kvOps, replaySafeFlag)))
-    if enforcePinsOverride.getOrElse(enforcePins) && !replaySafeFlag && !Pins.hasPin(requirements, kvOps) then
+    if !replaySafeFlag && !Pins.hasPin(requirements, kvOps) then
       throw UnpinnedTransaction(transactionId)
 
     var updates = Map[StoreId, TransactionData]()

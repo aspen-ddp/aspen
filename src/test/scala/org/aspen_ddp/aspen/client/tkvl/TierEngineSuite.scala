@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import java.util.UUID
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
@@ -69,20 +71,20 @@ class TierEngineSuite extends IntegrationTestSuite:
   private def multiTierTree(): Future[KVObjectRootManager] =
     val treeKey = Key(Array[Byte](0))
     def insert(tree: TieredKeyValueList, i: Int): Future[Unit] =
-      val tx = client.newTransaction()
+      val tx = TestTransactions.replaySafe(client.newTransaction())
       tree.set(Key(i), Value(new Array[Byte](100)))(using tx).flatMap(_ => tx.commit().map(_ => ()))
 
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- pool.allocator.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId, 500)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator,
         Map())(using tx1)
       _ <- tx1.commit()

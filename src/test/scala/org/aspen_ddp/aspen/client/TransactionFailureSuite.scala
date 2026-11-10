@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 
-import scala.concurrent.ExecutionContext
+import scala.concurrent.{ExecutionContext, Future}
 
 class TransactionFailureSuite extends IntegrationTestSuite:
 
@@ -68,7 +68,7 @@ class TransactionFailureSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       before <- client.read(radicle)
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ = tx.lockRevision(radicle, before.revision)
       fcommit = tx.commit()
       reason = new Exception("too late")
@@ -90,7 +90,7 @@ class TransactionFailureSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       before <- client.read(radicle)
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ = tx.lockRevision(radicle, before.revision)
       fcommit = tx.commit()
       _ = intercept[PostCommitTransactionModification](tx.note("too late"))
@@ -108,3 +108,31 @@ class TransactionFailureSuite extends IntegrationTestSuite:
     tx.abort(new Exception("second"))
 
     tx.result.failed.map(_ should be theSameInstanceAs first)
+
+  atest("transactUntilSuccessful fails at once with UnpinnedTransaction instead of retrying"):
+    given ExecutionContext = executionContext
+    var attempts = 0
+    for
+      before <- client.read(radicle)
+      err <- client.transactUntilSuccessful: tx =>
+        attempts += 1
+        tx.lockRevision(radicle, before.revision)
+        Future.successful(())
+      .failed
+    yield
+      err shouldBe a[UnpinnedTransaction]
+      attempts should be(1)
+
+  atest("transactUntilSuccessfulWithRecovery fails at once with UnpinnedTransaction"):
+    given ExecutionContext = executionContext
+    var attempts = 0
+    for
+      before <- client.read(radicle)
+      err <- client.transactUntilSuccessfulWithRecovery(_ => Future.unit): tx =>
+        attempts += 1
+        tx.lockRevision(radicle, before.revision)
+        Future.successful(())
+      .failed
+    yield
+      err shouldBe a[UnpinnedTransaction]
+      attempts should be(1)

@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.objects.IntegerKeyOrdering
@@ -81,7 +83,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
       (rootInode, rootPointer, rootRevision) <- fs.readInode(1)
       dir = new SimpleDirectory(rootPointer.asInstanceOf[DirectoryPointer],
         rootRevision, rootInode.asInstanceOf[DirectoryInode], fs)
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       f <- CreateFileTask.prepareTask(fs, dir.pointer, "foo", initInode)(using tx)
       _ <- tx.commit()
       _ <- f
@@ -102,7 +104,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
       dir = new SimpleDirectory(rootPointer.asInstanceOf[DirectoryPointer],
         rootRevision, rootInode.asInstanceOf[DirectoryInode], fs)
 
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       f <- CreateFileTask.prepareTask(fs, dir.pointer, "foo", initInode)(using tx)
       _ <- tx.commit()
       _ <- f

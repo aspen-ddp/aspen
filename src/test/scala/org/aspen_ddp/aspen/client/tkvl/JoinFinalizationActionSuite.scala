@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.Radicle
@@ -19,7 +21,7 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
 
       // Tier 2 root t over the tier-1 list u1 -> u2 -> u3. The tier-1 entries point at a placeholder,
       // which the join never reads.
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       _ = tx0.lockRevision(radicle, ikvos.revision)
       hosting <- alloc.allocateKeyValueObject()(using tx0)
       child <- alloc.allocateKeyValueObject(Map[Key, Value]())(using tx0)
@@ -34,7 +36,7 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
       fmgr = KVObjectRootManager.setNewRoot(client, hosting, Key(Array[Byte](0)), true,
                 Root(2, IntegerKeyOrdering, Some(t), nodeAllocator))(using tx1)
@@ -66,7 +68,7 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
   atest("an upper-tier join deletes under KeyRevision, and a second run completes without a transaction"):
     for
       (mgr, u2, _, _) <- twoTierTree()
-      audit = new PinAudit(client, enforce = false)
+      audit = new PinAudit(client)
       action = new JoinFinalizationAction(client, null, mgr, 1, k5, u2)
       _ = action.execute()
       _ <- action.complete

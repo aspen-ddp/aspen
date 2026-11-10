@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
@@ -109,7 +111,7 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
     * stays in place until restartAfterForgotten.
     */
   private def commitHeldBy(holders: Set[StoreId])(build: Transaction => Future[Unit]): Future[TransactionId] =
-    val tx = client.newTransaction()
+    val tx = TestTransactions.replaySafe(client.newTransaction())
     net.offlineStores = holders
     net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id && holders.contains(m.to) &&
       (m.isInstanceOf[TxResolved] || m.isInstanceOf[TxFinalized])
@@ -180,11 +182,11 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- pool.allocator.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- pump(tx0.commit(), clock = false)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, Key(Array[Byte](0)), ByteArrayKeyOrdering,
         new SinglePoolNodeAllocator(client, Radicle.poolId), Map())(using tx1)
       _ <- pump(tx1.commit(), clock = false)
@@ -246,6 +248,7 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
     for
       dataPtr <- client.transactUntilSuccessful: tx =>
                    given Transaction = tx
+                   tx.replaySafe("test")
                    client.getStoragePool(Radicle.poolId).flatMap(_.allocator.allocateDataObject(DataBuffer(Array[Byte](1))))
       _ <- settle(clock = false)
       before <- client.read(dataPtr)

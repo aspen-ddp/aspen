@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.tkvl.{InvalidRoot, Root}
@@ -39,7 +41,7 @@ class SimpleRootManagerDecodeSuite extends IntegrationTestSuite {
     * underflow before any of the root handling is reached.
     */
   private def allocateUndecodableInode(): Future[org.aspen_ddp.aspen.common.objects.DataObjectPointer] =
-    given tx: Transaction = client.newTransaction()
+    given tx: Transaction = TestTransactions.replaySafe(client.newTransaction())
     for
       pool <- client.getStoragePool(Radicle.poolId)
       dp <- pool.allocator.allocateDataObject(Array[Byte](0, 0, 0, 0))

@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
@@ -57,7 +59,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
 
     for {
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       node <- createNode(contents)(using tx1)
       _ <- tx1.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -121,7 +123,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
 
     for {
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       node <- createNode(contents)(using tx1)
       _ <- tx1.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -182,7 +184,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
 
     for {
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       node <- createNode(contents)(using tx1)
       _ <- tx1.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -232,7 +234,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
 
     for {
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       node <- createNode(contents)(using tx1)
       _ <- tx1.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -280,7 +282,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
 
     for {
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       node <- createNode(contents)(using tx1)
       _ <- tx1.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -326,7 +328,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
 
     for {
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       node <- createNode(contents)(using tx1)
       _ <- tx1.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -365,7 +367,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
 
     for {
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       node <- createNode(contents)(using tx1)
       _ <- tx1.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -410,7 +412,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       // Create tail and main nodes in first transaction
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       tailContents <- Future.successful(Map(tailKey -> tailValue))
       tailNode <- createNode(tailContents, tailKey)(using tx1)
       tailPtr = KeyValueListPointer(tailKey, tailNode.pointer)
@@ -459,7 +461,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
 
     for {
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       node <- createNode(contents)(using tx1)
       _ <- tx1.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -495,7 +497,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
 
     for {
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       node <- createNode(contents)(using tx1)
       _ <- tx1.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -536,7 +538,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
 
     for {
       _ <- Future.unit
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       node <- createNode(contents)(using tx1)
       _ <- tx1.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()

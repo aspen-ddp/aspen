@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.*
@@ -20,14 +22,14 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
@@ -64,14 +66,14 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
@@ -129,14 +131,14 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
@@ -146,17 +148,17 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       tree <- root.getTree()
 
       // Insert additional keys
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key2, value2)(using tx2)
       _ <- tx2.commit()
       _ <- waitForTransactionsToComplete()
 
-      tx3 = client.newTransaction()
+      tx3 = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key3, value3)(using tx3)
       _ <- tx3.commit()
       _ <- waitForTransactionsToComplete()
 
-      tx4 = client.newTransaction()
+      tx4 = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key4, value4)(using tx4)
       _ <- tx4.commit()
       _ <- waitForTransactionsToComplete()
@@ -224,14 +226,14 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
@@ -241,12 +243,12 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       tree <- root.getTree()
 
       // Insert additional keys
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key5, value5)(using tx2)
       _ <- tx2.commit()
       _ <- waitForTransactionsToComplete()
 
-      tx3 = client.newTransaction()
+      tx3 = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key7, value7)(using tx3)
       _ <- tx3.commit()
       _ <- waitForTransactionsToComplete()
@@ -304,14 +306,14 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
@@ -362,14 +364,14 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
@@ -379,7 +381,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       tree <- root.getTree()
 
       // Insert additional key
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key2, value2)(using tx2)
       _ <- tx2.commit()
       _ <- waitForTransactionsToComplete()
@@ -427,14 +429,14 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
@@ -472,14 +474,14 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
 
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      tx1 = client.newTransaction()
+      tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
@@ -489,7 +491,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       tree <- root.getTree()
 
       // Insert additional key
-      tx2 = client.newTransaction()
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.set(key2, value2)(using tx2)
       _ <- tx2.commit()
       _ <- waitForTransactionsToComplete()
@@ -511,7 +513,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now add a key to the new tree to verify it's functional
       newKey = createKey(15)
       newValueToAdd = createValue(150.toByte)
-      tx3 = client.newTransaction()
+      tx3 = TestTransactions.replaySafe(client.newTransaction())
       _ <- newTree.set(newKey, newValueToAdd)(using tx3)
       _ <- tx3.commit()
       _ <- waitForTransactionsToComplete()

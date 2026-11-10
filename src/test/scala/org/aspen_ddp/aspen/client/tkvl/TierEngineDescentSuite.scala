@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.TestTransactions
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
@@ -32,12 +34,12 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      tx0 = client.newTransaction()
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
       host <- pool.allocator.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId, maxNodeSize)
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, host, Key(Array[Byte](0)), ordering, nodeAllocator, Map(),
         kind)(using tx)
       _ <- tx.commit()
@@ -68,7 +70,7 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
   private def sequentially(ks: List[Key])(update: (Key, Transaction) => Future[Unit]): Future[Unit] =
     ks.foldLeft(Future.unit): (prev, k) =>
       prev.flatMap: _ =>
-        val tx = client.newTransaction()
+        val tx = TestTransactions.replaySafe(client.newTransaction())
         for
           _ <- update(k, tx)
           _ <- tx.commit()
@@ -148,7 +150,7 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
       m = b.minimum
       _ <- sequentially(all.filter(k => ordering.compare(k, m) < 0))((k, tx) => tree.delete(k)(using tx))
       above = all.filter(k => ordering.compare(k, m) > 0)
-      tx = client.newTransaction()
+      tx = TestTransactions.replaySafe(client.newTransaction())
       _ <- tree.prepareUpdates(above.map(k => TKVLInsert(k, value(99))), List(m))(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()

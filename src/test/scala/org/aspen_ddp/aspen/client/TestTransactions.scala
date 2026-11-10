@@ -6,3 +6,8 @@ object TestTransactions:
   def withoutMissedUpdateTracking(tx: Transaction): Transaction =
     tx.disableMissedUpdateTracking()
     tx
+
+  /** Marks `tx` replay-safe for tests that are not about replay and stage nothing pinned */
+  def replaySafe(tx: Transaction): Transaction =
+    tx.replaySafe("test")
+    tx

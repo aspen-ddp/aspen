@@ -247,6 +247,14 @@ before the scans re-applies at a quorum (X11 step 3). Each piece is accepted on 
 deferred Task 3 minor, X6's give-up); together they reopen X11 for one pool.
 Fix sketch: as recovery R-N7; at least, on a give-up D1 could list the stores of the batches that did commit (the
 marker would have to report per-pool results instead of one all-or-nothing future).
+> **Refresh (final fix wave, Rulings 7 and 8): NARROWED.** D1 no longer waits: on D0's message it cancels its finalizer
+> and finalizes at once with D0's `owed` union the planned set its marker recorded at the hand-off
+> (`MissedUpdateFinalizationAction.scala:53-55,141`; `TransactionDriver.scala:411-430`). The give-up leg is closed: the
+> planned set lists every store whatever the write's outcome, the committed pools' stores included, without per-pool
+> results. The crash leg shrinks to D1's host crashing between its hand-off and its prompt `TxFinalized`, or that
+> message lost at a store. A stub can now precede its entry, so the scan drops an orphan stub only after two
+> consecutive successful scans found no entry (Ruling 8, `StoreRepairer.scala:95-104,187-200`); a D1 batch still in
+> flight across two whole successful scans of a store would leave that store an entry without a stub (residual).
 
 ### X14. Ruling 3's delayed `TxFinalized` x status-cache expiry x replay (recovery R-N8 x paxos P-N3 x P17; addendum)
 
@@ -258,6 +266,10 @@ made D1's prompt `TxFinalized` harmless before Ruling 3 no longer covers it.
 Fix sketch: as recovery R-N8: send the delayed message late but keep its `owed`, and have stores honour `owed` on late
 messages (an owed store with a Tx writes the stub and applies nothing; one without writes it on the no-Tx path). A
 plain `late = true`, or a bounded wait, empties `owed` and reopens X13.
+> **Refresh (final fix wave, Ruling 7): FIXED** by a different route than the sketch: D1 does not wait at all. It
+> finalizes non-late on D0's `TxFinalized` at once, inside the stores' cache window, listing its planned stores, and a
+> finalized driver sends no `TxResolved` and is unaffected by later late messages (recovery R-N8's refresh). Ruling 4
+> stays: late and abort messages carry an empty `owed`.
 
 ## 2. Coverage gaps (failure scenarios no document covers)
 
@@ -273,7 +285,7 @@ G9. Marker-batch size/limit: `TransactionCreationError` is treated as permanent 
 G10. Capacity interaction: ErrorTree growth during long outages (repair 13.3-6) x CRL admission (X5) x rebuild in-progress counts as failure budget (rebuild 6.3): no combined capacity argument.
 
 G11. Replay ordering: the replay integration tests deliver the leader's copy of the replayed client prepare last (the TestNetwork leader driver does not retransmit), so the ordering where a driver's data-less prepare reaches stores before the replayed client prepare is not exercised end to end. *(Addendum: the headline stub test delivers the pool-B leader's copy before pool A's, because the default order dropped the provers' proofs at a leader with no driver yet (paxos P-N1). Prefer-abort makes a driver-first store withhold everything until the client's prepare arrives, then check it normally, or prove at once (`Tx.awaitingClientPrepare`, `Tx.scala:205-208`); FrontendSuite covers both at unit level, end to end is still untested.)*
-G13. (addendum) No document or test covers a second driver's handed-off entries across its host's crash (X13), nor a `TxFinalized` delivered after the stores' cache entries expired (X14).
+G13. (addendum) No document or test covers a second driver's handed-off entries across its host's crash (X13), nor a `TxFinalized` delivered after the stores' cache entries expired (X14). *(Final fix wave: X14's delayed `TxFinalized` no longer exists; the unit suites cover D1's prompt finalization with the planned set, its silence afterwards, and the two-scan stub drop. The crash leg of X13 is still untested.)*
 G12. amoebafs pre-existing bugs found during the refactor (cross-node rename whose delete joins into the target node updates it twice; stale `iptr` in `prepareMove`; `prepareDelete` able to end unpinned) are outside these documents' scope and are recorded in Todo.txt.
 
 ## 3. Inter-document contradictions

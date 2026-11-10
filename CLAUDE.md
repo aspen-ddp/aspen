@@ -253,11 +253,13 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     prepare of an aborted transaction (see the `Transaction.commit` scaladoc)
   - Applied stubs: a durable (store, txid) record in the device CRL, charged to `CrlAdmission`, meaning the store holds
     that transaction's update. Written where the Tx's CRL state would be deleted, after its commits persist: on an
-    owed-listing `TxFinalized` (`owed`, unioned by a second driver), on applying through an UnackedCommits entry, and
-    by a lookup when the Tx is forgotten without a listing one. A commit at a store with a stub applies nothing; a non-late one
-    reports its objects in `objectCommitErrors`. The repair scan drops a stub with its entry, and orphan stubs by a
-    pre-walk snapshot. Residuals: a store that never saw T and missed its TxFinalized (below a quorum, self-heals), and a
-    second driver's host crashing after its entries commit but before its TxFinalized arrives
+    owed-listing `TxFinalized` (`owed`), on applying through an UnackedCommits entry, and by a lookup when the Tx is
+    forgotten without a listing one. A driver reached by another's non-late commit `TxFinalized` cancels its finalizer
+    and finalizes at once, listing the received `owed` plus the stores its mark had handed off (`handedOffStores`), so
+    a stub may precede its entry. A commit at a store with a stub applies nothing; a non-late one reports its objects in
+    `objectCommitErrors`. The repair scan drops a stub with its entry, and an orphan stub (pre-walk snapshot, no entry)
+    only once two consecutive scans found it so. Residuals: a store that never saw T and missed its TxFinalized (below a
+    quorum, self-heals), and a second driver's host crashing after its hand-off but before its TxFinalized arrives
   - A commit decision can overtake the data too. The store holds the commit until the data, a client's prepare, or
     TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
     if the data beat the finalizer's `errorTimeout` (2 s)

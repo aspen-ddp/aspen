@@ -778,7 +778,7 @@ section 2. Findings it touches:
 #### F22 (new). Stubs grow with UnackedCommits entries when repair scans stall (PLAUSIBLE; liveness)
 
 **Verdict: PLAUSIBLE. Severity: liveness (device-wide prepare drops).** A stub lives until the store's scan deletes its
-entry or finds it gone (repair-process.md 5.5), and every forget of a late-acknowledged transaction writes one. While
+entry or two consecutive scans find it gone (repair-process.md 5.5, Ruling 8), and every forget of a late-acknowledged transaction writes one. While
 scans do not run for a store (metadata group unreadable, scans timing out, F9 of repair), stubs accumulate one per
 entry. Each is charged 33 bytes to the device's admission without a check (`Frontend.chargeStubs`,
 `Frontend.scala:294-297`), and admission drops new prepares of unseen transactions past half a stream (150 MB by

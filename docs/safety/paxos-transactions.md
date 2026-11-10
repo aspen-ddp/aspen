@@ -172,11 +172,13 @@ backend commit keeps the record for the life of the loaded store.
 FinalizationActions completed (`TransactionDriver.scala:496-499`). `TxFinalized(abort)` is sent immediately at
 resolution (`:502-503`). A store deletes a committed transaction's CRL record only after `TxFinalized` **and** its
 backend commits (`Frontend.scala:537-551`). (addendum) A commit `TxFinalized` carries `owed`, the stores for which the
-finalizer's marker wrote UnackedCommits entries, set atomically with finalization and empty for aborts and late commits
-(`TransactionDriver.scala:447-451`); a store named there replaces its record by an applied stub at that same point
-(`Tx.scala:935-936,959`; no Tx: `Frontend.scala:763-773`). A driver finalized by another driver's non-late commit
-`TxFinalized` whose own marker already handed entries off waits for them and sends its own `TxFinalized` with the union
-(Ruling 3, `TransactionDriver.scala:414-437`); its store keeps it until then (`Store.scala:214-219`).
+finalizer's marker handed UnackedCommits entries off, set atomically with finalization and empty for aborts and late
+commits (`TransactionDriver.scala:438-442`); a store named there replaces its record by an applied stub at that same
+point (`Tx.scala:935-936,959`; no Tx: `Frontend.scala:768-778`). A driver reached by another driver's non-late commit
+`TxFinalized` cancels its finalizer and finalizes at once with the received `owed` union its marker's planned set
+(`handedOffStores`, empty if nothing was handed off before the cancel): Ruling 7, `TransactionDriver.scala:411-430`,
+replacing Ruling 3's wait. Its entries may then become durable after its `TxFinalized` (P14's ordering holds for the
+first finalizer to complete, not for this driver's own late entries); the repair scan allows for that (Ruling 8).
 
 **P15 Proof of commit is sound.** If an object a store hosts shows revision `ObjectRevision(txid)` (or, for a
 revision-less KeyValueUpdate, some key carries it), the transaction committed, because only a committed transaction
@@ -743,7 +745,7 @@ Findings the addendum touches. Every other finding of this document is unchanged
 | F7 | unchanged | Undetermined answers still count as aborts | `TransactionDriver.scala:287-292` |
 | F14 | unchanged | Adopted data still not re-saved; the commit's own data wait is unchanged | `Tx.scala:239,798-802` |
 | P-N1 | **narrowed** | A store reached first by a driver's prepare now proves to *that* driver as soon as its objects load (no abort vote goes out beside the proof), so a recovery driver whose prepare creates a store's Tx holds the proof. A second driver, or a proof that reaches a store with no driver yet, is still lost; the latter is now reproduced (Task 4) | `Tx.scala:806,208,584-586,630`; `Store.scala:206` |
-| P-N3 | **narrowed** | A store holding an applied stub applies nothing on the non-late commit and reports its objects, so the finalizer re-marks it; stores without a stub (they acknowledged in time) still apply a concurrently replayed client prepare's blind writes. Ruling 3 adds a second source of non-late commits for a forgotten T (P-N10) | `Tx.scala:642-648` |
+| P-N3 | **narrowed** | A store holding an applied stub applies nothing on the non-late commit and reports its objects, so the finalizer re-marks it; stores without a stub (they acknowledged in time) still apply a concurrently replayed client prepare's blind writes. Ruling 3 added a second source of non-late commits for a forgotten T (P-N10); Ruling 7 removed it | `Tx.scala:642-648` |
 | P-N4 | **narrowed** to path 3 | Recovery and other store-side drivers can no longer re-decide a forgotten abort commit (prefer-abort, 6.2; tested by ReplayIntegrationSuite "an aborted data-less transaction re-driven by a recovered commit vote aborts again"). A delayed duplicate of the client's own prepare still can: the accepted corner case, documented in the `Transaction.commit` scaladoc | `Tx.scala:205-208,537-542`; `client/Transaction.scala:155-160` |
 | P-N5, P-N6 | unchanged (REFUTED stands) | | |
 
@@ -1151,6 +1153,12 @@ Nacks (extra rounds under contention).
 > status-cache entries expire (7 s), a replayed client prepare creates fresh Txs (`Frontend.scala:797-810`), and D1's
 > late-arriving non-late `TxFinalized(commit)` makes each of them apply T (`Tx.scala:945-946`, `doCommit`). This is
 > P-N3's consequence through a new source of non-late commits. Stores with a stub skip it.
+>
+> **Refresh (final fix wave, Ruling 7): FIXED.** D1 no longer waits for its entries: on D0's non-late commit
+> `TxFinalized` it finalizes at once with D0's `owed` union its planned set (`TransactionDriver.scala:411-430`), inside
+> the window in which every store that forgot T still holds T's finalized status entry, and once finalized it sends
+> neither `TxResolved` nor a later `TxFinalized` with another value (see transaction-recovery R-N8's refresh). The
+> non-late messages that remain after the window are P-N3's own, which predate the addendum.
 
 ### Verified safe (not flaws, listed so they are not re-investigated)
 
@@ -1174,4 +1182,4 @@ Nacks (extra rounds under contention).
 * **Refresh 2026-11-10 (addendum):** driver prepares are prefer-abort (6.2), so a forgotten abort is re-decidable only
   by a delayed duplicate client prepare (P-N4 narrowed to the accepted corner case). Applied stubs stop a store that
   holds T's update from applying T again through any later commit (P11). New: P-N7, P-N8 (liveness, by design), P-N9
-  (refuted), P-N10 (Ruling 3's delayed non-late `TxFinalized`).
+  (refuted), P-N10 (Ruling 3's delayed non-late `TxFinalized`; fixed by Ruling 7).

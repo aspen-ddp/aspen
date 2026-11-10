@@ -8,7 +8,10 @@ marking every earlier finding fixed, narrowed or unchanged, and a section of new
 2026-11-10 against `c181375b` for the replay-pins addendum
 (`docs/superpowers/specs/2026-11-09-replay-pins-addendum-design.md`: prefer-abort driver prepares, applied stubs in the
 device CRL, `TxFinalized.owed`), with a "Re-assessment for the replay-pins addendum" table and new findings in each.
-Each has its own "Suspected flaws" section, annotated with adversarial verification verdicts:
+The final fix wave of that addendum (amendments 7 to 9: a second driver finalizes at once with its planned set, an
+orphan stub is dropped only by the second scan to find it so, and a deferred finalization is concluded only by its own
+Tx) is recorded as "Refresh (final fix wave)" notes on the findings it changes (R-N7, R-N8, R-N11, P-N10, X13, X14,
+RP-N6, RP-N7) and in the rows below. Each has its own "Suspected flaws" section, annotated with adversarial verification verdicts:
 
 - **CONFIRMED**: the mechanism was traced in the code, or reproduced.
 - **PLAUSIBLE**: the mechanism is real, but the trigger is uncertain.
@@ -66,19 +69,19 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 |---|---|---|
 | Paxos F3 / Recovery F7 | **FIXED** (replay pins) (was CONFIRMED) | The horizon trusted the client clock. It is gone; replay is refused by the client pin rule and the late-commit rule |
 | Recovery R-N1 / X11 | **NARROWED** (addendum) | Applied stubs: a store that forgot T on a `TxFinalized` listing it in `owed`, or applied T through its entry, applies nothing on a replay's commit; the whole-pool scenario is tested end to end. Residual: stores with an entry and no stub (R-N7, R-N9, R-N6's lost `TxFinalized`) |
-| Recovery R-N7 / X13 | PLAUSIBLE (new, addendum; accepted residual) | Ruling 3's second driver lists its late-written entries only in its own `TxFinalized`: its host crashing before sending it, or its write giving up in one pool after another committed, leaves entries with no stub, possibly for a whole pool, so a replay re-applies at a quorum |
-| Recovery R-N8 / Paxos P-N10 / cross-document X14 | PLAUSIBLE (new, addendum; mechanism CONFIRMED) | Ruling 3 delays the second driver's non-late commit `TxFinalized` until its write is durable; arriving after the stores' cache entries expired, it resolves a replay's fresh Txs committed and they apply its blind writes where no stub exists |
+| Recovery R-N7 / X13 | PLAUSIBLE (new, addendum; accepted residual; **narrowed**, Rulings 7-8) | A second driver D1 finalized by another driver's `TxFinalized` now finalizes at once, listing the planned set its marker recorded at the hand-off whatever the write's outcome (the give-up leg is closed). Left: D1's host crashing between its hand-off and that prompt `TxFinalized`, or the message lost at a store, and a D1 batch in flight across two whole successful scans (Ruling 8's two-scan stub drop), each leaving entries with no stub, possibly for a whole pool |
+| Recovery R-N8 / Paxos P-N10 / cross-document X14 | **FIXED** (Ruling 7) (was PLAUSIBLE, mechanism CONFIRMED) | Ruling 3's wait is gone: the second driver finalizes non-late on the other driver's `TxFinalized` at once, inside the stores' cache window, and once finalized sends no `TxResolved` and ignores late messages, so no delayed non-late outcome reaches a replay's fresh Txs and no late message empties its `owed` |
 | Paxos P-N3 / X12 | PLAUSIBLE (new; **narrowed**, addendum) | A recovering acceptor holding T's accepted commit makes a post-proof quorum adopt a *non-late* commit even when a proof exists (broader than the design's residual): finalization actions re-run and a concurrent replayed client prepare applies blind writes, `DoesNotExist` inserts after a later delete, and allocations. Since the addendum stub holders apply nothing and are marked; stores that acknowledged in time still apply |
 | X3 | **FIXED** (Ruling 30) (was PLAUSIBLE, then NARROWED) | `TransactionStatusCache.updateStatus` is monotone (finalized and late sticky, no revert to Unresolved), so no store's write downgrades a finalized entry and the finalized relay stays late |
 | Recovery R-N6 | PLAUSIBLE (new; **narrowed**, addendum) | A driver adopting an accepted commit long after finalization re-runs every finalization action (Ruling 13): the marker's blind upsert can regress newer ErrorTree entries; a re-run allocation action can leave an orphan entry. The re-created UnackedCommits entries are now listed in its `TxFinalized`, so stores write stubs for them, unless that message is lost |
 | Repair RP-N4 | PLAUSIBLE (new; **narrowed**, addendum) | An UnackedCommits entry outlives the store's own late application of T until its scan deletes it; since the addendum a stub holder applies nothing meanwhile, so the window stays open only at stores with an entry and no stub (R-N1's residual) |
 | Recovery R-N9 | PLAUSIBLE (new, addendum; accepted residual) | A store named in `owed` that never saw T and missed that `TxFinalized` has an entry and no stub: a replay re-applies T there, at most `w - t` of a pool, repaired from the majority by the entry's own reconcile |
 | Rebuild N3 | PLAUSIBLE-low (new, addendum) | A rebuilt store has no stubs; only its `acceptorSince` mute keeps a replay from applying through an old incarnation's entry, and a fast client clock defeats the mute (P-N2, X10). One store, normally reconciled |
-| Recovery R-N11 | PLAUSIBLE (new, addendum; very narrow) | `deferredFinalizations` is keyed by txid: a second Tx of the same txid can remove a held commit's registration, so a later `owed` writes the stub before the held commit applies, which then applies nothing; repair restores it |
+| Recovery R-N11 | **FIXED** (M2) (was PLAUSIBLE, very narrow) | `deferredFinalizations` is still keyed by txid, but only the Tx that registered a held finalization removes it or concludes the state: a replay's Tx of the same txid, forgotten meanwhile, changes neither (FrontendSuite "a replay's Tx forgotten while a finalized commit is held for its turn leaves the held Tx registered") |
 | Requirements Q-N4 | CONFIRMED (new; trust model, by design) | The pin rule is enforced only by the client: a client built without the check sends replayable transactions, which get fresh commit votes and commit normally |
 | CRL F13 / Requirements F2 / Recovery F4 | **NARROWED** (was CONFIRMED, narrow) | A crash re-apply of a TKVL write now fails its per-write check; blind writes and `DoesNotExist` inserts after a later delete still re-apply |
 | Requirements F1 | **NARROWED** (was CONFIRMED) | A lagging store skips a stale per-write checked write and is marked; blind writes are still last-arrival-wins with no entry |
-| Requirements F11 | **NARROWED** (was PLAUSIBLE; again by the addendum) | A replayed allocation can no longer commit by fresh votes (its pin fails), nor apply at a store holding an applied stub; it still applies at stubless stores where X11, X13, X14 or P-N3 deliver the commit |
+| Requirements F11 | **NARROWED** (was PLAUSIBLE; again by the addendum) | A replayed allocation can no longer commit by fresh votes (its pin fails), nor apply at a store holding an applied stub; it still applies at stubless stores where X11, X13 or P-N3 deliver the commit (X14 fixed) |
 | Repair F4 | **NARROWED** (was CONFIRMED, narrow) | TKVL deletes now carry `KeyRevision`, so the invisible no-op delete fails at apply and is marked; blind deletes unchanged |
 | Repair F1, F2, N1, N2 / Requirements F3 | CONFIRMED | Opportunistic and pre-transaction rebuilds replace KV `data` without refreshing `kvState` and skip the commit-in-flight and refcount guards |
 | Paxos F2 / Recovery F3, F8 | **NARROWED** (was CONFIRMED, narrowed) | A driver holding a proof never decides abort and resolves late; the false abort remains without a proof (refcount or overwritten pin, or the single-shot proof missed, P-N1) |
@@ -103,7 +106,7 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 | Requirements Q-N3, Q-N6 | CONFIRMED (new, by design) | Derived per-write checks turn blind wins into abort-and-retry; the allocation action's lock collides with the allocator's follow-up writes; task allocation collides under bursts |
 | Paxos P-N7, P-N8 | CONFIRMED (new, addendum, by design) | The prefer-abort wait withholds promises as well as votes (up to 5 s more for recovery and late resolution); orphaned data-less transactions, and those whose client prepares to a store are lost for 5 s, now abort |
 | Recovery R-N10 | CONFIRMED (new, addendum, by design) | The case-3 fallback holds an applied, committed Tx until its UnackedCommits lookup answers; no locks, but it waits on the metadata group like R-N3 |
-| CRL F22 / Repair RP-N6 | PLAUSIBLE (new, addendum) | Stubs live as long as their entries plus one scan; a stalled scan lets them accumulate against the device's CRL admission (33 B each, about 4.5 M per device at the default size) |
+| CRL F22 / Repair RP-N6 | PLAUSIBLE (new, addendum) | Stubs live as long as their entries plus two scans (an orphan is dropped only by the second scan to find it so, Ruling 8); a stalled scan lets them accumulate against the device's CRL admission (33 B each, about 4.5 M per device at the default size) |
 | Repair RP-N7 | CONFIRMED (new, addendum, performance) | Each orphan stub costs its own sequential point lookup per scan |
 
 The full lists include lower-severity and documentation-only items, as well as refuted candidates recorded so they are
@@ -125,5 +128,5 @@ Per cross-document-review §2, no document yet covers:
 - a combined capacity argument covering the ErrorTree, UnackedCommits growth, CRL admission and rebuilds;
 - replay where a driver's data-less prepare precedes the replayed client prepare (untested end to end; since the
   addendum the store waits for the client's prepare or proves, covered at unit level only);
-- a second driver's handed-off entries across its host's crash, and a `TxFinalized` delivered after the stores' cache
-  entries expired (cross-document G13; X13, X14).
+- a second driver's handed-off entries across its host's crash (cross-document G13; X13). The `TxFinalized` delivered
+  after the stores' cache entries expired (X14) no longer exists.

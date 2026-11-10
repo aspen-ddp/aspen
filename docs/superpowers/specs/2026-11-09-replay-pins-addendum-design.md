@@ -139,8 +139,11 @@ has seen no client prepare, reacts to a prefer-abort prepare as follows:
 
 A Tx that already has a vote, live or recovered from its CRL, answers prefer-abort prepares with that vote.
 
-Prefer-abort affects votes only: Paxos promises and accepts are unchanged. Memoryless promises therefore still count
-toward late condition 1, and provers are unaffected.
+Prefer-abort never gathers a fresh commit vote, but the wait in rule 3 withholds the Tx's whole prepare response:
+its promise as well as its vote, until the client's prepare, the outcome or the end of the wait. Accepts are
+unchanged. A memoryless promise therefore still counts toward late condition 1 once it is given (after the wait, with
+the abort vote), so late resolution of a data-less transaction can take up to `MissingDataWait` longer; provers are
+unaffected, since the proof comes first.
 
 **Why paths 1 and 2 close.**
 - A driver decides abort only when some object cannot reach a write threshold of commit votes, which means at least
@@ -243,7 +246,8 @@ My calls, for review:
 
 ## Amendments during implementation
 
-Decisions made while building that refined the text above. Where they conflict, these win.
+Decisions made while building that refined the text above. Where they conflict, these win, and a later amendment
+wins over an earlier one.
 
 - **1 (stub write point).** A stub is written where the Tx's CRL state would be deleted today (after its backend commits
   persist), never at TxFinalized receipt while commits are outstanding or failed. The Tx remembers TxFinalized's owed
@@ -251,7 +255,7 @@ Decisions made while building that refined the text above. Where they conflict, 
 - **2 (hand-off).** `MissedUpdateFinalizationAction` sets `handedOff` when it hands a mark to `MissedUpdateMarker`;
   after that only the write callback (which sets `owed` first) may complete the action. Everything the finalizer writes
   is durable before TxFinalized.
-- **3 (second driver).** A driver finalized by another driver's non-late commit TxFinalized, whose own finalizer has
+- **3 (second driver; its wait is superseded by 7).** A driver finalized by another driver's non-late commit TxFinalized, whose own finalizer has
   handed off a mark, waits for that mark and sends its own TxFinalized with owed = received owed union its own (first
   send and heartbeat resends). The store does not discard such a driver on the other TxFinalized until it has sent its
   own. Stores that already forgot T write stubs from it. Residual: the second driver's host crashing after its entries
@@ -261,6 +265,26 @@ Decisions made while building that refined the text above. Where they conflict, 
 - **5 (recovered stub holder).** A recovered non-late commit vote holding a stub resolves committed and stays until
   TxFinalized (`doCommit` applies nothing), rather than applying nothing and being forgotten, preserving "acceptors
   forget only on TxFinalized or a late outcome".
-- **6 (scan snapshot).** The repair scan snapshots the store's stub set before walking its UnackedCommits range and
+- **6 (scan snapshot; amended by 8).** The repair scan snapshots the store's stub set before walking its UnackedCommits range and
   drops only snapshot stubs whose txid had no entry in the walk. A stub written mid-walk survives to the next scan;
   stubs are written after their entry is durable, so a pre-walk stub's entry is visible to the walk.
+- **7 (second driver, no wait; replaces 3's wait).** At the hand-off (amendment 2) the marker records the stores it
+  plans UnackedCommits entries for (`handedOffStores`), whatever the write's outcome. A driver D1 reached by another
+  driver's non-late commit TxFinalized cancels its finalizer (so a mark not yet handed off never writes) and then reads
+  `handedOffStores`, and finalizes at once, non-late, with owed = received owed union that planned set. That is the
+  timing before amendment 3, inside the status-cache window, so D1 sends no non-late TxResolved after it and no late
+  message can later finalize it with an empty owed. Amendment 4 stays: late and abort messages carry an empty owed.
+  The store drops D1 on that TxFinalized as before amendment 3. A cancelled marker whose write was handed off may still
+  write; its stores are listed. A failed multi-pool mark no longer drops any planned store from owed. A single driver
+  still finalizes only once its own write succeeded; a write that gives up never completes the action, as before.
+  Cost: a stub may now precede its entry's durability (amendment 8). The "set is final" sentence of case 1 holds for
+  the first finalizer to complete, not for D1's own entries.
+- **8 (two-scan orphan drop; amends 6).** Because of amendment 7, a stub may be written before its entry is durable.
+  The repair scan drops an orphan stub only after two consecutive successful scans of the store found it with no
+  entry (pre-walk snapshot, not seen in the walk, empty point lookup); one found with its entry in between is no
+  longer suspected. The suspicions are per store, in memory on the repairing host. The pre-walk snapshot rule of
+  amendment 6 stays. So a stub lives at most two scan periods past its entry, not one. Residual: a second driver's
+  marker batch still in flight across two whole successful scans of the same store leaves its entry without a stub.
+- **9 (test seam).** `missingDataWait` is a seam from `Host.Seams` through `DeviceControl`, `StoreLoader` and `Store`
+  to `Frontend`, exposed as `TestNetwork.HostOptions.missingDataWait`, so the prefer-abort integration test waits
+  200 ms instead of 5 s. No global var: suites run in parallel.

@@ -220,6 +220,25 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(errs.isEmpty)
   }
 
+  test("every requirement on a deleted object (refcount zero) fails with MissingObject") {
+    val deleted = ObjectRefcount(2, 0)
+    def objects(): HashMap[ObjectId, ObjectState] =
+      HashMap(oid1 -> new ObjectState(oid1, Metadata(rev1, deleted, ts1), ObjectType.Data, DataBuffer(new Array[Byte](0))))
+    val updates: HashMap[ObjectId, DataBuffer] = HashMap(oid1 -> DataBuffer.Empty)
+    for req <- List[TransactionRequirement](
+           RevisionLock(p1, rev1),
+           SharedRevisionLock(p1, rev1),
+           VersionBump(p1, rev1),
+           DataUpdate(p1, rev1, DataUpdateOperation.Overwrite),
+           RefcountUpdate(p1, deleted, ObjectRefcount(3, 1)))
+    do
+      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects(), updates)
+      withClue(req.toString) {
+        oerrs shouldBe Map(oid1 -> MissingObject())
+        errs shouldBe empty
+      }
+  }
+
   private def sharedLockFixture(): Map[ObjectId, ObjectState] =
     val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data, DataBuffer(new Array[Byte](0)))
     Map(o.objectId -> o)

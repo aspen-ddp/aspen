@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{Key, Value}
 import org.aspen_ddp.aspen.compute.ServiceEntry
+import org.aspen_ddp.aspen.common.util.uuid2byte
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
@@ -86,5 +87,17 @@ class SystemTaskServiceStateSuite extends IntegrationTestSuite:
     yield
       audit.built.size should be >= 3
       audit.unpinned shouldBe empty
+      // enroll pins on the task tree node it inserts into, never by bumping the task state object
+      val enrollTx = audit.built.find(_.kvOps.values.flatten.exists:
+        case i: org.aspen_ddp.aspen.common.objects.Insert => i.key == Key(uuid2byte(taskId))
+        case _ => false).get
+      enrollTx.description.requirements.exists:
+        case kvu: org.aspen_ddp.aspen.common.transaction.KeyValueUpdate => kvu.requiredRevision.isDefined
+        case _ => false
+      .shouldBe(true)
+      audit.built.flatMap(_.description.requirements).exists:
+        case vb: org.aspen_ddp.aspen.common.transaction.VersionBump => vb.objectPointer.id == taskStatePtr.id
+        case _ => false
+      .shouldBe(false)
       enrolled.map(_._1) should contain (otherId)
       enrolled.map(_._1) should not contain taskId

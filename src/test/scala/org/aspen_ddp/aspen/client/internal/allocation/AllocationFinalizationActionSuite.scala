@@ -118,3 +118,25 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       audit.builtExceptMarks shouldBe empty
       after shouldBe None
 
+
+  // What makes a replay of the action's transaction harmless: once the object is deleted its revision lock fails, on
+  // every backend (MapBackend keeps the zero-refcount state; the stores check it as missing)
+  atest("a revision lock on a deleted object aborts the transaction"):
+    for
+      ptr <- allocate()
+      other <- allocate()
+      before <- client.read(ptr)
+      tx = client.newTransaction()
+      _ = tx.setRefcount(ptr, before.refcount, before.refcount.setCount(0))
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      otherState <- client.read(other)
+      replay = client.newTransaction()
+      _ = replay.lockRevision(ptr, before.revision)
+      _ = replay.update(other, Some(otherState.revision), None, Nil, List(Insert(Key(3), Array[Byte](3))))
+      result <- replay.commit().failed
+      _ <- waitForTransactionsToComplete()
+      after <- client.read(other)
+    yield
+      result shouldBe a [org.aspen_ddp.aspen.client.TransactionAborted]
+      after.contents.contains(Key(3)) shouldBe false

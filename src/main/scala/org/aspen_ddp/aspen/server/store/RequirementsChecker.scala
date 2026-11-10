@@ -49,9 +49,13 @@ object RequirementsChecker extends Logging {
     def checkPartLocks(oid: ObjectId, os: ObjectState): Unit =
       collide(oid, os.lockedWriteTransactions)
 
+    /** A refcount of zero means deleted, whether or not the backend still holds the state (MapBackend keeps it): every
+      * requirement on a deleted object fails as on a missing one, so a replay that only locks it cannot commit
+      */
     def loaded(oid: ObjectId): ObjectState =
       objects.get(oid) match
         case None => throw ObjectErr(oid, MissingObject())
+        case Some(os) if os.metadata.refcount.count == 0 => throw ObjectErr(oid, MissingObject())
         case Some(os) =>
           if os.reloadRequired then
             throw ObjectErr(oid, StaleObjectState())

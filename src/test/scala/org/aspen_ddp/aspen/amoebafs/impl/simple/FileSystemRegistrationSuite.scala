@@ -1,6 +1,8 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
+import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.amoebafs.{FileSystem, FileType}
 import org.aspen_ddp.aspen.client.ObjectAllocator
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
@@ -100,3 +102,20 @@ class FileSystemRegistrationSuite extends IntegrationTestSuite:
       // Proves the root object the registry handed back carries the inode table, not just
       // that it decoded as a KeyValueObjectPointer.
       rootInode.fileType should be(FileType.Directory)
+
+  atest("create is pinned by the registry node it inserts the name into"):
+    given ExecutionContext = executionContext
+    val nameKey = NamespacedUUIDRegistry.makeKey(FileSystem.RegistryNamespace, "myfs")
+    for
+      alloc <- allocator()
+      // create is a single attempt, so the audit can enforce
+      audit = new PinAudit(client)
+      _     <- SimpleFileSystem.create(client, alloc, "myfs")
+      _     = audit.stop()
+    yield
+      audit.builtExceptMarks.filterNot(_.hasPin) shouldBe empty
+      audit.built.flatMap(_.description.requirements).exists:
+        case kvu: KeyValueUpdate =>
+          kvu.requiredRevision.isDefined && kvu.requirements.contains(KeyValueUpdate.DoesNotExist(nameKey))
+        case _ => false
+      .should(be(true))

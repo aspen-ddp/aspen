@@ -237,16 +237,17 @@ object DiskCatalog:
         yield
           ()
 
-    // Skipped when already absent: a transaction that deletes nothing has nothing to commit
+    // Skipped when already absent: a transaction that deletes nothing has nothing to commit. The delete requires
+    // the entry's revision as read (the pin), so a replay cannot remove a later registration of the key
     def removeKey(treeKey: Key, key: Key): Future[Unit] =
       val tree = TieredKeyValueList(client, KVObjectRootManager(client, treeKey, Radicle.pointer))
       client.retryStrategy.retryUntilSuccessful:
         tree.get(key).flatMap:
           case None => Future.unit
-          case Some(_) =>
+          case Some(vs) =>
             client.transact: tx =>
               given Transaction = tx
-              tree.prepareUpdates(Nil, List(key))
+              tree.delete(key, None, List(KeyValueUpdate.KeyRevision(key, vs.revision)))
 
     // Only a vanished config proves another delete finished the job. Any other failure (a missing map node,
     // a missing fence under a live config) must leave the registrations so that delete can be re-run.

@@ -1,11 +1,14 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import java.nio.charset.StandardCharsets
+import org.aspen_ddp.aspen.PinAudit
+import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.client.tkvl.RootAlreadyModified
-import org.aspen_ddp.aspen.common.objects.{ObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.client.tkvl.{Root, RootAlreadyModified, SinglePoolNodeAllocator, TieredKeyValueList}
+import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyAlreadyExists, LexicalKeyOrdering, ObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
-import org.aspen_ddp.aspen.amoebafs.{Directory, DirectoryPointer, FileMode, FileSystem, Timespec}
+import org.aspen_ddp.aspen.amoebafs.{Directory, DirectoryInode, DirectoryPointer, FileMode, FileSystem, Timespec}
 
 import scala.concurrent.Future
 
@@ -645,3 +648,116 @@ class DirectorySuite extends FilesSystemTestSuite:
       assert(err == RootAlreadyModified(dirPointer.pointer))
       assert(txErr == err)
       assert(oroot.isEmpty)
+
+  atest("inserting an absent name requires that it does not exist: a concurrent create of the name is not overwritten"):
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      // The concurrent create, committed after the inserter's read found the name absent
+      targetPtr <- cdir(rootDir, "target", mode=0, uid=1, gid=2)
+      otherPtr <- cdir(rootDir, "other", mode=0, uid=1, gid=2)
+      (rootInode, rootRevision) <- rootDir.getInode()
+      // Its entry read is the stale one: it saw "target" absent
+      stale = new SimpleDirectory(rootDir.pointer, rootRevision, rootInode, fs):
+        override def tree: TieredKeyValueList =
+          val real = super.tree
+          new TieredKeyValueList(real.client, real.rootManager):
+            override def get(key: Key): Future[Option[ValueState]] =
+              if key == Key("target") then Future.successful(None) else super.get(key)
+      tx = client.newTransaction()
+      outcome <- stale.prepareInsert("target", otherPtr, incref = false)(using tx)
+        .flatMap(_ => tx.commit()).map(_ => "committed")
+        .recover { case _: KeyAlreadyExists => "refused" }
+      entry <- rootDir.getEntry("target")
+    yield
+      outcome should be ("refused")
+      entry.map(_.number) should be (Some(targetPtr.number))
+
+  atest("a cross-directory move stages its delete and insert before committing"):
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      aPtr <- cdir(rootDir, "a", mode=0, uid=1, gid=2)
+      bPtr <- cdir(rootDir, "b", mode=0, uid=1, gid=2)
+      a <- fs.loadDirectory(aPtr)
+      b <- fs.loadDirectory(bPtr)
+      subPtr <- cdir(a, "sub", mode=0, uid=1, gid=2)
+      sub0 <- fs.loadDirectory(subPtr)
+      // A non-empty directory: the move must not treat its source entry as a deletion
+      _ <- cdir(sub0, "inner", mode=0, uid=1, gid=2)
+      sub <- fs.loadDirectory(subPtr)
+      _ <- a.refresh()
+      _ <- b.refresh()
+      audit = new PinAudit(client)
+      _ <- client.transact: tx =>
+        Directory.prepareMove(a, "sub", b, "moved", subPtr, Some(sub))(using tx)
+      _ = audit.stop()
+      aEntry <- a.getEntry("sub")
+      bEntry <- b.getEntry("moved")
+      moved <- fs.loadDirectory(subPtr)
+      (movedInode, _) <- moved.getInode()
+      innerEntry <- moved.getEntry("inner")
+    yield
+      val ops = audit.builtExceptMarks.map(_.kvOps.values.flatten.toList)
+      val moveTxs = ops.filter: o =>
+        o.exists { case d: Delete => d.key == Key("sub"); case _ => false } &&
+          o.exists { case i: Insert => i.key == Key("moved"); case _ => false }
+      moveTxs.size should be (1)
+      aEntry should be (None)
+      bEntry.map(_.number) should be (Some(subPtr.number))
+      movedInode.oparent.map(_.number) should be (Some(bPtr.number))
+      innerEntry shouldBe defined
+
+  /** A directory whose tree has nodes of `nodeSize` bytes, so that a few long names span several tier-0 nodes */
+  private def smallNodeDirectory(parent: Directory, name: String, nodeSize: Int): Future[DirectoryPointer] =
+    client.transact { tx =>
+      given Transaction = tx
+      for
+        pool <- client.getStoragePool(parent.pointer.pointer.poolId)
+        root = Root(0, LexicalKeyOrdering, None, new SinglePoolNodeAllocator(client, pool.poolId, nodeSize))
+        inode = DirectoryInode.init(0, 1, 2, Some(parent.pointer), None, root)
+        fcreated <- CreateFileTask.prepareTask(parent.fs, parent.pointer, name, inode)
+      yield fcreated
+    }.flatMap(identity).map(_.get.asInstanceOf[DirectoryPointer])
+
+  atest("a rename across tier-0 nodes unlinks the existing target entry"):
+    val pad = "x" * 200
+    val source = s"a$pad"
+    val target = s"z$pad"
+    def fill(d: Directory, names: List[String]): Future[Unit] = names match
+      case Nil => Future.unit
+      case n :: rest => cdir(d, n, mode=0, uid=1, gid=2).flatMap(_ => fill(d, rest))
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      dPtr <- smallNodeDirectory(rootDir, "d", 1024)
+      d <- fs.loadDirectory(dPtr)
+      sourcePtr <- cdir(d, source, mode=0, uid=1, gid=2)
+      targetPtr <- cdir(d, target, mode=0, uid=1, gid=2)
+      _ <- fill(d, (1 to 10).map(i => f"m$i%02d$pad").toList)
+      _ <- waitForTransactionsToComplete()
+      _ <- d.refresh()
+      tr = d.asInstanceOf[SimpleDirectory].tree
+      osourceNode <- tr.getContainingNode(Key(source))
+      otargetNode <- tr.getContainingNode(Key(target))
+      _ = osourceNode.get.nodeUUID should not be (otargetNode.get.nodeUUID)
+      targetRevision = otargetNode.get.get(Key(target)).get.revision
+      audit = new PinAudit(client, enforce = false)
+      _ <- d.rename(source, target)
+      _ = audit.stop()
+      sourceEntry <- d.getEntry(source)
+      targetEntry <- d.getEntry(target)
+    yield
+      sourceEntry should be (None)
+      targetEntry.map(_.number) should be (Some(sourcePtr.number))
+      audit.unpinned.filterNot(PinAudit.isMark) shouldBe empty
+      val built = audit.builtExceptMarks
+      // The replaced entry is unlinked: an UnlinkFileTask for the old target is enrolled
+      built.exists(_.kvOps.values.flatten.exists:
+        case i: Insert => i.value.sameElements(targetPtr.toArray)
+        case _ => false) should be (true)
+      // The new key is written at the revision the rename read
+      built.flatMap(_.description.requirements).exists:
+        case kvu: KeyValueUpdate => kvu.requirements.contains(KeyValueUpdate.KeyRevision(Key(target), targetRevision))
+        case _ => false
+      .should(be(true))

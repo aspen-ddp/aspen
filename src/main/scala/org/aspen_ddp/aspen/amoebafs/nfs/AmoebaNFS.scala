@@ -4,7 +4,7 @@ import scala.language.implicitConversions
 import java.io.IOException
 import java.nio.ByteBuffer
 import com.github.blemale.scaffeine.{LoadingCache, Scaffeine}
-import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying, Transaction, TransactionCreationError}
+import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying, TransactionCreationError}
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, InvalidInode}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, BlockDevice, CharacterDevice, Directory, DirectoryInode, File, FileHandle, FileMode, FileSystem, FileType, InodePointer, Symlink, Timespec}
 
@@ -17,7 +17,7 @@ import org.dcache.nfs.v4.{NfsIdMapping, SimpleIdMap}
 import org.dcache.nfs.v4.xdr.nfsace4
 import org.dcache.nfs.vfs.{AclCheckable, DirectoryEntry, DirectoryStream, FsStat, Inode, Stat, VirtualFileSystem}
 
-import scala.concurrent.{Await, ExecutionContext, Future, Promise}
+import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 
 
@@ -362,23 +362,10 @@ class AmoebaNFS(val fs: FileSystem,
                 if (newf.nonEmpty)
                   throw StopRetrying(DirectoryEntryExists(d.pointer, newName))
 
-          val p = Promise[Boolean]()
-
+          // Completes once the move commits, or fails with the StopRetrying that ends the retries
           fs.client.transactUntilSuccessfulWithRecovery(onFail): tx =>
-            given t: Transaction = tx
-
-            s.prepareDelete(oldName, decref = false)
-            d.prepareInsert(newName, iptr, incref = false)
-
-            odir.foreach: tdir =>
-              tdir.prepareSetParentDirectory(d)
-
-            tx.result.foreach: _ =>
-              p.success(true)
-
-            Future.unit
-
-          p.future
+            Directory.prepareMove(s, oldName, d, newName, iptr, odir)(using tx)
+          .map(_ => true)
 
     blockingCall( fcomplete )
   }

@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.client.tkvl.{PutRequirement, Root, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, Directory, DirectoryEntry, DirectoryInode, DirectoryPointer, FileSystem, InodePointer}
 import scribe.Logging
@@ -73,10 +74,14 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
       Future.unit
     }
 
+    // The entry's requirement follows the read above: a name seen absent must still be absent, so a concurrent
+    // create of it is never overwritten (its inode would leak), and a replaced entry must be the one unlinked.
+    // AtRevision is a pin (KeyRevision with the Insert); for an absent name the pin comes from the incref inode
+    // overwrite or the caller's other writes.
     for {
       oOldRevision <- fcleanupOldEntry
       _ <- fincref
-      requirement = oOldRevision.fold(PutRequirement.Checked)(rev => PutRequirement.AtRevision(rev))
+      requirement = oOldRevision.fold(PutRequirement.MustNotExist)(rev => PutRequirement.AtRevision(rev))
       _ <- tree.set(key, Value(pointer.toArray), requirement)
     } yield ()
   }
@@ -105,11 +110,14 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
       case None => Future.failed(DirectoryEntryDoesNotExist(pointer, name))
       case Some(vs) =>
         val fptr = InodePointer(vs.value.bytes)
-        val fcheck = checkForDeletion(fptr)
+        // Only a decref removes the inode. Without it (a move) the inode lives on under another entry, so a
+        // non-empty directory may go and its inode is left for the move to update.
+        val fcheck = if decref then checkForDeletion(fptr) else Future.unit
 
         for
           _ <- fcheck
-          _ <- tree.delete(key)
+          // KeyRevision of the entry as read: the pin, and a concurrent change of the entry aborts
+          _ <- tree.delete(key, None, List(KeyValueUpdate.KeyRevision(key, vs.revision)))
           ftaskComplete <- if (decref)
             UnlinkFileTask.prepareTask(fs, fptr).map: f =>
               f.map(_ => ())
@@ -141,17 +149,21 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
             if !a.contains(oldKey) then
               Future.failed(DirectoryEntryDoesNotExist(pointer, oldKey.stringValue))
             else
-              // If the directory entry already exists, unlink it
-              val newNameVs = a.get(newName)
+              // If the directory entry already exists, unlink it. It is in b, the node holding newKey
+              val newNameVs = b.get(newKey)
 
+              // Both keys are written under the state just read: KeyRevision of the old key (the pin), and
+              // KeyRevision or DoesNotExist of the new one (rename derives both from the one node it reads)
               def prepRename(): Future[Unit] =
                 if a.nodeUUID == b.nodeUUID then
                   a.rename(oldKey, newKey)
                 else
                   val keyValue = a.get(oldKey).get.value
+                  val newKeyRequirement = newNameVs.fold(PutRequirement.MustNotExist)(vs =>
+                    PutRequirement.AtRevision(vs.revision))
                   Future.sequence(List(
                     a.delete(oldKey),
-                    b.set(newKey, keyValue))).map(_ => ())
+                    b.set(newKey, keyValue, newKeyRequirement))).map(_ => ())
 
               for
                 _ <- newNameVs match

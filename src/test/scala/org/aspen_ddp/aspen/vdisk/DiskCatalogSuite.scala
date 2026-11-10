@@ -2,7 +2,8 @@ package org.aspen_ddp.aspen.vdisk
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.client.{GroupObjectAllocatorId, ObjectAllocator}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.Transaction
@@ -331,3 +332,31 @@ class DiskCatalogSuite extends IntegrationTestSuite:
       ids should be (Nil)
       reads.foreach(_ shouldBe a [org.aspen_ddp.aspen.client.InvalidObject])
       succeed
+
+  atest("create pins the registry node and delete requires the entry's revision"):
+    val nameKey = NamespacedUUIDRegistry.makeKey(DiskConfig.RegistryNamespace, "d1")
+    def kvUpdates(builts: List[org.aspen_ddp.aspen.client.internal.transaction.TransactionBuilder.Built]) =
+      builts.flatMap(_.description.requirements).collect { case kvu: KeyValueUpdate => kvu }
+    for
+      alloc <- allocator()
+      // create is a single attempt, so the audit can enforce
+      createAudit = new PinAudit(client)
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      _ = createAudit.stop()
+      idKey = Key(info.diskId)
+      names = TieredKeyValueList(client, KVObjectRootManager(client, Radicle.NamespacedRegistryKey, Radicle.pointer))
+      objects = TieredKeyValueList(client, KVObjectRootManager(client, Radicle.ObjectRegistryKey, Radicle.pointer))
+      nameVs <- names.get(nameKey)
+      idVs <- objects.get(idKey)
+      // delete retries every failure, so an unpinned transaction is caught by the assertion, not enforced
+      deleteAudit = new PinAudit(client, enforce = false)
+      _ <- DiskCatalog.delete(client, "d1")
+      _ = deleteAudit.stop()
+    yield
+      kvUpdates(createAudit.built).exists: kvu =>
+        kvu.requiredRevision.isDefined && kvu.requirements.contains(KeyValueUpdate.DoesNotExist(nameKey))
+      .should(be(true))
+      deleteAudit.unpinned.filterNot(PinAudit.isMark) shouldBe empty
+      val deletes = kvUpdates(deleteAudit.built)
+      deletes.exists(_.requirements.contains(KeyValueUpdate.KeyRevision(nameKey, nameVs.get.revision))) should be (true)
+      deletes.exists(_.requirements.contains(KeyValueUpdate.KeyRevision(idKey, idVs.get.revision))) should be (true)

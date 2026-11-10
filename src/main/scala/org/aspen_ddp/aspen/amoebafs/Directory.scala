@@ -291,3 +291,26 @@ trait Directory extends BaseFile with Logging {
     raw.map(_ => fdp)
   }
 }
+
+object Directory:
+  /** Stages the move of `iptr`, the entry `oldName` of `src`, to `newName` in `dst`, a different directory.
+    * `movedDirectory` is the moved inode when it is a directory: its parent pointer is updated too. The returned
+    * future completes once everything is staged, so the caller commits only then.
+    *
+    * The source entry is deleted under its KeyRevision, which pins the transaction. The destination entry is
+    * inserted under `DoesNotExist`, or under the KeyRevision of an entry it replaces, which is unlinked.
+    */
+  def prepareMove(src: Directory,
+                  oldName: String,
+                  dst: Directory,
+                  newName: String,
+                  iptr: InodePointer,
+                  movedDirectory: Option[Directory])(using tx: Transaction): Future[Unit] =
+    given ExecutionContext = src.fs.executionContext
+    movedDirectory.foreach(_.prepareSetParentDirectory(dst))
+    for
+      // No decref, so the returned task future is Future.unit
+      _ <- src.prepareDelete(oldName, decref = false)
+      _ <- dst.prepareInsert(newName, iptr, incref = false)
+    yield
+      ()

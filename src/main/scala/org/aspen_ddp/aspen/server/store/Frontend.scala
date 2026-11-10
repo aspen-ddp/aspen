@@ -649,15 +649,20 @@ class Frontend(val storeId: StoreId,
     * store holds the committed transaction's update and an UnackedCommits entry naming it may exist (replay-pins
     * addendum A), so it must never apply the transaction again through that entry. A failed backend commit keeps the
     * CRL state while the store is loaded, so no stub replaces it; a reloaded store recovers the transaction from it.
-    * Called by the Tx as it is forgotten, and by a TxFinalized for a transaction the store holds no Tx for
+    * Called by the Tx as it is forgotten (`by`), and by a TxFinalized for a transaction the store holds no Tx for.
+    * Only the Tx that registered a deferred finalization removes it. A replay's Tx for the same txid, forgotten while
+    * the first one's commit is held, changes nothing: the held Tx concludes the transaction's state once its commit is
+    * issued, so the replay's must neither take its registration away nor delete the state that commit still needs
     */
-  def transactionFinalized(txid: TransactionId, writeStub: Boolean = false): Unit =
-    deferredFinalizations.remove(txid)
-    txCommits.get(txid) match
-      case Some(r) =>
-        r.finalized = true
-        r.writeStub ||= writeStub
-      case None => concludeTransactionState(txid, writeStub, keepAdmission = false)
+  def transactionFinalized(txid: TransactionId, writeStub: Boolean = false, by: Option[Tx] = None): Unit =
+    val held = deferredFinalizations.get(txid)
+    if held.isEmpty || by.exists(tx => held.exists(_ eq tx)) then
+      deferredFinalizations.remove(txid)
+      txCommits.get(txid) match
+        case Some(r) =>
+          r.finalized = true
+          r.writeStub ||= writeStub
+        case None => concludeTransactionState(txid, writeStub, keepAdmission = false)
 
   /** Deletes the CRL state of a finalized transaction, or replaces it by an applied stub. A stub already held
     * suffices: the state is only deleted.

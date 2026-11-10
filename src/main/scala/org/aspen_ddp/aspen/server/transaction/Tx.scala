@@ -655,7 +655,7 @@ class Tx( trs: TransactionRecoveryState,
       frontend.heldCommitIssued(changedHere, this)
     if finalizeDeferred then
       finalizeDeferred = false
-      frontend.transactionFinalized(transactionId, writeStub = stubDue)
+      frontend.transactionFinalized(transactionId, writeStub = stubDue, by = Some(this))
 
     // Nothing was committed, so no commit completions will arrive to trigger the notification.
     // Without this the proposer never learns this store's outcome.
@@ -956,7 +956,7 @@ class Tx( trs: TransactionRecoveryState,
       finalizeDeferred = true
       frontend.finalizationDeferred(this)
     else
-      frontend.transactionFinalized(transactionId, writeStub = stubDue)
+      frontend.transactionFinalized(transactionId, writeStub = stubDue, by = Some(this))
     statusCache.updateStatus(transactionId, txStatus, finalized = true, late = lateOutcome)
 
   /** A late commit: the driver learned the commit only after the transaction was finalized and forgotten
@@ -1029,7 +1029,7 @@ class Tx( trs: TransactionRecoveryState,
     ofinalized = Some(committed)
     lateOutcome = late
     // Nothing was committed here, so nothing waits for backend commits
-    frontend.transactionFinalized(transactionId, writeStub = committed && stubDue)
+    frontend.transactionFinalized(transactionId, writeStub = committed && stubDue, by = Some(this))
     unlock()
     releaseObjects()
     statusCache.updateStatus(transactionId,

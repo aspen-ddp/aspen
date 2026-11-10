@@ -3267,6 +3267,33 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     crl.deleted should not contain txid2
   }
 
+  // M2: the registration is removed only by the Tx that made it
+  test("a replay's Tx forgotten while a finalized commit is held for its turn leaves the held Tx registered") {
+    val crl = new TestCrl
+    val (frontend, backend, net) = heldCommit(crl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    resolve(frontend, net, txid2, committed = true)
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.transactions.contains(txid2) shouldBe false
+    // The status entry is evicted for size, so a replayed prepare starts a fresh Tx, which is forgotten in turn
+    frontend.statusCache.evictForTest(txid2)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    frontend.transactions.contains(txid2) shouldBe true
+    // A late outcome reaches it: with no UnackedCommits entry it applies nothing and is forgotten at once
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = true, owed = Set()))
+    frontend.transactions.contains(txid2) shouldBe false
+    frontend.statusCache.evictForTest(txid2)
+
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false,
+      owed = Set(storeId)))
+    // The held Tx takes the stub, written once its commit persists, not before; its state is kept until then
+    crl.stubsSaved shouldBe Nil
+    crl.deleted should not contain txid2
+    backend.deliverCommits()
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+    crl.stubsSaved shouldBe List(txid2)
+  }
+
   test("a waiting transaction that resolves is no longer called when the commit persists") {
     val (frontend, backend, net) = heldCommit(new TestCrl)
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))

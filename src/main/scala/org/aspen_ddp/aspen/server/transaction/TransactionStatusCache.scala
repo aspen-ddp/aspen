@@ -39,6 +39,9 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
 
   private[aspen] def cleanUpForTest(): Unit = cache.cleanUp()
 
+  /** Drops `txid`'s entry, as a size eviction would */
+  private[aspen] def evictForTest(txid: TransactionId): Unit = cache.invalidate(txid)
+
   private[aspen] def size: Long = {
     cache.cleanUp()
     cache.estimatedSize()

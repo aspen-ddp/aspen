@@ -104,6 +104,9 @@ abstract class TransactionDriver(
     * entries (a non-late commit), or a TxFinalized from another driver, which reported them, finalized it
     */
   private var owed: Set[StoreId] = Set()
+
+  /** The `owed` of a commit TxFinalized from another driver, which this driver's TxFinalized must list too */
+  private var receivedOwed: Set[StoreId] = Set()
   protected var knownResolved: Set[StoreId] = Set()
   protected var resolvedValue: Boolean = false
 
@@ -418,6 +421,9 @@ abstract class TransactionDriver(
         // A cancelled marker may already have handed entries to the MissedUpdateMarker. They are written whatever the
         // cancel, so the TxFinalized this driver sends must list their stores too, once they are durable. The store
         // keeps the driver until it has sent that (Store: only a finalized driver is dropped)
+        // Recorded before waiting: the cancelled marker's write also completes the finalizer's `complete`, whose
+        // callback finalizes with the finalizer's own set, so every path to onFinalized unions this in
+        if msg.committed && !finalized then receivedOwed = receivedOwed ++ msg.owed
         val own = if msg.committed && !finalized then finalizer.flatMap(_.pendingOwed) else None
         own match
           case Some(pending) =>
@@ -441,7 +447,7 @@ abstract class TransactionDriver(
   private def onFinalized(committed: Boolean, owedStores: Set[StoreId]): Unit =
     synchronized:
       if !finalized then
-        owed = if committed && !late then owedStores else Set()
+        owed = if committed && !late then owedStores ++ receivedOwed else Set()
       onFinalized(committed)
 
   protected def onFinalized(committed: Boolean): Unit = {

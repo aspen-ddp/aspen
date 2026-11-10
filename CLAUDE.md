@@ -27,7 +27,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     with `IDAPolicy.ExactMatch`, is a floor: members must have no limit or one at least as large, and an unlimited
     group accepts only unlimited members
   - `maxSliceSize` is the source of truth for pools and groups; every `maxObjectSize` is derived from it and the IDA
-  - Metadata layout: an ordinary pool's ErrorTree/AllocationTree/TracelessCommits trees live in a metadata pool reached
+  - Metadata layout: an ordinary pool's ErrorTree/AllocationTree/UnackedCommits trees live in a metadata pool reached
     through a metadata group; metadata pools' trees live in the bootstrap pool; the bootstrap pool's live in itself.
     All pool state objects stay in the bootstrap pool
   - `StoragePoolState.isMetadataPool` / `AllocationGroupState.isMetadataGroup` are fixed at creation. A pool or child
@@ -109,7 +109,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     and uses whole-node revision checks: intended for single-writer / low-contention use. A second update to one of its
     nodes in a transaction fails with `NodeAlreadyModified`; `getContainingNode`/`TieredKeyValueListNode` are KV-only.
   - `prepareUpdates(inserts: List[TKVLInsert], deletes)` changes many keys in one transaction on either kind, updating
-    each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe.
+    each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe. Writes are per-key checked by default;
+    `PutRequirement` (`MustNotExist`, ...) and `TKVLInsert.blind` opt into weaker checks, so a blind write needs a pin
+    elsewhere in the transaction or `replaySafe`.
   - Each `RootManager` owns a `TierCache` (default `LruTierCache`: 5 nodes per tier >= 1, plus the root when on
     tier >= 1; `NoCache` for tests and finalization actions). Stale entries cost only reads, except that `splitTree`
     through another instance can make warm instances return moved entries. `LruTierCache(anyRoot = true)` also
@@ -211,27 +213,32 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     one with a lock holder the transaction is built on (it requires the revision the holder writes): the store then
     withholds its vote until the holder releases its locks, or for `Tx.CollisionWait` (500 ms, checked at heartbeat),
     so a single writer's next transaction need not abort while a store is behind on the previous one's outcome
+  - Pin rule: a client transaction must contain a pin, a write that invalidates its own requirement once applied (a
+    `DataUpdate`/`VersionBump` at a required revision, a `KeyValueUpdate` with a required revision, a `KeyRevision` on a
+    key the update writes, a `RefcountUpdate` that changes the count). Allocations, locks and `DoesNotExist` are not
+    pins. `TransactionBuilder` fails an unpinned one with `UnpinnedTransaction` unless `Transaction.replaySafe(reason)`
+    marked it (reason logged in `notes`; replay must be provably harmless); the retry helpers treat it as permanent.
+    So a forgotten transaction replayed by a delayed prepare cannot gather a write threshold of commit votes, and there
+    is no time horizon. A refcount-0 object is `MissingObject` for every requirement. Design:
+    `docs/superpowers/specs/2026-11-09-replay-pins-design.md`
   - A prepare for a transaction a store does not know, whose update an object there already shows (its revision, or
     a key's for a KeyValueUpdate without a required revision: `RequirementsApplyer.appliedBy`), proves it committed.
-    The store answers `TxResolved(committed)` instead of a vote (`Tx.proveCommitted`) and applies nothing again, so a
-    recovery driver for a recovered commit vote, after the other stores finalized and forgot the transaction, cannot
-    decide abort on votes against the commit's own result and drop the update the recovering store holds. Past the
-    horizon this check comes first; younger prepares make it only on the abort path
-  - Changes that leave no trace (a `RefcountUpdate`, or a KV update without a required revision whose
-    `KeyValueUpdate.deletesKeys` is set; stores reject an unflagged Delete) cannot be proven that way. For a commit voter
-    that sent no TxCommitted (any such store when the driver did not count the votes; `FinalizationAction.commitVoters`),
-    the finalizer also writes `TracelessCommitEntry(timestamp, objects)` to its pool's
-    TracelessCommits tree (`StoragePoolState.TracelessCommitsTreeKey`, key `TracelessCommitEntry.key(store, txid)`), in
-    the ErrorTree batch. A recovered unresolved commit vote looks its entry up (`TracelessCommitLookup`, from the Host)
-    once loaded and again before accepting any abort; an entry found means it committed: the Tx applies its saved
-    update locally, logs it at info and is forgotten as if finalized. A failed or unanswered lookup holds the abort and
-    retries at heartbeat (`Frontend.TracelessLookupTimeout`, 5 s).
-    Design: `docs/superpowers/specs/2026-11-08-traceless-commits-design.md`
-  - Horizon (`Host.txHorizon`: `txStatusCacheDuration` - 1 s, 6 s): a prepare for a transaction the store does not
-    know and the host's status cache holds no outcome for (an Unresolved entry counts as none), started more than the
-    horizon ago, is proven committed if an object shows its update, and otherwise votes abort with `TransactionTooOld`
-    without checking requirements or taking locks, so a forgotten transaction is never replayed. The cache warns,
-    rate-limited, when it evicts an entry younger than the horizon for size
+    The store answers `TxResolved(committed, proof = true)` (`Tx.proveCommitted`) for its driver only and applies
+    nothing, records nothing in the status cache, and casts no commit vote. A driver holding a proof never proposes
+    abort (an abort Paxos already accepted still resolves). A resolution reached after the transaction was forgotten
+    is late (`late = true`; the cached outcome is finalized): the driver runs no finalization actions, and a store
+    applies it only when it holds its own commit vote and its UnackedCommits entry exists. Everything else (abort
+    vote, prover, muted Tx) applies nothing and sends no TxCommitted
+  - UnackedCommits (`StoragePoolState.UnackedCommitsTreeKey`, `UnackedCommitEntry.key(store, txid)`): for every
+    committed transaction, the finalizer writes `UnackedCommitEntry(timestamp, objects)` for each counted commit voter
+    that sent no TxCommitted (`FinalizationAction.commitVoters`; all stores that sent none when voters are unknown),
+    in the ErrorTree batch. `MissedUpdateFinalizationAction` runs last, so an entry durable means every other
+    finalization action is done. A recovered unresolved commit vote looks its entry up (`UnackedCommitLookup`, from the
+    Host) once loaded and again before accepting any abort; no driver starts for it before the first lookup answers or
+    while the CRL loads. A found entry proves the commit to its own driver; the Tx applies its saved update locally, logs
+    it at info and stays until TxFinalized, writing no status-cache entry. A failed or unanswered lookup holds the
+    abort and retries at heartbeat (`Frontend.UnackedLookupTimeout`, 5 s). Designs:
+    `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2026-11-08-traceless-commits-design.md`
   - A rebuilt store lost its Paxos acceptor state. `RebuildingStore.finish` writes `acceptor-since` (finish time plus
     `AcceptorSinceMargin`, 10 s) into its directory; `Frontend.acceptorSince` mutes a prepare for an unknown
     transaction started earlier (`Tx.muted`): proven committed if an object shows its update, otherwise forgotten
@@ -251,7 +258,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     snapshot: KV objects key by key, refcounts by the higher serial (never lowered), DataObject data by revision when
     the read's timestamp is at least the store's. Keys and object-level parts a read reports locked (`ReadLocks`) are
     deferred; nothing is written while the object has a commit in flight. One `StoreRepairer` scan walks the store's
-    ErrorTree range, then its TracelessCommits range (skipping transactions the store holds live). After
+    ErrorTree range, then its UnackedCommits range (skipping transactions the store holds live). After
     `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op transaction
     proving the read state, and reconciles from it
   - A lost TxFinalized is recovered by the store itself: a Tx idle for `Host.txHeartbeatTimeout` gets a driver, which

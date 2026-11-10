@@ -143,7 +143,7 @@ Backward compatibility is not required.
 **Meaning of an entry:** this store cast a commit vote that the commit relied on (or might have), and had not
 acknowledged applying T when T was finalized. It is the durable record that the store is owed T.
 
-**Ordering fact the design relies on:** entries are written by a finalization action, so they are durable before
+**Ordering fact the design relies on (amended: see Amendments, Ruling 8 - the marker now runs last):** entries are written by a finalization action, so they are durable before
 `TxFinalized` is sent, and so before any store forgets T. `TransactionDriver.onResolution` completes the finalizer
 before `onFinalized`.
 
@@ -204,7 +204,7 @@ would itself be a replay, and not a harmless one:
 A store that applies nothing yet was owed T is covered: the original finalizer marked it in the ErrorTree, since it
 sent no `TxCommitted` then (bootstrap-pool marker batches excepted, as today).
 
-**The prover itself** (`proveCommitted` → `resolved(true)` → `doCommit`) today applies whatever its other objects lack.
+**The prover itself (amended: see Amendments, Rulings 10-12, 15)** (`proveCommitted` → `resolved(true)` → `doCommit`) today applies whatever its other objects lack.
 It now applies nothing, per the rule above: a prover voted no commit.
 
 **Status cache:** entries record `late`. A status answer for a late commit reports it as late, so a driver learning
@@ -503,3 +503,61 @@ My calls, for review:
 - **Lagging-store order and CRL re-apply** remain wherever a write is pin-only rather than per-write checked.
 - **More retries on contended keys**, from derived per-write checks.
 - **Untracked bootstrap-pool marker batches** get no entries, as today. Losing one costs an extra repair pass.
+
+## Amendments during implementation
+
+Decisions made while building that changed or refined the text above. Where they conflict, these win. Superseded
+rulings (4, 6, and 16 as read by 19) are omitted.
+
+- **1 (proof field).** `TxResolved` carries an explicit `proof: Boolean`, set only by `Tx.proveCommitted`. Inferring a
+  proof from `(committed, late=false)` misclassifies ordinary resolutions from other drivers.
+- **2 (proof vs Paxos).** "Never propose abort while holding a proof" constrains only the driver's local proposal. An
+  accepted value adopted from promises is not overridable without breaking safety; an adopted abort resolves normally.
+- **3 (muted path).** The muted path keeps its behavior (prove or forget, no vote); no new error type.
+- **5 (late via relay).** Late condition 2 ("a store reported T finalized") is the existing finalized relay: a
+  `TxFinalized` relayed from a finalized cache entry carries `late = true`. No status-request path was added.
+- **7 (adopted value).** A proof-holding driver with a prepare quorum whose promises carry an accepted value sends
+  accepts without waiting for the vote tally, since provers never vote.
+- **8 (finalizer order; amends 1a).** The finalizer runs `MissedUpdateFinalizationAction` only after every other
+  finalization action of T, so a durable UnackedCommits entry implies all other actions are done. Forgetting on a found
+  entry and skipping actions on a late commit are then safe.
+- **9 and 12 (found entry; amend 1c and 1d; 12 supersedes 4).** `unackedCommitFound` applies the update and resolves
+  committed but does not forget: the Tx stays until TxFinalized (or a later abort/late outcome), and writes no status
+  cache entry. This avoids cross-pool atomic batches (marker batches are per pool) and stops a sibling store on the host
+  relaying a recovery-time Committed entry to a fresh replay.
+- **10, 11 and 14 (prover; amend 1c).** A prover applies nothing, records nothing in the status cache, casts no commit
+  vote, and stays a live Tx: its first answer is the proof; later prepares get a memoryless promise plus an abort vote
+  saved to the CRL (muted provers stay proof-only). On any real outcome it applies nothing, sends no TxCommitted and is
+  forgotten, and only that message writes the cache. `Tx.receiveResolved` and Frontend's no-Tx path ignore
+  `proof = true`. A held post-proof promise sent after load carries an abort vote, which stopped a TestNetwork hang.
+- **13 (accepted cost).** A lingering found Tx whose heartbeat driver adopts an accepted commit re-runs T's finalization
+  actions; they are at-least-once and read-first or replay-safe.
+- **15, 20 and 21 (found entry as proof; lookup ordering).** A found entry is a proof for its own Tx's driver (never
+  proposes abort, runs a post-proof round, resolves late on a memoryless quorum), which also covers an original driver
+  that crashed mid-marker. No driver starts for a Tx before its first lookup answers, nor while the store's CRL state
+  loads (`Frontend.recoveryPending`). `Store.driveTransaction` delivers the proof before replaying cached prepare
+  responses.
+- **16 and 19 (when a Tx proves).** A Tx proves only with no accepted value and no recovered Paxos state; a promise it
+  gave itself in this incarnation does not block. A prover forgets only on TxFinalized or a late outcome.
+- **18 (late cached finalized).** A late `TxResolved` for an unknown transaction is cached `finalized = true,
+  late = true`. The invariant: finalized comes only from a real TxFinalized or a late outcome.
+- **22 (retry helpers).** `transactUntilSuccessful*`, `retryUntilSuccessful` and `ExponentialBackoffRetryStrategy`
+  treat `UnpinnedTransaction` as permanent, so a missed site fails instead of hanging.
+- **23 (unlisted sites).** Sites outside the analysis get a real pin where one is free or a node-revision pin
+  (`prepareSetPinned`); `replaySafe` only where replay is provably harmless, with the reason recorded.
+- **24 (refcount 0).** `RequirementsChecker` treats a refcount-0 object as `MissingObject` for every requirement, on
+  every backend, which the allocation-FA existence-lock argument (section 4) relies on.
+- **25, 26 and 27 (system tasks).** `SystemTaskServiceState.enroll` pins on the system-task tree node revision, not a
+  version bump of the task state (a bump would break a running task's steps on a replayed enroll). The services and
+  system-task trees get node-revision pins too. `enrollInTx` stays a Checked set; the node pin is applied only by admin
+  creators lacking another pin.
+- **28 (allocation FA; amends section 4).** `AllocationFinalizationAction` never concludes "gone" from a read: if the
+  object reads, Checked insert plus `lockRevision`; if not, Checked insert without the lock, `replaySafe`. The split
+  action keeps read-first-gone. A read right after resolution can precede the stores applying the allocation.
+
+Residuals recorded by the amendments:
+- **17.** A replay at a store that applied T but acknowledged late (its entry still exists until its repair scan) can
+  re-apply a blind write on that one store via a late commit. Transient, masked by quorum reads; the remaining entry
+  guarantees an exact reconcile.
+- **28.** A doubly-rare re-run of the allocation action after the object's deletion can leave an orphan allocation-tree
+  entry.

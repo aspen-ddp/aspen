@@ -1,11 +1,7 @@
 TODO
 ====
 
-Revisit the concept of Traceless operations such as blind inserts, blind deletions, and anything else that currently
-requires the use of the traceless tree. These operations require the horizon code and can be replayed in the
-presence of clock skew and/or excessive delays. What would be the impact on the codebase if we were to remove these
-operations entirely and require everything be explicitly checked? How would systems built on top of Aspen such as
-amoebafs and vdisk need to change to use checked operations only?
+Traceless operations and the horizon were replaced by the pin rule: see docs/superpowers/specs/2026-11-09-replay-pins-design.md.
 
 CRL expansion. If sufficient free disk space is available, add another file to the CRL rather than slowing down
 the transactions. This needs to be capped though. Do not add another file if the total size of all files would
@@ -63,3 +59,18 @@ the database and the next WriteBatch as soon as no operation was inside begin/en
 on the pool, or one past its write, then read the freed nextBatch in its chaining step. close() now waits until no
 commit is queued or in progress, and is idempotent. Covered by the two close tests in BufferedConsistentRocksDBSuite.
 The bug predates the host refactor; the store executors only changed how often closes overlap commits.
+
+Unverified findings from the replay-pins work (check each before acting):
+- UnlinkFileTask step 2 runs unpinned transactions during step preparation.
+- DataObject TKVL deleteList uses lockRevision rather than bumpVersion.
+- JoinFinalizationAction.setNewRoot deletes the old root with only a refcount update.
+- Joins triggered through StoreRepairer.deleteEntry register no JoinFinalizationAction.
+- LocalTimeRequirement's Equals comparison looks inverted.
+
+Pre-existing amoebafs bugs found during the replay-pins work:
+- Cross-node rename whose delete joins into the target node updates that node twice, so the rename deterministically
+  fails (liveness bug, SimpleDirectory.prepareRename).
+- Directory.prepareMove / AmoebaNFS.move read iptr outside the retry; the delete pins the fresh revision but does not
+  check that the entry still holds iptr.
+- SimpleDirectory.prepareDelete reads tree.get and the containing node separately; a NothingToDelete between them
+  leaves the transaction unpinned (enforcement then fails it).

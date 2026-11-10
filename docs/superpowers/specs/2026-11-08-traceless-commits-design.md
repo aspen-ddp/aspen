@@ -3,6 +3,11 @@
 Date: 2026-11-08. Follows `2ad0f326` (proof-of-commit, `Tx.proveCommitted`), which closed the recovered-commit-vote
 hole for changes that leave a trace, and the Todo.txt note on what it left open.
 
+> **Superseded in part by `2026-11-09-replay-pins-design.md`.** The horizon section (`Host.txHorizon`,
+> `TransactionTooOld`) was removed and replaced by the client pin rule. The TracelessCommits tree is now UnackedCommits
+> (`UnackedCommitEntry`, `UnackedCommitLookup`) and holds an entry for every committed transaction's unacknowledged
+> counted voters, not only traceless ones. Names below are the historical ones.
+
 ## Why
 
 A store that votes commit, crashes before learning the outcome, and recovers after the transaction T was finalized

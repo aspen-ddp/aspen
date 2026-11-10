@@ -434,6 +434,9 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       // designated leader is in pool B (its primary object is y), and a proof reaching its store before its driver
       // starts is lost. So pool B's prepares go first, the leader's last of them: its driver then prepares pool A,
       // whose stores prove at once and tell it. Pool A's client prepares follow
+      // The replay's outcomes, sent once its prepares are delivered (the prepares recorded so far are T's own)
+      _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == t &&
+            (m.isInstanceOf[TxFinalized] || m.isInstanceOf[TxResolved])
       _ <- replayClientPrepares(t, prepares =>
              val (b, a) = prepares.partition(_.to.poolId == poolB)
              val (leader, others) = b.partition(isLeader)
@@ -443,8 +446,14 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       _ <- forgottenByStores(t)
       _ <- eventually("every pool-B store forgot the transaction", clock = true):
              Future.successful((0 until 5).forall(i => bFrontend(i).forall(!_.transactions.contains(t))))
+      outcomes = { net.recordTxMessage = _ => false; net.takeRecordedTxMessages() }
       yAfterReplay <- client.read(y)
     yield
+      // Not an abort, which would leave k absent too: the replay resolved as a late commit, so each pool-B store
+      // reached its late-commit path and found its stub
+      withClue("the replay resolved late and committed, never aborted: "):
+        outcomes.collect { case m: TxFinalized => (m.committed, m.late) }.distinct shouldBe List((true, true))
+        outcomes.collect { case m: TxResolved if !m.proof => m.committed }.forall(identity) shouldBe true
       withClue("no pool-B store applied T again: "):
         (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe None)
       yAfterReplay.contents.keySet should not contain k

@@ -154,6 +154,11 @@ class Tx( trs: TransactionRecoveryState,
     */
   private var forgetLookupHeld = false
 
+  /** A TxFinalized listing this store in `owed` reached the store after this Tx was finalized and forgotten while its
+    * commit is held for its turn (Frontend.deferredFinalizations): the stub replaces its state once the commit persists
+    */
+  def stubOwed(): Unit = stubDue = true
+
   statusCache.updateStatus(transactionId, txStatus)
 
   private def allObjectsLoaded: Boolean = pendingObjectLoads == 0
@@ -638,7 +643,9 @@ class Tx( trs: TransactionRecoveryState,
       logger.info(s"Tx $transactionId. Store $storeId holds an applied stub for it: nothing is applied again")
       pendingObjectCommits = 0
       issuedCommits = Set()
-      objectCommitErrors = Nil
+      // Reported as not committed here: a store holding a stub may never have seen the transaction (owed, no Tx), so
+      // the finalizer of a non-late commit of it (a replay's) marks this store for repair rather than trusting it
+      objectCommitErrors = changedHere.toList
     else
       issueCommits()
 
@@ -916,6 +923,10 @@ class Tx( trs: TransactionRecoveryState,
     */
   def receiveFinalized(m: TxFinalized): Boolean =
     if ofinalized.nonEmpty then
+      // Already concluded: a Tx is kept past its finalization only by a held commit (finalizeDeferred), which the
+      // Frontend has dropped from `transactions` by then, so a later TxFinalized takes its no-Tx path, which hands
+      // `owed` to the held Tx (Frontend.deferredFinalizations). Any other finalized Tx was already forgotten, its
+      // state deleted or replaced: nothing is left for `owed` to change here
       true
     else
       reportLateOutcome("TxFinalized", m.from)
@@ -943,6 +954,7 @@ class Tx( trs: TransactionRecoveryState,
     // while backend commits of a committed transaction are outstanding or failed, or still held for their turn
     if commitHeld then
       finalizeDeferred = true
+      frontend.finalizationDeferred(this)
     else
       frontend.transactionFinalized(transactionId, writeStub = stubDue)
     statusCache.updateStatus(transactionId, txStatus, finalized = true, late = lateOutcome)

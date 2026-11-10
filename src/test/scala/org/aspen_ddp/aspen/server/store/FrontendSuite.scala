@@ -2516,6 +2516,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lookup.answer(unackedTxid, Success(true))
 
     kvKeys(backend) should contain (k(2))
+    // Its TxCommitted reports the object it did not change, so a driver's finalizer marks it for repair
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid2))
     // Still an acceptor: it is forgotten only on TxFinalized, as a recovered vote that found its entry is (Ruling 9)
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
     frontend.transactions(unackedTxid).provesCommitToItsDriver shouldBe true
@@ -3242,6 +3244,27 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.deliverOne()
     crl.deleted should contain (txid2)
     backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+  }
+
+  test("a second TxFinalized listing the store while its commit is held for its turn writes the stub once it persists") {
+    val crl = new TestCrl
+    val (frontend, backend, net) = heldCommit(crl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    resolve(frontend, net, txid2, committed = true)
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.transactions.contains(txid2) shouldBe false
+    // Another driver's TxFinalized (Ruling 3), or a retransmit, lists this store: the Tx holding the commit is forgotten
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false,
+      owed = Set(storeId)))
+    crl.stubsSaved shouldBe Nil
+
+    backend.deliverOne()
+    backend.issued shouldBe List(txid1, txid2)
+    crl.stubsSaved shouldBe Nil
+    backend.deliverOne()
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+    crl.stubsSaved shouldBe List(txid2)
+    crl.deleted should not contain txid2
   }
 
   test("a waiting transaction that resolves is no longer called when the commit persists") {

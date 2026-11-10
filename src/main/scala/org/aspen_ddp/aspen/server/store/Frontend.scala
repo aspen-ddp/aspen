@@ -214,6 +214,15 @@ class Frontend(val storeId: StoreId,
                                 var writeStub: Boolean = false)
   private val txCommits = scala.collection.mutable.HashMap[TransactionId, TxCommits]()
 
+  /** Finalized transactions whose commit is held for its turn (Tx.finalized, finalizeDeferred): forgotten, but their
+    * commits are not issued yet, so they have no TxCommits. A later TxFinalized listing this store in `owed` is passed
+    * to the Tx (Tx.stubOwed), which writes the stub where its state would be deleted, once its commits persist
+    */
+  private val deferredFinalizations = scala.collection.mutable.HashMap[TransactionId, Tx]()
+
+  /** `tx` was finalized while its commit is held for its turn: it calls transactionFinalized once it is issued */
+  def finalizationDeferred(tx: Tx): Unit = deferredFinalizations(tx.transactionId) = tx
+
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
 
   /** The state of every object a transaction or an in-flight backend commit references (see retain), consulted before
@@ -643,6 +652,7 @@ class Frontend(val storeId: StoreId,
     * Called by the Tx as it is forgotten, and by a TxFinalized for a transaction the store holds no Tx for
     */
   def transactionFinalized(txid: TransactionId, writeStub: Boolean = false): Unit =
+    deferredFinalizations.remove(txid)
     txCommits.get(txid) match
       case Some(r) =>
         r.finalized = true
@@ -756,7 +766,10 @@ class Frontend(val storeId: StoreId,
           // Either way it must not apply it through that entry: one that never saw it is restored by ErrorTree repair
           // from the majority (replay-pins addendum A, case 1)
           if m.committed && !m.late && m.owed.contains(storeId) && !stubs.contains(m.transactionId) then
-            transactionFinalized(m.transactionId, writeStub = true)
+            deferredFinalizations.get(m.transactionId) match
+              // Its commit is held for its turn: the state is not deletable yet, nor the update applied
+              case Some(tx) => tx.stubOwed()
+              case None => transactionFinalized(m.transactionId, writeStub = true)
     case m: TxHeartbeat => transactions.get(m.transactionId).foreach(tx => tx.receiveHeartbeat(m))
     case m: TxStatusRequest => transactions.get(m.transactionId).foreach(tx => tx.receiveStatusRequest(m))
     case _ => // Other TxMessages are not relevant

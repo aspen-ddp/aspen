@@ -50,6 +50,8 @@ object RegisteredTransactionFinalizerFactory {
 
     override def commitVoters(voters: Option[Set[StoreId]]): Unit = actions.foreach(_.commitVoters(voters))
 
+    override def owedStores: Set[StoreId] = actions.flatMap(_.owedStores).toSet
+
     def debugStatus: List[(String, Boolean)] = {
       actions.map(f => (f.getClass.getSimpleName, f.complete.isCompleted))
     }

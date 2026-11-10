@@ -75,6 +75,9 @@ object TransactionDriverSuite {
 
     override def cancel(): Unit = cancelled = true
 
+    var owed: Set[StoreId] = Set()
+    override def owedStores: Set[StoreId] = owed
+
     def complete: Future[Unit] = if (autoComplete) Future.unit else Promise[Unit]().future
 
     def debugStatus: List[(String, Boolean)] = Nil
@@ -127,7 +130,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     val messenger = new TMessenger()
     val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set()))
     messenger.clear()
     driver.heartbeat()
 
@@ -516,7 +519,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     finalizer.created should be (true)
     finalizer.cancelled should be (false)
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds0, txd.transactionId, true, late = false))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds0, txd.transactionId, true, late = false, owed = Set()))
 
     driver.mayBeDiscarded should be (true)
     completed should be (true)
@@ -850,7 +853,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     var completed = false
     val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set()))
 
     completed should be (true)
     finalizer.createCount should be (0)
@@ -876,12 +879,46 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     finalizer.createCount should be (1)
     messenger.clear()
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set()))
 
     completed should be (true)
     finalizer.cancelled should be (true)
     messenger.messages.collect { case f: TxFinalized => f } should not be (Nil)
     allLate(outcomes(messenger)) should be (true)
+  }
+
+  test("a driver's TxFinalized carries the finalizer's owed set; a late or abort TxFinalized carries none") {
+    def owedSent(m: TMessenger) = m.messages.collect { case f: TxFinalized => f.owed }.toSet
+
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+
+    // own finalizer
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    finalizer.owed = Set(ds1)
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => ())
+    for from <- List(ds0, ds1) do
+      driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
+        Right(TxAcceptResponse.Accepted(true))))
+    // The finalizer completes on another thread
+    val deadline = System.nanoTime() + 5_000_000_000L
+    while !driver.mayBeDiscarded && System.nanoTime() < deadline do Thread.sleep(5)
+    driver.mayBeDiscarded should be (true)
+    messenger.clear()
+    driver.heartbeat()
+    owedSent(messenger) should be (Set(Set(ds1)))
+
+    // late
+    val m2 = new TMessenger()
+    val d2 = new TTD(ds0, m2, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+    d2.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set(ds1)))
+    owedSent(m2) should be (Set(Set[StoreId]()))
+
+    // abort
+    val m3 = new TMessenger()
+    val d3 = new TTD(ds0, m3, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+    d3.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false, owed = Set(ds1)))
+    owedSent(m3) should be (Set(Set[StoreId]()))
   }
 
   test("a late TxResolved resolves late at once") {
@@ -927,7 +964,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     val messenger = new TMessenger()
     val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false, owed = Set()))
     val round = driver.testProposalId
     messenger.clear()
 

@@ -99,6 +99,11 @@ abstract class TransactionDriver(
   protected var peerDispositions: Map[StoreId, TransactionDisposition.Value] = Map()
   protected var acceptedPeers: Set[StoreId] = Set[StoreId]()
   protected var finalizer: Option[TransactionFinalizer] = None
+
+  /** The stores TxFinalized reports as owed an UnackedCommits entry. Empty unless this driver's finalizer wrote
+    * entries (a non-late commit), or a TxFinalized from another driver, which reported them, finalized it
+    */
+  private var owed: Set[StoreId] = Set()
   protected var knownResolved: Set[StoreId] = Set()
   protected var resolvedValue: Boolean = false
 
@@ -196,13 +201,13 @@ abstract class TransactionDriver(
     reportIfStuck()
     // One snapshot under the lock, sent outside it: onFinalized, on another thread, writes `finalized` before the
     // outcome, so unlocked reads could send TxFinalized(committed = false) for a committed transaction
-    val (isFinalized, committed, isLate, due) = synchronized {
+    val (isFinalized, committed, isLate, due, owedNow) = synchronized {
       val d = heartbeatDue
       heartbeatDue = true
-      (finalized, resolvedValue, late, d)
+      (finalized, resolvedValue, late, d, owed)
     }
     if (isFinalized)
-      messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed, isLate)))
+      messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed, isLate, owedNow)))
     else if (due)
       messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxHeartbeat(toStoreId, storeId, txd.transactionId)))
   }
@@ -410,6 +415,7 @@ abstract class TransactionDriver(
         resolveLate()
       else {
         finalizer.foreach( _.cancel() )
+        if !finalized && msg.committed then owed = msg.owed
         onFinalized(msg.committed)
       }
     }
@@ -431,7 +437,7 @@ abstract class TransactionDriver(
           clientFinalized = Some(TransactionFinalized(client, storeId, txd.transactionId, committed))
         })
 
-        val messages = allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed, late))
+        val messages = allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed, late, owed))
 
         logger.trace(s"Sending TxFinalized(${txd.transactionId}) to ${messages.head.to.poolId}:(${messages.map(_.to.poolIndex)})")
 
@@ -604,6 +610,7 @@ abstract class TransactionDriver(
 
         f.complete foreach { _ =>
           logger.trace(s"Finalization actions completed for transaction ${txd.transactionId}")
+          synchronized { if !finalized && committed && !late then owed = f.owedStores }
           onFinalized(committed)
         }
 

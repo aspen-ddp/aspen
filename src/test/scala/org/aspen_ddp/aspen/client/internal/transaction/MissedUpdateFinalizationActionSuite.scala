@@ -463,6 +463,26 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     yield
       entries.keySet shouldBe Set(UnackedCommitEntry.key(net.storeId1, txd.transactionId))
 
+  atest("a finalizer that wrote entries for stores 1 and 2 reports owedStores == {1, 2}"):
+    val ptr = pointerWith(Array[Byte](4, 6))
+    val txd = refcountTxd(ptr)
+    val fa = new MissedUpdateFinalizationAction(client, txd)
+    fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)))
+    fa.updateCommitErrors(Map(net.storeId0 -> Nil))
+    fa.owedStores shouldBe empty
+    fa.markMissedUpdates()
+    for _ <- fa.complete yield
+      fa.owedStores shouldBe Set(net.storeId1, net.storeId2)
+
+  atest("a cancelled marker that wrote nothing owes nothing"):
+    val ptr = pointerWith(Array[Byte](4, 7))
+    val txd = refcountTxd(ptr)
+    val fa = new MissedUpdateFinalizationAction(client, txd)
+    fa.updateCommitErrors(Map(net.storeId0 -> Nil))
+    fa.cancel()
+    fa.markMissedUpdates()
+    fa.owedStores shouldBe empty
+
   atest("a voter without TxCommitted gets a UnackedCommits entry for a data overwrite too"):
     val ptr = pointerWith(Array[Byte](4, 5))
     val txd = txdFor(ptr).copy(requirements =

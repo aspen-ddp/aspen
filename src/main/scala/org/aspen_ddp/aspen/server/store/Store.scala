@@ -175,7 +175,7 @@ class Store(val storageDeviceId: StorageDeviceId,
           r.foreach(resolved => net.sendTransactionMessage(resolved))
 
           if (entry.finalized) {
-            net.sendTransactionMessage(TxFinalized(msg.from, msg.to, m.txd.transactionId, committed, late = committed))
+            net.sendTransactionMessage(TxFinalized(msg.from, msg.to, m.txd.transactionId, committed, late = committed, owed = Set()))
 
             m.txd.originatingClient.foreach { client =>
               net.sendClientResponse(TransactionFinalized(client, msg.to, m.txd.transactionId, committed))

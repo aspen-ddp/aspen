@@ -26,6 +26,9 @@ trait TransactionFinalizer {
   /** See FinalizationAction.commitVoters */
   def commitVoters(voters: Option[Set[StoreId]]): Unit = ()
 
+  /** The stores for which the finalization actions wrote UnackedCommits entries. Valid once `complete` has succeeded */
+  def owedStores: Set[StoreId] = Set()
+
   /**
     * @return List of (test-class-name, is-complete)
     */

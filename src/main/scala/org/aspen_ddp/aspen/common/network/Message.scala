@@ -323,8 +323,10 @@ final case class TxFinalized(
                               from: StoreId,
                               transactionId: TransactionId,
                               committed: Boolean,
-                              late: Boolean) extends TxMessage:
-  override def toString: String = f"TxFinalized to $to from $from tx $transactionId committed $committed late $late"
+                              late: Boolean,
+                              // Stores for which the finalizer wrote UnackedCommits entries. Empty for aborts and late commits
+                              owed: Set[StoreId]) extends TxMessage:
+  override def toString: String = f"TxFinalized to $to from $from tx $transactionId committed $committed late $late owed $owed"
 
 final case class TxHeartbeat(
                               to: StoreId,

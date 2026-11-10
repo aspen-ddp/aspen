@@ -30,6 +30,9 @@ trait FinalizationAction extends Logging {
     */
   def commitVoters(voters: Option[Set[StoreId]]): Unit = ()
 
+  /** The stores for which this action wrote UnackedCommits entries. Meaningful once `complete` has succeeded */
+  def owedStores: Set[StoreId] = Set()
+
   def debugStatus: (String, Boolean) = synchronized {
     (this.getClass.toString, complete.isCompleted)
   }

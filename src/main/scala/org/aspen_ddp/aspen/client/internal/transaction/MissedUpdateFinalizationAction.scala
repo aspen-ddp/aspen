@@ -45,6 +45,11 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     markTask = None
   }
 
+  /** Set once the UnackedCommits entries are durable; empty until then, and if the marker is cancelled before writing */
+  private var owed: Set[StoreId] = Set()
+
+  override def owedStores: Set[StoreId] = synchronized(owed)
+
   private val completionPromise: Promise[Unit] = Promise()
 
   // Never marked: a store that misses a lock has nothing to repair, and since the lock doesn't change the object, its
@@ -124,6 +129,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
     writeMarks(errors, unacked).foreach { _ =>
       synchronized {
+        owed = unacked.map(_.store).toSet
         if (!completionPromise.isCompleted)
           completionPromise.success(())
       }

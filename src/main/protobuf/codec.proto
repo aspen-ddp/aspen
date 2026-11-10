@@ -271,6 +271,7 @@ message TxFinalized {
   UUID transaction_uuid = 3;
   bool committed = 4;
   bool late = 5;
+  repeated StoreId owed = 6;
 }
 
 message TxHeartbeat {

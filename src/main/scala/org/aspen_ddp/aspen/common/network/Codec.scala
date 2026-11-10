@@ -646,12 +646,13 @@ object Codec extends Logging:
       from = Some(encode(o.from)),
       transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
       committed = o.committed,
-      late = o.late
+      late = o.late,
+      owed = o.owed.toList.map(encode)
     )
 
   def decode(m: codec.TxFinalized): TxFinalized =
     TxFinalized(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
-      m.committed, m.late)
+      m.committed, m.late, m.owed.map(decode).toSet)
 
 
   def encode(o: TxHeartbeat): codec.TxHeartbeat =

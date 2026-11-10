@@ -89,7 +89,7 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
   test("a finalized driver stops retransmitting TxResolved") {
     val (driver, messenger, tasks) = resolvedDriver()
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, driver.txd.transactionId, committed = true, late = false))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, driver.txd.transactionId, committed = true, late = false, owed = Set()))
     messenger.clear()
 
     tasks.fireAll()

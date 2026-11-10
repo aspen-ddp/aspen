@@ -363,8 +363,13 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
 
   test("TxFinalized round-trip"):
     for late <- List(true, false) do
-      val original = TxFinalized(storeId(1), storeId(2), TransactionId(uuid(3)), committed = true, late = late)
+      val original = TxFinalized(storeId(1), storeId(2), TransactionId(uuid(3)), committed = true, late = late, owed = Set())
       Codec.decode(Codec.encode(original)) shouldBe original
+
+  test("TxFinalized owed round-trips through the codec"):
+    val original = TxFinalized(storeId(1), storeId(2), TransactionId(uuid(3)), committed = true, late = false,
+      owed = Set(storeId(2), storeId(3)))
+    Codec.decode(Codec.encode(original)) shouldBe original
 
   test("TxHeartbeat round-trip"):
     val original = TxHeartbeat(storeId(1), storeId(2), TransactionId(uuid(3)))

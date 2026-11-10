@@ -279,13 +279,49 @@ test("a stub whose entry is still present is kept")
   style.
 - **`docs/superpowers/specs/2026-11-09-replay-pins-design.md`:** add a pointer to the addendum in "Amendments during
   implementation".
-- **`docs/safety/*`:**
-  - P-N4: narrowed to the duplicate-client-prepare corner case;
-  - R-N1/X11: narrowed to a self-healing minority, per the addendum's residual;
-  - P-N1: re-check against prefer-abort;
-  - README tier tables;
-  - any finding whose cited lines moved.
+`docs/safety/*` is Task 7.
 
 - [ ] **Step 1: Edit.** Verify each statement against the code.
 - [ ] **Step 2: Run `sbt -batch compile`.** Expected: success. This step covers scaladoc only.
 - [ ] **Step 3: Commit.** `git commit -am "docs: prefer-abort, applied stubs, and the accepted abort corner case"`
+
+---
+
+### Task 7: Refresh `docs/safety/*` for the addendum
+
+The user asked for this explicitly. It runs last, against the final code on this branch.
+
+**Files** (every file in `docs/safety/`):
+- `README.md`
+- `paxos-transactions.md`
+- `transaction-recovery.md`
+- `transaction-requirements.md`
+- `repair-process.md`
+- `crash-recovery-log.md`
+- `rebuild-process.md`
+- `systemic-loss-protection.md`
+- `cross-document-review.md`
+
+- [ ] **Step 1: Re-assess every finding the addendum touches** against the code. Mark each one fixed, narrowed or
+  unchanged, with a one-line reason and file:line evidence. The expected outcomes below must be confirmed, not
+  assumed:
+  - P-N4: narrowed to the duplicate-client-prepare corner case.
+  - R-N1/X11: closed, or narrowed to the self-healing minority (stores that never saw T and lost their TxFinalized).
+  - RP-N4: changed by stubs.
+  - P-N1: changed by prefer-abort.
+  - The orphaned data-less transaction findings.
+  - Any finding that cites `awaitingData`, `MissingDataWait` or the late-commit apply path.
+- [ ] **Step 2: Describe the new mechanisms** wherever a document covers that ground:
+  - prefer-abort driver prepares;
+  - applied stubs (CRL record, write points, check, scan cleanup);
+  - `TxFinalized.owed`.
+- [ ] **Step 3: Look for new weaknesses these mechanisms introduce.** Record each as a new finding with a verdict
+  (CONFIRMED / PLAUSIBLE / refuted) in each document's existing format. At minimum, examine:
+  - stub durability versus CRL rotation, transfer, adoption and rebuild;
+  - a lost or misdirected `owed` set;
+  - stub cleanup failure, and how stubs grow if scans stall;
+  - the prefer-abort wait under CRL backpressure;
+  - orphaned data-less transactions now aborting;
+  - the documented corner case.
+- [ ] **Step 4: Update `README.md`'s tier tables** to match the documents. Fix any cited lines that moved.
+- [ ] **Step 5: Commit:** `git commit -am "docs/safety: refresh for applied stubs and prefer-abort"`

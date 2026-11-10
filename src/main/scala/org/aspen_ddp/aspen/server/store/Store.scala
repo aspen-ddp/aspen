@@ -213,7 +213,10 @@ class Store(val storageDeviceId: StorageDeviceId,
 
       case m: TxFinalized => transactionDrivers.get(m.transactionId).foreach { driver =>
         driver.receiveTxFinalized(m)
-        transactionDrivers -= m.transactionId
+        // A driver whose cancelled finalizer still has entries in flight finalizes later, and sends its own
+        // TxFinalized listing them. It stays until then (that TxFinalized reaches this store too)
+        if driver.mayBeDiscarded then
+          transactionDrivers -= m.transactionId
       }
 
       case m: TxUnknownStore => transactionDrivers.get(m.transactionId).foreach { driver =>

@@ -29,6 +29,9 @@ trait TransactionFinalizer {
   /** The stores for which the finalization actions wrote UnackedCommits entries. Valid once `complete` has succeeded */
   def owedStores: Set[StoreId] = Set()
 
+  /** See FinalizationAction.pendingOwed. Some if any action has handed off entries */
+  def pendingOwed: Option[Future[Set[StoreId]]] = None
+
   /**
     * @return List of (test-class-name, is-complete)
     */

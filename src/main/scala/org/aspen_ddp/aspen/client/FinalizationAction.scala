@@ -33,6 +33,12 @@ trait FinalizationAction extends Logging {
   /** The stores for which this action wrote UnackedCommits entries. Meaningful once `complete` has succeeded */
   def owedStores: Set[StoreId] = Set()
 
+  /** Once this action has handed UnackedCommits entries to be written: a future of the stores they are for, completed
+    * when the entries are durable (failed if the write gave up). None while nothing has been handed off. Unlike
+    * `complete`, it is unaffected by `cancel`
+    */
+  def pendingOwed: Option[Future[Set[StoreId]]] = None
+
   def debugStatus: (String, Boolean) = synchronized {
     (this.getClass.toString, complete.isCompleted)
   }

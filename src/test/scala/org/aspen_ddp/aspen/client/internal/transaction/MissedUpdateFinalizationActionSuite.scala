@@ -630,3 +630,31 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     tasks.scheduled shouldBe 0
     fa.markMissedUpdates()
     fa.writes shouldBe 0
+
+  private class PendingWriteMarker(txd: TransactionDescription) extends MissedUpdateFinalizationAction(client, txd):
+    val write: scala.concurrent.Promise[Unit] = scala.concurrent.Promise()
+    override protected def writeMarks(errors: List[MissedUpdate], unacked: List[MissedUnackedCommit]): Future[Unit] =
+      write.future
+
+  atest("a late TxCommitted making every store clean cannot complete the marker before its writes land"):
+    val txd = refcountTxd(pointerWith(Array[Byte](7, 4)))
+    val fa = new PendingWriteMarker(txd)
+    fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)))
+    fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil))
+    fa.pendingOwed shouldBe None
+    fa.markMissedUpdates()
+    val pending = fa.pendingOwed.get
+    pending.isCompleted shouldBe false
+
+    // The store whose entry is being written now reports in
+    fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil, net.storeId2 -> Nil))
+    fa.complete.isCompleted shouldBe false
+    fa.owedStores shouldBe empty
+
+    fa.write.success(())
+    for
+      _ <- fa.complete
+      stores <- pending
+    yield
+      fa.owedStores shouldBe Set(net.storeId2)
+      stores shouldBe Set(net.storeId2)

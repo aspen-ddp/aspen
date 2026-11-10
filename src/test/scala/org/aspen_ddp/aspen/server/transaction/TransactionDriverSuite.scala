@@ -78,6 +78,10 @@ object TransactionDriverSuite {
     var owed: Set[StoreId] = Set()
     override def owedStores: Set[StoreId] = owed
 
+    /** Set to simulate a marker whose entries were handed off and are still being written */
+    var pending: Option[Promise[Set[StoreId]]] = None
+    override def pendingOwed: Option[Future[Set[StoreId]]] = pending.map(_.future)
+
     def complete: Future[Unit] = if (autoComplete) Future.unit else Promise[Unit]().future
 
     def debugStatus: List[(String, Boolean)] = Nil
@@ -919,6 +923,50 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     val d3 = new TTD(ds0, m3, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
     d3.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false, owed = Set(ds1)))
     owedSent(m3) should be (Set(Set[StoreId]()))
+  }
+
+  test("another driver's TxFinalized waits for an in-flight mark; the sent TxFinalized carries the union") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer(autoComplete = false)
+    val inFlight = Promise[Set[StoreId]]()
+    finalizer.pending = Some(inFlight)
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
+    for from <- List(ds0, ds1) do
+      driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
+        Right(TxAcceptResponse.Accepted(true))))
+    finalizer.createCount should be (1)
+    messenger.clear()
+
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+
+    finalizer.cancelled should be (true)
+    completed should be (false)
+    driver.mayBeDiscarded should be (false)
+    messenger.messages.collect { case f: TxFinalized => f } should be (Nil)
+
+    inFlight.success(Set(ds0))
+
+    // The in-flight mark's callback runs on the driver's execution context
+    val waitUntil = System.nanoTime() + 5_000_000_000L
+    while !driver.mayBeDiscarded && System.nanoTime() < waitUntil do Thread.sleep(5)
+    completed should be (true)
+    driver.mayBeDiscarded should be (true)
+    val sent = messenger.messages.collect { case f: TxFinalized => f.owed }.toSet
+    sent should be (Set(Set(ds0, ds1)))
+    messenger.clear()
+    driver.heartbeat()
+    messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set(ds0, ds1)))
+  }
+
+  test("a late resolution after the owed set is chosen still sends an empty owed") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+    driver.receiveTxResolved(TxResolved(ds0, ds1, txd.transactionId, committed = true, late = true, proof = false))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+    messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set[StoreId]()))
   }
 
   test("a late TxResolved resolves late at once") {

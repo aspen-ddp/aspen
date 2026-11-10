@@ -415,8 +415,16 @@ abstract class TransactionDriver(
         resolveLate()
       else {
         finalizer.foreach( _.cancel() )
-        if !finalized && msg.committed then owed = msg.owed
-        onFinalized(msg.committed)
+        // A cancelled marker may already have handed entries to the MissedUpdateMarker. They are written whatever the
+        // cancel, so the TxFinalized this driver sends must list their stores too, once they are durable. The store
+        // keeps the driver until it has sent that (Store: only a finalized driver is dropped)
+        val own = if msg.committed && !finalized then finalizer.flatMap(_.pendingOwed) else None
+        own match
+          case Some(pending) =>
+            pending.onComplete: result =>
+              onFinalized(true, msg.owed ++ result.getOrElse(Set()))
+          case None =>
+            onFinalized(msg.committed, msg.owed)
       }
     }
 
@@ -425,6 +433,16 @@ abstract class TransactionDriver(
   }
 
   def mayBeDiscarded: Boolean = synchronized { finalized }
+
+  /** Finalizes with the stores `owedStores` as the TxFinalized `owed`, set in the same critical section as the
+    * finalization so a late resolution between them cannot send a non-empty `owed` with `late`. Aborts and late commits
+    * owe nothing
+    */
+  private def onFinalized(committed: Boolean, owedStores: Set[StoreId]): Unit =
+    synchronized:
+      if !finalized then
+        owed = if committed && !late then owedStores else Set()
+      onFinalized(committed)
 
   protected def onFinalized(committed: Boolean): Unit = {
     synchronized {
@@ -610,8 +628,7 @@ abstract class TransactionDriver(
 
         f.complete foreach { _ =>
           logger.trace(s"Finalization actions completed for transaction ${txd.transactionId}")
-          synchronized { if !finalized && committed && !late then owed = f.owedStores }
-          onFinalized(committed)
+          onFinalized(committed, f.owedStores)
         }
 
         finalizer = Some(f)

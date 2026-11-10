@@ -50,6 +50,16 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
   override def owedStores: Set[StoreId] = synchronized(owed)
 
+  /** Set when the marks are handed to the marker. From then on only the write's callback completes the action, with
+    * `owed` already set: a late TxCommitted making every store clean must not complete it before the writes land
+    */
+  private var handedOff = false
+
+  private val pendingPromise: Promise[Set[StoreId]] = Promise()
+
+  override def pendingOwed: Option[Future[Set[StoreId]]] = synchronized:
+    Option.when(handedOff)(pendingPromise.future)
+
   private val completionPromise: Promise[Unit] = Promise()
 
   // Never marked: a store that misses a lock has nothing to repair, and since the lock doesn't change the object, its
@@ -64,7 +74,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
   override def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = synchronized {
     this.commitErrors = commitErrors
 
-    if txd.allDataStores.size == commitErrors.keysIterator.toSet.size && !commitErrors.valuesIterator.exists(_.exists(!lockOnly.contains(_))) then
+    if !handedOff && txd.allDataStores.size == commitErrors.keysIterator.toSet.size && !commitErrors.valuesIterator.exists(_.exists(!lockOnly.contains(_))) then
       logger.trace(s"All stores responded to commit of tx ${txd.transactionId} without error. No MissedUpdates.")
       markTask.foreach(_.cancel())
       if (!completionPromise.isCompleted)
@@ -127,13 +137,18 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
     reportMarks(errors.map(_.store))
 
-    writeMarks(errors, unacked).foreach { _ =>
-      synchronized {
-        owed = unacked.map(_.store).toSet
-        if (!completionPromise.isCompleted)
-          completionPromise.success(())
-      }
-    }
+    handedOff = true
+    markTask = None
+    writeMarks(errors, unacked).onComplete:
+      case scala.util.Success(_) =>
+        val stores = unacked.map(_.store).toSet
+        synchronized:
+          owed = stores
+          if !completionPromise.isCompleted then
+            completionPromise.success(())
+        pendingPromise.trySuccess(stores)
+      case scala.util.Failure(err) =>
+        pendingPromise.tryFailure(err)
   }
 
   /** Where the mark timer and the report are scheduled. A seam for tests */

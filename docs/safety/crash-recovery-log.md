@@ -1,6 +1,8 @@
 # Crash Recovery Log (CRL): interface contract, SimpleCRL, and failure analysis
 
-Status: derived from the code on `main` (commit c3ad5493), not from CLAUDE.md. Where CLAUDE.md or a design doc
+Status: derived from the code on `main` (commit c3ad5493), not from CLAUDE.md. Refreshed 2026-11-09 against `0d08e3c6`
+(branch `pin_refactor`, replay pins): the CRL code (`server/crl/`) is unchanged by that work; what changed is how
+recovered state is used (section 11, "Re-assessment for replay pins"). Where CLAUDE.md or a design doc
 disagrees with the code, the code is reported and the disagreement is listed in section 11. Three of the flaws in
 section 11 were reproduced by running the real `SimpleCRL` from a scratch program outside the repository; those are
 marked "reproduced". No source file was modified.
@@ -681,6 +683,21 @@ Confidence is my confidence that the described behaviour exists in the code as w
 the real `SimpleCRL` from a scratch program (outside the repository) and observed the failure. Severity is stated
 separately where it matters.
 
+### Re-assessment for replay pins (2026-11-09, `0d08e3c6`)
+
+`git diff db789ab0..0d08e3c6 -- src/main/scala/org/aspen_ddp/aspen/server/crl` is empty, so every CRL mechanism is as
+described. Only findings whose *consequence* runs through the transaction layer change.
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F1-F12, F14-F17, F19-F21 | unchanged (earlier FIXED marks stand) | CRL code not in the diff | `server/crl/` |
+| F13 | **narrowed** | The re-apply after a crash now meets per-write checks for TKVL writes and is skipped; blind writes, `DoesNotExist` inserts after a later delete, and a recovered acceptor's non-late commit remain | `KeyValueListNode.scala:489-506`; paxos P-N3 |
+| F18 | unchanged (still RESOLVED by the X2 mute) | Its reasoning no longer rests on `TransactionTooOld`; the late-commit rule now also relies on the mute (paxos P-N2) | `Frontend.scala:676` |
+
+New, CRL-facing: every recovered unresolved commit vote now waits for its UnackedCommits lookup before its store drives
+it (transaction-recovery R-N3), and a prover saves an abort vote with a memoryless promise to the CRL on each later
+prepare (Ruling 10, `Tx.scala:786-788,817-836`): one extra record per prover, within admission.
+
 ### F1. Large entries are silently truncated; acknowledged saves are lost (reproduced, high confidence, severe)
 
 > **FIXED (2026-11-09).** `StreamWriter.writeFully` loops the gathering write until every buffer is written. Covered by
@@ -889,7 +906,14 @@ no equivalent guard in the transfer-in path was verified.
 
 ### F13. `dropTransactionObjectData` is memory-only; the durable record can point into recycled space (low confidence)
 
-**Verification: CONFIRMED mechanism; trigger needs a narrow window; severity data-loss (value regression). Detailed answer to the priority question.** `dropTransactionObjectData` (`SimpleCRL.scala:298-299`) is memory-only; the CRL record of a committed transaction is deleted only at finalization (`Frontend.transactionFinalized` `:537-540`, after outstanding commits). A crash between the backend commit persisting and that delete recovers the record with disposition VoteCommit, its object data and Paxos state (`Recovery.scala:90-102`). A recovered commit vote keeps its vote and is not re-checked (`Tx.scala:394-401`); when the outcome arrives as committed (TxResolved/TxFinalized from peers, or `tracelessCommitFound`), `doCommit` calls `RequirementsApplyer.apply`, whose only protection is `RequirementsChecker.check(applying = true)`. That check rejects a replay when the transaction carries a revision requirement (DataUpdate, VersionBump, KV update with `requiredRevision`: object revision has moved on, and the `ObjectTimestampError` check also fires), a `KeyRevision`/`DoesNotExist` key requirement, or a `RefcountUpdate` whose required refcount no longer matches. It does NOT reject: (1) a blind KV Insert (no required revision, no key requirement, or only `MayExist`/`Exists`): `RequirementsApplyer.scala:107-110` overwrites the key with the older value, regressing a newer committed blind write T2 that persisted before the crash; (2) a KV `Delete` guarded only by `Exists`, after the key was re-inserted by T2; (3) a `RefcountUpdate` whose required refcount equals the current one again (ABA: T1 takes 1 to 2, T2 takes 2 back to 1, T1's replay matches and sets 2). Nothing else stops it: the host status cache is in memory and empty after a crash; the horizon (`Tx.tooOld`) applies only to transactions the store does not know, not to recovered ones; `alreadyApplied` (`Tx.scala:526-533`) only affects logging/`TxCommitted` errors, and for a blind Insert it is false anyway once T2 replaced the key's revision. The same replay applies to the traceless-commit lookup path. Window: T1 backend-committed on this store, T2 (blind on the same key/object) committed and persisted, crash before T1's finalization delete (T1's finalization normally lags by at least `errorTimeout`, 2 s). TKVL nodes mostly use revision/key requirements, so exposure is limited to callers using `tx.update(..., requiredRevision = None, ...)` with blind inserts or Exists-guarded deletes. Fix sketch: make `dropTransactionObjectData` durable (write a tombstone record so a recovered commit vote with dropped data is not re-applied), or have `doCommit` skip a recovered transaction whose objects show a revision/timestamp newer than the transaction's start timestamp.
+> **Refresh (replay pins): NARROWED.** Unchanged CRL mechanism. The re-apply it enables is now skipped for per-write
+> checked writes: TKVL puts carry `KeyRevision`/`DoesNotExist` and deletes `KeyRevision` (`KeyValueListNode.scala:489-506`),
+> re-checked at apply (`RequirementsChecker.scala:141`). Still re-applied: blind writes, an `Exists`-guarded raw delete, and
+> a derived `DoesNotExist` insert whose key was deleted since. The recovered Tx learns commit either from its UnackedCommits
+> entry (only if it had not acknowledged), or non-late from its own driver adopting its accepted value (paxos P-N3); a
+> late commit with no entry applies nothing.
+
+**Verification: CONFIRMED mechanism; trigger needs a narrow window; severity data-loss (value regression). Detailed answer to the priority question.** `dropTransactionObjectData` (`SimpleCRL.scala:298-299`) is memory-only; the CRL record of a committed transaction is deleted only at finalization (`Frontend.transactionFinalized` `:537-540`, after outstanding commits). A crash between the backend commit persisting and that delete recovers the record with disposition VoteCommit, its object data and Paxos state (`Recovery.scala:90-102`). A recovered commit vote keeps its vote and is not re-checked (`Tx.scala:394-401`); when the outcome arrives as committed (TxResolved/TxFinalized from peers, or `unackedCommitFound`), `doCommit` calls `RequirementsApplyer.apply`, whose only protection is `RequirementsChecker.check(applying = true)`. That check rejects a replay when the transaction carries a revision requirement (DataUpdate, VersionBump, KV update with `requiredRevision`: object revision has moved on, and the `ObjectTimestampError` check also fires), a `KeyRevision`/`DoesNotExist` key requirement, or a `RefcountUpdate` whose required refcount no longer matches. It does NOT reject: (1) a blind KV Insert (no required revision, no key requirement, or only `MayExist`/`Exists`): `RequirementsApplyer.scala:107-110` overwrites the key with the older value, regressing a newer committed blind write T2 that persisted before the crash; (2) a KV `Delete` guarded only by `Exists`, after the key was re-inserted by T2; (3) a `RefcountUpdate` whose required refcount equals the current one again (ABA: T1 takes 1 to 2, T2 takes 2 back to 1, T1's replay matches and sets 2). Nothing else stops it: the host status cache is in memory and empty after a crash; the horizon (`Tx.tooOld`) applies only to transactions the store does not know, not to recovered ones; `alreadyApplied` (`Tx.scala:526-533`) only affects logging/`TxCommitted` errors, and for a blind Insert it is false anyway once T2 replaced the key's revision. The same replay applies to the traceless-commit lookup path. Window: T1 backend-committed on this store, T2 (blind on the same key/object) committed and persisted, crash before T1's finalization delete (T1's finalization normally lags by at least `errorTimeout`, 2 s). TKVL nodes mostly use revision/key requirements, so exposure is limited to callers using `tx.update(..., requiredRevision = None, ...)` with blind inserts or Exists-guarded deletes. Fix sketch: make `dropTransactionObjectData` durable (write a tombstone record so a recovered commit vote with dropped data is not re-applied), or have `doCommit` skip a recovered transaction whose objects show a revision/timestamp newer than the transaction's start timestamp.
 
 After `dropTransactionObjectData`, the last durable record of the transaction still lists its update locations. If
 those lie in a stream that is recycled before the transaction is saved or moved again (possible when the update data
@@ -939,12 +963,12 @@ CLAUDE.md and not re-verified here.
 > **RESOLVED (2026-11-09)** by the X2 fix (cross-document-review.md): the rebuilt store takes no part in any
 > transaction started before its `acceptor-since` time.
 
-**Verification: OPEN, not a CRL code defect; PLAUSIBLE only under correlated loss.** Safe in practice by timing: a rebuild takes long enough that every transaction in flight at the loss has been finalized at the other stores, and old prepares vote `TransactionTooOld`. Belongs to the Paxos documents.
+**Verification: OPEN, not a CRL code defect; PLAUSIBLE only under correlated loss.** Safe in practice by timing: a rebuild takes long enough that every transaction in flight at the loss has been finalized at the other stores, and old prepares vote `TransactionTooOld`. Belongs to the Paxos documents. *(Refresh: `TransactionTooOld` no longer exists; the mute covers it, see the RESOLVED note.)*
 
 After a lost CRL the store's directory is discarded and the store rebuilt under the same `StoreId`. A transaction in
 progress at the time had promises and accepts from this acceptor. The rebuild process does not process transactions
-while rebuilding (Todo.txt) and the horizon makes old prepares vote abort
-(`TransactionTooOld`, [transaction-recovery.md](transaction-recovery.md)), but a transaction decided by an accept
+while rebuilding (Todo.txt) and (before the refresh) the horizon made old prepares vote abort
+(`TransactionTooOld`, since removed), but a transaction decided by an accept
 quorum that included the lost store, whose other accepted members then fail, can be decided differently by a later
 proposer that reaches the amnesiac store. Whether the rebuilt store is blocked from Paxos participation for any
 transaction older than its rebuild, and whether the quorum structure makes the case impossible, is for

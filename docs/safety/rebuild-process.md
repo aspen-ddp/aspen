@@ -1,6 +1,8 @@
 # Store Rebuild Process: Safety Specification
 
-Status: derived from the code at commit `c3ad5493` (2026-11-09). Every mechanism below is cited as `path:line`
+Status: derived from the code at commit `c3ad5493` (2026-11-09); refreshed 2026-11-09 against `0d08e3c6` (branch
+`pin_refactor`, replay pins). The rebuild code is not in that diff; what changed is the transaction layer a rebuilt store
+meets (section 13, "Re-assessment for replay pins"). Every mechanism below is cited as `path:line`
 relative to `src/main/scala/org/aspen_ddp/aspen/` unless the path starts with `docs/`. Statements were checked against
 the code, not against `CLAUDE.md` or the design documents; where they disagree the code wins and the disagreement is
 called out.
@@ -354,7 +356,7 @@ does not report a commit within `errorTimeout` (2 s, `client/internal/transactio
 the pool's ErrorTree: key `errorKey(store, objectId)` = `poolIndex || objectId` (17 bytes,
 `client/internal/transaction/MissedUpdateMarker.scala:30`), value = timestamp + the object's store-pointer bytes
 (`MissedUpdateFinalizationAction.encodeErrorEntry`). The writes are batched one transaction per pool at a time
-(`MissedUpdateMarker.scala:46-`). A store that never voted gets no TracelessCommits entry, only the ErrorTree mark
+(`MissedUpdateMarker.scala:46-`). A store that never voted gets no UnackedCommits entry, only the ErrorTree mark
 (`MissedUpdateFinalizationAction.scala:89-100`). Deletes are covered by the same mark: the deletion
 transaction (a refcount update) is a change to a hosted object, and the entry preserves the storePointer, which is the
 only copy once the allocation-tree entry has been deleted (`MissedUpdateFinalizationAction.scala:62-68`).
@@ -365,7 +367,7 @@ Entries are processed only for **repairable** stores: served, and neither offlin
 (`server/host/HostStoreView.scala:27`, `server/repair/RepairService.scala:115`, `StoreRepairer.scala:143`). So the
 entries written during the rebuild are untouched until the store is loaded. A newly admitted store is first scanned at a
 random offset within the scan floor (30 s default, `server/repair/ScanState.scala:30`, `RepairPolicy.scala:44`). The
-scan (`StoreRepairer.scan` `:121`) walks the store's ErrorTree range then its TracelessCommits range:
+scan (`StoreRepairer.scan` `:121`) walks the store's ErrorTree range then its UnackedCommits range:
 
 * Allocation-tree entry present: reconcile the store's copy with a full read (snapshot the store, read, install only
   what still matches the snapshot; refcount by higher serial; data by revision when the read's timestamp is at least the
@@ -383,7 +385,7 @@ the design document predates the ErrorTree.
 
 * Tracking is disabled for an ErrorTree write only when that transaction references the pool the entry is about
   (`MissedUpdateFinalizationAction.limitTracking` `:130`, wired at `MissedUpdateMarker.scala:164`). For the bootstrap
-  pool, whose trees live in itself, misses of writes to its own ErrorTree and TracelessCommits nodes are never recorded
+  pool, whose trees live in itself, misses of writes to its own ErrorTree and UnackedCommits nodes are never recorded
   (F8).
 * A batch that "gave up" (`UnknownStoragePool`, `TransactionCreationError` from `onFail`,
   `MissedUpdateMarker.scala:148-157`) is logged and the entries are lost (F9).
@@ -458,7 +460,7 @@ Each is a property the code is intended to maintain and is checked by reading; "
   is replaced. Holds (`FailedStorageDeviceDurableTask.scala:345-353`).
 * **B11 Tombstone is one-way and the work list is the tombstone.** Holds (`:186`, `nextStore` `:251`).
 * **B12 Every transaction that touches the pool during a rebuild marks the store.** Holds for ordinary pools; does not
-  hold for ErrorTree/TracelessCommits nodes of the bootstrap pool (F8) or when the marker batch gives up (F9).
+  hold for ErrorTree/UnackedCommits nodes of the bootstrap pool (F8) or when the marker batch gives up (F9).
 * **B13 Missed-update processing is deferred until the store is repairable.** Holds (`HostStoreView.scala:27`).
 * **B14 Rebuild never writes to peers.** Holds (read path only).
 * **B15 A rebuilt copy is discarded if its device is Failed.** Holds (`DeviceMetadata.scala:395`).
@@ -598,6 +600,21 @@ Each item carries a **Verification** paragraph from an independent adversarial p
 
 Each item: scenario, reference, confidence.
 
+### Re-assessment for replay pins (2026-11-09, `0d08e3c6`)
+
+`git diff db789ab0..0d08e3c6` touches no rebuild code (`server/rebuild/`, `StoreRebuilds`, `DeviceDiscovery`,
+`DeviceShutdown`); `StoreLoader` lost only the horizon parameter.
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F1-F13, F15-F18 | unchanged (earlier FIXED marks stand) | Rebuild code not in the diff | |
+| F14 | unchanged (still covered by the X2 mute) | The horizon it cited is gone; the mute (`acceptorSince`) now also carries the late-commit rule's premise that no acceptor forgets a live T silently (paxos P-N2) | `Frontend.scala:676` |
+
+Notes: a rebuilt store inherits UnackedCommits entries keyed by its pool index, now one per transaction it owed
+(transaction-recovery R-N4); they are consumed by its repair scan once it is repairable, as ErrorTree entries are
+(8.2). A late commit reaching the rebuilt store for an older transaction is muted and applies nothing, which is
+correct: its owed state comes back through the entries' reconcile.
+
 > **F1 FIXED (2026-11-09)** together with cross-document X1: the reconcile retires a device it reads Failed (a durable
 > `failed` marker, then unloaded like a relinquished device), a device with the marker is never loaded, the tombstone
 > nudges the former host, and a repair scan runs only while the pool's entry names the scanning host. Residual: until
@@ -687,7 +704,7 @@ in-place path.
 **Verification: CONFIRMED (code), severity liveness/efficiency only.** `startRebuild` gossips `StoreOffline` but never calls `router.markOffline` (the callers are all in lost-CRL, transfer and shutdown paths), and `StoreRouter.answersUnknown` (`:82-84`) is true for a store that is neither offline, loading nor awaiting its device. Fix sketch: `router.markOffline(storeId)` in `startRebuild` on the new-device path and `clearOffline` on promotion.
 
 **F8 (Medium) Bootstrap-pool stores rebuilt with untracked stale nodes.**
-The bootstrap pool's ErrorTree and TracelessCommits nodes live in the bootstrap pool; writes to them have missed-update
+The bootstrap pool's ErrorTree and UnackedCommits nodes live in the bootstrap pool; writes to them have missed-update
 tracking disabled (`MissedUpdateFinalizationAction.limitTracking` `:130`). Scenario: a bootstrap-pool store S is
 rebuilding; the miss-recording transactions (which write these nodes) cannot record S's misses of those same nodes. The
 promoted S has a stale slice of each such node and no ErrorTree entry; it is only repaired if a read triggers
@@ -740,11 +757,12 @@ device this host did not adopt; its rightful owner then reads them as lost store
 **F14 (Low) The rebuilt store is a blank acceptor.**
 Promotion creates a `Frontend` with no transactions (`StoreLoader.scala:304-359`); `TxAccept`/`TxHeartbeat` for
 unknown transactions are ignored and a `TxPrepare` creates a fresh `Tx` (`server/store/Frontend.scala:608-650`),
-with transactions older than the horizon voting abort (`:655`). Paxos acceptor amnesia is safe only within the pool's
+with (before the refresh) transactions older than the horizon voting abort; since the X2 fix, older transactions are
+muted (`Frontend.scala:676`). Paxos acceptor amnesia is safe only within the pool's
 failure tolerance; the rebuild path does not check that no in-flight transaction chose a value with this store's
 acceptance. See [paxos-transactions.md](paxos-transactions.md) and [transaction-recovery.md](transaction-recovery.md).
 
-**Verification: OPEN (Paxos-level), PLAUSIBLE only under correlated loss.** Rebuilt stores are blank acceptors (`StoreLoader.scala:304-359`). Safe in practice because rebuilds take far longer than the lifetime of any transaction in flight when the state was lost and old prepares vote `TransactionTooOld` (`Frontend.scala:655`); not a proof.
+**Verification: OPEN (Paxos-level), PLAUSIBLE only under correlated loss.** Rebuilt stores are blank acceptors (`StoreLoader.scala:304-359`). Safe in practice because rebuilds take far longer than the lifetime of any transaction in flight when the state was lost and old prepares vote `TransactionTooOld` (`Frontend.scala:655`); not a proof. *(Refresh: `TransactionTooOld` was removed; the X2 mute is the protection.)*
 
 **F15 (Medium) No way to finish a rebuild past a permanently unreadable object.**
 `retryFailures` fails the pass while any object is unreadable (`RebuildingStore.scala:442-452`); a stale

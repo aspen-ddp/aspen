@@ -1,6 +1,10 @@
 # Transaction Requirements, Locking and the Commit Window
 
-Status: derived from the code at commit `c3ad5493` (2026-11-09). Every mechanism below was read in the source; line
+Status: derived from the code at commit `c3ad5493` (2026-11-09); refreshed 2026-11-09 against `0d08e3c6` (branch
+`pin_refactor`, replay pins: `docs/superpowers/specs/2026-11-09-replay-pins-design.md`). New since then: the client
+pin rule (2.5), derived per-write checks on TKVL puts and deletes (2.5, 9.3), refcount-0 objects failing every
+requirement, and the UnackedCommits tree replacing UnackedCommits (2.3). Line numbers in passages the refresh did not
+touch are for `c3ad5493`. Every mechanism below was read in the source; line
 numbers are `path:line` relative to `src/main/scala/org/aspen_ddp/aspen/`. Where `CLAUDE.md` or a scaladoc disagrees
 with the code, the code is described and the disagreement is called out.
 
@@ -100,8 +104,10 @@ clear `min/max/left/right`. `state.data := kvs.encode()` afterwards.
 `appliedBy` (`:50-63`) proves a commit for: `DataUpdate`, `VersionBump`, `KeyValueUpdate` with a required revision (object
 revision == txid), and `KeyValueUpdate` without one when any key currently carries revision txid. `RefcountUpdate`, lock
 requirements and a KV update whose effect left no key with that revision (delete-only, object-level-only, or inserts
-since overwritten) are traceless. The traceless fallback (`TracelessCommitEntry`) is only recorded for `RefcountUpdate`
-and for `KeyValueUpdate` with no required revision and `deletesKeys` (`TransactionDescription.scala:94-98`); see flaw F8.
+since overwritten) are traceless. Since the refresh the fallback (`UnackedCommitEntry`) is recorded for every commit
+voter that had not acknowledged T, whatever its change (`MissedUpdateFinalizationAction.scala:98-106`), so F8 is
+fixed. A refcount-0 object fails every requirement as `MissingObject` on every backend (`RequirementsChecker.scala:57-58`,
+Ruling 24).
 
 ### 2.4 Non-object requirements
 
@@ -123,6 +129,16 @@ The client builder rejects (`client/internal/transaction/TransactionBuilder.scal
 shared/exclusive lock mix on one object (`ConflictingRequirements`, `:346-358`), two refcount updates (`:319`). A
 `RefcountUpdate` may accompany a data or KV update of the same object (allocation does this, `:96-107`). **The stores do
 not enforce any of this.** See flaw F7.
+
+Since the refresh the builder also enforces the **pin rule** (`TransactionBuilder.scala:140-141`, `Pins.scala:18-33`):
+a transaction must carry a write that invalidates its own requirement once applied (a `DataUpdate` at a non-allocating
+revision, a `VersionBump`, a KV update with a required revision, a `KeyRevision` on a key the same update inserts or
+deletes, or a refcount change), or be marked `replaySafe(reason)`. Allocations, locks, `DoesNotExist`/`Exists`/
+`MayExist`, `WithinRange`, timestamp requirements and identity refcount updates are not pins. Stores do not check it
+(Q-N4). TKVL planners now derive **per-write checks** (`KeyValueListNode.putRequirements`/`deleteRequirements`,
+`client/tkvl/KeyValueListNode.scala:489-510`): a put gets `KeyRevision(k, rev)` for a key the node read holds and
+`DoesNotExist(k)` otherwise (`PutRequirement.Checked`, the default); a delete gets `KeyRevision(k, rev)`.
+`PutRequirement.Blind` opts out and is used only by `MissedUpdateMarker` (`MissedUpdateMarker.scala:145-148`).
 
 ## 3. Lock classes
 
@@ -376,7 +392,10 @@ See R8. Also: a commit held for its turn keeps the locks and the references (`re
 4. **Gap.** (3) argues about transactions concurrent at some store. Two *sequential* blind writes of the same key (the
    second voted after the first's locks were released at its quorum) can still be applied in the opposite order at a lagging
    store, because `apply` never compares the existing key's revision or timestamp with the incoming one and ignores locks
-   (F1).
+   (F1). Since the refresh the gap is closed for per-write checked writes (every TKVL put and delete by default): the
+   older write's `KeyRevision`/`DoesNotExist` fails at apply on the store that already applied the newer one, so it is
+   skipped, reported in `TxCommitted` and marked. It remains for `Blind` and raw revision-less writes, and for a
+   `DoesNotExist` insert re-applied after a later delete (ABA).
 
 ### 9.4 Deleted object, later transaction on the same id
 
@@ -506,8 +525,9 @@ its own deferral count (`RepairPolicy.proofAfterDeferrals`, [repair-process.md](
 * **Commit arrives while another commit on the object is in flight:** held and queued (R9). A `TxFinalized` for a held
   commit is deferred until the commit is issued (`Tx.scala:790-800`).
 * **Prepare arriving after finalization:** ignored, answered from the status cache (`Frontend.scala:638-652`).
-* **Prepare for an unknown transaction older than the horizon:** abort vote `TransactionTooOld` unless an object already
-  shows the update, in which case the store proves the commit (`Tx.scala:444-449`, `:491-493`, `:516-522`).
+* **Prepare for an unknown transaction, any age:** checked normally (the horizon and `TransactionTooOld` are gone). On
+  the abort path a memoryless acceptor whose object shows the update sends a proof instead of a vote
+  (`Tx.scala:548-550`, `:585-597`); see paxos-transactions.md 10.5.
 * **An object that fails to load** (`CorruptedObject` etc.) is absent from `objects`: `MissingObject` abort for a fresh vote
   (`Checker:52-55`).
 
@@ -516,7 +536,32 @@ its own deferral count (`RepairPolicy.proofAfterDeferrals`, [repair-process.md](
 Confidence is my confidence that the issue exists as described (High = the code path is plainly there; Medium = plausible
 under reordering/crash; Low = needs an unusual precondition or a trust-model violation). "Impact" is what can go wrong.
 
+### Re-assessment for replay pins (2026-11-09, `0d08e3c6`)
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F1 | **narrowed** | Per-write checked writes (every TKVL put and delete by default) fail their key check at apply on a store that applied a newer write, and are skipped, reported and marked; blind writes are unchanged | `KeyValueListNode.scala:489-506`; `RequirementsChecker.scala:141`; `Tx.scala:615-652` |
+| F2 | **narrowed** | Same re-check for the crash re-apply; blind writes and `DoesNotExist` inserts after a later delete still re-apply | as F1; `RequirementsApplyer.scala:65+` |
+| F3 | unchanged | Pre-transaction rebuild untouched | `Tx.scala:429-441` |
+| F4 | unchanged | Blind and refcount timestamps still assigned unconditionally (TKVL KV updates still carry no required revision) | `RequirementsApplyer.scala` (not in the diff) |
+| F5 | unchanged | `doCommit` still unlocks before applying | `Tx.scala:602` |
+| F6 | unchanged | `RequirementsLocker.lock` untouched | not in the diff |
+| F7 | unchanged (extended) | Stores also do not check the pin rule (Q-N4) | `TransactionBuilder.scala:140-141` |
+| F8 | **fixed** | UnackedCommits entries are written for every unacknowledged counted voter, traced or not | `MissedUpdateFinalizationAction.scala:98-106` |
+| F9 | unchanged | Not in the diff | |
+| F10 | unchanged | Apply still ignores locks | `RequirementsChecker.scala:71,84,141` |
+| F11 | **narrowed** | A replayed allocation can no longer commit through fresh votes: its transaction's pin fails. It still applies where a late commit finds a leftover entry (transaction-recovery R-N1) or where a recovering acceptor gives a non-late commit (paxos P-N3) | `Pins.scala:18-33`; `Tx.scala:926-930` |
+| F12 | unchanged | `awaitingCommits` still has no timer | `Tx.scala:511-517` |
+| F13 | unchanged | Not in the diff | |
+| N1, N2 | unchanged | Not in the diff | |
+
 ### F1. Sequential blind KV writes of one key (or object-level field) can be applied in opposite orders by a lagging store; permanent divergence with no repair entry. Confidence: Medium.
+
+> **Refresh (replay pins): NARROWED.** TKVL puts now carry `KeyRevision`/`DoesNotExist` and deletes `KeyRevision`
+> (`KeyValueListNode.scala:489-506`); the apply re-check enforces them (`RequirementsChecker.scala:141`), so a lagging
+> store skips the older write and reports it in `TxCommitted.objectCommitErrors` (`Tx.scala:640-652`), which the finalizer
+> marks. Unchanged for `PutRequirement.Blind` (the ErrorTree batch), raw `tx.update` with no key requirement, and
+> object-level fields.
 
 > **Verification 2026-11-09: CONFIRMED (mechanism). Severity: stale-replica (permanent divergence of one replica until rewritten).** Blind KeyValueUpdate has no state-dependent requirement and applying ignores locks (RequirementsChecker.scala:123-158, `ignoreLocks = applying`), so RequirementsApplyer.scala:126-133 overwrites the key with whatever transaction applies last; nothing compares ValueState revision/timestamp. Order inversion trigger on a lagging store S: A's commit is held by commitAwaitsData (Tx.scala:~120, data lost/dropped, e.g. CrlAdmission drop or QUIC budget drop) or A's TxResolved is delayed, while B (issued after the client saw A commit) votes, commits and applies at S; A's data/resolution then arrives (client retransmit) and applies over B. If S's TxCommitted for A reaches the finalizer within errorTimeout (2 s) no ErrorTree entry is written, so repair never runs. B's per-store commit queue only orders transactions present at that store (Frontend.holdCommit), A's held commit is not in it.
 > *Fix sketch:* Make blind KV apply last-writer-wins on (ValueState.timestamp, revision) with tombstones for deletes, or forbid blind writes to keys without a revision/lock.
@@ -537,6 +582,9 @@ already present at this store). *Possible direction:* last-writer-wins on `(Valu
 time for blind writes, with tombstones for deletes, or forbid blind writes.
 
 ### F2. A blind KV write can be replayed over newer state after a crash between "backend commit persisted" and "CRL object data dropped". Confidence: Low-Medium.
+
+> **Refresh (replay pins): NARROWED.** As F1 for checked writes. A derived `DoesNotExist(k)` insert is not ABA-free: if
+> k was deleted after A, A's re-apply passes and resurrects k.
 
 > **Verification 2026-11-09: CONFIRMED (mechanism, narrow window). Severity: stale-replica.** SimpleCRL.dropTransactionObjectData only flips in-memory state (SimpleCRL.scala:296-299, LogContent.scala:206-209); the on-disk log entry keeps the data until the entry is deleted at TxFinalized. A crash after A persisted and B (blind, same key) overwrote it, before A's finalization, recovers A with its data; on resolution doCommit re-checks with applying=true and a blind Insert passes (RequirementsChecker.scala:123-158), so k := v1 over v2 on this store only. Needs a crash within the finalization window (ms to ~2 s).
 > *Fix sketch:* Make the data drop durable before B's commit may proceed (or re-check ValueState timestamp/revision on apply).
@@ -621,15 +669,19 @@ the shared lock is subsumed. (b) The driver uses the description's `poolIDAMap` 
 
 ### F8. Traceless coverage is narrower than "KV with required revision"/"delete" suggests. Confidence: Medium-Low.
 
+> **Refresh (replay pins): FIXED.** The UnackedCommits entry no longer depends on `tracelessObjects`: every
+> unacknowledged counted voter gets one (`MissedUpdateFinalizationAction.scala:98-106`). `appliedBy` still cannot prove
+> such changes, so the proof path still misses them (paxos P-N1/F2).
+
 > **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (repair coverage).** TransactionDescription.tracelessObjects only covers RefcountUpdate and revision-less KV with deletesKeys (TransactionDescription.scala:93-98).
-> *Fix sketch:* Treat all revision-less KV updates as traceless, or write TracelessCommits for them.
+> *Fix sketch:* Treat all revision-less KV updates as traceless, or write UnackedCommits for them.
 
 
 `tracelessObjects` (`TransactionDescription.scala:94-98`) covers `RefcountUpdate` and no-revision KV updates with
 `deletesKeys`. A no-revision KV update that only sets or deletes `min/max/left/right`, and one whose inserts have since been
 overwritten or deleted by later transactions, also leave no revision trace (`Applyer:60-61` looks for the txid on a
 current key). The scaladoc on `deletesKeys` admits this for `DeleteMin/Max/Left/Right` (`TransactionRequirement.scala:104-107`).
-The effect: a forgotten, committed transaction cannot be proved by `appliedBy` and has no TracelessCommits entry, so
+The effect: a forgotten, committed transaction cannot be proved by `appliedBy` and has no UnackedCommits entry, so
 a recovered commit vote for it relies on the recovery driver (see [transaction-recovery.md](transaction-recovery.md)).
 
 ### F9. `LocalTimeRequirement` and the `Timestamp*` key requirements have inverted or ambiguous semantics and no non-test callers. Confidence: High (code reading), low impact.
@@ -656,6 +708,12 @@ violation into a silent overwrite instead of a detected conflict, since the lose
 Open question: should an apply that overrides a held lock of a *commit* voter be logged as an invariant violation?
 
 ### F11. An allocating object has no existence check, so a replayed allocation can overwrite a live or deleted object. Confidence: Low.
+
+> **Refresh (replay pins): NARROWED.** The horizon is gone, but allocations are never pins, so an allocating transaction
+> carries another pin, which a replay fails (`Pins.scala:18-33`). The fresh `Allocating` state still passes, so the
+> replayed allocation is applied wherever the replay reaches the commit anyway: a store with a leftover UnackedCommits
+> entry (transaction-recovery R-N1) or a non-late commit adopted from a recovering acceptor (paxos P-N3). It then
+> overwrites the live object at those stores (cross-document X11).
 
 > **Verification 2026-11-09: PLAUSIBLE. Severity: resurrection (needs horizon failure).** Frontend.readObjectForTransaction builds a fresh Allocating ObjectState for allocatingObjects without consulting backend/cache (Frontend.scala:834-845); protection is the cache/horizon only (see paxos F2/F3).
 > *Fix sketch:* Have the backend reject allocating over an existing object.
@@ -691,6 +749,53 @@ forever. The deliberate design; recorded because a lost completion has no recove
 and it makes new `SharedRevisionLock`s collide for 250 ms (`Checker:69-72`, `:83-86`). The collision names the requester
 itself (`:86`), so the driver never treats it as a stale race. Under repeated aborted writers on a fence object (vdisk) this
 can starve shared lockers. Documented behaviour.
+
+### New findings from the replay-pins refresh (2026-11-09)
+
+#### Q-N3. Derived per-write checks turn blind wins into aborts. Confidence: high
+
+> **Verdict: CONFIRMED (by design). Severity: liveness.** Two concurrent puts of one key now both require the key's
+> state as read (`KeyValueListNode.scala:489-500`); the loser fails `KeyRevision`/`DoesNotExist` and its transaction
+> aborts and retries (`transactUntilSuccessful`, TKVL retry loops), where before both committed in some order. The
+> checks are per key, so no node-level serialization is added. A stale tier-0 read (a cached node) costs an extra abort.
+> Safety: the checks are evaluated by stores at vote and again at apply; `ignoreLocks` is the only relaxation at apply.
+
+#### Q-N4. The pin rule is enforced only by the client. Confidence: high
+
+> **Verdict: CONFIRMED (trust model, by design). Severity: resurrection if violated.** `UnpinnedTransaction` is thrown
+> in `TransactionBuilder.buildTranaction` (`TransactionBuilder.scala:140-141`); descriptions carry no pin marker and
+> stores accept any description (F7). A client built without the check (an older version, a tool or test building
+> `TransactionDescription` directly) sends replayable transactions, which the store-side late-commit rule does not
+> catch (a pinless replay gets fresh commit votes and commits normally).
+
+#### Q-N5. `replaySafe` claims at the four product sites. Confidence: medium
+
+> **Verdict: mixed; see per site.**
+> * `RepairProofs` ("repair proof changes nothing", `server/repair/RepairProofs.scala:61`): **REFUTED** as a weakness.
+>   A proof is locks only; a replay changes nothing (it can only abort a concurrent writer once).
+> * `SplitFinalizationAction.insertIntoExistingTier` ("cannot re-add once the node is gone",
+>   `client/tkvl/SplitFinalizationAction.scala:61`): the claim **holds**: a deleted node fails the revision lock
+>   (`RequirementsChecker.scala:57-58`), and a node whose revision moved fails it too. Separate weakness, **PLAUSIBLE
+>   (performance)**: the read-first "gone" (`:76-77`) is also taken when the read precedes the stores applying the
+>   split (the reason Ruling 28 changed the allocation action), so the new node is never indexed in the tier above;
+>   lookups still reach it by following links. Its later join path was not traced.
+> * `AllocationFinalizationAction` ("never drops an entry; ... can leave an orphan entry",
+>   `client/internal/allocation/AllocationFinalizationAction.scala:45-57`): the claim is **honest**; the orphan is
+>   **PLAUSIBLE (stale-replica, leak)** and less rare than "doubly rare": any second run after a quick deletion leaves
+>   one, including the ordinary case of a leader and a recovery driver both finalizing in the live window. An orphan
+>   makes repair treat the deleted object as live (no `repairDeletion` for a store that missed the delete) and the
+>   rebuild walk read a missing object.
+> * `MissedUpdateMarker.writeBatch` ("missed-update marks are idempotent", `MissedUpdateMarker.scala:165`): **PLAUSIBLE
+>   (stale-replica, narrow)**. Re-writing one batch is idempotent, but a replayed or late batch's blind upsert replaces a
+>   newer entry's `missedTimestamp` with an older one (repair F10) and re-creates UnackedCommits entries the repair
+>   scan already deleted, which re-arms transaction-recovery R-N1 for that store.
+
+#### Q-N6. Liveness costs of the converted sites. Confidence: medium
+
+> **Verdict: CONFIRMED (liveness).** `AllocationFinalizationAction` takes an exclusive `RevisionLock` on the freshly
+> allocated object (`AllocationFinalizationAction.scala:53`, section 12), which collides with the allocator's own
+> follow-up writes to it; one side aborts and retries. `SimpleTaskExecutor.allocateTask` now collides on the executor
+> revision under bursts or several mounts (O(n^2) attempts). Neither affects safety.
 
 ### Open questions
 

@@ -1,6 +1,7 @@
 # Systemic Loss Protection (placeholder, problem statement only)
 
-Status: derived from the code at commit `c3ad5493` (2026-11-09). Paths are relative to
+Status: derived from the code at commit `c3ad5493` (2026-11-09); refreshed 2026-11-09 against `0d08e3c6` (branch
+`pin_refactor`, replay pins), see section 11. Paths are relative to
 `src/main/scala/org/aspen_ddp/aspen/` unless they start with `docs/`.
 
 > **A solution to the problem described here has NOT been identified.** This document states the problem, inventories
@@ -319,3 +320,18 @@ Each claim in sections 3 to 6 was re-derived from the code.
   first) CONFIRMED; F15 (no escape from an unreadable object) CONFIRMED; F12 (co-location) CONFIRMED.
 * **S10** (`failStorageDevice` has no pool-health guard) was not re-read in `BaseAspenClient`; the reconcile side
   confirmed that nothing stops a Failed device's host from continuing to serve (rebuild-process F1).
+
+## 11. Refresh for replay pins (2026-11-09, `0d08e3c6`)
+
+The replay-pins change adds no declaration (D1-D7) or discard (X1-X13) path: `git diff db789ab0..0d08e3c6` touches no
+code in `server/host/DeviceDiscovery`, `StoreRebuilds`, `StoreLoader` (beyond the horizon parameter) or `server/crl/`.
+The problem statement and sections 3 to 9 stand. Two interactions change:
+
+* **Owed commits now live in a tree, not only in CRLs.** A store's unacknowledged counted commit votes have
+  UnackedCommits entries in its pool's metadata group (transaction-recovery T-M2). A correlated CRL loss still destroys
+  the votes themselves, so section 2's arithmetic is unchanged; the entries only let repair reconcile the rebuilt stores
+  (repair-process 2.3), which needs a read quorum that still holds T.
+* **Recovery now depends on the metadata group.** Every recovered unresolved commit vote waits for its UnackedCommits
+  lookup before its store drives it (transaction-recovery R-N3). A systemic event that also takes the metadata pool
+  below a read quorum leaves recovered votes holding their locks with no driver until it returns: a stall, not a
+  declaration, so it does not feed D1-D7.

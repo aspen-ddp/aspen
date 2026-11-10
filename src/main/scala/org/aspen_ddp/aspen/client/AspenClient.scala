@@ -807,9 +807,15 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *  commit and retry are the caller's responsibility. A best-effort wake-up message to the
    *  SystemTaskExecutorService is sent after the transaction commits.
    *
-   *  `taskTypeUUID` must resolve to a DurableTaskFactory in the type registry. */
+   *  `taskTypeUUID` must resolve to a DurableTaskFactory in the type registry.
+   *
+   *  The enrollment is a checked insert of a new key, which is not a pin (see `Pins`). A transaction with no other
+   *  pin passes `pinned = true`: the insert then also requires the system-task tree node's revision, which serializes
+   *  every enrollment on that node. Transactions that carry a pin of their own (FSIF index releases, pool migration,
+   *  allocation group usage updates) leave it false, so they do not contend on the node. */
   def prepareSystemDurableTask(taskTypeUUID: UUID,
-                               initialState: Map[Key, Array[Byte]])
+                               initialState: Map[Key, Array[Byte]],
+                               pinned: Boolean = false)
                               (using tx: Transaction): Future[Unit]
 
   private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]]

@@ -143,11 +143,16 @@ class SimpleTaskExecutor(val client: AspenClient,
     yield
       tx.update(taskPointer.kvPointer, Some(taskRevision), None, Nil, ins)
 
-      // Not written, so free again. Re-read: a stale revision would fail every later use
+      // Not written by this transaction. Re-read: a stale revision would fail every later use. Free again only if it
+      // still holds no task; if one is there (the transaction committed after all, or another writer used the object)
+      // it is dropped from this executor's lists, since reusing it at its new revision would overwrite that task
       tx.result.failed.foreach: _ =>
         client.read(taskPointer.kvPointer).foreach: kvos =>
-          synchronized:
-            inactive = (taskPointer, kvos.revision) :: inactive
+          if !kvos.contents.contains(TaskTypeKey) then
+            synchronized:
+              inactive = (taskPointer, kvos.revision) :: inactive
+          else
+            logger.warn(s"Task object ${taskPointer.kvPointer.id} holds a task after a failed prepare; not reused")
 
       tx.result.flatMap: _ =>
         client.read(taskPointer.kvPointer).flatMap: kvos =>

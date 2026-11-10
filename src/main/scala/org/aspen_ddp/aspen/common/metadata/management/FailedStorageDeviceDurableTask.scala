@@ -46,11 +46,13 @@ object FailedStorageDeviceDurableTask extends DurableTaskFactory:
     val deviceId = StorageDeviceId(byte2uuid(state(DeviceIdKey).value.bytes))
     new FailedStorageDeviceDurableTask(pointer, client, deviceId, pollPeriod)
 
-  /** Stage enrollment of a failure task for `deviceId` inside the caller's transaction. */
+  /** Stage enrollment of a failure task for `deviceId` inside the caller's transaction. `pinned`: see
+   *  `AspenClient.prepareSystemDurableTask`. */
   def prepareSystemTask(client: AspenClient,
-                        deviceId: StorageDeviceId)(using tx: Transaction): Future[Unit] =
+                        deviceId: StorageDeviceId,
+                        pinned: Boolean = false)(using tx: Transaction): Future[Unit] =
     client.prepareSystemDurableTask(typeUUID, Map(
-      DeviceIdKey -> uuid2byte(deviceId.uuid)))
+      DeviceIdKey -> uuid2byte(deviceId.uuid)), pinned)
 
 
 /** Tombstones a failed storage device and drains its stores onto live devices, one at a time.

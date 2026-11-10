@@ -32,15 +32,20 @@ object SystemTaskServiceState:
       tkvl(client, statePtr).prepareSetPinned(Key(uuid2byte(taskId)), Value(taskStatePtr.toArray), PutRequirement.Checked)
 
   /** Insert a task into the registry within an existing transaction, whose task state object is typically allocated
-   *  by that transaction. The insert requires the revision of the tree node it goes into
-   *  (`TieredKeyValueList.prepareSetPinned`), which pins the transaction: a replay after any later change to the
-   *  node fails instead of enrolling the task again.
+   *  by that transaction. A checked insert, which is not a pin. With `pinned` it also requires the revision of the
+   *  tree node it goes into (`TieredKeyValueList.prepareSetPinned`), for transactions with no other pin; that
+   *  serializes every pinned enrollment on the node, so transactions pinned otherwise (FSIF index releases) leave it
+   *  false.
    */
   def enrollInTx(client: AspenClient,
                  statePtr: KeyValueObjectPointer,
                  taskId: UUID,
-                 taskStatePtr: KeyValueObjectPointer)(using tx: Transaction): Future[Unit] =
-    tkvl(client, statePtr).prepareSetPinned(Key(uuid2byte(taskId)), Value(taskStatePtr.toArray), PutRequirement.Checked)
+                 taskStatePtr: KeyValueObjectPointer,
+                 pinned: Boolean = false)(using tx: Transaction): Future[Unit] =
+    val tree = tkvl(client, statePtr)
+    val key = Key(uuid2byte(taskId))
+    if pinned then tree.prepareSetPinned(key, Value(taskStatePtr.toArray), PutRequirement.Checked)
+    else tree.set(key, Value(taskStatePtr.toArray))
 
   /** Read all enrolled (taskId, taskStatePointer) pairs. */
   def scan(client: AspenClient,

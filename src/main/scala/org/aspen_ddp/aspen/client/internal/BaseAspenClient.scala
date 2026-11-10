@@ -637,7 +637,8 @@ abstract class BaseAspenClient(
     given ExecutionContext = clientContext
     transactUntilSuccessful: tx =>
       given Transaction = tx
-      prepareSystemDurableTask(taskTypeUUID, initialState)
+      // Nothing else in this transaction pins it
+      prepareSystemDurableTask(taskTypeUUID, initialState, pinned = true)
 
   /** Signals that the pool's set pointer already equals the target. Thrown from inside the
    *  transaction so nothing is staged: Aspen has no empty transactions. Recovered to unit. */
@@ -733,11 +734,13 @@ abstract class BaseAspenClient(
             // Only the device id is recorded. The task re-reads everything else -- including the
             // device's set -- inside its own transactions, so nothing here can go stale between
             // enrollment and the first pass.
-            FailedStorageDeviceDurableTask.prepareSystemTask(this, deviceId)
+            // The device state is only read, so the enrollment must pin the transaction
+            FailedStorageDeviceDurableTask.prepareSystemTask(this, deviceId, pinned = true)
       yield ()
 
   override def prepareSystemDurableTask(taskTypeUUID: UUID,
-                                        initialState: Map[Key, Array[Byte]])
+                                        initialState: Map[Key, Array[Byte]],
+                                        pinned: Boolean)
                                        (using tx: Transaction): Future[Unit] =
     given ExecutionContext = clientContext
 
@@ -764,7 +767,7 @@ abstract class BaseAspenClient(
           pool <- getStoragePool(Radicle.poolId)
           allocator = new PoolObjectAllocator(this, pool)
           taskStatePtr <- allocator.allocateKeyValueObject(taskContent)
-          _ <- SystemTaskServiceState.enrollInTx(this, statePtr, taskId, taskStatePtr)
+          _ <- SystemTaskServiceState.enrollInTx(this, statePtr, taskId, taskStatePtr, pinned)
         yield
           tx.result.foreach: _ =>
             sendServiceMessage(SystemTaskExecutorService.ServiceUUID,

@@ -14,7 +14,7 @@ import scala.concurrent.Future
   */
 class AllocationFinalizationActionSuite extends IntegrationTestSuite:
 
-  private val reason = "cannot re-add once the object is gone: its revision lock fails"
+  private val reason = "never drops an entry; a rare re-run after the object's deletion can leave an orphan entry"
 
   private def allocate(): Future[KeyValueObjectPointer] =
     for
@@ -100,7 +100,9 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       audit.unpinned shouldBe empty
       audit.built.flatMap(_.description.requirements) should contain (RevisionLock(ptr, updated.revision))
 
-  atest("an allocation FA run after its object was deleted completes without writing"):
+  // A read straight after resolution can precede the stores applying the allocation, so an object that does not read
+  // is never taken to be gone. Deleting it is the deterministic way to make it unreadable here
+  atest("a run when the object does not read still records the entry"):
     for
       ptr <- allocate()
       before <- client.read(ptr)
@@ -115,9 +117,16 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       after <- entry(ptr)
     yield
       gone shouldBe None
-      audit.builtExceptMarks shouldBe empty
-      after shouldBe None
-
+      after shouldBe Some(ptr.toArray.toList)
+      val own = audit.builtExceptMarks
+      own should not be empty
+      audit.unpinned shouldBe empty
+      audit.replaySafeWith(reason).size shouldBe own.size
+      // Unreadable: no lock, which would fail on the missing object and retry forever
+      own.flatMap(_.description.requirements).exists:
+        case r: RevisionLock => r.objectPointer.id == ptr.id
+        case _ => false
+      .shouldBe(false)
 
   // What makes a replay of the action's transaction harmless: once the object is deleted its revision lock fails, on
   // every backend (MapBackend keeps the zero-refcount state; the stores check it as missing)

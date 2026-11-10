@@ -78,7 +78,7 @@ class SystemTaskServiceStateSuite extends IntegrationTestSuite:
              given Transaction = tx
              for
                p <- allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](9))))
-               _ <- SystemTaskServiceState.enrollInTx(client, statePtr, otherId, p)
+               _ <- SystemTaskServiceState.enrollInTx(client, statePtr, otherId, p, pinned = true)
              yield ()
       _ <- SystemTaskServiceState.remove(client, statePtr, taskId)
       _ <- waitForTransactionsToComplete()
@@ -101,3 +101,46 @@ class SystemTaskServiceStateSuite extends IntegrationTestSuite:
       .shouldBe(false)
       enrolled.map(_._1) should contain (otherId)
       enrolled.map(_._1) should not contain taskId
+
+  // The FSIF index release path (deferAllocationRelease) enrolls without the node pin, so those transactions do not
+  // serialize on the system-task tree node; their deletion's refcount update is their pin
+  atest("an unpinned enrollInTx carries no node revision and is pinned by the transaction's refcount update"):
+    given ExecutionContext = executionContext
+    val taskId = UUID.randomUUID()
+    for
+      statePtr <- servicePtr()
+      // One enrollment first, so the second goes into an existing node rather than the tree's initial node
+      _ <- client.transactUntilSuccessful: tx =>
+             given Transaction = tx
+             client.getStoragePool(Radicle.poolId).flatMap: pool =>
+               new PoolObjectAllocator(client, pool).allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](1))))
+                 .flatMap(p => SystemTaskServiceState.enrollInTx(client, statePtr, UUID.randomUUID(), p, pinned = true))
+      pool <- client.getStoragePool(Radicle.poolId)
+      allocator = new PoolObjectAllocator(client, pool)
+      doomed <- client.transactUntilSuccessful: tx =>
+                  given Transaction = tx
+                  allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](2))))
+      _ <- waitForTransactionsToComplete()
+      doomedState <- client.read(doomed)
+      audit = new PinAudit(client)
+      tx = client.newTransaction()
+      _ = tx.setRefcount(doomed, doomedState.refcount, doomedState.refcount.setCount(0))
+      taskStatePtr <- allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](3))))(using tx)
+      _ <- SystemTaskServiceState.enrollInTx(client, statePtr, taskId, taskStatePtr)(using tx)
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      _ = audit.stop()
+      enrolled <- SystemTaskServiceState.scan(client, statePtr)
+    yield
+      enrolled.map(_._1) should contain (taskId)
+      val built = audit.built.find(_.description.transactionId == tx.id).get
+      built.hasPin shouldBe true
+      built.replaySafe shouldBe false
+      val enrollUpdate = built.description.requirements.collect:
+        case kvu: org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
+          if built.kvOps.getOrElse(kvu.objectPointer.id, Nil).exists:
+               case i: org.aspen_ddp.aspen.common.objects.Insert => i.key == Key(uuid2byte(taskId))
+               case _ => false
+        => kvu
+      enrollUpdate.size shouldBe 1
+      enrollUpdate.head.requiredRevision shouldBe None

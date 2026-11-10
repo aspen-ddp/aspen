@@ -225,6 +225,15 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     def objects(): HashMap[ObjectId, ObjectState] =
       HashMap(oid1 -> new ObjectState(oid1, Metadata(rev1, deleted, ts1), ObjectType.Data, DataBuffer(new Array[Byte](0))))
     val updates: HashMap[ObjectId, DataBuffer] = HashMap(oid1 -> DataBuffer.Empty)
+    def kvObjects(): HashMap[ObjectId, ObjectState] =
+      val o = new ObjectState(oid1, Metadata(rev1, deleted, ts1), ObjectType.Data, DataBuffer(new Array[Byte](0)))
+      o.kvState = Some(new KVObjectState)
+      HashMap(oid1 -> o)
+    val kvReq = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.DoesNotExist(Key(Array[Byte](1)))))
+    val (kvErrs, kvNonObject) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(kvReq), kvObjects(), updates)
+    kvErrs shouldBe Map(oid1 -> MissingObject())
+    kvNonObject shouldBe empty
+
     for req <- List[TransactionRequirement](
            RevisionLock(p1, rev1),
            SharedRevisionLock(p1, rev1),

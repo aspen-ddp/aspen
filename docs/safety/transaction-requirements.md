@@ -337,7 +337,7 @@ backend commits per object.
    Objects that the transaction only locks (`RevisionLock`, `SharedRevisionLock`) never have a commit in flight unless
    another transaction changes them (`changedObjects`); the check is on `commitInFlight`, whatever the requirement.
 2. **Commit path** (`resolvedAndAllObjectsLoaded` `:615-632`): if the commit decision arrived before the object data
-   (`commitAwaitsData`, `:165`), the commit is held without locks (a commit vote requires the data, so only a transaction
+   (`commitAwaitsData`, `Tx.scala:239` at `c181375b`), the commit is held without locks (a commit vote requires the data, so only a transaction
    that voted abort can be here). Else if `holdForTurn()` (`:178-188`): some changed object has a commit in flight or held,
    the Tx joins every changed object's queue in one `holdCommit` call (`Frontend.scala:150-151`) and keeps its locks. Queues are appended
    to atomically, so the oldest held commit heads every queue it is in and held commits cannot wait on each other in a

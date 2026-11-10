@@ -43,7 +43,7 @@ Each has its own "Suspected flaws" section, annotated with adversarial verificat
 The ranking is by worst plausible consequence, then by confidence. IDs refer to each document's flaw section; `X*` ids
 refer to cross-document-review.md. New findings from the replay-pins refresh carry `-N` ids (`P-N*` paxos, `R-N*`
 recovery, `Q-N*` requirements, `RP-N*` repair). Findings from the addendum refresh continue those series (P-N7 to
-P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, X13, X14).
+P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cross-document X13 and X14; not systemic-loss X13/X14, which are discard-inventory ids).
 
 ### Tier 1: lost durable state, split decisions, systemic loss
 
@@ -67,7 +67,7 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, X1
 | Paxos F3 / Recovery F7 | **FIXED** (replay pins) (was CONFIRMED) | The horizon trusted the client clock. It is gone; replay is refused by the client pin rule and the late-commit rule |
 | Recovery R-N1 / X11 | **NARROWED** (addendum) | Applied stubs: a store that forgot T on a `TxFinalized` listing it in `owed`, or applied T through its entry, applies nothing on a replay's commit; the whole-pool scenario is tested end to end. Residual: stores with an entry and no stub (R-N7, R-N9, R-N6's lost `TxFinalized`) |
 | Recovery R-N7 / X13 | PLAUSIBLE (new, addendum; accepted residual) | Ruling 3's second driver lists its late-written entries only in its own `TxFinalized`: its host crashing before sending it, or its write giving up in one pool after another committed, leaves entries with no stub, possibly for a whole pool, so a replay re-applies at a quorum |
-| Recovery R-N8 / Paxos P-N10 / X14 | PLAUSIBLE (new, addendum; mechanism CONFIRMED) | Ruling 3 delays the second driver's non-late commit `TxFinalized` until its write is durable; arriving after the stores' cache entries expired, it resolves a replay's fresh Txs committed and they apply its blind writes where no stub exists |
+| Recovery R-N8 / Paxos P-N10 / cross-document X14 | PLAUSIBLE (new, addendum; mechanism CONFIRMED) | Ruling 3 delays the second driver's non-late commit `TxFinalized` until its write is durable; arriving after the stores' cache entries expired, it resolves a replay's fresh Txs committed and they apply its blind writes where no stub exists |
 | Paxos P-N3 / X12 | PLAUSIBLE (new; **narrowed**, addendum) | A recovering acceptor holding T's accepted commit makes a post-proof quorum adopt a *non-late* commit even when a proof exists (broader than the design's residual): finalization actions re-run and a concurrent replayed client prepare applies blind writes, `DoesNotExist` inserts after a later delete, and allocations. Since the addendum stub holders apply nothing and are marked; stores that acknowledged in time still apply |
 | X3 | **FIXED** (Ruling 30) (was PLAUSIBLE, then NARROWED) | `TransactionStatusCache.updateStatus` is monotone (finalized and late sticky, no revert to Unresolved), so no store's write downgrades a finalized entry and the finalized relay stays late |
 | Recovery R-N6 | PLAUSIBLE (new; **narrowed**, addendum) | A driver adopting an accepted commit long after finalization re-runs every finalization action (Ruling 13): the marker's blind upsert can regress newer ErrorTree entries; a re-run allocation action can leave an orphan entry. The re-created UnackedCommits entries are now listed in its `TxFinalized`, so stores write stubs for them, unless that message is lost |

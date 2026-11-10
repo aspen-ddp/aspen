@@ -495,7 +495,8 @@ status cache. After a crash a store knows only its own vote and acceptor state; 
   `resolvedAndAllObjectsLoaded(c)`; otherwise the resolution is applied when loading finishes (`:405-408`).
 * Abort: `frontend.deleteTransactionState`, `unlock()`, `releaseObjects()`.
 * Commit: first the two holds:
-  * **commit overtook the data** (`commitAwaitsData`, `:165`): no data and no client prepare seen and not finalized ->
+  * **commit overtook the data** (`commitAwaitsData`, `Tx.scala:239` at `c181375b`): not recovered, no data and no
+    client prepare seen and not finalized ->
     hold (`commitHeld`) with no `TxCommitted`, so the driver does not yet count this store as having missed the update.
     Ends with the data, a client prepare, or `TxFinalized`; after `TxFinalized` the store applies without the data,
     reports the object as uncommittable and repair restores it.

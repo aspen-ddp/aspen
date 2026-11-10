@@ -255,7 +255,9 @@ D1's non-late commit `TxFinalized` waits for its handed-off write, which retries
 finalized cache entries expire (7 s, paxos P17), a replayed client prepare creates fresh Txs, and D1's message resolves
 each of them committed (`Tx.scala:945-946`), applying the replay's data where no stub exists. The cache window that
 made D1's prompt `TxFinalized` harmless before Ruling 3 no longer covers it.
-Fix sketch: as recovery R-N8 (send it late once it may postdate the stores' forgetting).
+Fix sketch: as recovery R-N8: send the delayed message late but keep its `owed`, and have stores honour `owed` on late
+messages (an owed store with a Tx writes the stub and applies nothing; one without writes it on the no-Tx path). A
+plain `late = true`, or a bounded wait, empties `owed` and reopens X13.
 
 ## 2. Coverage gaps (failure scenarios no document covers)
 

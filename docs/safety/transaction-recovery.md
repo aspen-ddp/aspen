@@ -547,11 +547,12 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
 * **T11 (apply exactly once, mostly)** A committed transaction's update is applied to an object at most once on a store
   provided the requirements include a revision check on that object; blind KV updates and refcount updates rely on
   other mechanisms (F4).
-* **T12 (client independence)** The client can crash at any time without affecting safety. The only client-dependent
-  quantity is object data: a store without it withholds its vote up to `MissingDataWait`, votes abort afterwards, and holds
-  a commit decided without it until data arrives or `TxFinalized` (`commitAwaitsData`, `Tx.scala:165`). (addendum) The
-  client's prepare itself is now a dependency: a store that has seen none votes abort after the wait, for data-less
-  transactions too (prefer-abort, paxos 6.2 and P-N8).
+* **T12 (client independence)** The client can crash at any time without affecting safety. (addendum) The only
+  client-dependent input is the client's prepare, which carries the object data: a store that has seen no client
+  prepare checks no requirements, withholds its promise and vote up to `MissingDataWait`, and votes abort afterwards,
+  for data-less transactions too (prefer-abort, `Tx.scala:205-208,537-542`; paxos 6.2 and P-N8). A commit decided
+  without the store's data is held until the data, a client prepare, or `TxFinalized` arrives (`commitAwaitsData`,
+  `Tx.scala:239`).
 
 ## 9. Failure scenarios
 
@@ -1001,8 +1002,12 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > once, inside the stores' cache window, when no fresh Tx can be created (`Frontend.scala:787`). Needs D1's write to
 > outlast the cache window and the replay's fresh Txs to be alive when D1's message lands (until the replay's own late
 > resolution). The same class as paxos P-N3 (a non-late commit reaching a replay's fresh Txs).
-> *Fix sketch:* send D1's union `TxFinalized` with `late = true` once the stores may have forgotten T (its own
-> resolution is not late, but every acceptor finalized), or bound D1's wait and fall back to the case-3 lookup.
+> *Fix sketch:* a plain `late = true` is not enough: late messages carry an empty `owed` and stores ignore `owed` on
+> them (`TransactionDriver.scala:450`; `Frontend.scala:768`; `Tx.scala:935`), which reopens R-N7, and a replay's fresh
+> commit-vote Tx would then look up and find D1's entry and apply through it (`lateCommit`, `Tx.scala:1001-1005`).
+> Bounding D1's wait has the same flaw. Instead send the delayed message as late **but keep its `owed`**, and have
+> stores honour `owed` on late messages too: an owed store with a Tx writes the stub and applies nothing, and a store
+> without a Tx writes it on the no-Tx path.
 
 > **R-N9. Verdict: PLAUSIBLE (accepted residual, design A). Severity: stale-replica at a minority, self-healing.** A
 > store S named in `owed` that holds no Tx for T and never receives that `TxFinalized` writes no stub. The design

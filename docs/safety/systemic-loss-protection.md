@@ -340,7 +340,9 @@ The problem statement and sections 3 to 9 stand. Two interactions change:
 
 The addendum adds no declaration or discard path. It adds one kind of durable state, the applied stub, kept in the
 device CRL beside the transactions (crash-recovery-log.md 3.6), and destroyed by exactly the discards that already
-destroy CRL state (`dropStore`, a lost CRL, X1-X13 here). Losing stubs in a correlated event costs no data: a rebuilt
+destroy CRL state: in this document's discard inventory (section 4.2; its X ids are not cross-document-review's),
+X1 (a lost CRL renamed aside), X2 (`dropStore` on fail-stop), X3 (`discardLostStore`), X7 (`dropLeftoverCrlState`)
+and X13 (`UnloadFailedStore`); X12 moves them into `crl_save.log` with the transactions. Losing stubs in a correlated event costs no data: a rebuilt
 store is muted for older transactions, and its owed state comes back through the entries' reconcile (rebuild-process.md
 N3 for the clock caveat). A long repair stall, which a systemic event can cause, lets stubs accumulate against each
 device's CRL admission (crash-recovery-log.md F22): a stall, not a declaration. Prefer-abort makes a systemic client

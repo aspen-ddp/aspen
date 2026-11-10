@@ -4,7 +4,9 @@ Scope: only flaws that arise from combining mechanisms of different documents. P
 Refreshed 2026-11-09 against `0d08e3c6` (branch `pin_refactor`, replay pins): the horizon and `TransactionTooOld` are
 gone, TracelessCommits is UnackedCommits (entries for every committed transaction's unacknowledged voters), and
 forgotten transactions are guarded by the client pin rule and late commits (paxos-transactions.md 10.5). Each item
-below carries a refresh status; X11 and X12 are new.
+below carries a refresh status; X11 and X12 are new. Refreshed again 2026-11-10 against `c181375b` for the replay-pins
+addendum (prefer-abort driver prepares, applied stubs, `TxFinalized.owed`): X6, X10, X11 and X12 carry an addendum
+status, X13 and X14 are new.
 Paths are relative to src/main/scala/org/aspen_ddp/aspen/ unless noted. Verdicts: CONFIRMED (mechanism read in code, no guard
 found; trigger may still be rare), PLAUSIBLE (mechanism real, trigger/reachability uncertain), REFUTED (guard found).
 
@@ -137,6 +139,8 @@ Fix sketch: exempt (or reserve a lane for) transactions whose pool is a metadata
 ### X6. Missed delete marker is a prerequisite for repairing a missed allocation into a reused FSIF slot (FSIF Ruling 18 x repair x rebuild F9 x recovery F2)
 
 > **Refresh (replay pins): unchanged.**
+> **Refresh (addendum): unchanged; one more consequence.** The same give-up, in the second driver's handed-off write,
+> now also leaves the committed pools' UnackedCommits entries listed in no `owed` (X13).
 Verdict: PLAUSIBLE.  Severity: stale-replica (permanently missing slice); resurrection of the old object's zombie slice in the same event.
 Code: `FsifBackend.updateExt` (`server/store/backend/fsif/FsifBackend.scala:1273-1295`): a repair of object N at ext x never overwrites a different occupant; it returns
 `ObjectMismatch` and relies on "that missed delete heals first through repairDelete". `startRepairDelete` is id- and ext-checked (`:1457-1478`), so slot aliasing itself is REFUTED (see
@@ -184,6 +188,8 @@ Fix sketch: track misses of B-internal writes in an in-memory/CRL-backed list on
 ### X10. UnackedCommits / ErrorTree entries for a store are not bound to the store's incarnation (traceless design x rebuild x transfer x repair 12.6)
 
 > **Refresh (replay pins): unchanged; matters more.** An UnackedCommits entry now means "this store is owed T", and a late commit reads it (R-N1).
+> **Refresh (addendum): unchanged; one stub-specific case.** A rebuilt store has no stubs for the entries it inherits;
+> the mute protects it except with a fast client clock (rebuild-process N3, paxos P-N2).
 Verdict: PLAUSIBLE-low.  Severity: stale-replica.
 Keys are `(poolIndex, objectId)` / `(poolIndex, txid)`; values carry no incarnation. After an in-place rebuild or T12 move the new store consumes entries written for the old
 incarnation: harmless (reconcile is exact), but the opposite order is unprotected: entries consumed (deleted as complete) by the old incarnation shortly before its loss mean
@@ -206,6 +212,13 @@ where T has no pin of its own (blind or `replaySafe` writes, ABA-prone `DoesNotE
 pool; KeyRevision-checked writes are pins and fail), within each store's scan window of 30 s to 15 min. No closure is
 implemented.
 Fix sketch: as R-N1; and have an allocating update fail at apply when the backend already holds the object.
+> **Refresh (addendum): NARROWED.** Each P store that forgot T on a `TxFinalized` listing it in `owed` holds an applied
+> stub and applies nothing on step 3 (`Tx.scala:998-1000`), so the quorum overwrite needs entries without stubs: the
+> second driver's entries after its host crashed or its write gave up (transaction-recovery R-N7, X13), or a lost
+> `TxFinalized` of a re-run finalizer (R-N6). The never-saw-T minority (R-N9) reaches fewer than a quorum and is
+> reconciled from the majority. The end-to-end form of steps 1-3 (with a `DoesNotExist` insert instead of an
+> allocation) is ReplayIntegrationSuite's headline test, which now passes. The `Allocating` state is unchanged, so the
+> overwrite remains wherever a commit does reach a stubless store.
 
 ### X12. Recovering acceptor x replay x finalization re-run (paxos P-N3 x recovery R-N6 x requirements Q-N5)
 Verdict: PLAUSIBLE.  Severity: resurrection (blind writes), stale-replica (orphan allocation entries, regressed marks).
@@ -215,6 +228,34 @@ actions long after the original ran (Ruling 13): the allocation action may re-in
 (orphan), the marker re-marks stores and re-creates deleted UnackedCommits entries, and a replayed client prepare in the
 same window applies its blind writes on the non-late commit. Each step is accepted in isolation by a ruling; together
 they let one long outage plus one delayed duplicate leave three different kinds of residue.
+> **Refresh (addendum): NARROWED.** The re-created UnackedCommits entries come with a non-late `TxFinalized` listing
+> them, so every store with no Tx writes a stub (recovery R-N6); stores holding a stub apply nothing on the non-late
+> commit and are marked (paxos P-N3). Blind writes at stores that acknowledged in time, the regressed marks and the
+> orphan allocation entry remain.
+
+### X13. Second driver's entries x marker give-up x late commit (recovery R-N7 x X6 x R-N1; addendum)
+
+Verdict: PLAUSIBLE.  Severity: resurrection (unpinned-pool writes, possibly at a quorum).
+Ruling 3 makes a second driver D1, finalized by D0's non-late commit `TxFinalized`, wait for the entries its cancelled
+marker already handed off and list them in its own `TxFinalized` (`TransactionDriver.scala:414-437`). The stores forgot
+T on D0's message, so they get stubs for D1's entries only from D1's (`Frontend.scala:763-773`). D1's write can give up
+on a permanent error in one pool after another pool's batch committed (`MissedUpdateMarker.scala:153,157`); D1 then
+finalizes with D0's `owed` only (`TransactionDriver.scala:432`), and the committed pool's entries are listed nowhere.
+D1's host crashing between its write and its message has the same effect. D1 marks every store that did not report to
+it (voters unknown), which with `TxCommitted` going to `lastProposer` (paxos F10) can be a whole pool, so a replay
+before the scans re-applies at a quorum (X11 step 3). Each piece is accepted on its own (Ruling 3's residual, the
+deferred Task 3 minor, X6's give-up); together they reopen X11 for one pool.
+Fix sketch: as recovery R-N7; at least, on a give-up D1 could list the stores of the batches that did commit (the
+marker would have to report per-pool results instead of one all-or-nothing future).
+
+### X14. Ruling 3's delayed `TxFinalized` x status-cache expiry x replay (recovery R-N8 x paxos P-N3 x P17; addendum)
+
+Verdict: PLAUSIBLE (mechanism CONFIRMED).  Severity: resurrection (blind writes at stores that acknowledged in time).
+D1's non-late commit `TxFinalized` waits for its handed-off write, which retries without a deadline. Once the stores'
+finalized cache entries expire (7 s, paxos P17), a replayed client prepare creates fresh Txs, and D1's message resolves
+each of them committed (`Tx.scala:945-946`), applying the replay's data where no stub exists. The cache window that
+made D1's prompt `TxFinalized` harmless before Ruling 3 no longer covers it.
+Fix sketch: as recovery R-N8 (send it late once it may postdate the stores' forgetting).
 
 ## 2. Coverage gaps (failure scenarios no document covers)
 
@@ -229,7 +270,8 @@ G8. Clock: HLC skew no longer affects replay (the horizon is gone, paxos F3 fixe
 G9. Marker-batch size/limit: `TransactionCreationError` is treated as permanent (StopRetrying) and wedges finalization (recovery F2); no document asks which creation errors an oversized batch (256 entries x many objects) can hit.
 G10. Capacity interaction: ErrorTree growth during long outages (repair 13.3-6) x CRL admission (X5) x rebuild in-progress counts as failure budget (rebuild 6.3): no combined capacity argument.
 
-G11. Replay ordering: the replay integration tests deliver the leader's copy of the replayed client prepare last (the TestNetwork leader driver does not retransmit), so the ordering where a driver's data-less prepare reaches stores before the replayed client prepare is not exercised end to end. Reading the code (`Tx.awaitingData`, `Tx.scala:180-183`) it withholds the vote up to 5 s or until a proof exists; untested.
+G11. Replay ordering: the replay integration tests deliver the leader's copy of the replayed client prepare last (the TestNetwork leader driver does not retransmit), so the ordering where a driver's data-less prepare reaches stores before the replayed client prepare is not exercised end to end. *(Addendum: the headline stub test delivers the pool-B leader's copy before pool A's, because the default order dropped the provers' proofs at a leader with no driver yet (paxos P-N1). Prefer-abort makes a driver-first store withhold everything until the client's prepare arrives, then check it normally, or prove at once (`Tx.awaitingClientPrepare`, `Tx.scala:205-208`); FrontendSuite covers both at unit level, end to end is still untested.)*
+G13. (addendum) No document or test covers a second driver's handed-off entries across its host's crash (X13), nor a `TxFinalized` delivered after the stores' cache entries expired (X14).
 G12. amoebafs pre-existing bugs found during the refactor (cross-node rename whose delete joins into the target node updates it twice; stale `iptr` in `prepareMove`; `prepareDelete` able to end unpinned) are outside these documents' scope and are recorded in Todo.txt.
 
 ## 3. Inter-document contradictions
@@ -254,3 +296,7 @@ R4. Quorum of {rebuilt-stale S, current S2} committing on stale requirements: re
 R5. ErrorTree entries consumed by a rebuilding staging store: staging is a bare `Backend`, never a `Store`; `HostStoreView.repairable` excludes `rebuilding`; in-place rebuild keeps the store offline. Entries written during the rebuild wait for promotion. (Only the F4 crash window and X1 zombie bypass this.)
 R6. Metadata recursion deadlock (marker txn needing its own marker): `limitTracking` stops the recursion at the bootstrap pool; the marker for a pool's entries references the metadata pool only through different pools. No infinite recursion; residual issue is X9.
 R7. Device-CRL loss dropping commit votes that the other stores need: the lost store is offline for the rebuild duration, other holders answer, and the finalizer marks the silent store; confirmed except for X2's window.
+R8. (addendum) Applied-stub loss across rotation, transfer or adoption: stubs are copied forward by anchor, carried in `crl_save.log` and in the device CRL (crash-recovery-log F23). Only rebuild and CRL loss drop them (rebuild-process N3).
+R9. (addendum) The repair scan dropping a stub while a replay's late commit at that store looks up its entry: a stub holder never looks up, and the drop follows the entry's deletion (repair-process RP-N8).
+R10. (addendum) Prefer-abort turning CRL backpressure into abort votes for live clients: a known transaction's retransmit is admitted without a check, within the 5 s wait (paxos P-N9).
+R11. (addendum) A misdirected `owed`: every store of the transaction receives the same set and checks its own `StoreId`; a moved store keeps its `StoreId`, and a rebuilt one is muted for T, so a stub written there is harmless.

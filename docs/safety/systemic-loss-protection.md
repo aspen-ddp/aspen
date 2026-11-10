@@ -335,3 +335,14 @@ The problem statement and sections 3 to 9 stand. Two interactions change:
   lookup before its store drives it (transaction-recovery R-N3). A systemic event that also takes the metadata pool
   below a read quorum leaves recovered votes holding their locks with no driver until it returns: a stall, not a
   declaration, so it does not feed D1-D7.
+
+## 12. Refresh for the replay-pins addendum (2026-11-10, `c181375b`)
+
+The addendum adds no declaration or discard path. It adds one kind of durable state, the applied stub, kept in the
+device CRL beside the transactions (crash-recovery-log.md 3.6), and destroyed by exactly the discards that already
+destroy CRL state (`dropStore`, a lost CRL, X1-X13 here). Losing stubs in a correlated event costs no data: a rebuilt
+store is muted for older transactions, and its owed state comes back through the entries' reconcile (rebuild-process.md
+N3 for the clock caveat). A long repair stall, which a systemic event can cause, lets stubs accumulate against each
+device's CRL admission (crash-recovery-log.md F22): a stall, not a declaration. Prefer-abort makes a systemic client
+outage abort orphaned data-less transactions rather than commit them (paxos-transactions.md P-N8), which is the
+intended direction.

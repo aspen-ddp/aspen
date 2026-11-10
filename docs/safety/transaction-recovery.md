@@ -4,7 +4,11 @@ Status: derived from the code at commit `c3ad5493` (main); refreshed 2026-11-09 
 `pin_refactor`, replay pins: `docs/superpowers/specs/2026-11-09-replay-pins-design.md`). The horizon, `TransactionTooOld`
 and the UnackedCommits name are gone: the tree is now UnackedCommits, with entries for every committed transaction,
 and forgotten transactions are protected by the pin rule and late commits. Every mechanism below was checked against
-the source; line numbers in passages the refresh did not touch are for `c3ad5493`, refresh evidence is for `0d08e3c6`. Paths are relative to `src/main/scala/org/aspen_ddp/aspen/` unless they start with `docs/`.
+the source; line numbers in passages the refresh did not touch are for `c3ad5493`, refresh evidence is for `0d08e3c6`.
+Refreshed again 2026-11-10 against `c181375b` for the replay-pins addendum
+(`docs/superpowers/specs/2026-11-09-replay-pins-addendum-design.md` and its amendments): prefer-abort driver prepares,
+applied stubs and `TxFinalized.owed`; passages it changed are marked "(addendum)" and cite `c181375b`.
+Paths are relative to `src/main/scala/org/aspen_ddp/aspen/` unless they start with `docs/`.
 
 Sibling documents (not duplicated here): [paxos-transactions.md](paxos-transactions.md),
 [crash-recovery-log.md](crash-recovery-log.md), [transaction-requirements.md](transaction-requirements.md),
@@ -78,7 +82,7 @@ Defaults in production (`cmdline/Main.scala:1724-1749`): `txHeartbeatPeriod` = 1
 | `Driver.heartbeat` | every store heartbeat | `TransactionDriver.scala:184` | `TxHeartbeat` to all stores while not finalized (first tick sends none); `TxFinalized` while finalized |
 | `errorTimeout` | 2 s | `MissedUpdateFinalizationAction.scala:138` | Finalizer waits this long for `TxCommitted` before marking silent stores |
 | `Tx.CollisionWait` | 500 ms (+ up to 1 s heartbeat granularity) | `Tx.scala:26` | Votes withheld for a lock holder the Tx builds on |
-| `Frontend.MissingDataWait` | 5 s | `Frontend.scala:27`, used `Tx.scala:146` | Vote withheld waiting for the client's per-store object data |
+| `Frontend.MissingDataWait` | 5 s | `Frontend.scala:27`, used `Tx.scala:207` | (addendum) Promise and vote withheld by a Tx that has seen no client prepare (prefer-abort); afterwards it votes abort with its requirements unchecked |
 | `Frontend.UnackedLookupTimeout` | 5 s | `Frontend.scala:32`, `:401-411` | Re-issues an unanswered UnackedCommits lookup |
 | `Tx.StuckReportAfter/Every` | 2 s / 5 s | `Tx.scala:20` | Logging only |
 
@@ -94,7 +98,9 @@ Required relationships (the code states the first three; the rest I derived):
   driver's finalizer is restarted by a recovery driver after 5-6 s, and the original `errorTimeout` timer must not be
   the thing that delays the takeover's finalizer. With 2 s there is room for one full retry of the mark.
 * **TR4** `CollisionWait` (0.5-1.5 s) `< MissingDataWait` (5 s) `< ` the client's patience; both are vote-withholding
-  timers, bounded so that a driver never waits on them past `txHeartbeatTimeout`.
+  timers, bounded so that a driver never waits on them past `txHeartbeatTimeout`. (addendum) Also client
+  `txRetransmitDelay` (1 s, `cmdline/Main.scala:1268`) `< MissingDataWait`: a live client's retransmit must land within
+  the prefer-abort wait, or a store that missed its first prepare votes abort (paxos P-N8).
 * **TR5** Driver silence must be shorter than `txHeartbeatTimeout`. The driver comment (`TransactionDriver.scala:181-183`)
   claims at most two periods of silence; `maxDelay` (3 s) rebroadcasts are independent of heartbeats.
 * **TR6** Status-cache entries must survive until every store that could still be idle has taken over: this is TR1.
@@ -133,7 +139,9 @@ arbitrates (4.3). The extra drivers cost messages and each runs its own finalize
 
 A driver is discarded only when its store receives a `TxFinalized` for the transaction (`Store.scala:181-184`;
 `onFinalized` also calls `shutdown()` which cancels its timer, `TransactionDriver.scala:392`). There is no timeout, no
-cap. Since Ruling 31 `Store.close` shuts its drivers down (F12).
+cap. Since Ruling 31 `Store.close` shuts its drivers down (F12). (addendum, Ruling 3) Only a finalized driver is
+dropped (`mayBeDiscarded`, `Store.scala:214-219`): one waiting for its own handed-off entries stays until its own
+`TxFinalized`, which reaches its store too.
 
 ### 4.2 How the outcome is learned (without having been the proposer)
 
@@ -150,8 +158,11 @@ A recovery driver sends `TxPrepare(fromClient=false)` with a fresh proposal id t
 3. **Live `Tx`** (`Frontend.scala:632-633`): the existing `Tx.receivePrepare` answers with its stored vote and acceptor
    promise (`Tx.scala:730-749`; the response is sent only after the CRL save of the acceptor state is durable). A `Tx`
    that already applied the commit also resends `TxCommitted` to the proposer (`Tx.scala:695-699`).
-4. **Unknown to the store, no cache entry**: a fresh `Tx` is created (`Frontend.scala:671-691`) and evaluates
-   requirements normally, whatever its age. On the abort path, a memoryless acceptor whose object already shows the
+4. **Unknown to the store, no cache entry**: a fresh `Tx` is created (`Frontend.scala:671-691`). (addendum) A
+   recovery driver's prepare is prefer-abort: the fresh Tx checks no requirements. Once its objects load it proves to
+   this driver if an object shows the update, and otherwise withholds promise and vote until a client prepare arrives
+   or `MissingDataWait` (5 s) passes, then votes abort (`Tx.scala:205-208,537-542`; paxos 6.2). A client prepare is
+   checked normally, whatever its age. On the abort path, a memoryless acceptor whose object already shows the
    update sends the proposer a proof (`TxResolved(proof = true)`, `Tx.scala:548-550,585-597`) instead of a vote; the
    driver then never proposes abort and resolves late on a memoryless post-proof quorum. A muted Tx (rebuilt store,
    older transaction) proves or is forgotten unanswered.
@@ -203,7 +214,8 @@ Guarantees:
   keeps the Tx (Ruling 9, `Tx.scala:997-1010`). The finalizer runs `MissedUpdateFinalizationAction` only after every
   other action completed (`RegisteredTransactionFinalizerFactory.scala:37-42`, Ruling 8), so a durable entry implies
   all other actions are done. The exceptions are a muted Tx and a prover, neither of which voted commit, and a
-  status-cache entry that expires (7 s).
+  status-cache entry that expires (7 s). (addendum) A committed Tx forgotten where an UnackedCommits entry may name its
+  store replaces its CRL record by an applied stub instead of deleting it (`Frontend.scala:654-674`); 5.4.
 
 ## 5. Feeding missed updates into repair (R6)
 
@@ -244,6 +256,11 @@ the entry is about).
   `UnknownStoragePool` and `TransactionCreationError` give up (`:377-386`).
 * The action completes (and so the transaction can finalize) only when the marker's future succeeds
   (`MissedUpdateFinalizationAction.scala:101-106`). If the marker gives up, the action never completes (F2).
+* (addendum) Once the marks are handed to the marker (`handedOff`, Ruling 2), only the write's callback completes the
+  action, after setting `owed` to the stores of the UnackedCommits entries it wrote
+  (`MissedUpdateFinalizationAction.scala:140-151`); a late all-clean `TxCommitted` no longer completes it early
+  (`:77`). `pendingOwed` exposes the in-flight write, unaffected by `cancel` (`:60-61`), and fails if the write gives
+  up.
 
 ### 5.3 What this guarantees, and what it depends on
 
@@ -258,11 +275,45 @@ the entry is about).
   reconcile is exact and a store already at the committed state is left alone, `server/store/Reconcile`).
 * The scan side (repair-process.md): `StoreRepairer.scan` skips UnackedCommits entries for transactions the store still
   holds live (`StoreRepairer.scala:237-240` via `Frontend.mayHoldTransaction`); until the scan deletes an entry, a late
-  commit at that store applies T again (R-N1).
+  commit at that store applies T again (R-N1). (addendum) Unless the store holds an applied stub for T (5.4), which it
+  writes when it forgets T on a `TxFinalized` listing it, or after applying T through the entry.
 * Dependency inversion to be aware of: **finalization of any transaction in which a store goes quiet depends on a
   successful write to that pool's ErrorTree/UnackedCommits trees**, which needs a write quorum of the metadata pool.
   While that write is retried, `TxFinalized` is withheld, every store keeps the CRL entry and the host-wide
   status cache keeps no `finalized` entry.
+
+### 5.4 Applied stubs and `TxFinalized.owed` (addendum)
+
+An **applied stub** (S, T) is a durable CRL record meaning "S already holds T's update, so an UnackedCommits entry
+naming S for T is stale" (`StoreRecoveryState`, crash-recovery-log.md 3.6). The Frontend keeps the set in memory
+(`Frontend.scala:374-415`).
+
+* **`owed`.** A commit `TxFinalized` lists the stores the finalizer's marker wrote entries for. The driver sets it in
+  the same critical section as finalization, from the finalizer's `owedStores` unioned with any `owed` received from
+  another driver; it is empty for aborts and late commits (Ruling 4, `TransactionDriver.scala:447-451`), and the
+  finalized relay sends none (`Store.scala:178`). Heartbeat resends carry it (`:206-215`).
+* **Second driver (Ruling 3).** A driver D1 finalized by D0's non-late commit `TxFinalized` while D1's own marker has
+  handed entries off records D0's `owed`, waits for its own write, then sends its own `TxFinalized` with the union
+  (`TransactionDriver.scala:414-437`); its store keeps it until then (`Store.scala:214-219`).
+* **Write points** (Ruling 1: where the record would be deleted, after the backend commits persist; never while they
+  are outstanding or failed, `Frontend.recordAppliedStub` requires it, `:395-409`):
+  1. `TxFinalized(commit, non-late)` naming S: the Tx sets `stubDue` (`Tx.scala:935-936`) and finalizes with
+     `writeStub` (`:959`); with no Tx the Frontend writes it directly, or hands it to a Tx whose commit is held for its
+     turn (`Frontend.scala:763-773`, `deferredFinalizations` `:221-224`).
+  2. S applied T through its entry (`unackedCommitFound`, `Tx.scala:1092`, recovered vote or held late commit).
+  3. Fallback: a Tx resolved committed and reached by a late commit with neither (its `TxFinalized` was lost) looks up
+     its entry, writes a stub if found, and is forgotten either way (`Tx.scala:990-997,1079-1086,1127-1131`); a failed
+     lookup is retried at heartbeat.
+* **The check.** `doCommit` with a stub applies nothing and reports T's changed objects as uncommitted
+  (`Tx.scala:642-648`); a late commit reaching an undecided commit vote with a stub, or a held late commit whose stub
+  arrived during its lookup, applies nothing (`:998-1000`, `:1087-1088`). A recovered non-late commit vote with a stub
+  resolves committed through `doCommit` and stays until `TxFinalized` (Ruling 5).
+* **Cleanup.** The repair scan drops S's stub for T when it deletes entry (S, T), and drops stubs read before the walk
+  whose txid had no entry in it and whose point lookup finds none (Ruling 6, `StoreRepairer.scala:144-183,304`;
+  repair-process.md 5.5).
+* **Residual (design A).** A store named in `owed` that never receives that `TxFinalized` and holds no Tx for T: by the
+  design's argument it never saw T, so at most `w - t` of a pool (R-N9). Ruling 3's residual (R-N7) and a lost
+  `TxFinalized` of a re-run finalizer (R-N6) are not bounded that way.
 
 ## 6. Participant recovery (R2, R5, R7)
 
@@ -352,7 +403,10 @@ after the other stores finalized and forgot. S's recovery driver prepares them; 
 check requirements against *current* state. (Refreshed for replay pins; the horizon defence is gone.)
 
 **Answering side (peers).**
-* No age test: the fresh `Tx` checks requirements normally (`Frontend.scala:671-691`). T's pin fails at them.
+* No age test. (addendum) S's driver sends prefer-abort prepares, so the fresh `Tx` checks no requirements: it proves
+  if an object shows T's update, and otherwise votes abort after `MissingDataWait` (`Tx.scala:205-208,537-542`). Before
+  the addendum it checked requirements and T's pin failed; the answer is the same, delayed up to 5 s, and it can no
+  longer be a fresh commit vote (which closes the re-driven abort, paxos P-N4).
 * Proof of commit on the abort path: a memoryless acceptor whose object shows T's update (`RequirementsApplyer.appliedBy`)
   sends a proof to the proposer instead of a vote (`Tx.scala:548-550,585-597`) and stays live, applying nothing whatever
   the outcome (`applyNothing`, `:941-964`).
@@ -378,7 +432,9 @@ txStatus == Unresolved && oresolution.isEmpty`, for every transaction, not only 
 
 **Late commit at any commit voter** (`Tx.lateCommit`, `Tx.scala:920-932`), recovered or live: held for a lookup started
 then; found, it applies and is forgotten as finalized; absent, it applies nothing. Any Tx without its own commit vote
-applies nothing.
+applies nothing. (addendum, `Tx.scala:984-1007`) A stub held means it applies nothing without a lookup; a found entry
+writes a stub as the Tx is forgotten; a Tx already resolved committed looks its entry up before it is forgotten
+(5.4, case 3).
 
 ### 6.6 What happens if a forgotten commit is aborted anyway
 
@@ -397,7 +453,8 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
         load objects (pendingObjectLoads)  --- recovered: Frontend orders completions
                     |
      [Undetermined] --determineDisposition--> [VoteCommit | VoteAbort | withheld]
-        withheld while: awaitingData (<5 s, no client data) / waitingOn holders (<0.5 s) / awaitingCommits (in-flight commit)
+        withheld while: awaitingClientPrepare (<5 s, no client prepare, promise withheld too) / waitingOn holders (<0.5 s) / awaitingCommits (in-flight commit)
+        no client prepare after the wait: VoteAbort (NoClientPrepare), requirements unchecked, or a proof
                     |
      CRL.save(vote + acceptor)  ---durable--->  TxPrepareResponse sent
                     |
@@ -410,11 +467,14 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
         commit: commitAwaitsData? holdForTurn? -> doCommit -> backend commits -> TxCommitted -> (CRL data drop in memory)
                     |
    TxFinalized(c) -> finalized(c): statusCache(c, finalized=true); CRL entry deleted once backend commits ok
+                     (or replaced by an applied stub: owed names this store, or it applied T through its entry)
                     |
               Frontend forgets Tx
+ commit at a store holding an applied stub: doCommit applies nothing, TxCommitted reports T's objects
  recovered + VoteCommit + Unresolved: lookup UnackedCommits (no driver until answered); abort held until a later
                     lookup is absent; entry found -> resolved(true), applied, kept until TxFinalized
- late commit (TxResolved/TxFinalized late=true): own commit vote -> lookup -> found: apply + forget / absent: applyNothing;
+ late commit (TxResolved/TxFinalized late=true): own commit vote -> lookup -> found: apply + stub + forget / absent: applyNothing;
+                    stub held -> applyNothing; already resolved committed -> lookup -> found: stub / absent: delete; forget
                     no commit vote or prover -> applyNothing (no TxCommitted, forgotten)
 ```
 
@@ -429,7 +489,8 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
    resolved(c): commit => finalizer.create (actions execute) ; abort => finalized immediately
    -> send TxResolved (all data stores + notifyOnResolution + client) ; keep re-sending TxResolved to stores not known resolved
    -> commit: wait finalizer.complete ==> finalized => TxFinalized to stores, TransactionFinalized to client
-   discarded when this store receives any TxFinalized for the txid (Store.scala:181)
+   discarded when this store receives any TxFinalized for the txid (Store.scala:181), once the driver is finalized
+     (addendum: a driver waiting for its handed-off entries finalizes later with owed = received owed ∪ its own)
    Nack at any phase => nextRound() with randomized backoff
 ```
 
@@ -477,7 +538,10 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
   forgotten, pinned transaction cannot collect `t` commit votes on its pinned object; with a proof it resolves late and
   is applied only where an UnackedCommits entry says it is owed. Holds independent of clocks. Exceptions: `replaySafe`
   transactions; stores with entries left over from a late acknowledgement (R-N1); a recovering acceptor that still holds
-  the accepted commit (paxos P-N3); forgotten *aborts* (paxos P-N4).
+  the accepted commit (paxos P-N3); forgotten *aborts* (paxos P-N4). (addendum) A store holding an applied stub never
+  applies T again (5.4), which narrows R-N1 to stores with an entry and no stub (R-N7 to R-N9); forgotten aborts are
+  re-decidable only by a delayed duplicate client prepare (P-N4 narrowed); Ruling 3's delayed non-late `TxFinalized`
+  joins P-N3 (R-N8).
 * **T10 (missed commits are repairable)** A store that does not apply a committed update either recorded it in the ErrorTree/
   UnackedCommits trees (T8) or can only have stayed behind because the tree write failed permanently (F2).
 * **T11 (apply exactly once, mostly)** A committed transaction's update is applied to an object at most once on a store
@@ -485,7 +549,9 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
   other mechanisms (F4).
 * **T12 (client independence)** The client can crash at any time without affecting safety. The only client-dependent
   quantity is object data: a store without it withholds its vote up to `MissingDataWait`, votes abort afterwards, and holds
-  a commit decided without it until data arrives or `TxFinalized` (`commitAwaitsData`, `Tx.scala:165`).
+  a commit decided without it until data arrives or `TxFinalized` (`commitAwaitsData`, `Tx.scala:165`). (addendum) The
+  client's prepare itself is now a dependency: a store that has seen none votes abort after the wait, for data-less
+  transactions too (prefer-abort, paxos 6.2 and P-N8).
 
 ## 9. Failure scenarios
 
@@ -496,7 +562,7 @@ Notation: L = designated leader store/driver; S = an arbitrary participant store
 | Crash point | Outcome | Why safe / not |
 |-------------|---------|----------------|
 | Before sending any prepare | Transaction does not exist. Allocated objects were never created | Nothing durable on stores. Client's local pointers are lost: leaks nothing on stores |
-| After prepare to a subset of stores, not to L | The stores that got it create `Tx`s; L starts no driver. After 5-6 s idle (client prepares do not count as events) the first idle store starts a recovery driver, whose data-less prepares reach L and the rest | Safe: T3. Stores that never got data withhold votes for up to 5 s then vote abort (`awaitingData`); the transaction may abort or commit with fewer stores; a commit decided without a store's data is held there until data/TxFinalized, then repair (R6) |
+| After prepare to a subset of stores, not to L | The stores that got it create `Tx`s; L starts no driver. After 5-6 s idle (client prepares do not count as events) the first idle store starts a recovery driver, whose data-less prepares reach L and the rest | Safe: T3. Stores that never got the client's prepare withhold promise and vote for up to 5 s then vote abort, requirements unchecked (`awaitingClientPrepare`, addendum; data-less transactions too); the transaction may abort or commit with fewer stores; a commit decided without a store's data is held there until data/TxFinalized, then repair (R6) |
 | After prepare to all stores, before result | Normal completion by L; client never learns | Safe. A later retry by a new client instance would be a new txid |
 | After result (committed), before using it | Committed | Safe. The caller's state (e.g. the pointer to an allocated object stored in another object by the same transaction) is whatever the transaction wrote (guideline in CLAUDE.md) |
 | Client survives but its TransactionFinalized/Resolved messages are lost | It retransmits prepares forever (logs "HUNG Client Transaction" every 3 retries). Stores that know the txid answer from cache/`Tx`. After the cache expires, those prepares are ignored or answered from `Frontend.receivePrepare` (finalized cache) or, unknown, checked afresh: with a proof the driver resolves late and the client gets committed; without one the client can get `TxResolved(abort)` for a committed transaction (F8, narrowed) |
@@ -563,7 +629,8 @@ Notation: L = designated leader store/driver; S = an arbitrary participant store
   if it was a counted voter. If it crashes before `TxFinalized`, its recovered `Tx` finds the entry and "applies" via
   `doCommit`; revision- and per-write-checked updates are skipped; blind KV may re-apply (F4). If it does not crash, the
   repair scan sees the store is current and deletes the entry; until then a replay's late commit re-applies T's blind
-  writes there (Ruling 17, R-N1).
+  writes there (Ruling 17, R-N1). (addendum) Not if it forgot T on a `TxFinalized` listing it in `owed`: it then
+  holds an applied stub and applies nothing; the scan drops the stub with the entry (5.4).
 * **Store applied but crashed before the backend commit**: covered in 9.2 (no `TxCommitted` sent, marked, replayed from
   CRL or repaired).
 
@@ -594,6 +661,20 @@ or an assumption I could not verify).
 | F16 | unchanged | Leader trigger is still `notFinalized` | `Store.scala:182-184` |
 | F17 | unchanged (open) | Not re-derived | |
 | F18 | **narrowed** | No driver starts while the store's CRL state loads or a recovered vote awaits its first lookup | `Store.scala:95-98`; `Frontend.scala:99` |
+
+### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| R-N1 | **narrowed** | A store that forgot T on a `TxFinalized` listing it in `owed`, applied T through its entry, or found its entry through the case-3 lookup holds an applied stub and applies nothing on a replay's commit, late or not. The R-N1 quorum scenario is tested end to end (ReplayIntegrationSuite "a replay at a pool whose stores all acknowledged late leaves every store unchanged"). Remaining: stores with an entry and no stub: the self-healing minority that never saw T (R-N9), Ruling 3's residual (R-N7), and a lost `TxFinalized` after a re-run finalizer (R-N6) | `Tx.scala:642-648,935-936,984-1007,1078-1092`; `Frontend.scala:763-773` |
+| R-N3 | unchanged (widened slightly) | The case-3 lookup also depends on the metadata group, but holds no locks: a committed, applied Tx stays in memory (status cache not yet finalized) until the lookup answers or a non-late `TxFinalized` arrives (R-N10) | `Tx.scala:990-997`; `Frontend.scala:484-494` |
+| R-N4 | unchanged (cost added) | Each entry for a store that forgets T on a listing `TxFinalized` now also costs one stub in the device CRL until the scan drops it (repair-process RP-N6) | `Frontend.scala:395-409` |
+| R-N6 | **narrowed** | The re-run marker's entries come with a non-late `TxFinalized` listing them; stores with no Tx write stubs (`Frontend.scala:763-773`), so the re-created entries no longer re-arm R-N1 unless that `TxFinalized` is lost at a store. The ErrorTree regression and the orphan allocation entry are unchanged | as cited |
+| F2 / R-N2 | unchanged | Still no failure path. With Ruling 3 a give-up of the second driver's handed-off write finalizes it with only the other driver's `owed` (R-N7) | `TransactionDriver.scala:430-433` |
+| F3 | unchanged | A live commit voter still accepts an abort at once; the late-commit half is now covered by stubs too | `Tx.scala:176-178` |
+| F4 | unchanged | A crash between the backend commit and the stub's (or deletion's) durability still recovers the Tx and can re-apply a blind write through `unackedCommitFound`: the stub in memory is lost with the crash, and the record it would have replaced is still there | `Frontend.scala:395-409`; `Tx.scala:1089-1100` |
+| F12 | unchanged | Store close still shuts its drivers down; a driver waiting for its entries is shut down too, and may still send its `TxFinalized` from a pending callback (Task 3, harmless) | `Store.scala:68-72` |
+| T12 | **changed** | The client's prepare, not only its data, is now needed for a store's vote (paxos P-N8) | `Tx.scala:205-208` |
 
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness.** RegisteredTransactionFinalizerFactory.create does getType(...).get (server/RegisteredTransactionFinalizerFactory.scala, create); it runs inside TransactionDriver.onResolution after `resolved = true` and before `finalizer =` and before queueTxMessages (TransactionDriver.scala:471-520), the exception escapes the handler; periodic TxResolved (SimpleTransactionDriver.scala:42-47) still tells stores, but no finalizer ever exists. Needs a host lacking a registered type (version skew, partial --load-jars).
 > *Fix sketch:* Catch creation failure, leave resolved=false so the driver retries, and surface an error; or refuse to drive txds with unknown types.
@@ -829,6 +910,14 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > Ruling 17 amendment say the same.
 > *Fix sketch:* have a late commit apply only objects whose state still predates T (for KV, keys absent from or older
 > than T), or record "acknowledged late" so the scan, or a late Tx, can tell an owed store from a late one.
+>
+> **Refresh (addendum): NARROWED. Verdict for the residual: PLAUSIBLE.** The user chose the second fix sketch (option b,
+> applied stubs; 5.4). A late-acknowledging store forgets T on a `TxFinalized` whose `owed` lists it and replaces its
+> record by a stub (`Tx.scala:935-936,959`); a replay's fresh Tx there votes commit as before but applies nothing on the
+> late commit (`Tx.scala:998-1000`), nor on a non-late one (`:642-648`). The quorum scenario above is the
+> ReplayIntegrationSuite headline test, which failed before the change ("no pool-B store applied T again"). What
+> remains is any store holding an entry for T and no stub: R-N7 (Ruling 3, can reach a quorum), R-N9 (never saw T, at
+> most `w - t`, self-healing) and R-N6's lost `TxFinalized`.
 
 > **R-N2. Verdict: CONFIRMED. Severity: stale-replica (lost marks) plus F2's hang.** Ruling 8 runs the marker only when
 > `Future.sequence(first.map(_.complete))` succeeds (`RegisteredTransactionFinalizerFactory.scala:39-42`). A failed
@@ -869,13 +958,94 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > long-gone T: its blind upsert can replace a newer ErrorTree entry's `missedTimestamp` with T's (repair F10) and
 > re-create UnackedCommits entries the scan already deleted, re-arming R-N1. `AllocationFinalizationAction` re-run after
 > the object's deletion inserts an orphan entry (Ruling 28, transaction-requirements Q-N5).
+>
+> **Refresh (addendum): NARROWED.** The re-run is a non-late resolution, so its `TxFinalized` lists the re-created
+> entries in `owed`, and every store with no Tx for T writes a stub for them (`Frontend.scala:763-773`): the re-arming
+> of R-N1 is closed wherever that message arrives. Every store has long forgotten T here, so a store that misses it is
+> not bounded by R-N9's `w - t` argument (no Tx does not imply "never saw T"); only message loss leaves it exposed, and
+> the driver resends `TxFinalized` only until its own store receives it. The ErrorTree regression and the orphan
+> allocation entry are unchanged.
+
+### 10.0a New findings from the addendum refresh (2026-11-10, `c181375b`)
+
+> **R-N7. Verdict: PLAUSIBLE (accepted residual, Ruling 3). Severity: resurrection (unpinned-pool writes, can reach a
+> quorum).** A second driver D1, finalized by D0's non-late commit `TxFinalized` after its own marker handed entries
+> off, writes those entries later and lists them only in its own `TxFinalized` (`TransactionDriver.scala:414-437`).
+> The stores forgot T on D0's `TxFinalized`, so a store named only by D1 gets its stub only from D1's message, on the
+> no-Tx path (`Frontend.scala:763-773`). Two ways it never arrives:
+> 1. D1's host crashes after the entries commit and before its `TxFinalized` reaches the stores (the accepted residual).
+> 2. D1's write gives up on a permanent error in one pool after another pool's batch committed (`MissedUpdateMarker`
+>    is all-or-nothing, `:73`, StopRetrying at `:153,157`): `pendingOwed` fails and D1 finalizes with D0's `owed` only
+>    (`result.getOrElse(Set())`, `:432`), so the committed batch's stores are listed nowhere (the deferred Task 3
+>    minor; X6's give-up).
+> D1 marks every store that sent it no `TxCommitted` (voters unknown when it learned the outcome another way:
+> `MissedUpdateFinalizationAction.scala:130-136`), and stores send `TxCommitted` to their `lastProposer`, usually D0
+> (paxos F10). So D1's entries can name a whole pool, and a replay's late commit then re-applies T at a quorum through
+> them, the R-N1 scenario. Narrow: D1 must have resolved commit at least `errorTimeout` before D0's `TxFinalized`
+> reached it, plus a crash in a short window or a permanent marker error, plus a replay before the scans. Also
+> (liveness): a write that never succeeds keeps D1 in its store's driver map, sending `TxHeartbeat`s, until the store
+> closes.
+> *Fix sketch:* have D1 write no entries for stores D0 already listed or that acknowledged to anyone (needs the stores'
+> acknowledgement, not the driver's), or have the case-3 lookup also run for a store with no Tx that is named in a
+> later entry; the user accepted the residual over the alternative (D1 writes no entries).
+
+> **R-N8. Verdict: PLAUSIBLE (mechanism CONFIRMED). Severity: resurrection (blind writes at stores that acknowledged in
+> time).** Ruling 3 lets a non-late commit `TxFinalized` arrive long after the transaction was finalized and forgotten:
+> D1 sends it only once its handed-off write is durable (`TransactionDriver.scala:428-433`), and the marker retries
+> with backoff without a deadline. Trace: the stores forget T on D0's `TxFinalized`, their finalized status-cache
+> entries expire after 7 s, and a replayed client prepare of T then creates a fresh Tx (`Frontend.scala:797-810`); at a
+> store hosting a blind-written object of an unpinned pool it votes commit. D1's `TxFinalized(committed, late = false)`
+> reaches that Tx: not a prover, not late, so `finalized(true)` (`Tx.scala:945-946`) resolves it committed and
+> `doCommit` applies the replay's data (`:635-650`, requirements re-checked: blind writes pass). A store with a stub
+> skips (`:642-648`); a store that acknowledged D0 in time has none. Before Ruling 3, D1 finalized on D0's message at
+> once, inside the stores' cache window, when no fresh Tx can be created (`Frontend.scala:787`). Needs D1's write to
+> outlast the cache window and the replay's fresh Txs to be alive when D1's message lands (until the replay's own late
+> resolution). The same class as paxos P-N3 (a non-late commit reaching a replay's fresh Txs).
+> *Fix sketch:* send D1's union `TxFinalized` with `late = true` once the stores may have forgotten T (its own
+> resolution is not late, but every acceptor finalized), or bound D1's wait and fall back to the case-3 lookup.
+
+> **R-N9. Verdict: PLAUSIBLE (accepted residual, design A). Severity: stale-replica at a minority, self-healing.** A
+> store S named in `owed` that holds no Tx for T and never receives that `TxFinalized` writes no stub. The design
+> argues S never saw T (a store that saw T holds a Tx until `TxFinalized` or a late outcome, and the case-3 lookup covers
+> a lost `TxFinalized` there, `Tx.scala:990-997`), and T committed with a write threshold of commit votes in every
+> pool it writes, so such stores are at most `w - t` of a pool. Confirmed for the ordinary path. A replay's late commit
+> then applies T at S through its entry (`unackedCommitFound`); S also holds an ErrorTree mark and the entry itself,
+> and the scan reconciles S from the majority before deleting the entry. Two caveats: the bound does not hold where
+> every store has already forgotten T (R-N6's re-run, R-N7), and the heal fails if the late commit's lookup read the
+> entry before a concurrent scan deleted it and its answer is handled after the scan's reconcile (a lookup race that
+> predates the addendum; a stub holder is immune because it never looks up, `Tx.scala:998-1000`).
+
+> **R-N10. Verdict: CONFIRMED (liveness, by design). Severity: liveness (memory, status-cache lag).** The case-3
+> fallback holds a committed, applied Tx until its UnackedCommits lookup answers (`forgetLookupHeld`,
+> `Tx.scala:990-997`; retried at heartbeat, `Frontend.scala:484-494`). It holds no locks, but it is not finalized in
+> the status cache meanwhile, and with the metadata group unreadable it stays until a non-late `TxFinalized` arrives,
+> which may never come (the driver that would send it finalized long ago). Same dependency as R-N3, without the lock
+> cost (Task 4 concern 5).
+
+> **R-N11. Verdict: PLAUSIBLE (very narrow). Severity: stale-replica at one store, self-healing.**
+> `deferredFinalizations` is keyed by txid and `transactionFinalized` removes the key whatever Tx calls it
+> (`Frontend.scala:221-224,654-655`). If a Tx A is finalized while its commit is held for its turn, and a second Tx B
+> for the same txid is created and finalized meanwhile (a replay's, possible only once the host's finalized status
+> entry for T is gone: size-evicted, or expired because A's commit stayed held for more than 7 s behind a slow or hung
+> backend commit, transaction-requirements F12), B's finalization removes A's registration. A later `TxFinalized`
+> listing the store then takes the no-Tx path and writes the stub at once (`:768-773`): A's state is replaced while
+> its commit has not been issued, and when it is, `doCommit` sees the stub and applies nothing. The store lacks T, but its UnackedCommits entry
+> (it is in `owed`) drives repair from the majority. Deferred Task 4 minor.
+
+> **R-N12. Verdict: REFUTED (harmless).** A stub may be written for a store that does not hold T: an owed store that
+> never saw T (no-Tx path), a found entry whose local apply was skipped, and `issueCommits` skipping every object
+> because of an earlier failed backend commit (`Tx.scala:669-676`), after which `concludeTransactionState` writes the
+> stub at once (deferred Task 4 minor). Each such store is named in an UnackedCommits entry (that is why the stub is
+> written) or reported its objects in `TxCommitted`, so repair restores it; the stub only stops a replay from
+> applying T there, which the design wants ("must not apply through a replay"). A failed earlier commit also forces
+> every later transaction on the object to vote abort until the store reloads (`BackendCommitFailed`).
 
 ### 10.1 Mapping to the requested hazard classes
 
 | Hazard | Flaws |
 |--------|-------|
 | Lose a committed update | F3, F5, F6, F13 (all on a lagging store, rescued only by repair); paxos P-N2 (late in the live window) |
-| Apply an aborted update | none found for the UnackedCommits path (entries exist only for committed transactions); paxos P-N4 (a forgotten abort re-decided commit) |
-| Replay a forgotten transaction | F4 (narrowed), F10 (narrowed), R-N1, paxos P-N3; F7 and F9 fixed |
+| Apply an aborted update | none found for the UnackedCommits path (entries exist only for committed transactions); paxos P-N4 (a forgotten abort re-decided commit; addendum: only by a delayed duplicate client prepare) |
+| Replay a forgotten transaction | F4 (narrowed), F10 (narrowed), R-N1 (narrowed by stubs), R-N7, R-N8, R-N9, paxos P-N3; F7 and F9 fixed |
 | Fail to record a missed update | F2 (permanent marker failure), R-N2, F14; F13 |
-| Hang forever | F1, F2, F12; F14 (long); R-N3 (recovered votes without lookups) |
+| Hang forever | F1, F2, F12; F14 (long); R-N3 (recovered votes without lookups); R-N10 (case-3 lookup, no locks) |

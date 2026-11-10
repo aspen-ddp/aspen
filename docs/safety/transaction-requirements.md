@@ -4,7 +4,8 @@ Status: derived from the code at commit `c3ad5493` (2026-11-09); refreshed 2026-
 `pin_refactor`, replay pins: `docs/superpowers/specs/2026-11-09-replay-pins-design.md`). New since then: the client
 pin rule (2.5), derived per-write checks on TKVL puts and deletes (2.5, 9.3), refcount-0 objects failing every
 requirement, and the UnackedCommits tree replacing UnackedCommits (2.3). Line numbers in passages the refresh did not
-touch are for `c3ad5493`. Every mechanism below was read in the source; line
+touch are for `c3ad5493`. Refreshed again 2026-11-10 against `c181375b` (replay-pins addendum: prefer-abort driver
+prepares and applied stubs; marked "(addendum)"). Every mechanism below was read in the source; line
 numbers are `path:line` relative to `src/main/scala/org/aspen_ddp/aspen/`. Where `CLAUDE.md` or a scaladoc disagrees
 with the code, the code is described and the disagreement is called out.
 
@@ -431,9 +432,10 @@ collide through C/K. E: `DoesNotExist(k)` vs `Insert(k)`: collide through N. All
 
 The driver acts on the votes in hand (section 7). Abort needs `> width - T` abort votes, commit needs `T` commit votes.
 Missing votes can only postpone a decision. A store that withholds its vote (waiting for data, collision, or in-flight
-commits) is simply a missing reply; Paxos allows no reply, and the driver retransmits. The vote withheld for object data
-times out into an abort vote after `Frontend.MissingDataWait` = 5 s (`Tx.scala:144-147`). Safe; liveness depends on
-retransmission.
+commits) is simply a missing reply; Paxos allows no reply, and the driver retransmits. (addendum) A Tx that has seen
+no client prepare withholds its promise and vote, data or not, and votes abort with `NoClientPrepare` after
+`Frontend.MissingDataWait` = 5 s without checking its requirements (prefer-abort, `Tx.scala:205-208,537-542`;
+paxos-transactions.md 6.2). Safe; liveness depends on retransmission.
 
 ### 10.3 Stale stores voting on requirements
 
@@ -525,9 +527,13 @@ its own deferral count (`RepairPolicy.proofAfterDeferrals`, [repair-process.md](
 * **Commit arrives while another commit on the object is in flight:** held and queued (R9). A `TxFinalized` for a held
   commit is deferred until the commit is issued (`Tx.scala:790-800`).
 * **Prepare arriving after finalization:** ignored, answered from the status cache (`Frontend.scala:638-652`).
-* **Prepare for an unknown transaction, any age:** checked normally (the horizon and `TransactionTooOld` are gone). On
-  the abort path a memoryless acceptor whose object shows the update sends a proof instead of a vote
-  (`Tx.scala:548-550`, `:585-597`); see paxos-transactions.md 10.5.
+* **Prepare for an unknown transaction, any age:** a client prepare is checked normally (the horizon and
+  `TransactionTooOld` are gone). (addendum) A driver's prepare is not: the requirements are checked only once a client
+  prepare arrives, and without one the store votes abort after the wait (prefer-abort). On the abort path a memoryless
+  acceptor whose object shows the update sends a proof instead of a vote (`Tx.scala:584-586`, `:621-630`); see
+  paxos-transactions.md 10.5.
+* **(addendum) A commit of a transaction the store holds an applied stub for:** nothing is applied, and the changed
+  objects are reported in `TxCommitted.objectCommitErrors` (`Tx.scala:642-648`); see transaction-recovery.md 5.4.
 * **An object that fails to load** (`CorruptedObject` etc.) is absent from `objects`: `MissingObject` abort for a fresh vote
   (`Checker:52-55`).
 
@@ -554,6 +560,16 @@ under reordering/crash; Low = needs an unusual precondition or a trust-model vio
 | F12 | unchanged | `awaitingCommits` still has no timer | `Tx.scala:511-517` |
 | F13 | unchanged | Not in the diff | |
 | N1, N2 | unchanged | Not in the diff | |
+
+### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F2 | unchanged | The crash re-apply runs before any stub exists: a stub replaces the record only once it would be deleted, and a crash before that recovers the record | `Frontend.scala:668-674`; crash-recovery-log 3.6 |
+| F5 | unchanged | A stub holder applies nothing on commit, but it holds the update already (or was never a commit voter of T), and it reports its objects, so the finalizer marks it | `Tx.scala:642-648` |
+| F7 | unchanged | Stores still trust the description; prefer-abort keys on `TxPrepare.fromClient`, which a driver sets false (`TransactionDriver.scala:415,434`) and a client sets true: a forged `fromClient = true` from a store-side component would re-open P-N4's paths, within the same trust model | `Tx.scala:808-811` |
+| F11 | **narrowed** | A replayed allocation reaching a late or non-late commit is no longer applied at a store holding an applied stub for T. It still applies at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) and at stores that acknowledged in time on a non-late commit (paxos P-N3, P-N10) | `Tx.scala:642-648,998-1000` |
+| Q-N5 | **narrowed** (marker site) | A re-run marker's re-created UnackedCommits entries now come with a `TxFinalized` listing them, so stores write stubs for them (transaction-recovery R-N6); the ErrorTree regression is unchanged | `Frontend.scala:763-773` |
 
 ### F1. Sequential blind KV writes of one key (or object-level field) can be applied in opposite orders by a lagging store; permanent divergence with no repair entry. Confidence: Medium.
 
@@ -714,6 +730,11 @@ Open question: should an apply that overrides a held lock of a *commit* voter be
 > replayed allocation is applied wherever the replay reaches the commit anyway: a store with a leftover UnackedCommits
 > entry (transaction-recovery R-N1) or a non-late commit adopted from a recovering acceptor (paxos P-N3). It then
 > overwrites the live object at those stores (cross-document X11).
+>
+> **Refresh (addendum): NARROWED.** A store that holds an applied stub for the allocating transaction applies nothing on
+> any later commit of it (`Tx.scala:642-648`, `:998-1000`), which covers every store that forgot T on a `TxFinalized`
+> listing it. The overwrite remains at stores with an entry and no stub (transaction-recovery R-N7, R-N9) and on a
+> non-late commit at stores that acknowledged in time (paxos P-N3, P-N10). The fresh `Allocating` state is unchanged.
 
 > **Verification 2026-11-09: PLAUSIBLE. Severity: resurrection (needs horizon failure).** Frontend.readObjectForTransaction builds a fresh Allocating ObjectState for allocatingObjects without consulting backend/cache (Frontend.scala:834-845); protection is the cache/horizon only (see paxos F2/F3).
 > *Fix sketch:* Have the backend reject allocating over an existing object.
@@ -789,6 +810,9 @@ can starve shared lockers. Documented behaviour.
 >   (stale-replica, narrow)**. Re-writing one batch is idempotent, but a replayed or late batch's blind upsert replaces a
 >   newer entry's `missedTimestamp` with an older one (repair F10) and re-creates UnackedCommits entries the repair
 >   scan already deleted, which re-arms transaction-recovery R-N1 for that store.
+>
+>   **Refresh (addendum):** the re-armed R-N1 half is closed where the re-run's `TxFinalized`, which lists the re-created
+>   entries in `owed`, reaches the store (it writes a stub, transaction-recovery R-N6); the regression half stands.
 
 #### Q-N6. Liveness costs of the converted sites. Confidence: medium
 
@@ -796,6 +820,26 @@ can starve shared lockers. Documented behaviour.
 > allocated object (`AllocationFinalizationAction.scala:53`, section 12), which collides with the allocator's own
 > follow-up writes to it; one side aborts and retries. `SimpleTaskExecutor.allocateTask` now collides on the executor
 > revision under bursts or several mounts (O(n^2) attempts). Neither affects safety.
+
+### New findings from the addendum refresh (2026-11-10, `c181375b`)
+
+#### Q-N7. The stub check in `doCommit` covers every commit of the transaction, not only an apply through an entry. Confidence: high
+
+> **Verdict: REFUTED as a weakness (mechanism CONFIRMED).** `doCommit` applies nothing for any txid the store holds a
+> stub for (`Tx.scala:642-648`), including a non-late commit of a replay at a store that was named in `owed` but never
+> saw T, which then claims nothing it lacks: since Task 4's fix round it reports T's changed objects in
+> `objectCommitErrors`, so a non-late finalizer marks the store and repair restores it (Task 4 concern 2). A recovered
+> non-late commit vote with a stub resolves committed through the same check and stays until `TxFinalized` (Ruling 5).
+
+#### Q-N8. Prefer-abort and the requirement check. Confidence: high
+
+> **Verdict: REFUTED (no requirement is weakened).** A driver-only Tx votes abort without checking (`Tx.scala:537-542`):
+> an abort vote is always sound (R2 and the lock argument rest on checked commit votes only). Its commit vote, if
+> any, comes from
+> `RequirementsChecker.check` on a client prepare (`:543-570`), with its locks (`lock()` after the decision, `:482`,
+> `:847`). Proof-first is preserved: `decideDisposition` proves on the abort path before recording the abort
+> (`:584-586`). Lock-only transactions (`SharedRevisionLock`) prepared only by drivers now wait for the client's
+> prepare too (FrontendSuite "a lock-only transaction prepared only by a driver waits for the client's prepare").
 
 ### Open questions
 

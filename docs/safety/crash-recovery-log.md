@@ -2,7 +2,10 @@
 
 Status: derived from the code on `main` (commit c3ad5493), not from CLAUDE.md. Refreshed 2026-11-09 against `0d08e3c6`
 (branch `pin_refactor`, replay pins): the CRL code (`server/crl/`) is unchanged by that work; what changed is how
-recovered state is used (section 11, "Re-assessment for replay pins"). Where CLAUDE.md or a design doc
+recovered state is used (section 11, "Re-assessment for replay pins"). Refreshed again 2026-11-10 against `c181375b`
+for the replay-pins addendum, which **does** change the CRL: it adds applied stubs, a second record kind (section 3.6;
+"Re-assessment for the replay-pins addendum" in section 11). Passages it changed are marked
+"(addendum)". Where CLAUDE.md or a design doc
 disagrees with the code, the code is reported and the disagreement is listed in section 11. Three of the flaws in
 section 11 were reproduced by running the real `SimpleCRL` from a scratch program outside the repository; those are
 marked "reproduced". No source file was modified.
@@ -58,11 +61,14 @@ accepted: Option[(ProposalId, Boolean)])`.
 | `deleteTransaction(store, txid)` | Best-effort, lazy, **no acknowledgement**. A crash before the deletion is written leaves the transaction recoverable. |
 | `deleteTransactions(store, txids): Future` | As above, but the Future completes only when the deletion is durable. |
 | `dropTransactionObjectData(store, txid)` | Stop carrying the object data of this transaction in future entries. Memory-only; not durable by itself. |
-| `readStoreState(store): Future[List[TRS]]` | The store's live transactions. Leaves them live. Ordered with saves (FIFO on the CRL thread). |
-| `getFullRecoveryState(store)` | Blocking variant, used only by tests (`S/store/Frontend.scala:271`). |
-| `loadStore(store, trs)` | Default: `save` each, complete when all are durable. Used to load a `crl_save.log`. |
-| `dropStore(store): Future` | Delete every entry the store holds *at the time of the call*, durably. |
-| `storesWithEntries(): Future[Set[StoreId]]` | Which stores have live entries. |
+| `readStoreState(store): Future[StoreRecoveryState]` | (addendum) The store's live transactions **and applied stubs**. Leaves them live. Ordered with saves (FIFO on the CRL thread). |
+| `getFullRecoveryState(store)` / `getAppliedStubs(store)` | Blocking variants (`S/crl/CrashRecoveryLog.scala:121-130`); the undeferred, test-only Frontend path reads through `readStoreState` (`S/store/Frontend.scala:305`). |
+| `loadStore(store, state)` | Default: save each stub, then each transaction, complete when all are durable (`CrashRecoveryLog.scala:136-155`). Used to load a `crl_save.log`. |
+| `saveAppliedStub(store, txid, onDurable)` (addendum) | Save a stub for (store, txid), replacing any transaction state held for it in the **same** entry; `onDurable` once durable. Not subject to admission checks (`CrashRecoveryLog.scala:164-167`). |
+| `deleteAppliedStub(store, txid)` (addendum) | Lazy, unacknowledged deletion of the stub only; transaction state for the id stays. `deleteTransaction` likewise never removes a stub. |
+| `deleteTransactions(store, txids): Future` | (addendum) Deletes transaction state *and* stubs of each id. |
+| `dropStore(store): Future` | Delete every entry the store holds *at the time of the call*, stubs included, durably. |
+| `storesWithEntries(): Future[Set[StoreId]]` | Which stores have live entries, stub-only stores included. |
 | `shutdown()` | Blocks until the CRL threads stop. Idempotent in SimpleCRL. |
 | `admissionLimitBytes` | How many live bytes the CRL admits (section 6). |
 | `openCRL(devicePath, config)` (factory) | Recover and open. **Throws** if the files cannot be recovered. |
@@ -141,6 +147,7 @@ All `crl.save` call sites are in `S/transaction/Tx.scala`. The state saved is al
 | Accept handled | `Tx.scala:762` (`receiveAccept`) | `TxAcceptResponse` (Accepted or Nack) | Accepted proposal and value |
 | Backend commits of this transaction complete | `Tx.scala:610` | nothing; `dropTransactionObjectData` | stop carrying object data |
 | TxFinalized (all commits succeeded) | `Frontend.scala:481` via `Frontend.scala:537` | nothing; `deleteTransaction` | end of the record |
+| (addendum) Same point, when an UnackedCommits entry may name the store (`owed`, or applied through the entry) | `Frontend.concludeTransactionState`, `Frontend.scala:668-674` -> `recordAppliedStub` `:395-409` | nothing; releases the transaction's admission once durable | the record is replaced by an applied stub (3.6) |
 
 Consequences:
 
@@ -155,8 +162,9 @@ Consequences:
 
 ### 3.2 What data the record must contain
 
-A commit vote requires the store to hold the object data it will apply (`Tx.scala` `missingObjectData`/`awaitingData`:
-the vote is withheld until the data, a client prepare, the outcome, or `Frontend.MissingDataWait` arrives). So every
+A commit vote requires the store to hold the object data it will apply (`Tx.scala` `missingObjectData`, checked as
+`MissingObjectUpdate`; (addendum) and since prefer-abort a commit vote requires a client prepare at all, the carrier of
+the data: `awaitingClientPrepare`, `Tx.scala:205-208`). So every
 commit vote that reaches `onDurable` has its object data in the same record. Data that arrives *after* a vote
 (`Tx.adoptObjectUpdates`) is persisted only by the next save of that transaction; a store that voted abort for lack of
 data and later applies a commit with late data has that data only in memory. That store did not count towards the
@@ -202,7 +210,41 @@ transaction from it. This is the rule behind A4.
 
 The rule that makes this safe: **an entry leaves the device CRL only after another durable copy exists, or after the
 store has been made unservable on disk.** The transfer deletes after the save file is durable; the rebuild drops after
-the marker is durable.
+the marker is durable. (addendum) Every operation in the table carries applied stubs with the transactions: the save
+file holds both kinds of entry (`codec.StoreCRLEntry.applied_stub`, `CrashRecoveryLog.scala:26-51`), an unloaded
+store's extraction merges them (`StoreRecoveryState.supersededBy`, `S/host/StoreTransfers.scala:107-112`), the
+deletions name `state.entryIds`, and `discardLostStore` saves them into `lost-crl-state.log`
+(`StoreRebuilds.scala:511`).
+
+### 3.6 Applied stubs (addendum)
+
+An applied stub (store S, transaction T) means "S already holds T's update, so an UnackedCommits entry naming S for T
+is stale" (`S/crl/StoreRecoveryState.scala`). It carries no description, object data, Paxos state or requirements, and
+is never recovered as a transaction: the Frontend keeps the stub txids as a set (`Frontend.recoverState`,
+`Frontend.scala:307-311`) and consults it before applying T (transaction-recovery.md 5.4).
+
+- **Namespace.** Stubs are separate entries under the same TxId: a stub's save replaces the transaction state of the
+  id **in the same log entry** (`LogEntry.deleteTxForStub`, `SimpleCRL.onSaveAppliedStub`, `SimpleCRL.scala:320-335`),
+  so the deletion and the stub are durable together; a later save of the transaction (a replay's Tx) lives beside the
+  stub, and in the same entry it cancels the stub-made deletion (`LogEntry.addTx`, `stubReplaced`). Only
+  `deleteAppliedStub`, `deleteTransactions` and `dropStore` remove a stub.
+- **Write point.** Only where the transaction's record would be deleted (after its backend commits succeeded), never
+  while they are outstanding or failed: `recordAppliedStub` requires it (`Frontend.scala:395-399`), because the record
+  (object data included) is what a reloaded store recovers a failed commit from.
+- **Crash between "commits durable" and "stub durable".** The record is still live, so the store recovers T as a
+  commit vote; if its entry is found it applies T again through the normal path (transaction-recovery F4, unchanged).
+- **Copy-forward.** A stub has a zero-length `anchor` location in the entry that first wrote it, so rotation copies it
+  forward exactly as it copies a transaction's data (`Stub.closeStream`, `SimpleCRL.scala:211-220`). It keeps
+  `oldestEntryNeeded` back like a long-lived transaction.
+- **Recovery.** Entries are read newest first; a stub is live unless a newer or same-entry stub deletion names it
+  (`LogEntry.loadStaticEntryContent`). An entry never holds a stub and its deletion (`addStub`/`deleteStub`). The
+  open-time re-save writes stubs before transactions, so a re-saved stub cannot delete a re-saved transaction of the
+  same id (`SimpleCRL.scala:153`).
+- **Admission.** Each stub is charged `CrlAdmission.AppliedStubBytes` (33) without a check, and released when dropped;
+  a closing store retains the charge (section 6).
+- **Lifetime.** Dropped by the store's repair scan with its UnackedCommits entry, or on the next scan once no entry
+  needs it (repair-process.md 5.5). A rebuilt store has none (its entries are dropped with `dropStore`); it is muted
+  for older transactions instead (rebuild-process.md N3).
 
 ---
 
@@ -245,7 +287,8 @@ new entry is written over them.
 
 ### 5.2 Entry format
 
-Header (`LogEntry.scala:124-141`), 70 bytes, big-endian:
+Header (`LogEntry.scala:124-141`), 70 bytes, big-endian; (addendum) 78 bytes since applied stubs, with two more
+4-byte counts (`StaticEntryHeaderSize`, `LogEntry.scala:168`):
 
 | Field | Bytes |
 |-------|-------|
@@ -257,11 +300,14 @@ Header (`LogEntry.scala:124-141`), 70 bytes, big-endian:
 | static data size | 8 |
 | number of transactions | 4 |
 | number of deletions | 4 |
+| (addendum) number of applied stubs | 4 |
+| (addendum) number of applied-stub deletions | 4 |
 
 Then, in order: **dynamic data** (serialized transaction descriptions and object-update payloads, written only the
 first time a transaction appears in a stream, `LogEntry.scala:90-100`), **static data** (one fixed record per
-transaction in the entry, then 33-byte TxIds of deletions, then the 16-byte stream UUID again), then zero padding to a
-4 KiB multiple (`padTo4k`, `LogEntry.scala:187-195`).
+transaction in the entry, then (addendum) one 33-byte TxId per applied stub, then 33-byte TxIds of transaction
+deletions, then (addendum) of stub deletions, then the 16-byte stream UUID again), then zero padding to a 4 KiB
+multiple (`padTo4k`, `LogEntry.scala:187-195`). A stub has no dynamic data.
 
 The static record of a transaction (`LogContent.scala:116-132`): TxId 33 (pool UUID 16, store index 1, tx UUID 16),
 txd location 14, disposition 1 (0/1/2), Paxos mask byte 1 + promised (int + byte) 5 + accepted (int + byte) 5, object
@@ -308,7 +354,9 @@ write, `currentLogEntry = new LogEntry(location, serial + 1, oldestEntryNeeded)`
    whose txd or object data lies in the stream *after* the recycled one (since the F3 fix; data still in the recycled
    stream itself would break the invariant and is logged and copied too) (`Tx.closeStream`, `LogContent.scala:185-204`) clear its
    locations, move it to the queue head and add it to the entry being written. Then set the entry's
-   `oldestEntryNeeded` to the queue tail's serial.
+   `oldestEntryNeeded` to the queue tail's serial. (addendum) Applied stubs are walked the same way: a stub whose
+   zero-length `anchor` lies in either stream is moved to the queue head and re-added (`copyForward`,
+   `SimpleCRL.scala:211-220`).
 2. `Stream.writeEntry` builds the buffers (`LogEntry.createEntryBuffers`, `LogEntry.scala:59-121`): header, then the
    txd and update buffers of transactions that have no location, then the static region, then padding. It issues one
    gathering write.
@@ -358,6 +406,9 @@ entry needed is the one holding the oldest live transaction's data (`SimpleCRL.s
 where the "current UUID" of a file is read from its first 16 bytes (`StreamReader.scala:15-19, 47-74`). A recycled
 stream gets a new UUID with its first new entry, which is what makes all older entries in that file unreadable.
 
+(addendum) Applied stubs are recovered apart from transactions (`Recovery.Result.appliedStubs`) with the same
+newest-first rule against stub deletions, and are re-saved first at open (`SimpleCRL.scala:153`).
+
 After recovery the CRL constructor **re-saves every recovered transaction** into the active stream
 (`SimpleCRL.scala:132-137`), waiting for the write. Every open therefore appends a full copy of the live set (up to
 half a stream), and may itself rotate and recycle. It does not wait for store recovery.
@@ -382,7 +433,9 @@ the `Tx` from the map and the queue, and calls `startWrite` (`SimpleCRL.scala:29
 entry write (not coalesced with anything unless a write is already in flight). `deleteTransactions` does the same for a
 list, atomically in one entry, and attaches its handler to that entry (`SimpleCRL.scala:202-214`); an empty list
 completes at once, with no write. A deleted `Tx` that is already in the *current* entry's `txs` stays there and is
-filtered at recovery by the deletion list.
+filtered at recovery by the deletion list. (addendum) `deleteTransactions` also writes a stub deletion for every id
+it is given (33 bytes each), and deletes a held stub. `deleteAppliedStub` writes a stub deletion only for a stub held
+in memory (`SimpleCRL.scala:337-343`).
 
 ### 5.9 Shutdown and thread death
 
@@ -412,6 +465,12 @@ limit `crl.admissionLimitBytes` = half a stream (`DeviceDiscovery.scala:567`, `S
   entries leave the CRL or the store reloads (`CrlAdmission.scala:50-64`, `Frontend.close`, `Frontend.scala:493`).
 - Admission does **not** cover: records of stores that are not loaded since process start (F8), the duplication caused
   by rewriting object data when the update count changes, or deletions queued in an entry.
+- (addendum) Applied stubs are charged `AppliedStubBytes` (33) each without a check, by the Frontend: on
+  `recordAppliedStub`, and for those recovered (`Frontend.scala:307-311,395-409`). The transaction's own admission is
+  taken out of `admitted` at once and released once the stub is durable, so a prepare in between is admitted afresh;
+  a later Tx of the same id that shares the record keeps it (`keepAdmission`, `:668-674,676-685`). `dropAppliedStub`
+  releases a stub's charge; `close` retains the stubs' charge with the transactions' bytes
+  (`Frontend.scala:600-608`). Stubs therefore never stall, but new prepares feel them.
 
 Admission is a liveness tool and the only thing that maintains C11. A failure of C11 is not a data-loss event by
 itself: it kills the CRL thread (`Stream.scala:28`), which stops the device (F9) and leaves the CRL recoverable on
@@ -697,6 +756,59 @@ described. Only findings whose *consequence* runs through the transaction layer 
 New, CRL-facing: every recovered unresolved commit vote now waits for its UnackedCommits lookup before its store drives
 it (transaction-recovery R-N3), and a prover saves an abort vote with a memoryless promise to the CRL on each later
 prepare (Ruling 10, `Tx.scala:786-788,817-836`): one extra record per prover, within admission.
+
+### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
+
+`git diff ab2500a4..c181375b -- src/main/scala/org/aspen_ddp/aspen/server/crl` adds applied stubs (3.6): a second record
+kind in `LogEntry`, `Stub` beside `Tx` (`LogContent.scala:93-133`), `StoreRecoveryState`, and the interface methods of
+section 2. Findings it touches:
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F3 | unchanged (FIXED stands, extended) | Stubs are copied forward from the stream after the active one by the same rule, through their zero-length anchor | `SimpleCRL.scala:211-220`; `LogContent.scala:124-128` |
+| F4 | unchanged (exception added by design) | A save after an ordinary delete in the same entry is still dropped; a save after a *stub-made* deletion cancels it and is written beside the stub (`stubReplaced`, fix round 1 of Task 2) | `LogEntry.scala:48-84` |
+| F5 | unchanged (scope extended) | Stub TxIds are as unchecksummed as everything else; a corrupted TxId would make a store skip one transaction's apply, or keep a stray stub that the scan drops | `LogEntry.scala:223-250` |
+| F8 | **narrowed** | Stubs are charged without a check, so they count toward the live bound; the gaps listed remain for transactions | `Frontend.scala:395-415` |
+| F12 | unchanged | `dropStore` lists stubs through the same `readStoreState` and deletes them with the transactions; the same-txid race applies to a stub saved between the read and the delete | `CrashRecoveryLog.scala:187-190` |
+| F13 | unchanged | The stub replaces the record at the point the deletion would run; a crash before it is durable recovers the record, as before | `Frontend.scala:668-674` |
+| F16 | unchanged (load larger) | Every open also re-saves every live stub | `SimpleCRL.scala:153` |
+
+### New findings from the addendum refresh (2026-11-10)
+
+#### F22 (new). Stubs grow with UnackedCommits entries when repair scans stall (PLAUSIBLE; liveness)
+
+**Verdict: PLAUSIBLE. Severity: liveness (device-wide prepare drops).** A stub lives until the store's scan deletes its
+entry or finds it gone (repair-process.md 5.5), and every forget of a late-acknowledged transaction writes one. While
+scans do not run for a store (metadata group unreadable, scans timing out, F9 of repair), stubs accumulate one per
+entry. Each is charged 33 bytes to the device's admission without a check (`Frontend.chargeStubs`,
+`Frontend.scala:294-297`), and admission drops new prepares of unseen transactions past half a stream (150 MB by
+default): about 4.5 million stubs per device. A store acknowledging late under sustained load (10 k transactions/s)
+writes that many in about 8 minutes of stalled scans. Before the limit is reached the tree growth of the same entries
+(transaction-recovery R-N4) is the larger cost, and copy-forward stays inside the bound. Not a safety issue: the stubs
+are durable and the admission limit keeps C11. *Fix sketch:* none needed beyond R-N4's; or cap stubs per store and fall
+back to the case-3 lookup.
+
+#### F23 (new). Stub durability across rotation, transfer, adoption and rebuild (REFUTED except rebuild)
+
+**Verdict: REFUTED for rotation, transfer and adoption; see rebuild-process.md N3 for rebuild.** Rotation: copy-forward
+by anchor (`SimpleCRL.scala:211-220`); Task 2's SimpleCRLSuite runs more than six rotations and two reopens. Transfer
+out of an open store: the stubs' saves precede `Frontend.close` on the executor, and `readStoreState` is answered in
+order with them (C14), so the extraction carries every stub the store wrote; out of an unloaded store:
+`saved.supersededBy(state)` merges stubs as it merges transactions (`StoreTransfers.scala:111`); transfer in:
+`loadStore` saves stubs first and the Frontend recovers them (`Frontend.scala:307-311`). Adoption: the device CRL moves
+with the device, and `storesWithEntries` counts stub-only stores so `dropLeftoverCrlState` cleans a transferred-away
+store's stubs. Rebuild and CRL loss: the stubs are dropped (`dropStore`) or lost with the CRL; the rebuilt store relies
+on its mute instead.
+
+#### F24 (new). A stub and a transaction state of one id in the same entry (REFUTED)
+
+**Verdict: REFUTED.** The candidates were a stub's save silently dropping a later save of the same id (fixed in Task 2,
+fix round 1: `stubReplaced` lets the later save cancel the stub's deletion), the open-time re-save of a stub deleting
+the re-saved transaction of the same id (stubs are re-saved first, before any transaction is in memory,
+`SimpleCRL.scala:153`), and an entry holding both a stub and its deletion (`addStub` removes a pending deletion,
+`deleteStub` removes a pending stub, `LogEntry.scala:86-93`). Task 2's deferred minor, an admission undercount if a
+prepare reused the replaced record across the stub's callback, was closed by Task 4: the record leaves `admitted` at
+once and a prepare in the window is admitted afresh (`Frontend.scala:401-409`).
 
 ### F1. Large entries are silently truncated; acknowledged saves are lost (reproduced, high confidence, severe)
 

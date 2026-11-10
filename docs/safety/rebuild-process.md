@@ -2,7 +2,8 @@
 
 Status: derived from the code at commit `c3ad5493` (2026-11-09); refreshed 2026-11-09 against `0d08e3c6` (branch
 `pin_refactor`, replay pins). The rebuild code is not in that diff; what changed is the transaction layer a rebuilt store
-meets (section 13, "Re-assessment for replay pins"). Every mechanism below is cited as `path:line`
+meets (section 13, "Re-assessment for replay pins"). Refreshed again 2026-11-10 against `c181375b` for the replay-pins
+addendum (applied stubs in the device CRL; section 13, N3). Every mechanism below is cited as `path:line`
 relative to `src/main/scala/org/aspen_ddp/aspen/` unless the path starts with `docs/`. Statements were checked against
 the code, not against `CLAUDE.md` or the design documents; where they disagree the code wins and the disagreement is
 called out.
@@ -615,6 +616,14 @@ Notes: a rebuilt store inherits UnackedCommits entries keyed by its pool index, 
 (8.2). A late commit reaching the rebuilt store for an older transaction is muted and applies nothing, which is
 correct: its owed state comes back through the entries' reconcile.
 
+### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
+
+The addendum touches rebuild code only through the CRL's new record kind: `StoreRebuilds` writes an empty
+`StoreRecoveryState` save file (`StoreRebuilds.scala:324`) and `discardLostStore` saves the full state, applied stubs
+included, into `lost-crl-state.log` (`:511`); `dropStore` drops a lost store's stubs with its transactions
+(`CrashRecoveryLog.scala:187-190`). Every finding above is unchanged. A rebuilt store starts with no stubs (see N3), and
+its inherited UnackedCommits entries no longer have the stubs the old incarnation may have written for them.
+
 > **F1 FIXED (2026-11-09)** together with cross-document X1: the reconcile retires a device it reads Failed (a durable
 > `failed` marker, then unloaded like a relinquished device), a device with the marker is never loaded, the tombstone
 > nudges the former host, and a repair scan runs only while the pool's entry names the scanning host. Residual: until
@@ -799,3 +808,16 @@ the old id succeeds was not traced. See [repair-process.md](repair-process.md).
 **New (verification pass) N1 (Medium) Replay of a recovered commit vote can regress a newer blind write.** A store that crashes between a transaction's backend commit and its CRL record deletion recovers the record and re-applies it; revision requirements stop the replay but blind KV inserts, Exists-guarded deletes and ABA refcounts are applied over newer committed values. Details and fix in crash-recovery-log.md F13. Relevant here because a rebuilt or adopted store recovers through the same path.
 
 **New N2. Crash-recovery-log F2/F4 can raise `BrokenEntryChain` at a restart, which marks every store of the device rebuild-required and so feeds this process (see crash-recovery-log.md F2, Exp3).**
+
+**New (addendum) N3 (Low) A rebuilt store loses its applied stubs; only the mute keeps a replay from applying through
+an old incarnation's entry.** Verdict: PLAUSIBLE, low (inherits paxos P-N2). A rebuild discards the store's CRL
+entries, stubs included (`dropStore`; with a lost CRL they go with it). The addendum design calls this harmless because
+a rebuilt store is muted for older transactions (`Frontend.scala:802`: muted iff `txd.startTimestamp <
+acceptorSince`), and a muted Tx applies nothing on a late commit (`Tx.scala:1006-1007`). The mute rests on the
+client-chosen start timestamp: a client clock fast by more than the rebuild's duration plus the 10 s margin leaves a
+replay of T unmuted (paxos P-N2, cross-document X2). The fresh Tx then votes commit on an unpinned object, and a late
+commit finds the entry the old incarnation was owed (UnackedCommits entries carry no incarnation, cross-document X10)
+and applies T over the rebuilt state. One store, so quorum reads mask it, and the entry, which still exists, is
+reconciled by a later scan, which restores it (except in the lookup race of transaction-recovery
+R-N9). Before the addendum the same
+store would have re-applied with or without the rebuild.

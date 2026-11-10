@@ -4,7 +4,9 @@ Status: derived from the code at commit c3ad5493 (branch main); refreshed 2026-1
 `pin_refactor`, replay pins: `docs/superpowers/specs/2026-11-09-replay-pins-design.md`). The TracelessCommits tree is now
 the UnackedCommits tree: same schema and scan, but entries are written for every committed transaction's
 unacknowledged counted voters (2.3, 3), an entry means "this store is owed T", and late commits read it (5.3). Line
-numbers in passages the refresh did not touch are for c3ad5493. Every mechanism cites `path:line` relative to
+numbers in passages the refresh did not touch are for c3ad5493. Refreshed again 2026-11-10 against `c181375b` for the
+replay-pins addendum: each entry may be shadowed by an applied stub in the store's device CRL, which the scan now
+cleans (5.5); passages changed are marked "(addendum)". Every mechanism cites `path:line` relative to
 `src/main/scala/org/aspen_ddp/aspen/` unless the path starts with `docs/`. Claims in `CLAUDE.md` and the two design
 documents (`docs/superpowers/specs/2026-09-02-continual-repair-design.md`,
 `docs/superpowers/specs/2026-11-08-traceless-commits-design.md`) were checked against the code; where the code
@@ -106,7 +108,7 @@ AllocationTree entry (`client/internal/allocation/DeletionFinalizationAction.sca
 | Key | 17 bytes: `poolIndex` then `transactionId` (msb, lsb big-endian). One entry per (store, transaction). | `client/internal/transaction/UnackedCommitEntry.scala:40-46` |
 | Value | `timestamp` (8) = the transaction's start timestamp; `count` (4); then `count` x (`length` (4), `ObjectPointer` bytes). The pointers keep their store pointers and are the objects of this store that T changes (traced or traceless; see the next row). | `UnackedCommitEntry.scala:16-37` |
 | Which objects | Since the refresh: every object the transaction changes on that store, traced or traceless. Before, only `RefcountUpdate`s and revision-less `KeyValueUpdate`s with `deletesKeys`. | `MissedUpdateFinalizationAction.scala:98-106` |
-| Meaning | The store cast a commit vote the commit may have relied on and had not acknowledged applying T when T was finalized: it is owed T. A recovered commit vote, and any commit voter receiving a late commit, applies T only if its entry exists. | `Tx.scala:158-160,920-932,997-1041` |
+| Meaning | The store cast a commit vote the commit may have relied on and had not acknowledged applying T when T was finalized: it is owed T. A recovered commit vote, and any commit voter receiving a late commit, applies T only if its entry exists. (addendum) Unless the store holds an applied stub for T, which says the entry is stale: it then applies nothing. | `Tx.scala:158-160,920-932,997-1041`; addendum `Tx.scala:642-648,984-1007` |
 
 ### 2.4 AllocationTree (dependency, not repaired)
 
@@ -131,6 +133,8 @@ read), absent means "deleted, or its allocation has not been recorded yet" (sect
 | Overwrite ErrorTree entry | same path; plain insert, no `requireDoesNotExist`, no timestamp comparison | a later miss of the same (store, object) |
 | Delete either kind | `StoreRepairer` only (`deleteEntryIfUnchanged`, `deleteEntry`). No other code deletes entries (grep of `errorTree`/`unackedCommitsTree` over the tree). | after the object is verified or found deleted |
 | Read | `StoreRepairer.scan`; `Host.unackedLookup` (`Host.scala:~210`, point lookup for a recovered commit vote) | |
+| (addendum) Write an applied stub | the store itself, in its device CRL (`Frontend.recordAppliedStub`) | when it forgets T on a `TxFinalized` listing it in `owed`, after applying T through its entry, or after the case-3 lookup finds its entry (transaction-recovery.md 5.4) |
+| (addendum) Drop an applied stub | `StoreRepairer` only, through the store's executor (`RepairTarget.dropAppliedStub`, `StoreRouter.scala:206-211`) | after deleting the entry (S, T), or when the stub had no entry in the walk and a point lookup finds none (5.5) |
 
 ---
 
@@ -234,8 +238,10 @@ caller never treats a departed store as repaired and the entry survives for the 
 scan(store, policy, deferral):
   pool  = client.getStoragePool(store.poolId)
   range = [Key(poolIndex), Key(poolIndex+1))                                  -- StoreRepairer.scala:124-127
+  stubs = target.appliedStubs(store)       -- (addendum) read before the walks, StoreRepairer.scala:147-148
   pool.errorTree.foreachInRange(range, repairErrorEntry)                      -- phase A
   pool.unackedCommitsTree.foreachInRange(range, repairUnackedEntry)       -- phase B (after A completes)
+  dropOrphanStubs(stubs -- txids seen in phase B)  -- (addendum) 5.5
   deferral.retain(keys touched this scan)      -- forget deferral state of entries not seen (gone or rewritten)
   return ScanResult(seen, repaired, deferred, unackedSeen)
 ```
@@ -289,7 +295,9 @@ the scan thread (`server/store/Frontend.scala:96`, `Store.scala:114`, `StoreRout
 recovered vote that finds its entry applies T but stays live until `TxFinalized` (Ruling 9), so the scan keeps skipping;
 a Tx that applied a late commit is forgotten at once. The entry remains either way, and the next scan reconciles (a
 no-op) and removes it (`StoreRepairer.scala:228-268`). Until then the entry still says the store is owed T, so a replay
-of T that resolves late is applied there again (Ruling 17; transaction-recovery R-N1).
+of T that resolves late is applied there again (Ruling 17; transaction-recovery R-N1). (addendum) Unless the store holds
+an applied stub for T, which it writes when it forgets T in those cases (5.5); on deleting the entry the scan drops the
+stub (`StoreRepairer.scala:303-304`).
 
 ### 5.4 Entry deletion and its guard
 
@@ -302,6 +310,26 @@ of T that resolves late is applied there again (Ruling 17; transaction-recovery 
 - Delete and a concurrent entry insert both lock the key (key requirement vs insert), so they collide at the stores:
   exactly one orders first. If the delete commits first, the later insert creates a fresh entry. If the insert commits
   first, the delete fails its `KeyRevision` requirement (`RequirementsChecker.scala:~278-285`).
+
+### 5.5 Applied stub cleanup (addendum)
+
+A store writes an applied stub (S, T) only after entry (S, T) is durable: `owed` lists entries the marker wrote before
+`TxFinalized` was sent (Ruling 2), and the case-3 fallback writes one only after its lookup found the entry
+(transaction-recovery.md 5.4). The scan removes stubs in two ways:
+
+```
+on deleting entry (S, T) after a complete repair:  target.dropAppliedStub(S, T)        -- StoreRepairer.scala:303-304
+after phase B (dropOrphanStubs, :171-183), unless the store left this host mid-walk:
+  for each txid in (stubs read before the walk) -- (txids of entries seen in phase B, held live or not):
+      if unackedCommitsTree.get(key(S, txid)) is empty: target.dropAppliedStub(S, txid)
+```
+
+Why it is safe (Ruling 6): a stub in the pre-walk snapshot had its entry durable before the walk began, so the walk
+sees that entry unless it was deleted meanwhile; a stub written during the walk is not in the snapshot and survives to
+the next scan, since its entry may lie behind the cursor. The point lookup guards against a walk that misses a live key
+when the tree is restructured under it, and each drop names one exact txid. An entry the scan skips because the store
+holds T live is still counted as seen, so its stub stays. The stub therefore lives as long as its entry, and at most
+one scan period longer. `appliedStubs` of a store that is not loaded is empty, so nothing is dropped for it.
 
 ---
 
@@ -807,6 +835,20 @@ completion gate are unchanged.
 | F11-F15 | unchanged | Not in the diff | |
 | N1, N2 | unchanged | Not in the diff | |
 
+### 13.0a Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
+
+The addendum adds stub cleanup to the scan (5.5) and `owed`/handed-off completion to the marker's action; reconcile,
+opportunistic rebuild, deletion and the completion gate are unchanged.
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| RP-N4 | **narrowed** | The entry still outlives the store's own late application of T until the scan, but a store that forgot T on a `TxFinalized` listing it, or applied T through the entry, holds an applied stub and applies nothing on a replay's commit. The window stays open only at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) | `Tx.scala:642-648,998-1000`; `StoreRepairer.scala:303-304` |
+| RP-N3 | unchanged (cost added) | Each such entry also keeps a stub in the device CRL until the scan (RP-N6) | `Frontend.scala:395-409` |
+| RP-N5 | unchanged (REFUTED stands) | The scan still skips an entry while the store holds T live; the skipped entry now also counts as seen, so its stub is kept | `StoreRepairer.scala:273-278` |
+| F7 | unchanged | Entry deletion is still untracked; the stub drop that follows it is a store-local CRL write | `StoreRepairer.scala:303-304` |
+| F8, F9 | unchanged (load larger) | One point lookup per orphan candidate per scan (RP-N7); a timed-out scan's background walk still runs its orphan pass, which is harmless (each drop is checked by a lookup) | `StoreRepairer.scala:171-183` |
+| F10 | unchanged | The blind upsert still regresses newer entries; the re-created UnackedCommits entries are now shadowed by stubs when the re-run's `TxFinalized` arrives (transaction-recovery R-N6) | `MissedUpdateMarker.scala:145-148` |
+
 ### 13.1 Summary table
 
 | ID | Title | Severity | Confidence |
@@ -1052,6 +1094,26 @@ dependency is real but sound. Confidence: low.
   allocations in another pool (Ruling 17 as corrected by Ruling 32; transaction-recovery R-N1). When the whole pool
   acknowledged late this reaches a quorum and the scans' reconcile follows it. Faster scans shrink the window; nothing
   closes it.
+  *Refresh (addendum): NARROWED.* Applied stubs close it at every store that forgot T on a `TxFinalized` listing it in
+  `owed`, or that applied T through the entry (`Tx.scala:642-648,998-1000`); the stub is dropped with the entry. What
+  remains is a store holding an entry and no stub (transaction-recovery R-N7 to R-N9).
 * **RP-N5 (REFUTED).** Deleting an entry while a recovered vote still needs it: the scan skips while
   `mayHoldTransaction` (`awaitingCrl || transactions.contains`, `Frontend.scala:96`), and a found entry's Tx stays live
   until `TxFinalized` (Ruling 9), so a recovered vote has looked its entry up before the scan can delete it.
+
+### 13.6 New findings from the addendum refresh (2026-11-10, `c181375b`)
+
+* **RP-N6 (capacity; PLAUSIBLE).** Stubs live as long as their entries plus one scan (5.5), so a stalled scan (metadata
+  group unreadable, scans timing out, the store not repairable) lets them accumulate one per entry, in the device CRL
+  and charged to its admission (crash-recovery-log.md F22). Liveness only; bounded by the same entry growth as RP-N3 and
+  transaction-recovery R-N4.
+* **RP-N7 (performance; CONFIRMED).** Each orphan candidate gets its own point lookup of the UnackedCommits tree, run
+  one after another (`StoreRepairer.scala:177-183`), so a scan after a stall that deleted many entries some other way
+  pays one tree read per stub (deferred Task 5 minor). Correctness is unaffected: a failed lookup stops the orphan
+  pass, and each drop made before it was checked by its own lookup.
+* **RP-N8 (REFUTED for stub holders).** A scan deleting entry (S, T) and then dropping S's stub, racing a replay's late
+  commit at S: while the stub is held, `lateCommit` applies nothing without a lookup (`Tx.scala:998-1000`), and the
+  stub is dropped only after the deletion committed, so a lookup started after the drop finds nothing. A held late
+  commit whose stub appears during its lookup also applies nothing (`:1087-1088`). For a store with an entry and no
+  stub the pre-existing race stands (a lookup that read the entry before a concurrent deletion, answered after the
+  scan's reconcile; transaction-recovery R-N9).

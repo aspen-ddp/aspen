@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 
-import scala.concurrent.Promise
+import scala.concurrent.{Future, Promise}
 
 /** Completes a repair operation aimed at a store this host no longer holds.
   *
@@ -57,3 +57,13 @@ trait RepairTarget:
     */
   def repairDelete(storeId: StoreId, objectId: ObjectId,
                    storePointer: Array[Byte], completion: Promise[Unit]): Unit
+
+  /** The txids of the store's applied stubs (Frontend.appliedStubs), read on the store's executor. An unhosted store
+    * has none to report: the Future completes empty, so nothing is dropped
+    */
+  def appliedStubs(storeId: StoreId): Future[Set[TransactionId]]
+
+  /** Drops the store's applied stub for `txid`, if it holds one, on the store's executor. Does nothing for an unhosted
+    * store
+    */
+  def dropAppliedStub(storeId: StoreId, txid: TransactionId): Unit

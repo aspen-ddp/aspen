@@ -203,6 +203,13 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
       completion.failure(StoreNotHosted(storeId))
     route(storeId, notHosted)(_.repairDelete(objectId, storePointer, completion))
 
+  /** The store's applied stubs, read on its executor. Empty when the store is not loaded */
+  def appliedStubs(storeId: StoreId): Future[Set[TransactionId]] =
+    onStore(storeId)(_.frontend.appliedStubs).map(_.getOrElse(Set()))(using ExecutionContext.parasitic)
+
+  def dropAppliedStub(storeId: StoreId, txid: TransactionId): Unit =
+    post(storeId)(_.frontend.dropAppliedStub(txid))
+
   /** One dispatch step that posts `store.heartbeat()` to each loaded store's executor. */
   def heartbeat(): Unit = postToEachStore(_.heartbeat())
 

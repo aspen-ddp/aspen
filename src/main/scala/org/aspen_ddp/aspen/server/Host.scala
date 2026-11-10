@@ -387,6 +387,12 @@ class Host(val client: AspenClient,
                 p: Promise[ReconcileResult]): Unit =
     deviceControl.router.reconcileForRepair(storeId, snapshot, read, p)
 
+  def appliedStubs(storeId: StoreId): Future[Set[TransactionId]] =
+    deviceControl.router.appliedStubs(storeId)
+
+  def dropAppliedStub(storeId: StoreId, txid: TransactionId): Unit =
+    deviceControl.router.dropAppliedStub(storeId, txid)
+
   /** Repairs a missed deletion on the given store. Used when the object is gone from the rest
     * of the system, leaving only the ObjectId and the storePointer bytes recorded in the pool's
     * errorTree to identify it.

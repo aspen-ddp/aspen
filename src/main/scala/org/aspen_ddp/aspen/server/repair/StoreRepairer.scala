@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjec
                                            ObjectId, ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
+import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import scribe.Logging
 
@@ -119,6 +119,11 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     val deferred = AtomicInteger(0)
     val unackedSeen = AtomicInteger(0)
     private var touched = Set[Key]()
+    private var unackedTxids = Set[TransactionId]()
+
+    /** Notes a UnackedCommits entry of the walk, whatever became of it */
+    def sawUnacked(txid: TransactionId): Unit = synchronized { unackedTxids += txid }
+    def unackedTxidsSeen: Set[TransactionId] = synchronized(unackedTxids)
 
     def touch(keys: Iterable[Key]): Unit = synchronized { touched ++= keys }
     def touchedKeys: Set[Key] = synchronized(touched)
@@ -139,12 +144,42 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       else
         for
           pool <- client.getStoragePool(storeId.poolId)
+          // Read before the UnackedCommits walk: see dropOrphanStubs
+          stubs <- target.appliedStubs(storeId)
           _ <- pool.errorTree.foreachInRange(min, max, repairErrorEntry(pool, storeId, policy, deferral, counts))
           _ <- pool.unackedCommitsTree.foreachInRange(min, max,
                  repairUnackedEntry(pool, storeId, policy, deferral, counts))
+          _ <- dropOrphanStubs(pool, storeId, stubs, counts)
         yield
           deferral.retain(counts.touchedKeys)
           counts.result
+
+  /** Drops the stubs of the store that no UnackedCommits entry needs any more: those in `before`, the store's stubs
+    * read before the walk, whose transaction had no entry in the walk.
+    *
+    * The order is what makes this safe. A stub is written only after its entry is durable (TxFinalized lists `owed`
+    * after the marker's writes commit, and the fallback lookup writes a stub only after finding the entry). So a stub
+    * in `before` has had its entry durable since before the walk began, and the walk did not miss it unless the entry
+    * was deleted meanwhile. A stub written during the walk is not in `before` and survives to the next scan: its entry
+    * may sit behind the walk's cursor.
+    *
+    * An entry can also leave a walk unseen without being gone, if the tree is restructured under the walk, and one
+    * deleted by another scan is rightly gone. So each candidate gets a point lookup of its own entry, and is dropped
+    * only if that finds nothing. The drop names the txid exactly, so a stub is never dropped for another's entry.
+    * Skipped when the store left this host mid-walk: the entries were then not handled.
+    */
+  private def dropOrphanStubs(pool: StoragePool, storeId: StoreId, before: Set[TransactionId],
+                              counts: Counts): Future[Unit] =
+    val orphans = before -- counts.unackedTxidsSeen
+    if orphans.isEmpty || abandoned(storeId) then
+      Future.unit
+    else
+      orphans.foldLeft(Future.unit): (f, txid) =>
+        f.flatMap: _ =>
+          pool.unackedCommitsTree.get(UnackedCommitEntry.key(storeId, txid)).map: entry =>
+            if entry.isEmpty then
+              logger.info(s"Dropping the applied stub of $txid on $storeId: no UnackedCommits entry needs it")
+              target.dropAppliedStub(storeId, txid)
 
   /** Whether the pool's entry for the store names this host, read fresh for each scan */
   private def ownedHere(storeId: StoreId): Future[Boolean] = hostId match
@@ -236,6 +271,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       Future.unit.flatMap: _ =>
         counts.unackedSeen.incrementAndGet()
         val txid = UnackedCommitEntry.decodeTransactionId(key)
+        counts.sawUnacked(txid)
         if target.holdsTransaction(storeId, txid) then
           logger.debug(s"Skipping UnackedCommits entry of $txid on $storeId: the store holds it live")
           counts.deferred.incrementAndGet()
@@ -265,6 +301,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
             if allComplete then
               entryKeys.foreach((_, entryKey) => deferral.clear(entryKey))
               deleteEntryIfUnchanged(value.revision, node, key).map: _ =>
+                target.dropAppliedStub(storeId, txid)
                 logger.info(s"Repair complete for UnackedCommits entry of $txid on store $storeId")
                 counts.repaired.incrementAndGet()
             else

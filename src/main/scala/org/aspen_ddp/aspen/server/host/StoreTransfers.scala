@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.TransferOutcome
 import org.aspen_ddp.aspen.server.DurableFiles
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -94,23 +94,22 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       case Some(sds) =>
         val saveFile = Backend.crlSaveFile(sds.devicePath / storeId.directoryName)
         val earlier =
-          if os.exists(saveFile) then CrashRecoveryLog.loadValidStoreState(saveFile, storeId) else Right(Nil)
+          if os.exists(saveFile) then CrashRecoveryLog.loadValidStoreState(saveFile, storeId)
+          else Right(StoreRecoveryState.Empty)
         earlier match
           case Left(err) => Future.failed(err)
           case Right(saved) =>
             val opens = ctx.loader.opensStarted(storeId)
-            sds.crl.readStoreState(storeId).flatMap: trs =>
+            sds.crl.readStoreState(storeId).flatMap: state =>
               if ctx.loader.opensStarted(storeId) != opens then
                 Future.failed(new IllegalStateException(
                   s"store $storeId was opened while its CRL state was being extracted"))
-              else if trs.isEmpty then
+              else if state.isEmpty then
                 Future.unit
               else
-                val ids = trs.map(_.txd.transactionId)
-                val kept = saved.filterNot(t => ids.contains(t.txd.transactionId))
                 // A failed save leaves them in the device CRL, for a retried request to extract again
-                CrashRecoveryLog.saveStoreState(storeId, kept ++ trs, saveFile)
-                sds.crl.deleteTransactions(storeId, ids).map(_ => sds.admission.releaseRetained(storeId))
+                CrashRecoveryLog.saveStoreState(storeId, saved.supersededBy(state), saveFile)
+                sds.crl.deleteTransactions(storeId, state.entryIds).map(_ => sds.admission.releaseRetained(storeId))
 
   /** The transfer-in work on `deviceId` that a shutdown of it must stop or wait for. `ingStores` are the stores
    *  the device's tree entry records as TransferringIn.

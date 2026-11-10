@@ -20,3 +20,8 @@
 - `admissionLimitBytes` (SimpleCRL: half a stream, so a recycled stream's live copy-forward always fits) sizes the
   device's `CrlAdmission`, which drops prepares for unseen transactions past it. `Stream.writeEntry`'s `require` stays
   the fail-stop backstop
+- Applied stubs (`StoreRecoveryState`, `saveAppliedStub`/`deleteAppliedStub`): a (store, txid) entry meaning the store
+  holds that transaction's update. A namespace apart from transaction state (own header counts and deletion list in
+  each `LogEntry`), copied forward like a transaction (`Stub.anchor`); a stub's save replaces the transaction's state
+  in the same entry. `readStoreState`, `crl_save.log`, `loadStore`, `deleteTransactions` and `dropStore` carry both.
+  Not admission-counted

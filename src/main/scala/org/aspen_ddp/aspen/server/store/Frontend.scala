@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadR
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitState, Completion, Read}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -15,7 +15,7 @@ import scribe.Logging
 import org.aspen_ddp.aspen.client.{ReadLocks, ObjectState as ClientObjectState}
 
 import scala.concurrent.duration.{Duration, FiniteDuration, SECONDS}
-import scala.concurrent.{Future, Promise}
+import scala.concurrent.{Await, Future, Promise}
 import scala.util.{Failure, Success, Try}
 
 
@@ -270,8 +270,16 @@ class Frontend(val storeId: StoreId,
   private val unackedLookups = scala.collection.mutable.HashMap[TransactionId, UnackedLookup]()
   private var nextUnackedRequest: Long = 0L
 
+  /** The transactions this store holds an applied stub for (StoreRecoveryState): it holds their updates. Loaded at
+    * recovery. Written only on the store's executor; `@volatile` so appliedStubs may be read from any thread */
+  @volatile private var stubs: Set[TransactionId] = Set()
+
   // Undeferred (tests only), the state is read here, which may block on the CRL
-  if deferRecovery then awaitRecovery() else recoverTransactions(crl.getFullRecoveryState(storeId))
+  if deferRecovery then awaitRecovery() else recoverState(Await.result(crl.readStoreState(storeId), Duration.Inf))
+
+  private def recoverState(state: StoreRecoveryState): Unit =
+    stubs ++= state.appliedStubs
+    recoverTransactions(state.transactions)
 
   /** Recreates the transactions in `states`, which the CRL holds for this store, that are not already known.
     *
@@ -321,15 +329,38 @@ class Frontend(val storeId: StoreId,
     */
   def awaitRecovery(): Unit = awaitingCrl = true
 
-  /** `states` is the store's recovery state, read from the CRL by the caller (CrashRecoveryLog.readStoreState, which
-    * does not block): recreates its transactions. Held messages are handled, in arrival order, once those
-    * transactions have loaded their objects. The flag is cleared only once they are registered, so
-    * mayHoldTransaction, read from other threads, never reads false in between
+  /** `state` is the store's recovery state, read from the CRL by the caller (CrashRecoveryLog.readStoreState, which
+    * does not block): recreates its transactions and loads its applied stubs, which are not transactions. Held
+    * messages are handled, in arrival order, once those transactions have loaded their objects. The flag is cleared
+    * only once they are registered, so mayHoldTransaction, read from other threads, never reads false in between
     */
-  def recover(states: List[TransactionRecoveryState]): Unit =
-    recoverTransactions(states)
+  def recover(state: StoreRecoveryState): Unit =
+    recoverState(state)
     awaitingCrl = false
     releaseHeldMessages()
+
+  // ---- Applied stubs (StoreRecoveryState) ----
+
+  /** Whether the store holds an applied stub for `txid`: it already holds the transaction's update */
+  def hasAppliedStub(txid: TransactionId): Boolean = stubs.contains(txid)
+
+  /** The store's applied stubs. Callable from any thread */
+  def appliedStubs: Set[TransactionId] = stubs
+
+  /** Records that the store holds `txid`'s update: an applied stub, saved in the CRL in place of the transaction's
+    * state, for a transaction the store is forgetting. `onDurable` runs on the store's executor once the stub is durable.
+    * What the transaction was admitted for is released (its CRL state is replaced). Never subject to CrlAdmission
+    */
+  def recordAppliedStub(txid: TransactionId)(onDurable: => Unit): Unit =
+    stubs += txid
+    releaseAdmission(txid)
+    crl.saveAppliedStub(storeId, txid, () => post(() => onDurable))
+
+  /** Drops the applied stub for `txid`, if the store holds one, and deletes it from the CRL */
+  def dropAppliedStub(txid: TransactionId): Unit =
+    if stubs.contains(txid) then
+      stubs -= txid
+      crl.deleteAppliedStub(storeId, txid)
 
   // ---- UnackedCommits lookups of recovered commit votes and held late commits (Tx.awaitsUnackedLookup) ----
 

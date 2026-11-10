@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
   TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CompletionHandler, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
@@ -108,8 +108,8 @@ object StoreRouterSuite:
     def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = synchronized:
       states.getOrElse(storeId, Map()).values.toList
 
-    override def loadStore(storeId: StoreId, trsList: List[TransactionRecoveryState]): Future[Unit] =
-      gate.flatMap(_ => super.loadStore(storeId, trsList))(using ExecutionContext.parasitic)
+    override def loadStore(storeId: StoreId, state: StoreRecoveryState): Future[Unit] =
+      gate.flatMap(_ => super.loadStore(storeId, state))(using ExecutionContext.parasitic)
 
     def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
       synchronized:
@@ -120,6 +120,11 @@ object StoreRouterSuite:
 
     def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = synchronized:
       states += storeId -> (states.getOrElse(storeId, Map()) - txid)
+
+    def getAppliedStubs(storeId: StoreId): Set[TransactionId] = Set()
+    def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
+      completionHandler()
+    def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = ()
 
   /** A DeviceControl on a StoreThreadPool with what loading, routing and closing a store use. Its posted events run
    *  the StoreLoader handlers on the control thread. Its router is ready (as after a Host's startup scan) unless
@@ -278,7 +283,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       val trs = TransactionRecoveryState(s0, overwriteTxd(txid).serialize(),
         List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), TransactionDisposition.VoteCommit,
         TransactionStatus.Unresolved, PersistentState.initial)
-      CrashRecoveryLog.saveStoreState(s0, List(trs), backend.crlSaveFile)
+      CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(List(trs)), backend.crlSaveFile)
 
       val loaded = fx.load(backend)
       // The LoadStore handler has run: the store is installed and its CRL load waits on the gate

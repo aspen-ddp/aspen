@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
 import org.aspen_ddp.aspen.server.{DurableFiles, Host, StoreConfig}
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild}
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.Backend
@@ -321,7 +321,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     try
       DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile, "")
       if ! os.exists(Backend.crlSaveFile(storePath)) then
-        CrashRecoveryLog.saveStoreState(storeId, Nil, Backend.crlSaveFile(storePath))
+        CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(storePath))
     catch
       case t: Throwable =>
         // Offline for the life of this process either way. A restart cancelling the shutdown

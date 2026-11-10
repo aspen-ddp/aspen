@@ -51,11 +51,20 @@ object TestNetwork {
     override def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit = ()
 
     override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = ()
+
+    override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = Set()
+
+    override def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
+      completionHandler()
+
+    override def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = ()
   }
 
-  /** A CRL that keeps what it is given in memory, so a store loaded again recovers its transactions from it */
+  /** A CRL that keeps what it is given in memory, so a store loaded again recovers its transactions and applied stubs
+    * from it */
   class RecordingCRL extends CrashRecoveryLog:
     private var states: Map[StoreId, Map[TransactionId, TransactionRecoveryState]] = Map()
+    private var stubs: Map[StoreId, Set[TransactionId]] = Map()
 
     def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = synchronized:
       states.getOrElse(storeId, Map()).values.toList
@@ -69,6 +78,19 @@ object TestNetwork {
 
     def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = synchronized:
       states += storeId -> (states.getOrElse(storeId, Map()) - txid)
+
+    def getAppliedStubs(storeId: StoreId): Set[TransactionId] = synchronized:
+      stubs.getOrElse(storeId, Set())
+
+    /** Replaces the transaction's state, as SimpleCRL does */
+    def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
+      synchronized:
+        states += storeId -> (states.getOrElse(storeId, Map()) - txid)
+        stubs += storeId -> (stubs.getOrElse(storeId, Set()) + txid)
+      completionHandler()
+
+    def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = synchronized:
+      stubs += storeId -> (stubs.getOrElse(storeId, Set()) - txid)
 
     /** Rewrites the state held for `txid` of `storeId`: what a crash between two of its saves leaves */
     def rewrite(storeId: StoreId, txid: TransactionId)(f: TransactionRecoveryState => TransactionRecoveryState): Unit =

@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.paxos.PersistentState
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, RevisionLock, SharedRevisionLock, VersionBump, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.TempDirManager
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
@@ -114,6 +114,21 @@ object FrontendSuite {
     override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit =
       txDel = true
       deleted = deleted :+ txid
+
+    var stubsSaved: List[TransactionId] = Nil
+    var stubsDeleted: List[TransactionId] = Nil
+    /** While set, stub saves complete only when the test runs the handlers held here */
+    var holdStubSaves = false
+    var heldStubSaves: List[() => Unit] = Nil
+
+    override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = Set()
+
+    override def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
+      stubsSaved = stubsSaved :+ txid
+      if holdStubSaves then heldStubSaves = heldStubSaves :+ completionHandler else completionHandler()
+
+    override def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit =
+      stubsDeleted = stubsDeleted :+ txid
   }
 
   /** Holds commits until deliverCommits, applying each to the map only then, and counts backend reads and repairs.
@@ -1587,7 +1602,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     recoverable = List(TransactionRecoveryState(storeId, lockTxd(txid1, List(overwrite(op1))).serialize(),
       List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), TransactionDisposition.VoteCommit,
       TransactionStatus.Unresolved, PersistentState.initial))
-    frontend.recover(recoverable)
+    frontend.recover(StoreRecoveryState(recoverable))
 
     frontend.transactions.keySet shouldBe Set(txid1, txid2)
     net.txMessage() match
@@ -1638,7 +1653,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
     recoverable = List(commitVote(txid1, List(overwrite(op1))))
-    frontend.recover(recoverable)
+    frontend.recover(StoreRecoveryState(recoverable))
     backend.deliver() // The shared read of op1 completes after recover returned
     backend.deliver() // and so does any read issued once the held prepare is handled
 
@@ -1663,9 +1678,55 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend = Some(f)
 
     // Read as the host reads it: before recover, while recovery is awaited
-    f.recover(crl.getFullRecoveryState(storeId))
+    f.recover(StoreRecoveryState(crl.getFullRecoveryState(storeId)))
     seenDuringRecovery shouldBe List(true)
     f.mayHoldTransaction(txid1) shouldBe true
+  }
+
+  test("a store's stub set is loaded on recovery") {
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    // Recovered at construction, read from the CRL
+    val crl = new TestCrl:
+      override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = Set(txid1)
+    val f = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet, crl,
+      new TransactionStatusCache())
+    f.hasAppliedStub(txid1) shouldBe true
+    f.hasAppliedStub(txid2) shouldBe false
+    f.transactions shouldBe empty
+
+    // Deferred, as a host recovers: from the state it read
+    val deferred = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
+      new TestCrl, new TransactionStatusCache(), deferRecovery = true)
+    deferred.hasAppliedStub(txid2) shouldBe false
+    deferred.recover(StoreRecoveryState(Nil, Set(txid2)))
+    deferred.hasAppliedStub(txid2) shouldBe true
+    deferred.appliedStubs shouldBe Set(txid2)
+    // A stub is not a transaction
+    deferred.transactions shouldBe empty
+  }
+
+  test("recordAppliedStub continues once the stub is durable, and dropAppliedStub deletes it") {
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val crl = new TestCrl
+    crl.holdStubSaves = true
+    val f = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet, crl,
+      new TransactionStatusCache())
+    var durable = false
+    f.recordAppliedStub(txid1) { durable = true }
+    f.hasAppliedStub(txid1) shouldBe true
+    crl.stubsSaved shouldBe List(txid1)
+    durable shouldBe false
+    crl.heldStubSaves.foreach(_())
+    durable shouldBe true
+
+    f.dropAppliedStub(txid1)
+    f.hasAppliedStub(txid1) shouldBe false
+    crl.stubsDeleted shouldBe List(txid1)
+    // Only a stub held is deleted
+    f.dropAppliedStub(txid2)
+    crl.stubsDeleted shouldBe List(txid1)
   }
 
   test("a prepare arriving during startup recovery is handled after the recovered transactions take their locks") {
@@ -1821,7 +1882,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     recoverable = List(
       recoveryState(txid1, List(SharedRevisionLock(fencePtr, rev0)), TransactionDisposition.VoteCommit),
       recoveryState(txid2, List(overwrite(op1)), TransactionDisposition.VoteCommit))
-    frontend.recover(recoverable)
+    frontend.recover(StoreRecoveryState(recoverable))
     backend.deliver()
     backend.deliver()
 
@@ -2799,7 +2860,11 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   class SyncCrl(val crl: SimpleCRL) extends CrashRecoveryLog:
     override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
       crl.getFullRecoveryState(storeId)
-    override def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] = crl.readStoreState(storeId)
+    override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] = crl.readStoreState(storeId)
+    override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = crl.getAppliedStubs(storeId)
+    override def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
+      crl.saveAppliedStub(storeId, txid, completionHandler)
+    override def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = crl.deleteAppliedStub(storeId, txid)
     override def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
       val done = new LinkedBlockingQueue[java.lang.Boolean]()
       crl.save(txid, state, () => done.put(true))
@@ -2818,7 +2883,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       val (frontend, backend, _) = heldCommit(crl)
       backend.deliverCommits(Right(CommitError.IOFailure))
       finalizeTx1(frontend)
-      Await.result(crl.readStoreState(storeId), Duration(10, SECONDS))
+      Await.result(crl.readStoreState(storeId), Duration(10, SECONDS)).transactions
     finally
       crl.crl.shutdown()
       tdir.delete()
@@ -3091,6 +3156,32 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     admission.admittedBytes shouldBe 100
   }
 
+  test("a stub write is not subject to CrlAdmission backpressure") {
+    // Below the limit until tx1 is admitted, which crosses it
+    val admission = new CrlAdmission(1)
+    val crl = new TestCrl
+    val (store, _, net) = admissionStore(admission, crl)
+    val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+    store.receiveTransactionMessage(p1)
+    prepareResponses(net, txid1).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+    admission.full shouldBe true
+
+    // Written past the mark; the stub replaces txid1's CRL state, so what it was admitted for is released
+    var durable = false
+    store.frontend.recordAppliedStub(txid1) { durable = true }
+    durable shouldBe true
+    crl.stubsSaved shouldBe List(txid1)
+    admission.admittedBytes shouldBe 0
+
+    // And with the admission full of other transactions' bytes
+    admission.tryAdmit(1) shouldBe true
+    admission.full shouldBe true
+    store.frontend.recordAppliedStub(txid2)(())
+    crl.stubsSaved shouldBe List(txid1, txid2)
+    store.frontend.hasAppliedStub(txid2) shouldBe true
+    admission.admittedBytes shouldBe 1
+  }
+
   test("a known transaction's retransmitted prepare is answered past the mark") {
     // Below the limit until tx1 is admitted, which crosses it
     val admission = new CrlAdmission(1)
@@ -3308,7 +3399,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.receiveTransactionMessage(p1)
     recoverable = List(TransactionRecoveryState(storeId, p1.txd.serialize(), p1.objectUpdates,
       TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial))
-    frontend.recover(recoverable)
+    frontend.recover(StoreRecoveryState(recoverable))
     frontend.transactions.contains(txid1) shouldBe true
     admission.admittedBytes shouldBe admissionBytes(p1)
   }

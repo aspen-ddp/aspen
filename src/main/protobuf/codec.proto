@@ -561,8 +561,10 @@ message TransactionRecoveryState {
   PersistentState paxos_acceptor_state = 6;
 }
 
+// One entry of a crl_save.log: a transaction's state, or an applied stub (the transaction id)
 message StoreCRLEntry {
   TransactionRecoveryState trs = 1;
+  UUID applied_stub = 2;
 }
 
 message PoolStoreEntry {

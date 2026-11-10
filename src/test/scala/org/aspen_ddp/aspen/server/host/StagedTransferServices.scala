@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
 
@@ -45,7 +45,7 @@ class StagedTransferService extends StoreTransferService:
       os.makeDir.all(staged)
       os.write.over(staged / StoreTransfer.TransferOutMarkerFile, "")
       if crlValid then
-        CrashRecoveryLog.saveStoreState(sid, Nil, Backend.crlSaveFile(staged))
+        CrashRecoveryLog.saveStoreState(sid, StoreRecoveryState.Empty, Backend.crlSaveFile(staged))
       else
         os.write.over(Backend.crlSaveFile(staged), "")
       p.success(())

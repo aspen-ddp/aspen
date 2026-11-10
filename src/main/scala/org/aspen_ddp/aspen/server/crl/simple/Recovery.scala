@@ -21,7 +21,9 @@ object Recovery extends Logging:
                     initialNextEntryOffset: Long,
                     initialOldestEntryNeeded: Long,
                     initialPreviousEntryLocation: StreamLocation,
-                    trsList: List[TransactionRecoveryState])
+                    trsList: List[TransactionRecoveryState],
+                    /** Applied stubs: not transactions, recovered apart from them */
+                    appliedStubs: Set[TxId] = Set())
 
   def recover(files: List[(StreamId, os.Path)]): Result =
     val readers = files.sortBy(_._1.number).map(t => StreamReader(t._1, t._2)).toArray
@@ -111,4 +113,5 @@ object Recovery extends Logging:
       initialNextEntryOffset,
       initialOldestEntryNeeded,
       initialPreviousEntryLocation,
-      trsList)
+      trsList,
+      rs.stubs)

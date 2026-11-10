@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription,
   TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.Store
@@ -50,7 +50,7 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     val txd = overwriteTxd(txid, 0)
     val trs = TransactionRecoveryState(crlStoreId, txd.serialize(), List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))),
       TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial)
-    CrashRecoveryLog.saveStoreState(crlStoreId, List(trs), backend.crlSaveFile)
+    CrashRecoveryLog.saveStoreState(crlStoreId, StoreRecoveryState(List(trs)), backend.crlSaveFile)
     backend
 
   private val ida = Replication(3, 2)
@@ -124,6 +124,49 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       store.frontend.transactions.keySet should be (Set(txid))
       store.objectCache.get(oid).flatMap(_.lockedToTransaction) should be (Some(txid))
 
+  atest("a store loaded from its crl_save.log recovers its applied stubs"):
+    given ExecutionContext = executionContext
+    val stubbed = TransactionId(new UUID(7, 9))
+    val backend = storeWithSaveFile()
+    val (_, saved) = CrashRecoveryLog.loadStoreState(backend.crlSaveFile)
+    CrashRecoveryLog.saveStoreState(crlStoreId, saved.copy(appliedStubs = Set(stubbed)), backend.crlSaveFile)
+    val crl = new TestNetwork.RecordingCRL
+    val host = newCrlHost(crl)
+    val loaded = host.loadStore(deviceId, backend, None)
+
+    def recovered: Boolean =
+      host.testingOnlyHandleEvents()
+      loaded.isCompleted && storeOf(host).exists(_.frontend.transactions.contains(txid))
+
+    for
+      _ <- yieldUntil(recovered)
+      _ <- loaded
+    yield
+      val store = storeOf(host).get
+      store.frontend.appliedStubs should be (Set(stubbed))
+      store.frontend.transactions.keySet should be (Set(txid))
+      crl.getAppliedStubs(crlStoreId) should be (Set(stubbed))
+
+  atest("a store loaded with applied stubs in its device CRL recovers them"):
+    given ExecutionContext = executionContext
+    val stubbed = TransactionId(new UUID(7, 9))
+    val crl = new TestNetwork.RecordingCRL
+    crl.save(txid, commitVote(), () => ())
+    crl.saveAppliedStub(crlStoreId, stubbed, () => ())
+    val backend = storeWithObject()
+    val host = newCrlHost(crl)
+    val loaded = host.loadStore(deviceId, backend, None)
+
+    def recovered: Boolean =
+      host.testingOnlyHandleEvents()
+      loaded.isCompleted && storeOf(host).exists(_.frontend.transactions.contains(txid))
+
+    for
+      _ <- yieldUntil(recovered)
+      _ <- loaded
+    yield
+      storeOf(host).get.frontend.appliedStubs should be (Set(stubbed))
+
   /** A RecordingCRL whose readStoreState answers only when the test completes `answer`, as a busy CRL thread would,
    *  and which records any blocking getFullRecoveryState call */
   private class SlowReadCRL extends TestNetwork.RecordingCRL:
@@ -133,9 +176,9 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
       blockingReads += 1
       super.getFullRecoveryState(storeId)
-    override def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] =
+    override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
       asked = true
-      val held = super.getFullRecoveryState(storeId)
+      val held = StoreRecoveryState(super.getFullRecoveryState(storeId), getAppliedStubs(storeId))
       answer.future.map(_ => held)(using ExecutionContext.parasitic)
 
   atest("device-CRL recovery waits for the CRL without blocking and holds messages until it recovers"):

@@ -15,16 +15,22 @@ class LogEntry(val previousEntryLocation: StreamLocation,
   private var txs: HashMap[TxId, Tx] = new HashMap()
   private var txDeletions: List[TxId] = Nil
   private var txDelSet: Set[TxId] = Set()
+  private var stubs: HashMap[TxId, Stub] = new HashMap()
+  private var stubDeletions: Set[TxId] = Set()
 
 
   def isEmpty: Boolean =
     txs.isEmpty
       && txDeletions.isEmpty
+      && stubs.isEmpty
+      && stubDeletions.isEmpty
 
 
   def staticDataSize: Long =
     txs.valuesIterator.foldLeft(0L)((s, tx) => s + tx.staticDataSize)
     + TxId.StaticSize * txDeletions.length
+    + TxId.StaticSize * stubs.size
+    + TxId.StaticSize * stubDeletions.size
     + 16 // Trailing file UUID. Must match header UUID during load process or corrupted entry
 
   def dynamicDataSize: Long =
@@ -56,6 +62,17 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     txDeletions = txid :: txDeletions
     txDelSet = txDelSet + txid
 
+  /** Unlike a transaction's save, a stub's save after its deletion in this entry is written: the newer of the two
+    * wins, so an entry never holds both for one id */
+  def addStub(stub: Stub, completionHandler: () => Unit): Unit =
+    stubDeletions -= stub.id
+    stubs += (stub.id -> stub)
+    completionHandlers = completionHandler :: completionHandlers
+
+  def deleteStub(txid: TxId): Unit =
+    stubs -= txid
+    stubDeletions += txid
+
   def createEntryBuffers(startingOffset: Long,
                          streamUUID: UUID,
                          streamId: StreamId): Array[ByteBuffer] =
@@ -76,6 +93,8 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     hbuff.putLong(statDataSize)
     hbuff.putInt(txs.size)
     hbuff.putInt(txDeletions.length)
+    hbuff.putInt(stubs.size)
+    hbuff.putInt(stubDeletions.size)
 
     buffers = ByteBuffer.wrap(harr) :: buffers
 
@@ -97,13 +116,19 @@ class LogEntry(val previousEntryLocation: StreamLocation,
           (ou.objectId, allocate(ou.data.asReadOnlyBuffer()))
         )
 
+    stubs.valuesIterator.foreach: stub =>
+      if stub.anchor.isEmpty then
+        stub.anchor = Some(StreamLocation(streamId, offset, 0))
+
     // StaticData ---------
     val staticArr = new Array[Byte](statDataSize.toInt)
 
     val bb = ByteBuffer.wrap(staticArr)
 
     txs.valuesIterator.foreach(_.writeStaticEntry(bb))
+    stubs.valuesIterator.foreach(_.writeStaticEntry(bb))
     txDeletions.foreach(Tx.putTxId(bb, _))
+    stubDeletions.foreach(Tx.putTxId(bb, _))
     Tx.putUUID(bb, streamUUID)
 
     assert(bb.position() == bb.limit)
@@ -121,7 +146,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
 object LogEntry:
 
-  val StaticEntryHeaderSize: Int = 16 + 8 + 8 + 14 + 8 + 8 + 4 + 4
+  val StaticEntryHeaderSize: Int = 16 + 8 + 8 + 14 + 8 + 8 + 4 + 4 + 4 + 4
 
   /// Entry Header
   ///   stream_uuid - 16
@@ -132,6 +157,10 @@ object LogEntry:
   ///   static_data_size - 8
   ///   num_transactions - 4
   ///   num_tx_deletions - 4
+  ///   num_applied_stubs - 4
+  ///   num_applied_stub_deletions - 4
+  ///
+  /// Static data: transactions, applied stubs (TxId each), transaction deletions, applied stub deletions, stream UUID
   case class EntryHeader(streamUUID: UUID,
                          entrySerialNumber: Long,
                          oldestEntryNeeded: Long,
@@ -139,7 +168,9 @@ object LogEntry:
                          dynamicDataSize: Long,
                          staticDataSize: Long,
                          numTransactions: Int,
-                         numDeletedTransactions: Int):
+                         numDeletedTransactions: Int,
+                         numAppliedStubs: Int,
+                         numDeletedAppliedStubs: Int):
     def trailingUUIDOffset: Long =
       StaticEntryHeaderSize + dynamicDataSize + staticDataSize - 16
 
@@ -149,7 +180,9 @@ object LogEntry:
 
 
   class RecoveringState(var txs: HashMap[TxId, Tx.LoadingTx],
-                        var txDeletions: Set[TxId])
+                        var txDeletions: Set[TxId],
+                        var stubs: Set[TxId] = Set(),
+                        var stubDeletions: Set[TxId] = Set())
 
 
   def loadHeader(hbuff: ByteBuffer): EntryHeader =
@@ -161,9 +194,11 @@ object LogEntry:
     val staticDataSize = hbuff.getLong()
     val numTransactions = hbuff.getInt()
     val numTxDeletions = hbuff.getInt()
+    val numStubs = hbuff.getInt()
+    val numStubDeletions = hbuff.getInt()
 
     EntryHeader(streamUUID, entrySerialNumber, oldestEntryNeeded, previousEntryLocation, dynamicDataSize,
-      staticDataSize, numTransactions, numTxDeletions)
+      staticDataSize, numTransactions, numTxDeletions, numStubs, numStubDeletions)
 
 
   def loadStaticEntryContent(header: EntryHeader,
@@ -175,13 +210,23 @@ object LogEntry:
     // after a delete of the same id within one entry) and to saves in older entries. It must
     // not remove a save from a newer entry: that is a re-save of a previously deleted id.
     val loaded = List.fill(header.numTransactions)(Tx.loadTx(bb))
+    val stubsHere = List.fill(header.numAppliedStubs)(Tx.getTxId(bb))
     val deletedHere = List.fill(header.numDeletedTransactions)(Tx.getTxId(bb)).toSet
+    val stubsDeletedHere = List.fill(header.numDeletedAppliedStubs)(Tx.getTxId(bb)).toSet
 
     loaded.foreach: ltx =>
       if !rstate.txDeletions.contains(ltx.id) && !deletedHere.contains(ltx.id) && !rstate.txs.contains(ltx.id) then
         rstate.txs += (ltx.id -> ltx)
 
     rstate.txDeletions ++= deletedHere
+
+    // Applied stubs are separate entries, with the same rule. An entry never holds a stub and its deletion
+    // (LogEntry.addStub), so only newer deletions can remove one
+    stubsHere.foreach: id =>
+      if !rstate.stubDeletions.contains(id) && !stubsDeletedHere.contains(id) then
+        rstate.stubs += id
+
+    rstate.stubDeletions ++= stubsDeletedHere
 
 
   def padTo4k(offset: Long): Int =

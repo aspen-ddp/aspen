@@ -88,15 +88,51 @@ object Tx:
     LoadingTx(txid, txdLocation, updateLocations, disposition, paxState)
 
 
-class Tx(val id: TxId,
+/** A live entry of the CRL: a transaction's state (Tx) or an applied stub (Stub). Records are queued by the entry that
+  * first wrote them, oldest at the tail, which sets the oldest entry a recovery needs */
+sealed abstract class Record(val id: TxId):
+  var next: Option[Record] = None
+  var prev: Option[Record] = None
+  var entrySerialNumber: Long = 0
+
+  /** Forgets where its data was written, so the next entry writes it again */
+  def clearDynamicData(): Unit
+
+  def dynamicDataSize: Long
+
+  def staticDataSize: Long
+
+  def writeStaticEntry(bb: ByteBuffer): Unit
+
+  /** Whether the record has data in stream `id`, which it then forgets, to be written again */
+  def closeStream(id: StreamId): Boolean
+
+
+/** An applied stub (StoreRecoveryState): its static record is only its TxId. `anchor` is a zero-length location in
+  * the entry that wrote it, so a rotation recycling that stream copies it forward as it does a transaction's data */
+final class Stub(id: TxId) extends Record(id):
+  var anchor: Option[StreamLocation] = None
+
+  def clearDynamicData(): Unit = anchor = None
+
+  def dynamicDataSize: Long = 0
+
+  def staticDataSize: Long = TxId.StaticSize
+
+  def writeStaticEntry(bb: ByteBuffer): Unit = Tx.putTxId(bb, id)
+
+  def closeStream(streamId: StreamId): Boolean = anchor match
+    case Some(loc) if loc.streamId == streamId =>
+      anchor = None
+      true
+    case _ => false
+
+
+final class Tx(id: TxId,
          var state: TransactionRecoveryState,
          var txdLocation: Option[StreamLocation] = None,
          var objectUpdateLocations: Option[List[(ObjectId, StreamLocation)]] = None,
-         var keepObjectUpdates: Boolean = true):
-
-  var next: Option[Tx] = None
-  var prev: Option[Tx] = None
-  var entrySerialNumber: Long = 0
+         var keepObjectUpdates: Boolean = true) extends Record(id):
 
   def clearDynamicData(): Unit =
     txdLocation = None

@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig,
   StorageDeviceManager, StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, SimpleCRL}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome,
   TransferOutcome}
@@ -49,7 +49,11 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   /** While set, the next read of a store's state completes only once it completes: a host stopped there crashes in
    *  the window between the read and the save file's write. Later reads (a store's recovery) are not gated */
   @volatile var readGate: Option[Future[Unit]] = None
-  override def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] =
+  def getAppliedStubs(storeId: StoreId): Set[TransactionId] = inner.getAppliedStubs(storeId)
+  def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
+    inner.saveAppliedStub(storeId, txid, completionHandler)
+  def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = inner.deleteAppliedStub(storeId, txid)
+  override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
     val read = inner.readStoreState(storeId)
     readCalled.trySuccess(())
     val gate = synchronized:
@@ -60,8 +64,8 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
       case None => read
       case Some(gate) => read.flatMap(trs => gate.map(_ => trs)(using ExecutionContext.parasitic))(
         using ExecutionContext.parasitic)
-  override def loadStore(storeId: StoreId, trsList: List[TransactionRecoveryState]): Future[Unit] =
-    inner.loadStore(storeId, trsList)
+  override def loadStore(storeId: StoreId, state: StoreRecoveryState): Future[Unit] =
+    inner.loadStore(storeId, state)
   def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
     inner.save(txid, state, () => completions.execute(() => { completionHandler(); firstSave.trySuccess(()) }))
   def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit =
@@ -810,7 +814,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = second.shutdownAll()
     yield
       copies.size should be(1)
-      saved.map(_.map(_.map(_.txd.transactionId))) should be(List(Right(List(txid))))
+      saved.map(_.map(_.transactions.map(_.txd.transactionId))) should be(List(Right(List(txid))))
       leftInCrl should be(Set())
       keptWhileRebuilding should be(true)
       deletedOnceActive should be(true)
@@ -919,10 +923,64 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     yield
       heldAfterClose should be(Set(txid))
       saveFileAfterClose should be(false)
-      saved.map(_.map(_.txd.transactionId)) should be(Right(List(txid)))
+      saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(txid)))
       heldAfterExtract should be(Set())
       // Deleted from the files once the save file was durable: not recovered here on a restart as well
       heldOnDisk(deviceDir, storeId) should be(Set())
+
+  /** Extracts the store's CRL state for a network transfer out, from the open store (`loaded`) or from its device
+   *  CRL once closed, holding an in-flight transaction and an applied stub. Returns the save file's state, the stubs
+   *  the device CRL held afterwards, and those its files hold */
+  private def extractionWithStub(loaded: Boolean)
+    : Future[(Either[CrashRecoveryLog.InvalidSaveFile, StoreRecoveryState], Set[TransactionId], Set[TransactionId])] =
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val stubbed = TransactionId(new UUID(9, 41))
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = factory.opened.head
+      _ <- prepareInFlight(host, crl, storeId, txid)
+      stubDurable = Promise[Unit]()
+      _ = crl.saveAppliedStub(storeId, stubbed, () => stubDurable.trySuccess(()))
+      _ <- stubDurable.future
+      _ <-
+        if loaded then
+          Future.unit
+        else
+          val closed = host.closeStore(storeId)
+          pumpUntil(host, closed.isCompleted).flatMap(_ => closed)
+      extracting = host.control.transfers.closeForTransferOut(storeId)
+      _ <- pumpUntil(host, extracting.isCompleted)
+      _ <- extracting
+      saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
+      heldAfter = crl.getAppliedStubs(storeId)
+      _ = factory.shutdownAll()
+      onDisk = heldStubsOnDisk(deviceDir, storeId)
+    yield (saved, heldAfter, onDisk)
+
+  private def heldStubsOnDisk(deviceDir: os.Path, sid: StoreId): Set[TransactionId] =
+    val crl = newFactory().openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
+      deviceDir / StorageDeviceConfig.configFilename))
+    try crl.getAppliedStubs(sid)
+    finally crl.shutdown()
+
+  atest("a network transfer out of an open store ships its applied stubs in its crl_save.log"):
+    given ExecutionContext = executionContext
+    extractionWithStub(loaded = true).map: (saved, heldAfter, onDisk) =>
+      saved.map(_.appliedStubs) should be(Right(Set(TransactionId(new UUID(9, 41)))))
+      saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(txid)))
+      heldAfter should be(Set())
+      onDisk should be(Set())
+
+  atest("a network transfer out of an unloaded store ships its applied stubs in its crl_save.log"):
+    given ExecutionContext = executionContext
+    extractionWithStub(loaded = false).map: (saved, heldAfter, onDisk) =>
+      saved.map(_.appliedStubs) should be(Right(Set(TransactionId(new UUID(9, 41)))))
+      saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(txid)))
+      heldAfter should be(Set())
+      onDisk should be(Set())
 
   atest("a discarded store's directory and marker stay until its device-CRL entries are durably dropped"):
     given ExecutionContext = executionContext

@@ -3,7 +3,8 @@ package org.aspen_ddp.aspen.server.crl.simple
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.StorageDeviceConfig
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, StoreRecoveryState,
+  TransactionRecoveryState}
 import scribe.Logging
 
 import java.util.UUID
@@ -27,6 +28,11 @@ object SimpleCRL:
   case class DeleteTransactions(storeId: StoreId, transactionIds: List[TransactionId],
                                 completionHandler: () => Unit) extends ActionRequest
 
+  case class SaveAppliedStub(storeId: StoreId, transactionId: TransactionId,
+                             completionHandler: () => Unit) extends ActionRequest
+
+  case class DeleteAppliedStub(storeId: StoreId, transactionId: TransactionId) extends ActionRequest
+
   case class WriteComplete(serialNumber: Long) extends ActionRequest
 
   /** Queued when the writer thread dies, so the open-time re-save does not wait forever for its write */
@@ -35,14 +41,15 @@ object SimpleCRL:
   case class Shutdown(completionHandler: () => Unit) extends ActionRequest
 
   case class GetRecoveryState(storeId: StoreId,
-                              completion: List[TransactionRecoveryState] => Unit
+                              completion: StoreRecoveryState => Unit
                              ) extends ActionRequest
 
   case class GetStoresWithEntries(completion: Set[StoreId] => Unit) extends ActionRequest
 
 
   case class InitialCRLState(crl: SimpleCRL,
-                             trsList: List[TransactionRecoveryState])
+                             trsList: List[TransactionRecoveryState],
+                             appliedStubs: Set[TxId])
 
   /** Opens each device's SimpleCRL in `CrashRecoveryLog.deviceCrlDir`, creating the directory if absent, sized by
    *  the device's config. `onThreadDeath` is called if a CRL thread dies: that device's transactions stop. */
@@ -82,7 +89,8 @@ object SimpleCRL:
         files,
         r,
         onThreadDeath),
-      r.trsList)
+      r.trsList,
+      r.appliedStubs)
 
   /** A directory with no stream files is a new CRL. Otherwise its files must be exactly `expected`, each
     * `maxSizeInBytes` long (StreamWriter creates them at that size) */
@@ -123,8 +131,11 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   private var transactions: HashMap[TxId, Tx] = new HashMap()
 
-  private var queueHead: Option[Tx] = None
-  private var queueTail: Option[Tx] = None
+  /** Applied stubs: entries apart from transactions, under the same ids (StoreRecoveryState) */
+  private var stubs: HashMap[TxId, Stub] = new HashMap()
+
+  private var queueHead: Option[Record] = None
+  private var queueTail: Option[Record] = None
 
   private var initializing = true
   private var writeInProgress = false
@@ -138,6 +149,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   // A failed open shuts its writer down: the caller may open the same files again
   try
+    // Stubs first: a stub's save replaces a transaction's state of the same id, and both may be live
+    r.appliedStubs.foreach(id => onSaveAppliedStub(id.storeId, id.transactionId, () => ()))
     r.trsList.foreach(trs => onSaveTransaction(trs.txd.transactionId, trs, () => ()))
 
     if !currentLogEntry.isEmpty then
@@ -195,14 +208,16 @@ class SimpleCRL private (val maxSizeInBytes: Long,
       val recycled = StreamId(currentStream)
       val nextToRecycle = StreamId((currentStream + 1) % streams.length)
       streams(currentStream).recycleStream()
-      transactions.foreach: tx =>
-        val inRecycled = tx._2.closeStream(recycled)
-        val inNext = tx._2.closeStream(nextToRecycle)
+      def copyForward(record: Record)(add: => Unit): Unit =
+        val inRecycled = record.closeStream(recycled)
+        val inNext = record.closeStream(nextToRecycle)
         if inRecycled then
-          logger.error(s"CRL transaction ${tx._1} still had data in recycled stream $recycled. Copying it forward")
+          logger.error(s"CRL entry ${record.id} still had data in recycled stream $recycled. Copying it forward")
         if inRecycled || inNext then
-          moveToQueueHead(tx._2)
-          currentLogEntry.addTx(tx._2, () => ())
+          moveToQueueHead(record)
+          add
+      transactions.valuesIterator.foreach(tx => copyForward(tx)(currentLogEntry.addTx(tx, () => ())))
+      stubs.valuesIterator.foreach(stub => copyForward(stub)(currentLogEntry.addStub(stub, () => ())))
 
       currentLogEntry.oldestEntryNeeded = oldestEntryNeeded
 
@@ -234,8 +249,16 @@ class SimpleCRL private (val maxSizeInBytes: Long,
               currentLogEntry.deleteTx(txid)
               transactions.get(txid).foreach(tx => removeFromQueue(tx))
               transactions -= txid
+              currentLogEntry.deleteStub(txid)
+              stubs.get(txid).foreach(stub => removeFromQueue(stub))
+              stubs -= txid
             currentLogEntry.addCompletionHandler(completionHandler)
             startWrite()
+
+        case SaveAppliedStub(storeId, transactionId, completionHandler) =>
+          onSaveAppliedStub(storeId, transactionId, completionHandler)
+
+        case DeleteAppliedStub(storeId, transactionId) => onDeleteAppliedStub(storeId, transactionId)
 
         case WriterDied(_) => () // Reported through onThreadDeath
 
@@ -249,18 +272,18 @@ class SimpleCRL private (val maxSizeInBytes: Long,
           onGetRecoveryState(storeId, completion)
 
         case GetStoresWithEntries(completion) =>
-          completion(transactions.keysIterator.map(_.storeId).toSet)
+          completion((transactions.keysIterator ++ stubs.keysIterator).map(_.storeId).toSet)
 
         case Shutdown(completionHandler) =>
           writer.shutdown(completionHandler)
           return
 
-  private def moveToQueueHead(lc: Tx): Unit =
+  private def moveToQueueHead(lc: Record): Unit =
     lc.clearDynamicData()
     removeFromQueue(lc)
     addToQueueHead(lc)
 
-  private def removeFromQueue(lc: Tx): Unit =
+  private def removeFromQueue(lc: Record): Unit =
     queueHead.foreach: h =>
       if h eq lc then
         queueHead = lc.prev
@@ -275,7 +298,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     lc.prev = None
     lc.next = None
 
-  private def addToQueueHead(lc: Tx): Unit =
+  private def addToQueueHead(lc: Record): Unit =
     lc.next = None
     lc.prev = queueHead
     queueHead.foreach(_.next = Some(lc))
@@ -286,9 +309,37 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   /** Leaves the transactions live: only a deletion, which is written, takes them out of the log */
   private def onGetRecoveryState(storeId: StoreId,
-                                 completion: List[TransactionRecoveryState] => Unit
+                                 completion: StoreRecoveryState => Unit
                                 ): Unit =
-    completion(transactions.valuesIterator.filter(_.id.storeId == storeId).map(_.state).toList)
+    completion(StoreRecoveryState(
+      transactions.valuesIterator.filter(_.id.storeId == storeId).map(_.state).toList,
+      stubs.keysIterator.filter(_.storeId == storeId).map(_.transactionId).toSet))
+
+  /** Replaces the transaction state held for the id, if any, in the same entry: its deletion and the stub are durable
+    * together */
+  private def onSaveAppliedStub(storeId: StoreId, transactionId: TransactionId, completionHandler: () => Unit): Unit =
+    val txid = TxId(storeId, transactionId)
+    transactions.get(txid).foreach: tx =>
+      removeFromQueue(tx)
+      transactions -= txid
+      currentLogEntry.deleteTx(txid)
+    val stub = stubs.get(txid) match
+      case Some(stub) => stub
+      case None =>
+        val stub = new Stub(txid)
+        addToQueueHead(stub)
+        stubs += (txid -> stub)
+        stub
+    currentLogEntry.addStub(stub, completionHandler)
+    startWrite()
+
+  private def onDeleteAppliedStub(storeId: StoreId, transactionId: TransactionId): Unit =
+    val txid = TxId(storeId, transactionId)
+    stubs.get(txid).foreach: stub =>
+      removeFromQueue(stub)
+      stubs -= txid
+      currentLogEntry.deleteStub(txid)
+      startWrite()
 
   private def onSaveTransaction(transactionId: TransactionId,
                       state: TransactionRecoveryState,
@@ -324,20 +375,14 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   private def onDropTransactionObjectData(storeId: StoreId, transactionid: TransactionId): Unit =
     transactions.get(TxId(storeId, transactionid)).foreach(_.dropTransactionObjectData())
 
-  def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
-    var trsList: List[TransactionRecoveryState] = Nil
+  def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = blockingRead(storeId).transactions
 
-    val blockingQueue = new LinkedBlockingQueue[String]()
+  def getAppliedStubs(storeId: StoreId): Set[TransactionId] = blockingRead(storeId).appliedStubs
 
-    def completion(tl: List[TransactionRecoveryState]): Unit =
-      trsList = tl
-      blockingQueue.put("")
-
-    ioQueue.put(GetRecoveryState(storeId, completion))
-
+  private def blockingRead(storeId: StoreId): StoreRecoveryState =
+    val blockingQueue = new LinkedBlockingQueue[StoreRecoveryState]()
+    ioQueue.put(GetRecoveryState(storeId, state => blockingQueue.put(state)))
     blockingQueue.take()
-
-    trsList
 
   def save(transactionId: TransactionId,
            state: TransactionRecoveryState,
@@ -350,14 +395,20 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   def dropTransactionObjectData(storeId: StoreId, transactionid: TransactionId): Unit =
     ioQueue.put(DropTransactionData(storeId, transactionid))
 
+  def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
+    ioQueue.put(SaveAppliedStub(storeId, txid, completionHandler))
+
+  def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit =
+    ioQueue.put(DeleteAppliedStub(storeId, txid))
+
   override def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
     val p = Promise[Unit]()
     ioQueue.put(DeleteTransactions(storeId, txids, () => p.trySuccess(())))
     p.future
 
-  override def readStoreState(storeId: StoreId): Future[List[TransactionRecoveryState]] =
-    val p = Promise[List[TransactionRecoveryState]]()
-    ioQueue.put(GetRecoveryState(storeId, trsList => p.success(trsList)))
+  override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
+    val p = Promise[StoreRecoveryState]()
+    ioQueue.put(GetRecoveryState(storeId, state => p.success(state)))
     p.future
 
   override def storesWithEntries(): Future[Set[StoreId]] =

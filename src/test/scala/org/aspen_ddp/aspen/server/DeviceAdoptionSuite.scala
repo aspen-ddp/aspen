@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.runSequentially
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -104,7 +104,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
   private def writeTransferringOutStore(deviceDir: os.Path, storeId: StoreId): os.Path =
     val dir = writeClosedStore(deviceDir, storeId)
     os.write.over(dir / StoreTransfer.TransferOutMarkerFile, "")
-    CrashRecoveryLog.saveStoreState(storeId, Nil, Backend.crlSaveFile(dir))
+    CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(dir))
     dir
 
   private def marker(dir: os.Path): os.Path = dir / StoreTransfer.TransferOutMarkerFile
@@ -250,7 +250,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
         ("no", (file, _) => os.remove(file)),
         ("a truncated", (file, _) => os.write.over(file, "")),
         ("another store's", (file, s) =>
-          CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), Nil, file))) do
+          CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), StoreRecoveryState.Empty, file))) do
     atest(s"a store whose network transfer left transferring-out with $what save file is adopted as Rebuilding"):
       adoptWithLostStore: (dir, s) =>
         writeTransferringOutStore(dir / os.up, s)

@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.{DurableFiles, Host}
-import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
+import org.aspen_ddp.aspen.server.crl.StoreRecoveryState
 import org.aspen_ddp.aspen.server.repair.StoreNotHosted
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store}
 import org.aspen_ddp.aspen.server.store.backend.CompletionHandler
@@ -240,10 +240,10 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
                 recoverOrFail(installed, trs)
         }(using ExecutionContext.parasitic)
 
-  /** Recovers `store`'s transactions from `trs`, on its executor. A recovery that throws may have recreated only some
+  /** Recovers `store`'s transactions and applied stubs from `trs`, on its executor. A recovery that throws may have recreated only some
    *  of them: the store keeps holding its messages and dropping reads (Frontend.awaitRecovery stays set) and is
    *  fail-stopped on the control thread (StoreRebuilds.handleRecoveryFailed) */
-  private def recoverOrFail(store: Store, trs: List[TransactionRecoveryState]): Unit =
+  private def recoverOrFail(store: Store, trs: StoreRecoveryState): Unit =
     try
       store.frontend.recover(trs)
     catch

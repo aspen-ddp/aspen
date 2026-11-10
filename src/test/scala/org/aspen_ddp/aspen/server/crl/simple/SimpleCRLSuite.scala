@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation, Tx}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState, TransactionRecoveryState}
 
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -122,7 +122,7 @@ class SimpleCRLSuite extends FileBasedTests {
     // Read, not removed: only the deletion takes them out
     assert(i.crl.getFullRecoveryState(storeId).size == 1)
 
-    Await.result(i.crl.deleteTransactions(storeId, t.map(_.txd.transactionId)), Duration(5000, MILLISECONDS))
+    Await.result(i.crl.deleteTransactions(storeId, t.entryIds), Duration(5000, MILLISECONDS))
 
     val t3 = i.crl.getFullRecoveryState(storeId)
 
@@ -137,9 +137,9 @@ class SimpleCRLSuite extends FileBasedTests {
     val (sid, trl) = CrashRecoveryLog.loadStoreState(savePath)
 
     assert(sid == storeId)
-    assert(trl.length == 1)
+    assert(trl.transactions.length == 1)
 
-    assert(trl.head == trsValidTxd)
+    assert(trl.transactions.head == trsValidTxd)
 
     Await.result(i.crl.loadStore(sid, trl), Duration(5000, MILLISECONDS))
 
@@ -158,7 +158,7 @@ class SimpleCRLSuite extends FileBasedTests {
   // host accepts it. Loading that file must restore nothing and succeed.
   test("An empty CRL saved state file loads with no transactions") {
     val savePath = tdir / "crl_save_file.log"
-    CrashRecoveryLog.saveStoreState(storeId, Nil, savePath)
+    CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, savePath)
 
     val (sid, trl) = CrashRecoveryLog.loadStoreState(savePath)
     assert(sid == storeId)
@@ -174,9 +174,9 @@ class SimpleCRLSuite extends FileBasedTests {
   // file cut short by a crash or a pulled disk must fail to load, never load as fewer entries.
   test("A truncated CRL saved state file fails to load") {
     val savePath = tdir / "crl_save_file.log"
-    CrashRecoveryLog.saveStoreState(storeId, List(trsValidTxd), savePath)
+    CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState(List(trsValidTxd)), savePath)
     val full = os.read.bytes(savePath)
-    assert(CrashRecoveryLog.loadStoreState(savePath)._2.length == 1)
+    assert(CrashRecoveryLog.loadStoreState(savePath)._2.transactions.length == 1)
     assert(os.list(tdir).map(_.last).toSet == Set("crl_save_file.log"))
 
     // Zero length, mid-header, mid-length-prefix and mid-entry
@@ -191,8 +191,8 @@ class SimpleCRLSuite extends FileBasedTests {
 
     assert(CrashRecoveryLog.loadValidStoreState(savePath, storeId).isLeft)
 
-    CrashRecoveryLog.saveStoreState(storeId, List(trsValidTxd), savePath)
-    assert(CrashRecoveryLog.loadValidStoreState(savePath, storeId) == Right(List(trsValidTxd)))
+    CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState(List(trsValidTxd)), savePath)
+    assert(CrashRecoveryLog.loadValidStoreState(savePath, storeId) == Right(StoreRecoveryState(List(trsValidTxd))))
     assert(CrashRecoveryLog.loadValidStoreState(savePath, other).isLeft)
 
     os.write.over(savePath, os.read.bytes(savePath).dropRight(1))
@@ -1118,7 +1118,7 @@ class SimpleCRLSuite extends FileBasedTests {
     queue.take()
 
     val read = Await.result(i.crl.readStoreState(storeId), Duration(5000, MILLISECONDS))
-    assert(read.map(_.storeId) == List(storeId))
+    assert(read.transactions.map(_.storeId) == List(storeId))
     assert(i.crl.getFullRecoveryState(storeId).length == 1)
 
     // A new transaction of another store, saved twice: the last entry needs nothing older than the first of these
@@ -1362,5 +1362,145 @@ class SimpleCRLSuite extends FileBasedTests {
 
     for _ <- 1 to 2 do
       assertThrows[IllegalArgumentException](SimpleCRL(tdir, 3, size))
+  }
+
+  // ---- Applied stubs ----
+
+  private def stubAndWait(crl: CrashRecoveryLog, sid: StoreId, tid: TransactionId): Unit =
+    val q = new LinkedBlockingQueue[String]()
+    crl.saveAppliedStub(sid, tid, () => q.put(""))
+    q.take()
+
+  private def readState(crl: CrashRecoveryLog, sid: StoreId): StoreRecoveryState =
+    Await.result(crl.readStoreState(sid), Duration(5000, MILLISECONDS))
+
+  test("an applied stub replaces a transaction's state and is recovered as a stub, not a transaction") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    stubAndWait(i.crl, storeId, transactionId)
+
+    readState(i.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    i.crl.getFullRecoveryState(storeId) shouldBe Nil
+    // A transaction deletion leaves the stub
+    i.crl.deleteTransaction(storeId, transactionId)
+    saveAndWait(i.crl, transactionId2, trsValidTxd2)
+    i.crl.getAppliedStubs(storeId) shouldBe Set(transactionId)
+    Await.result(i.crl.storesWithEntries(), Duration(5000, MILLISECONDS)) shouldBe Set(storeId, storeId2)
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    i2.trsList.map(_.storeId) shouldBe List(storeId2)
+    i2.appliedStubs shouldBe Set(TxId(storeId, transactionId))
+    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    i2.crl.shutdown()
+  }
+
+  test("a transaction saved after its applied stub keeps the stub") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    stubAndWait(i.crl, storeId, transactionId)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    i.crl.deleteTransaction(storeId, transactionId)
+    saveAndWait(i.crl, transactionId2, trsValidTxd2)
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    i2.crl.shutdown()
+  }
+
+  test("an applied stub written after its transaction's deletion in the same entry is kept") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    // Both queued before the CRL thread takes either, so they normally share an entry
+    i.crl.deleteTransaction(storeId, transactionId)
+    stubAndWait(i.crl, storeId, transactionId)
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    i2.crl.shutdown()
+  }
+
+  test("an applied stub survives stream rotation") {
+    val size = 4096L * 3
+    val i = SimpleCRL(tdir, 3, size)
+    stubAndWait(i.crl, storeId, transactionId)
+    var rotations = 0
+    var stream = i.crl.currentStreamNumber
+    // Another store's transaction saved and deleted over and over: the ring recycles every stream several times
+    for n <- 0 until 40 do
+      val (tid, t) = mkTx(n, 1)
+      saveAndWait(i.crl, tid, t.copy(storeId = storeId2))
+      i.crl.deleteTransaction(storeId2, tid)
+      if i.crl.currentStreamNumber != stream then
+        rotations += 1
+        stream = i.crl.currentStreamNumber
+    saveAndWait(i.crl, transactionId2, trsValidTxd2)
+    assert(rotations > 6)
+    readState(i.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, size)
+    i2.appliedStubs shouldBe Set(TxId(storeId, transactionId))
+    i2.crl.shutdown()
+    // And again: the open's re-save carries it on
+    val i3 = SimpleCRL(tdir, 3, size)
+    i3.appliedStubs shouldBe Set(TxId(storeId, transactionId))
+    i3.crl.shutdown()
+  }
+
+  test("deleteAppliedStub removes it durably") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    stubAndWait(i.crl, storeId, transactionId3)
+    i.crl.deleteAppliedStub(storeId, transactionId3)
+    // Requests are handled in order: a save completing after the deletion proves it durable
+    saveAndWait(i.crl, transactionId2, trsValidTxd2)
+    readState(i.crl, storeId).appliedStubs shouldBe Set()
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    i2.appliedStubs shouldBe Set()
+    // Only the stub: the store's transaction stays
+    readState(i2.crl, storeId).transactions shouldBe List(trsValidTxd)
+    i2.crl.shutdown()
+  }
+
+  test("stubs travel with a store transfer and are dropped by dropStore") {
+    val savePath = tdir / "crl_save_file.log"
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    stubAndWait(i.crl, storeId, transactionId3)
+    stubAndWait(i.crl, storeId, transactionId4)
+    saveAndWait(i.crl, transactionId2, trsValidTxd2)
+
+    // Extraction: read, saved to the file, then deleted from the CRL
+    val extracted = readState(i.crl, storeId)
+    extracted shouldBe StoreRecoveryState(List(trsValidTxd), Set(transactionId3, transactionId4))
+    CrashRecoveryLog.saveStoreState(storeId, extracted, savePath)
+    CrashRecoveryLog.loadValidStoreState(savePath, storeId) shouldBe Right(extracted)
+
+    // The target's CRL loads it
+    val targetDir = tdir / "target"
+    os.makeDir.all(targetDir)
+    val target = SimpleCRL(targetDir, 3, 1024 * 1024)
+    Await.result(target.crl.loadStore(storeId, extracted), Duration(5000, MILLISECONDS))
+    readState(target.crl, storeId) shouldBe extracted
+    target.crl.shutdown()
+    SimpleCRL(targetDir, 3, 1024 * 1024) match
+      case reopened =>
+        reopened.appliedStubs shouldBe Set(TxId(storeId, transactionId3), TxId(storeId, transactionId4))
+        reopened.crl.shutdown()
+
+    // A store with only stubs still has entries; dropStore takes them with its transactions
+    i.crl.deleteTransaction(storeId, transactionId)
+    Await.result(i.crl.storesWithEntries(), Duration(5000, MILLISECONDS)) shouldBe Set(storeId, storeId2)
+    Await.result(i.crl.dropStore(storeId), Duration(5000, MILLISECONDS))
+    readState(i.crl, storeId) shouldBe StoreRecoveryState(Nil, Set())
+    i.crl.shutdown()
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    i2.appliedStubs shouldBe Set()
+    readState(i2.crl, storeId2).transactions.size shouldBe 1
+    i2.crl.shutdown()
   }
 }

@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{Host, StoreConfig}
 import org.aspen_ddp.aspen.server.Host.{BackendFailed, BackendOpened, LoadStore, LoadStoreById, ShutdownStore,
   SpaceWait, StoreFailedOnClose, UnloadFailedStore}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendStateLost}
@@ -381,7 +381,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   /** The rest of a LoadStore once its store is installed: with no saved state, recovers it from the device CRL and
    *  completes `p` at once; otherwise completes `p` once the CRL holds `trs` and the store has recovered from it. Its
    *  transactions are recreated, and its transaction messages handled, only once it has recovered. */
-  private def awaitCrlLoad(store: Store, trs: Option[List[TransactionRecoveryState]], p: Promise[Unit]): Unit =
+  private def awaitCrlLoad(store: Store, trs: Option[StoreRecoveryState], p: Promise[Unit]): Unit =
     val storeId = store.storeId
     trs match
       // The device CRL already holds its state: recovered on its executor, ahead of any message it holds
@@ -512,8 +512,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             // Deleted from the device CRL files only once the save file holding them is durable, so a restart does
             // not recover them on this device too. A crash between the two leaves them in both: harmless, as loading
             // the save file re-saves them under the same ids
-            extracted.fold(Future.unit): trs =>
-              store.crl.deleteTransactions(storeId, trs.map(_.txd.transactionId)).map: _ =>
+            extracted.fold(Future.unit): state =>
+              store.crl.deleteTransactions(storeId, state.entryIds).map: _ =>
                 // Every entry of the closed store has left the device CRL
                 store.frontend.admission.releaseRetained(storeId)
         .onComplete: result =>

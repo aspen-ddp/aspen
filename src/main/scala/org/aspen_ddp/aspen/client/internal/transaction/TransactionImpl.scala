@@ -159,6 +159,8 @@ class TransactionImpl(val client: AspenClient,
 
   def note(note: String): Unit = modify(_.note(note))
 
+  def replaySafe(reason: String): Unit = modify(_.replaySafe(reason))
+
   def deferAllocationRelease(): Unit = modify(_ => releaseDeferred = true)
 
   def allocationReleaseDeferred: Boolean = synchronized { releaseDeferred }
@@ -224,6 +226,8 @@ class TransactionImpl(val client: AspenClient,
       doAddFinalizationAction(true, finalizationActionId, serializedContent)
 
     def note(note: String): Unit = hookModify(_.note(note))
+
+    def replaySafe(reason: String): Unit = hookModify(_.replaySafe(reason))
 
     /** Every hook is passed the deferRelease the caller chose, so the hooks may not change it */
     def deferAllocationRelease(): Unit =

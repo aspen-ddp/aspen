@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client
 import org.aspen_ddp.aspen.AspenError
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
-import org.aspen_ddp.aspen.common.transaction.TransactionDescription
+import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 
 sealed abstract class TransactionError extends AspenError
 
@@ -33,6 +33,13 @@ final case class RangeWriteBeyondEnd(objectPointer:ObjectPointer, currentLength:
   * effective slice limit (`StoragePool.maxSliceSize`), since that is what the stores enforce for key-value objects.
   */
 final case class ObjectSizeLimitExceeded(objectPointer:ObjectPointer, newLength: Long, maxObjectSize: Long) extends TransactionCreationError
+
+/** Thrown when a transaction has no pin (see `Pins`: an update at a required revision, a version bump, a key update
+  * that requires the key's revision while writing that key, or a refcount change) and was not marked with
+  * `Transaction.replaySafe`. Replaying such a transaction after it committed would succeed a second time, so the
+  * builder refuses it.
+  */
+final case class UnpinnedTransaction(transactionId: TransactionId) extends TransactionCreationError
 
 /** Used if multiple refcount modifications are attempted on the same object within a single transaction */
 final case class MultipleRefcountUpdatesToObject(objectPointer:ObjectPointer) extends TransactionCreationError

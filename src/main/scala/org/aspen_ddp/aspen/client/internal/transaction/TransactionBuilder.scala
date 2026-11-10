@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.DeletionFinalizationAction
-import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
+import org.aspen_ddp.aspen.client.{UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -15,6 +15,11 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.server.store.KVObjectState
 
 object TransactionBuilder {
+  /** Temporary switch: when true, building a transaction without a pin that was not marked replaySafe throws
+    * UnpinnedTransaction. Removed once all sites are converted.
+    */
+  @volatile var enforcePins: Boolean = false
+
   case class KVUpdate(
                        pointer: KeyValueObjectPointer,
                        requiredRevision: Option[ObjectRevision],
@@ -52,6 +57,9 @@ class TransactionBuilder(
   private  var notifyOnResolution = Set[StoreId]()
   private  var allocatingObjects = Set[ObjectPointer]()
   private  var notes = List[String]()
+  private  var replaySafeFlag = false
+  /** Tests use this to enforce the pin check on one builder without touching the global switch */
+  private[aspen] var enforcePinsOverride: Option[Boolean] = None
   private  var addMissedUpdateTrackingFA = true
   private  var missedCommitDelayInMs = 1000
   private  val minimumTimestamp = HLCTimestamp.now
@@ -106,6 +114,10 @@ class TransactionBuilder(
     keyValueUpdates.valuesIterator.foreach: kvu =>
       requirements = KeyValueUpdate(kvu.pointer, kvu.requiredRevision, kvu.contentLock, kvu.requirements,
         deletesKeys = kvu.operations.exists(_.isInstanceOf[Delete])) :: requirements
+
+    if enforcePinsOverride.getOrElse(enforcePins) && !replaySafeFlag &&
+      !Pins.hasPin(requirements, keyValueUpdates.map((p, kvu) => p.id -> kvu.operations)) then
+      throw UnpinnedTransaction(transactionId)
 
     // Ensure the transaction has at least one requirement
     require(requirements.nonEmpty)
@@ -384,5 +396,10 @@ class TransactionBuilder(
 
   def note(note: String): Unit = synchronized {
     notes = note :: notes
+  }
+
+  def replaySafe(reason: String): Unit = synchronized {
+    replaySafeFlag = true
+    note(s"replay-safe: $reason")
   }
 }

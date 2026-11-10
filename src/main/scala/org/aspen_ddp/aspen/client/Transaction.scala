@@ -113,6 +113,11 @@ trait Transaction {
   /** Adds a human-readable note that may be used for debugging transactions */
   def note(note: String): Unit
 
+  /** Records that replaying this transaction after it committed is harmless, which exempts it from the pin
+    * requirement. The reason is added to the transaction's notes as "replay-safe: reason".
+    */
+  def replaySafe(reason: String): Unit
+
   /** Permanently marks the transaction as unable to commit and throws `reason`.
    *
    *  Use this when a precondition check fails while building a transaction. Throwing unwinds

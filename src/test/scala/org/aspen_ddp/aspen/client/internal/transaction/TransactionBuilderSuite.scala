@@ -1,15 +1,17 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
-import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject}
+import org.aspen_ddp.aspen.client.{UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject}
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, IDA, ReedSolomon}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, VersionBump}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, DeleteLeft, DeleteMax, DeleteMin, DeleteRight, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectId, ObjectRevision}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, Exists, KeyRevision}
+import org.aspen_ddp.aspen.common.objects.ObjectRefcount
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.scalatest.funsuite.AnyFunSuite
@@ -116,5 +118,88 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
     bldr.overwrite(p1, rev1, DataBuffer(Array[Byte](1, 2, 3)))
 
     assert(!bldr.isEmpty)
+  }
+
+  // Pin check. Enforcement is switched on per builder: the global switch is shared with suites running in parallel
+  private def withPins[T](f: => T): T = f
+
+  private def buildPin(bldr: TransactionBuilder) =
+    bldr.enforcePinsOverride = Some(true)
+    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(p1.poolId -> Replication(3, 2)),
+      Map(p1.poolId -> None), Map())
+
+  private val k1 = Key(Array[Byte](1))
+  private val k2 = Key(Array[Byte](2))
+  private val ins1 = Insert(k1, Array[Byte](9))
+  private val rc1 = ObjectRefcount(1, 1)
+  private val rc2 = ObjectRefcount(2, 2)
+
+  test("pin: overwrite at a revision") {
+    withPins:
+      val b = mkBuilder(); b.overwrite(p1, rev1, DataBuffer(Array[Byte](1))); buildPin(b)
+  }
+  test("pin: bumpVersion") {
+    withPins:
+      val b = mkBuilder(); b.bumpVersion(p1, rev1); buildPin(b)
+  }
+  test("pin: update with a required revision") {
+    withPins:
+      val b = mkBuilder(); b.update(kvp, Some(rev1), None, Nil, List(ins1)); buildPin(b)
+  }
+  test("pin: KeyRevision with an Insert of the key") {
+    withPins:
+      val b = mkBuilder(); b.update(kvp, None, None, List(KeyRevision(k1, rev1)), List(ins1)); buildPin(b)
+  }
+  test("pin: KeyRevision with a Delete of the key") {
+    withPins:
+      val b = mkBuilder(); b.update(kvp, None, None, List(KeyRevision(k1, rev1)), List(Delete(k1))); buildPin(b)
+  }
+  test("pin: setRefcount with a different refcount") {
+    withPins:
+      val b = mkBuilder(); b.setRefcount(p1, rc1, rc2); buildPin(b)
+  }
+
+  test("no pin: allocation only") {
+    withPins:
+      val b = mkBuilder(); b.addAllocatingObject(p1)
+      intercept[UnpinnedTransaction](buildPin(b))
+  }
+  test("no pin: lockRevision only") {
+    withPins:
+      val b = mkBuilder(); b.lockRevision(p1, rev1)
+      intercept[UnpinnedTransaction](buildPin(b))
+  }
+  test("no pin: DoesNotExist with an Insert") {
+    withPins:
+      val b = mkBuilder(); b.update(kvp, None, None, List(DoesNotExist(k1)), List(ins1))
+      intercept[UnpinnedTransaction](buildPin(b))
+  }
+  test("no pin: Exists with a Delete") {
+    withPins:
+      val b = mkBuilder(); b.update(kvp, None, None, List(Exists(k1)), List(Delete(k1)))
+      intercept[UnpinnedTransaction](buildPin(b))
+  }
+  test("no pin: KeyRevision with an Insert of another key") {
+    withPins:
+      val b = mkBuilder(); b.update(kvp, None, None, List(KeyRevision(k1, rev1)), List(Insert(k2, Array[Byte](9))))
+      intercept[UnpinnedTransaction](buildPin(b))
+  }
+  test("no pin: setRefcount to the same refcount") {
+    withPins:
+      val b = mkBuilder(); b.setRefcount(p1, rc1, rc1)
+      intercept[UnpinnedTransaction](buildPin(b))
+  }
+
+  test("replaySafe lets a pinless transaction through and records the reason in its notes") {
+    withPins:
+      val b = mkBuilder(); b.lockRevision(p1, rev1); b.replaySafe("harmless")
+      val (txd, _, _) = buildPin(b)
+      txd.notes should contain ("replay-safe: harmless")
+  }
+  test("replaySafe on a pinned transaction changes nothing") {
+    withPins:
+      val b = mkBuilder(); b.bumpVersion(p1, rev1); b.replaySafe("harmless")
+      val (txd, _, _) = buildPin(b)
+      txd.requirements should contain (VersionBump(p1, rev1))
   }
 }

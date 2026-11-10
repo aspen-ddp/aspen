@@ -144,10 +144,15 @@ object TestNetwork {
     override def opportunisticRebuildManager: OpportunisticRebuildManager =
       OpportunisticRebuildManager.None
 
-    // Fixed IDA: the test network lives entirely within the bootstrap pool, so resolving the
-    // pool per-read would recurse. Returning the known IDA breaks that cycle.
+    // Fixed IDA for the bootstrap pool: resolving it per-read would recurse, since the pool states live in it.
+    // Other pools are resolved from their state (read through the bootstrap pool), so objects in pools of another
+    // IDA, such as a test's metadata pool, can be read. A pool whose state cannot be read keeps the fixed IDA.
     override protected def resolveIda(pointer: ObjectPointer): Future[IDA] =
-      Future.successful(ida)
+      if pointer.poolId == PoolId.BootstrapPoolId then
+        Future.successful(ida)
+      else
+        given ExecutionContext = executionContext
+        getStoragePool(pointer.poolId).map(_.ida).recover { case _ => ida }
 
     // Single attempt, no retry: test failures must surface rather than being retried away.
     override protected def runCreate[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T]): Future[T] =

@@ -60,6 +60,14 @@ class TieredKeyValueList(val client: AspenClient,
 
   def delete(key: Key)(using t: Transaction): Future[Unit] = engine.delete(key)
 
+  /** `set`, with the update of the node holding `key` also requiring that node's revision as read. For transactions
+    * that have no other pin (see `Pins`): the insert of an absent key carries only `DoesNotExist`, which a later
+    * delete makes true again, while the node's revision changes with every write to it. Every writer of the node is
+    * serialized, so this suits low-rate trees such as registries.
+    */
+  def prepareSetPinned(key: Key, value: Value, requirement: PutRequirement)(using t: Transaction): Future[Unit] =
+    engine.setPinned(key, value, requirement)
+
   /** Inserts and deletes many keys in one transaction. Each node is updated once, so keys sharing a node can change
     * together, which `set` and `delete` on the same node in one transaction cannot. Deleting a key the tree does not
     * hold does nothing. Fails with `IllegalArgumentException`, before touching the transaction, if a key is inserted

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedUnackedCommit, MissedUpdate}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
@@ -532,3 +532,27 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     val txid = TransactionId(UUID.randomUUID())
     UnackedCommitEntry.decode(entry.encode) shouldBe entry
     UnackedCommitEntry.decodeTransactionId(UnackedCommitEntry.key(net.storeId1, txid)) shouldBe txid
+
+  atest("a mark batch is blind and marked replay-safe"):
+    val marker = new ObservedMarker
+    val txid = TransactionId(UUID.randomUUID())
+    val entry = UnackedCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
+    val update = missed(net.storeId0)
+    val errorKey = buildErrorKey(update.store, update.objectId)
+    for
+      _ <- marker.mark(List(update))
+      audit = new PinAudit(client)
+      // A rewrite of a held key: blind, so it carries no KeyRevision a concurrent mark could fail
+      _ <- marker.mark(List(update.copy(missedTimestamp = HLCTimestamp(2000L))),
+                       List(MissedUnackedCommit(net.storeId0, txid, entry)))
+      _ = audit.stop()
+    yield
+      audit.unpinned shouldBe empty
+      audit.replaySafeWith("missed-update marks are idempotent") should not be empty
+      val keyReqs = audit.built.flatMap(_.description.requirements).collect:
+        case kvu: KeyValueUpdate => kvu.requirements
+      keyReqs.flatten.exists:
+        case KeyValueUpdate.KeyRevision(k, _) => k == errorKey
+        case KeyValueUpdate.DoesNotExist(k) => k == errorKey
+        case _ => false
+      .shouldBe(false)

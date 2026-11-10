@@ -77,9 +77,11 @@ class HostServices(ctx: DeviceControl) extends Logging:
                     executorRoot <- allocator.allocateKeyValueObject(Map())(using tx)
                     currentHostKvos <- ctx.client.read(hostPtr)
                   yield
+                    // The host object's revision as read pins the transaction: the absent key alone (DoesNotExist)
+                    // would not. Written once per host, so requiring the revision costs only a retry on a collision
                     val reqs = List(DoesNotExist(HostState.TaskExecutorRootKey))
                     val ops = List(Insert(HostState.TaskExecutorRootKey, executorRoot.toArray))
-                    tx.update(hostPtr, None, None, reqs, ops)
+                    tx.update(hostPtr, Some(currentHostKvos.revision), None, reqs, ops)
                     executorRoot
                 }(using ctx.ec)
                 .foreach: executorRoot =>

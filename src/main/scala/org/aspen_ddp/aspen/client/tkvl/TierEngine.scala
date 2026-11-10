@@ -168,6 +168,26 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
   def delete(key: Key)(using t: Transaction): Future[Unit] =
     prepareUpdates(List(BatchOp.Remove(key)))
 
+  /** `set` on a KeyValue-object tree, with the update of the tier-0 node holding `key` also requiring that node's
+    * revision as read. That pins the transaction (see `Pins`) where the key requirement alone would not, as for the
+    * insert of an absent key, at the cost of serializing every writer of the node. An empty tree gets its initial
+    * node, whose root update is a pin of its own.
+    */
+  def setPinned(key: Key, value: Value, requirement: PutRequirement)(using t: Transaction): Future[Unit] =
+    def onSplit(newMinimum: Key, newNode: ObjectPointer): Future[Unit] =
+      SplitFinalizationAction.addToTransaction(rootManager, 1, newMinimum, newNode, t)
+      Future.unit
+
+    containingNode(key, write = true).flatMap:
+      case None => rootManager.createInitialNode(Map(key -> value))
+      case Some(node) =>
+        for
+          alloc <- rootManager.getAllocatorForTier(0)
+          maxNodeSize <- rootManager.getMaxNodeSize(0)
+          _ <- KeyValueListNode.insert(TieredKeyValueList.kvNode(node), node.ordering, key, value, maxNodeSize, alloc,
+                 onSplit, requirement, pinned = true)
+        yield ()
+
   /** Applies `ops`, at most one per key, to the tree in `t`. Each tier-0 node is updated once, so any number of keys
     * sharing a node can change together. The ops are split among the down pointers of each node on the way down and
     * the subtrees are descended in parallel, then each tier-0 node's ops are applied by `ListBatch`. A failure once an

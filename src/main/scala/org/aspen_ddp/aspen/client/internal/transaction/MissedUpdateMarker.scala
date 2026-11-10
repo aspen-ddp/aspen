@@ -138,12 +138,14 @@ class MissedUpdateMarker(client: AspenClient,
     synchronized(nextBatch(poolId, wasWriting = true)).foreach(write(poolId, _))
 
   private def writeBatch(poolId: PoolId, updates: List[MissedUpdate], unacked: List[MissedUnackedCommit]): Future[Unit] =
+    // Blind upserts. A mark only asks for a repair pass, so a concurrent mark of the same key must not abort this one,
+    // and a replay of the batch costs at most one more pass: the transaction is replay-safe without a pin
     val inserts = updates.map: u =>
       TKVLInsert(errorKey(u.store, u.objectId),
-                 MissedUpdateFinalizationAction.encodeErrorEntry(u.missedTimestamp, u.storePointer))
+                 MissedUpdateFinalizationAction.encodeErrorEntry(u.missedTimestamp, u.storePointer), blind = true)
 
     val unackedInserts = unacked.map: t =>
-      TKVLInsert(UnackedCommitEntry.key(t.store, t.transactionId), Value(t.entry.encode))
+      TKVLInsert(UnackedCommitEntry.key(t.store, t.transactionId), Value(t.entry.encode), blind = true)
 
     def onFail(err: Throwable): Future[Unit] = err match
       case err: UnknownStoragePool =>
@@ -160,6 +162,7 @@ class MissedUpdateMarker(client: AspenClient,
       for
         pool <- client.getStoragePool(poolId)
         tx = client.newTransaction()
+        _ = tx.replaySafe("missed-update marks are idempotent")
         _ <- if inserts.isEmpty then Future.unit else pool.errorTree.prepareUpdates(inserts, Nil)(using tx)
         _ <- if unackedInserts.isEmpty then Future.unit
              else pool.unackedCommitsTree.prepareUpdates(unackedInserts, Nil)(using tx)

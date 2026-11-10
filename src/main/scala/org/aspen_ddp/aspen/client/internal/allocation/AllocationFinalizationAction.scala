@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.allocation
 
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
-import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, ConflictingRequirements, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription}
 import scribe.Logging
@@ -21,16 +21,43 @@ class AllocationFinalizationAction(val client: AspenClient,
   logger.debug(s"Created AllocationFinalizationAction for Tx ${txd.transactionId}, object ${newObject.id}")
   def complete: Future[Unit] = completionPromise.future
 
+  /** Records the new object in its pool's allocation tree. At least once, and possibly long after the allocating
+    * transaction was finalized, so the object is read first:
+    *  - gone: there is nothing to record, and the action completes without a transaction
+    *  - its entry is already present with this pointer: an earlier run recorded it
+    *  - otherwise a checked insert, with a lock on the object's revision as just read
+    *
+    * Neither the insert of an absent key (`DoesNotExist`) nor the lock is a pin, so the transaction is marked
+    * replay-safe: a replay cannot re-add the entry once the object is deleted, because a deleted object fails the
+    * revision lock. A late first run reads the current revision, so it cannot fail forever.
+    */
   def execute(): Unit = client.retryStrategy.retryUntilSuccessful {
-    for {
-      pool <- client.getStoragePool(newObject.poolId)
-      tx = client.newTransaction()
-      _ <- pool.allocationTree.set(Key(newObject.id.toBytes), Value(newObject.toArray))(using tx)
-      _ <- tx.commit()
-    } yield {
+    val key = Key(newObject.id.toBytes)
+    client.readMetadataOptional(newObject).flatMap:
+      case None =>
+        logger.debug(s"AllocationFA for Tx ${txd.transactionId}: object ${newObject.id} is gone, nothing to record")
+        Future.unit
+      case Some(state) =>
+        for
+          pool <- client.getStoragePool(newObject.poolId)
+          existing <- pool.allocationTree.get(key)
+          _ <- existing match
+            case Some(vs) if java.util.Arrays.equals(vs.value.bytes, newObject.toArray) => Future.unit
+            case _ =>
+              val tx = client.newTransaction()
+              tx.replaySafe("cannot re-add once the object is gone: its revision lock fails")
+              for
+                _ <- pool.allocationTree.set(key, Value(newObject.toArray))(using tx)
+                // An allocation tree node allocated by this very object's transaction can hold its own entry: the
+                // update of the node then requires the object to exist, and a lock on it would conflict
+                _ = try tx.lockRevision(newObject, state.revision)
+                    catch case _: ConflictingRequirements => ()
+                _ <- tx.commit()
+              yield ()
+        yield ()
+    .map: _ =>
       logger.debug(s"AllocationFA Completed Successfully for Tx ${txd.transactionId}, Object ${newObject.id}")
-      completionPromise.success(())
-    }
+      completionPromise.trySuccess(())
   }
 }
 

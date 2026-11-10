@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.repair
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, ReadLocks, Transaction}
 import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedUnackedCommit
@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Key, KeyValueObjectPointer, ObjectId,
                                            ObjectPointer, ObjectRefcount, Value}
-import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -932,3 +932,60 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       val now = HLCTimestamp(1_756_742_400_000L << 16)
       val old = HLCTimestamp((1_756_742_400_000L - 120_000) << 16)
       StoreRepairer.errorEntryMayBeDeleted(old, now, Duration(60, SECONDS)).shouldBe(true)
+
+  test("a deletion repair deletes its entry under the entry's KeyRevision"):
+    val objectId = ObjectId(new UUID(7, 8))
+    val errorKey = buildErrorKey(0.toByte, objectId)
+    val target = RecordingTarget(List(storeId))
+    val repairer = StoreRepairer(client, target)
+    val policy = RepairPolicy.Default.copy(minErrorEntryAgeForDeletion = Duration(0, SECONDS))
+    for
+      _ <- seedErrorEntry(objectId, Array[Byte](4, 5))
+      tree <- errorTree
+      entry <- tree.get(errorKey)
+      audit = new PinAudit(client)
+      _ <- repairer.scan(storeId, policy)
+      _ = audit.stop()
+      stillThere <- errorEntryExists(objectId)
+    yield
+      stillThere shouldBe false
+      audit.built should not be empty
+      audit.unpinned shouldBe empty
+      val keyReqs = audit.built.flatMap(_.description.requirements).collect:
+        case kvu: KeyValueUpdate => kvu.requirements
+      keyReqs.flatten should contain (KeyValueUpdate.KeyRevision(errorKey, entry.get.revision))
+
+  test("repair proofs of a key and of a refcount are marked replay-safe"):
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target)
+    val deferral = DeferralState()
+    val n = RepairPolicy.Default.proofAfterDeferrals
+    for
+      (kvPtr, _) <- lockedKeyScenario(target)
+      _ <- passes(n - 1, 2, repairer, deferral)
+      audit = new PinAudit(client)
+      _ <- pass(2, repairer, deferral)
+      _ = audit.stop()
+      dataPtr <- sharedDataObject()
+      before <- client.read(dataPtr)
+      audit2 = new PinAudit(client)
+      proven <- RepairProofs.proveRefcount(client, dataPtr, before.refcount)
+      _ = audit2.stop()
+    yield
+      audit.unpinned shouldBe empty
+      audit.replaySafeWith("repair proof changes nothing") should not be empty
+      proven shouldBe true
+      audit2.unpinned shouldBe empty
+      audit2.replaySafeWith("repair proof changes nothing").size shouldBe 1
+
+  test("a repair proof of the object level is marked replay-safe"):
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      read <- client.read(kvPtr)
+      audit = new PinAudit(client)
+      proven <- RepairProofs.proveObjectLevel(client, read)
+      _ = audit.stop()
+    yield
+      proven shouldBe true
+      audit.unpinned shouldBe empty
+      audit.replaySafeWith("repair proof changes nothing").size shouldBe 1

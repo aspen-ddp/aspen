@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.registries
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, Key, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
@@ -69,3 +69,24 @@ class UUIDObjectRegistrySuite extends IntegrationTestSuite:
       result <- registry.registerObject(objectId, ptr2).failed
     yield
       result shouldBe a [Registry.DuplicateRegistration]
+
+  atest("registerObject pins the node it inserts into"):
+    val objectId = UUID.randomUUID()
+    for
+      registry <- createRegistry()
+      _ <- registry.registerObject(UUID.randomUUID(), radicle)
+      // register retries every failure, so an unpinned transaction is caught by the assertion, not enforced
+      audit = new PinAudit(client, enforce = false)
+      _ <- registry.registerObject(objectId, radicle)
+      _ = audit.stop()
+      retrieved <- registry.getRegisteredObject(objectId)
+    yield
+      retrieved should be (radicle)
+      audit.unpinned shouldBe empty
+      audit.built.flatMap(_.description.requirements).exists:
+        case kvu: org.aspen_ddp.aspen.common.transaction.KeyValueUpdate =>
+          kvu.requiredRevision.isDefined && kvu.requirements.exists:
+            case org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist(k) => k == Key(objectId)
+            case _ => false
+        case _ => false
+      .shouldBe(true)

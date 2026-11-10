@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.registries
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, Key, KeyAlreadyExists, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
@@ -141,3 +141,29 @@ class RegistrySuite extends IntegrationTestSuite:
       result <- registry.register(key, value2).failed
     yield
       result shouldBe a [Registry.DuplicateRegistration]
+
+  atest("prepareRegister pins the node it inserts into"):
+    for
+      registry <- createRegistry()
+      _ <- registry.register(Key("first"), Value(radicle.toArray))
+      key = Key("second")
+      pool <- client.getStoragePool(Radicle.poolId)
+      audit = new PinAudit(client)
+      // An allocation and the registration only: the registration must pin the transaction by itself
+      tx = client.newTransaction()
+      ptr <- pool.allocator.allocateKeyValueObject()(using tx)
+      _ <- registry.prepareRegister(key, Value(ptr.toArray))(using tx)
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      _ = audit.stop()
+      retrieved <- registry.get(key)
+    yield
+      java.util.Arrays.equals(retrieved.bytes, ptr.toArray) should be (true)
+      audit.unpinned shouldBe empty
+      audit.built.flatMap(_.description.requirements).exists:
+        case kvu: org.aspen_ddp.aspen.common.transaction.KeyValueUpdate =>
+          kvu.requiredRevision.isDefined && kvu.requirements.exists:
+            case org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist(k) => k == key
+            case _ => false
+        case _ => false
+      .shouldBe(true)

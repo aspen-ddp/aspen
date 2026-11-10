@@ -94,7 +94,8 @@ class JoinFinalizationAction(val client: AspenClient,
         } yield ()
       }
 
-      rootManager.getRootNode().flatMap { t =>
+      // Fresh, never cached: a retry after a collision, or a repeat run, must see what the last attempt changed
+      rootManager.getFreshRootNode().flatMap { t =>
         val (rootTier, ordering, orootNode) = t
         orootNode match {
           case None =>  Future.unit// Nothing to do

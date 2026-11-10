@@ -49,7 +49,10 @@ class SimpleTaskExecutor(val client: AspenClient,
   private var executorRevision: ObjectRevision = kvos.revision
 
   protected var active: Map[DurableTaskPointer, DurableTask] = Map.empty
-  protected var inactive: List[DurableTaskPointer] = Nil
+  /** Task objects free for reuse, each with its revision as last read or written by this executor, its only writer.
+    * prepareTask's write requires that revision, which pins the enrolling transaction
+    */
+  protected var inactive: List[(DurableTaskPointer, ObjectRevision)] = Nil
 
   def shutdown(): Unit = synchronized:
     active.values.foreach(_.stop())
@@ -60,7 +63,7 @@ class SimpleTaskExecutor(val client: AspenClient,
       client.read(taskPointer.kvPointer).foreach: kvos =>
         synchronized:
           if kvos.contents.isEmpty || !kvos.contents.contains(TaskTypeKey) then
-            inactive = taskPointer :: inactive
+            inactive = (taskPointer, kvos.revision) :: inactive
           else
             val taskType = byte2uuid(kvos.contents(TaskTypeKey).value.bytes)
 
@@ -74,7 +77,11 @@ class SimpleTaskExecutor(val client: AspenClient,
                 val task = dtt.createTask(client, taskPointer, kvos.revision, kvos.contents, this)
                 active += taskPointer -> task
 
-  private def allocateTask(): Future[DurableTaskPointer] =
+  /** Allocates a task object and records it in the executor object. The executor object's update requires its
+    * revision (cached, and refreshed after a collision), which pins the transaction: the new key alone
+    * (`DoesNotExist`) would not. Completes with the object and its revision once allocated.
+    */
+  private def allocateTask(): Future[(DurableTaskPointer, ObjectRevision)] =
     // Only a collision is retried, after refreshing the executor's revision. Anything else -- an
     // unreadable executor object, an executor object grown past its size limit -- is permanent.
     def onFail(err: Throwable): Future[Unit] = err match
@@ -89,24 +96,34 @@ class SimpleTaskExecutor(val client: AspenClient,
       synchronized:
         val taskKey = Key(UUID.randomUUID())
         val kreqs = KeyValueUpdate.DoesNotExist(taskKey) :: Nil
+        val requiredRevision = executorRevision
         for
           ptr <- taskStateAllocator.allocateKeyValueObject(Map())
         yield
-          tx.update(executorObject, None, None, kreqs, Insert(taskKey, ptr.toArray) :: Nil)
+          tx.update(executorObject, Some(requiredRevision), None, kreqs, Insert(taskKey, ptr.toArray) :: Nil)
+          tx.result.foreach: _ =>
+            synchronized:
+              if executorRevision == requiredRevision then
+                executorRevision = tx.revision
           DurableTaskPointer(ptr)
+    .flatMap: taskPointer =>
+      // A new KeyValue object's revision is not the allocating transaction's, so it is read
+      client.readMetadata(taskPointer.kvPointer).map(m => (taskPointer, m.revision))
 
+  /** Empties a completed task's object for reuse. The write requires the object's revision as read, which pins it */
   private def deallocateTask(task: DurableTaskPointer): Unit =
     client.transactUntilSuccessful[Unit]: tx =>
       given Transaction = tx
 
       client.read(task.kvPointer).map: kvos =>
         val deletes = kvos.contents.keys.map(k => Delete(k)).toList
-        tx.update(task.kvPointer, None, None, Nil, deletes)
+        tx.update(task.kvPointer, Some(kvos.revision), None, Nil, deletes)
         tx.result.foreach: _ =>
           synchronized:
             active -= task
-            inactive = task :: inactive
+            inactive = (task, tx.revision) :: inactive
 
+  /** The task's write requires the reused object's revision, as this executor last saw it, which pins `tx` */
   override def prepareTask(taskType: DurableTaskFactory,
                            initialState: List[(Key, Array[Byte])])
                           (using tx: Transaction): Future[Future[Option[AnyRef]]] = synchronized:
@@ -122,13 +139,15 @@ class SimpleTaskExecutor(val client: AspenClient,
         Future.successful(p)
 
     for
-      taskPointer <- fptr
+      (taskPointer, taskRevision) <- fptr
     yield
-      tx.update(taskPointer.kvPointer, None, None, Nil, ins)
+      tx.update(taskPointer.kvPointer, Some(taskRevision), None, Nil, ins)
 
+      // Not written, so free again. Re-read: a stale revision would fail every later use
       tx.result.failed.foreach: _ =>
-        synchronized:
-          inactive = taskPointer :: inactive
+        client.read(taskPointer.kvPointer).foreach: kvos =>
+          synchronized:
+            inactive = (taskPointer, kvos.revision) :: inactive
 
       tx.result.flatMap: _ =>
         client.read(taskPointer.kvPointer).flatMap: kvos =>

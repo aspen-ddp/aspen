@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.compute.systemtask
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
@@ -57,3 +57,34 @@ class SystemTaskServiceStateSuite extends IntegrationTestSuite:
       enrolled <- SystemTaskServiceState.scan(client, statePtr)
     yield
       enrolled.map(_._1) should contain (taskId)
+
+  atest("enroll, enrollInTx and remove are each pinned"):
+    given ExecutionContext = executionContext
+    val taskId = UUID.randomUUID()
+    val otherId = UUID.randomUUID()
+    for
+      statePtr <- servicePtr()
+      pool <- client.getStoragePool(Radicle.poolId)
+      allocator = new PoolObjectAllocator(client, pool)
+      taskStatePtr <- client.transactUntilSuccessful: tx =>
+                        given Transaction = tx
+                        allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](7))))
+      _ <- waitForTransactionsToComplete()
+      // enroll and remove retry every failure, so an unpinned transaction is caught by the assertion, not enforced
+      audit = new PinAudit(client, enforce = false)
+      _ <- SystemTaskServiceState.enroll(client, statePtr, taskId, taskStatePtr)
+      _ <- client.transactUntilSuccessful: tx =>
+             given Transaction = tx
+             for
+               p <- allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](9))))
+               _ <- SystemTaskServiceState.enrollInTx(client, statePtr, otherId, p)
+             yield ()
+      _ <- SystemTaskServiceState.remove(client, statePtr, taskId)
+      _ <- waitForTransactionsToComplete()
+      _ = audit.stop()
+      enrolled <- SystemTaskServiceState.scan(client, statePtr)
+    yield
+      audit.built.size should be >= 3
+      audit.unpinned shouldBe empty
+      enrolled.map(_._1) should contain (otherId)
+      enrolled.map(_._1) should not contain taskId

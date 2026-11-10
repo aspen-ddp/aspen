@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.*
-import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectId, ObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -43,44 +43,61 @@ class SplitFinalizationAction(val client: AspenClient,
         } yield ()
       }
 
+      /** Adds the new node's entry to `tier`. At least once, and possibly long after the split was finalized, so the
+        * new node is read first:
+        *  - gone (a later join deleted it): there is nothing to index, and the action completes without a transaction
+        *  - its entry is already present with this pointer: an earlier run added it
+        *  - otherwise a checked insert, with a lock on the new node's revision as just read
+        *
+        * On a KeyValue-object tree neither the insert of an absent key (`DoesNotExist`) nor the lock is a pin, so the
+        * transaction is marked replay-safe: a replay cannot re-add the entry once the node is gone, because a deleted
+        * node fails the revision lock. A late first run reads the current revision, so it cannot fail forever.
+        */
       def insertIntoExistingTier(rootTier: Int, ordering: KeyOrdering, rootNode: ListNode): Future[Unit] = {
 
-        given tx: Transaction = client.newTransaction()
+        def prepareInsert(node: ListNode, nodeRevision: ObjectRevision, nodeSize: Int,
+                          alloc: ObjectAllocator): Future[Unit] = {
+          given tx: Transaction = client.newTransaction()
+          tx.replaySafe("cannot re-add once the node is gone: its revision lock fails")
 
-        val fe = TierEngine.fetchContainingNode(client, rootTier, tier, ordering, newMinimum, rootNode, Set())
-        val fnodeSize = rootManager.getMaxNodeSize(tier)
-        val falloc = rootManager.getAllocatorForTier(tier)
-
-        def prepareInsert(e: Either[Set[ObjectId], ListNode], nodeSize: Int, alloc: ObjectAllocator): Future[Unit] = {
-          e match {
-            case Left(_) =>
-              // Tree is likely being deleted. Not much we can do
-              Future.unit
-              
-            case Right(node) =>
-              def onSplit(min: Key, ptr: ObjectPointer): Future[Unit] = {
-                SplitFinalizationAction.addToTransaction(rootManager, tier+1, min, ptr, tx)
-                Future.unit
-              }
-
-              TierEngine.encodingFor(node).insert(node, newMinimum, Value(newNode.toArray), nodeSize, alloc, onSplit,
-                PutRequirement.Checked).map(_=>())
+          def onSplit(min: Key, ptr: ObjectPointer): Future[Unit] = {
+            SplitFinalizationAction.addToTransaction(rootManager, tier+1, min, ptr, tx)
+            Future.unit
           }
+
+          for {
+            _ <- TierEngine.encodingFor(node).insert(node, newMinimum, Value(newNode.toArray), nodeSize, alloc,
+                   onSplit, PutRequirement.Checked)
+            _ = tx.lockRevision(newNode, nodeRevision)
+            _ <- tx.commit()
+          } yield ()
         }
 
-        for {
-          e <- fe
-          nodeSize <- fnodeSize
+        client.readMetadataOptional(newNode).flatMap {
+          case None => Future.unit // Deleted by a later join: nothing to index
 
-          alloc <- falloc
+          case Some(newNodeState) =>
+            TierEngine.fetchContainingNode(client, rootTier, tier, ordering, newMinimum, rootNode, Set()).flatMap {
+              case Left(_) =>
+                // Tree is likely being deleted. Not much we can do
+                Future.unit
 
-          _ <- prepareInsert(e, nodeSize, alloc)
-
-          _ <- tx.commit()
-        } yield ()
+              case Right(node) =>
+                node.get(newMinimum) match {
+                  case Some(v) if java.util.Arrays.equals(v.bytes, newNode.toArray) => Future.unit // Already indexed
+                  case _ =>
+                    for {
+                      nodeSize <- rootManager.getMaxNodeSize(tier)
+                      alloc <- rootManager.getAllocatorForTier(tier)
+                      _ <- prepareInsert(node, newNodeState.revision, nodeSize, alloc)
+                    } yield ()
+                }
+            }
+        }
       }
 
-      rootManager.getRootNode().flatMap { t =>
+      // Fresh, never cached: a retry after a collision, or a repeat run, must see what the last attempt changed
+      rootManager.getFreshRootNode().flatMap { t =>
         val (rootTier, ordering, orootNode) = t
 
         orootNode match {

@@ -19,6 +19,10 @@ class MetadataTree(client: AspenClient, radicle: KeyValueObjectPointer, treeKey:
 
   /** Fails with KeyAlreadyExists if the uuid is already mapped. The requirement's
    *  abortAndThrow raises it directly out of the insert.
+   *
+   *  The insert requires the revision of the tree node it goes into, which pins the transaction: the creators
+   *  (createHost, createStorageDeviceSet, createAllocationGroup, ...) otherwise only allocate and insert absent keys,
+   *  and a replay of one would map the uuid again after a later delete.
    */
   def preparePut(uuid: UUID, ptr: ObjectPointer)(using tx: Transaction): Future[Unit] =
-    tree.set(Key(uuid), Value(ptr.toArray), requirement = PutRequirement.MustNotExist)
+    tree.prepareSetPinned(Key(uuid), Value(ptr.toArray), PutRequirement.MustNotExist)

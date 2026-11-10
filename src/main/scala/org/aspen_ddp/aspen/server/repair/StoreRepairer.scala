@@ -206,7 +206,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                 // entry. Empty means "delete by ObjectId alone".
                 for
                   _ <- repairDeletion(storeId, objectId, storePointer)
-                  _ <- deleteEntry(node, key)
+                  _ <- deleteEntryIfUnchanged(value.revision, node, key)
                 yield
                   counts.repaired.incrementAndGet()
               else
@@ -352,19 +352,12 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     completion.future.map: _ =>
       logger.info(s"Repair complete (deletion) for object $objectId on store $storeId")
 
-  private def deleteEntry(node: KeyValueListNode, key: Key): Future[Unit] =
-    val tx = client.newRepairTransaction()
-    val fdelete = node.delete(key)(using tx)
-    for
-      _ <- fdelete
-      _ <- tx.commit()
-    yield ()
-
   /** Deletion of the entry is best effort. A transient error or a collision only costs another
     * pass. The revision guard is the point: the caller compared the repaired state against the
     * missed timestamp it scanned, and a store that misses another update while the repair is
     * underway rewrites the entry with that newer timestamp. Requiring the scanned revision makes
-    * the delete fail in that case, which is how the next pass learns to try again.
+    * the delete fail in that case, which is how the next pass learns to try again. The KeyRevision of the deleted
+    * key is also the transaction's pin, so a replay deletes no newer entry.
     */
   private def deleteEntryIfUnchanged(entryRevision: ObjectRevision,
                                      node: KeyValueListNode, key: Key): Future[Unit] =

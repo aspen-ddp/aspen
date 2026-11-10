@@ -781,13 +781,14 @@ object KeyValueListNode extends Logging {
                      maxNodeSize: Int,
                      allocator: ObjectAllocator,
                      prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit,
-                     requirement: PutRequirement = PutRequirement.Checked
+                     requirement: PutRequirement = PutRequirement.Checked,
+                     pinned: Boolean = false
                     )(using tx: Transaction, ec: ExecutionContext): Future[Unit] = {
     val plan =
       try planInsert(node.shape, key, value, maxNodeSize, requirement)
       catch case e: KeyAlreadyExists => tx.abortAndThrow(e)
 
-    applyChange(node, plan, allocator, prepareForSplit)
+    applyChange(node, plan, allocator, prepareForSplit, pinned)
   }
 
   // Implemented as a non-class member to prevent accidental use of member variables instead of "node." attributes
@@ -801,13 +802,15 @@ object KeyValueListNode extends Logging {
                     )(using tx: Transaction, ec: ExecutionContext): Future[Unit] =
     applyChange(node, planRename(node.shape, oldKey, newKey, maxNodeSize), allocator, prepareForSplit)
 
+  /** `pinned` makes an in-place change require the node's revision as read, as a split always does */
   private def applyChange(node: KeyValueListNode,
                           plan: ChangePlan,
                           allocator: ObjectAllocator,
-                          prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit]
+                          prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit],
+                          pinned: Boolean = false
                          )(using tx: Transaction, ec: ExecutionContext): Future[Unit] = plan match {
     case InPlace(reqs, ops) =>
-      tx.update(node.pointer, None, None, reqs, ops)
+      tx.update(node.pointer, if pinned then Some(node.revision) else None, None, reqs, ops)
       Future.unit
 
     case Split(reqs, newMinimum, newContent, newTail, leftOps) =>

@@ -20,6 +20,9 @@ import scala.util.control.NonFatal
   * The object-level proof is a pure lock and changes nothing. The key and refcount proofs change no content (only the
   * object's timestamp moves). So all of them disable missed-update tracking (`AspenClient.newRepairTransaction`) and
   * cannot create repair entries. Each completes with true when the proof committed, false otherwise.
+  *
+  * None carries a pin (the refcount proof sets the refcount it requires), and none needs one: a replay changes
+  * nothing either, so every proof is marked `replaySafe`.
   */
 object RepairProofs extends Logging:
 
@@ -55,6 +58,7 @@ object RepairProofs extends Logging:
     Future.unit
       .flatMap: _ =>
         val tx = newProofTransaction(client)
+        tx.replaySafe("repair proof changes nothing")
         build(tx)
         tx.commit()
       .map: _ =>

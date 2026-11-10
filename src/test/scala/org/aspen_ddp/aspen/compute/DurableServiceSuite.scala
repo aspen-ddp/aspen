@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.compute
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, RegisteredTypeFactory, Transaction}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.metadata.HostId
@@ -136,6 +137,28 @@ class DurableServiceSuite extends IntegrationTestSuite:
       entry.typeUUID shouldBe typeUUID
       entry.hostId shouldBe ServiceEntry.UnclaimedHostId
       entry.leaseExpiry shouldBe HLCTimestamp.Zero
+
+  atest("registerService pins the services tree node it inserts into"):
+    given ExecutionContext = executionContext
+    val exec = makeExecutor()
+    val svcUUID = UUID.randomUUID()
+    // registerService retries every failure, so an unpinned transaction is caught by the assertion, not enforced
+    val audit = new PinAudit(client, enforce = false)
+    for
+      _ <- exec.registerService(UUID.randomUUID(), svcUUID, Map.empty)
+      _ = audit.stop()
+      vs <- exec.servicesTkvl.get(Key(svcUUID))
+    yield
+      exec.shutdown()
+      vs shouldBe defined
+      audit.unpinned shouldBe empty
+      // The insert's own update carries the node's revision
+      audit.built.flatMap(_.description.requirements).exists:
+        case kvu: KeyValueUpdate => kvu.requiredRevision.isDefined && kvu.requirements.exists:
+          case KeyValueUpdate.DoesNotExist(k) => k == Key(svcUUID)
+          case _ => false
+        case _ => false
+      .shouldBe(true)
 
   atest("registerService is idempotent"):
     given ExecutionContext = executionContext

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.registries
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, SinglePoolNodeAllocator}
@@ -90,3 +90,24 @@ class NamespacedUUIDRegistrySuite extends IntegrationTestSuite:
       pools <- registry.getAllEntries("pool")
     yield
       pools should be (List("real" -> poolId))
+
+  atest("registerObject pins the node it inserts into"):
+    val objectId = UUID.randomUUID()
+    for
+      registry <- createRegistry()
+      _ <- registry.registerObject("storage", "first", UUID.randomUUID())
+      // register retries every failure, so an unpinned transaction is caught by the assertion, not enforced
+      audit = new PinAudit(client, enforce = false)
+      _ <- registry.registerObject("storage", "second", objectId)
+      _ = audit.stop()
+      retrieved <- registry.getRegisteredObject("storage", "second")
+    yield
+      retrieved should be (objectId)
+      audit.unpinned shouldBe empty
+      audit.built.flatMap(_.description.requirements).exists:
+        case kvu: org.aspen_ddp.aspen.common.transaction.KeyValueUpdate =>
+          kvu.requiredRevision.isDefined && kvu.requirements.exists:
+            case org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist(k) => k == NamespacedUUIDRegistry.makeKey("storage", "second")
+            case _ => false
+        case _ => false
+      .shouldBe(true)

@@ -20,6 +20,12 @@ object TransactionBuilder {
     */
   @volatile var enforcePins: Boolean = false
 
+  /** A transaction as built, before the pin check. Tests see it through `AspenClient.testingOnlyOnBuilt` */
+  final case class Built(description: TransactionDescription,
+                         kvOps: Map[ObjectId, List[KeyValueOperation]],
+                         replaySafe: Boolean):
+    def hasPin: Boolean = Pins.hasPin(description.requirements, kvOps)
+
   case class KVUpdate(
                        pointer: KeyValueObjectPointer,
                        requiredRevision: Option[ObjectRevision],
@@ -60,6 +66,8 @@ class TransactionBuilder(
   private  var replaySafeFlag = false
   /** Tests use this to enforce the pin check on one builder without touching the global switch */
   private[aspen] var enforcePinsOverride: Option[Boolean] = None
+  /** Tests use this to see every transaction this builder builds, pinned or not */
+  private[aspen] var onBuilt: Option[Built => Unit] = None
   private  var addMissedUpdateTrackingFA = true
   private  var missedCommitDelayInMs = 1000
   private  val minimumTimestamp = HLCTimestamp.now
@@ -115,10 +123,6 @@ class TransactionBuilder(
       requirements = KeyValueUpdate(kvu.pointer, kvu.requiredRevision, kvu.contentLock, kvu.requirements,
         deletesKeys = kvu.operations.exists(_.isInstanceOf[Delete])) :: requirements
 
-    if enforcePinsOverride.getOrElse(enforcePins) && !replaySafeFlag &&
-      !Pins.hasPin(requirements, keyValueUpdates.map((p, kvu) => p.id -> kvu.operations)) then
-      throw UnpinnedTransaction(transactionId)
-
     // Ensure the transaction has at least one requirement
     require(requirements.nonEmpty)
 
@@ -137,6 +141,11 @@ class TransactionBuilder(
     val txd = TransactionDescription(transactionId, startTimestamp, primaryObject, designatedLeaderUID,
       requirements, finalizationActions, originatingClient, notifyOnResolution.toList,
       notes, primaryObjectIDA, poolIDAMap, allocatingObjects.map(_.id))
+
+    val kvOps = keyValueUpdates.map((p, kvu) => p.id -> kvu.operations)
+    onBuilt.foreach(_(Built(txd, kvOps, replaySafeFlag)))
+    if enforcePinsOverride.getOrElse(enforcePins) && !replaySafeFlag && !Pins.hasPin(requirements, kvOps) then
+      throw UnpinnedTransaction(transactionId)
 
     var updates = Map[StoreId, TransactionData]()
 

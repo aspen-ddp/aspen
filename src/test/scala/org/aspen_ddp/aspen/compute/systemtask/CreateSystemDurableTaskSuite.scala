@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.compute.systemtask
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
+import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.client.RegisteredTypeFactory
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
@@ -48,3 +49,19 @@ class CreateSystemDurableTaskSuite extends IntegrationTestSuite:
     yield
       enrolled.size shouldBe 1
       byte2uuid(taskKvos.contents(SimpleTaskExecutor.TaskTypeKey).value.bytes) shouldBe CountingSystemTask.typeUUID
+
+  atest("createSystemDurableTask and the admin creators are pinned"):
+    given ExecutionContext = executionContext
+    // createSystemDurableTask retries every failure, so an unpinned transaction is caught by the assertion
+    val audit = new PinAudit(client, enforce = false)
+    for
+      _ <- client.createSystemDurableTask(CountingSystemTask.typeUUID, CountingSystemTask.initialState(0))
+      _ <- client.createAllocationGroup("pin-group", 0, ida = Some(Replication(3, 2)))
+      setId <- client.createStorageDeviceSet("pin-set", 1, None)
+      _ <- client.createStorageDeviceSet("pin-child-set", 0, Some(setId))
+      _ <- client.createHost("pin-host", "127.0.0.1", 1, 2, 3)
+      _ <- waitForTransactionsToComplete()
+      _ = audit.stop()
+    yield
+      audit.built.size should be >= 5
+      audit.unpinned shouldBe empty

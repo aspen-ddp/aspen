@@ -264,7 +264,9 @@ class SimpleDurableServiceExecutor(
               allocator  = new PoolObjectAllocator(client, pool)
               statePtr  <- allocator.allocateKeyValueObject(initialState.map((k, v) => k -> Value(v)))
               entry      = ServiceEntry(typeUUID, ServiceEntry.UnclaimedHostId, HLCTimestamp.Zero, statePtr)
-              _         <- servicesTkvl.set(serviceKey, Value(entry.encode()), PutRequirement.MustNotExist)
+              // The services tree node's revision pins the transaction: a replay after unregisterService would
+              // otherwise register the service again, pointing at its freed state object
+              _         <- servicesTkvl.prepareSetPinned(serviceKey, Value(entry.encode()), PutRequirement.MustNotExist)
             yield ()
 
   override def unregisterService(serviceUUID: UUID): Future[Unit] =

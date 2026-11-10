@@ -38,9 +38,13 @@ class Registry(val client: AspenClient,
 
   /** Fails with KeyAlreadyExists if the key is taken. The requirement's abortAndThrow
    *  raises it directly, before this insert stages anything on the transaction.
+   *
+   *  The insert requires the revision of the tree node it goes into, which pins the transaction: `DoesNotExist`
+   *  alone would let a replay register the key again after a later delete. Registrations are rare, so serializing
+   *  the node's writers costs nothing.
    */
   def prepareRegister(key: Key, value: Value)(using tx: Transaction): Future[Unit] =
-    tkvl.set(key, value, requirement = PutRequirement.MustNotExist)
+    tkvl.prepareSetPinned(key, value, PutRequirement.MustNotExist)
 
   def register(key: Key, value: Value): Future[Unit] =
     client.retryStrategy.retryUntilSuccessful:

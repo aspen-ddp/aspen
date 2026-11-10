@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
-import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker
+import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateMarker, TransactionBuilder}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
@@ -66,6 +66,14 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   val typeRegistry: TypeRegistry
 
   protected var storagePoolCache: Map[PoolId, StoragePool] = Map.empty
+
+  /** Tests only: while true, every transaction this client commits enforces the pin rule and fails with
+    * UnpinnedTransaction without a pin or a replaySafe mark (TransactionBuilder.enforcePinsOverride). Read at commit.
+    */
+  @volatile private[aspen] var testingOnlyEnforcePins: Boolean = false
+
+  /** Tests only: handed every transaction this client commits, as built and before the pin check. Read at commit */
+  @volatile private[aspen] var testingOnlyOnBuilt: Option[TransactionBuilder.Built => Unit] = None
 
   def client: AspenClient = this
 

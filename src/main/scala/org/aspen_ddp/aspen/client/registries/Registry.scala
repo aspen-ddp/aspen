@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.registries
 
 import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, Transaction}
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, PutRequirement, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyAlreadyExists, KeyValueObjectPointer, Value}
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -40,7 +40,7 @@ class Registry(val client: AspenClient,
    *  raises it directly, before this insert stages anything on the transaction.
    */
   def prepareRegister(key: Key, value: Value)(using tx: Transaction): Future[Unit] =
-    tkvl.set(key, value, requirement = Some(Left(true)))
+    tkvl.set(key, value, requirement = PutRequirement.MustNotExist)
 
   def register(key: Key, value: Value): Future[Unit] =
     client.retryStrategy.retryUntilSuccessful:

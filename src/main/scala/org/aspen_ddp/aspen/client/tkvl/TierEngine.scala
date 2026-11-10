@@ -161,7 +161,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
   def set(key: Key,
           value: Value,
-          requirement: Option[Either[Boolean, ObjectRevision]] = None)
+          requirement: PutRequirement = PutRequirement.Checked)
          (using t: Transaction): Future[Unit] =
     prepareUpdates(List(BatchOp.Put(key, value, requirement)))
 

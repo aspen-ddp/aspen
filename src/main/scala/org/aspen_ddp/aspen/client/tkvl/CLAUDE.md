@@ -27,8 +27,17 @@
   node fails. A node can split into several (`SplitMany`, `planMultiSplit` over `SplitPlan.runs`); an empty tree
   gets a list of nodes (`allocateChain`). A node the batch empties absorbs its right neighbor only if the batch leaves
   the neighbor alone; otherwise it is left empty for `TailRemovalFinalizationAction`.
-- `TKVLInsert.requireDoesNotExist` works on both kinds: KV via `DoesNotExist`, DataObject via the node's revision
-  guard (the key's range changes only through an update of its node). Revision requirements remain KV-only.
+- Every write is checked by default (`PutRequirement.Checked`). On KV trees the planners derive per-key requirements
+  from the node as read (`KeyValueListNode.putRequirements`/`deleteRequirements`): a put of a held key requires its
+  `KeyRevision`, of an absent key `DoesNotExist`; a delete (single, batch, rename's old key, `deleteOneAtATime`)
+  requires the key's `KeyRevision`, and a key the node does not hold is not deleted; rename's new key gets
+  `KeyRevision` or `DoesNotExist`. These are per key: no node-level serialization. A competing write fails them as an
+  ordinary abort that the caller retries, never `KeyAlreadyExists`. `PutRequirement.Blind` (`TKVLInsert.blind`) opts
+  out, for idempotent upserts only; `AtRevision(rev)` requires a given revision.
+- `TKVLInsert.requireDoesNotExist` (`MustNotExist`) works on both kinds: KV via `DoesNotExist`, DataObject via the
+  node's revision guard (the key's range changes only through an update of its node). Only it fails with
+  `KeyAlreadyExists`, when the node read holds the key. On DataObject trees `Checked` and `Blind` add nothing (every
+  rewrite requires the node revision); `AtRevision` is KV-only (`UnsupportedRequirement`).
 - A node deleted by a join or a tail removal has its version bumped, not just its revision locked. A lock leaves the
   revision unchanged, so a racing removal that read the node as a predecessor could still rewrite it after it was
   deleted and leave a live node linked to a deleted one. Batches empty adjacent nodes routinely, which exposed this.

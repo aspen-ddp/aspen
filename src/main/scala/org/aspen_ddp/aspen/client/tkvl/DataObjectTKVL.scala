@@ -42,7 +42,7 @@ class DataObjectTKVL(val client: AspenClient, val rootManager: RootManager):
 
   /** With `requireDoesNotExist`, the transaction fails with `KeyAlreadyExists` if the tree holds `key` */
   def set(key: Key, value: Value, requireDoesNotExist: Boolean = false)(using Transaction): Future[Unit] =
-    checked(engine.set(key, value, if requireDoesNotExist then Some(Left(true)) else None))
+    checked(engine.set(key, value, if requireDoesNotExist then PutRequirement.MustNotExist else PutRequirement.Checked))
 
   def delete(key: Key)(using Transaction): Future[Unit] = checked(engine.delete(key))
 

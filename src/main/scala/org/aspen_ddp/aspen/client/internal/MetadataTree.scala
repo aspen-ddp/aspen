@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.internal
 
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, PutRequirement, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyAlreadyExists, KeyValueObjectPointer, ObjectPointer, Value}
 
 import java.util.UUID
@@ -21,4 +21,4 @@ class MetadataTree(client: AspenClient, radicle: KeyValueObjectPointer, treeKey:
    *  abortAndThrow raises it directly out of the insert.
    */
   def preparePut(uuid: UUID, ptr: ObjectPointer)(using tx: Transaction): Future[Unit] =
-    tree.set(Key(uuid), Value(ptr.toArray), requirement = Some(Left(true)))
+    tree.set(Key(uuid), Value(ptr.toArray), requirement = PutRequirement.MustNotExist)

@@ -90,7 +90,7 @@ class KeyValueNodePlanSuite extends AnyFunSuite:
     /** Throws NodeSizeExceeded like the executors do */
     def insert(key: Key, value: Value): Unit =
       val index = indexFor(key)
-      applyPlan(index, planInsert(shapeOf(nodes(index)), key, value, maxNodeSize, None))
+      applyPlan(index, planInsert(shapeOf(nodes(index)), key, value, maxNodeSize, PutRequirement.Checked))
 
     def rename(oldKey: Key, newKey: Key): Unit =
       val index = indexFor(oldKey)
@@ -414,12 +414,73 @@ class KeyValueNodePlanSuite extends AnyFunSuite:
     tier.insert(key(1), value(10))
     val shape = tier.shapeOf(tier.nodes(0))
     intercept[org.aspen_ddp.aspen.common.objects.KeyAlreadyExists]:
-      planInsert(shape, key(1), value(10), 1024, Some(Left(true)))
-    planInsert(shape, key(2), value(10), 1024, Some(Left(true))) match
+      planInsert(shape, key(1), value(10), 1024, PutRequirement.MustNotExist)
+    planInsert(shape, key(2), value(10), 1024, PutRequirement.MustNotExist) match
       case InPlace(reqs, ops) =>
         assert(reqs.map(_.getClass.getSimpleName) == List("WithinRange", "DoesNotExist"))
         assert(ops.map(_.getClass.getSimpleName) == List("Insert"))
       case other => fail(s"Expected InPlace, got $other")
+
+  /** A node holding `held` at known revisions, for requirement checks */
+  private def shapeHolding(held: (Key, ObjectRevision)*): NodeShape =
+    val ptr = new KeyValueObjectPointer(ObjectId(new UUID(1, 1)), PoolId(new UUID(2, 0)), new Array[Byte](40))
+    val contents = held.map((k, rev) => k -> KeyValueObjectState.ValueState(value(10), rev, HLCTimestamp.now)).toMap
+    NodeShape(ptr, Replication(3, 2), ordering, Key.AbsoluteMinimum, None, None, contents)
+
+  private def keyReqs(plan: Any): List[KeyValueUpdate.KeyRequirement] = plan match
+    case InPlace(reqs, _) => reqs.filterNot(_.isInstanceOf[KeyValueUpdate.WithinRange])
+    case Change(p) => keyReqs(p)
+    case Empties(reqs, _) => reqs
+    case other => fail(s"Unexpected plan $other")
+
+  test("a Checked put of a present key requires its KeyRevision"):
+    val rev = new ObjectRevision(UUID.randomUUID())
+    val shape = shapeHolding(key(1) -> rev)
+    assert(keyReqs(planInsert(shape, key(1), value(10), 1024, PutRequirement.Checked)) ==
+      List(KeyValueUpdate.KeyRevision(key(1), rev)))
+    assert(keyReqs(planBatch(shape, List(BatchOp.Put(key(1), value(10), PutRequirement.Checked)), 1024)) ==
+      List(KeyValueUpdate.KeyRevision(key(1), rev)))
+
+  test("a Checked put of an absent key requires DoesNotExist"):
+    val shape = shapeHolding(key(1) -> new ObjectRevision(UUID.randomUUID()))
+    assert(keyReqs(planInsert(shape, key(2), value(10), 1024, PutRequirement.Checked)) ==
+      List(KeyValueUpdate.DoesNotExist(key(2))))
+    assert(keyReqs(planBatch(shape, List(BatchOp.Put(key(2), value(10), PutRequirement.Checked)), 1024)) ==
+      List(KeyValueUpdate.DoesNotExist(key(2))))
+
+  test("a Blind put adds no key requirement"):
+    val shape = shapeHolding(key(1) -> new ObjectRevision(UUID.randomUUID()))
+    for k <- List(key(1), key(2)) do
+      assert(keyReqs(planInsert(shape, k, value(10), 1024, PutRequirement.Blind)) == Nil)
+      assert(keyReqs(planBatch(shape, List(BatchOp.Put(k, value(10), PutRequirement.Blind)), 1024)) == Nil)
+
+  test("an AtRevision put requires the given revision"):
+    val rev = new ObjectRevision(UUID.randomUUID())
+    val shape = shapeHolding(key(1) -> new ObjectRevision(UUID.randomUUID()))
+    assert(keyReqs(planInsert(shape, key(1), value(10), 1024, PutRequirement.AtRevision(rev))) ==
+      List(KeyValueUpdate.KeyRevision(key(1), rev)))
+
+  test("a planned delete requires the key's KeyRevision, not Exists"):
+    val rev1 = new ObjectRevision(UUID.randomUUID())
+    val rev2 = new ObjectRevision(UUID.randomUUID())
+    val shape = shapeHolding(key(1) -> rev1, key(2) -> rev2)
+    assert(deleteRequirements(shape, key(1)) == List(KeyValueUpdate.KeyRevision(key(1), rev1)))
+    assert(keyReqs(planBatch(shape, List(BatchOp.Remove(key(2))), 1024)) ==
+      List(KeyValueUpdate.KeyRevision(key(2), rev2)))
+    assert(keyReqs(planBatch(shape, List(BatchOp.Remove(key(1)), BatchOp.Remove(key(2))), 1024)) ==
+      List(KeyValueUpdate.KeyRevision(key(1), rev1), KeyValueUpdate.KeyRevision(key(2), rev2)))
+    // A key the node does not hold is not deleted, as before
+    assert(planDelete(shape, key(3)) == NothingToDelete)
+    assert(planBatch(shape, List(BatchOp.Remove(key(3))), 1024) == Unchanged)
+
+  test("rename requires KeyRevision on the old key and KeyRevision or DoesNotExist on the new key"):
+    val rev1 = new ObjectRevision(UUID.randomUUID())
+    val rev2 = new ObjectRevision(UUID.randomUUID())
+    val shape = shapeHolding(key(1) -> rev1, key(2) -> rev2)
+    assert(keyReqs(planRename(shape, key(1), key(2), 1024)).toSet ==
+      Set(KeyValueUpdate.KeyRevision(key(1), rev1), KeyValueUpdate.KeyRevision(key(2), rev2)))
+    assert(keyReqs(planRename(shape, key(1), key(3), 1024)).toSet ==
+      Set(KeyValueUpdate.KeyRevision(key(1), rev1), KeyValueUpdate.DoesNotExist(key(3))))
 
   test("delete plans"):
     val tier = new Tier(Replication(3, 2), 1024)
@@ -429,7 +490,7 @@ class KeyValueNodePlanSuite extends AnyFunSuite:
     assert(planDelete(shape, key(1)) == RemoveKey(key(1)))
 
   private def put(k: Key, v: Value, mustNotExist: Boolean = false): BatchOp =
-    BatchOp.Put(k, v, if mustNotExist then Some(Left(true)) else None)
+    BatchOp.Put(k, v, if mustNotExist then PutRequirement.MustNotExist else PutRequirement.Checked)
 
   /** A random batch: new keys, overwrites and deletes of held keys, and deletes of absent keys */
   private def randomBatch(rnd: Random, model: Map[List[Byte], List[Byte]], size: Int, limit: Int): List[BatchOp] =
@@ -528,7 +589,7 @@ class KeyValueNodePlanSuite extends AnyFunSuite:
 
         locally:
           val v = randomValue(rnd)
-          val requirement = if rnd.nextBoolean() then Some(Left(true)) else None
+          val requirement = if rnd.nextBoolean() then PutRequirement.MustNotExist else PutRequirement.Checked
           val single = scala.util.Try(planInsert(shape, k, v, 1024, requirement))
           val batched = scala.util.Try(planBatch(shape, List(BatchOp.Put(k, v, requirement)), 1024))
           (single, batched) match
@@ -543,7 +604,7 @@ class KeyValueNodePlanSuite extends AnyFunSuite:
           val held = shape.contents.keys.toVector(rnd.nextInt(shape.contents.size))
           (planDelete(shape, held), planBatch(shape, List(BatchOp.Remove(held)), 1024)) match
             case (RemoveKey(_), Change(InPlace(reqs, ops))) =>
-              assert(reqs == List(KeyValueUpdate.Exists(held)) && describe(InPlace(Nil, ops)) == describe(InPlace(Nil, List(Delete(held)))))
+              assert(reqs == List(KeyValueUpdate.KeyRevision(held, shape.contents(held).revision)) && describe(InPlace(Nil, ops)) == describe(InPlace(Nil, List(Delete(held)))))
             case (RemoveKey(_), Empties(reqs, removed)) =>
               assert(shape.contents.size == 1 && shape.tail.isEmpty && removed == List(held))
             case (ConsiderJoin(_), Empties(_, removed)) => assert(removed == List(held))

@@ -205,13 +205,13 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     */
   private def checkRequirement(content: NodeContent,
                                key: Key,
-                               requirement: Option[Either[Boolean, ObjectRevision]]): Unit =
+                               requirement: PutRequirement): Unit =
     requirement match
-      case None | Some(Left(false)) =>
-      case Some(Left(true)) =>
+      case PutRequirement.Checked | PutRequirement.Blind =>
+      case PutRequirement.MustNotExist =>
         if content.entries.exists(_._1 == key) then
           throw new KeyAlreadyExists(key)
-      case Some(Right(_)) => throw new UnsupportedRequirement(kind)
+      case PutRequirement.AtRevision(_) => throw new UnsupportedRequirement(kind)
 
   /** Plans a batch of `ops`, ascending and at most one per key, all within the node's range, or None if the batch
     * changes nothing (it only deletes keys the node does not hold). Generalizes `planInsert` and `planDelete`: each
@@ -377,7 +377,7 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
              maxNodeSize: Int,
              allocator: ObjectAllocator,
              prepareForSplit: (Key, ObjectPointer) => Future[Unit],
-             requirement: Option[Either[Boolean, ObjectRevision]])(using tx: Transaction): Future[Unit] =
+             requirement: PutRequirement)(using tx: Transaction): Future[Unit] =
     val n = dataNode(node)
     given ExecutionContext = n.reader.client.clientContext
 

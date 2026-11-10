@@ -64,7 +64,7 @@ class SplitFinalizationAction(val client: AspenClient,
               }
 
               TierEngine.encodingFor(node).insert(node, newMinimum, Value(newNode.toArray), nodeSize, alloc, onSplit,
-                None).map(_=>())
+                PutRequirement.Checked).map(_=>())
           }
         }
 

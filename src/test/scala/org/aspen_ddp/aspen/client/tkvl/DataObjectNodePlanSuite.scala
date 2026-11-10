@@ -210,7 +210,7 @@ class DataObjectNodePlanSuite extends AnyFunSuite:
       assert(applied > 30)
 
   private def put(k: Key, v: Value, mustNotExist: Boolean = false): BatchOp =
-    BatchOp.Put(k, v, if mustNotExist then Some(Left(true)) else None)
+    BatchOp.Put(k, v, if mustNotExist then PutRequirement.MustNotExist else PutRequirement.Checked)
 
   for limit <- List(200, 400, 1024); pointerLengths <- List(Seq(3), Seq(3, 30, 60)); seed <- 1 to 3 do
     test(s"random batches keep every node within the limit and match the model (limit $limit, pointers ${pointerLengths.mkString("/")}, seed $seed)"):
@@ -253,7 +253,7 @@ class DataObjectNodePlanSuite extends AnyFunSuite:
     intercept[org.aspen_ddp.aspen.common.objects.KeyAlreadyExists](
       planBatch(ptr, content, ordering, List(put(key(1), value(2), mustNotExist = true)), 1024))
     intercept[UnsupportedRequirement](
-      planBatch(ptr, content, ordering, List(BatchOp.Put(key(2), value(2), Some(Right(org.aspen_ddp.aspen.common.objects.ObjectRevision.Null)))), 1024))
+      planBatch(ptr, content, ordering, List(BatchOp.Put(key(2), value(2), PutRequirement.AtRevision(org.aspen_ddp.aspen.common.objects.ObjectRevision.Null))), 1024))
     assert(planBatch(ptr, content, ordering, List(put(key(2), value(2), mustNotExist = true)), 1024).isDefined)
 
   for seed <- 1 to 5 do

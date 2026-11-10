@@ -23,7 +23,7 @@ class TieredKeyValueListNode(val tkvl: TieredKeyValueList,
 
   def set(key: Key,
           value: Value,
-          requirement: Option[Either[Boolean, ObjectRevision]] = None)(using t: Transaction): Future[Unit] = {
+          requirement: PutRequirement = PutRequirement.Checked)(using t: Transaction): Future[Unit] = {
 
     def onSplit(newMinimum: Key, newNode: KeyValueObjectPointer): Future[Unit] = {
       SplitFinalizationAction.addToTransaction(tkvl.rootManager, 1, newMinimum, newNode, t)

@@ -104,7 +104,7 @@ class KeyValueListNode(val reader: ObjectReader,
              maxNodeSize: Int,
              allocator: ObjectAllocator,
              prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit,
-             requirement: Option[Either[Boolean, ObjectRevision]] = None
+             requirement: PutRequirement = PutRequirement.Checked
             )(using tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
     logger.trace(s"KeyValueListNode got containing node for key $key. Min: ${node.minimum}")
     KeyValueListNode.insert(node, ordering, key, value, maxNodeSize, allocator, prepareForSplit, requirement)
@@ -481,6 +481,30 @@ object KeyValueListNode extends Logging {
     }
   }
 
+  /** The key requirements of a put of `key` to the node `shape` was read from. `Checked` derives the per-write check
+    * from the node as read: `KeyRevision` of a held key, `DoesNotExist` of an absent one. A competing write of the
+    * key fails that check as an ordinary abort, which the caller retries; only `MustNotExist` throws
+    * KeyAlreadyExists, and only when the node read holds the key.
+    */
+  def putRequirements(shape: NodeShape, key: Key, requirement: PutRequirement): List[KeyRequirement] =
+    requirement match
+      case PutRequirement.Checked =>
+        shape.contents.get(key) match
+          case Some(vs) => KeyRevision(key, vs.revision) :: Nil
+          case None => DoesNotExist(key) :: Nil
+      case PutRequirement.MustNotExist =>
+        if shape.contents.contains(key) then
+          throw new KeyAlreadyExists(key)
+        DoesNotExist(key) :: Nil
+      case PutRequirement.AtRevision(revision) => KeyRevision(key, revision) :: Nil
+      case PutRequirement.Blind => Nil
+
+  /** The key requirements of a delete of `key` from the node `shape` was read from: the key's `KeyRevision` as read.
+    * Nothing for a key the node does not hold, which is not deleted.
+    */
+  def deleteRequirements(shape: NodeShape, key: Key): List[KeyRequirement] =
+    shape.contents.get(key).map(vs => KeyRevision(key, vs.revision)).toList
+
   /** Plans an insert of `key`/`value`. Throws NodeSizeExceeded if the pair cannot fit in any node and
     * KeyAlreadyExists if `requirement` demands the key be new and it is not
     */
@@ -488,7 +512,7 @@ object KeyValueListNode extends Logging {
                  key: Key,
                  value: Value,
                  maxNodeSize: Int,
-                 requirement: Option[Either[Boolean, ObjectRevision]]): ChangePlan = {
+                 requirement: PutRequirement): ChangePlan = {
     val currentSize = pairsSize(shape.ida, shape.contents)
     val newPairSize = KVObjectState.idaEncodedPairSize(shape.ida, key, value)
     val maxSize = maxNodeSize - nodeOverhead(shape.ida, shape.minimum, shape.maximum, shape.tail, shape.contents.size)
@@ -496,17 +520,7 @@ object KeyValueListNode extends Logging {
     if (newPairSize > maxSize)
       throw new NodeSizeExceeded
 
-    val reqs: List[KeyRequirement] = requirement match {
-      case None => Nil
-      case Some(Left(mustNotExist)) =>
-        if (mustNotExist) {
-          if (shape.contents.contains(key))
-            throw new KeyAlreadyExists(key)
-          DoesNotExist(key) :: Nil
-        } else
-          Nil
-      case Some(Right(revision)) => KeyRevision(key, revision) :: Nil
-    }
+    val reqs = putRequirements(shape, key, requirement)
 
     // An overwrite replaces the existing pair rather than adding to it
     val replacedSize = shape.contents.get(key).map(vs => KVObjectState.idaEncodedPairSize(shape.ida, key, vs.value)).getOrElse(0)
@@ -537,7 +551,9 @@ object KeyValueListNode extends Logging {
     if (newPairSize > maxSize)
       throw new NodeSizeExceeded
 
-    val reqs: List[KeyRequirement] = KeyRevision(oldKey, shape.contents(oldKey).revision) :: Nil
+    // The old key as read, and the new key as read: its revision if held, otherwise that it does not exist
+    val newKeyReqs = if newKey == oldKey then Nil else putRequirements(shape, newKey, PutRequirement.Checked)
+    val reqs: List[KeyRequirement] = KeyRevision(oldKey, shape.contents(oldKey).revision) :: newKeyReqs
 
     // The old pair is removed, and a pair already stored under newKey is replaced
     val replacedSize = shape.contents.get(newKey).filter(_ => newKey != oldKey)
@@ -594,7 +610,7 @@ object KeyValueListNode extends Logging {
   /** Plans a batch of `ops`, ascending and at most one per key, all within the node's range. Generalizes
     * `planInsert` and `planDelete`: a batch of one op plans exactly what they do, except that a node no single split
     * can hold is split into more (`SplitMany`) rather than rejected. Every put gets the `WithinRange` and requirement
-    * `planInsert` would give it and every deleted key an `Exists` requirement, as `delete` does. Throws
+    * `planInsert` would give it and every deleted key its `KeyRevision` as read, as `delete` does. Throws
     * NodeSizeExceeded if a pair cannot fit in any node and KeyAlreadyExists if a put demands its key be new and it
     * is not.
     */
@@ -605,23 +621,13 @@ object KeyValueListNode extends Logging {
       if (KVObjectState.idaEncodedPairSize(shape.ida, put.key, put.value) > maxPairSize)
         throw new NodeSizeExceeded
 
-      put.requirement match {
-        case None => Nil
-        case Some(Left(mustNotExist)) =>
-          if (mustNotExist) {
-            if (shape.contents.contains(put.key))
-              throw new KeyAlreadyExists(put.key)
-            DoesNotExist(put.key) :: Nil
-          } else
-            Nil
-        case Some(Right(revision)) => KeyRevision(put.key, revision) :: Nil
-      }
+      KeyValueListNode.putRequirements(shape, put.key, put.requirement)
     }
 
     val puts = ops.collect { case p: BatchOp.Put => p }
     val removed = ops.collect { case BatchOp.Remove(k) if shape.contents.contains(k) => k }
     val putReqs = puts.map(p => p -> putRequirements(p)).toMap
-    val removeReqs: List[KeyRequirement] = removed.map(KeyValueUpdate.Exists(_))
+    val removeReqs: List[KeyRequirement] = removed.flatMap(deleteRequirements(shape, _))
 
     val newContents = shape.contents -- removed ++ puts.map(p => p.key -> pendingEntry(p.value))
 
@@ -775,7 +781,7 @@ object KeyValueListNode extends Logging {
                      maxNodeSize: Int,
                      allocator: ObjectAllocator,
                      prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit,
-                     requirement: Option[Either[Boolean, ObjectRevision]] = None
+                     requirement: PutRequirement = PutRequirement.Checked
                     )(using tx: Transaction, ec: ExecutionContext): Future[Unit] = {
     val plan =
       try planInsert(node.shape, key, value, maxNodeSize, requirement)
@@ -941,7 +947,7 @@ object KeyValueListNode extends Logging {
              key: Key,
              reader: ObjectReader,
              prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit)(using tx: Transaction, ec: ExecutionContext): Future[Boolean] =
-    delete(node, key, None, List(KeyValueUpdate.Exists(key)), reader, prepareForJoin)
+    delete(node, key, None, deleteRequirements(node.shape, key), reader, prepareForJoin)
 
   /** Deletes `key` from `node`. The result is true if the node is left empty: its last key was deleted and the
     * join with the right node was declined (see `planJoin`), or the right node was empty too. The caller removes
@@ -1111,7 +1117,7 @@ object KeyValueListNode extends Logging {
           val (key, vs) = contents.head
           val fdeleted = Future.delegate(deleteKVPair(key, vs)).flatMap: _ =>
             val dtx = client.newTransaction()
-            dtx.update(node.pointer, None, None, Nil, List(Delete(key)))
+            dtx.update(node.pointer, None, None, List(KeyRevision(key, vs.revision)), List(Delete(key)))
             dtx.commit()
 
           fdeleted.onComplete:

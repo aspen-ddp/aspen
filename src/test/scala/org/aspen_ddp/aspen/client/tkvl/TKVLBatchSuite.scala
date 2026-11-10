@@ -216,6 +216,53 @@ class TKVLBatchRequirementSuite extends TKVLBatchSuiteSupport:
         assert(second.isEmpty)
         assert(stored == first.map(_.toArray.toList))
 
+    /** Puts `k` -> `v` through the client's retry loop. The first attempt stages its put, then lets `race` commit a
+      * competing write of `k` before committing. Returns the first attempt's failure and the number of attempts.
+      */
+    def racedPut(tree: Tree, k: Key, v: Value, race: () => Future[Unit]): Future[(Option[Throwable], Int)] =
+      var attempts = 0
+      var firstFailure: Option[Throwable] = None
+      client.retryStrategy.retryUntilSuccessful:
+        attempts += 1
+        val first = attempts == 1
+        val tx = client.newTransaction()
+        val f = for
+          _ <- tree.set(k, v)(using tx)
+          _ <- if first then race() else Future.unit
+          _ <- tx.commit()
+        yield ()
+        f.recoverWith:
+          case e if first =>
+            firstFailure = Some(e)
+            Future.failed(e)
+      .map(_ => (firstFailure, attempts))
+
+    atest(s"$kind: a Checked put that loses a race to another writer of the key aborts and succeeds on retry"):
+      for
+        (tree, _) <- newTree(kind)
+        _ <- batch(tree, inserts(keys(1 to 3)), Nil)
+        (failure, attempts) <- racedPut(tree, Key(2), value(22),
+          () => inTransaction(rtx => tree.set(Key(2), value(21))(using rtx)))
+        stored <- tree.get(Key(2))
+      yield
+        assert(failure.isDefined)
+        assert(!failure.get.isInstanceOf[KeyAlreadyExists])
+        assert(attempts == 2)
+        assert(stored == Some(value(22).bytes.toList))
+
+    atest(s"$kind: a Checked put racing a concurrent insert of the same absent key retries, never KeyAlreadyExists"):
+      for
+        (tree, _) <- newTree(kind)
+        _ <- batch(tree, inserts(keys(1 to 3)), Nil)
+        (failure, attempts) <- racedPut(tree, Key(5), value(52),
+          () => inTransaction(rtx => tree.set(Key(5), value(51))(using rtx)))
+        stored <- tree.get(Key(5))
+      yield
+        assert(failure.isDefined)
+        assert(!failure.get.isInstanceOf[KeyAlreadyExists])
+        assert(attempts == 2)
+        assert(stored == Some(value(52).bytes.toList))
+
   atest("DataObjects: a batch after a change to the same node in the transaction fails with NodeAlreadyModified"):
     for
       (tree, _) <- newTree(TreeKind.DataObjects)

@@ -664,7 +664,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
         tx.revision, ObjectRefcount(0, 1),
         Map(key -> ValueState(value, tx.revision, HLCTimestamp.now)), None)
 
-      err <- lst.insert(key, value, 100, alloc, requirement = Some(Left(true))).failed
+      err <- lst.insert(key, value, 100, alloc, requirement = PutRequirement.MustNotExist).failed
       txErr <- tx.result.failed
     } yield {
       // The insert must unwind rather than fall through to the split path, which would
@@ -691,7 +691,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
         tx.revision, ObjectRefcount(0, 1),
         Map(key -> ValueState(largeValue, tx.revision, HLCTimestamp.now)), None)
 
-      err <- lst.insert(key, largeValue, 100, alloc, requirement = Some(Left(true))).failed
+      err <- lst.insert(key, largeValue, 100, alloc, requirement = PutRequirement.MustNotExist).failed
       txErr <- tx.result.failed
     } yield {
       // The insert must unwind before reaching the split path that would allocate.

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import java.nio.charset.StandardCharsets
 import java.util.UUID
-import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
+import org.aspen_ddp.aspen.client.tkvl.{PutRequirement, TieredKeyValueList}
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, DurableTaskFactory, SteppedDurableTask, TaskExecutor}
@@ -74,12 +74,12 @@ class CreateFileTask(
       onode <- tkvl.getContainingNode(fkey)
       _ <- onode match
         case None =>
-          tkvl.set(fkey, Value(newFile.toArray), requirement = Some(Left(true)))
+          tkvl.set(fkey, Value(newFile.toArray), requirement = PutRequirement.MustNotExist)
         case Some(node) => node.get(fkey) match
           case None =>
-            node.set(fkey, Value(newFile.toArray), requirement = Some(Left(true)))
+            node.set(fkey, Value(newFile.toArray), requirement = PutRequirement.MustNotExist)
           case Some(vs) =>
-            node.set(fkey, Value(newFile.toArray), requirement = Some(Right(vs.revision))).flatMap: _ =>
+            node.set(fkey, Value(newFile.toArray), requirement = PutRequirement.AtRevision(vs.revision)).flatMap: _ =>
               UnlinkFileTask.prepareTask(fs, InodePointer(vs.value.bytes))
     yield
       state

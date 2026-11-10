@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.compute.impl
 
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, PutRequirement, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.ServiceMessage
@@ -174,7 +174,7 @@ class SimpleDurableServiceExecutor(
         // will detect whoever won.
         client.transact: tx =>
           given Transaction = tx
-          servicesTkvl.set(serviceKey, Value(newEntry.encode()), Some(Right(oldRevision)))(using tx)
+          servicesTkvl.set(serviceKey, Value(newEntry.encode()), PutRequirement.AtRevision(oldRevision))(using tx)
         .foreach: _ =>
           if !isShutdown then
             client.read(statePointer).foreach: state =>
@@ -232,7 +232,7 @@ class SimpleDurableServiceExecutor(
               val newEntry  = entry.copy(leaseExpiry = newExpiry)
               client.transact: tx =>
                 given Transaction = tx
-                servicesTkvl.set(serviceKey, Value(newEntry.encode()), Some(Right(vs.revision)))(using tx)
+                servicesTkvl.set(serviceKey, Value(newEntry.encode()), PutRequirement.AtRevision(vs.revision))(using tx)
               .recoverWith:
                 case _ => retryLater()
         .recoverWith:
@@ -264,7 +264,7 @@ class SimpleDurableServiceExecutor(
               allocator  = new PoolObjectAllocator(client, pool)
               statePtr  <- allocator.allocateKeyValueObject(initialState.map((k, v) => k -> Value(v)))
               entry      = ServiceEntry(typeUUID, ServiceEntry.UnclaimedHostId, HLCTimestamp.Zero, statePtr)
-              _         <- servicesTkvl.set(serviceKey, Value(entry.encode()), Some(Left(true)))
+              _         <- servicesTkvl.set(serviceKey, Value(entry.encode()), PutRequirement.MustNotExist)
             yield ()
 
   override def unregisterService(serviceUUID: UUID): Future[Unit] =

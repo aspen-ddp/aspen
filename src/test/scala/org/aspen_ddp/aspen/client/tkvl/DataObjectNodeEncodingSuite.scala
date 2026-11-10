@@ -84,11 +84,11 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       n0 <- makeNode(List(key(1) -> vbytes(1), key(5) -> vbytes(5)), key(1), link)
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.insert(n0, key(3), vbytes(3), 4096, alloc, noSplit, None)(using tx)
+      _ <- enc.insert(n0, key(3), vbytes(3), 4096, alloc, noSplit, PutRequirement.Checked)(using tx)
       _ <- tx.commit()
       tx2 = client.newTransaction()
       n1 <- readNode(n0.pointer, key(1))
-      _ <- enc.insert(n1, key(5), vbytes(9), 4096, alloc, noSplit, None)(using tx2)
+      _ <- enc.insert(n1, key(5), vbytes(9), 4096, alloc, noSplit, PutRequirement.Checked)(using tx2)
       _ <- tx2.commit()
       n2 <- readNode(n0.pointer, key(1))
     yield
@@ -116,7 +116,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       n0 <- makeNode(original, Key.AbsoluteMinimum, originalLink)
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.insert(n0, newKey, newValue, maxNodeSize, alloc, onSplit, None)(using tx)
+      _ <- enc.insert(n0, newKey, newValue, maxNodeSize, alloc, onSplit, PutRequirement.Checked)(using tx)
       _ <- tx.commit()
       left <- readNode(n0.pointer)
       (newMin, newPtr) = split.head
@@ -148,7 +148,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
     for
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.insert(n0, k, v, maxNodeSize, alloc, rec.onSplit, None)(using tx)
+      _ <- enc.insert(n0, k, v, maxNodeSize, alloc, rec.onSplit, PutRequirement.Checked)(using tx)
       _ <- tx.commit()
       left <- readNode(n0.pointer)
       right <- readNode(rec.splits.head._2)
@@ -168,7 +168,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       alloc <- allocator()
       tx = client.newTransaction()
       err <- Future.delegate(enc.insert(n0, key(2), vbytes(2, 10), maxNodeSize, alloc, noSplit,
-        None)(using tx)).failed
+        PutRequirement.Checked)(using tx)).failed
       n1 <- readNode(n0.pointer)
     yield
       assert(enc.encodedSize(original, Key.AbsoluteMinimum, None) <= maxNodeSize)
@@ -183,15 +183,15 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       alloc <- allocator()
       tx = client.newTransaction()
       r <- Future.delegate(enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit,
-        Some(Right(n0.revision)))(using tx)).failed
+        PutRequirement.AtRevision(n0.revision))(using tx)).failed
       _ = assert(r.isInstanceOf[UnsupportedRequirement])
       _ = assert(tx.isEmpty)
-      _ <- enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit, Some(Left(true)))(using tx)
+      _ <- enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit, PutRequirement.MustNotExist)(using tx)
       _ <- tx.commit()
       n1 <- readNode(n0.pointer)
       tx2 = client.newTransaction()
       exists <- Future.delegate(enc.insert(n1, key(1), vbytes(3), 4096, alloc, noSplit,
-        Some(Left(true)))(using tx2)).failed
+        PutRequirement.MustNotExist)(using tx2)).failed
       aborted <- tx2.result.failed
     yield
       assert(n1.entries.map(_._1) == List(key(1), key(2)))
@@ -205,7 +205,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       alloc <- allocator()
       tx = client.newTransaction()
       err <- Future.delegate(enc.insert(n0, key(2), vbytes(2, maxNodeSize), maxNodeSize, alloc, noSplit,
-        None)(using tx)).failed
+        PutRequirement.Checked)(using tx)).failed
       n1 <- readNode(n0.pointer)
     yield
       assert(err.isInstanceOf[NodeSizeExceeded])
@@ -317,7 +317,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
         for
           r <- readNode(right.pointer, key(50))
           tx2 = client.newTransaction()
-          _ <- enc.insert(r, key(70), vbytes(70), 4096, alloc, noSplit, None)(using tx2)
+          _ <- enc.insert(r, key(70), vbytes(70), 4096, alloc, noSplit, PutRequirement.Checked)(using tx2)
           _ <- tx2.commit()
         yield
           ())(using tx)
@@ -378,7 +378,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       _ <- tx.commit()
       n1 <- readNode(n0.pointer)
       tx2 = client.newTransaction()
-      _ <- enc.insert(n1, key(9), vbytes(9), 4096, alloc, noSplit, None)(using tx2)
+      _ <- enc.insert(n1, key(9), vbytes(9), 4096, alloc, noSplit, PutRequirement.Checked)(using tx2)
       _ <- tx2.commit()
       n2 <- readNode(n0.pointer)
     yield
@@ -487,8 +487,8 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       n0 <- makeNode(List(key(1) -> vbytes(1)))
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit, None)(using tx)
-      err <- Future.delegate(enc.insert(n0, key(3), vbytes(3), 4096, alloc, noSplit, None)(using tx)).failed
+      _ <- enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit, PutRequirement.Checked)(using tx)
+      err <- Future.delegate(enc.insert(n0, key(3), vbytes(3), 4096, alloc, noSplit, PutRequirement.Checked)(using tx)).failed
       _ <- tx.commit()
       n1 <- readNode(n0.pointer)
     yield
@@ -500,7 +500,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       n0 <- makeNode(List(key(1) -> vbytes(1), key(2) -> vbytes(2)))
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.insert(n0, key(3), vbytes(3), 4096, alloc, noSplit, None)(using tx)
+      _ <- enc.insert(n0, key(3), vbytes(3), 4096, alloc, noSplit, PutRequirement.Checked)(using tx)
       err <- Future.delegate(enc.delete(n0, key(1), 4096, noJoin)(using tx)).failed
     yield
       assert(alreadyModified(err, n0))
@@ -515,7 +515,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       alloc <- allocator()
       tx = client.newTransaction()
       _ <- enc.delete(n0, key(2), 4096, noJoin)(using tx)
-      err <- Future.delegate(enc.insert(n0, key(3), vbytes(3, 100), maxNodeSize, alloc, noSplit, None)(using tx))
+      err <- Future.delegate(enc.insert(n0, key(3), vbytes(3, 100), maxNodeSize, alloc, noSplit, PutRequirement.Checked)(using tx))
         .failed
       txErr <- tx.result.failed
       n1 <- readNode(n0.pointer)
@@ -530,7 +530,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       left <- makeNode(List(key(1) -> vbytes(1)), Key.AbsoluteMinimum, Some(NodeLink(key(50), right.pointer)))
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.insert(left, key(2), vbytes(2), 4096, alloc, noSplit, None)(using tx)
+      _ <- enc.insert(left, key(2), vbytes(2), 4096, alloc, noSplit, PutRequirement.Checked)(using tx)
       err <- Future.delegate(enc.delete(left, key(1), 4096, noJoin)(using tx)).failed
     yield
       assert(alreadyModified(err, left))
@@ -541,7 +541,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       left <- makeNode(List(key(1) -> vbytes(1)), Key.AbsoluteMinimum, Some(NodeLink(key(50), right.pointer)))
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.insert(right, key(60), vbytes(60), 4096, alloc, noSplit, None)(using tx)
+      _ <- enc.insert(right, key(60), vbytes(60), 4096, alloc, noSplit, PutRequirement.Checked)(using tx)
       err <- Future.delegate(enc.delete(left, key(1), 4096, noJoin)(using tx)).failed
       txErr <- tx.result.failed
       l1 <- readNode(left.pointer)
@@ -561,7 +561,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       alloc <- allocator()
       tx = client.newTransaction()
       _ <- enc.delete(left, key(1), 4096, onJoin)(using tx)
-      err <- Future.delegate(enc.insert(right, key(60), vbytes(60), 4096, alloc, noSplit, None)(using tx)).failed
+      err <- Future.delegate(enc.insert(right, key(60), vbytes(60), 4096, alloc, noSplit, PutRequirement.Checked)(using tx)).failed
     yield
       assert(joined)
       assert(alreadyModified(err, right))

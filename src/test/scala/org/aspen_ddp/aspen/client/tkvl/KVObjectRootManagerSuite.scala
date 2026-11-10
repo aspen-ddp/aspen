@@ -212,9 +212,9 @@ class KVObjectRootManagerSuite extends IntegrationTestSuite:
     for
       rm <- newTree()
       tree <- rm.getTree()
-      _ <- inTx(tx => tree.set(Key(1), value(1), Some(Left(true)))(using tx))
+      _ <- inTx(tx => tree.set(Key(1), value(1), PutRequirement.MustNotExist)(using tx))
       tx = client.newTransaction()
-      err <- tree.set(Key(1), value(2), Some(Left(true)))(using tx).failed
+      err <- tree.set(Key(1), value(2), PutRequirement.MustNotExist)(using tx).failed
       v <- tree.get(Key(1))
     yield
       assert(err.isInstanceOf[KeyAlreadyExists])
@@ -226,9 +226,9 @@ class KVObjectRootManagerSuite extends IntegrationTestSuite:
       tree <- rm.getTree()
       _ <- inTx(tx => tree.set(Key(1), value(1))(using tx))
       v1 <- tree.get(Key(1))
-      _ <- inTx(tx => tree.set(Key(1), value(2), Some(Right(v1.get.revision)))(using tx))
+      _ <- inTx(tx => tree.set(Key(1), value(2), PutRequirement.AtRevision(v1.get.revision))(using tx))
       tx = client.newTransaction()
-      _ <- tree.set(Key(1), value(3), Some(Right(v1.get.revision)))(using tx)
+      _ <- tree.set(Key(1), value(3), PutRequirement.AtRevision(v1.get.revision))(using tx)
       err <- tx.commit().failed
       v <- tree.get(Key(1))
     yield

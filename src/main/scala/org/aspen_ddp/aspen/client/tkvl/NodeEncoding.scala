@@ -19,9 +19,9 @@ trait NodeEncoding:
 
   /** Inserts or replaces `key` in `node`, which must be the node whose range holds `key`. A node that would grow
     * past `maxNodeSize` is split: the new right node is allocated from `allocator` and `prepareForSplit` is called
-    * with its minimum and pointer. `requirement` is `Left(true)` for "key must not exist" or `Right(revision)` for
-    * "key must be at this revision"; encodings that cannot enforce it throw `UnsupportedRequirement`. A key that
-    * must not exist but does aborts the transaction with `KeyAlreadyExists`.
+    * with its minimum and pointer. `requirement` is a `PutRequirement` (`Checked` by default); encodings that cannot
+    * enforce it throw `UnsupportedRequirement`. A key that must not exist (`MustNotExist`) but does aborts the
+    * transaction with `KeyAlreadyExists`.
     */
   def insert(node: ListNode,
              key: Key,
@@ -29,7 +29,7 @@ trait NodeEncoding:
              maxNodeSize: Int,
              allocator: ObjectAllocator,
              prepareForSplit: (Key, ObjectPointer) => Future[Unit],
-             requirement: Option[Either[Boolean, ObjectRevision]])(using Transaction): Future[Unit]
+             requirement: PutRequirement)(using Transaction): Future[Unit]
 
   /** Deletes `key` from `node`. Deleting the last key of a node with a right link joins the right node into it
     * and calls `prepareForJoin` with the right node's minimum and pointer. `maxNodeSize` is the node's tier's; an
@@ -48,7 +48,7 @@ trait NodeEncoding:
     * node's right neighbor, as read, when the caller found that the batch removes every entry of the node and leaves
     * the neighbor alone: the node absorbs it if the join fits, calling `prepareForJoin`. Reads nothing.
     *
-    * A put demanding its key be new (`Left(true)`) aborts the transaction with `KeyAlreadyExists` if the node holds
+    * A put demanding its key be new (`PutRequirement.MustNotExist`) aborts the transaction with `KeyAlreadyExists` if the node holds
     * the key. The result is true if the node is left empty.
     */
   def applyBatch(node: ListNode,

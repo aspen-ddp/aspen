@@ -54,7 +54,7 @@ class TieredKeyValueList(val client: AspenClient,
 
   def set(key: Key,
           value: Value,
-          requirement: Option[Either[Boolean, ObjectRevision]] = None)
+          requirement: PutRequirement = PutRequirement.Checked)
          (using t: Transaction): Future[Unit] =
     engine.set(key, value, requirement)
 

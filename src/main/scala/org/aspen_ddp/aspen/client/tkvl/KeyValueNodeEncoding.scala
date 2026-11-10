@@ -33,7 +33,7 @@ object KeyValueNodeEncoding extends NodeEncoding:
              maxNodeSize: Int,
              allocator: ObjectAllocator,
              prepareForSplit: (Key, ObjectPointer) => Future[Unit],
-             requirement: Option[Either[Boolean, ObjectRevision]])(using Transaction): Future[Unit] =
+             requirement: PutRequirement)(using Transaction): Future[Unit] =
     val n = kvNode(node)
     given ExecutionContext = n.reader.client.clientContext
     KeyValueListNode.insert(n, n.ordering, key, value, maxNodeSize, allocator, prepareForSplit, requirement)

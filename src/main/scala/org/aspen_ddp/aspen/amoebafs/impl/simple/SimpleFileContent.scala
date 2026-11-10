@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTask
 import org.aspen_ddp.aspen.amoebafs.{FileInode, FileSystem}
 import scribe.Logging
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, PutRequirement, Root, TieredKeyValueList}
 
 import scala.annotation.tailrec
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -219,7 +219,7 @@ class SimpleFileContent(file: SimpleFile,
         _ <- tree.set(
           Key(segment.segmentBeginOffset),
           Value(ptr.toArray),
-          Some(Left(true)))
+          PutRequirement.MustNotExist)
       yield
         val dos = new DataObjectState(
           ptr,

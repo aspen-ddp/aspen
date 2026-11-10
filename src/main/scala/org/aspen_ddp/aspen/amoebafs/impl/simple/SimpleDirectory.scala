@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 import scala.language.implicitConversions
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, Transaction}
-import org.aspen_ddp.aspen.client.tkvl.{Root, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{PutRequirement, Root, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, Directory, DirectoryEntry, DirectoryInode, DirectoryPointer, FileSystem, InodePointer}
@@ -76,7 +76,7 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     for {
       oOldRevision <- fcleanupOldEntry
       _ <- fincref
-      requirement = oOldRevision.map(rev => Right(rev))
+      requirement = oOldRevision.fold(PutRequirement.Checked)(rev => PutRequirement.AtRevision(rev))
       _ <- tree.set(key, Value(pointer.toArray), requirement)
     } yield ()
   }

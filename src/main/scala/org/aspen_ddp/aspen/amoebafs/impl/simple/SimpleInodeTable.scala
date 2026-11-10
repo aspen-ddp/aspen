@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import scala.language.implicitConversions
 import org.aspen_ddp.aspen.client.{ObjectAllocator, Transaction}
-import org.aspen_ddp.aspen.client.tkvl.{RootManager, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{PutRequirement, RootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
@@ -50,7 +50,7 @@ class SimpleInodeTable(
     for {
       ptr <- fs.defaultInodeAllocator.allocateDataObject(updatedInode.toArray)
       iptr = InodePointer(inode.fileType, inodeNumber, ptr)
-      _ <- table.set(key, Value(iptr.toArray), requirement = Some(Left(true)))
+      _ <- table.set(key, Value(iptr.toArray), requirement = PutRequirement.MustNotExist)
     } yield {
       iptr
     }

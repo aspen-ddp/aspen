@@ -293,7 +293,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       // Recreate the initial node through the empty-tree path of set
       tx2 = client.newTransaction()
-      _ <- tree.set(key2, value, requirement = Some(Left(true)))(using tx2)
+      _ <- tree.set(key2, value, requirement = PutRequirement.MustNotExist)(using tx2)
       _ <- tx2.commit()
       _ <- waitForTransactionsToComplete()
 

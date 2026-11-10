@@ -9,7 +9,7 @@ private[tkvl] sealed abstract class BatchOp:
 private[tkvl] object BatchOp:
 
   /** Sets `key` to `value`. `requirement` is as for `NodeEncoding.insert` */
-  final case class Put(key: Key, value: Value, requirement: Option[Either[Boolean, ObjectRevision]]) extends BatchOp
+  final case class Put(key: Key, value: Value, requirement: PutRequirement) extends BatchOp
 
   /** Deletes `key`. Nothing is done for a key that is not in the tree. */
   final case class Remove(key: Key) extends BatchOp
@@ -25,7 +25,7 @@ private[tkvl] object BatchOp:
     if deletes.exists(distinctInserts.contains) then
       throw new IllegalArgumentException("A batch update may not both insert and delete a key")
 
-    val puts = inserts.map(i => Put(i.key, i.value, if i.requireDoesNotExist then Some(Left(true)) else None))
+    val puts = inserts.map(i => Put(i.key, i.value, i.requirement))
     puts ++ deletes.distinct.map(Remove(_))
 
   /** `ops` ascending by `ordering` */

@@ -348,7 +348,7 @@ class KeyValueNodeEncodingSuite extends IntegrationTestSuite:
       _ <- tx0.commit()
       n0 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")
       tx1 = client.newTransaction()
-      _ <- enc.insert(n0, key(2), value(2), 4096, alloc, noSplit, None)(using tx1)
+      _ <- enc.insert(n0, key(2), value(2), 4096, alloc, noSplit, PutRequirement.Checked)(using tx1)
       _ <- tx1.commit()
       n1 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")
       tx2 = client.newTransaction()

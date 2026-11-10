@@ -165,7 +165,7 @@ never checks the transaction's requirements on such a prepare. It proves the com
 already shows the transaction's update. Otherwise it waits (up to 5 seconds) for the client's own prepare, and
 votes abort if none arrives. Recovery therefore never gathers fresh commit votes, so it cannot commit a
 transaction that was already aborted and forgotten. The one accepted corner case is a delayed duplicate of the
-client's own prepare that reaches enough stores after all of them forgot an aborted transaction while its
+client's own prepare that reaches enough stores after all of them forgot an aborted transaction (after the status-cache duration, 7 s by default) while its
 requirements hold again; a client that successfully retries the transaction closes it.
 
 One reason transactions are intended to commit/abort as fast as possible is that once a DataStore 

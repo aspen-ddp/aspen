@@ -493,7 +493,7 @@ yield
   `TransactionAborted`, not as an exception while you're building the transaction.
 * `TransactionAborted` does not tell you *why* a transaction failed, only that it did.
 * An abort is final, with one accepted corner case: a delayed duplicate of your own prepare can still commit an
-  aborted transaction after every store has forgotten it, if its requirements hold again. A successful retry
+  aborted transaction after every store has forgotten it (the status-cache duration, 7 s by default), if its requirements hold again. A successful retry
   closes it, since the retry consumes the same pin and the old requirements then fail.
 * Objects die by refcount, and it's on you to remove pointers to them in the same transaction.
 * Object refcounts exist for user convenience. It is perfectly acceptable to store multiple pointers

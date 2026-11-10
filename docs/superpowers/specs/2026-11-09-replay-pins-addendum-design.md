@@ -30,7 +30,7 @@ requiring a pin in every pool, as too restrictive.
 ## Problem 2: an aborted transaction commits later
 
 The pin rule fixes only committed transactions in place. An aborted T wrote nothing, so its requirements can hold
-again. After the 5 s status cache expires no store remembers T, and three paths can bring it back:
+again. After the status cache (7 s by default) expires no store remembers T, and three paths can bring it back:
 1. A commit voter that crashed before learning of the abort recovers its vote, and its driver re-prepares T.
 2. A driver left running after its store closed re-prepares T (already closed by Ruling 31).
 3. A delayed duplicate of the client's own prepare arrives.
@@ -163,7 +163,7 @@ toward late condition 1, and provers are unaffected.
 ### C. The accepted corner case, documented
 
 > A transaction the client was told aborted can still commit later in one case: a delayed duplicate of the client's
-> own prepare reaches enough stores after every store has forgotten the transaction (more than the 5 s status cache
+> own prepare reaches enough stores after every store has forgotten the transaction (more than the status-cache duration (7 s by default)
 > later), and the transaction's requirements hold again at that time. Recovery and other store-side drivers can never
 > commit an aborted transaction (prefer-abort prepares). A client that retries an aborted transaction successfully
 > closes the case, because the retry consumes the same pin and the old requirements then fail.

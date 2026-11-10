@@ -254,7 +254,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Applied stubs: a durable (store, txid) record in the device CRL, charged to `CrlAdmission`, meaning the store holds
     that transaction's update. Written where the Tx's CRL state would be deleted, after its commits persist: on an
     owed-listing `TxFinalized` (`owed`, unioned by a second driver), on applying through an UnackedCommits entry, and
-    by a lookup when the Tx is forgotten without a listing one. A late commit at a store with a stub applies nothing and
+    by a lookup when the Tx is forgotten without a listing one. A commit at a store with a stub applies nothing; a non-late one
     reports its objects in `objectCommitErrors`. The repair scan drops a stub with its entry, and orphan stubs by a
     pre-walk snapshot. Residuals: a store that never saw T and missed its TxFinalized (below a quorum, self-heals), and a
     second driver's host crashing after its entries commit but before its TxFinalized arrives

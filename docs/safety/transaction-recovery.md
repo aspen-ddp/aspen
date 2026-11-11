@@ -305,7 +305,7 @@ naming S for T is stale" (`StoreRecoveryState`, crash-recovery-log.md 3.6). The 
      `writeStub` (`:959`); with no Tx the Frontend writes it directly, or hands it to a Tx whose commit is held for its
      turn (`Frontend.scala:768-778`, `deferredFinalizations` `:221-224`). Only the Tx that registered a held
      finalization removes the registration or concludes the state (M2, `:657-665`): a replay's Tx for the same txid,
-     forgotten meanwhile, changes neither.
+     forgotten meanwhile, changes neither, but a stub it owes passes to the registered Tx (`held.foreach(_.stubOwed())`).
   2. S applied T through its entry (`unackedCommitFound`, `Tx.scala:1092`, recovered vote or held late commit).
   3. Fallback: a Tx resolved committed and reached by a late commit with neither (its `TxFinalized` was lost) looks up
      its entry, writes a stub if found, and is forgotten either way (`Tx.scala:990-997,1079-1086,1127-1131`); a failed
@@ -1072,6 +1072,13 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > transaction's CRL state, which A's held commit still needs (a second effect of the same race, found while testing:
 > B's conclusion deleted it). A concludes it once its commit is issued. Tested by FrontendSuite "a replay's Tx
 > forgotten while a finalized commit is held for its turn leaves the held Tx registered".
+>
+> **Refresh (post-addendum): gap closed.** A skipped call dropped its `writeStub`. Reachable: a replay's Tx queues behind
+> the same held commit and its `finalizationDeferred` replaces A's registration by txid, so A's own call, carrying the
+> stub it was handed, was the skipped one; B then concluded without it. A skipped call with `writeStub` now marks the
+> registered Tx `stubOwed`. Tested by FrontendSuite "a stub owed to a held commit survives a replay's Tx deferring its
+> finalization for the same transaction" (failed before the fix) and "a replay's Tx forgotten owing a stub while a
+> finalized commit is held hands the stub to the held Tx".
 
 > **R-N12. Verdict: REFUTED (harmless).** A stub may be written for a store that does not hold T: an owed store that
 > never saw T (no-Tx path), a found entry whose local apply was skipped, and `issueCommits` skipping every object

@@ -652,7 +652,9 @@ class Frontend(val storeId: StoreId,
     * Called by the Tx as it is forgotten (`by`), and by a TxFinalized for a transaction the store holds no Tx for.
     * Only the Tx that registered a deferred finalization removes it. A replay's Tx for the same txid, forgotten while
     * the first one's commit is held, changes nothing: the held Tx concludes the transaction's state once its commit is
-    * issued, so the replay's must neither take its registration away nor delete the state that commit still needs
+    * issued, so the replay's must neither take its registration away nor delete the state that commit still needs.
+    * A stub it owes passes to the registered Tx, which concludes the state: the registration may be the replay's,
+    * which replaced the first Tx's (finalizationDeferred) when it deferred behind the same held commit
     */
   def transactionFinalized(txid: TransactionId, writeStub: Boolean = false, by: Option[Tx] = None): Unit =
     val held = deferredFinalizations.get(txid)
@@ -663,6 +665,8 @@ class Frontend(val storeId: StoreId,
           r.finalized = true
           r.writeStub ||= writeStub
         case None => concludeTransactionState(txid, writeStub, keepAdmission = false)
+    else if writeStub then
+      held.foreach(_.stubOwed())
 
   /** Deletes the CRL state of a finalized transaction, or replaces it by an applied stub. A stub already held
     * suffices: the state is only deleted.

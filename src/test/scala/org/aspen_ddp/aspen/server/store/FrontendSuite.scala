@@ -3294,6 +3294,55 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     crl.stubsSaved shouldBe List(txid2)
   }
 
+  // The stub a replay's Tx is owed when it is forgotten passes to the held Tx: the guard above must not drop it
+  test("a replay's Tx forgotten owing a stub while a finalized commit is held hands the stub to the held Tx") {
+    val crl = new TestCrl
+    val (frontend, backend, net) = heldCommit(crl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    resolve(frontend, net, txid2, committed = true)
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.transactions.contains(txid2) shouldBe false
+    // The status entry is evicted for size, so a replayed driver prepare, which carries no data, starts a fresh Tx
+    frontend.statusCache.evictForTest(txid2)
+    frontend.receiveTransactionMessage(mkPrepare(lockTxd(txid2, List(overwriteAfter(txid1))), fromClient = false))
+    frontend.transactions.contains(txid2) shouldBe true
+    // A TxFinalized listing this store reaches the replay's Tx. With no data it holds no commit of its own, so it is
+    // forgotten at once, owing the stub
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false,
+      owed = Set(storeId)))
+    frontend.transactions.contains(txid2) shouldBe false
+    crl.stubsSaved shouldBe Nil
+    crl.deleted should not contain txid2
+
+    backend.deliverCommits()
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+    crl.stubsSaved shouldBe List(txid2)
+  }
+
+  // The held Tx owes the stub first; a replay's Tx then defers its own finalization behind the same commit
+  test("a stub owed to a held commit survives a replay's Tx deferring its finalization for the same transaction") {
+    val crl = new TestCrl
+    val (frontend, backend, net) = heldCommit(crl)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    resolve(frontend, net, txid2, committed = true)
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.transactions.contains(txid2) shouldBe false
+    // A TxFinalized listing this store reaches the store with no Tx: the held Tx owes the stub
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false,
+      owed = Set(storeId)))
+    // The status entry is evicted for size, so a replayed prepare starts a fresh Tx, finalized behind the held commit
+    frontend.statusCache.evictForTest(txid2)
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    frontend.transactions.contains(txid2) shouldBe true
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.transactions.contains(txid2) shouldBe false
+    crl.stubsSaved shouldBe Nil
+
+    backend.deliverCommits()
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+    crl.stubsSaved shouldBe List(txid2)
+  }
+
   test("a waiting transaction that resolves is no longer called when the commit persists") {
     val (frontend, backend, net) = heldCommit(new TestCrl)
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))

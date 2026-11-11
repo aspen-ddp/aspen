@@ -2,9 +2,6 @@ TODO
 ====
 
 Open items from the replay-pins work:
-- An UnackedCommits entry too large for a tree node (a transaction changing very many objects on one store) fails
-  the marker's insert with NodeSizeExceeded, which the marker retries in place forever: the transaction never
-  finalizes (docs/safety cross-document G9). Not investigated: find the bound and make entries fit.
 - docs/safety/paxos-transactions.md cites line numbers (e.g. TransactionDriver.scala:262-263, :318-319) that are stale
   after the replay-pins branch.
 - TransactionDriver.mayBeDiscarded is used only by tests: remove it or fold it into them.

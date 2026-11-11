@@ -7,8 +7,9 @@
   object-level parts a read reports locked (`ReadLocks`) are deferred; nothing is written while the object has a
   commit in flight
 - One `StoreRepairer` scan walks the store's ErrorTree range, then its UnackedCommits range (skipping transactions
-  the store holds live). It drops an applied stub with its entry, and an orphan stub only once two consecutive scans
-  found it so (`server/transaction/CLAUDE.md`)
+  the store holds live). Each chunk of a chunked UnackedCommits entry is repaired as an entry of its own. It drops an
+  applied stub with its entry (for a chunked one, with its head, the chunk the lookups name), and an orphan stub only
+  once two consecutive scans found it so (`server/transaction/CLAUDE.md`)
 - An entry is deleted through its tree (`TieredKeyValueList.deleteIfPresent`, under the entry's `KeyRevision`), not
   through the node the walk handed over, so a delete that empties a node registers the join/tail-removal finalization
   actions and the trees shrink as repair drains them. Those actions run in ordinary (tracked) transactions, as the

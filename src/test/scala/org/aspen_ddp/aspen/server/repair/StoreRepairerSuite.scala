@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, ReadLocks, 
 import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedUnackedCommit
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
-import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
+import org.aspen_ddp.aspen.client.tkvl.{TKVLInsert, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Key, KeyValueObjectPointer, ObjectId,
                                            ObjectPointer, ObjectRefcount, Value}
@@ -809,6 +809,39 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       keptDuringScan shouldBe true
       keptByNext shouldBe true
       hasStub(2, late) shouldBe false
+
+  /** Writes UnackedCommits entry chunks for store `i` and `txid`, each naming `objects`, under the given chunk indexes */
+  private def writeChunks(i: Int, txid: TransactionId, objects: List[ObjectPointer], chunks: Int*): Future[Unit] =
+    // Older than the objects, so a read of them is not stale against it
+    val entry = Value(UnackedCommitEntry(HLCTimestamp(1000L), objects).encode)
+    for
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      tx = TestTransactions.replaySafe(client.newRepairTransaction())
+      _ <- pool.unackedCommitsTree.prepareUpdates(
+             chunks.toList.map(c => TKVLInsert(UnackedCommitEntry.key(sid(i), txid, c), entry, blind = true)), Nil)(using tx)
+      _ <- pump(tx.commit(), deadline())
+      _ <- settle()
+    yield ()
+
+  // A chunked entry (UnackedCommitEntry.chunks): the lookups that decide a late commit's apply name the head, so the
+  // stub outlives the head, not the later chunks
+  test("deleting a later chunk of an UnackedCommits entry keeps the stub; the head's deletion drops it"):
+    val repairer = StoreRepairer(client, SeamTarget())
+    val deferral = DeferralState()
+    val onlyLater = TransactionId(new UUID(78, 1))
+    val both = TransactionId(new UUID(78, 2))
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      _ <- writeChunks(2, onlyLater, List(kvPtr), 1)
+      _ <- writeChunks(2, both, List(kvPtr), 0, 1)
+      _ <- writeStub(2, onlyLater)
+      _ <- writeStub(2, both)
+      _ <- pass(2, repairer, deferral)
+      remaining <- unackedEntries(2)
+    yield
+      remaining shouldBe empty
+      hasStub(2, onlyLater) shouldBe true
+      hasStub(2, both) shouldBe false
 
   test("a UnackedCommits entry is reconciled and deleted once the store no longer holds it"):
     val target = SeamTarget()

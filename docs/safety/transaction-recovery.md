@@ -253,6 +253,10 @@ the entry is about).
     transaction changes, **whether or not the change leaves a trace** (`MissedUpdateFinalizationAction.scala:98-106`).
     Meaning: the store cast a commit vote the commit may have relied on and had not acknowledged applying T, so it is
     owed T.
+* (2026-11-11) An UnackedCommits entry too large for half a leaf node of its tree is written as chunks under
+  consecutive keys, head first (repair-process.md 2.3, 13.0b); before, its insert failed with `NodeSizeExceeded` and was
+  retried in place forever, so the transaction never finalized. A `NodeSizeExceeded` still raised is permanent and
+  takes the finalizer failure path (F2).
 * `MissedUpdateMarker.mark` (`client/internal/transaction/MissedUpdateMarker.scala:302`) groups by pool, merges entries
   by `(poolIndex, object)` keeping the newest timestamp (`:316-327`) and by `(poolIndex, txid)` (`:330-332`), and writes
   one transaction per pool at a time (`nextBatch`, `:335-353`) with at most 256 entries across both trees, ErrorTree
@@ -320,7 +324,8 @@ naming S for T is stale" (`StoreRecoveryState`, crash-recovery-log.md 3.6). The 
   (`Tx.scala:642-648`); a late commit reaching an undecided commit vote with a stub, or a held late commit whose stub
   arrived during its lookup, applies nothing (`:998-1000`, `:1087-1088`). A recovered non-late commit vote with a stub
   resolves committed through `doCommit` and stays until `TxFinalized` (Ruling 5).
-* **Cleanup.** The repair scan drops S's stub for T when it deletes entry (S, T) (`StoreRepairer.scala:322`). It
+* **Cleanup.** The repair scan drops S's stub for T when it deletes entry (S, T) (`StoreRepairer.scala:322`); for an
+  entry written in chunks (2026-11-11, repair-process.md 2.3), when it deletes the head, the chunk the lookups name. It
   drops an orphan stub only after two consecutive successful scans found it orphaned: read before the walk, no entry
   in the walk, and none at a point lookup (Rulings 6 and 8, `:95-104,161-165,187-200`; repair-process.md 5.5).
 * **Residual (design A).** A store named in `owed` that never receives that `TxFinalized` and holds no Tx for T: by the

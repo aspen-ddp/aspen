@@ -2,8 +2,8 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import java.nio.{ByteBuffer, ByteOrder}
 
-import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, Transaction, TransactionCreationError}
-import org.aspen_ddp.aspen.client.tkvl.TKVLInsert
+import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, StoragePool, Transaction, TransactionCreationError}
+import org.aspen_ddp.aspen.client.tkvl.{NodeSizeExceeded, TKVLInsert}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -144,14 +144,19 @@ class MissedUpdateMarker(client: AspenClient,
       TKVLInsert(errorKey(u.store, u.objectId),
                  MissedUpdateFinalizationAction.encodeErrorEntry(u.missedTimestamp, u.storePointer), blind = true)
 
-    val unackedInserts = unacked.map: t =>
-      TKVLInsert(UnackedCommitEntry.key(t.store, t.transactionId), Value(t.entry.encode), blind = true)
+    // An entry too large for half a node (a transaction changing many objects on one store) is written as chunks,
+    // each a complete entry for some of its objects, head first under the entry's own key (UnackedCommitEntry.chunks)
+    def unackedInserts(maxEntrySize: Int): List[TKVLInsert] = unacked.flatMap: t =>
+      t.entry.chunks(maxEntrySize).zipWithIndex.map: (chunk, i) =>
+        TKVLInsert(UnackedCommitEntry.key(t.store, t.transactionId, i), Value(chunk.encode), blind = true)
 
-    // A TransactionCreationError is always permanent: the write gives up and fails every entry of the batch, whose
-    // finalizers their drivers start again (TransactionDriver.startFinalizer). Other errors stay on the retry path:
-    // the error tree deletes entries, so a join racing the insert's scan can raise a transient InvalidObject.
+    // A TransactionCreationError, or an entry that fits no node (NodeSizeExceeded: a node too small for even one
+    // object's chunk), is permanent: the write gives up and fails every entry of the batch, whose finalizers their
+    // drivers start again (TransactionDriver.startFinalizer), logging each failure. Other errors stay on the retry
+    // path: the error tree deletes entries, so a join racing the insert's scan can raise a transient InvalidObject.
     def onFail(err: Throwable): Future[Unit] = err match
       case err: TransactionCreationError => throw StopRetrying(err)
+      case err: NodeSizeExceeded => throw StopRetrying(err)
 
       case _ => Future.unit
 
@@ -161,11 +166,16 @@ class MissedUpdateMarker(client: AspenClient,
         tx = client.newTransaction()
         _ = tx.replaySafe("missed-update marks are idempotent")
         _ <- if inserts.isEmpty then Future.unit else pool.errorTree.prepareUpdates(inserts, Nil)(using tx)
-        _ <- if unackedInserts.isEmpty then Future.unit
-             else pool.unackedCommitsTree.prepareUpdates(unackedInserts, Nil)(using tx)
+        _ <- if unacked.isEmpty then Future.unit
+             else maxUnackedEntrySize(pool).flatMap: max =>
+               pool.unackedCommitsTree.prepareUpdates(unackedInserts(max), Nil)(using tx)
         _ = MissedUpdateFinalizationAction.limitTracking(poolId, tx)
         _ <- commitErrorTreeTransaction(tx)
       yield ()
+
+  /** The largest encoded UnackedCommits entry written in one piece into `pool`'s tree. A seam for tests */
+  private[aspen] def maxUnackedEntrySize(pool: StoragePool): Future[Int] =
+    pool.unackedCommitsTree.leafNodeSize.map(UnackedCommitEntry.maxEncodedSize)
 
   // Test seam: lets a test observe or delay the transactions of a write
   private[aspen] def commitErrorTreeTransaction(tx: Transaction): Future[Unit] = tx.commit().map(_ => ())

@@ -17,6 +17,11 @@ class TieredKeyValueList(val client: AspenClient,
 
   private val engine = new TierEngine(client, rootManager)
 
+  /** The `maxNodeSize` of the tree's leaf (tier 0) nodes */
+  def leafNodeSize: Future[Int] =
+    given ExecutionContext = client.clientContext
+    rootManager.getRoot().map(_.nodeAllocator.maxNodeSize(0))
+
   def get(key: Key): Future[Option[ValueState]] =
     engine.getContainingNode(key).map(_.flatMap(node => kvNode(node).contents.get(key)))
 

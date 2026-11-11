@@ -115,6 +115,9 @@ class NodeAllocator(val client:AspenClient, config: Seq[(ObjectAllocatorId, Int)
   private def tierConfig(tier: Int): (ObjectAllocatorId, Int) =
     if tier < tiers.length then tiers(tier) else tiers.last
 
+  /** The tier's `maxNodeSize` */
+  def maxNodeSize(tier: Int): Int = tierConfig(tier)._2
+
   /** Looks up an allocator. Overridable for tests */
   protected def lookupAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator] =
     client.getAllocator(allocatorId)

@@ -105,7 +105,7 @@ AllocationTree entry (`client/internal/allocation/DeletionFinalizationAction.sca
 
 | Field | Format | Code |
 |-------|--------|------|
-| Key | 17 bytes: `poolIndex` then `transactionId` (msb, lsb big-endian). One entry per (store, transaction). | `client/internal/transaction/UnackedCommitEntry.scala:40-46` |
+| Key | 17 bytes: `poolIndex` then `transactionId` (msb, lsb big-endian). One entry per (store, transaction). (2026-11-11) An entry larger than `UnackedCommitEntry.maxEncodedSize` of the tree's leaf node size (half a node less 64 bytes) is written as chunks, each a complete entry (same timestamp, some of the objects): chunk 0 under the 17-byte key, chunk `i` under it plus `i` as 2 big-endian bytes. The lookups name the head only. | `UnackedCommitEntry.key`, `chunks`; `MissedUpdateMarker.writeBatch` |
 | Value | `timestamp` (8) = the transaction's start timestamp; `count` (4); then `count` x (`length` (4), `ObjectPointer` bytes). The pointers keep their store pointers and are the objects of this store that T changes (traced or traceless; see the next row). | `UnackedCommitEntry.scala:16-37` |
 | Which objects | Since the refresh: every object the transaction changes on that store, traced or traceless. Before, only `RefcountUpdate`s and revision-less `KeyValueUpdate`s with `deletesKeys`. | `MissedUpdateFinalizationAction.scala:98-106` |
 | Meaning | The store cast a commit vote the commit may have relied on and had not acknowledged applying T when T was finalized: it is owed T. A recovered commit vote, and any commit voter receiving a late commit, applies T only if its entry exists. (addendum) Unless the store holds an applied stub for T, which says the entry is stale: it then applies nothing. | `Tx.scala:158-160,920-932,997-1041`; addendum `Tx.scala:642-648,984-1007` |
@@ -134,7 +134,7 @@ read), absent means "deleted, or its allocation has not been recorded yet" (sect
 | Delete either kind | `StoreRepairer` only (`deleteEntryIfUnchanged`, `deleteEntry`). No other code deletes entries (grep of `errorTree`/`unackedCommitsTree` over the tree). | after the object is verified or found deleted |
 | Read | `StoreRepairer.scan`; `Host.unackedLookup` (`Host.scala:~210`, point lookup for a recovered commit vote) | |
 | (addendum) Write an applied stub | the store itself, in its device CRL (`Frontend.recordAppliedStub`) | when it forgets T on a `TxFinalized` listing it in `owed`, after applying T through its entry, or after the case-3 lookup finds its entry (transaction-recovery.md 5.4) |
-| (addendum) Drop an applied stub | `StoreRepairer` only, through the store's executor (`RepairTarget.dropAppliedStub`, `StoreRouter.scala:206-211`) | after deleting the entry (S, T), or when the stub had no entry in the walk and a point lookup finds none (5.5) |
+| (addendum) Drop an applied stub | `StoreRepairer` only, through the store's executor (`RepairTarget.dropAppliedStub`, `StoreRouter.scala:206-211`) | after deleting the entry (S, T) (for a chunked entry, its head: the chunk the lookups name), or when the stub had no entry in the walk and a point lookup finds none (5.5) |
 
 ---
 
@@ -861,6 +861,22 @@ opportunistic rebuild, deletion and the completion gate are unchanged.
 | F7 | unchanged | Entry deletion is still untracked; the stub drop that follows it is a store-local CRL write | `StoreRepairer.scala:322` |
 | F8, F9 | unchanged (load larger) | One point lookup per orphan candidate per scan (RP-N7); a timed-out scan's background walk still runs its orphan pass against the DeferralState it started with, which `RepairService` has replaced, so it drops only stubs that state already suspected: two successful scans' evidence either way (each drop also checked by a lookup) | `StoreRepairer.scala:187-200`; `RepairService.scala:195-199` |
 | F10 | unchanged | The blind upsert still regresses newer entries; the re-created UnackedCommits entries are now shadowed by stubs when the re-run's `TxFinalized` arrives (transaction-recovery R-N6) | `MissedUpdateMarker.scala:145-148` |
+
+### 13.0b Re-assessment for chunked UnackedCommits entries (2026-11-11)
+
+An UnackedCommits entry naming many objects (a transaction changing many objects on one store) could exceed a tree
+node: with 4096-byte FSIF segments in the metadata pool, about 90 objects. Its insert failed with `NodeSizeExceeded`,
+which the marker retried in place forever, so the transaction never finalized. The marker now writes such an entry as
+chunks (2.3), each sized to half a leaf node less the pair's overhead: with every pair at most half a node, a two-way
+split of a full node always fits, so a chunk never exceeds a node. Each chunk is repaired and deleted as an entry of its
+own; a scan skips them all while the store holds T live (`holdsTransaction` is by txid). Only the head's deletion
+drops the stub: the recovered-vote and late-commit lookups name the head, so a stub dropped while a later chunk
+remains changes nothing they decide, and one kept past the head while a later chunk remains is dropped by the orphan
+pass once the chunks are gone. A `NodeSizeExceeded` that still occurs (a node too small for one object's chunk) is
+permanent: the write gives up and the finalizer failure path retries it with backoff, logged (transaction-recovery F2).
+Test: StoreRepairerSuite "deleting a later chunk of an UnackedCommits entry keeps the stub; the head's deletion drops
+it"; MissedUpdateFinalizationActionSuite "an entry too large for the tree is written as chunks under consecutive keys,
+head first".
 
 ### 13.1 Summary table
 

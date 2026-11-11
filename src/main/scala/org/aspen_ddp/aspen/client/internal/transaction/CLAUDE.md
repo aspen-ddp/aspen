@@ -19,6 +19,9 @@
   transaction changes (a lock changes nothing, so there is nothing to repair and the object's timestamp would not
   catch up). A client's `MissedUpdateMarker` writes one batch per pool at a time and merges waiting entries by key,
   so a slow spell makes batches larger rather than adding colliding writes. Repair: `server/repair/CLAUDE.md`
-- A marker write that gives up (only a `TransactionCreationError`) fails every entry of its batch, and so the
+- An UnackedCommits entry larger than half a leaf node of its tree (`UnackedCommitEntry.maxEncodedSize`) is written as
+  chunks, each a complete entry for some of the objects: chunk 0 under `UnackedCommitEntry.key(store, txid)`, chunk `i`
+  under that plus `i` as 2 bytes. Lookups name the head only
+- A marker write that gives up (a `TransactionCreationError` or `NodeSizeExceeded`) fails every entry of its batch, and so the
   `MissedUpdateFinalizationAction`s waiting on them; their drivers re-run the finalizers, which mark again
   (`server/transaction/CLAUDE.md`, finalization failure path). No entry is dropped

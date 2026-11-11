@@ -319,7 +319,10 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
             if allComplete then
               entryKeys.foreach((_, entryKey) => deferral.clear(entryKey))
               deleteEntryIfUnchanged(pool.unackedCommitsTree, value.revision, key).map: _ =>
-                target.dropAppliedStub(storeId, txid)
+                // Only the head's deletion drops the stub: the lookups that decide whether the store applies a
+                // late commit name the head (UnackedCommitEntry.key), so the stub must outlive it, not the other
+                // chunks, which only carry more objects to repair
+                if UnackedCommitEntry.isHeadKey(key) then target.dropAppliedStub(storeId, txid)
                 logger.info(s"Repair complete for UnackedCommits entry of $txid on store $storeId")
                 counts.repaired.incrementAndGet()
             else

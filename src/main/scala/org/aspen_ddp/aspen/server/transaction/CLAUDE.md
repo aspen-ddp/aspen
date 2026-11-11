@@ -60,7 +60,7 @@ Designs: `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2
   forgotten without a listing one. A driver reached by another's non-late commit `TxFinalized` cancels its finalizer
   and finalizes at once, listing the received `owed` plus the stores its mark had handed off (`handedOffStores`), so
   a stub may precede its entry. A commit at a store with a stub applies nothing; a non-late one reports its objects in
-  `objectCommitErrors`. The repair scan drops a stub with its entry, and an orphan stub (pre-walk snapshot, no entry)
+  `objectCommitErrors`. The repair scan drops a stub with its entry (a chunked entry's head), and an orphan stub (pre-walk snapshot, no entry)
   only once two consecutive scans found it so. Residuals: a store that never saw T and missed its TxFinalized (below a
   quorum, self-heals), and a second driver's host crashing after its hand-off but before its TxFinalized arrives
 - CRL encoding of stubs: `server/crl/CLAUDE.md`

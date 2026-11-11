@@ -553,6 +553,84 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     UnackedCommitEntry.decode(entry.encode) shouldBe entry
     UnackedCommitEntry.decodeTransactionId(UnackedCommitEntry.key(net.storeId1, txid)) shouldBe txid
 
+  // ---- Chunked UnackedCommits entries: an entry too large for a tree node is written in pieces ----------------
+
+  test("an entry within the limit is its only chunk; a larger one splits in order, each chunk within it"):
+    val ptrs = List.tabulate(10)(i => pointerWith(Array[Byte](5, i.toByte)))
+    val entry = UnackedCommitEntry(missedTimestamp, ptrs)
+    entry.chunks(entry.encodedSize) shouldBe List(entry)
+    entry.encode.length shouldBe entry.encodedSize
+
+    val limit = entry.encodedSize / 3
+    val chunks = entry.chunks(limit)
+    chunks.size should be > 1
+    chunks.flatMap(_.objects) shouldBe ptrs
+    chunks.foreach: c =>
+      c.timestamp shouldBe missedTimestamp
+      c.objects should not be empty
+      c.encodedSize should be <= limit
+
+    // A limit too small for one object still makes progress: one object per chunk
+    entry.chunks(1).map(_.objects) shouldBe ptrs.map(List(_))
+
+  test("chunk 0's key is the entry's key; later chunks sort after it and name the same transaction"):
+    val txid = TransactionId(UUID.randomUUID())
+    val head = UnackedCommitEntry.key(net.storeId1, txid)
+    UnackedCommitEntry.key(net.storeId1, txid, 0) shouldBe head
+    UnackedCommitEntry.isHeadKey(head) shouldBe true
+    val later = (1 to 3).map(UnackedCommitEntry.key(net.storeId1, txid, _))
+    later.foreach: k =>
+      UnackedCommitEntry.isHeadKey(k) shouldBe false
+      UnackedCommitEntry.decodeTransactionId(k) shouldBe txid
+      k.bytes.take(17).toSeq shouldBe head.bytes.toSeq
+    val ordering = org.aspen_ddp.aspen.common.objects.ByteArrayKeyOrdering
+    (head +: later).sliding(2).foreach(pair => ordering.compare(pair(0), pair(1)) should be < 0)
+    succeed
+
+  test("an entry no larger than half a leaf node, less its pair's overhead, is written whole"):
+    UnackedCommitEntry.maxEncodedSize(4096) shouldBe 4096 / 2 - 64
+
+  /** A marker whose entries are written whole only up to `maxEntry` encoded bytes */
+  private class SmallEntryMarker(maxEntry: Int) extends MissedUpdateMarker(client):
+    override private[aspen] def maxUnackedEntrySize(pool: org.aspen_ddp.aspen.client.StoragePool): Future[Int] =
+      Future.successful(maxEntry)
+
+  atest("an entry too large for the tree is written as chunks under consecutive keys, head first"):
+    val txid = TransactionId(UUID.randomUUID())
+    val ptrs = List.tabulate(12)(i => pointerWith(Array[Byte](6, i.toByte)))
+    val entry = UnackedCommitEntry(missedTimestamp, ptrs)
+    val limit = entry.encodedSize / 4
+    val marker = new SmallEntryMarker(limit)
+    for
+      _ <- marker.mark(Nil, List(MissedUnackedCommit(net.storeId0, txid, entry)))
+      entries <- unackedEntries(Radicle.poolId, txid)
+    yield
+      val expected = entry.chunks(limit)
+      entries.keySet shouldBe expected.indices.map(UnackedCommitEntry.key(net.storeId0, txid, _)).toSet
+      expected.indices.foreach(i => entries(UnackedCommitEntry.key(net.storeId0, txid, i)) shouldBe expected(i))
+      entries.values.flatMap(_.objects).toSet shouldBe ptrs.toSet
+
+  atest("a real tree's limit writes an ordinary entry whole"):
+    val txid = TransactionId(UUID.randomUUID())
+    val entry = UnackedCommitEntry(missedTimestamp, List.tabulate(3)(i => pointerWith(Array[Byte](7, i.toByte))))
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      max <- client.missedUpdateMarker.maxUnackedEntrySize(pool)
+      leaf <- pool.unackedCommitsTree.leafNodeSize
+      _ <- client.missedUpdateMarker.mark(Nil, List(MissedUnackedCommit(net.storeId0, txid, entry)))
+      entries <- unackedEntries(Radicle.poolId, txid)
+    yield
+      max shouldBe UnackedCommitEntry.maxEncodedSize(leaf)
+      entries shouldBe Map(UnackedCommitEntry.key(net.storeId0, txid) -> entry)
+
+  // An entry that fits no node fails the same way on every attempt: the write gives up rather than retrying in place,
+  // and the finalizer's failure path takes over (TransactionDriver.startFinalizer)
+  atest("a write that fails with NodeSizeExceeded gives up"):
+    val marker = new MissedUpdateMarker(client):
+      override private[aspen] def commitErrorTreeTransaction(tx: Transaction): Future[Unit] =
+        Future.failed(new org.aspen_ddp.aspen.client.tkvl.NodeSizeExceeded)
+    marker.mark(List(missed(net.storeId0))).failed.map(_ shouldBe a [org.aspen_ddp.aspen.client.tkvl.NodeSizeExceeded])
+
   atest("a mark batch is blind and marked replay-safe"):
     val marker = new ObservedMarker
     val txid = TransactionId(UUID.randomUUID())

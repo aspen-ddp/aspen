@@ -3,6 +3,10 @@ Backlog
 
 --- Near term ---
 
+Flaky tests:
+- TKVL "deleting entries that join tier-0 nodes removes their upper-tier entries" failed once in three full runs on
+  7d9c8847 (not investigated).
+
 CRL expansion. If sufficient free disk space is available, add another file to the CRL rather than slowing down
 the transactions. This needs to be capped though. Do not add another file if the total size of all files would
 exceed 3% of the device's size.

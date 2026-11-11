@@ -1,9 +1,7 @@
 TODO
 ====
 
-Flaky tests:
-- TKVL "deleting entries that join tier-0 nodes removes their upper-tier entries" failed once in three full runs on
-  7d9c8847 (not investigated).
+
 
 Turn the findings in docs/safety/* into a prioritized work list of issues to address and in priority order recorded
 in this document. Correct operation is the foundation of this project and every potential issue must be thoroughly

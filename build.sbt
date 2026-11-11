@@ -48,7 +48,11 @@ lazy val root = (project in file(".")).
     ),
 
     // Include the Backblaze Java source files during compilation
-    Compile / unmanagedSourceDirectories += baseDirectory.value / "submodules" / "JavaReedSolomon" / "src" / "main" / "java"
+    Compile / unmanagedSourceDirectories += baseDirectory.value / "submodules" / "JavaReedSolomon" / "src" / "main" / "java",
+
+    // Keep Markdown (CLAUDE.md guides, DESIGN.md) out of the jar. sbt never copies them, but IDE builds that share
+    // the classes directory copy non-source files from source roots, and packageBin ships whatever is there
+    Compile / packageBin / mappings ~= (_.filterNot { case (_, path) => path.endsWith(".md") })
   )
 
   Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-W", "10", "5")

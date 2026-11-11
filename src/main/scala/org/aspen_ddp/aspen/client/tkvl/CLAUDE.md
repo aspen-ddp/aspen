@@ -1,6 +1,19 @@
 ### Tiered Key Value List (TKVL)
 - Very simple B-Tree like data structure implemented in terms of a hierarchy of linked lists.
 - Trees use a KeyOrdering instance to sort keys. Current orderings include Integer, Lexical, and ByteArray
+- A tree is KeyValue-object or DataObject based (`TreeKind` in its `Root`); shared logic is `TierEngine` over a
+  pluggable `NodeEncoding`. `DataObjectTKVL` is more compact, stores values only (no per-key revisions/requirements)
+  and uses whole-node revision checks: intended for single-writer / low-contention use. A second update to one of its
+  nodes in a transaction fails with `NodeAlreadyModified`; `getContainingNode`/`TieredKeyValueListNode` are KV-only.
+- `prepareUpdates(inserts: List[TKVLInsert], deletes)` changes many keys in one transaction on either kind, updating
+  each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe. Writes are per-key
+  checked by default; `PutRequirement` (`MustNotExist`, ...) and `TKVLInsert.blind` opt into weaker checks, so a
+  blind write needs a pin elsewhere in the transaction or `replaySafe`.
+- Each `RootManager` owns a `TierCache` (default `LruTierCache`: 5 nodes per tier >= 1, plus the root when on
+  tier >= 1; `NoCache` for tests and finalization actions). Stale entries cost only reads, except that `splitTree`
+  through another instance can make warm instances return moved entries. `LruTierCache(anyRoot = true)` also
+  keeps tier-0 and empty roots and shares one read among concurrent root misses; writes then read the root fresh.
+  Only for a single writer that remembers its own changes (a vdisk's `BlockMap`, whose `refresh` clears it)
 - Every time a new node is added to a list, an the minimum value of the new node and a pointer to the new object is
   inserted into the tier above it.
 - Tier-0 holds the data, the upper tiers consist exclusively of (minimum_key, object-pointer) pairs

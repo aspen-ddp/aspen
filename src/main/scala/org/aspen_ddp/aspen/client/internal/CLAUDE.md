@@ -5,5 +5,6 @@
 - There are two key Managers:
   - ReadManager - Ensures reads complete
   - TransactionManager - Ensures transactions complete
+- Subpackages with their own guides: `transaction/` (builder, pin rule, missed-update marking), `allocation/`
 - Proactively assists with object reconstruction by sending OpportunisticRebuild messages when DataStores return stale
   object state.

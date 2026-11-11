@@ -163,6 +163,11 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
   private val factories = scala.collection.mutable.ListBuffer[RecordingCrlFactory]()
 
+  /** How long pumpUntil and pumpWithTx wait for their condition */
+  private val PumpTimeout = Duration(10, SECONDS)
+  /** Rounds pumpLoop runs before it starts sleeping between them */
+  private val FastRounds = 2000
+
   override def subFixtureTeardown(): Unit =
     factories.foreach(_.shutdownAll())
     factories.clear()
@@ -191,32 +196,39 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
       StoreTransferService.Disabled, rebuilds, 2, seams = seams)
 
-  /** Drains `host`'s events and yields until `condition` holds or `rounds` run out. The caller asserts it. */
-  private def pumpUntil(host: Host, condition: => Boolean, rounds: Int = 2000): Future[Unit] =
+  /** Drains `host`'s events and yields until `condition` holds. The caller asserts it.
+   *
+   *  The conditions wait on work done on other threads (RocksDB loads, CRL saves), so the wait is bounded by time
+   *  (PumpTimeout), not by a count of yields: under load a count runs out before the work completes. `rounds` instead
+   *  pumps exactly that many times at most, for callers showing that something does not happen.
+   */
+  private def pumpUntil(host: Host, condition: => Boolean, rounds: Int = -1): Future[Unit] =
+    pumpLoop(host, condition, rounds, System.nanoTime() + PumpTimeout.toNanos)(Future(())(using executionContext))
+
+  /** As pumpUntil, also letting the client's transactions complete each round */
+  private def pumpWithTx(host: Host, condition: => Boolean, rounds: Int = -1): Future[Unit] =
+    given ExecutionContext = executionContext
+    pumpLoop(host, condition, rounds, System.nanoTime() + PumpTimeout.toNanos):
+      yieldUntil(false, 5).flatMap(_ => waitForTransactionsToComplete())
+
+  /** Runs `round` between drains of `host` until `condition`, `rounds` drains (when not negative) or `deadline`.
+   *  Past the first FastRounds it also sleeps a millisecond a round, so a long wait does not spin a core
+   */
+  private def pumpLoop(host: Host, condition: => Boolean, rounds: Int, deadline: Long, done: Int = 0)
+                      (round: => Future[Unit]): Future[Unit] =
     given ExecutionContext = executionContext
     host.testingOnlyHandleEvents()
-    if condition || rounds == 0 then
+    if condition || rounds == done || (rounds < 0 && System.nanoTime() - deadline > 0) then
       Future.unit
     else
-      Future(()).flatMap(_ => pumpUntil(host, condition, rounds - 1))
+      if rounds < 0 && done >= FastRounds then
+        Thread.sleep(1)
+      round.flatMap(_ => pumpLoop(host, condition, rounds, deadline, done + 1)(round))
 
   private def overwriteTxd(id: TransactionId, leader: Byte, pool: PoolId = poolId): TransactionDescription =
     val p = DataObjectPointer(oid, pool, Array[Byte]())
     TransactionDescription(id, HLCTimestamp.now, p, leader,
       List(DataUpdate(p, rev0, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida, Map(pool -> ida))
-
-  /** As pumpUntil, also letting the client's transactions complete each round */
-  private def pumpWithTx(host: Host, condition: => Boolean, rounds: Int = 500): Future[Unit] =
-    given ExecutionContext = executionContext
-    host.testingOnlyHandleEvents()
-    if condition || rounds == 0 then
-      Future.unit
-    else
-      for
-        _ <- yieldUntil(false, 5)
-        _ <- waitForTransactionsToComplete()
-        _ <- pumpWithTx(host, condition, rounds - 1)
-      yield ()
 
   /** A RocksDB store `sid` in `deviceDir` holding the suite's object at rev0 */
   private def writeRocksStore(deviceDir: os.Path, sid: StoreId): Future[os.Path] =

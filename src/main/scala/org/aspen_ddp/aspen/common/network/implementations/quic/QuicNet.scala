@@ -241,6 +241,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Applies the daily network snapshots. Set once, by `startIoThread`. */
   @volatile private var snapshotReader: Option[NetworkSnapshotReader[QuicHostEntry]] = None
 
+  /** Host mode: the hosts membership last reported offline (removed when reported online again). A subscription's
+    * snapshot lists them: a subscriber whose lease had lapsed when the offline report went out learns it only so.
+    */
+  private val membershipOffline = ConcurrentHashMap.newKeySet[HostId]()
+
   /** Client mode: the hosts our relays last reported online. Written on loops, read by `createHostEntry`. */
   private val relayedOnline = ConcurrentHashMap.newKeySet[HostId]()
 
@@ -522,10 +527,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private val membershipListener = new MembershipListener:
     // Peek, never look up: an entry created later seeds its online state from membership (see createHostEntry)
     override def online(hostId: HostId): Unit =
+      membershipOffline.remove(hostId)
       metadataManager.peekHostEntry(hostId).foreach(_.setOnline())
       forwardToSubscribers(HostOnlineStatus(List(hostId), Nil))
 
     override def offline(hostId: HostId): Unit =
+      membershipOffline.add(hostId)
       metadataManager.peekHostEntry(hostId).foreach(_.setOffline())
       forwardToSubscribers(HostOnlineStatus(Nil, List(hostId)))
 
@@ -754,6 +761,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Client mode: our current relay hosts. Blocks until `loops(0)` answers. */
   private[quic] def relaysForTests: Set[HostId] = loops(0).submit(() => relays).get()
+
+  /** Client mode: subscribes to `hostId`'s gossip as a relay renewal would, whether or not it is one of our relays */
+  private[quic] def subscribeForTests(hostId: HostId): Unit = sendToHostId(hostId, GossipSubscribe(clientId))
 
   /** Host mode: the clients holding a subscription, lapsed or not */
   private[quic] def subscribersForTests: Set[ClientId] = subscribers.keySet().asScala.toSet
@@ -1259,7 +1269,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Host mode, on `conn`'s loop. Starts or renews `m.fromClient`'s lease. A subscription that is new, or renewed
     * over a different connection or after lapsing, starts with a snapshot of the hosts we see online, ourselves
-    * included, and of the store availability we hold.
+    * included, of those membership reported offline, and of the store availability we hold. The offline list is
+    * needed: the client may have missed the offline report (its lease had lapsed), and a snapshot that only omits a
+    * host leaves the client's view of it unchanged.
     */
   private def subscribe(conn: QuicConnection, m: GossipSubscribe): Unit =
     for hm <- membership; (hostId, _) <- ohost do
@@ -1267,7 +1279,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         val now = System.nanoTime()
         val previous = subscribers.put(m.fromClient, Subscription(conn, now + config.gossip.relayLease.toNanos))
         if previous == null || (previous.conn ne conn) || now - previous.expiresNanos >= 0 then
-          forward(conn, HostOnlineStatus(hostId :: hm.onlineHosts.toList, Nil, storeAvailability.snapshot, snapshot = true))
+          val online = hm.onlineHosts
+          val offline = membershipOffline.asScala.filterNot(h => online.contains(h) || h == hostId).toList
+          forward(conn, HostOnlineStatus(hostId :: online.toList, offline, storeAvailability.snapshot, snapshot = true))
 
   /** Client mode, on `loops(0)`. Keeps `relayCount` relays among the hosts we have resolved and renews each one's
     * subscription. With `rotate`, one relay is first swapped for a host not currently a relay, when there is one.

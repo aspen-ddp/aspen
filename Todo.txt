@@ -17,11 +17,6 @@ Test environment:
   AppendIntegrationSuite / RangedWriteIntegrationSuite (they rely on a store falling behind) and 4
   PoolObjectAllocatorSuite tests (not investigated). Decide whether to make it the default, with those suites making
   a store fall behind explicitly (dropTxMessage).
-- Flaky under full-suite load, each seen once in 4 runs, unrelated to the unlink fix:
-  DeviceCrlSuite "a shut-down device adopted by another host recovers its in-flight transaction" (DeviceCrlSuite:238,
-  prepareInFlight's fixed 2000 pump rounds); "an FSIF store whose recovery finds it lost is rebuilt through the
-  rebuild path" (TransactionAborted). Seen on the unmodified baseline (1 of 3 runs): "a client learns host liveness
-  from its relays and replaces a relay that goes offline".
 
 Pre-existing amoebafs bugs found during the replay-pins work:
 - Cross-node rename whose delete joins into the target node updates that node twice, so the rename deterministically

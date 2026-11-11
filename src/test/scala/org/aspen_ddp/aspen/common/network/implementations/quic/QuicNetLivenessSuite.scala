@@ -377,6 +377,19 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     eventually("the client sees B offline", WaitMillis)(!entryFor(c.net, fx.hostIdB).isOnline)
     eventually("A replaces B as the relay", WaitMillis)(c.net.relaysForTests == Set(fx.hostIdA))
 
+  // The relay's offline report went out while the client held no subscription there (its lease lapsed under
+  // load), so only the snapshot the next subscription starts with can tell it
+  test("a new subscription's snapshot reports the hosts its relay sees offline"):
+    awaitOnline()
+    val c = quietClient()
+    c.net.dispatchForTests(HostOnlineStatus(List(fx.hostIdA, fx.hostIdB), Nil))
+    entryFor(c.net, fx.hostIdB).isOnline shouldBe true
+    fx.crashB()
+    eventually("A sees B offline", WaitMillis)(!entryFor(fx.a.net, fx.hostIdB).isOnline)
+    c.net.subscribeForTests(fx.hostIdA)
+    eventually("the client sees B offline", WaitMillis)(!entryFor(c.net, fx.hostIdB).isOnline)
+    entryFor(c.net, fx.hostIdA).isOnline shouldBe true
+
   test("relays rotate between renewals"):
     val c = fx.client(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests.copy(relayCount = 1)))
     val seen = scala.collection.mutable.Set[Set[HostId]]()

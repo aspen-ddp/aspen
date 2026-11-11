@@ -204,6 +204,10 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
 
   /** Allocates a DataObject holding `content` in the FSIF pool and links it from the radicle, in the bootstrap pool,
     * in the same transaction. `radicleRevision` adds a revision requirement on the radicle.
+    *
+    * Completes once the allocation's finalization actions are done too: the one recording the object in the pool's
+    * allocation tree locks the new object, so an update committed while it runs (the single-attempt appends here)
+    * can collide with it and abort.
     */
   private def allocate(content: Array[Byte], radicleRevision: Option[ObjectRevision] = None): Future[DataObjectPointer] =
     given tx: Transaction = client.newTransaction()
@@ -213,6 +217,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
       _ = tx.update(radicle, radicleRevision, None, List(KeyValueUpdate.DoesNotExist(linkKey(dp))),
                     List(Insert(linkKey(dp), dp.toArray)))
       _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
     yield dp
 
   /** The pointer the radicle links under `dp`'s key, if any */

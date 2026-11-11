@@ -1,0 +1,22 @@
+
+Could add concept of EventHandlers
+  - Identified by UUID
+  - Optionally able to be attached to "things of interest"
+    - Such as an AllocationGroup storage changing by 0.5%
+  - When an "event" triggers:
+    - Use TypeRegistry to get a factory for handler corresponding to UUID
+      - Factory type must castable to a base factory type
+        - Ensures that handler objects will have the needed API for handling events
+          of that type. like AllocGroupUsageChangeEventHandler
+
+For maximum recovery speed, DurableRecoveryManagerTask
+  - Delegates restore operations to groups of workers
+  - Workers restore objects
+     - Store the results locally (not re-erasure coded)
+       - Could use a RocksDB-like backend. Key = ObjId + PoolIndex
+     - Update dist datastructure noting their location
+  - End-location downloads rebulit slices as they're created
+
+  + End-location can be throttled so as not to overload bandwidth
+  + Data can be rebuilt at maximum speed (no choke points)
+  + Rebuilt data can be read from dist data structure at a speed penalty

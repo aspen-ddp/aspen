@@ -1,6 +1,47 @@
 Backlog
 =======
 
+--- Near term ---
+
+CRL expansion. If sufficient free disk space is available, add another file to the CRL rather than slowing down
+the transactions. This needs to be capped though. Do not add another file if the total size of all files would
+exceed 3% of the device's size.
+
+Store commit delay FSIF commits seem to be taking longer than they should when backed by NVMe media. Investigate the
+timing of commits.
+
+vdisk (native TCMU frontend) follow-ups:
+- LockState.Fenced is learned only when a commit fails; part 3 (ALUA) needs an active fence check.
+- TMR ring entries are logged and otherwise ignored (no abort of in-flight commands). Revisit with part 3.
+- vdisk tcmu: a timed-out acquire keeps running and can fence a later successful add of the same disk; needs a
+  cancellable acquire in DiskHandle/VirtualDisk.
+
+vdisk: before the ALUA failover work, verify that readRanges always returns the newest committed revision of an
+object (not a stale one from lagging stores). "Flushed data survives a takeover" depends on it.
+
+vdisk: Add ALUA failover support
+
+vdisk: Rename "vdisk" to "amoeba_disk"
+
+DataObject TKVL test suite sometimes reports hung tests during full test runs though it still succeeds. Although
+apparently not flaky, it suggests that these tests may be taking an inordinately long time to complete. Investigate
+to see if these tests are slower than they should be and where the hung transactions are occurring. Determine if
+this is purely a test issue that can be fixed or if there may be an underlying system issue that needs to be addressed.
+
+"Hung Test" prints now also appear occasionally in TKVLBatchSuite and AppendIntegrationSuite since stores began
+holding requirement locks. They come from finalization actions waiting ~2.5-3.2 s on lock contention and retry
+backoff; the tests pass. Investigate together with the DataObject TKVL item above: determine whether the backoff is
+too conservative or whether finalization actions collide more than they should.
+
+Fixed (2026-11-06): JVM SIGSEGV in librocksdbjni at `rocksdb::WriteBatchInternal::Count`, from
+BufferedConsistentRocksDB.commitOnPool, seen twice in full `sbt test` runs. BufferedConsistentRocksDB.close() released
+the database and the next WriteBatch as soon as no operation was inside begin/endOperation, but a commit still queued
+on the pool, or one past its write, then read the freed nextBatch in its chaining step. close() now waits until no
+commit is queued or in progress, and is idempotent. Covered by the two close tests in BufferedConsistentRocksDBSuite.
+The bug predates the host refactor; the store executors only changed how often closes overlap commits.
+
+--- Mid Term ---
+
 Isolate every device's I/O, and detect and handle hung devices
   - Devices can hang for long durations, and every read and write to a hung device can hang indefinitely.
   - Today some I/O pools span devices: FSIF's I/O pools and the shared RocksDB engines. A single hung device can
@@ -158,31 +199,6 @@ and measure with longer runs and more than one workload.
 TLS certificate rotation, renewal and revocation
   - CA and entity certificates are issued with ~100 year lifetimes and are never
     renewed or revoked.
-
------------------------------------------------------------
-- Brainstorming
--
-Could add concept of EventHandlers
-  - Identified by UUID
-  - Optionally able to be attached to "things of interest"
-    - Such as an AllocationGroup storage changing by 0.5%
-  - When an "event" triggers:
-    - Use TypeRegistry to get a factory for handler corresponding to UUID
-      - Factory type must castable to a base factory type
-        - Ensures that handler objects will have the needed API for handling events
-          of that type. like AllocGroupUsageChangeEventHandler
-
-For maximum recovery speed, DurableRecoveryManagerTask
-  - Delegates restore operations to groups of workers
-  - Workers restore objects
-     - Store the results locally (not re-erasure coded)
-       - Could use a RocksDB-like backend. Key = ObjId + PoolIndex
-     - Update dist datastructure noting their location
-  - End-location downloads rebulit slices as they're created
-
-  + End-location can be throttled so as not to overload bandwidth
-  + Data can be rebuilt at maximum speed (no choke points)
-  + Rebuilt data can be read from dist data structure at a speed penalty
 
 DurableFiles' directory fsync is Linux-only
   - DurableFiles.syncDirectory opens a directory with FileChannel READ and forces it. Only Linux makes

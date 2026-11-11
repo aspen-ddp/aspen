@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ReadLocks, StoragePool,
                                    ObjectState as ClientObjectState}
 import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateFinalizationAction, UnackedCommitEntry}
-import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
+import org.aspen_ddp.aspen.client.tkvl.{KeyValueListNode, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer,
                                            ObjectId, ObjectPointer, ObjectRevision}
@@ -243,7 +243,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                            deferral).flatMap: result =>
                 if result.complete then
                   deferral.clear(entryKey)
-                  deleteEntryIfUnchanged(value.revision, node, key).map(_ => counts.repaired.incrementAndGet())
+                  deleteEntryIfUnchanged(pool.errorTree, value.revision, key).map(_ => counts.repaired.incrementAndGet())
                 else
                   counts.deferred.incrementAndGet()
                   Future.unit
@@ -259,7 +259,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                 // entry. Empty means "delete by ObjectId alone".
                 for
                   _ <- repairDeletion(storeId, objectId, storePointer)
-                  _ <- deleteEntryIfUnchanged(value.revision, node, key)
+                  _ <- deleteEntryIfUnchanged(pool.errorTree, value.revision, key)
                 yield
                   counts.repaired.incrementAndGet()
               else
@@ -318,7 +318,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           completed.flatMap: allComplete =>
             if allComplete then
               entryKeys.foreach((_, entryKey) => deferral.clear(entryKey))
-              deleteEntryIfUnchanged(value.revision, node, key).map: _ =>
+              deleteEntryIfUnchanged(pool.unackedCommitsTree, value.revision, key).map: _ =>
                 target.dropAppliedStub(storeId, txid)
                 logger.info(s"Repair complete for UnackedCommits entry of $txid on store $storeId")
                 counts.repaired.incrementAndGet()
@@ -416,16 +416,16 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * the delete fail in that case, which is how the next pass learns to try again. The KeyRevision of the deleted
     * key is also the transaction's pin, so a replay deletes no newer entry.
     */
-  private def deleteEntryIfUnchanged(entryRevision: ObjectRevision,
-                                     node: KeyValueListNode, key: Key): Future[Unit] =
+  /** Deletes `key` from `tree` if its value is still at `entryRevision`. Through the tree rather than the node the walk
+    * handed over: a delete that empties its node joins it with its right neighbor or leaves it empty, and the tree's
+    * delete registers the finalization action that removes the deleted node's upper-tier entry (and so lets the tree
+    * shrink). Fails if the entry is gone, as the requirement on it did before.
+    */
+  private def deleteEntryIfUnchanged(tree: TieredKeyValueList, entryRevision: ObjectRevision, key: Key): Future[Unit] =
     val tx = client.newRepairTransaction()
-    val fdelete = node.delete(key,
-      None,
-      List(KeyValueUpdate.KeyRevision(key, entryRevision)),
-      (_, _) => Future.unit)(using tx)
     for
-      _ <- fdelete
-      _ <- tx.commit()
+      deleted <- tree.deleteIfPresent(key, None, List(KeyValueUpdate.KeyRevision(key, entryRevision)))(using tx)
+      _ <- if deleted then tx.commit() else Future.failed(new IllegalStateException(s"Repair entry $key is gone"))
     yield ()
 
 object StoreRepairer:

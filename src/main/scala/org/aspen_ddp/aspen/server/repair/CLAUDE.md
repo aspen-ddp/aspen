@@ -9,6 +9,10 @@
 - One `StoreRepairer` scan walks the store's ErrorTree range, then its UnackedCommits range (skipping transactions
   the store holds live). It drops an applied stub with its entry, and an orphan stub only once two consecutive scans
   found it so (`server/transaction/CLAUDE.md`)
+- An entry is deleted through its tree (`TieredKeyValueList.deleteIfPresent`, under the entry's `KeyRevision`), not
+  through the node the walk handed over, so a delete that empties a node registers the join/tail-removal finalization
+  actions and the trees shrink as repair drains them. Those actions run in ordinary (tracked) transactions, as the
+  splits of errorTree inserts already do; only the entry delete itself is a `newRepairTransaction`
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
 - A repair scan runs only while the store's pool entry names this host, so a superseded copy never consumes the

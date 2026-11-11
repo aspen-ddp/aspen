@@ -20,6 +20,12 @@
 - The root of the tree is replaced every time the current root node is split into two nodes
 - FinalizationActions are used to insert/remove entries in upper tiers as nodes are split/joined
 - Left to right navigation in a tier is guaranteed to be consistent. Navigation between tiers is not
+- The entry walks (`foreach*`, through `TierEngine.walk`) survive joins: a right-neighbour read that fails because a
+  join deleted the neighbour (often caused by `fn` itself deleting what it visits) descends again to the node holding
+  the last visited key and continues after it, up to `MaxJoinRaceRestarts` restarts in a row without a visited key.
+  A delete from inside a walk must go through the tree (`deleteIfPresent`), not the node handed to `fn`: that node is
+  the walk's snapshot, so a delete through it neither sees that it empties the node nor registers the upper-tier
+  finalization actions
 - A join absorbs a node's right neighbor, so a tier's rightmost node is never joined away. A join is also declined when
   the joined node would be larger than the neighbor, which happens when the emptied node's minimum is longer than the
   neighbor's. In both cases the node is left empty and `TailRemovalFinalizationAction` removes it: its predecessor

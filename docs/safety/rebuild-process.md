@@ -338,10 +338,12 @@ How the tree is maintained (this defines what the walk can see):
 * Walk and concurrent modification: `TierEngine.walk` reads each right neighbour on demand. A split moves entries to a
   new right node, so a walk that already read the old node saw them all. A join is performed by the **emptied left**
   node absorbing its right neighbour, deleting the neighbour in the same transaction with its version bumped
-  (`client/tkvl/CLAUDE.md`; `ListBatch`), so a walk that follows a stale link to the deleted node gets `InvalidObject` and
-  the pass **fails** (`readRight` failure fails the walk, `TierEngine.scala:158`) rather than skipping entries
-  silently. I found no path where a join makes the walk skip live entries without an error (analysis, not a test;
-  see F5 for the cost).
+  (`client/tkvl/CLAUDE.md`; `ListBatch`), so a walk that follows a stale link to the deleted node gets `InvalidObject`.
+  The walk then descends again to the node holding the last key it visited, which the join moved the neighbour's
+  entries into, and continues after that key (`TierEngine.walk`, at most `MaxJoinRaceRestarts` restarts in a row
+  without a visited key, after which the pass **fails**). Entries are not skipped silently: every node's entries are
+  filtered only by the walk's bounds and the last visited key, and navigation within a tier is consistent (tested by
+  `TKVLSuite` "A walk that deletes each key it visits resumes past the joins its deletes cause"; see F5).
 
 ---
 
@@ -538,8 +540,9 @@ probability).
 
 **FS10 Tree restructuring during the walk.** Splits are benign (entries move to the right, the walk's read node already
 held them). Joins and tail removals delete nodes with a version bump; a stale link read raises `InvalidObject` and the
-pass fails and resumes at the next device check from the checkpoint (`TierEngine.scala:158`). No silent skip found.
-Under heavy delete churn the pass can fail repeatedly; each retry waits for the next device check (F5).
+walk resumes in the pass after the last key it visited (`TierEngine.walk`). Only a run of `MaxJoinRaceRestarts`
+failed restarts with no key visited fails the pass, which then resumes at the next device check from the checkpoint.
+No silent skip found (F5, narrowed).
 
 **FS11 Old device comes back after the rebuild started elsewhere (stale owner, data resurrection).**
 (i) *Same host, operator declared the device failed*: the tombstone zeroes the ids in the tree but the host decides
@@ -681,8 +684,14 @@ it differs from B1/B8 and from `RebuildingStore.scala:135-137`'s claim that only
 
 **Verification: PLAUSIBLE, severity stale-replica (low).** After `os.move` (`RebuildingStore.scala:467-470`) a crash before `markRebuiltStoreActive` leaves a plain store directory with no marker; the restart loads it (`DeviceDiscovery.scala:565-571`, `tryLoadStore` has no tree check). It serves and votes with ErrorTree entries unprocessed until the first reconcile finds the tree entry Rebuilding, runs `startRebuild`, and `start()` sees `finalPath` and just flips. It then behaves like any lagging replica, which the revision checks tolerate, and the repairable set (`HostStoreView.of`) includes it once rebuilding is not registered. Also a blank Paxos acceptor (F14). Fix sketch: load a store whose tree entry is Rebuilding as offline until the flip commits.
 
-**F5 (Medium) A walk that fails on a tree read waits for the next hourly device check; under delete churn it may never
-finish.**
+**F5 (Medium, narrowed) A walk that fails on a tree read waits for the next hourly device check; under delete churn it
+may never finish.**
+
+**Status: narrowed.** The walk now retries a right-neighbour read that a join made fail inside the pass: it descends
+again to the node holding the last visited key and continues after it (`TierEngine.walk`, bounded by
+`MaxJoinRaceRestarts` restarts in a row without a visited key). Delete churn near the cursor no longer fails the pass.
+What remains is the hourly wait after a pass fails for any other reason (a read that keeps failing, or the restart bound
+exhausted), with no delayed self-recheck or backoff. The original analysis follows.
 Scenario: heavy deletion near the walk cursor keeps joining/removing nodes; `readRight` raises `InvalidObject`
 (`client/tkvl/TierEngine.scala:158`), the pass fails, `recheckOtherDevices` excludes this device
 (`StoreRebuilds.scala:288-302`), the retry occurs after up to `CheckStorageDevicesPeriod` = 1 h

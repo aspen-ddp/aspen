@@ -587,6 +587,30 @@ class TKVLSuite extends IntegrationTestSuite {
       v.isEmpty should be (false)
   }
 
+  atest("A walk that deletes each key it visits resumes past the joins its deletes cause") {
+    var visited = List[Key]()
+
+    def deleteVisited(tree: TieredKeyValueList)(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      visited = visited :+ key
+      val tx = client.newTransaction()
+      for
+        _ <- tree.delete(key)(using tx)
+        _ <- tx.commit()
+        _ <- waitForTransactionsToComplete()
+      yield ()
+
+    for
+      (tree, _, keys) <- buildSplitTree(4)
+      nodesBefore <- tier0Nodes(tree)
+      // Each delete of a node's only key joins its right neighbour into it, deleting the node the walk would read next
+      _ <- tree.foreach(deleteVisited(tree))
+      remaining <- Future.sequence(keys.map(tree.get))
+    yield
+      nodesBefore.size should be > 1
+      visited shouldBe keys
+      remaining.flatten shouldBe empty
+  }
+
   atest("A scan into a permanently deleted node fails rather than hanging") {
     for
       (tree, root, keys) <- buildSplitTree(3)

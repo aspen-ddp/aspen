@@ -115,8 +115,14 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     * reading a node whose minimum satisfies `past`. `label` names the walk the caller invoked, in read diagnostics
     * and the `fn`-failure log.
     *
-    * Every node's entries are filtered by `minKey`, not just the first node's, so the walk stays correct however
-    * it is started.
+    * Every node's entries are filtered by `minKey` and by the last key handed to `fn`, not just the first node's, so
+    * the walk stays correct however it is started or resumed.
+    *
+    * A join deletes the right neighbour of a node the walk already read (often through `fn` itself, as when the
+    * repairer deletes the entries it visits), so reading that neighbour fails with InvalidObject. The walk then
+    * descends again to the node holding the last key it visited and continues after that key: the join moved the
+    * neighbour's entries into that node, and navigation within a tier is consistent. At most `MaxJoinRaceRestarts`
+    * restarts in a row without visiting a key, so a link to a node that is permanently deleted still fails the walk.
     */
   private def walk(minKey: Key,
                    label: String,
@@ -125,34 +131,45 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
                    fn: (ListNode, Key, Value) => Future[Unit],
                    stopWhen: () => Boolean = () => false): Future[Unit] =
 
-    def inRange(node: ListNode): List[(Key, Value)] =
-      node.entries.filter((k, _) => node.ordering.compare(k, minKey) >= 0 && below(k, node.ordering))
+    // `after` is the last key handed to `fn`, if any
+    def inRange(node: ListNode, after: Option[Key]): List[(Key, Value)] =
+      node.entries.filter: (k, _) =>
+        node.ordering.compare(k, minKey) >= 0 && below(k, node.ordering) &&
+          after.forall(a => node.ordering.compare(k, a) > 0)
 
     // The only place a node is paired with a list of entries, so the walk has nowhere to pair a node with some
     // other node's entries.
-    def advance(node: ListNode): Future[Unit] = visit(node, inRange(node))
+    def advance(node: ListNode, after: Option[Key], restarts: Int): Future[Unit] =
+      visit(node, inRange(node, after), after, restarts)
 
-    def visit(node: ListNode, entries: List[(Key, Value)]): Future[Unit] = entries match
-      case _ if stopWhen() => Future.unit
+    def visit(node: ListNode, entries: List[(Key, Value)], after: Option[Key], restarts: Int): Future[Unit] =
+      entries match
+        case _ if stopWhen() => Future.unit
 
-      case (key, value) :: rest =>
-        Future.delegate(fn(node, key, value)).transformWith:
-          case Failure(err) =>
-            logger.error(s"Failure in TKVL $label: $err", err)
-            visit(node, rest)
-          case Success(_) =>
-            visit(node, rest)
+        case (key, value) :: rest =>
+          Future.delegate(fn(node, key, value)).transformWith:
+            case Failure(err) =>
+              logger.error(s"Failure in TKVL $label: $err", err)
+              visit(node, rest, Some(key), 0)
+            case Success(_) =>
+              visit(node, rest, Some(key), 0)
 
-      case Nil =>
-        node.link match
-          case None => Future.unit
-          case Some(link) =>
-            if past(link.minimum, node.ordering) then
-              Future.unit
-            else
-              readRight(node, link, label).flatMap(advance)
+        case Nil =>
+          node.link match
+            case None => Future.unit
+            case Some(link) =>
+              if past(link.minimum, node.ordering) then
+                Future.unit
+              else
+                readRight(node, link, label).transformWith:
+                  case Success(right) => advance(right, after, restarts)
+                  case Failure(_: InvalidObject) if restarts < MaxJoinRaceRestarts => resume(after, restarts + 1)
+                  case Failure(err) => Future.failed(err)
 
-    withContainingNode(minKey, ())(advance)
+    def resume(after: Option[Key], restarts: Int): Future[Unit] =
+      withContainingNode(after.getOrElse(minKey), ())(node => advance(node, after, restarts))
+
+    resume(None, 0)
 
   /** Reads the node `link` points to, the right neighbour of `node`. `label` names the walk, for diagnostics. */
   private def readRight(node: ListNode, link: NodeLink, label: String): Future[ListNode] =

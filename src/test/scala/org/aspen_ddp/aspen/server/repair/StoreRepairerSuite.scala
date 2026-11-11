@@ -1079,6 +1079,33 @@ class StoreRepairerSuite extends IntegrationTestSuite:
         case kvu: KeyValueUpdate => kvu.requirements
       keyReqs.flatten should contain (KeyValueUpdate.KeyRevision(errorKey, entry.get.revision))
 
+  // Deleting an entry can empty its node, which then absorbs its right neighbor or is left empty. Either needs the
+  // upper-tier finalization action the tree's own delete registers, or the tier above keeps an entry for a deleted
+  // node and the tree never shrinks.
+  test("deleting entries that join tier-0 nodes removes their upper-tier entries"):
+    val target = RecordingTarget(List(storeId))
+    val repairer = StoreRepairer(client, target)
+    val policy = RepairPolicy.Default.copy(minErrorEntryAgeForDeletion = Duration(0, SECONDS))
+    // Each entry carries a 400 KiB store pointer, so the 1 MiB tier-0 nodes hold two each
+    val objectIds = (1 to 8).toList.map(i => ObjectId(new UUID(11, i)))
+    val bigPointer = Array.fill[Byte](400 * 1024)(3)
+
+    for
+      _ <- objectIds.foldLeft(Future.unit)((f, oid) => f.flatMap(_ => seedErrorEntry(oid, bigPointer)))
+      _ <- net.waitForTransactionsToComplete()
+      tree <- errorTree
+      (seededTier, _, _) <- tree.rootManager.getFreshRootNode()
+      // One scan: its walk resumes past the joins its own deletes cause
+      _ <- repairer.scan(storeId, policy)
+      _ <- net.waitForTransactionsToComplete()
+      present <- Future.sequence(objectIds.map(errorEntryExists))
+      (tier, _, _) <- tree.rootManager.getFreshRootNode()
+    yield
+      seededTier should be >= 1
+      present should not contain true
+      target.deletions.map(_._1) shouldBe objectIds
+      tier shouldBe 0
+
   test("repair proofs of a key and of a refcount are marked replay-safe"):
     val target = SeamTarget()
     val repairer = StoreRepairer(client, target)

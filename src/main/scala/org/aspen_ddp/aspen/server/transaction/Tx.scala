@@ -925,7 +925,7 @@ class Tx( trs: TransactionRecoveryState,
     if ofinalized.nonEmpty then
       // Already concluded: a Tx is kept past its finalization only by a held commit (finalizeDeferred), which the
       // Frontend has dropped from `transactions` by then, so a later TxFinalized takes its no-Tx path, which hands
-      // `owed` to the held Tx (Frontend.deferredFinalizations). Any other finalized Tx was already forgotten, its
+      // `owed` to the held Txs (Frontend.deferredFinalizations). Any other finalized Tx was already forgotten, its
       // state deleted or replaced: nothing is left for `owed` to change here
       true
     else

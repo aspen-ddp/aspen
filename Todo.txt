@@ -2,9 +2,6 @@ TODO
 ====
 
 Open items from the replay-pins work:
-- Frontend.finalizationDeferred overwrites a registration by txid without checking which Tx holds it. A tidiness issue
-  (with the stub hand-off in transactionFinalized no path found misbehaves), but clean it up: make the registration's
-  ownership explicit rather than relying on whichever Tx deferred last.
 - All modifications made as part of working on this item must update the docs/safety/* documents to reflect the changes
   and denote outstanding items as fixed/narrowed/etc.
 

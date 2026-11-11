@@ -63,6 +63,9 @@ Designs: `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2
   `objectCommitErrors`. The repair scan drops a stub with its entry (a chunked entry's head), and an orphan stub (pre-walk snapshot, no entry)
   only once two consecutive scans found it so. Residuals: a store that never saw T and missed its TxFinalized (below a
   quorum, self-heals), and a second driver's host crashing after its hand-off but before its TxFinalized arrives
+- A Tx finalized while its commit is held for its turn defers concluding its state (`Frontend.finalizationDeferred`).
+  Every deferring Tx of the txid (a replay's too) is listed, and the state is deleted or stubbed only by the call that
+  empties the list; a stub owed meanwhile passes to every listed Tx
 - CRL encoding of stubs: `server/crl/CLAUDE.md`
 
 #### Commit delivery, lost messages, status cache

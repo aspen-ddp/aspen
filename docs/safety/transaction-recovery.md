@@ -313,9 +313,10 @@ naming S for T is stale" (`StoreRecoveryState`, crash-recovery-log.md 3.6). The 
   are outstanding or failed, `Frontend.recordAppliedStub` requires it, `:395-409`):
   1. `TxFinalized(commit, non-late)` naming S: the Tx sets `stubDue` (`Tx.scala:935-936`) and finalizes with
      `writeStub` (`:959`); with no Tx the Frontend writes it directly, or hands it to a Tx whose commit is held for its
-     turn (`Frontend.scala:768-778`, `deferredFinalizations` `:221-224`). Only the Tx that registered a held
-     finalization removes the registration or concludes the state (M2, `:657-665`): a replay's Tx for the same txid,
-     forgotten meanwhile, changes neither, but a stub it owes passes to the registered Tx (`held.foreach(_.stubOwed())`).
+     turn (`Frontend.scala:784-787`, `deferredFinalizations` `:216-229`). Every Tx that deferred its finalization is
+     listed; each removes only itself, and the call that empties the list concludes the state (M2, `:664-676`, made
+     explicit 2026-11-11): a replay's Tx for the same txid, forgotten meanwhile, changes nothing, and a stub any caller
+     owes passes to every listed Tx (`waiting.foreach(_.stubOwed())`).
   2. S applied T through its entry (`unackedCommitFound`, `Tx.scala:1092`, recovered vote or held late commit).
   3. Fallback: a Tx resolved committed and reached by a late commit with neither (its `TxFinalized` was lost) looks up
      its entry, writes a stub if found, and is forgotten either way (`Tx.scala:990-997,1079-1086,1127-1131`); a failed
@@ -1117,6 +1118,16 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > registered Tx `stubOwed`. Tested by FrontendSuite "a stub owed to a held commit survives a replay's Tx deferring its
 > finalization for the same transaction" (failed before the fix) and "a replay's Tx forgotten owing a stub while a
 > finalized commit is held hands the stub to the held Tx".
+>
+> **Refresh (2026-11-11): ownership explicit.** The registration was one Tx per txid, replaced by whichever Tx deferred
+> last, which was correct only if the last to defer was also the last to issue its commit. Two Txs of one transaction
+> queue on the same objects, so the later one normally issues later; but `changedHere` is the set of objects that
+> loaded, and if the two loaded different objects the later one could issue first and conclude the state (delete it,
+> or let a later owed `TxFinalized` write the stub at once) while the earlier one's commit was still held: R-N11's
+> original effect again. No such path was reproduced. `deferredFinalizations` now lists every deferring Tx
+> (`Frontend.scala:216-229`); each call removes only its own Tx, only the call that empties the list concludes the
+> state, and an owed stub passes to every Tx still listed (`:664-676`, the no-Tx `TxFinalized` path goes through the
+> same call, `:784-787`). Order no longer matters. The FrontendSuite tests above still cover the reachable orders.
 
 > **R-N12. Verdict: REFUTED (harmless).** A stub may be written for a store that does not hold T: an owed store that
 > never saw T (no-Tx path), a found entry whose local apply was skipped, and `issueCommits` skipping every object

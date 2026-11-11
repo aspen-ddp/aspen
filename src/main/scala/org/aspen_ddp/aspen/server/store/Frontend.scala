@@ -215,13 +215,18 @@ class Frontend(val storeId: StoreId,
   private val txCommits = scala.collection.mutable.HashMap[TransactionId, TxCommits]()
 
   /** Finalized transactions whose commit is held for its turn (Tx.finalized, finalizeDeferred): forgotten, but their
-    * commits are not issued yet, so they have no TxCommits. A later TxFinalized listing this store in `owed` is passed
-    * to the Tx (Tx.stubOwed), which writes the stub where its state would be deleted, once its commits persist
+    * commits are not issued yet, so they have no TxCommits. Every Tx that deferred is listed: a replay's Tx for the
+    * same txid may defer too, and the transaction's state is concluded only by the last of them to issue its commit,
+    * in whatever order they issue (transactionFinalized). A later TxFinalized listing this store in `owed` is passed
+    * to every listed Tx (Tx.stubOwed), so the one that concludes writes the stub where the state would be deleted
     */
-  private val deferredFinalizations = scala.collection.mutable.HashMap[TransactionId, Tx]()
+  private val deferredFinalizations = scala.collection.mutable.HashMap[TransactionId, List[Tx]]()
 
   /** `tx` was finalized while its commit is held for its turn: it calls transactionFinalized once it is issued */
-  def finalizationDeferred(tx: Tx): Unit = deferredFinalizations(tx.transactionId) = tx
+  def finalizationDeferred(tx: Tx): Unit =
+    val listed = deferredFinalizations.getOrElse(tx.transactionId, Nil)
+    if !listed.exists(_ eq tx) then
+      deferredFinalizations(tx.transactionId) = listed :+ tx
 
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
 
@@ -650,23 +655,25 @@ class Frontend(val storeId: StoreId,
     * addendum A), so it must never apply the transaction again through that entry. A failed backend commit keeps the
     * CRL state while the store is loaded, so no stub replaces it; a reloaded store recovers the transaction from it.
     * Called by the Tx as it is forgotten (`by`), and by a TxFinalized for a transaction the store holds no Tx for.
-    * Only the Tx that registered a deferred finalization removes it. A replay's Tx for the same txid, forgotten while
-    * the first one's commit is held, changes nothing: the held Tx concludes the transaction's state once its commit is
-    * issued, so the replay's must neither take its registration away nor delete the state that commit still needs.
-    * A stub it owes passes to the registered Tx, which concludes the state: the registration may be the replay's,
-    * which replaced the first Tx's (finalizationDeferred) when it deferred behind the same held commit
+    * While any Tx of the transaction has a deferred finalization (finalizationDeferred) the state is left alone: a
+    * listed Tx's commit is not issued yet and still needs it. A listed Tx is removed from the list by its own call; the
+    * call that empties the list concludes the state. A call by any other Tx (a replay's, forgotten while a held commit
+    * waits), or by a TxFinalized with no Tx, changes nothing else. A stub the caller owes passes to every Tx still
+    * listed, so whichever concludes the state writes it
     */
   def transactionFinalized(txid: TransactionId, writeStub: Boolean = false, by: Option[Tx] = None): Unit =
-    val held = deferredFinalizations.get(txid)
-    if held.isEmpty || by.exists(tx => held.exists(_ eq tx)) then
+    val waiting = deferredFinalizations.getOrElse(txid, Nil).filterNot(tx => by.exists(_ eq tx))
+    if waiting.isEmpty then
       deferredFinalizations.remove(txid)
       txCommits.get(txid) match
         case Some(r) =>
           r.finalized = true
           r.writeStub ||= writeStub
         case None => concludeTransactionState(txid, writeStub, keepAdmission = false)
-    else if writeStub then
-      held.foreach(_.stubOwed())
+    else
+      deferredFinalizations(txid) = waiting
+      if writeStub then
+        waiting.foreach(_.stubOwed())
 
   /** Deletes the CRL state of a finalized transaction, or replaces it by an applied stub. A stub already held
     * suffices: the state is only deleted.
@@ -775,10 +782,9 @@ class Frontend(val storeId: StoreId,
           // Either way it must not apply it through that entry: one that never saw it is restored by ErrorTree repair
           // from the majority (replay-pins addendum A, case 1)
           if m.committed && !m.late && m.owed.contains(storeId) && !stubs.contains(m.transactionId) then
-            deferredFinalizations.get(m.transactionId) match
-              // Its commit is held for its turn: the state is not deletable yet, nor the update applied
-              case Some(tx) => tx.stubOwed()
-              case None => transactionFinalized(m.transactionId, writeStub = true)
+            // While a commit is held for its turn the state is not deletable yet, nor the update applied: the listed
+            // Txs take the stub
+            transactionFinalized(m.transactionId, writeStub = true)
     case m: TxHeartbeat => transactions.get(m.transactionId).foreach(tx => tx.receiveHeartbeat(m))
     case m: TxStatusRequest => transactions.get(m.transactionId).foreach(tx => tx.receiveStatusRequest(m))
     case _ => // Other TxMessages are not relevant

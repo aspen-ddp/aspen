@@ -792,7 +792,9 @@ path. Safe.
   abandoned walk keeps running in the background, DeferralState is discarded, the store's interval doubles (F9).
 - The tree walk fails: logged, scan failed, treated as clean, interval doubles toward the 15 min cap.
 - Entry insert (marker): `retryUntilSuccessful`; the finalization action cannot complete, so the transaction is not
-  forgotten: servers keep its state ("clog up", per CLAUDE.md). No entry is lost.
+  forgotten: servers keep its state ("clog up", per CLAUDE.md). No entry is lost. A permanent error
+  (`TransactionCreationError`) fails the action and the driver re-runs the finalizer after a backoff, which marks
+  again (2026-11-11, transaction-recovery F2): still no entry lost.
 - Entry delete fails: best-effort, one more pass.
 - Policy or limits read fails: last-good or defaults (E14).
 - Net effect: no entry is dropped, no state is installed. Repair delay grows until the metadata pool recovers, up to

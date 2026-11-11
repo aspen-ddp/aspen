@@ -9,13 +9,15 @@ import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId}
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.NoBackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.transaction.TransactionFinalizer.Factory
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-import scala.concurrent.{Future, Promise}
+import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.duration.{Duration, SECONDS}
 
 
 object TransactionDriverSuite {
@@ -56,7 +58,10 @@ object TransactionDriverSuite {
              messenger: Messenger,
              initialPrepare: TxPrepare,
              finalizerFactory: Factory,
-             onComplete: TransactionId => Unit) extends TransactionDriver(storeId, messenger, NoBackgroundTaskManager, initialPrepare.txd, finalizerFactory) {
+             onComplete: TransactionId => Unit,
+             tasks: BackgroundTaskManager = NoBackgroundTaskManager,
+             ec: ExecutionContext = scala.concurrent.ExecutionContext.global)
+    extends TransactionDriver(storeId, messenger, tasks, initialPrepare.txd, finalizerFactory)(using ec) {
     override protected def onFinalized(committed: Boolean): Unit = {
       super.onFinalized(committed)
       onComplete(txd.transactionId)
@@ -110,6 +115,54 @@ object TransactionDriverSuite {
       this.voters = Some(voters)
     }
   }
+
+
+  /** Runs tasks only when told to, recording each one's delay */
+  class StepTasks extends BackgroundTaskManager(ExecutionContext.parasitic):
+    final class Task(val delay: Duration, fn: () => Unit) extends BackgroundTaskManager.ScheduledTask:
+      var cancelled = false
+      def cancel(): Unit = cancelled = true
+      def run(): Unit = if !cancelled then fn()
+    var tasks: List[Task] = Nil
+    override def schedule(delay: Duration)(fn: => Unit): BackgroundTaskManager.ScheduledTask = synchronized:
+      val t = new Task(delay, () => fn)
+      tasks = tasks :+ t
+      t
+    def runAll(): Unit =
+      val ts = synchronized { val t = tasks; tasks = Nil; t }
+      ts.foreach(_.run())
+
+  /** A finalizer whose completion the test sets, and which plans entries for `handedOff` */
+  class StepFinalizer(val handedOff: Set[StoreId]) extends TransactionFinalizer:
+    val done: Promise[Unit] = Promise()
+    var cancelled = false
+    def complete: Future[Unit] = done.future
+    override def handedOffStores: Set[StoreId] = handedOff
+    def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = ()
+    def debugStatus: List[(String, Boolean)] = Nil
+    def cancel(): Unit = cancelled = true
+
+  /** Hands out a new StepFinalizer per create, planning the next set of `plans` (empty once they run out). A create
+    * whose plan is None throws, as a host lacking an action's type does (transaction-recovery F1)
+    */
+  class StepFactory(plans: Option[Set[StoreId]]*) extends TransactionFinalizer.Factory:
+    private var remaining = plans.toList
+    var created: List[StepFinalizer] = Nil
+    def create(txd: TransactionDescription, messenger: Messenger): TransactionFinalizer =
+      val plan = remaining match
+        case p :: rest => remaining = rest; p
+        case Nil => Some(Set[StoreId]())
+      plan match
+        case None => throw new NoSuchElementException("no such finalization action type")
+        case Some(stores) =>
+          val f = new StepFinalizer(stores)
+          created = created :+ f
+          f
+
+  def commitBy(driver: TransactionDriver, txd: TransactionDescription): Unit =
+    for from <- List(ds0, ds1) do
+      driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
+        Right(TxAcceptResponse.Accepted(true))))
 
 }
 
@@ -1083,5 +1136,127 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     messenger.messages.collect { case a: TxAccept => a } should be (Nil)
     finalizer.createCount should be (1)
     finalizer.cancelled should be (false)
+  }
+
+  // transaction-recovery F2 / R-N2: finalization has a failure path. A failed finalizer is started again from scratch
+  // after a backoff; the transaction is never finalized without its actions
+  test("a failed finalizer is started again after a backoff, and TxFinalized waits for one that completes") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val tasks = new StepTasks
+    val factory = new StepFactory(Some(Set(ds2)), Some(Set(ds1)))
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), factory, _ => completed = true, tasks,
+      ExecutionContext.parasitic)
+    tasks.tasks = Nil
+    commitBy(driver, txd)
+    factory.created.size should be (1)
+
+    // The marker gave up part way: some of its entries (for ds2) may have landed
+    factory.created.head.done.failure(new Exception("marker gave up"))
+    factory.created.head.cancelled should be (true)
+    completed should be (false)
+    tasks.tasks.map(_.delay) should be (List(TransactionDriver.FinalizerRetryInitial))
+
+    tasks.runAll()
+    factory.created.size should be (2)
+    completed should be (false)
+    messenger.clear()
+
+    factory.created(1).done.success(())
+    completed should be (true)
+    driver.mayBeDiscarded should be (true)
+    // The failed finalizer's planned stores are listed as owed with the completed one's
+    messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set(ds1, ds2)))
+  }
+
+  test("a finalizer that cannot be created is started again, and the resolution is still sent") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val tasks = new StepTasks
+    val factory = new StepFactory(None, Some(Set()))
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), factory, _ => completed = true, tasks,
+      ExecutionContext.parasitic)
+    tasks.tasks = Nil
+    messenger.clear()
+    commitBy(driver, txd)
+    factory.created should be (Nil)
+    messenger.messages.collect { case r: TxResolved => r.committed }.toSet should be (Set(true))
+    tasks.tasks.size should be (1)
+
+    tasks.runAll()
+    factory.created.size should be (1)
+    factory.created.head.done.success(())
+    completed should be (true)
+  }
+
+  test("repeated finalizer failures back off, doubling up to the cap") {
+    TransactionDriver.finalizerRetryDelay(1) should be (TransactionDriver.FinalizerRetryInitial)
+    TransactionDriver.finalizerRetryDelay(2) should be (TransactionDriver.FinalizerRetryInitial * 2)
+    TransactionDriver.finalizerRetryDelay(6) should be (TransactionDriver.FinalizerRetryInitial * 32)
+    TransactionDriver.finalizerRetryDelay(7) should be (TransactionDriver.FinalizerRetryMax)
+    TransactionDriver.finalizerRetryDelay(1000) should be (TransactionDriver.FinalizerRetryMax)
+
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val tasks = new StepTasks
+    val factory = new StepFactory()
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), factory, _ => (), tasks,
+      ExecutionContext.parasitic)
+    tasks.tasks = Nil
+    commitBy(driver, txd)
+    for n <- 1 to 3 do
+      factory.created.last.done.failure(new Exception(s"failure $n"))
+      tasks.tasks.map(_.delay) should be (List(TransactionDriver.finalizerRetryDelay(n)))
+      tasks.runAll()
+    factory.created.size should be (4)
+  }
+
+  test("another driver's TxFinalized during a pending restart finalizes at once, listing the failed plan, and starts no finalizer") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val tasks = new StepTasks
+    val factory = new StepFactory(Some(Set(ds2)))
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), factory, _ => (), tasks, ExecutionContext.parasitic)
+    tasks.tasks = Nil
+    commitBy(driver, txd)
+    factory.created.head.done.failure(new Exception("marker gave up"))
+    messenger.clear()
+
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+    driver.mayBeDiscarded should be (true)
+    messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set(ds1, ds2)))
+
+    tasks.runAll()
+    factory.created.size should be (1)
+  }
+
+  test("a late resolution during a pending restart, or a shutdown, starts no finalizer") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+
+    val tasks = new StepTasks
+    val factory = new StepFactory()
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), factory, _ => (), tasks, ExecutionContext.parasitic)
+    tasks.tasks = Nil
+    commitBy(driver, txd)
+    factory.created.head.done.failure(new Exception("action gave up"))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set()))
+    driver.mayBeDiscarded should be (true)
+    tasks.runAll()
+    factory.created.size should be (1)
+
+    val tasks2 = new StepTasks
+    val factory2 = new StepFactory()
+    val driver2 = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), factory2, _ => (), tasks2,
+      ExecutionContext.parasitic)
+    tasks2.tasks = Nil
+    commitBy(driver2, txd)
+    factory2.created.head.done.failure(new Exception("action gave up"))
+    driver2.shutdown()
+    tasks2.tasks.forall(_.cancelled) should be (true)
+    tasks2.tasks.foreach(t => t.cancelled = false)
+    tasks2.runAll()
+    factory2.created.size should be (1)
+    driver2.mayBeDiscarded should be (false)
   }
 }

@@ -54,9 +54,9 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
   override def handedOffStores: Set[StoreId] = synchronized(planned)
 
-  /** Set when the marks are handed to the marker. From then on only the write's success completes the action: a late
+  /** Set when the marks are handed to the marker. From then on only the write's outcome completes the action: a late
     * TxCommitted making every store clean must not complete it before the writes land. A failed write (the marker gave
-    * up on a pool) never completes it, as before
+    * up on a pool) fails it, and the driver starts the transaction's finalizer again (TransactionDriver.startFinalizer)
     */
   private var handedOff = false
 
@@ -140,10 +140,9 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     handedOff = true
     planned = unacked.map(_.store).toSet
     markTask = None
-    writeMarks(errors, unacked).foreach: _ =>
+    writeMarks(errors, unacked).onComplete: result =>
       synchronized:
-        if !completionPromise.isCompleted then
-          completionPromise.success(())
+        completionPromise.tryComplete(result)
   }
 
   /** Where the mark timer and the report are scheduled. A seam for tests */

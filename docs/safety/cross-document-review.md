@@ -61,7 +61,7 @@ Rebuild F14 says amnesia "is safe only within the pool's failure tolerance". Tha
 the entire intersection. The amnesiac store is silent for the whole rebuild (offline marker, `StoreLoader.scala:73`; `HostStoreView`),
 which hides the problem: during the rebuild the other holder of the accept answers every promise quorum. The hole opens at promotion
 for any transaction still unresolved then:
- - T accepted commit at S0,S1 (chosen). S0's CRL is lost (D1/D2/T3-T8), S1 stalls (e.g. T cannot finalize: recovery F2 permanent marker failure,
+ - T accepted commit at S0,S1 (chosen). S0's CRL is lost (D1/D2/T3-T8), S1 stalls (e.g. T cannot finalize: recovery F2 permanent marker failure (since 2026-11-11 one that repeats on every retry),
    F14 ErrorTree unavailable, paxos F8 tally stall), but S1 keeps the Tx (resolved or accepted).
  - Rebuild of a small/empty store takes seconds to minutes; S0' promotes with no promises or accepts.
  - A new driver reaching {S0', S2} sees no accepted value; a young T gets fresh votes; S0'/S2 re-check requirements (S0' on rebuilt data) and may vote abort
@@ -138,7 +138,7 @@ Fix sketch: `Store.close` must `shutdown()` all drivers; a driver should stop wh
 Verdict: PLAUSIBLE.  Severity: liveness (system-wide stall, positive feedback).
 `CrlAdmission` is per device and "nothing is exempt". A store whose device CRL is past half a stream silently drops prepares for unseen transactions.
 Every dropped prepare makes that store "silent" for `errorTimeout` (2 s), which forces the finalizer to write a marker batch (`MissedUpdateFinalizationAction.markMissedUpdates`)
-and holds `TxFinalized` until it succeeds (recovery F2/F14). Marker batches are transactions whose prepares go to the metadata pool's stores; if those share a device with
+and holds `TxFinalized` until it succeeds (recovery F14; since the F2 fix a write that gives up restarts the finalizer rather than hanging it, which does not change this loop). Marker batches are transactions whose prepares go to the metadata pool's stores; if those share a device with
 data-pool stores (default: metadata pool members are ordinary devices), their prepares are dropped too. Unfinalized transactions keep their admitted bytes, so the
 CRL stays full and more prepares drop: the loop only breaks when a metadata quorum of devices has room. Also each drop adds an ErrorTree entry (more repair load, repair F8/F9).
 Fix sketch: exempt (or reserve a lane for) transactions whose pool is a metadata pool / marker batches / TxFinalized-path; or finalize with the miss recorded in memory first.
@@ -148,6 +148,10 @@ Fix sketch: exempt (or reserve a lane for) transactions whose pool is a metadata
 > **Refresh (replay pins): unchanged.**
 > **Refresh (addendum): unchanged; one more consequence.** The same give-up, in the second driver's handed-off write,
 > now also leaves the committed pools' UnackedCommits entries listed in no `owed` (X13).
+> **Refresh (2026-11-11): the recovery F2 leg is fixed.** A marker write that gives up fails the finalizer and its driver
+> re-runs it, so the delete mark is written before the transaction finalizes, or the transaction stays unfinalized
+> (a logged stall). A second driver finalized by another's `TxFinalized` cancels its marker and does not re-run it; its
+> lost entries are the first driver's to write (X13 unchanged).
 Verdict: PLAUSIBLE.  Severity: stale-replica (permanently missing slice); resurrection of the old object's zombie slice in the same event.
 Code: `FsifBackend.updateExt` (`server/store/backend/fsif/FsifBackend.scala:1273-1295`): a repair of object N at ext x never overwrites a different occupant; it returns
 `ObjectMismatch` and relies on "that missed delete heals first through repairDelete". `startRepairDelete` is id- and ext-checked (`:1457-1478`), so slot aliasing itself is REFUTED (see
@@ -172,6 +176,9 @@ Fix sketch: gate on content equality after install (as repair F3 suggests), mand
 ### X8. Mixed-version rolling upgrade and finalizer types (recovery F1 x systemic SC1-SC7 x repair x user jars)
 
 > **Refresh (replay pins): unchanged.** `RegisteredTransactionFinalizerFactory.scala:66-70` still throws on an unknown type.
+> **Refresh (2026-11-11): narrowed.** Recovery F1 is fixed: a creation failure is logged at error and retried with
+> backoff (`TransactionDriver.startFinalizer`), so a host that loads the type later (upgrade completes) finalizes the
+> transaction, marks included. While the skew lasts the transaction still stalls with its CRL state, now visibly.
 Verdict: PLAUSIBLE.  Severity: liveness, then stale-replica.
 `RegisteredTransactionFinalizerFactory.create` throws `NoSuchElementException` on an unknown type and the driver never finalizes (recovery F1). In a rolling upgrade, a new host
 can start transactions with new FinalizationAction types while old hosts, whose stores hold the CRL state, become recovery drivers for them (idle 5 s). Each wedged
@@ -288,7 +295,7 @@ G5. ErrorTree/UnackedCommits entry-key incarnation (X10) and the time-line of en
 G6. Allocation-tree dependency: rebuild F10/F17, repair F5 and requirements F11 each mention an allocation recorded late or not at all, but nobody analyses the total effect (missing slice, stale deletion decision, replayed allocation) across rebuild, repair and horizon.
 G7. Client object caches/pointers (stale `ObjectPointer`, DataObject read caches) are outside all seven; resurrection by a client reading a zombie slice with a cached pointer is not discussed.
 G8. Clock: HLC skew no longer affects replay (the horizon is gone, paxos F3 fixed), but still affects the rebuilt store's `acceptorSince` mute, on which the late-commit rule now also rests (paxos P-N2), repair's 60 s age gate (entry timestamp is the marker transaction's), and rebuild timestamps; no document looks at them together.
-G9. Marker-batch size/limit: `TransactionCreationError` is treated as permanent (StopRetrying) and wedges finalization (recovery F2); no document asks which creation errors an oversized batch (256 entries x many objects) can hit.
+G9. Marker-batch size/limit: `TransactionCreationError` is treated as permanent (StopRetrying) and wedges finalization (recovery F2); no document asks which creation errors an oversized batch (256 entries x many objects) can hit. *(2026-11-11: no longer a wedge. The give-up fails the actions and their drivers re-run the finalizers with backoff, so a transient creation error heals; one that repeats forever is a logged stall. An oversized entry surfaces as TKVL `NodeSizeExceeded`, which is not a creation error and is retried in place; which entries can exceed a node is still unasked.)*
 G10. Capacity interaction: ErrorTree growth during long outages (repair 13.3-6) x CRL admission (X5) x rebuild in-progress counts as failure budget (rebuild 6.3): no combined capacity argument.
 
 G11. Replay ordering: the replay integration tests deliver the leader's copy of the replayed client prepare last (the TestNetwork leader driver does not retransmit), so the ordering where a driver's data-less prepare reaches stores before the replayed client prepare is not exercised end to end. *(Addendum: the headline stub test delivers the pool-B leader's copy before pool A's, because the default order dropped the provers' proofs at a leader with no driver yet (paxos P-N1). Prefer-abort makes a driver-first store withhold everything until the client's prepare arrives, then check it normally, or prove at once (`Tx.awaitingClientPrepare`, `Tx.scala:205-208`); FrontendSuite covers both at unit level, end to end is still untested.)*
@@ -299,7 +306,7 @@ G12. amoebafs pre-existing bugs found during the refactor (cross-node rename who
 
 C1. systemic-loss-protection X11 says a Failed device is "refused (DeviceDiscovery.scala:219)" and "by design never reintroduced"; rebuild-process F1 says it is loaded again. Code: both true in different branches. The refusal is in `resolveOwnership`
     (`:215-219`) used when `owning-host` names another host or a shutdown marker exists; the `owning-host == this host` branch calls `loadOwnedDevice` with no tree check (`:474-478`). Rebuild F1 is right for a device whose owning-host is the local host.
-C2. repair-process 12.8 says marker inserts use `retryUntilSuccessful` and "No entry is lost"; rebuild F9 and transaction-recovery F2 say the batch gives up. Code: both: transient errors retry, but `UnknownStoragePool` and every `TransactionCreationError` throw `StopRetrying`
+C2. repair-process 12.8 says marker inserts use `retryUntilSuccessful` and "No entry is lost"; rebuild F9 and transaction-recovery F2 say the batch gives up. Code: both: transient errors retry, but `UnknownStoragePool` and every `TransactionCreationError` throw `StopRetrying` *(2026-11-11: resolved. `UnknownStoragePool` is no longer handled (nothing throws it); a `TransactionCreationError` give-up fails the actions and their drivers re-run the finalizers, which mark again, so "No entry is lost" now holds: rebuild F9 and recovery F2 fixed.)*
     and `finished` only logs "Gave up" (`MissedUpdateMarker.scala:127-157`); repair 12.8 is wrong on "no entry is lost".
 C3. rebuild-process F14 ("Paxos acceptor amnesia is safe only within the pool's failure tolerance") contradicts paxos-transactions P8/P9 (state of a possibly chosen value must be retained) and crash-recovery-log F18 (open question). Quorum arithmetic says tolerance
     does not cover amnesia (X2). The three documents give three different answers.

@@ -2,12 +2,9 @@ TODO
 ====
 
 Open items from the replay-pins work:
-- A committed transaction can be reported to its client as aborted (docs/safety paxos F2). A client paused for more
-  than ~10 s, whose reply was lost, retransmits its prepare; a fresh round decides abort if no object still shows the
-  update. Store state stays correct and repair catches up the stores, but the client is told the wrong outcome.
-- A driver relying on its own finalizer never finalizes when the missed-update marker's write gives up
-  (docs/safety transaction-recovery F2 / R-N2): there is no failure path. Pre-existing, made slightly worse by the
-  marker now running last, so a failed earlier action also loses the ErrorTree marks and UnackedCommits entries.
+- An UnackedCommits entry too large for a tree node (a transaction changing very many objects on one store) fails
+  the marker's insert with NodeSizeExceeded, which the marker retries in place forever: the transaction never
+  finalizes (docs/safety cross-document G9). Not investigated: find the bound and make entries fit.
 - docs/safety/paxos-transactions.md cites line numbers (e.g. TransactionDriver.scala:262-263, :318-319) that are stale
   after the replay-pins branch.
 - TransactionDriver.mayBeDiscarded is used only by tests: remove it or fold it into them.

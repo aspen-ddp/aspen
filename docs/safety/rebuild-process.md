@@ -390,8 +390,9 @@ the design document predates the ErrorTree.
   (`MissedUpdateFinalizationAction.limitTracking` `:130`, wired at `MissedUpdateMarker.scala:164`). For the bootstrap
   pool, whose trees live in itself, misses of writes to its own ErrorTree and UnackedCommits nodes are never recorded
   (F8).
-* A batch that "gave up" (`UnknownStoragePool`, `TransactionCreationError` from `onFail`,
-  `MissedUpdateMarker.scala:148-157`) is logged and the entries are lost (F9).
+* A batch that "gave up" (a `TransactionCreationError` from `onFail`) is logged and fails its entries' actions; each
+  driver then starts its transaction's finalizer again, which marks again, so no entry is lost: the transaction stays
+  unfinalized until its marks land (F9 fixed 2026-11-11, transaction-recovery F2).
 
 ---
 
@@ -729,6 +730,11 @@ promoted S has a stale slice of each such node and no ErrorTree entry; it is onl
 `OpportunisticRebuild`. Redundancy of those nodes is silently reduced by one after every bootstrap rebuild.
 
 **Verification: CONFIRMED mechanism, severity stale-replica.** `MissedUpdateFinalizationAction.limitTracking` (`:130-133`) disables missed-update tracking for the whole ErrorTree-writing transaction whenever it references the pool the entry describes; only the bootstrap pool's own trees live in the bootstrap pool, so this applies there only. Any bootstrap-pool store that is silent while such a write commits (offline, or rebuilding) gets no entry for those tree nodes, and the walk may already have passed them. The damage is bounded by client reads of those nodes (quorum reads detect the stale slice and OpportunisticRebuild repairs it), so the effect is redundancy silently reduced until read. Fix sketch: run a second pass of the walk over objects of the bootstrap pool's metadata trees after the first, or write the entries for bootstrap-pool nodes in a follow-up transaction that does not reference the pool's own nodes.
+
+> **F9 FIXED (2026-11-11)** with transaction-recovery F2: a batch that gives up fails its entries' finalization
+> actions, and each transaction's driver starts its finalizer again after a backoff, which re-marks. No entry is
+> dropped; a give-up that repeats forever keeps the transaction unfinalized (logged at error on each attempt), so
+> its stores never forget it while a missed store is unmarked. The `UnknownStoragePool` case is gone: nothing throws it.
 
 **F9 (Medium-Low) The missed-update batch can give up.**
 `MissedUpdateMarker.onFail` converts `UnknownStoragePool` and `TransactionCreationError` into `StopRetrying`

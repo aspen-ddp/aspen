@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.transaction.TransactionFinalizer
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
 object RegisteredTransactionFinalizerFactory {
 
@@ -26,6 +26,9 @@ object RegisteredTransactionFinalizerFactory {
     * none of them. The ordering is kept as defence in depth.
     *
     * The marker receives `updateCommitErrors` and `commitVoters` from the start, before it executes, and keeps them.
+    *
+    * `complete` fails as soon as any action's does, without waiting for the rest (a marker whose turn never comes
+    * would never complete); the driver then starts a fresh finalizer (TransactionDriver.startFinalizer).
     */
   class Finalizer(val actions: List[FinalizationAction],
                   runsLast: FinalizationAction => Boolean = Finalizer.isMissedUpdateMarker)
@@ -42,7 +45,11 @@ object RegisteredTransactionFinalizerFactory {
       synchronized { if !cancelled then last.foreach(_.execute()) }
     }
 
-    def complete: Future[Unit] = Future.sequence(actions.map(_.complete)).map(_=>())
+    private val completion: Promise[Unit] = Promise()
+    actions.foreach(_.complete.failed.foreach(completion.tryFailure))
+    Future.sequence(actions.map(_.complete)).foreach(_ => completion.trySuccess(()))
+
+    def complete: Future[Unit] = completion.future
 
     def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = {
       actions.foreach(_.updateCommitErrors(commitErrors))

@@ -13,9 +13,19 @@ import scribe.Logging
 
 import scala.concurrent.duration.{Duration, NANOSECONDS, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.boundary, boundary.break
+import scala.util.{Failure, Success, boundary}, boundary.break
+import scala.util.control.NonFatal
 
 object TransactionDriver {
+
+  /** The delay before a failed finalizer is started again, doubling with each failure up to `FinalizerRetryMax` */
+  val FinalizerRetryInitial: Duration = Duration(1, SECONDS)
+  val FinalizerRetryMax: Duration = Duration(60, SECONDS)
+
+  private[transaction] def finalizerRetryDelay(failures: Int): Duration =
+    val doublings = math.min(failures - 1, 6)
+    val delay = FinalizerRetryInitial * math.pow(2, doublings)
+    if delay > FinalizerRetryMax then FinalizerRetryMax else delay
 
   trait Factory {
     def failedDriverDuration: Duration = Duration(2, SECONDS)
@@ -52,7 +62,9 @@ object TransactionDriver {
         }
       }
 
-      override def shutdown(): Unit = hangCheckTask.cancel()
+      override def shutdown(): Unit =
+        super.shutdown()
+        hangCheckTask.cancel()
 
       override protected def onFinalized(committed: Boolean): Unit = {
         super.onFinalized(committed)
@@ -99,6 +111,19 @@ abstract class TransactionDriver(
   protected var peerDispositions: Map[StoreId, TransactionDisposition.Value] = Map()
   protected var acceptedPeers: Set[StoreId] = Set[StoreId]()
   protected var finalizer: Option[TransactionFinalizer] = None
+
+  /** The stores the hand-offs of this driver's failed finalizers planned entries for. A failed marker may have written
+    * some pools' entries before another pool's write gave up, so TxFinalized lists them too
+    */
+  private var failedHandedOff: Set[StoreId] = Set()
+
+  /** Failed finalizers so far, for the restart backoff */
+  private var finalizerFailures = 0
+
+  private var finalizerRestart: BackgroundTaskManager.ScheduledTask = BackgroundTaskManager.NoTask
+
+  /** Set by `shutdown`: no finalizer is started again */
+  private var stopped = false
 
   /** The stores TxFinalized reports as owed an UnackedCommits entry. Empty unless this driver's finalizer wrote
     * entries (a non-late commit), or a TxFinalized from another driver, which reported them, finalized it
@@ -161,7 +186,11 @@ abstract class TransactionDriver(
     ds.poolId == txd.primaryObject.poolId && validAcceptorSet.contains(ds.poolIndex)
   }
 
-  def shutdown(): Unit = {}
+  /** Releases the driver's timers. Overrides must call it: it stops a pending finalizer restart */
+  def shutdown(): Unit = synchronized {
+    stopped = true
+    finalizerRestart.cancel()
+  }
 
   private val startNanos: Long = System.nanoTime()
   private var lastStuckReport: Option[Long] = None
@@ -420,7 +449,7 @@ abstract class TransactionDriver(
         // TxFinalized this driver sends lists every store that may get an entry from either driver. A stub may then be
         // written before its entry is durable; the repair scan allows for that (Ruling 8)
         finalizer.foreach( _.cancel() )
-        val planned = if msg.committed then finalizer.fold(Set[StoreId]())(_.handedOffStores) else Set[StoreId]()
+        val planned = if msg.committed then handedOffStores else Set[StoreId]()
         onFinalized(msg.committed, msg.owed ++ planned)
       }
     }
@@ -584,17 +613,77 @@ abstract class TransactionDriver(
     }
   }
 
+  /** Every store a finalizer of this driver, failed or running, handed off an UnackedCommits entry for */
+  private def handedOffStores: Set[StoreId] = synchronized {
+    failedHandedOff ++ finalizer.fold(Set[StoreId]())(_.handedOffStores)
+  }
+
+  /** Creates and starts the finalizer. Must hold the lock.
+    *
+    * Finalization has a failure path (transaction-recovery F1, F2): a finalizer that cannot be created, or whose
+    * `complete` fails (an action gave up, such as a missed-update marker write failing with a
+    * TransactionCreationError), is logged at error and started again from scratch after a backoff
+    * (`finalizerRetryDelay`), until one completes, the driver is finalized another way, or it shuts down. The actions
+    * are idempotent and at-least-once, so re-running them is what a recovery driver would do. The transaction is never
+    * finalized without its actions: TxFinalized lets the stores forget it, and without the marker's ErrorTree marks and
+    * UnackedCommits entries a store that missed it would stay stale, unrepaired. A failure that repeats forever is a
+    * stall, logged on every attempt, never a lost mark.
+    */
+  private def startFinalizer(): Unit =
+    logger.trace(s"Running finalization actions for transaction ${txd.transactionId}")
+    val created =
+      try Right(finalizerFactory.create(txd, messenger))
+      catch case NonFatal(err) => Left(err)
+
+    created match
+      case Left(err) =>
+        finalizer = None
+        finalizerFailed(None, err)
+
+      case Right(f) =>
+        f.commitVoters(countedCommitVoters)
+
+        // Update with initial commitErrors. This avoids problems when all TxCommit messages arrive
+        // before we notice that resolution has been achieved
+        f.updateCommitErrors(commitErrors)
+
+        finalizer = Some(f)
+
+        f.complete.onComplete {
+          case Success(_) =>
+            logger.trace(s"Finalization actions completed for transaction ${txd.transactionId}")
+            onFinalized(true, handedOffStores)
+          case Failure(err) =>
+            synchronized { finalizerFailed(Some(f), err) }
+        }
+
+  /** Must hold the lock. Schedules a fresh finalizer unless this one was replaced, or the driver finalized or stopped */
+  private def finalizerFailed(f: Option[TransactionFinalizer], err: Throwable): Unit =
+    if !finalized && !stopped && finalizer == f then
+      f.foreach: f =>
+        failedHandedOff ++= f.handedOffStores
+        f.cancel()
+      finalizer = None
+      finalizerFailures += 1
+      val delay = TransactionDriver.finalizerRetryDelay(finalizerFailures)
+      logger.error(s"Tx ${txd.transactionId} on store $storeId: finalization failed (attempt $finalizerFailures), " +
+        s"starting it again in $delay: $err")
+      finalizerRestart = backgroundTasks.schedule(delay) {
+        synchronized { if !finalized && !stopped && finalizer.isEmpty then startFinalizer() }
+      }
+
   /** Starts the finalizer of a committed transaction, or finalizes an aborted one at once.
     *
     * Ordering premise: this driver sends TxFinalized only from onFinalized, which a commit reaches only once the
-    * finalizer completes (`f.complete foreach onFinalized`), or on a TxFinalized from another driver, sent under the
-    * same rule, or on a late commit (`resolveLate`), which follows a finalization whose actions other than the
-    * UnackedCommits marker already completed. A store forgets a committed transaction it voted on only on TxFinalized
+    * finalizer completes (`startFinalizer`: a failed one is started again, never skipped), or on a TxFinalized from
+    * another driver, sent under the same rule, or on a late commit (`resolveLate`), which follows a finalization whose
+    * actions other than the UnackedCommits marker already completed. A store forgets a committed transaction it voted on only on TxFinalized
     * (Frontend.receiveTransactionMessage via Tx.receiveFinalized), or on a late commit, which follows TxFinalized
     * (Tx.lateCommit). Finding its UnackedCommits entry (Tx.unackedCommitFound) applies the update but does not forget
     * it. So everything the first finalizer to complete writes, in every pool, is durable before any voter forgets the
     * transaction. A second driver finalized by its TxFinalized does not wait for its own cancelled mark: entries that
-    * mark had already handed off may land after its TxFinalized, which lists their stores (Ruling 7). A
+    * mark had already handed off may land after its TxFinalized, which lists their stores (Ruling 7); so may those of
+    * this driver's own failed finalizers, whose stores its TxFinalized lists too (`failedHandedOff`). A
     * muted Tx (Frontend.forgetMuted) and a prover (Tx.proveCommitted) are dropped without TxFinalized, but neither
     * voted commit. Tx.unackedCommitFound and Tx.proveCommitted record nothing in the host's status cache, so a
     * finalized status, and the TxFinalized(late = true) a store relays from it, always stems from a real TxFinalized
@@ -616,21 +705,7 @@ abstract class TransactionDriver(
         //       only start the finalizers ourselves if they time out to prevent contention. Could be tricky to
         //       get this right though so we'll go with the simple approach for now
 
-        logger.trace(s"Running finalization actions for transaction ${txd.transactionId}")
-        val f = finalizerFactory.create(txd, messenger)
-
-        f.commitVoters(countedCommitVoters)
-
-        // Update with initial commitErrors. This avoids problems when all TxCommit messages arrive
-        // before we notice that resolution has been achieved
-        f.updateCommitErrors(commitErrors)
-
-        f.complete foreach { _ =>
-          logger.trace(s"Finalization actions completed for transaction ${txd.transactionId}")
-          onFinalized(committed, f.handedOffStores)
-        }
-
-        finalizer = Some(f)
+        startFinalizer()
       } else
         onFinalized(false)
 

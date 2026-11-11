@@ -52,6 +52,7 @@ class SimpleTransactionDriver(executionContext: ExecutionContext,
 
   override def shutdown(): Unit = synchronized:
     logger.trace(s"**** Shutting down tx: ${txd.transactionId}")
+    super.shutdown()
     stopped = true
     nextTry.cancel()
 

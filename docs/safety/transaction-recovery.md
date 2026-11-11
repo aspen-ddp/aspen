@@ -207,8 +207,13 @@ Guarantees:
   both learn commit each run the actions (TODO at `:482`), and a driver that dies mid-finalizer is replaced by a
   recovery driver that restarts them from scratch. Actions must be idempotent (`CLAUDE.md`, and each shipped action
   is: allocation-tree insert/delete, TKVL split/join, ErrorTree upserts).
-* **Not at-most-once**, and **no failure path**: `f.complete foreach` ignores a failed future, and a thrown exception in
-  `finalizerFactory.create` escapes `onResolution` after `resolved = true` (F1, F2).
+* **Not at-most-once**. (2026-11-11) **Failure path** (F1, F2 fixed): a finalizer that cannot be created, or whose
+  `complete` fails (any action failing fails it at once, `RegisteredTransactionFinalizerFactory.Finalizer`), is logged at
+  error and started again from scratch after a backoff of 1 s doubling to 60 s (`TransactionDriver.startFinalizer`,
+  `finalizerFailed`), until one completes, the driver finalizes another way, or it shuts down. The transaction is never
+  finalized without its actions; a failure that repeats forever is a logged stall, never a lost mark. `TxFinalized` lists
+  the planned stores of the failed finalizers too (`failedHandedOff`): a marker that failed in one pool may have written
+  another's entries.
 * **Finalization is the gate for forgetting**: an acceptor forgets a committed transaction only on `TxFinalized` or a
   late outcome, which follows one (`Tx.scala:874-890,920-964`); a found UnackedCommits entry applies the update but
   keeps the Tx (Ruling 9, `Tx.scala:997-1010`). The finalizer runs `MissedUpdateFinalizationAction` only after every
@@ -252,16 +257,17 @@ the entry is about).
   by `(poolIndex, object)` keeping the newest timestamp (`:316-327`) and by `(poolIndex, txid)` (`:330-332`), and writes
   one transaction per pool at a time (`nextBatch`, `:335-353`) with at most 256 entries across both trees, ErrorTree
   entries through `pool.errorTree.prepareUpdates` and UnackedCommits entries through `pool.unackedCommitsTree.prepareUpdates`
-  in the same transaction (`:388-397`). The write is retried with exponential backoff until success; only
-  `UnknownStoragePool` and `TransactionCreationError` give up (`:377-386`).
-* The action completes (and so the transaction can finalize) only when the marker's future succeeds
-  (`MissedUpdateFinalizationAction.scala:101-106`). If the marker gives up, the action never completes (F2).
+  in the same transaction. The write is retried with exponential backoff until success; only a
+  `TransactionCreationError` gives up (the `UnknownStoragePool` case is gone: nothing throws it), failing every entry of
+  the batch.
+* The action completes (and so the transaction can finalize) only when the marker's future succeeds. (2026-11-11) If
+  the marker gives up, the action fails, and the driver starts the finalizer again (4.4; F2 fixed).
 * (addendum) Once the marks are handed to the marker (`handedOff`, Ruling 2), only the write's success completes the
   action (`MissedUpdateFinalizationAction.scala:140-146`); a late all-clean `TxCommitted` no longer completes it early
   (`:77`). The hand-off records the planned set, the stores of the UnackedCommits entries handed off
   (`handedOffStores`, Ruling 7, `:53-55,141`), whatever the write's outcome. `cancel` shares the action's lock with
   the hand-off (`:44`), so a caller that cancels and then reads `handedOffStores` sees every store that may still get
-  an entry: a mark not handed off by then never writes. A failed write still never completes the action (F2).
+  an entry: a mark not handed off by then never writes. (2026-11-11) A failed write fails the action (F2 fixed).
 
 ### 5.3 What this guarantees, and what it depends on
 
@@ -507,9 +513,10 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
    MissedUpdate: all data stores reported error-free? -> complete (no writes)
                  runs only after every other action completed (Ruling 8); after errorTimeout: markMissedUpdates
                       -> MissedUpdateMarker (ErrorTree + UnackedCommits, one txn/pool)
-                      -> complete on success; on permanent marker failure: never completes
-   others (alloc/dealloc/TKVL): retryUntilSuccessful; Deletion action never completes on StopRetrying
+                      -> complete on success; fails on permanent marker failure
+   others (alloc/dealloc/TKVL): retryUntilSuccessful; a give-up fails the action
  all complete -> driver.onFinalized
+ any fails    -> complete fails at once -> logged; a fresh finalizer after 1 s, doubling to 60 s (F1, F2 fixed)
  cancel() on any TxFinalized received: actions stop retrying (best effort)
 ```
 
@@ -549,7 +556,9 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
   re-decidable only by a delayed duplicate client prepare (P-N4 narrowed). Ruling 3's delayed non-late `TxFinalized`
   (R-N8) is gone with Ruling 7.
 * **T10 (missed commits are repairable)** A store that does not apply a committed update either recorded it in the ErrorTree/
-  UnackedCommits trees (T8) or can only have stayed behind because the tree write failed permanently (F2).
+  UnackedCommits trees (T8), or its transaction is not finalized yet: since 2026-11-11 a failed tree write or other
+  action restarts the finalizer rather than losing the marks (F2 fixed); a failure that repeats forever stalls the
+  transaction, and the marks with it (R-N2 narrowed).
 * **T11 (apply exactly once, mostly)** A committed transaction's update is applied to an object at most once on a store
   provided the requirements include a revision check on that object; blind KV updates and refcount updates rely on
   other mechanisms (F4).
@@ -626,12 +635,13 @@ Notation: L = designated leader store/driver; S = an arbitrary participant store
   false) and is repaired from its ErrorTree and UnackedCommits entries. This relies on repair being exact.
 * **Finalization action that keeps failing**: the action retries itself with backoff forever (unless `StopRetrying`), the
   driver keeps heartbeating, stores keep the `Tx`, CRL entry and admission bytes; a crash of the driver's host hands the
-  work to D2. If an action's future *fails* (not retries), `onResolution`'s `foreach` ignores it: the transaction is
-  never finalized, ever (F2). Locks are already released (they release on apply), so other transactions proceed; CRL space is
+  work to D2. (2026-11-11) If an action's future *fails* (not retries), the finalizer fails and the driver starts a
+  fresh one after a backoff (1 s doubling to 60 s), logging each failure at error (F2 fixed). A failure that repeats
+  forever leaves the transaction unfinalized for good, as before but logged. Locks are already released (they release on apply), so other transactions proceed; CRL space is
   consumed (`CrlAdmission`) until finalization.
 * **ErrorTree write that fails**: transient failures retry forever (exponential backoff); finalization of the transaction
-  is withheld meanwhile and so is forgetting; permanent failures (`UnknownStoragePool`, `TransactionCreationError`) end the
-  future with failure and the action never completes (F2). During the wait a store that is S-missed remains unrepaired.
+  is withheld meanwhile and so is forgetting; a permanent failure (`TransactionCreationError`) fails the action and the
+  driver re-runs the finalizer, marker included (F2 fixed). During the wait a store that is S-missed remains unrepaired.
 * **Store missed `errorTimeout` but did apply**: it is marked (extra repair pass) - and gets an UnackedCommits entry
   if it was a counted voter. If it crashes before `TxFinalized`, its recovered `Tx` finds the entry and "applies" via
   `doCommit`; revision- and per-write-checked updates are skipped; blind KV may re-apply (F4). If it does not crash, the
@@ -683,8 +693,20 @@ or an assumption I could not verify).
 | F12 | unchanged | Store close still shuts its drivers down. Since Ruling 7 no driver waits for its own entries after another driver's `TxFinalized` | `Store.scala:68-72` |
 | T12 | **changed** | The client's prepare, not only its data, is now needed for a store's vote (paxos P-N8) | `Tx.scala:205-208` |
 
+### Re-assessment for the finalization failure path (2026-11-11)
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F2 | **fixed** | Finalization has a failure path. `Finalizer.complete` fails as soon as any action fails; the marker fails its action when its write gives up; Deletion and Allocation actions fail theirs instead of dropping the failure. The driver logs the failure at error and starts a fresh finalizer after a backoff (1 s doubling to 60 s), until one completes, another driver's `TxFinalized` or a late resolution finalizes it, or the driver shuts down (`Store.close`). It never finalizes without the actions: dropping the marks would leave a missed store stale and unrepaired, and an owed store unable to find its entry. `TxFinalized` lists the failed finalizers' planned stores with the last one's (`failedHandedOff`), since a marker that failed in one pool may have written another's entries; the second-driver argument (Ruling 7) covers them. The dead `UnknownStoragePool` give-up is removed (nothing throws it) | `TransactionDriver.scala` `startFinalizer`, `finalizerFailed`, `handedOffStores`; `RegisteredTransactionFinalizerFactory.scala` `Finalizer.complete`; `MissedUpdateFinalizationAction.scala` `writeMissedUpdates`; TransactionDriverSuite "a failed finalizer is started again after a backoff, and TxFinalized waits for one that completes" and the three tests after it |
+| F1 | **fixed** | A finalizer that cannot be created (an unknown action type) takes the same path: the exception no longer escapes `onResolution`, the resolution messages are still queued, and creation is retried with the backoff. A host lacking the type stalls the transaction, logged, until the type is loaded | `TransactionDriver.scala` `startFinalizer`; TransactionDriverSuite "a finalizer that cannot be created is started again, and the resolution is still sent" |
+| R-N2 | **narrowed** | A failed action no longer loses the marks for good: the fresh finalizer runs the marker once its other actions complete. The marker still waits for them (Ruling 8: a durable entry implies every other action is done, which the late-commit argument uses), so an action failing on every attempt (a deterministic bug, or a type no host can load) keeps the marks unwritten along with the transaction unfinalized. That is a logged stall, not a finalization with missing marks. Running the marker after a failed action would buy repair of the missed stores during such a stall at the cost of Ruling 8; not done | `RegisteredTransactionFinalizerFactory.scala` `Finalizer` |
+| F14 | unchanged | A marker that keeps failing now restarts the whole finalizer rather than hanging, but finalization still needs the write | as F2 |
+
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness.** RegisteredTransactionFinalizerFactory.create does getType(...).get (server/RegisteredTransactionFinalizerFactory.scala, create); it runs inside TransactionDriver.onResolution after `resolved = true` and before `finalizer =` and before queueTxMessages (TransactionDriver.scala:471-520), the exception escapes the handler; periodic TxResolved (SimpleTransactionDriver.scala:42-47) still tells stores, but no finalizer ever exists. Needs a host lacking a registered type (version skew, partial --load-jars).
 > *Fix sketch:* Catch creation failure, leave resolved=false so the driver retries, and surface an error; or refuse to drive txds with unknown types.
+
+> **Fixed 2026-11-11.** Creation failure is caught in `TransactionDriver.startFinalizer`, logged at error and retried
+> with the finalizer backoff; the resolution messages are queued regardless (re-assessment table above).
 
 **F1 (M-H) A host that cannot instantiate a finalization action wedges the transaction permanently.**
 `RegisteredTransactionFinalizerFactory.create` does `client.typeRegistry.getType[FinalizationActionFactory](...).get`
@@ -699,6 +721,12 @@ driver for a txd whose types are unknown.
 
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness (permanent hang; replica stays stale).** MissedUpdateFinalizationAction.markMissedUpdates completes its promise only in `mark(...).foreach` (MissedUpdateFinalizationAction.scala:~100-106); MissedUpdateMarker.writeBatch throws StopRetrying for UnknownStoragePool and every TransactionCreationError (MissedUpdateMarker.scala:140-160) and finished() completes the Queued promises with Failure, which `foreach` ignores. Finalizer.complete = Future.sequence of actions (server/RegisteredTransactionFinalizerFactory.scala), driver uses `f.complete foreach` (TransactionDriver.scala:496), so onFinalized never runs: stores keep CRL state and admission bytes indefinitely. Same for DeletionFinalizationAction.
 > *Fix sketch:* Handle failure: on permanent marker failure log loudly, record the loss, and still complete the action so TxFinalized goes out.
+
+> **Fixed 2026-11-11, not as sketched.** Completing the action without its marks would let every store forget T with a
+> missed store unmarked (stale, never repaired) and an owed store unable to find its entry, so the transaction is never
+> finalized without them. Instead every failure fails the finalizer, and the driver logs it and starts a fresh one after
+> a backoff (1 s doubling to 60 s); see the re-assessment table above. What remains is a failure that repeats forever:
+> logged on every attempt, with the transaction and its marks waiting (R-N2).
 
 **F2 (H) Finalization has no failure path: any failed finalizer future, including the missed-update marker's permanent
 failure, hangs the transaction forever.** `f.complete foreach { ... onFinalized }` (`TransactionDriver.scala:496`) ignores
@@ -932,6 +960,11 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > UnackedCommits entries are written for the stores that missed T, where before the marker ran in parallel.
 > *Fix sketch:* as F2; run the marker when the others settle, success or failure, once a failure path exists.
 
+> **Narrowed 2026-11-11.** The failure path exists: a failed action fails the finalizer and the driver starts a fresh
+> one, whose marker runs once the other actions complete. The marker still waits for them (Ruling 8), so an action
+> failing on every attempt keeps the marks unwritten with the transaction unfinalized and logged; see the re-assessment
+> table above.
+
 > **R-N3. Verdict: CONFIRMED (liveness). Severity: liveness (locks held, no driver).** Every recovered unresolved commit
 > vote now waits for its first UnackedCommits lookup before its store will drive it (`Store.scala:95-98`,
 > `Tx.scala:139`), holding its commit-vote locks (`Tx.scala:293-298`). The lookup reads the pool's tree in its metadata
@@ -1095,5 +1128,5 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 | Lose a committed update | F3, F5, F6, F13 (all on a lagging store, rescued only by repair); paxos P-N2 (late in the live window) |
 | Apply an aborted update | none found for the UnackedCommits path (entries exist only for committed transactions); paxos P-N4 (a forgotten abort re-decided commit; addendum: only by a delayed duplicate client prepare) |
 | Replay a forgotten transaction | F4 (narrowed), F10 (narrowed), R-N1 (narrowed by stubs), R-N7 (narrowed), R-N9, paxos P-N3; F7, F9 and R-N8 fixed |
-| Fail to record a missed update | F2 (permanent marker failure), R-N2, F14; F13 |
-| Hang forever | F1, F2, F12; F14 (long); R-N3 (recovered votes without lookups); R-N10 (case-3 lookup, no locks) |
+| Fail to record a missed update | F14; F13; F2 fixed, R-N2 narrowed (marks wait for a permanently failing action) |
+| Hang forever | F12; F14 (long); R-N2 (a failure repeating forever, logged); R-N3 (recovered votes without lookups); R-N10 (case-3 lookup, no locks); F1, F2 fixed |

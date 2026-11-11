@@ -77,13 +77,30 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     f.complete.isCompleted should be (true)
   }
 
-  test("a failed action keeps the marker from executing") {
+  // The driver's failure path (transaction-recovery F2): a marker that never executes never completes, so complete
+  // must fail on the failed action alone
+  test("a failed action keeps the marker from executing and fails complete at once") {
+    val a = new StubAction
+    val b = new StubAction
+    val marker = new StubMarker
+    val f = new Finalizer(List(a, marker, b))
+
+    val err = new Exception("action failed")
+    b.done.failure(err)
+    marker.executed should be (false)
+    f.complete.value should be (Some(scala.util.Failure(err)))
+  }
+
+  test("a failed marker fails complete") {
     val a = new StubAction
     val marker = new StubMarker
     val f = new Finalizer(List(a, marker))
 
-    a.done.failure(new Exception("action failed"))
-    marker.executed should be (false)
+    a.done.success(())
+    marker.executed should be (true)
+    val err = new Exception("marker gave up")
+    marker.done.failure(err)
+    f.complete.value should be (Some(scala.util.Failure(err)))
   }
 
   test("cancel cancels every action and keeps a marker not yet started from executing") {

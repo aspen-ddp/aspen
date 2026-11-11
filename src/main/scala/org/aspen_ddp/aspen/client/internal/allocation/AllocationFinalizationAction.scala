@@ -34,6 +34,7 @@ class AllocationFinalizationAction(val client: AspenClient,
     * deletion fail; a rare run or replay after the deletion that cannot read it can leave an orphan entry, which costs
     * the repair scan a lookup.
     */
+  // A failure fails the action, and the driver starts the finalizer again (TransactionDriver.startFinalizer)
   def execute(): Unit = client.retryStrategy.retryUntilSuccessful {
     val key = Key(newObject.id.toBytes)
     for
@@ -57,7 +58,7 @@ class AllocationFinalizationAction(val client: AspenClient,
     yield
       logger.debug(s"AllocationFA Completed Successfully for Tx ${txd.transactionId}, Object ${newObject.id}")
       completionPromise.trySuccess(())
-  }
+  }.failed.foreach(completionPromise.tryFailure)
 }
 
 object AllocationFinalizationAction extends RegisteredTypeFactory with FinalizationActionFactory {

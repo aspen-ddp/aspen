@@ -655,7 +655,8 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       fa.handedOffStores shouldBe Set(net.storeId2)
 
   // R-N7 variant 2: a mark of several pools whose write fails part way (one pool's batch committed, another gave up)
-  // fails as a whole. The planned set still lists every store, cancelled or not
+  // fails as a whole. The planned set still lists every store, cancelled or not, and the action fails, so its driver
+  // starts the finalizer again (transaction-recovery F2)
   for cancelAfter <- List(false, true) do
     atest(s"a partially failed mark still lists every planned store (cancelled after hand-off: $cancelAfter)"):
       val txd = refcountTxd(pointerWith(Array[Byte](7, 5)))
@@ -664,8 +665,8 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       fa.updateCommitErrors(Map(net.storeId0 -> Nil))
       fa.markMissedUpdates()
       if cancelAfter then fa.cancel()
-      fa.write.failure(new Exception("one pool's batch gave up"))
-      for _ <- fa.write.future.failed yield
+      val err = new Exception("one pool's batch gave up")
+      fa.write.failure(err)
+      for failed <- fa.complete.failed yield
+        failed shouldBe err
         fa.handedOffStores shouldBe Set(net.storeId1, net.storeId2)
-        // A failed write never completes the action: TxFinalized is not sent for entries that did not land
-        fa.complete.isCompleted shouldBe false

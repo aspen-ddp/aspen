@@ -9,6 +9,12 @@ Designs: `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2
 - The CrashRecoveryLog is used to store this decision and Paxos is then used to arrive at an overall commit/abort decision
 - The client and all stores are informed of the final decision
 - If committed, FinalizationActions are then run. Once complete, the CRL content is dropped and the transaction is forgotten.
+- Finalization failure path (`TransactionDriver.startFinalizer`): a finalizer that cannot be created, or whose
+  `complete` fails (it fails as soon as any action does), is logged at error and started again from scratch after a
+  backoff (1 s doubling to 60 s) until one completes, the driver finalizes another way, or it shuts down. Never
+  finalize without the actions: the marker's entries are what repair and owed stores rely on. TxFinalized's `owed`
+  includes the planned stores of failed finalizers (`failedHandedOff`). An action that gives up must fail its
+  `complete`, never leave it pending
 - If the refcount of the object is set to zero, it is deleted
 
 #### Paxos

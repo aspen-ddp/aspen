@@ -27,10 +27,10 @@ class DeletionFinalizationAction(val client: AspenClient,
         tx = client.newTransaction()
         _ <- pool.allocationTree.delete(Key(deletedObject.id.toBytes))(using tx)
         _ <- tx.commit()
-      } yield {
-        completionPromise.success(())
-      }
+      } yield ()
     }
+    // A failure fails the action, and the driver starts the finalizer again (TransactionDriver.startFinalizer)
+    completionPromise.completeWith(fcomplete)
   }
 }
 

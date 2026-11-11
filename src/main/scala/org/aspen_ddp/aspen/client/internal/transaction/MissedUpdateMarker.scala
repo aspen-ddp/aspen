@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import java.nio.{ByteBuffer, ByteOrder}
 
-import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, Transaction, TransactionCreationError, UnknownStoragePool}
+import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, Transaction, TransactionCreationError}
 import org.aspen_ddp.aspen.client.tkvl.TKVLInsert
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, Value}
@@ -147,13 +147,10 @@ class MissedUpdateMarker(client: AspenClient,
     val unackedInserts = unacked.map: t =>
       TKVLInsert(UnackedCommitEntry.key(t.store, t.transactionId), Value(t.entry.encode), blind = true)
 
+    // A TransactionCreationError is always permanent: the write gives up and fails every entry of the batch, whose
+    // finalizers their drivers start again (TransactionDriver.startFinalizer). Other errors stay on the retry path:
+    // the error tree deletes entries, so a join racing the insert's scan can raise a transient InvalidObject.
     def onFail(err: Throwable): Future[Unit] = err match
-      case err: UnknownStoragePool =>
-        // StoragePool must have been deleted
-        throw StopRetrying(err)
-
-      // Always permanent. Other errors stay on the retry path: the error tree deletes entries, so a
-      // join racing the insert's scan can raise a transient InvalidObject.
       case err: TransactionCreationError => throw StopRetrying(err)
 
       case _ => Future.unit

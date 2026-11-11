@@ -94,10 +94,11 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 
 | Id | Verdict | Finding |
 |---|---|---|
-| Recovery F2, F14 / X5 / R-N2 | CONFIRMED | Finalization has no failure path. Since Ruling 8 a failed action also stops the marker, so no ErrorTree marks or UnackedCommits entries are written (R-N2) |
+| Recovery F2 / R-N2 | **FIXED** / **NARROWED** 2026-11-11 (was CONFIRMED) | Finalization has a failure path: a failed finalizer is logged and started again with backoff, never finalized without its marks. Residual (R-N2): an action failing on every attempt keeps the marks unwritten with the transaction unfinalized, a logged stall |
+| Recovery F14 / X5 | CONFIRMED | Finalization still needs the marker's write; under a metadata outage or CRL admission pressure transactions pile up unfinalized |
 | Recovery R-N3 | CONFIRMED (new) | Every recovered commit vote waits, holding its locks and with no driver, for its UnackedCommits lookup; a metadata-group outage stalls them all |
 | Recovery R-N4 / Repair RP-N3 | CONFIRMED (new) | UnackedCommits entries are one per (store, transaction), never merge, and are now written for every transaction with a silent voter: tree growth, larger marker batches, double reconciles |
-| Recovery F1 / X8 | CONFIRMED | An unknown finalizer type throws after resolution and the transaction never finalizes |
+| Recovery F1 / X8 | **FIXED** 2026-11-11 (was CONFIRMED) | An unknown finalizer type threw after resolution and the transaction never finalized; creation now takes the finalizer failure path (logged, retried with backoff) |
 | Recovery F12 / X4 | **FIXED** (Ruling 31) (was CONFIRMED) | `Store.close` shuts down the store's drivers, so no zombie driver keeps re-preparing; P-N4's delayed duplicate client prepare is unaffected |
 | CRL F9 | CONFIRMED | Death of the writer thread only logs, and all dependent futures hang |
 | Requirements F12 | CONFIRMED | `awaitingCommits` has no timer, so an FSIF ENOSPC freeze stalls the object forever |

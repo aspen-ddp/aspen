@@ -26,7 +26,9 @@
   (found by a descent through the upper tiers, not a scan of the tier) is pointed at the empty node's link, and its
   upper-tier entry is removed. If the neighbor's minimum is longer than the empty node's by then, the predecessor may
   no longer fit and splits in the normal manner; if it cannot be split, the node stays empty. Removing the upper-tier
-  entries lets `JoinFinalizationAction` reduce the root by as many tiers as are left with a single entry.
+  entries lets `JoinFinalizationAction` reduce the root by as many tiers as are left with a single entry. It reduces
+  only a two-entry root that still holds the removed node's entry (the action runs at least once), and bumps each
+  deleted node's version so that an entry added to it before the commit aborts the reduction.
 - The size, split and join decisions of both encodings are in pure `plan*` functions (`KeyValueListNode` over a
   `NodeShape`, `DataObjectNodeEncoding` over a `NodeContent`); `insert`, `rename`, `delete`, `relink` and `splitAt`
   only apply the plan to a Transaction. The separation exists for testing: the node-size arithmetic is subtle and needs
@@ -51,7 +53,7 @@
   node's revision guard (the key's range changes only through an update of its node). Only it fails with
   `KeyAlreadyExists`, when the node read holds the key. On DataObject trees `Checked` and `Blind` add nothing (every
   rewrite requires the node revision); `AtRevision` is KV-only (`UnsupportedRequirement`).
-- A node deleted by a join, a tail removal or a DataObject `deleteList` has its version bumped, not just its revision
+- A node deleted by a join, a tail removal, a root reduction or a DataObject `deleteList` has its version bumped, not just its revision
   locked. A lock leaves the revision unchanged, so a racing removal that read the node as a predecessor could still
   rewrite it after it was deleted and leave a live node linked to a deleted one (batches empty adjacent nodes
   routinely, which exposed this as a hang). Stores now also fail every requirement on a zero-refcount object

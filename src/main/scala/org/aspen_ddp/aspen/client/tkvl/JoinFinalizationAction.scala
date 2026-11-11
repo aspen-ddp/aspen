@@ -32,8 +32,11 @@ class JoinFinalizationAction(val client: AspenClient,
         def firstChild(node: ListNode): ObjectPointer = ObjectPointer(node.get(Key.AbsoluteMinimum).get.bytes)
 
         // The new root may itself be an upper-tier node left with a single entry and no right neighbor. It is then a
-        // needless tier, so keep descending past it. The revision lock keeps that single-entry check honest.
+        // needless tier, so keep descending past it. Each node deleted here has its version bumped, which requires the
+        // revision read: an entry added to it since (a split finalization inserting into the root, say) aborts the
+        // collapse, and the retry rereads the root, rather than deleting the node and losing that entry.
         def reduce(nodeTier: Int, node: ListNode): Future[(Int, ObjectPointer)] = {
+          tx.bumpVersion(node.pointer, node.revision)
           tx.setRefcount(node.pointer, node.refcount, node.refcount.decrement())
           val child = firstChild(node)
           val childTier = nodeTier - 1
@@ -43,10 +46,9 @@ class JoinFinalizationAction(val client: AspenClient,
           else
             TierEngine.encodingFor(node).read(client, child, Key.AbsoluteMinimum, ordering,
               s"Reducing tier $nodeTier root").flatMap { childNode =>
-              if (childNode.size == 1 && childNode.link.isEmpty) {
-                tx.exclusiveLockRevision(childNode.pointer, childNode.revision)
+              if (childNode.size == 1 && childNode.link.isEmpty)
                 reduce(childTier, childNode)
-              } else
+              else
                 Future.successful((childTier, child))
             }
         }
@@ -100,7 +102,9 @@ class JoinFinalizationAction(val client: AspenClient,
         orootNode match {
           case None =>  Future.unit// Nothing to do
           case Some(rootNode) =>
-            if (tier == rootTier && rootNode.size == 2)
+            // The root must still hold the deleted node's entry: this action runs at least once, and a repeat run
+            // after the tree grew back to this tier would otherwise collapse a new two-entry root
+            if (tier == rootTier && rootNode.size == 2 && rootNode.get(deleteMinimum).isDefined)
               setNewRoot(rootTier, ordering, rootNode)
             else
               deleteFromExistingTier(rootTier, ordering, rootNode)

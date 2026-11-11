@@ -2,7 +2,6 @@ TODO
 ====
 
 Unverified findings from the replay-pins work (check each before acting):
-- JoinFinalizationAction.setNewRoot deletes the old root with only a refcount update.
 - Joins triggered through StoreRepairer.deleteEntry register no JoinFinalizationAction.
 - LocalTimeRequirement's Equals comparison looks inverted.
 

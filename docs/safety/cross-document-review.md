@@ -79,6 +79,13 @@ completion (or than "now minus horizon" at promotion), answering only TxUnknown/
 > constructor can no longer downgrade A's finalized late entry, so the finalized relay keeps answering late
 > (`StoreSuite` "a sibling store's delayed resolution does not downgrade a finalized late entry").
 
+> **Refresh (post-addendum): opposite outcomes.** The monotone merge ORed `finalized`/`late` across opposite statuses,
+> reachable through split decisions (paxos F2, P-N4): a stray abort over a finalized late commit became a finalized
+> abort that the relay spread, and a commit over a finalized abort became a finalized late commit whose drivers skip
+> the finalization actions. Now Committed wins (an abort never replaces a commit) and a commit replacing an abort
+> takes only its own flags (TransactionStatusCacheSuite "a false abort never replaces a finalized late commit", "a
+> commit replacing a finalized abort takes none of the abort's flags").
+
 > **Refresh (replay pins): NARROWED, not fixed.** `Frontend`'s no-Tx `TxResolved` path now leaves a finalized entry
 > alone and ignores proofs (`server/store/Frontend.scala:636-637`). But `Tx.resolved` still writes
 > `(status, finalized = false, late = lateOutcome)` unconditionally (`server/transaction/Tx.scala:737-738`), so step 1

@@ -914,6 +914,13 @@ as soon as any object cannot reach `t` commits.
 > downgrade another's. Frontend's two workarounds (the finalized check on the no-Tx `TxResolved` path, and the restore
 > after a new Tx) were removed as redundant.
 
+> **Refresh (post-addendum): opposite outcomes.** The monotone merge ORed `finalized`/`late` across opposite statuses,
+> reachable through split decisions (paxos F2, P-N4): a stray abort over a finalized late commit became a finalized
+> abort that the relay spread, and a commit over a finalized abort became a finalized late commit whose drivers skip
+> the finalization actions. Now Committed wins (an abort never replaces a commit) and a commit replacing an abort
+> takes only its own flags (TransactionStatusCacheSuite "a false abort never replaces a finalized late commit", "a
+> commit replacing a finalized abort takes none of the abort's flags").
+
 > **Verification 2026-11-09: CONFIRMED. Severity: stale-replica / hygiene.** TransactionStatusCache.updateStatus is an unconditional put (TransactionStatusCache.scala:64-66); Tx's constructor writes Unresolved (Tx.scala:114) and resolved() writes finalized=false (Tx.scala:662) over an entry another store of the host may have marked finalized (Tx.scala:800). Frontend.receivePrepare restores status for new Txs only (Frontend.scala:660-664).
 > *Fix sketch:* Make updateStatus monotone (never downgrade finalized or a known outcome to Unresolved).
 

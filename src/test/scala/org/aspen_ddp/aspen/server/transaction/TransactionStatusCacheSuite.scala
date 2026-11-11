@@ -72,3 +72,24 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     cache.updateStatus(txid, TransactionStatus.Committed) // the sibling's delayed resolution (Tx.resolved)
     cache.getStatus(txid) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed, true, true))
   }
+
+  // Split decisions: a forgotten transaction decided again with the opposite outcome. Committed wins
+
+  test("a false abort never replaces a finalized late commit") {
+    val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), maxEntries = 100)
+    val txid = TransactionId(new UUID(0, 1))
+    cache.updateStatus(txid, TransactionStatus.Committed, finalized = true, late = true)
+    cache.updateStatus(txid, TransactionStatus.Aborted) // a stray TxResolved of a later round (paxos F2)
+    cache.updateStatus(txid, TransactionStatus.Aborted, finalized = true)
+    cache.getStatus(txid) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed, true, true))
+  }
+
+  test("a commit replacing a finalized abort takes none of the abort's flags") {
+    val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), maxEntries = 100)
+    val txid = TransactionId(new UUID(0, 1))
+    cache.updateStatus(txid, TransactionStatus.Aborted, finalized = true)
+    cache.updateStatus(txid, TransactionStatus.Committed) // the abort decided again as a commit (P-N4)
+    cache.getStatus(txid) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed, finalized = false))
+    cache.updateStatus(txid, TransactionStatus.Committed, finalized = true)
+    cache.getStatus(txid) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed, finalized = true))
+  }

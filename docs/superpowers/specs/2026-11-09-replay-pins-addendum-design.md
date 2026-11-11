@@ -288,3 +288,7 @@ wins over an earlier one.
 - **9 (test seam).** `missingDataWait` is a seam from `Host.Seams` through `DeviceControl`, `StoreLoader` and `Store`
   to `Frontend`, exposed as `TestNetwork.HostOptions.missingDataWait`, so the prefer-abort integration test waits
   200 ms instead of 5 s. No global var: suites run in parallel.
+- **10 (post-addendum fixes).** A `transactionFinalized` call skipped because another Tx holds the registration passes
+  its `writeStub` to that Tx (`stubOwed`): a replay's Tx deferring behind the same held commit replaces the first Tx's
+  registration, so the first Tx's call, carrying an owed stub, was dropped. And the host status cache resolves
+  opposite outcomes of a split decision to Committed, with flags only from the outcome they came with.

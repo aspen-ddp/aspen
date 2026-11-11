@@ -22,11 +22,22 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
   /** Records what is known of `txid`. Monotone, atomically (Ruling 30): `finalized` and `late` are sticky, and a
     * resolved status (Committed or Aborted) never reverts to Unresolved. Several stores of a host write the same
     * entry, and a write from one that learned less (a Tx created, or a delayed non-late resolution) must not erase
-    * what another recorded: the finalized relay (Store) reports from it
+    * what another recorded: the finalized relay (Store) reports from it.
+    *
+    * Opposite outcomes arise only from a split decision: a forgotten transaction decided again by a later round
+    * (paxos F2, a false abort of a commit; P-N4, an abort decided again as a commit). Committed wins, because a commit is
+    * what the stores hold and nothing rolls it back. An abort never replaces a commit, and the flags describe the
+    * outcome they came with: an abort's `finalized` and `late` do not pass to a commit that replaces it. Otherwise the
+    * relay would spread the false abort as finalized, or report a commit still being finalized as late, so that its
+    * driver skipped the finalization actions
     */
   def updateStatus(txid: TransactionId, status: TransactionStatus.Value, finalized: Boolean=false, late: Boolean=false): Unit = {
     cache.underlying.asMap().compute(txid, (_, old) =>
       if old == null then
+        Entry(status, finalized, late)
+      else if status == TransactionStatus.Aborted && old.status == TransactionStatus.Committed then
+        old
+      else if status == TransactionStatus.Committed && old.status == TransactionStatus.Aborted then
         Entry(status, finalized, late)
       else
         val merged = if status == TransactionStatus.Unresolved then old.status else status

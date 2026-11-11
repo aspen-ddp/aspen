@@ -3,8 +3,8 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 import scala.language.implicitConversions
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, Transaction}
-import org.aspen_ddp.aspen.client.tkvl.{PutRequirement, Root, TieredKeyValueList}
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, KeyValueListNode, NoCache, PutRequirement, Root, TieredKeyValueList}
+import org.aspen_ddp.aspen.common.objects.{Delete, Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, Directory, DirectoryEntry, DirectoryInode, DirectoryPointer, FileSystem, InodePointer}
@@ -13,6 +13,7 @@ import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, TaskExecutor}
 
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
 class SimpleDirectory(override val pointer: DirectoryPointer,
@@ -188,23 +189,16 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     getEntry(name).flatMap:
       case None => prepareInsert(name, file.pointer)
       case Some(_) => throw DirectoryEntryExists(this.pointer, name)
-
-  override def freeResources(): Future[Unit] =
-    given ExecutionContext = fs.executionContext
-
-    fs.client.retryStrategy.retryUntilSuccessful:
-      inode.contents.orootObject match
-        case None => Future.unit
-        case Some(root) =>
-          val tx = fs.client.newTransaction()
-          DeleteDirectoryContentTask.prepareTask(fs, pointer)(using tx)
-          tx.commit().map(_ => ())
 }
 
 object SimpleDirectory:
+  /** Deletes the content tree of a directory whose inode is gone, unlinking every entry still in it (a create
+    * racing the directory's removal can leave one). The tree's root is held in the task object, not the inode,
+    * since the transaction enrolling the task deletes the inode.
+    */
   object DeleteDirectoryContentTask extends DurableTaskFactory:
     private val FileSystemUUIDKey: Key = Key(1)
-    private val InodePointerKey: Key = Key(2)
+    private val RootKey: Key = Key(2)
 
     val typeUUID: UUID = UUID.fromString("c1fb782f-7f13-4921-8ddf-155123445730")
 
@@ -214,34 +208,34 @@ object SimpleDirectory:
                             state: Map[Key, KeyValueObjectState.ValueState],
                             taskExecutor: TaskExecutor): DurableTask =
       val fsUUID = byte2uuid(state(FileSystemUUIDKey).value.bytes)
-      val dptr = InodePointer(state(InodePointerKey).value.bytes).asInstanceOf[DirectoryPointer]
-
       val fs = FileSystem.getRegisteredFileSystem(fsUUID).get
 
-      new DeleteDirectoryContentTask(client, pointer, revision, state, fs, dptr)
+      new DeleteDirectoryContentTask(client, pointer, fs)
 
-    /** Returns a Future that completes then the task creation is prepared for commit of the transaction.
+    /** Returns a Future that completes when the task creation is prepared for commit of the transaction.
      * The inner future completes when the task finishes
      */
     def prepareTask(fs: FileSystem,
-                    directoryPointer: DirectoryPointer)
+                    root: Root)
                    (using tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] =
       fs.taskExecutor.prepareTask(
         DeleteDirectoryContentTask,
         List(
           FileSystemUUIDKey -> uuid2byte(fs.uuid),
-          InodePointerKey -> directoryPointer.toArray
+          RootKey -> root.encode()
         )
       ).map: fcomplete =>
         fcomplete.map(_ => ())
 
+    /** Signals an entry found by `deleteTree` after the drain: the drain runs again */
+    private class EntryRemains extends Exception("Directory entry remains after the drain")
+
   class DeleteDirectoryContentTask private(client: AspenClient,
                                            val taskPointer: DurableTaskPointer,
-                                           revision: ObjectRevision,
-                                           initialState: Map[Key, KeyValueObjectState.ValueState],
-                                           fs: FileSystem,
-                                           directoryPointer: DirectoryPointer
+                                           fs: FileSystem
                                           ) extends DurableTask:
+
+    import DeleteDirectoryContentTask.*
 
     given ExecutionContext = client.clientContext
 
@@ -252,18 +246,32 @@ object SimpleDirectory:
     resume()
 
     def resume(): Unit =
+      // Read fresh: an entry seen in a stale node would fail its KeyRevision on every pass
+      val tree = new TieredKeyValueList(client, new KVObjectRootManager(client, RootKey, taskPointer.kvPointer, NoCache))
 
-      // Although directory deletion is protected by isEmpty checks, race
-      // conditions could allow the directory to be deleted between the
-      // check and the removal from the parent directory. Simply delete any
-      // content found
-      def deleteEntry(key: Key, vs: ValueState): Future[Unit] =
-        client.transactUntilSuccessful: tx =>
-          UnlinkFileTask.prepareTask(fs, InodePointer(vs.value.bytes))(using tx).map(_ => ())
+      // The entry's removal and its unlink commit together, so each entry is unlinked exactly once. A failed
+      // attempt (the entry moved or went) is logged by foreach and left for the next pass
+      def unlinkEntry(node: KeyValueListNode, key: Key, vs: ValueState): Future[Future[Unit]] =
+        val tx = client.newTransaction()
+        tx.update(node.pointer, None, None, List(KeyValueUpdate.KeyRevision(key, vs.revision)), List(Delete(key)))
+        for
+          funlinked <- UnlinkFileTask.prepareTask(fs, InodePointer(vs.value.bytes))(using tx)
+          _ <- tx.commit()
+        yield funlinked.map(_ => ())
 
-      val rootManager = new SimpleDirectoryRootManager(client, directoryPointer.pointer)
-      val tree = new TieredKeyValueList(fs.client, rootManager)
+      // The unlinks enrolled by every pass, awaited before the task completes
+      val unlinked = new AtomicReference(List.empty[Future[Unit]])
 
+      // Unlinks every entry, then deletes the emptied tree. An entry deleteTree still finds (a pass that lost a
+      // race, or a late insert) fails the attempt, so the drain runs again rather than the entry being dropped
+      // without its unlink
       client.retryStrategy.retryUntilSuccessful:
-        tree.deleteTree(Some(deleteEntry)).map: _ =>
-          promise.success(None)
+        tree.foreach: (node, key, vs) =>
+          unlinkEntry(node, key, vs).map: funlinked =>
+            unlinked.updateAndGet(funlinked :: _)
+            ()
+        .flatMap: _ =>
+          tree.deleteTree(Some((_, _) => Future.failed(EntryRemains())))
+      .flatMap(_ => Future.sequence(unlinked.get))
+      .onComplete: _ =>
+        promise.success(None)

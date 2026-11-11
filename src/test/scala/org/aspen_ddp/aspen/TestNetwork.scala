@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, Gossip, HostMessage, Read, ReadResponse, TxMessage}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, Gossip, HostMessage, Read, ReadResponse, TxMessage, TxPrepare}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -277,6 +277,27 @@ class TestNetwork(executionContext: ExecutionContext,
 
   private var recordedTx: List[TxMessage] = Nil
 
+  /** Opt-in: a client's initial prepares for a transaction are held until it has sent one to every store, then
+   *  delivered together before events are drained. The client sends them one at a time, and draining after each lets
+   *  the first stores decide and finalize before the last sees its prepare: that store misses the update, and
+   *  nothing here repairs it. Two stores each missing a different object a later transaction requires make that
+   *  transaction abort on every attempt. Off by default: suites that need a store behind rely on that ordering.
+   *  Set it in subFixtureSetup.
+   */
+  @volatile var batchClientPrepares: Boolean = false
+
+  private var heldPrepares: Map[TransactionId, List[TxPrepare]] = Map()
+
+  /** The held batch for `p`'s transaction, oldest first, once it holds a prepare for every store */
+  private def holdPrepare(p: TxPrepare): Option[List[TxPrepare]] = synchronized:
+    val batch = p :: heldPrepares.getOrElse(p.transactionId, Nil)
+    if batch.size >= p.txd.allDataStores.size then
+      heldPrepares -= p.transactionId
+      Some(batch.reverse)
+    else
+      heldPrepares += p.transactionId -> batch
+      None
+
   /** The messages recorded since the last call, oldest first */
   def takeRecordedTxMessages(): List[TxMessage] = synchronized:
     val taken = recordedTx.reverse
@@ -343,12 +364,17 @@ class TestNetwork(executionContext: ExecutionContext,
       handleEvents()
     }
 
-    def sendTransactionMessage(msg: TxMessage): Unit = {
-      handleEvents()
-      if !dropped(msg) then
-        hostFor(msg.to).receiveTransactionMessage(msg)
-      handleEvents()
-    }
+    def sendTransactionMessage(msg: TxMessage): Unit = msg match
+      case p: TxPrepare if batchClientPrepares && p.fromClient =>
+        holdPrepare(p).foreach: batch =>
+          handleEvents()
+          batch.foreach(m => if !dropped(m) then hostFor(m.to).receiveTransactionMessage(m))
+          handleEvents()
+      case _ =>
+        handleEvents()
+        if !dropped(msg) then
+          hostFor(msg.to).receiveTransactionMessage(msg)
+        handleEvents()
 
     def sendTransactionMessages(msg: List[TxMessage]): Unit = msg.foreach(sendTransactionMessage)
 

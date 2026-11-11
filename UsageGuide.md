@@ -681,11 +681,14 @@ class UnlinkFileTask(
     val updatedLink = byte2int(state("updatedLink"))
     updatedLink match
       case 0 =>
+        // Everything in the step's own transaction: the content task is enrolled exactly once, with the
+        // inode's removal. A step must never commit transactions of its own while it is prepared
         for
-          entry <- fs.lookup(iptr)
-          _ <- entry.freeResources()
+          (inode, _, revision) <- fs.readInode(iptr)
+          ffreed <- UnlinkFileTask.prepareContentDeletion(fs, inode)
           _ <- fs.inodeTable.delete(iptr)
         yield
+          tx.bumpVersion(iptr.pointer, revision)
           tx.setRefcount(iptr.pointer, ObjectRefcount(0, 1), ObjectRefcount(1, 0))
           state
       case _ => Future.successful(state)

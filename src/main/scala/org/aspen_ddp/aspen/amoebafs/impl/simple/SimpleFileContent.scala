@@ -155,17 +155,6 @@ class SimpleFileContent(file: SimpleFile,
       yield
         fcomplete
         
-  def deleteFile(): Future[Unit] = 
-    given ExecutionContext = fs.executionContext
-    fs.client.retryStrategy.retryUntilSuccessful:
-      val inode = file.inode
-      inode.contents.orootObject match
-        case None => Future.unit
-        case Some(root) => 
-          val tx = fs.client.newTransaction()
-          DeleteFileContentTask.prepareTask(fs, inode.contents)(using tx)
-          tx.commit().map(_ => ())
-
   def write(offset: Long,
             buffers: List[DataBuffer])
            (using tx: Transaction, ec: ExecutionContext): Future[WriteResult] =

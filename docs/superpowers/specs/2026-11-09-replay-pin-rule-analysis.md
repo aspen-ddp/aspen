@@ -237,7 +237,12 @@ Separate from this question. Worth fixing either way.
 - **Concurrent create overwrite:** directory insert of an absent name is blind, so a concurrent create of the same name
   is overwritten and its inode leaks. *Unverified.*
 - **`UnlinkFileTask` step 2:** runs `freeResources()` transactions while the step is being prepared, so a step retry
-  enrolls duplicate delete tasks. *Unverified.*
+  enrolls duplicate delete tasks. *Verified, worse than stated, fixed.* The separate transaction was committed before
+  the task enrollment was staged, so it was usually empty and "succeeded" with nothing in it: unlinked content was
+  never freed, and a task object leaked each time. `DeleteDirectoryContentTask` also read its root from the inode the
+  same step deletes, and unlinked each entry in a transaction separate from the entry's removal (a crash between them
+  unlinked it twice). Step 2 now enrolls the content task in its own transaction, at the inode revision it read; the
+  directory task holds the root in its task object and removes each entry in the transaction that unlinks it.
 - **Unguarded node deletes:** DataObject TKVL `deleteList` deletes nodes with `lockRevision` + `setRefcount` rather
   than `bumpVersion`, against the tkvl rule that deleted nodes get a version bump. `JoinFinalizationAction.setNewRoot`
   deletes the old root with only a refcount update. *Unverified.*

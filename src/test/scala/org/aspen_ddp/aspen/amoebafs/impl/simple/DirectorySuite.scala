@@ -5,10 +5,11 @@ import org.aspen_ddp.aspen.PinAudit
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.tkvl.{Root, RootAlreadyModified, SinglePoolNodeAllocator, TieredKeyValueList}
-import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyAlreadyExists, LexicalKeyOrdering, ObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Key, KeyAlreadyExists, LexicalKeyOrdering, ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
-import org.aspen_ddp.aspen.amoebafs.{Directory, DirectoryInode, DirectoryPointer, FileMode, FileSystem, Timespec}
+import org.aspen_ddp.aspen.amoebafs.{Directory, DirectoryInode, DirectoryPointer, FileInode, FileMode, FilePointer, FileSystem, Timespec}
+import org.aspen_ddp.aspen.common.DataBuffer
 
 import scala.concurrent.Future
 
@@ -790,3 +791,89 @@ class DirectorySuite extends FilesSystemTestSuite:
         case kvu: KeyValueUpdate => kvu.requirements.contains(KeyValueUpdate.KeyRevision(Key(target), targetRevision))
         case _ => false
       .should(be(true))
+
+  /** These tests await every step of an unlink, whose later steps require state earlier transactions wrote. A store
+    * that missed one of those (see TestNetwork.batchClientPrepares) would never catch up here, and two such stores
+    * would abort the step on every attempt
+    */
+  private def awaitsUnlinkSteps(): Unit = net.batchClientPrepares = true
+
+  private def createFile(dir: Directory, name: String): Future[FilePointer] =
+    client.transact { tx =>
+      given Transaction = tx
+      dir.prepareCreateFile(name, mode=0, uid=1, gid=2)
+    }.flatMap(identity)
+
+  // The unlink's completion includes the release of the content it enrolled
+  atest("unlinking a file frees its content tree and data segments"):
+    awaitsUnlinkSteps()
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      filePtr <- createFile(rootDir, "f")
+      file <- fs.loadFile(filePtr)
+      _ <- file.write(0, DataBuffer(Array[Byte](1, 2, 3)))
+      _ <- waitForTransactionsToComplete()
+      (inode, _, _) <- fs.readInode(filePtr)
+      contentRoot = inode.asInstanceOf[FileInode].contents.rootKeyValuePointer.get
+      rootKvos <- client.read(contentRoot)
+      segments = rootKvos.contents.values.map(vs => DataObjectPointer(vs.value.bytes)).toList
+      fdel <- rootDir.delete("f")
+      _ <- fdel
+      oroot <- client.readOptional(contentRoot)
+      osegments <- Future.sequence(segments.map(client.readOptional))
+      oinode <- client.readOptional(filePtr.pointer)
+    yield
+      segments should not be empty
+      oroot should be (None)
+      osegments.flatten shouldBe empty
+      oinode should be (None)
+
+  // The content task must not depend on the inode the same unlink step deletes
+  atest("unlinking a directory frees its content tree"):
+    awaitsUnlinkSteps()
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      dPtr <- cdir(rootDir, "d", mode=0, uid=1, gid=2)
+      d <- fs.loadDirectory(dPtr)
+      _ <- cdir(d, "x", mode=0, uid=1, gid=2)
+      fx <- d.delete("x")
+      _ <- fx
+      (inode, _, _) <- fs.readInode(dPtr)
+      contentRoot = inode.asInstanceOf[DirectoryInode].contents.rootKeyValuePointer.get
+      fdel <- rootDir.delete("d")
+      _ <- fdel
+      oroot <- client.readOptional(contentRoot)
+      oinode <- client.readOptional(dPtr.pointer)
+    yield
+      oroot should be (None)
+      oinode should be (None)
+
+  // A create racing an rmdir can leave an entry in a directory whose last link is gone. Its content deletion
+  // unlinks the entry, exactly once
+  atest("deleting a non-empty directory's content unlinks each entry once"):
+    awaitsUnlinkSteps()
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      dPtr <- cdir(rootDir, "d", mode=0, uid=1, gid=2)
+      d <- fs.loadDirectory(dPtr)
+      filePtr <- createFile(rootDir, "f")
+      file <- fs.loadFile(filePtr)
+      _ <- client.transact { tx =>
+        given Transaction = tx
+        d.prepareHardLink("g", file)
+      }
+      (linked, _, _) <- fs.readInode(filePtr)
+      // Unlink d without the emptiness check
+      funlink <- client.transact { tx =>
+        UnlinkFileTask.prepareTask(fs, dPtr)(using tx)
+      }
+      _ <- funlink
+      (after, _, _) <- fs.readInode(filePtr)
+      oinode <- client.readOptional(dPtr.pointer)
+    yield
+      linked.links should be (2)
+      after.links should be (1)
+      oinode should be (None)

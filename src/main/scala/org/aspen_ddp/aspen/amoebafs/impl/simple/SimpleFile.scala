@@ -25,8 +25,6 @@ class SimpleFile(override val pointer: FilePointer,
     val t = super.inodeState
     (t._1.asInstanceOf[FileInode], t._2)
 
-  override def freeResources(): Future[Unit] = sfc.deleteFile()
-
   def debugReadFully(): Future[Array[Byte]] = sfc.debugReadFully()
 
   def read(offset: Long, nbytes: Int): Future[Option[DataBuffer]] =

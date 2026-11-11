@@ -2,11 +2,26 @@ TODO
 ====
 
 Unverified findings from the replay-pins work (check each before acting):
-- UnlinkFileTask step 2 runs unpinned transactions during step preparation.
 - DataObject TKVL deleteList uses exclusiveLockRevision rather than bumpVersion.
 - JoinFinalizationAction.setNewRoot deletes the old root with only a refcount update.
 - Joins triggered through StoreRepairer.deleteEntry register no JoinFinalizationAction.
 - LocalTimeRequirement's Equals comparison looks inverted.
+
+Test environment:
+- TestNetwork creates missed updates that nothing repairs. The client sends a transaction's prepares one store at a
+  time and the test messenger drains events after each, so the first stores can decide and finalize before the last
+  sees its prepare (~100 such missed updates per DirectorySuite run). The test client has no opportunistic rebuild and
+  no repairer runs, so a later transaction requiring state two stores each missed aborts on every attempt (a hang).
+  TestNetwork.batchClientPrepares (opt-in, off by default) delivers a client's prepares together; only the
+  unlink-step tests in DirectorySuite use it. Enabling it globally (or batching in ClientTransactionDriver) breaks
+  AppendIntegrationSuite / RangedWriteIntegrationSuite (they rely on a store falling behind) and 4
+  PoolObjectAllocatorSuite tests (not investigated). Decide whether to make it the default, with those suites making
+  a store fall behind explicitly (dropTxMessage).
+- Flaky under full-suite load, each seen once in 4 runs, unrelated to the unlink fix:
+  DeviceCrlSuite "a shut-down device adopted by another host recovers its in-flight transaction" (DeviceCrlSuite:238,
+  prepareInFlight's fixed 2000 pump rounds); "an FSIF store whose recovery finds it lost is rebuilt through the
+  rebuild path" (TransactionAborted). Seen on the unmodified baseline (1 of 3 runs): "a client learns host liveness
+  from its relays and replaces a relay that goes offline".
 
 Pre-existing amoebafs bugs found during the replay-pins work:
 - Cross-node rename whose delete joins into the target node updates that node twice, so the rename deterministically

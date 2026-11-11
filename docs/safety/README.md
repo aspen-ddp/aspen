@@ -11,7 +11,9 @@ device CRL, `TxFinalized.owed`), with a "Re-assessment for the replay-pins adden
 The final fix wave of that addendum (amendments 7 to 9: a second driver finalizes at once with its planned set, an
 orphan stub is dropped only by the second scan to find it so, and a deferred finalization is concluded only by its own
 Tx) is recorded as "Refresh (final fix wave)" notes on the findings it changes (R-N7, R-N8, R-N11, P-N10, X13, X14,
-RP-N6, RP-N7) and in the rows below. Each has its own "Suspected flaws" section, annotated with adversarial verification verdicts:
+RP-N6, RP-N7) and in the rows below. The 2026-11-11 follow-ups (the finalization failure path, chunked
+UnackedCommits entries, explicit ownership of deferred finalizations, and a refresh of every line citation in
+paxos-transactions.md) are recorded as dated notes on the findings they change and in the rows below. Each has its own "Suspected flaws" section, annotated with adversarial verification verdicts:
 
 - **CONFIRMED**: the mechanism was traced in the code, or reproduced.
 - **PLAUSIBLE**: the mechanism is real, but the trigger is uncertain.
@@ -98,6 +100,7 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 | Recovery F14 / X5 | CONFIRMED | Finalization still needs the marker's write; under a metadata outage or CRL admission pressure transactions pile up unfinalized |
 | Recovery R-N3 | CONFIRMED (new) | Every recovered commit vote waits, holding its locks and with no driver, for its UnackedCommits lookup; a metadata-group outage stalls them all |
 | Recovery R-N4 / Repair RP-N3 | CONFIRMED (new) | UnackedCommits entries are one per (store, transaction), never merge, and are now written for every transaction with a silent voter: tree growth, larger marker batches, double reconciles |
+| Cross G9 | **FIXED** 2026-11-11 (was a coverage gap) | An UnackedCommits entry naming more objects than half a metadata-tree node (about 90 with 4 KiB FSIF segments) failed its insert with `NodeSizeExceeded`, retried forever; the marker now writes it as chunks under consecutive keys (repair-process 13.0b), and a node too small for one object gives up into the finalizer failure path |
 | Recovery F1 / X8 | **FIXED** 2026-11-11 (was CONFIRMED) | An unknown finalizer type threw after resolution and the transaction never finalized; creation now takes the finalizer failure path (logged, retried with backoff) |
 | Recovery F12 / X4 | **FIXED** (Ruling 31) (was CONFIRMED) | `Store.close` shuts down the store's drivers, so no zombie driver keeps re-preparing; P-N4's delayed duplicate client prepare is unaffected |
 | CRL F9 | CONFIRMED | Death of the writer thread only logs, and all dependent futures hang |

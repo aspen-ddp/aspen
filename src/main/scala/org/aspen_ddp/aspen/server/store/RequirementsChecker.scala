@@ -204,21 +204,15 @@ object RequirementsChecker extends Logging {
     if newSize > maxSliceSize && newSize > currentSize then
       throw ObjectErr(objectId, SliceSizeExceeded(newSize, maxSliceSize))
 
-  def checkLocalTime(tsReq: LocalTimeRequirement): Unit = {
-    val now = HLCTimestamp.now
-    tsReq.tsRequirement match {
-      case LocalTimeRequirement.Requirement.Equals =>
-        if (now == tsReq.timestamp)
-          throw NonObjectErr(LocalTimeError())
-
-      case LocalTimeRequirement.Requirement.LessThan =>
-        if (now < tsReq.timestamp)
-          throw NonObjectErr(LocalTimeError())
-
-      case LocalTimeRequirement.Requirement.GreaterThan =>
-        if (now > tsReq.timestamp)
-          throw NonObjectErr(LocalTimeError())
+  /** Holds when the store's local time `now` equals, is less than, or is greater than the requirement's timestamp */
+  def checkLocalTime(tsReq: LocalTimeRequirement, now: HLCTimestamp = HLCTimestamp.now): Unit = {
+    val holds = tsReq.tsRequirement match {
+      case LocalTimeRequirement.Requirement.Equals => now == tsReq.timestamp
+      case LocalTimeRequirement.Requirement.LessThan => now < tsReq.timestamp
+      case LocalTimeRequirement.Requirement.GreaterThan => now > tsReq.timestamp
     }
+    if !holds then
+      throw NonObjectErr(LocalTimeError())
   }
 
   def checkRevision(state: ObjectState, requiredRevision: ObjectRevision, txTimestamp: HLCTimestamp): Unit = {
@@ -340,7 +334,7 @@ object RequirementsChecker extends Logging {
             case r: KeyValueUpdate.TimestampLessThan => kvs.content.get(r.key) match {
               case None => throw ObjectErr(state.objectId, KeyExistenceError())
               case Some(vs) =>
-                if (vs.timestamp < r.timestamp)
+                if (!(vs.timestamp < r.timestamp))
                   throw ObjectErr(state.objectId, KeyTimestampError())
                 checkLock(vs, kvs)
             }
@@ -348,7 +342,7 @@ object RequirementsChecker extends Logging {
             case r: KeyValueUpdate.TimestampGreaterThan => kvs.content.get(r.key) match {
               case None => throw ObjectErr(state.objectId, KeyExistenceError())
               case Some(vs) =>
-                if (vs.timestamp > r.timestamp)
+                if (!(vs.timestamp > r.timestamp))
                   throw ObjectErr(state.objectId, KeyTimestampError())
                 checkLock(vs, kvs)
             }

@@ -7,6 +7,10 @@ import scala.concurrent.duration.{DurationInt, FiniteDuration}
 
 sealed abstract class TransactionRequirement
 
+/** Holds when the local time of each store checking it equals, is less than, or is greater than `timestamp`
+  * (`Equals`, `LessThan`, `GreaterThan`). Every store hosting an object of the transaction checks it against its own
+  * clock when it votes, so stores can disagree, and a store's failure aborts its vote for all of its objects.
+  */
 case class LocalTimeRequirement(timestamp: HLCTimestamp,
                                 tsRequirement: LocalTimeRequirement.Requirement.Value) extends TransactionRequirement
 
@@ -88,8 +92,11 @@ object KeyValueUpdate {
   case class Exists(key: Key) extends KeyRequirement
   case class MayExist(key: Key) extends KeyRequirement
   case class DoesNotExist(key: Key) extends KeyRequirement
+  /** The key exists and its timestamp equals `timestamp` */
   case class TimestampEquals(key: Key, timestamp: HLCTimestamp) extends KeyRequirement
+  /** The key exists and its timestamp is less than `timestamp` */
   case class TimestampLessThan(key: Key, timestamp: HLCTimestamp) extends KeyRequirement
+  /** The key exists and its timestamp is greater than `timestamp` */
   case class TimestampGreaterThan(key: Key, timestamp: HLCTimestamp) extends KeyRequirement
 
 }

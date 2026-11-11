@@ -81,8 +81,8 @@ or an object-level operation (`:132-134`). Otherwise it is "key level".
 | `MayExist(k)` | present: not locked; absent: no absent-key lock by another (`:314-319`) | present-key lock, or `absentKeyLocks(k)` if absent (`lockKey` `:118-121`) | |
 | `DoesNotExist(k)` | absent and no absent-key lock by another (`:321-326`) | `absentKeyLocks(k) = tx` (`:99`) | |
 | `TimestampEquals(k, ts)` | present, key timestamp == ts, not locked (`:328-334`) | present-key lock | |
-| `TimestampLessThan(k, ts)` | present, error if `key.timestamp < ts`, i.e. passes when `key.timestamp >= ts` (`:336-342`) | present-key lock | The name reads "ts is less than the key's timestamp" |
-| `TimestampGreaterThan(k, ts)` | present, error if `key.timestamp > ts`, i.e. passes when `key.timestamp <= ts` (`:344-350`) | present-key lock | Not used by any non-test, non-codec code |
+| `TimestampLessThan(k, ts)` | present, key timestamp < ts, not locked (`RequirementsChecker` `TimestampLessThan` case) | present-key lock | Not used by any non-test, non-codec code (F9, fixed) |
+| `TimestampGreaterThan(k, ts)` | present, key timestamp > ts, not locked (`RequirementsChecker` `TimestampGreaterThan` case) | present-key lock | Not used by any non-test, non-codec code (F9, fixed) |
 | Operation `Insert(k, v)` | after requirements, every key an operation writes is checked like a key lock: present key's lock holder, else `absentKeyLocks` holder, must be none or this tx (`:145-152`, not when `applying`) | `lockWrites`: present-key lock or absent-key lock (`:131-134`, `lockKey`) | A blind insert (no requirement on `k`) still locks `k` |
 | Operation `Delete(k)` | same as Insert; requires `deletesKeys` | same as Insert | Leaves no trace (see `appliedBy`) |
 | Operation `SetMin/SetMax/SetLeft/SetRight/DeleteMin/DeleteMax/DeleteLeft/DeleteRight` | `KVWrites.objectLevel = true` (`KVWrites.scala:22-28`), so the update is whole-object (`Checker:134`) | `lockWrites`: object exclusive (`Locker:131-133`) | Do not set `deletesKeys` |
@@ -114,10 +114,10 @@ Ruling 24).
 
 `LocalTimeRequirement(timestamp, Equals|LessThan|GreaterThan)` is the only non-object requirement
 (`TransactionRequirement.scala:50`). It is checked by every store hosting any object of the transaction against that
-store's `HLCTimestamp.now` (`RequirementsChecker.scala:203-218`). It takes no lock and applies nothing
-(`Locker:45`, `Applyer:41`). Semantics: `Equals` **fails when equal** (`now == ts` throws), `LessThan` fails when
-`now < ts`, `GreaterThan` fails when `now > ts` (so `GreaterThan(ts)` means "ts is greater than now"). The tests encode this
-(`RequirementsCheckerSuite.scala:604-640`). No code outside tests constructs it (grep: only codec, checker, locker,
+store's `HLCTimestamp.now` (`RequirementsChecker.checkLocalTime`). It takes no lock and applies nothing
+(`Locker:45`, `Applyer:41`). Semantics (F9, fixed): it holds when the store's local time `now` equals, is less than, or is
+greater than `ts` (`Equals`, `LessThan`, `GreaterThan`), as named. `RequirementsCheckerSuite` "Localtime comparisons hold
+exactly as named against the local time" covers each case. No code outside tests constructs it (grep: only codec, checker, locker,
 applyer), and there is no `TransactionBuilder` method for it. Because each store reads its own clock at its own time, the
 votes of different stores need not agree, which is harmless to safety (only commit votes counted per object matter) but
 makes the requirement non-deterministic; a non-object failure aborts the store's vote for all of its objects
@@ -704,6 +704,12 @@ a recovered commit vote for it relies on the recovery driver (see [transaction-r
 
 > **Verification 2026-11-09: CONFIRMED. Severity: doc-only.** RequirementsChecker.checkLocalTime throws on Equals when equal and inverts LessThan/GreaterThan (RequirementsChecker.scala:~203-217); no non-test callers (grep).
 > *Fix sketch:* Fix or delete.
+>
+> **Status 2026-11-11: FIXED (semantics).** Every comparison now holds as named: `LocalTimeRequirement` compares the
+> store's `now` to `ts` (`Equals` holds when equal, `LessThan` when `now < ts`, `GreaterThan` when `now > ts`), and
+> `TimestampLessThan/GreaterThan(k, ts)` hold when the key's timestamp is `<` / `>` `ts`. The definitions carry scaladoc
+> and `RequirementsCheckerSuite` tests each direction. Remaining by design: `LocalTimeRequirement` is checked by each
+> store against its own clock, so stores can disagree (documented on the class); it is still unused outside tests.
 
 
 `Equals` throws when equal (`Checker:207-209`), the other two compare `now` to `ts` in the opposite direction from the

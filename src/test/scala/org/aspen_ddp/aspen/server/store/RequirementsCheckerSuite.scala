@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, SetMax, SetRight, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, MissingObject, RequirementCheckFailure, RequirementError, ExclusiveRevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, AppendMismatch, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, KeyTimestampError, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, MissingObject, RequirementCheckFailure, RequirementError, ExclusiveRevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, AppendMismatch, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -630,7 +630,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(errs.isEmpty)
   }
 
-  test("Localtime okay") {
+  test("Localtime GreaterThan holds when the local time is later") {
     val o = new ObjectState(
       oid1,
       Metadata(rev1, ref1, ts1),
@@ -648,10 +648,10 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
 
     assert(oerrs.isEmpty)
-    assert(errs == List(LocalTimeError()))
+    assert(errs.isEmpty)
   }
 
-  test("Localtime error") {
+  test("Localtime LessThan fails when the local time is later") {
     val o = new ObjectState(
       oid1,
       Metadata(rev1, ref1, ts1),
@@ -670,7 +670,27 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
 
     assert(oerrs.isEmpty)
-    assert(errs.isEmpty)
+    assert(errs == List(LocalTimeError()))
+  }
+
+  test("Localtime comparisons hold exactly as named against the local time") {
+    import LocalTimeRequirement.Requirement.{Equals, GreaterThan, LessThan}
+
+    def holds(req: LocalTimeRequirement.Requirement.Value, ts: Long, now: Long): Boolean =
+      try
+        RequirementsChecker.checkLocalTime(LocalTimeRequirement(HLCTimestamp(ts), req), HLCTimestamp(now))
+        true
+      catch case _: Throwable => false
+
+    assert(holds(Equals, 5, 5))
+    assert(!holds(Equals, 5, 4))
+    assert(!holds(Equals, 5, 6))
+    assert(holds(LessThan, 5, 4))
+    assert(!holds(LessThan, 5, 5))
+    assert(!holds(LessThan, 5, 6))
+    assert(holds(GreaterThan, 5, 6))
+    assert(!holds(GreaterThan, 5, 5))
+    assert(!holds(GreaterThan, 5, 4))
   }
 
   test("KeyValues checks") {
@@ -863,23 +883,21 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       assert(errs.isEmpty)
     }
 
-    {
-      val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.TimestampLessThan(k2, ts1)))
-
+    // k1 and k2 hold timestamp ts1. Each comparison holds exactly as named: the key's timestamp against the given one
+    def timestampCheck(kreq: KeyValueUpdate.KeyRequirement): Map[ObjectId, RequirementError] =
+      val req = KeyValueUpdate(kp1, Some(rev1), None, List(kreq))
       val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
-
-      assert(oerrs.isEmpty)
       assert(errs.isEmpty)
-    }
+      oerrs
 
-    {
-      val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.TimestampGreaterThan(k1, ts2)))
-
-      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
-
-      assert(oerrs.isEmpty)
-      assert(errs.isEmpty)
-    }
+    val ts0 = HLCTimestamp(0)
+    assert(timestampCheck(KeyValueUpdate.TimestampLessThan(k2, ts2)).isEmpty)
+    assert(timestampCheck(KeyValueUpdate.TimestampLessThan(k2, ts1)) == Map(o.objectId -> KeyTimestampError()))
+    assert(timestampCheck(KeyValueUpdate.TimestampLessThan(k2, ts0)) == Map(o.objectId -> KeyTimestampError()))
+    assert(timestampCheck(KeyValueUpdate.TimestampGreaterThan(k1, ts0)).isEmpty)
+    assert(timestampCheck(KeyValueUpdate.TimestampGreaterThan(k1, ts1)) == Map(o.objectId -> KeyTimestampError()))
+    assert(timestampCheck(KeyValueUpdate.TimestampGreaterThan(k1, ts2)) == Map(o.objectId -> KeyTimestampError()))
+    assert(timestampCheck(KeyValueUpdate.TimestampEquals(k1, ts2)) == Map(o.objectId -> KeyTimestampError()))
 
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.WithinRange(k2, ByteArrayKeyOrdering)))

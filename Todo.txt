@@ -1,9 +1,6 @@
 TODO
 ====
 
-Unverified findings from the replay-pins work (check each before acting):
-- LocalTimeRequirement's Equals comparison looks inverted.
-
 Test environment:
 - TestNetwork creates missed updates that nothing repairs. The client sends a transaction's prepares one store at a
   time and the test messenger drains events after each, so the first stores can decide and finalize before the last

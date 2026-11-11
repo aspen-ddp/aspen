@@ -4,8 +4,8 @@ import scala.language.implicitConversions
 import java.io.IOException
 import java.nio.ByteBuffer
 import com.github.blemale.scaffeine.{LoadingCache, Scaffeine}
-import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying, TransactionCreationError}
-import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, InvalidInode}
+import org.aspen_ddp.aspen.client.FatalReadError
+import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, BlockDevice, CharacterDevice, Directory, DirectoryInode, File, FileHandle, FileMode, FileSystem, FileType, InodePointer, Symlink, Timespec}
 
 import javax.security.auth.Subject
@@ -332,42 +332,12 @@ class AmoebaNFS(val fs: FileSystem,
     logger.info(s"move $oldName to $newName. Src ${s.inodeNumber} Dst ${d.inodeNumber}")
 
     val fcomplete = if s.inode.inodeNumber == d.inode.inodeNumber then
-      s.rename(oldName, newName).map(_ => true)
+      s.rename(oldName, newName)
     else
-      blockingCall { s.getEntry(oldName) } match
-        case None => throw new NoEntException(s"$oldName does not exist")
-        case Some(iptr) =>
-          val odir = iptr.ftype match
-            case FileType.Directory => Some(getDirectory(iptr.number))
-            case _ => None
-
-          val refreshOnFailure = s :: d :: odir.map(t => t :: Nil).getOrElse(Nil)
-
-          def onFail(err: Throwable): Future[Unit] = err match
-            case e: InvalidInode => throw StopRetrying(e)
-            case e: DirectoryEntryExists => throw StopRetrying(e)
-            case e: DirectoryEntryDoesNotExist => throw StopRetrying(e)
-            case e: FatalReadError => throw StopRetrying(e)
-            case e: TransactionCreationError => throw StopRetrying(e)
-            case _ =>
-              val refreshOld = s.getEntry(oldName)
-              val refreshNew = d.getEntry(newName)
-              for
-                _ <- Future.sequence(refreshOnFailure.map(_.refresh())).map(_ => ())
-                oldf <- refreshOld
-                newf <- refreshNew
-              yield
-                if (oldf.isEmpty)
-                  throw StopRetrying(DirectoryEntryDoesNotExist(s.pointer, oldName))
-                if (newf.nonEmpty)
-                  throw StopRetrying(DirectoryEntryExists(d.pointer, newName))
-
-          // Completes once the move commits, or fails with the StopRetrying that ends the retries
-          fs.client.transactUntilSuccessfulWithRecovery(onFail): tx =>
-            Directory.prepareMove(s, oldName, d, newName, iptr, odir)(using tx)
-          .map(_ => true)
+      Directory.move(s, oldName, d, newName)
 
     blockingCall( fcomplete )
+    true
   }
 
   /**

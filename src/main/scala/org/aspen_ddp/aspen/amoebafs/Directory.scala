@@ -33,6 +33,12 @@ trait Directory extends BaseFile with Logging {
 
   def prepareDelete(name: String, decref: Boolean=true)(using tx: Transaction): Future[Future[Unit]]
 
+  /** Stages the removal of entry `name` by a move: the inode keeps its links. The entry is deleted under its
+    * KeyRevision as read, the pin, and the result is the pointer it held, so the move re-inserts exactly the inode the
+    * commit removes. Fails with DirectoryEntryDoesNotExist if there is no such entry.
+    */
+  def prepareMoveOut(name: String)(using tx: Transaction): Future[InodePointer]
+
   def prepareRename(oldName: String, newName: String)(using tx: Transaction): Future[Unit]
 
   def prepareHardLink(name: String, file: BaseFile)(using tx: Transaction): Future[Unit]
@@ -293,24 +299,57 @@ trait Directory extends BaseFile with Logging {
 }
 
 object Directory:
-  /** Stages the move of `iptr`, the entry `oldName` of `src`, to `newName` in `dst`, a different directory.
-    * `movedDirectory` is the moved inode when it is a directory: its parent pointer is updated too. The returned
+  /** Moves entry `oldName` of `src` to `newName` in `dst`, a different directory, retrying until it commits. Each
+    * attempt reads the entry afresh (see `prepareMove`). Fails with DirectoryEntryDoesNotExist if `oldName` is gone
+    * and, after a failed attempt, with DirectoryEntryExists if `newName` has appeared.
+    */
+  def move(src: Directory, oldName: String, dst: Directory, newName: String): Future[Unit] =
+    given ExecutionContext = src.fs.executionContext
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: InvalidInode => throw StopRetrying(e)
+      case e: DirectoryEntryExists => throw StopRetrying(e)
+      case e: DirectoryEntryDoesNotExist => throw StopRetrying(e)
+      case e: FatalReadError => throw StopRetrying(e)
+      case e: TransactionCreationError => throw StopRetrying(e)
+      case _ =>
+        for
+          _ <- Future.sequence(List(src.refresh(), dst.refresh()))
+          oldf <- src.getEntry(oldName)
+          newf <- dst.getEntry(newName)
+        yield
+          if oldf.isEmpty then
+            throw StopRetrying(DirectoryEntryDoesNotExist(src.pointer, oldName))
+          if newf.nonEmpty then
+            throw StopRetrying(DirectoryEntryExists(dst.pointer, newName))
+
+    src.fs.client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+      prepareMove(src, oldName, dst, newName)(using tx)
+
+  /** Stages the move of the entry `oldName` of `src` to `newName` in `dst`, a different directory. The returned
     * future completes once everything is staged, so the caller commits only then.
     *
-    * The source entry is deleted under its KeyRevision, which pins the transaction. The destination entry is
-    * inserted under `DoesNotExist`, or under the KeyRevision of an entry it replaces, which is unlinked.
+    * The source entry is read and deleted under its KeyRevision (`prepareMoveOut`), which pins the transaction, and
+    * the pointer it held is the one moved: a concurrent replacement of the entry aborts the attempt rather than
+    * moving an inode no longer under the name. A moved directory has its parent pointer rewritten at its inode's
+    * revision as read here. The destination entry is inserted under `DoesNotExist`, or under the KeyRevision of an
+    * entry it replaces, which is unlinked.
     */
   def prepareMove(src: Directory,
                   oldName: String,
                   dst: Directory,
-                  newName: String,
-                  iptr: InodePointer,
-                  movedDirectory: Option[Directory])(using tx: Transaction): Future[Unit] =
+                  newName: String)(using tx: Transaction): Future[Unit] =
     given ExecutionContext = src.fs.executionContext
-    movedDirectory.foreach(_.prepareSetParentDirectory(dst))
     for
-      // No decref, so the returned task future is Future.unit
-      _ <- src.prepareDelete(oldName, decref = false)
+      iptr <- src.prepareMoveOut(oldName)
+      _ <- iptr match
+        case dptr: DirectoryPointer =>
+          for
+            moved <- src.fs.loadDirectory(dptr)
+            _ <- moved.refresh()
+          yield
+            moved.prepareSetParentDirectory(dst)
+        case _ => Future.unit
       _ <- dst.prepareInsert(newName, iptr, incref = false)
     yield
       ()

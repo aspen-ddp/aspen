@@ -720,7 +720,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       _ <- b.refresh()
       audit = new PinAudit(client)
       _ <- client.transact: tx =>
-        Directory.prepareMove(a, "sub", b, "moved", subPtr, Some(sub))(using tx)
+        Directory.prepareMove(a, "sub", b, "moved")(using tx)
       _ = audit.stop()
       aEntry <- a.getEntry("sub")
       bEntry <- b.getEntry("moved")
@@ -737,6 +737,46 @@ class DirectorySuite extends FilesSystemTestSuite:
       bEntry.map(_.number) should be (Some(subPtr.number))
       movedInode.oparent.map(_.number) should be (Some(bPtr.number))
       innerEntry shouldBe defined
+
+  // The moved inode is the one under the name when the move runs, not one a caller read before
+  atest("a cross-directory move moves the entry as it reads it, and a replacement after its read aborts it"):
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      aPtr <- cdir(rootDir, "a", mode=0, uid=1, gid=2)
+      bPtr <- cdir(rootDir, "b", mode=0, uid=1, gid=2)
+      a <- fs.loadDirectory(aPtr)
+      b <- fs.loadDirectory(bPtr)
+      firstPtr <- cdir(a, "sub", mode=0, uid=1, gid=2)
+      secondPtr <- cdir(a, "other", mode=0, uid=1, gid=2)
+      thirdPtr <- cdir(a, "third", mode=0, uid=1, gid=2)
+      // Staged against "sub" as first created, then "sub" is replaced before the commit: the commit must fail
+      staged = client.newTransaction()
+      _ <- Directory.prepareMove(a, "sub", b, "moved")(using staged)
+      _ <- a.rename("other", "sub")
+      stagedFailed <- staged.commit().map(_ => false).recover(_ => true)
+      afterRace <- b.getEntry("moved")
+      // A move run now moves the replacement
+      _ <- Directory.move(a, "sub", b, "moved")
+      // Replaced again between a caller's read and the move: the move takes what the name holds when it runs
+      seen <- a.getEntry("third")
+      replacementPtr <- cdir(a, "sub2", mode=0, uid=1, gid=2)
+      _ <- a.rename("sub2", "third")
+      _ <- Directory.move(a, "third", b, "third")
+      aSub <- a.getEntry("sub")
+      bMoved <- b.getEntry("moved")
+      bThird <- b.getEntry("third")
+      moved <- fs.loadDirectory(secondPtr)
+      _ <- moved.refresh()
+      (movedInode, _) <- moved.getInode()
+    yield
+      stagedFailed should be (true)
+      afterRace should be (None)
+      aSub should be (None)
+      bMoved.map(_.number) should be (Some(secondPtr.number))
+      movedInode.oparent.map(_.number) should be (Some(bPtr.number))
+      seen.map(_.number) should be (Some(thirdPtr.number))
+      bThird.map(_.number) should be (Some(replacementPtr.number))
 
   /** A directory whose tree has nodes of `nodeSize` bytes, so that a few long names span several tier-0 nodes */
   private def smallNodeDirectory(parent: Directory, name: String, nodeSize: Int): Future[DirectoryPointer] =

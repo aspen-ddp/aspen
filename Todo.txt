@@ -2,8 +2,6 @@ TODO
 ====
 
 Pre-existing amoebafs bugs found during the replay-pins work:
-- Directory.prepareMove / AmoebaNFS.move read iptr outside the retry; the delete pins the fresh revision but does not
-  check that the entry still holds iptr.
 - SimpleDirectory.prepareDelete reads tree.get and the containing node separately; a NothingToDelete between them
   leaves the transaction unpinned (enforcement then fails it).
 

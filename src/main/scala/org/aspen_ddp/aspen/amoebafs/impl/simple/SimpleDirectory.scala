@@ -104,10 +104,20 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
 
       case _ => Future.unit
 
-  override def prepareDelete(name: String, decref: Boolean)(using tx: Transaction): Future[Future[Unit]] = {
+  override def prepareDelete(name: String, decref: Boolean)(using tx: Transaction): Future[Future[Unit]] =
+    prepareDeleteEntry(name, decref).map(_._2)
+
+  override def prepareMoveOut(name: String)(using tx: Transaction): Future[InodePointer] =
+    prepareDeleteEntry(name, decref = false).map(_._1)
+
+  /** Stages the delete of entry `name`, returning the pointer it held as read and, with `decref`, the completion of
+    * the unlink task enrolled for it
+    */
+  private def prepareDeleteEntry(name: String,
+                                 decref: Boolean)(using tx: Transaction): Future[(InodePointer, Future[Unit])] = {
     val key = Key(name)
 
-    def onptr(ovs: Option[ValueState]): Future[Future[Unit]] = ovs match
+    def onptr(ovs: Option[ValueState]): Future[(InodePointer, Future[Unit])] = ovs match
       case None => Future.failed(DirectoryEntryDoesNotExist(pointer, name))
       case Some(vs) =>
         val fptr = InodePointer(vs.value.bytes)
@@ -117,9 +127,9 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
 
         for
           _ <- fcheck
-          // KeyRevision of the entry as read: the pin, and a concurrent change of the entry aborts. Gone by the time
-          // the delete reads its node (a concurrent unlink), nothing is deleted and the pin is missing: fail as if
-          // the entry had been absent from the start
+          // KeyRevision of the entry as read: the pin, and a concurrent change of the entry aborts, so fptr is what
+          // the commit deletes. Gone by the time the delete reads its node (a concurrent unlink), nothing is deleted
+          // and the pin is missing: fail as if the entry had been absent from the start
           deleted <- tree.deleteIfPresent(key, None, List(KeyValueUpdate.KeyRevision(key, vs.revision)))
           _ <- if deleted then Future.unit else Future.failed(DirectoryEntryDoesNotExist(pointer, name))
           ftaskComplete <- if (decref)
@@ -129,13 +139,13 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
             Future.successful(Future.unit)
 
         yield
-          ftaskComplete
+          (fptr, ftaskComplete)
 
     for
       ovs <- tree.get(key)
-      ftaskComplete <- onptr(ovs)
+      result <- onptr(ovs)
     yield
-      ftaskComplete
+      result
   }
 
   override def prepareRename(oldName: String, newName: String)(using tx: Transaction): Future[Unit] =

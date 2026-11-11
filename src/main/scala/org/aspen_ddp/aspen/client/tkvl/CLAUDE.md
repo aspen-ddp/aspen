@@ -51,6 +51,8 @@
   node's revision guard (the key's range changes only through an update of its node). Only it fails with
   `KeyAlreadyExists`, when the node read holds the key. On DataObject trees `Checked` and `Blind` add nothing (every
   rewrite requires the node revision); `AtRevision` is KV-only (`UnsupportedRequirement`).
-- A node deleted by a join or a tail removal has its version bumped, not just its revision locked. A lock leaves the
-  revision unchanged, so a racing removal that read the node as a predecessor could still rewrite it after it was
-  deleted and leave a live node linked to a deleted one. Batches empty adjacent nodes routinely, which exposed this.
+- A node deleted by a join, a tail removal or a DataObject `deleteList` has its version bumped, not just its revision
+  locked. A lock leaves the revision unchanged, so a racing removal that read the node as a predecessor could still
+  rewrite it after it was deleted and leave a live node linked to a deleted one (batches empty adjacent nodes
+  routinely, which exposed this as a hang). Stores now also fail every requirement on a zero-refcount object
+  (`RequirementsChecker.loaded`), which closes that race on its own. The bump is kept as a second guard.

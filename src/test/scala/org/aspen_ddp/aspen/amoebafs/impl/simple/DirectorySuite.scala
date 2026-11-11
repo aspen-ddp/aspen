@@ -739,6 +739,61 @@ class DirectorySuite extends FilesSystemTestSuite:
       innerEntry shouldBe defined
 
   // The moved inode is the one under the name when the move runs, not one a caller read before
+  // POSIX rename: an existing destination is replaced on every attempt, not only on the first
+  atest("a cross-directory move replaces an existing destination entry, also after a failed attempt"):
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      aPtr <- cdir(rootDir, "a", mode=0, uid=1, gid=2)
+      bPtr <- cdir(rootDir, "b", mode=0, uid=1, gid=2)
+      a <- fs.loadDirectory(aPtr)
+      b <- fs.loadDirectory(bPtr)
+      movedPtr <- cdir(a, "src", mode=0, uid=1, gid=2)
+      _ <- cdir(b, "target", mode=0, uid=1, gid=2)
+      racerPtr <- cdir(b, "racer", mode=0, uid=1, gid=2)
+      (bInode, bRevision) <- b.getInode()
+      // The first attempt's insert is followed by a committed replacement of the destination entry, so that attempt
+      // fails at commit with the destination name still present
+      attempts = new java.util.concurrent.atomic.AtomicInteger(0)
+      racingDst = new SimpleDirectory(bPtr, bRevision, bInode, fs):
+        override def prepareInsert(name: String, ptr: org.aspen_ddp.aspen.amoebafs.InodePointer, incref: Boolean)
+                                  (using tx: Transaction): Future[Unit] =
+          super.prepareInsert(name, ptr, incref).flatMap: _ =>
+            if attempts.incrementAndGet() == 1 then b.rename("racer", "target") else Future.unit
+      _ <- Directory.move(a, "src", racingDst, "target")
+      srcEntry <- a.getEntry("src")
+      targetEntry <- b.getEntry("target")
+      racerEntry <- b.getEntry("racer")
+      moved <- fs.loadDirectory(movedPtr)
+      _ <- moved.refresh()
+      (movedInode, _) <- moved.getInode()
+    yield
+      attempts.get should be (2)
+      srcEntry should be (None)
+      racerEntry should be (None)
+      targetEntry.map(_.number) should be (Some(movedPtr.number))
+      targetEntry.map(_.number) should not be (Some(racerPtr.number))
+      movedInode.oparent.map(_.number) should be (Some(bPtr.number))
+
+  atest("a cross-directory move onto a non-empty directory fails with DirectoryNotEmpty and changes nothing"):
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      aPtr <- cdir(rootDir, "a", mode=0, uid=1, gid=2)
+      bPtr <- cdir(rootDir, "b", mode=0, uid=1, gid=2)
+      a <- fs.loadDirectory(aPtr)
+      b <- fs.loadDirectory(bPtr)
+      movedPtr <- cdir(a, "src", mode=0, uid=1, gid=2)
+      targetPtr <- cdir(b, "target", mode=0, uid=1, gid=2)
+      target <- fs.loadDirectory(targetPtr)
+      _ <- cdir(target, "inner", mode=0, uid=1, gid=2)
+      _ <- recoverToSucceededIf[DirectoryNotEmpty](Directory.move(a, "src", b, "target"))
+      srcEntry <- a.getEntry("src")
+      targetEntry <- b.getEntry("target")
+    yield
+      srcEntry.map(_.number) should be (Some(movedPtr.number))
+      targetEntry.map(_.number) should be (Some(targetPtr.number))
+
   atest("a cross-directory move moves the entry as it reads it, and a replacement after its read aborts it"):
     for
       fs <- bootstrap()

@@ -5,14 +5,14 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import com.github.blemale.scaffeine.{LoadingCache, Scaffeine}
 import org.aspen_ddp.aspen.client.FatalReadError
-import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists}
+import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, BlockDevice, CharacterDevice, Directory, DirectoryInode, File, FileHandle, FileMode, FileSystem, FileType, InodePointer, Symlink, Timespec}
 
 import javax.security.auth.Subject
 import scribe.Logging
 import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS.given_Conversion_Long_Inode
 import org.dcache.nfs.util.UnixSubjects
-import org.dcache.nfs.status.{ExistException, InvalException, NoEntException, NotDirException, NotSuppException, ServerFaultException}
+import org.dcache.nfs.status.{ExistException, InvalException, NoEntException, NotDirException, NotEmptyException, NotSuppException, ServerFaultException}
 import org.dcache.nfs.v4.{NfsIdMapping, SimpleIdMap}
 import org.dcache.nfs.v4.xdr.nfsace4
 import org.dcache.nfs.vfs.{AclCheckable, DirectoryEntry, DirectoryStream, FsStat, Inode, Stat, VirtualFileSystem}
@@ -73,6 +73,7 @@ object AmoebaNFS {
   } catch {
     case e: DirectoryEntryExists => throw new ExistException(e.toString)
     case e: DirectoryEntryDoesNotExist => throw new NoEntException(e.toString)
+    case e: DirectoryNotEmpty => throw new NotEmptyException(e.toString)
     case _: FatalReadError => throw new IOException("Fatal Aspen Read Error")
     case t: Throwable => throw t
   }

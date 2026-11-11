@@ -300,8 +300,9 @@ trait Directory extends BaseFile with Logging {
 
 object Directory:
   /** Moves entry `oldName` of `src` to `newName` in `dst`, a different directory, retrying until it commits. Each
-    * attempt reads the entry afresh (see `prepareMove`). Fails with DirectoryEntryDoesNotExist if `oldName` is gone
-    * and, after a failed attempt, with DirectoryEntryExists if `newName` has appeared.
+    * attempt reads both entries afresh (see `prepareMove`). As POSIX rename, and as `rename` within one directory,
+    * an existing `newName` is replaced and unlinked on every attempt. Fails with DirectoryEntryDoesNotExist if
+    * `oldName` is gone and with DirectoryNotEmpty if `newName` is a non-empty directory.
     */
   def move(src: Directory, oldName: String, dst: Directory, newName: String): Future[Unit] =
     given ExecutionContext = src.fs.executionContext
@@ -310,18 +311,16 @@ object Directory:
       case e: InvalidInode => throw StopRetrying(e)
       case e: DirectoryEntryExists => throw StopRetrying(e)
       case e: DirectoryEntryDoesNotExist => throw StopRetrying(e)
+      case e: DirectoryNotEmpty => throw StopRetrying(e)
       case e: FatalReadError => throw StopRetrying(e)
       case e: TransactionCreationError => throw StopRetrying(e)
       case _ =>
         for
           _ <- Future.sequence(List(src.refresh(), dst.refresh()))
           oldf <- src.getEntry(oldName)
-          newf <- dst.getEntry(newName)
         yield
           if oldf.isEmpty then
             throw StopRetrying(DirectoryEntryDoesNotExist(src.pointer, oldName))
-          if newf.nonEmpty then
-            throw StopRetrying(DirectoryEntryExists(dst.pointer, newName))
 
     src.fs.client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       prepareMove(src, oldName, dst, newName)(using tx)

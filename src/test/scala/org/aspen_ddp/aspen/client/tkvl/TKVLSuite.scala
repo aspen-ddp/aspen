@@ -25,7 +25,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -65,7 +65,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -116,7 +116,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -157,7 +157,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -218,7 +218,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -278,7 +278,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -333,7 +333,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -425,7 +425,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -558,7 +558,7 @@ class TKVLSuite extends IntegrationTestSuite {
       // deadRoot stands in for a root that tier reduction deleted. x stands in for a node read
       // just before a join deleted its right neighbour, deadRight.
       tx0 = TestTransactions.replaySafe(client.newTransaction())
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       deadRoot <- alloc.allocateKeyValueObject(Map[Key, Value]())(using tx0)
       deadRight <- alloc.allocateKeyValueObject(Map[Key, Value]())(using tx0)
       x <- alloc.allocateKeyValueObject(Map(Key(2) -> Value(Array[Byte](2))),

@@ -85,7 +85,7 @@ class TransactionRangedWriteSuite extends AnyFunSuite with Matchers {
       b2.rangedWrites(fullState(), w, false)
 
     val b3 = mkBuilder()
-    b3.lockRevision(p1, rev1)
+    b3.exclusiveLockRevision(p1, rev1)
     intercept[ConflictingRequirements]:
       b3.rangedWrites(fullState(), w, false)
   }

@@ -69,7 +69,7 @@ class TransactionFailureSuite extends IntegrationTestSuite:
     for
       before <- client.read(radicle)
       tx = TestTransactions.replaySafe(client.newTransaction())
-      _ = tx.lockRevision(radicle, before.revision)
+      _ = tx.exclusiveLockRevision(radicle, before.revision)
       fcommit = tx.commit()
       reason = new Exception("too late")
       thrown = intercept[AbortAfterCommit](tx.abort(reason))
@@ -91,7 +91,7 @@ class TransactionFailureSuite extends IntegrationTestSuite:
     for
       before <- client.read(radicle)
       tx = TestTransactions.replaySafe(client.newTransaction())
-      _ = tx.lockRevision(radicle, before.revision)
+      _ = tx.exclusiveLockRevision(radicle, before.revision)
       fcommit = tx.commit()
       _ = intercept[PostCommitTransactionModification](tx.note("too late"))
       _ <- fcommit
@@ -116,7 +116,7 @@ class TransactionFailureSuite extends IntegrationTestSuite:
       before <- client.read(radicle)
       err <- client.transactUntilSuccessful: tx =>
         attempts += 1
-        tx.lockRevision(radicle, before.revision)
+        tx.exclusiveLockRevision(radicle, before.revision)
         Future.successful(())
       .failed
     yield
@@ -130,7 +130,7 @@ class TransactionFailureSuite extends IntegrationTestSuite:
       before <- client.read(radicle)
       err <- client.transactUntilSuccessfulWithRecovery(_ => Future.unit): tx =>
         attempts += 1
-        tx.lockRevision(radicle, before.revision)
+        tx.exclusiveLockRevision(radicle, before.revision)
         Future.successful(())
       .failed
     yield

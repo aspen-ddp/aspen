@@ -47,7 +47,7 @@ class TransactionBuilder(
   private  var refcountUpdates = Set[ObjectPointer]()
   private  var deletingObjects = List[ObjectPointer]() // Objects whose refcount is being set to zero
   private  var updatingObjects = Set[ObjectPointer]() // Tracks UUIDs of all objects being modified
-  private  var revisionLocks = Set[ObjectPointer]() // UUIDs of all revision-locked objects, shared or not
+  private  var exclusiveRevisionLocks = Set[ObjectPointer]() // UUIDs of all revision-locked objects, shared or not
   private  var sharedRevisionLocks = Set[ObjectPointer]() // UUIDs of all shared-revision-locked objects
   private  var dataObjectUpdates = Map[ObjectPointer, DataBuffer]()
   private  var appendUpdates = Map[ObjectPointer, (AppendPosition, DataBuffer)]()
@@ -259,7 +259,7 @@ class TransactionBuilder(
     val objectPointer = position.pointer
     if (updatingObjects.contains(objectPointer))
       throw MultipleDataUpdatesToObject(objectPointer)
-    if (revisionLocks.contains(objectPointer))
+    if (exclusiveRevisionLocks.contains(objectPointer))
       throw ConflictingRequirements(objectPointer)
 
     updatingObjects += objectPointer
@@ -285,7 +285,7 @@ class TransactionBuilder(
 
     if updatingObjects.contains(objectPointer) then
       throw MultipleDataUpdatesToObject(objectPointer)
-    if revisionLocks.contains(objectPointer) then
+    if exclusiveRevisionLocks.contains(objectPointer) then
       throw ConflictingRequirements(objectPointer)
 
     val edits = sorted.map(w => RangeEdit(w.offset, w.data, state.oldBytes(w.offset, w.data.length)))
@@ -301,7 +301,7 @@ class TransactionBuilder(
       //printStack()
       throw MultipleDataUpdatesToObject(objectPointer)
     }
-    if (revisionLocks.contains(objectPointer))
+    if (exclusiveRevisionLocks.contains(objectPointer))
       throw ConflictingRequirements(objectPointer)
 
     updatingObjects += objectPointer
@@ -320,7 +320,7 @@ class TransactionBuilder(
       //printStack()
       throw MultipleDataUpdatesToObject(pointer)
     }
-    if (revisionLocks.contains(pointer))
+    if (exclusiveRevisionLocks.contains(pointer))
       throw ConflictingRequirements(pointer)
 
     updatingObjects += pointer
@@ -348,27 +348,27 @@ class TransactionBuilder(
     //println(s"   TXB BumpVersion txid $transactionUUID object ${objectPointer.uuid}")
     if (updatingObjects.contains(objectPointer))
       throw MultipleDataUpdatesToObject(objectPointer)
-    if (revisionLocks.contains(objectPointer))
+    if (exclusiveRevisionLocks.contains(objectPointer))
       throw ConflictingRequirements(objectPointer)
 
     updatingObjects += objectPointer
     requirements = VersionBump(objectPointer, requiredRevision) :: requirements
   }
 
-  def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized {
-    //println(s"   TXB LockRevision txid $transactionUUID object ${objectPointer.uuid}")
+  def exclusiveLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized {
+    //println(s"   TXB ExclusiveLockRevision txid $transactionUUID object ${objectPointer.uuid}")
     if (updatingObjects.contains(objectPointer) || sharedRevisionLocks.contains(objectPointer))
       throw ConflictingRequirements(objectPointer)
 
-    revisionLocks += objectPointer
+    exclusiveRevisionLocks += objectPointer
     requirements = ExclusiveRevisionLock(objectPointer, requiredRevision) :: requirements
   }
 
   def sharedLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized {
-    if updatingObjects.contains(objectPointer) || revisionLocks.contains(objectPointer) then
+    if updatingObjects.contains(objectPointer) || exclusiveRevisionLocks.contains(objectPointer) then
       throw ConflictingRequirements(objectPointer)
 
-    revisionLocks += objectPointer
+    exclusiveRevisionLocks += objectPointer
     sharedRevisionLocks += objectPointer
     requirements = SharedRevisionLock(objectPointer, requiredRevision) :: requirements
   }

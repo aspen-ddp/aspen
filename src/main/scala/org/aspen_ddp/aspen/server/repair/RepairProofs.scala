@@ -42,7 +42,7 @@ object RepairProofs extends Logging:
     */
   def proveObjectLevel(client: AspenClient, read: KeyValueObjectState): Future[Boolean] =
     prove(client, s"object level of ${read.pointer.id}"):
-      _.lockRevision(read.pointer, read.revision)
+      _.exclusiveLockRevision(read.pointer, read.revision)
 
   /** A RefcountUpdate requiring `refcount` and setting that same refcount. Its exclusive object lock is the one every
     * refcount change takes

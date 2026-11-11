@@ -512,7 +512,7 @@ runs, one at a time (parallel proofs of one object would collide):
 | Deferred part | Proof | Code |
 |---------------|-------|------|
 | each deferred key (KeyValue only) | `update(ptr, None, None, [KeyRevision(key, readRevision)] or [DoesNotExist(key)], Nil)` | `RepairProofs.scala:254-259` |
-| object level, KeyValue | `RefcountUpdate(required=rc, new=rc)` then `lockRevision(ptr, read.revision)` | `:265-273`; `StoreRepairer.scala:317-319` |
+| object level, KeyValue | `RefcountUpdate(required=rc, new=rc)` then `exclusiveLockRevision(ptr, read.revision)` | `:265-273`; `StoreRepairer.scala:317-319` |
 | object level, DataObject | `RefcountUpdate(required=rc, new=rc)` | `StoreRepairer.scala:320-321` |
 
 All use `client.newRepairTransaction()` (tracking off) and complete `true` only on commit; an abort or any error is

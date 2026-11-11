@@ -35,7 +35,7 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       pool <- client.getStoragePool(Radicle.poolId)
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- pool.allocator.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
     yield

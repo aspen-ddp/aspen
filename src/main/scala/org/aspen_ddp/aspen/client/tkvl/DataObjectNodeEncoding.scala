@@ -713,7 +713,7 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
           tx.abortAndThrow(new Exception("Node is not empty"))
 
         // The revision lock ensures nothing is inserted or joined into the node while it is being deleted
-        tx.lockRevision(node.pointer, node.revision)
+        tx.exclusiveLockRevision(node.pointer, node.revision)
         tx.setRefcount(node.pointer, node.refcount, node.refcount.decrement())
         writeNode(headNode, encode(headNode.entries, headNode.minimum, node.link))(using tx)
         tx.commit().map(_ => ())
@@ -750,7 +750,7 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
               val tx = client.newTransaction()
               if node.entries.nonEmpty then
                 tx.abortAndThrow(new Exception("Node is not empty"))
-              tx.lockRevision(node.pointer, node.revision)
+              tx.exclusiveLockRevision(node.pointer, node.revision)
               tx.setRefcount(node.pointer, node.refcount, node.refcount.decrement())
               tx.commit().map(_ => ())
         yield

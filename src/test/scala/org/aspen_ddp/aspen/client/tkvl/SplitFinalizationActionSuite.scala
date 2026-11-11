@@ -25,7 +25,7 @@ class SplitFinalizationActionSuite extends IntegrationTestSuite:
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.allocator
       tx0 = TestTransactions.replaySafe(client.newTransaction())
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       hosting <- alloc.allocateKeyValueObject()(using tx0)
       n1 <- alloc.allocateKeyValueObject(Map(k5 -> Value(Array[Byte](5))), minimum = Some(k5))(using tx0)
       n0 <- alloc.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](1))),

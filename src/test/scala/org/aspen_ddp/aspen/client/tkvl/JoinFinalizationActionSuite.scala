@@ -22,7 +22,7 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
       // Tier 2 root t over the tier-1 list u1 -> u2 -> u3. The tier-1 entries point at a placeholder,
       // which the join never reads.
       tx0 = TestTransactions.replaySafe(client.newTransaction())
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       hosting <- alloc.allocateKeyValueObject()(using tx0)
       child <- alloc.allocateKeyValueObject(Map[Key, Value]())(using tx0)
       childValue = Value(child.toArray)

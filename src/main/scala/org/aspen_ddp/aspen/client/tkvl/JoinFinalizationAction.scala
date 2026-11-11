@@ -44,7 +44,7 @@ class JoinFinalizationAction(val client: AspenClient,
             TierEngine.encodingFor(node).read(client, child, Key.AbsoluteMinimum, ordering,
               s"Reducing tier $nodeTier root").flatMap { childNode =>
               if (childNode.size == 1 && childNode.link.isEmpty) {
-                tx.lockRevision(childNode.pointer, childNode.revision)
+                tx.exclusiveLockRevision(childNode.pointer, childNode.revision)
                 reduce(childTier, childNode)
               } else
                 Future.successful((childTier, child))

@@ -868,7 +868,7 @@ Evidence:
   `release` (`:185`).
 * Not a write: `RequirementsApplyer` has an empty case (`:147`) and `changedObjects` excludes it (`:39`), so it never starts a
   backend commit and never appears in the in-flight machinery.
-* Builder: `lockRevision` throws if the object is also updated or shared-locked in the same transaction
+* Builder: `exclusiveLockRevision` throws if the object is also updated or shared-locked in the same transaction
   (`TransactionBuilder.scala:346-347`), and updates throw if the object is revision-locked (`:246-249` etc.).
 * Other code states it: `server/repair/RepairProofs.scala:36` ("It takes the exclusive object lock, which collides with
   every lock a ..."), and the tests `RequirementsCheckerSuite` "ExclusiveRevisionLock failure on tx collision" (`:365`).

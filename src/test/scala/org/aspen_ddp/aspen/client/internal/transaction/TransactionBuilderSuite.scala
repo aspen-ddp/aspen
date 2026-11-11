@@ -94,7 +94,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
       b2.append(pos, DataBuffer(appended))
 
     val b3 = mkBuilder()
-    b3.lockRevision(p1, rev1)
+    b3.exclusiveLockRevision(p1, rev1)
     intercept[ConflictingRequirements]:
       b3.append(pos, DataBuffer(appended))
   }
@@ -164,9 +164,9 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
       val b = mkBuilder(); b.addAllocatingObject(p1)
       intercept[UnpinnedTransaction](buildPin(b))
   }
-  test("no pin: lockRevision only") {
+  test("no pin: exclusiveLockRevision only") {
     withPins:
-      val b = mkBuilder(); b.lockRevision(p1, rev1)
+      val b = mkBuilder(); b.exclusiveLockRevision(p1, rev1)
       intercept[UnpinnedTransaction](buildPin(b))
   }
   test("no pin: DoesNotExist with an Insert") {
@@ -192,7 +192,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
 
   test("replaySafe lets a pinless transaction through and records the reason in its notes") {
     withPins:
-      val b = mkBuilder(); b.lockRevision(p1, rev1); b.replaySafe("harmless")
+      val b = mkBuilder(); b.exclusiveLockRevision(p1, rev1); b.replaySafe("harmless")
       val (txd, _, _) = buildPin(b)
       txd.notes should contain ("replay-safe: harmless")
   }

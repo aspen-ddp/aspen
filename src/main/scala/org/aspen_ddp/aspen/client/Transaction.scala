@@ -61,9 +61,9 @@ trait Transaction {
   /** Ensures the object revision matches the specified value and blocks other transactions attempting to modify the
     *  revision while this transaction is being executed.
     */
-  def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit
+  def exclusiveLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit
 
-  /** Like lockRevision, but any number of concurrent transactions may hold the lock on the same object. It blocks
+  /** Like exclusiveLockRevision, but any number of concurrent transactions may hold the lock on the same object. It blocks
     * only transactions that modify or exclusively lock the object, so an overwrite of the object aborts every
     * transaction that shared-locks the old revision and has not yet committed.
     */

@@ -36,7 +36,7 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
       pool <- client.getStoragePool(Radicle.poolId)
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       host <- pool.allocator.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId, maxNodeSize)
       tx = TestTransactions.replaySafe(client.newTransaction())

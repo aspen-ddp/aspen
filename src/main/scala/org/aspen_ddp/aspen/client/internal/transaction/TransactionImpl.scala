@@ -142,8 +142,8 @@ class TransactionImpl(val client: AspenClient,
   def bumpVersion(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
     doBumpVersion(false, objectPointer, requiredRevision)
 
-  def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
-    modify(_.lockRevision(objectPointer, requiredRevision))
+  def exclusiveLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
+    modify(_.exclusiveLockRevision(objectPointer, requiredRevision))
 
   def sharedLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
     modify(_.sharedLockRevision(objectPointer, requiredRevision))
@@ -210,8 +210,8 @@ class TransactionImpl(val client: AspenClient,
     def setRefcount(objectPointer: ObjectPointer, requiredRefcount: ObjectRefcount, refcount: ObjectRefcount): Unit =
       doSetRefcount(true, objectPointer, requiredRefcount, refcount)
 
-    def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
-      hookModify(_.lockRevision(objectPointer, requiredRevision))
+    def exclusiveLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
+      hookModify(_.exclusiveLockRevision(objectPointer, requiredRevision))
 
     def sharedLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
       hookModify(_.sharedLockRevision(objectPointer, requiredRevision))

@@ -338,7 +338,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
         net.offlineStores = blocked
         net.dropTxMessage = outcomeTo(tx.id, blocked)
         net.recordTxMessage = outcomeTo(tx.id, blocked)
-        tx.lockRevision(x, xBefore.revision)
+        tx.exclusiveLockRevision(x, xBefore.revision)
         for
           _ <- pump(tx.commit(), clock = false)
           _ <- settle(clock = false)

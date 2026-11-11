@@ -24,7 +24,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -68,7 +68,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -133,7 +133,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -228,7 +228,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -308,7 +308,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -366,7 +366,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -431,7 +431,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -476,7 +476,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
 
       tx0 = TestTransactions.replaySafe(client.newTransaction())
       ptr <- alloc.allocateKeyValueObject()(using tx0)
-      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 

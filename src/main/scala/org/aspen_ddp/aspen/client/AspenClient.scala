@@ -673,7 +673,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       .foreach: pool =>
         throw StopRetrying(ShutdownWouldBreakPool(pool.poolId))
       operational.valuesIterator.foreach: (ptr, kvos, _) =>
-        tx.lockRevision(ptr, kvos.revision)
+        tx.exclusiveLockRevision(ptr, kvos.revision)
 
   /** Reverses `shutdownStorageDevice`: Offline stores become Active and the device Operational.
    *  Idempotent in the same way: on an Operational device nothing is written but the nudge is

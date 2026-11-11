@@ -68,7 +68,7 @@ class SplitFinalizationAction(val client: AspenClient,
           for {
             _ <- TierEngine.encodingFor(node).insert(node, newMinimum, Value(newNode.toArray), nodeSize, alloc,
                    onSplit, PutRequirement.Checked)
-            _ = tx.lockRevision(newNode, nodeRevision)
+            _ = tx.exclusiveLockRevision(newNode, nodeRevision)
             _ <- tx.commit()
           } yield ()
         }

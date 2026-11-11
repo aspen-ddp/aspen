@@ -3,7 +3,7 @@ TODO
 
 Unverified findings from the replay-pins work (check each before acting):
 - UnlinkFileTask step 2 runs unpinned transactions during step preparation.
-- DataObject TKVL deleteList uses lockRevision rather than bumpVersion.
+- DataObject TKVL deleteList uses exclusiveLockRevision rather than bumpVersion.
 - JoinFinalizationAction.setNewRoot deletes the old root with only a refcount update.
 - Joins triggered through StoreRepairer.deleteEntry register no JoinFinalizationAction.
 - LocalTimeRequirement's Equals comparison looks inverted.

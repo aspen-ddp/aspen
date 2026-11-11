@@ -50,7 +50,7 @@ class AllocationFinalizationAction(val client: AspenClient,
               // An allocation tree node allocated by this very object's transaction can hold its own entry: the
               // update of the node then requires the object to exist, and a lock on it would conflict
               _ = ostate.foreach: state =>
-                    try tx.lockRevision(newObject, state.revision)
+                    try tx.exclusiveLockRevision(newObject, state.revision)
                     catch case _: ConflictingRequirements => ()
               _ <- tx.commit()
             yield ()

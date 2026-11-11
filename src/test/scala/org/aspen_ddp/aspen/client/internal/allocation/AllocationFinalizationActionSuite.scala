@@ -142,7 +142,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
       otherState <- client.read(other)
       replay = client.newTransaction()
-      _ = replay.lockRevision(ptr, before.revision)
+      _ = replay.exclusiveLockRevision(ptr, before.revision)
       _ = replay.update(other, Some(otherState.revision), None, Nil, List(Insert(Key(3), Array[Byte](3))))
       result <- replay.commit().failed
       _ <- waitForTransactionsToComplete()

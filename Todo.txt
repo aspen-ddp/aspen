@@ -74,3 +74,19 @@ Pre-existing amoebafs bugs found during the replay-pins work:
   check that the entry still holds iptr.
 - SimpleDirectory.prepareDelete reads tree.get and the containing node separately; a NothingToDelete between them
   leaves the transaction unpinned (enforcement then fails it).
+
+Open items from the replay-pins work:
+- DiskCatalog.removeKey reads the key and then deletes it, so a concurrent change between the two makes the delete a
+  silent no-op. Use the deleteIfPresent helper.
+- A committed transaction can be reported to its client as aborted (docs/safety paxos F2). A client paused for more
+  than ~10 s, whose reply was lost, retransmits its prepare; a fresh round decides abort if no object still shows the
+  update. Store state stays correct and repair catches up the stores, but the client is told the wrong outcome.
+- A driver relying on its own finalizer never finalizes when the missed-update marker's write gives up
+  (docs/safety transaction-recovery F2 / R-N2): there is no failure path. Pre-existing, made slightly worse by the
+  marker now running last, so a failed earlier action also loses the ErrorTree marks and UnackedCommits entries.
+- docs/safety/paxos-transactions.md cites line numbers (e.g. TransactionDriver.scala:262-263, :318-319) that are stale
+  after the replay-pins branch.
+- TransactionDriver.mayBeDiscarded is used only by tests: remove it or fold it into them.
+- Frontend.finalizationDeferred overwrites a registration by txid without checking which Tx holds it. A tidiness issue
+  (with the stub hand-off in transactionFinalized no path found misbehaves), but clean it up: make the registration's
+  ownership explicit rather than relying on whichever Tx deferred last.

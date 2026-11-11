@@ -265,6 +265,37 @@ class TKVLBatchRequirementSuite extends TKVLBatchSuiteSupport:
         assert(attempts == 2)
         assert(stored == Some(value(52).bytes.toList))
 
+  atest("KeyValueObjects: a delete at a revision deletes only the key as read, else aborts with KeyNotAtRevision"):
+    for
+      (_, rm) <- newTree(TreeKind.KeyValueObjects)
+      t = new TieredKeyValueList(client, rm)
+      _ <- inTransaction(tx => t.prepareUpdates(inserts(keys(1 to 3)), Nil)(using tx))
+      vs1 <- t.get(Key(1)).map(_.get)
+      vs2 <- t.get(Key(2)).map(_.get)
+      // Key 2 changes after it was read
+      _ <- inTransaction(tx => t.set(Key(2), value(22))(using tx))
+      stale = client.newTransaction()
+      err <- t.prepareUpdates(inserts(List(Key(9))), Nil, List(Key(2) -> vs2.revision))(using stale).failed
+      aborted <- stale.result.failed
+      // Key 1 goes after it was read
+      _ <- inTransaction(tx => t.delete(Key(1))(using tx))
+      gone = client.newTransaction()
+      goneErr <- t.prepareUpdates(Nil, Nil, List(Key(1) -> vs1.revision))(using gone).failed
+      // At the revision as read: deleted
+      vs3 <- t.get(Key(3)).map(_.get)
+      _ <- inTransaction(tx => t.prepareUpdates(Nil, Nil, List(Key(3) -> vs3.revision))(using tx))
+      rejected <- t.prepareUpdates(Nil, List(Key(2)), List(Key(2) -> vs2.revision))(using client.newTransaction())
+        .failed
+      entries <- t.get(Key(2)).map(_.map(_.value.bytes.toList))
+      left <- Future.sequence(List(Key(1), Key(3), Key(9)).map(t.get))
+    yield
+      assert(err.isInstanceOf[KeyNotAtRevision])
+      assert(aborted.isInstanceOf[KeyNotAtRevision])
+      assert(goneErr.isInstanceOf[KeyNotAtRevision])
+      assert(rejected.isInstanceOf[IllegalArgumentException])
+      assert(entries == Some(value(22).bytes.toList))
+      assert(left == List(None, None, None))
+
   atest("DataObjects: a batch after a change to the same node in the transaction fails with NodeAlreadyModified"):
     for
       (tree, _) <- newTree(TreeKind.DataObjects)

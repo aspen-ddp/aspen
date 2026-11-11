@@ -226,7 +226,9 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
                 ops: List[BatchOp],
                 maxNodeSize: Int): Option[RewritePlan] =
     val puts = ops.collect { case p: BatchOp.Put => p }
-    val removes = ops.collect { case BatchOp.Remove(k) => k }.toSet
+    if ops.exists { case BatchOp.Remove(_, Some(_)) => true; case _ => false } then
+      throw new UnsupportedRequirement(kind)
+    val removes = ops.collect { case BatchOp.Remove(k, _) => k }.toSet
 
     puts.foreach: p =>
       checkRequirement(content, p.key, p.requirement)

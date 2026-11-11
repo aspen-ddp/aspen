@@ -473,6 +473,19 @@ class KeyValueNodePlanSuite extends AnyFunSuite:
     assert(planDelete(shape, key(3)) == NothingToDelete)
     assert(planBatch(shape, List(BatchOp.Remove(key(3))), 1024) == Unchanged)
 
+  test("a delete at a revision requires that revision and fails unless the node holds the key at it"):
+    val rev1 = new ObjectRevision(UUID.randomUUID())
+    val rev2 = new ObjectRevision(UUID.randomUUID())
+    val shape = shapeHolding(key(1) -> rev1, key(2) -> rev2)
+    assert(keyReqs(planBatch(shape, List(BatchOp.Remove(key(2), Some(rev2))), 1024)) ==
+      List(KeyValueUpdate.KeyRevision(key(2), rev2)))
+    // Emptying the node at the revisions read
+    assert(keyReqs(planBatch(shape, List(BatchOp.Remove(key(1), Some(rev1)), BatchOp.Remove(key(2), Some(rev2))),
+      1024)) == List(KeyValueUpdate.KeyRevision(key(1), rev1), KeyValueUpdate.KeyRevision(key(2), rev2)))
+    // Changed since read, and gone since read
+    assertThrows[KeyNotAtRevision](planBatch(shape, List(BatchOp.Remove(key(2), Some(rev1))), 1024))
+    assertThrows[KeyNotAtRevision](planBatch(shape, List(BatchOp.Remove(key(3), Some(rev1))), 1024))
+
   test("rename requires KeyRevision on the old key and KeyRevision or DoesNotExist on the new key"):
     val rev1 = new ObjectRevision(UUID.randomUUID())
     val rev2 = new ObjectRevision(UUID.randomUUID())
@@ -509,7 +522,7 @@ class KeyValueNodePlanSuite extends AnyFunSuite:
   private def applyToModel(model: Map[List[Byte], List[Byte]], ops: List[BatchOp]): Map[List[Byte], List[Byte]] =
     ops.foldLeft(model):
       case (m, p: BatchOp.Put) => m + (p.key.bytes.toList -> p.value.bytes.toList)
-      case (m, BatchOp.Remove(k)) => m - k.bytes.toList
+      case (m, BatchOp.Remove(k, _)) => m - k.bytes.toList
 
   for (idaName, ida) <- idas; limit <- List(400, 1024, 4096); seed <- 1 to 3 do
     test(s"random batches keep every node within the limit and match the model ($idaName, limit $limit, seed $seed)"):

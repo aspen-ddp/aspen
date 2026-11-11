@@ -1,13 +1,7 @@
 TODO
 ====
 
-Flaky tests:
-- TKVL "deleting entries that join tier-0 nodes removes their upper-tier entries" failed once in three full runs on
-  7d9c8847 (not investigated).
-
 Pre-existing amoebafs bugs found during the replay-pins work:
-- Cross-node rename whose delete joins into the target node updates that node twice, so the rename deterministically
-  fails (liveness bug, SimpleDirectory.prepareRename).
 - Directory.prepareMove / AmoebaNFS.move read iptr outside the retry; the delete pins the fresh revision but does not
   check that the entry still holds iptr.
 - SimpleDirectory.prepareDelete reads tree.get and the containing node separately; a NothingToDelete between them
@@ -30,6 +24,10 @@ Open items from the replay-pins work:
   ownership explicit rather than relying on whichever Tx deferred last.
 - All modifications made as part of working on this item must update the docs/safety/* documents to reflect the changes
   and denote outstanding items as fixed/narrowed/etc.
+
+Flaky tests:
+- TKVL "deleting entries that join tier-0 nodes removes their upper-tier entries" failed once in three full runs on
+  7d9c8847 (not investigated).
 
 Turn the findings in docs/safety/* into a prioritized work list of issues to address and in priority order recorded
 in this document. Correct operation is the foundation of this project and every potential issue must be thoroughly

@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 import scala.language.implicitConversions
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, Transaction}
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, KeyValueListNode, NoCache, PutRequirement, Root, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, KeyValueListNode, NoCache, PutRequirement, Root, TKVLInsert, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{Delete, Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
@@ -146,42 +146,24 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
       val newKey = Key(newName)
       val tr = tree
       for
-        oa <- tr.getContainingNode(oldKey)
-        ob <- tr.getContainingNode(newKey)
-        _ <- (oa, ob) match
-          case (Some(a), Some(b)) =>
-            if !a.contains(oldKey) then
-              Future.failed(DirectoryEntryDoesNotExist(pointer, oldKey.stringValue))
-            else
-              // If the directory entry already exists, unlink it. It is in b, the node holding newKey
-              val newNameVs = b.get(newKey)
-
-              // Both keys are written under the state just read: KeyRevision of the old key (the pin), and
-              // KeyRevision or DoesNotExist of the new one (rename derives both from the one node it reads)
-              def prepRename(): Future[Unit] =
-                if a.nodeUUID == b.nodeUUID then
-                  a.rename(oldKey, newKey)
-                else
-                  val keyValue = a.get(oldKey).get.value
-                  val newKeyRequirement = newNameVs.fold(PutRequirement.MustNotExist)(vs =>
-                    PutRequirement.AtRevision(vs.revision))
-                  Future.sequence(List(
-                    a.delete(oldKey),
-                    b.set(newKey, keyValue, newKeyRequirement))).map(_ => ())
-
-              for
-                _ <- newNameVs match
-                  case None => Future.unit
-                  case Some(vs) =>
-                    val iptr = InodePointer(vs.value.bytes)
-                    checkForDeletion(iptr).flatMap: _ =>
-                      UnlinkFileTask.prepareTask(fs, iptr)
-
-                _ <- prepRename()
-              yield
-                ()
-
-          case _ => Future.failed(DirectoryEntryDoesNotExist(pointer, oldName))
+        oold <- tr.get(oldKey)
+        onew <- tr.get(newKey)
+        old = oold.getOrElse(throw DirectoryEntryDoesNotExist(pointer, oldName))
+        // An entry already under the new name is replaced: unlink it
+        _ <- onew match
+          case None => Future.unit
+          case Some(vs) =>
+            val iptr = InodePointer(vs.value.bytes)
+            checkForDeletion(iptr).flatMap: _ =>
+              UnlinkFileTask.prepareTask(fs, iptr)
+        // One batch, so a node is updated once even when deleting the old key joins its node into the new key's.
+        // Both keys are written under the state just read: the old one is deleted at its revision as read (the pin;
+        // a concurrent change of it aborts, so the value moved is the one read), the new one requires its revision
+        // as read, or that it is still absent, so the entry unlinked above is the one replaced
+        newInsert = onew match
+          case None => TKVLInsert(newKey, old.value, requireDoesNotExist = true)
+          case Some(vs) => TKVLInsert(newKey, old.value, requiredRevision = Some(vs.revision))
+        _ <- tr.prepareUpdates(List(newInsert), Nil, List(oldKey -> old.revision))
       yield
         ()
 

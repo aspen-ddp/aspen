@@ -72,9 +72,16 @@ class TieredKeyValueList(val client: AspenClient,
     * together, which `set` and `delete` on the same node in one transaction cannot. Deleting a key the tree does not
     * hold does nothing. Fails with `IllegalArgumentException`, before touching the transaction, if a key is inserted
     * twice or both inserted and deleted. A failure once part of the batch is staged aborts the transaction.
+    *
+    * Each key of `deletesAtRevision` is deleted only if the node read holds it at the given revision, under that
+    * `KeyRevision`. Otherwise (a concurrent write changed or removed it since the caller read it) the transaction is
+    * aborted with `KeyNotAtRevision`, so a caller that derived other writes from the key's value as it read it never
+    * commits them against a different value.
     */
-  def prepareUpdates(inserts: List[TKVLInsert], deletes: List[Key])(using t: Transaction): Future[Unit] =
-    Future.delegate(engine.prepareUpdates(BatchOp.from(inserts, deletes)))
+  def prepareUpdates(inserts: List[TKVLInsert],
+                     deletes: List[Key],
+                     deletesAtRevision: List[(Key, ObjectRevision)] = Nil)(using t: Transaction): Future[Unit] =
+    Future.delegate(engine.prepareUpdates(BatchOp.from(inserts, deletes, deletesAtRevision)))
 
   /** KeyValue-object trees only: the requirements are key-value requirements on the containing node */
   def delete(key: Key, 

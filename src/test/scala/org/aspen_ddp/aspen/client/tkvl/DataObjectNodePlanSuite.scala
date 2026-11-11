@@ -237,7 +237,7 @@ class DataObjectNodePlanSuite extends AnyFunSuite:
           tier.batch(ops)
           model = ops.foldLeft(model):
             case (m, p: BatchOp.Put) => m + (p.key.bytes.toList -> p.value.bytes.toList)
-            case (m, BatchOp.Remove(k)) => m - k.bytes.toList
+            case (m, BatchOp.Remove(k, _)) => m - k.bytes.toList
           applied += 1
         catch
           case _: NodeSizeExceeded => assert(asBytes(tier.entries) == before, s"step $step")

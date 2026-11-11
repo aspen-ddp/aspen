@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.AspenError
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectPointer}
+import org.aspen_ddp.aspen.common.objects.{Key, ObjectPointer, ObjectRevision}
 
 sealed abstract class KeyValueError(cause: Throwable = null) extends AspenError(cause = cause)
 
@@ -22,6 +22,12 @@ final case class NodeSizeExceedsAllocatorLimit(tier: Int, requested: Int, limit:
     s"TKVL tier $tier has maxNodeSize $requested, above its allocator's limit of $limit bytes"
 
 class KeyDoesNotExist(val key: Key) extends KeyValueError
+
+/** A batch delete of `key` at `revision` (`TieredKeyValueList.prepareUpdates`) found the node read not holding the key
+  * at that revision: a concurrent write changed or removed it. The transaction is aborted; a retry reads afresh.
+  */
+final case class KeyNotAtRevision(key: Key, revision: ObjectRevision) extends KeyValueError:
+  override def getMessage: String = s"TKVL key is not held at revision $revision"
 
 /** `cause` carries the underlying decode failure when the root could not be read out of an
   * inode. Without it the original traceback is lost entirely. */

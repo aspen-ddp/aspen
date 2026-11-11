@@ -55,6 +55,11 @@
   `KeyRevision` or `DoesNotExist`. These are per key: no node-level serialization. A competing write fails them as an
   ordinary abort that the caller retries, never `KeyAlreadyExists`. `PutRequirement.Blind` (`TKVLInsert.blind`) opts
   out, for idempotent upserts only; `AtRevision(rev)` requires a given revision.
+- KV trees only: `TKVLInsert(requiredRevision = Some(rev))` is an `AtRevision` put, and `prepareUpdates`'
+  `deletesAtRevision` deletes a key only if the node read holds it at the given revision, else the batch aborts with
+  `KeyNotAtRevision` (DataObject planning rejects it with `UnsupportedRequirement`). Together they move an entry under
+  the state the caller read, as amoebafs rename does: other writes derived from the old value never commit against a
+  changed one. Use a batch, not `set` plus `delete`, whenever the two keys may share a node or a join may merge theirs.
 - `TKVLInsert.requireDoesNotExist` (`MustNotExist`) works on both kinds: KV via `DoesNotExist`, DataObject via the
   node's revision guard (the key's range changes only through an update of its node). Only it fails with
   `KeyAlreadyExists`, when the node read holds the key. On DataObject trees `Checked` and `Blind` add nothing (every

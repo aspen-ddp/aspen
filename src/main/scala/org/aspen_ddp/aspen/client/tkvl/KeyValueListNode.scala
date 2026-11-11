@@ -623,8 +623,8 @@ object KeyValueListNode extends Logging {
     * `planInsert` and `planDelete`: a batch of one op plans exactly what they do, except that a node no single split
     * can hold is split into more (`SplitMany`) rather than rejected. Every put gets the `WithinRange` and requirement
     * `planInsert` would give it and every deleted key its `KeyRevision` as read, as `delete` does. Throws
-    * NodeSizeExceeded if a pair cannot fit in any node and KeyAlreadyExists if a put demands its key be new and it
-    * is not.
+    * NodeSizeExceeded if a pair cannot fit in any node, KeyAlreadyExists if a put demands its key be new and it
+    * is not, and KeyNotAtRevision if a delete at a revision finds its key absent or at another revision.
     */
   def planBatch(shape: NodeShape, ops: List[BatchOp], maxNodeSize: Int): BatchPlan = {
     val maxPairSize = maxNodeSize - nodeOverhead(shape.ida, shape.minimum, shape.maximum, shape.tail, shape.contents.size)
@@ -636,8 +636,14 @@ object KeyValueListNode extends Logging {
       KeyValueListNode.putRequirements(shape, put.key, put.requirement)
     }
 
+    ops.foreach {
+      case BatchOp.Remove(k, Some(rev)) if !shape.contents.get(k).exists(_.revision == rev) =>
+        throw KeyNotAtRevision(k, rev)
+      case _ =>
+    }
+
     val puts = ops.collect { case p: BatchOp.Put => p }
-    val removed = ops.collect { case BatchOp.Remove(k) if shape.contents.contains(k) => k }
+    val removed = ops.collect { case BatchOp.Remove(k, _) if shape.contents.contains(k) => k }
     val putReqs = puts.map(p => p -> putRequirements(p)).toMap
     val removeReqs: List[KeyRequirement] = removed.flatMap(deleteRequirements(shape, _))
 
@@ -646,7 +652,7 @@ object KeyValueListNode extends Logging {
     // Applied in key order, as the ops are
     val nodeOps: List[KeyValueOperation] = ops.collect {
       case p: BatchOp.Put => Insert(p.key, p.value.bytes)
-      case BatchOp.Remove(k) if shape.contents.contains(k) => Delete(k)
+      case BatchOp.Remove(k, _) if shape.contents.contains(k) => Delete(k)
     }
 
     if (puts.isEmpty && removed.isEmpty)
@@ -883,7 +889,9 @@ object KeyValueListNode extends Logging {
                               )(using tx: Transaction, ec: ExecutionContext): Future[Boolean] = {
     val plan =
       try planBatch(node.shape, ops, maxNodeSize)
-      catch case e: KeyAlreadyExists => tx.abortAndThrow(e)
+      catch
+        case e: KeyAlreadyExists => tx.abortAndThrow(e)
+        case e: KeyNotAtRevision => tx.abortAndThrow(e)
 
     plan match {
       case Unchanged => Future.successful(false)

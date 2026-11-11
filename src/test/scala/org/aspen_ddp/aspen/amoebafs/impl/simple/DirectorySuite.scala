@@ -792,6 +792,66 @@ class DirectorySuite extends FilesSystemTestSuite:
         case _ => false
       .should(be(true))
 
+  /** A rename whose old entry is alone in its tier-0 node, so that deleting it joins the node with its right
+    * neighbor, and whose new name falls in that neighbor. The join and the write of the new name update the same
+    * node: they must be staged as one update of it
+    */
+  private def renameIntoJoinedNeighbor(replaceTarget: Boolean): Future[org.scalatest.Assertion] =
+    val pad = "x" * 200
+    val names = (1 to 12).map(i => f"m$i%02d$pad").toList
+    def fill(d: Directory, names: List[String]): Future[Unit] = names match
+      case Nil => Future.unit
+      case n :: rest => cdir(d, n, mode=0, uid=1, gid=2).flatMap(_ => fill(d, rest))
+    def deleteAll(d: Directory, names: List[String]): Future[Unit] = names match
+      case Nil => Future.unit
+      case n :: rest => d.delete(n).flatMap(f => f).flatMap(_ => deleteAll(d, rest))
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      dPtr <- smallNodeDirectory(rootDir, "d", 1024)
+      d <- fs.loadDirectory(dPtr)
+      _ <- fill(d, names)
+      _ <- waitForTransactionsToComplete()
+      tr = d.asInstanceOf[SimpleDirectory].tree
+      nodes <- Future.sequence(names.map(n => tr.getContainingNode(Key(n)).map(o => n -> o.get.nodeUUID)))
+      // Nodes in key order, each with the names it holds
+      groups = nodes.foldLeft(List.empty[(java.util.UUID, List[String])]):
+        case ((u, ns) :: rest, (n, nu)) if u == nu => (u, ns :+ n) :: rest
+        case (acc, (n, nu)) => (nu, List(n)) :: acc
+      .reverse
+      _ = groups.size should be > 2
+      sourceGroup = groups(1)._2
+      neighborGroup = groups(2)._2
+      source = sourceGroup.head
+      target = if replaceTarget then neighborGroup.last else neighborGroup.head + "q"
+      sourcePtr <- d.getEntry(source).map(_.get)
+      _ <- deleteAll(d, sourceGroup.tail)
+      _ <- waitForTransactionsToComplete()
+      _ <- d.refresh()
+      osourceNode <- tr.getContainingNode(Key(source))
+      otargetNode <- tr.getContainingNode(Key(target))
+      _ = osourceNode.get.keys should be (Set(Key(source)))
+      _ = osourceNode.get.nodeUUID should not be (otargetNode.get.nodeUUID)
+      audit = new PinAudit(client)
+      _ <- d.rename(source, target)
+      _ = audit.stop()
+      _ <- waitForTransactionsToComplete()
+      sourceEntry <- d.getEntry(source)
+      targetEntry <- d.getEntry(target)
+      contents <- d.getContents()
+    yield
+      audit.unpinned.filterNot(PinAudit.isMark) shouldBe empty
+      sourceEntry should be (None)
+      targetEntry.map(_.number) should be (Some(sourcePtr.number))
+      val expected = (names.toSet -- sourceGroup) + target
+      contents.map(_.name).toSet should be (expected)
+
+  atest("a rename whose delete joins the old entry's node into the new name's node commits"):
+    renameIntoJoinedNeighbor(replaceTarget = false)
+
+  atest("a rename whose delete joins the old entry's node into the node of the entry it replaces commits"):
+    renameIntoJoinedNeighbor(replaceTarget = true)
+
   private def createFile(dir: Directory, name: String): Future[FilePointer] =
     client.transact { tx =>
       given Transaction = tx

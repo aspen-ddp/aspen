@@ -361,7 +361,7 @@ class TransactionBuilder(
       throw ConflictingRequirements(objectPointer)
 
     revisionLocks += objectPointer
-    requirements = RevisionLock(objectPointer, requiredRevision) :: requirements
+    requirements = ExclusiveRevisionLock(objectPointer, requiredRevision) :: requirements
   }
 
   def sharedLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized {

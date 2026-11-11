@@ -155,7 +155,7 @@ read), absent means "deleted, or its allocation has not been recorded yet" (sect
      traced or not (`:98-106` at `0d08e3c6`). A store outside a known voter set gets no entry.
    Since the refresh the marker runs only after every other finalization action of T completed
    (`RegisteredTransactionFinalizerFactory.scala:37-42`, Ruling 8).
-   Lock-only objects (`RevisionLock`/`SharedRevisionLock` without a change) are never marked (`:36-39`).
+   Lock-only objects (`ExclusiveRevisionLock`/`SharedRevisionLock` without a change) are never marked (`:36-39`).
 4. `MissedUpdateMarker.mark` (`MissedUpdateMarker.scala:302-309`) queues entries per pool. Per pool at most one write
    is outstanding. Entries arriving meanwhile wait; the queue is a `LinkedHashMap` keyed by (poolIndex, objectId) for
    updates and (poolIndex, txid) for UnackedCommits entries, so a store missing one object repeatedly produces one write of
@@ -874,7 +874,7 @@ opportunistic rebuild, deletion and the completion gate are unchanged.
 | F8 | `stale` outcomes never escalate: a hot or perpetually busy object is retried forever | medium (resource), low-medium | medium |
 | F9 | `ScanTimedOut` throws away deferral counts and doubles the interval while a backlog exists | low-medium | medium |
 | F10 | Marker overwrite can replace a newer `missedTimestamp` with an older one | low | medium |
-| F11 | Object-level proof is a `RevisionLock`; blind SetMin/SetMax/SetLeft/SetRight do not move the revision | low | low |
+| F11 | Object-level proof is a `ExclusiveRevisionLock`; blind SetMin/SetMax/SetLeft/SetRight do not move the revision | low | low |
 | F12 | Reader ranks revisions by timestamp before count; timestamp bumps from refcount updates can make a stale revision win the ranking and stall reads | low (availability) | low |
 | F13 | DataObject `read.timestamp < current.timestamp` is a silent skip that counts as complete | low | low |
 | F14 | A zombie slice installed from a pre-deletion read is cleaned only if the delete's own marker is written | low | low |
@@ -1023,13 +1023,13 @@ writes the entry with T1's smaller timestamp. The completion gate M13 is weakene
 defence-in-depth only, so it is low impact; but it shows that the entry value is not a monotone max. Confidence:
 medium that it happens; low impact. Also affects which `storePointer` bytes are kept (identical, so no effect).
 
-> **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica (low).** Blind object-level KV ops do not move the revision (RequirementsApplyer.scala:105-112); proof is a RevisionLock.
+> **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica (low).** Blind object-level KV ops do not move the revision (RequirementsApplyer.scala:105-112); proof is a ExclusiveRevisionLock.
 > *Fix sketch:* Include a timestamp in the proof's requirements.
 
 **F11. Object-level proof compares revision only** (`RepairProofs.scala:261-268`; `RequirementsApplyer.scala:105-111`).
 A blind `SetMin`/`SetMax`/`SetLeft`/`SetRight` (no required revision) changes the object-level parts but not the
 revision. If the read saw the object-level part locked (reason for the deferral) and the lock holder committed between
-the read and the proof, the `RevisionLock(readRevision)` still commits; the scan then reconciles object-level parts
+the read and the proof, the `ExclusiveRevisionLock(readRevision)` still commits; the scan then reconciles object-level parts
 from the older read (if S is unchanged since the snapshot, F4-style). The same note appears in the continual-repair
 design ("compares the revision but not min, max, left or right"). Whether TKVL/system code issues blind object-level
 writes is for the reviewer; the code permits them. Confidence: low.

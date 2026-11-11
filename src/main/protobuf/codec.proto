@@ -116,7 +116,7 @@ message VersionBump {
   ObjectRevision required_revision = 2;
 }
 
-message RevisionLock {
+message ExclusiveRevisionLock {
   ObjectPointer object_pointer = 1;
   ObjectRevision required_revision = 2;
 }
@@ -162,7 +162,7 @@ message TransactionRequirement {
   DataUpdate data_update = 1;
   RefcountUpdate refcount_update = 2;
   VersionBump version_bump = 3;
-  RevisionLock revision_lock = 4;
+  ExclusiveRevisionLock exclusive_revision_lock = 4;
   KeyValueUpdate kv_update = 5;
   LocalTimeRequirement localtime = 6;
   SharedRevisionLock shared_revision_lock = 7;

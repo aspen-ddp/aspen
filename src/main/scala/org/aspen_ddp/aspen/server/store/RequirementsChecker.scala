@@ -165,7 +165,7 @@ object RequirementsChecker extends Logging {
 
           case r: VersionBump => checkRevision(getState(r.objectPointer.id), r.requiredRevision, txTimestamp)
 
-          case r: RevisionLock => checkRevision(getState(r.objectPointer.id), r.requiredRevision, txTimestamp)
+          case r: ExclusiveRevisionLock => checkRevision(getState(r.objectPointer.id), r.requiredRevision, txTimestamp)
 
           case r: SharedRevisionLock =>
             checkRevision(getSharedState(r.objectPointer.id), r.requiredRevision, txTimestamp)

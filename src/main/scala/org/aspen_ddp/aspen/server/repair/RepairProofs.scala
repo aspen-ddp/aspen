@@ -36,7 +36,7 @@ object RepairProofs extends Logging:
       case None => DoesNotExist(key)
     prove(client, s"key of ${ptr.id}")(_.update(ptr, None, None, List(requirement), Nil))
 
-  /** A RevisionLock of the read's revision. It takes the exclusive object lock, which collides with every lock a
+  /** A ExclusiveRevisionLock of the read's revision. It takes the exclusive object lock, which collides with every lock a
     * write of the object level or of any key holds, and changes nothing: no revision, timestamp or backend commit.
     * Keys and the refcount have proofs of their own
     */

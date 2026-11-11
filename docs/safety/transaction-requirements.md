@@ -59,7 +59,7 @@ objects get a backend commit and take part in the in-flight rule (section 8).
 | `DataUpdate(.., Append)` and `DataUpdate(.., WriteRange)` | as Overwrite, plus the encoded `EncodedAppendDelta` must match the store's current slice (expected length; trailer for encoding index k-1) else `AppendMismatch` (`:103-111`); size check uses the delta's `newSliceLength` (`:115-120`) | same exclusive lock | revision, timestamp as above; `data := delta.applyTo(data)` XOR (`:98-99`) | yes | revision == txid |
 | `RefcountUpdate(ptr, required, new)` | `getState` (exclusive), `checkRefcount`: refcount (count and updateSerial) equals `required` (`:160`, `:228-231`). No revision or timestamp check | object exclusive lock (`:54`) | refcount := new, timestamp := tx timestamp, revision unchanged (`:135-139`). A count of 0 makes `Frontend.commit` a deletion (`Frontend.scala:507-511`) | yes | none (traceless) |
 | `VersionBump(ptr, rev)` | `getState`, `checkRevision` (`:162`) | exclusive (`:56`) | revision := txid, timestamp (`:141-145`) | yes | revision == txid |
-| `RevisionLock(ptr, rev)` | `getState`, `checkRevision` (`:164`) | exclusive (`:58`) | nothing (`:147`) | no | none |
+| `ExclusiveRevisionLock(ptr, rev)` | `getState`, `checkRevision` (`:164`) | exclusive (`:58`) | nothing (`:147`) | no | none |
 | `SharedRevisionLock(ptr, rev)` | `getSharedState` (shared): collides with exclusive object locks, content lock, any part lock, and refuses while the exclusive-preference window is open (`:78-87`); then `checkRevision` (`:166-167`) | adds txid to `sharedLocks` (`:60`) | nothing (`:149`) | no | none |
 | `KeyValueUpdate(ptr, requiredRevision, contentLock, requirements, deletesKeys)` | see 2.2 | see 2.2 | see 2.3 | yes | see 2.3 |
 
@@ -147,7 +147,7 @@ deletes, or a refcount change), or be marked `replaySafe(reason)`. Allocations, 
 
 | Class | Field | Holders | Taken by |
 |---|---|---|---|
-| X | `ObjectState.lockedToTransaction` (`:17`) | one (a second writer logs an error and overwrites, `Locker:15-21`) | DataUpdate, RefcountUpdate, VersionBump, RevisionLock, KV with `requiredRevision`, `KeyObjectRevision`, object-level KV operation |
+| X | `ObjectState.lockedToTransaction` (`:17`) | one (a second writer logs an error and overwrites, `Locker:15-21`) | DataUpdate, RefcountUpdate, VersionBump, ExclusiveRevisionLock, KV with `requiredRevision`, `KeyObjectRevision`, object-level KV operation |
 | S | `ObjectState.sharedLocks` (`:26`) | many | SharedRevisionLock |
 | C | `KVObjectState.contentLocked` | one | `FullContentLock` |
 | R | `KVObjectState.rangeLocks` | many | `WithinRange` |
@@ -171,7 +171,7 @@ Only non-`applying` checks are shown; `applying = true` takes no locks and enfor
 
 | Request \ Held | X | S | C | R | K (same k) | K (other k) | N (same k) | N (other k) |
 |---|---|---|---|---|---|---|---|---|
-| Whole-object exclusive (DataUpdate, RefcountUpdate, VersionBump, RevisionLock, KV with `requiredRevision`/`contentLock`/`KeyObjectRevision`/object-level op) | x | x | x | x | x | x | x | x |
+| Whole-object exclusive (DataUpdate, RefcountUpdate, VersionBump, ExclusiveRevisionLock, KV with `requiredRevision`/`contentLock`/`KeyObjectRevision`/object-level op) | x | x | x | x | x | x | x | x |
 | `SharedRevisionLock` | x | - | x | x | x | x | x | x |
 | Key-level KV (key requirements, Insert, Delete on key k) | x | x | x | - | x | - | - | - |
 | Key-level on an absent key k | x | x | x | - | - | - | x | - |
@@ -195,8 +195,8 @@ Additional rules:
 
 | Operation | Takes | Collides with held | Conflicts only through |
 |---|---|---|---|
-| DataUpdate / VersionBump / RefcountUpdate / RevisionLock | X | anything on the object (row 1 above) | |
-| `RevisionLock` | X | same as above; applies nothing | |
+| DataUpdate / VersionBump / RefcountUpdate / ExclusiveRevisionLock | X | anything on the object (row 1 above) | |
+| `ExclusiveRevisionLock` | X | same as above; applies nothing | |
 | `SharedRevisionLock` | S | X, C, R, K, N, exclusive preference window | |
 | KV update with `requiredRevision` | X (+ C/K/N/R for its other items) | anything on the object | |
 | KV update with only key items | K/N on named and written keys | X, S, C, K/N on the same keys | |
@@ -334,7 +334,7 @@ backend commits per object.
    else if any of the transaction's hosted objects has `commitInFlight` and the outcome is unknown -> `awaitingCommits`,
    registered with `awaitCommitPersisted`; no timer, no locks; the vote is decided when `commitPersisted(oid)` has been
    received for each (`:304-311`, `endCollisionWait` `:325-333`). Otherwise the requirements are checked and locks are taken.
-   Objects that the transaction only locks (`RevisionLock`, `SharedRevisionLock`) never have a commit in flight unless
+   Objects that the transaction only locks (`ExclusiveRevisionLock`, `SharedRevisionLock`) never have a commit in flight unless
    another transaction changes them (`changedObjects`); the check is on `commitInFlight`, whatever the requirement.
 2. **Commit path** (`resolvedAndAllObjectsLoaded` `:615-632`): if the commit decision arrived before the object data
    (`commitAwaitsData`, `Tx.scala:239` at `c181375b`), the commit is held without locks (a commit vote requires the data, so only a transaction
@@ -354,7 +354,7 @@ backend commits per object.
 ### 8.4 `CollisionWait`: waiting out a holder you are built on
 
 A transaction whose requirement check fails only with collisions against holders that it is **built on** (it requires the
-revision that the holder writes: `DataUpdate`, `VersionBump`, `RevisionLock`, `SharedRevisionLock`, or a KV update's
+revision that the holder writes: `DataUpdate`, `VersionBump`, `ExclusiveRevisionLock`, `SharedRevisionLock`, or a KV update's
 `requiredRevision`, `Tx.scala:284-292`) and that still hold locks on this store (`frontend.holdsLocks`) does not vote
 abort. It registers with each holder (`awaitLocksReleased`, `Frontend.scala:98-100`), holds no locks, and votes when the
 holder releases (`locksReleased`, called at the end of `releaseObjects`, after the commit was issued so the follower then
@@ -816,7 +816,7 @@ can starve shared lockers. Documented behaviour.
 
 #### Q-N6. Liveness costs of the converted sites. Confidence: medium
 
-> **Verdict: CONFIRMED (liveness).** `AllocationFinalizationAction` takes an exclusive `RevisionLock` on the freshly
+> **Verdict: CONFIRMED (liveness).** `AllocationFinalizationAction` takes an exclusive `ExclusiveRevisionLock` on the freshly
 > allocated object (`AllocationFinalizationAction.scala:53`, section 12), which collides with the allocator's own
 > follow-up writes to it; one side aborts and retries. `SimpleTaskExecutor.allocateTask` now collides on the executor
 > revision under bursts or several mounts (O(n^2) attempts). Neither affects safety.
@@ -853,13 +853,14 @@ can starve shared lockers. Documented behaviour.
 
 ## 12. Todo question: is `RevisionLock` exclusive?
 
-**Verdict: yes, `RevisionLock` is exclusive, and it is a pure lock (it changes nothing).** The existing name does not say
-"exclusive", and `SharedRevisionLock` is the non-exclusive sibling, so the Todo.txt rename to `ExclusiveRevisionLock`
-would be accurate.
+**Verdict: yes, `RevisionLock` is exclusive, and it is a pure lock (it changes nothing).** The old name did not say
+"exclusive", and `SharedRevisionLock` is the non-exclusive sibling. **Fixed (2026-11-10):** renamed to
+`ExclusiveRevisionLock` (the protobuf message and its `TransactionRequirement` field too); the references below use the
+new name.
 
 Evidence:
 
-* Check: `RevisionLock` goes through `getState(oid)` with `wholeObject = true` (`RequirementsChecker.scala:164`), the same
+* Check: `ExclusiveRevisionLock` goes through `getState(oid)` with `wholeObject = true` (`RequirementsChecker.scala:164`), the same
   path as `DataUpdate`, `VersionBump` and `RefcountUpdate`. That path collides with any other holder of X
   (`checkObjectLocks`, `:44-46`), with any other holder of S (`:69-72`), and with every part lock including key, absent-key,
   content and range locks (`:73-74`, `ObjectState.lockedWriteTransactions` `:42-54`).
@@ -870,10 +871,10 @@ Evidence:
 * Builder: `lockRevision` throws if the object is also updated or shared-locked in the same transaction
   (`TransactionBuilder.scala:346-347`), and updates throw if the object is revision-locked (`:246-249` etc.).
 * Other code states it: `server/repair/RepairProofs.scala:36` ("It takes the exclusive object lock, which collides with
-  every lock a ..."), and the tests `RequirementsCheckerSuite` "RevisionLock failure on tx collision" (`:365`).
+  every lock a ..."), and the tests `RequirementsCheckerSuite` "ExclusiveRevisionLock failure on tx collision" (`:365`).
 * Contrast `SharedRevisionLock`: `getSharedState` (`:78-87`), `sharedLocks += txid` (`Locker:60`), compatible with other
   shared locks (test "two SharedRevisionLocks on one object both pass", `RequirementsCheckerSuite.scala:237`).
-* One difference from `VersionBump`: a `RevisionLock` leaves the revision unchanged, so a later transaction can still
+* One difference from `VersionBump`: a `ExclusiveRevisionLock` leaves the revision unchanged, so a later transaction can still
   require the same revision; a `VersionBump` invalidates it.
 
 ### New findings from the adversarial verification (2026-11-09)

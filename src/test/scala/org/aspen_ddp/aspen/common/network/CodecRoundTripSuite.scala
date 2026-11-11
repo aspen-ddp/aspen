@@ -121,8 +121,8 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.objectPointer.id shouldBe original.objectPointer.id
     decoded.requiredRevision.lastUpdateTxUUID shouldBe original.requiredRevision.lastUpdateTxUUID
 
-  test("RevisionLock round-trip"):
-    val original = RevisionLock(dataPtr(1), rev(2))
+  test("ExclusiveRevisionLock round-trip"):
+    val original = ExclusiveRevisionLock(dataPtr(1), rev(2))
     val decoded = Codec.decode(Codec.encode(original))
     decoded.objectPointer.id shouldBe original.objectPointer.id
     decoded.requiredRevision.lastUpdateTxUUID shouldBe original.requiredRevision.lastUpdateTxUUID
@@ -222,8 +222,8 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val vb: TransactionRequirement = VersionBump(dataPtr(4), rev(5))
     Codec.decode(Codec.encode(vb)) shouldBe a[VersionBump]
 
-    val rl: TransactionRequirement = RevisionLock(dataPtr(6), rev(7))
-    Codec.decode(Codec.encode(rl)) shouldBe a[RevisionLock]
+    val rl: TransactionRequirement = ExclusiveRevisionLock(dataPtr(6), rev(7))
+    Codec.decode(Codec.encode(rl)) shouldBe a[ExclusiveRevisionLock]
 
     val kvu: TransactionRequirement = KeyValueUpdate(kvPtr(8), None, None, Nil)
     Codec.decode(Codec.encode(kvu)) shouldBe a[KeyValueUpdate]

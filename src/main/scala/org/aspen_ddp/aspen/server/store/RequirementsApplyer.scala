@@ -26,7 +26,7 @@ object RequirementsApplyer extends Logging {
   }
 
   /** Objects the requirements modify: those named by a DataUpdate, KeyValueUpdate, RefcountUpdate or VersionBump.
-    * Objects named only by RevisionLock or SharedRevisionLock are unchanged. Exhaustive, with no wildcard, so a new
+    * Objects named only by ExclusiveRevisionLock or SharedRevisionLock are unchanged. Exhaustive, with no wildcard, so a new
     * requirement must be classified here (an unchanged object gets no backend commit).
     */
   def changedObjects(requirements: List[TransactionRequirement]): Set[ObjectId] =
@@ -36,7 +36,7 @@ object RequirementsApplyer extends Logging {
         case r: KeyValueUpdate => Some(r.objectPointer.id)
         case r: RefcountUpdate => Some(r.objectPointer.id)
         case r: VersionBump => Some(r.objectPointer.id)
-        case _: RevisionLock => None
+        case _: ExclusiveRevisionLock => None
         case _: SharedRevisionLock => None
         case _: LocalTimeRequirement => None
     }.toSet
@@ -144,7 +144,7 @@ object RequirementsApplyer extends Logging {
               revision=ObjectRevision(transactionId),
               timestamp=timestamp)
 
-          case _: RevisionLock =>
+          case _: ExclusiveRevisionLock =>
 
           case _: SharedRevisionLock =>
         }

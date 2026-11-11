@@ -36,7 +36,7 @@ RP-N6, RP-N7) and in the rows below. Each has its own "Suspected flaws" section,
   and Architecture.md describe a protocol the code does not implement (paxos F1). Either the protocol needs
   implementing or the description needs correcting.
 - **Is RevisionLock exclusive?** Yes. It takes the same exclusive object lock as a DataUpdate and changes nothing.
-  Renaming it to `ExclusiveRevisionLock` would be accurate (transaction-requirements, RevisionLock verdict).
+  **Fixed (2026-11-10):** renamed to `ExclusiveRevisionLock` (transaction-requirements §12).
 - **Two failure-recovery modes?** Driver loss and participant loss are the roots. A lost `TxFinalized`, a recovered
   commit vote whose peers forgot the transaction, and missed updates handed to repair each need separate treatment
   (transaction-recovery §1).

@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, KeyValueObjectSta
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.*
-import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, RevisionLock}
+import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, ExclusiveRevisionLock}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, FullContentLock, KeyObjectRevision, KeyRequirement, KeyRevision, WithinRange}
 import org.aspen_ddp.aspen.server.store.KVObjectState
 import org.aspen_ddp.aspen.common.util.Varint

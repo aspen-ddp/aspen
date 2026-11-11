@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.TestTransactions
 import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{Insert, IntegerKeyOrdering, Key, KeyValueObjectPointer, Value}
-import org.aspen_ddp.aspen.common.transaction.RevisionLock
+import org.aspen_ddp.aspen.common.transaction.ExclusiveRevisionLock
 
 import scala.concurrent.Future
 
@@ -69,7 +69,7 @@ class SplitFinalizationActionSuite extends IntegrationTestSuite:
       first should not be empty
       audit.unpinned shouldBe empty
       audit.replaySafeWith(reason).size shouldBe first.size
-      first.foreach(_.description.requirements should contain (RevisionLock(n1, n1State.revision)))
+      first.foreach(_.description.requirements should contain (ExclusiveRevisionLock(n1, n1State.revision)))
       // The entry is present with this value: the second run stages nothing
       audit.builtExceptMarks.size shouldBe first.size
       afterSecond.revision shouldBe afterFirst.revision
@@ -90,7 +90,7 @@ class SplitFinalizationActionSuite extends IntegrationTestSuite:
     yield
       tState.contents.get(k5).map(_.value.bytes.toList) shouldBe Some(n1.toArray.toList)
       audit.unpinned shouldBe empty
-      audit.built.flatMap(_.description.requirements) should contain (RevisionLock(n1, updated.revision))
+      audit.built.flatMap(_.description.requirements) should contain (ExclusiveRevisionLock(n1, updated.revision))
 
   atest("a split FA run after its node was deleted completes without writing"):
     for

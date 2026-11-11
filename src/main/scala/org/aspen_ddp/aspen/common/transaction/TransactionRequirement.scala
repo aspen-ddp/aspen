@@ -38,11 +38,11 @@ case class VersionBump(
                         objectPointer: ObjectPointer,
                         requiredRevision: ObjectRevision) extends TransactionObjectRequirement
 
-case class RevisionLock(
+case class ExclusiveRevisionLock(
                          objectPointer: ObjectPointer,
                          requiredRevision: ObjectRevision) extends TransactionObjectRequirement
 
-/** Like RevisionLock, but any number of transactions may hold it on the same object at once. It excludes only
+/** Like ExclusiveRevisionLock, but any number of transactions may hold it on the same object at once. It excludes only
   * transactions that modify or exclusively lock the object. An exclusive requirement that collides with held shared
   * locks opens an ExclusivePreferenceWindow during which new shared locks are refused, so a writer cannot be starved
   * by a continuous stream of shared lockers.

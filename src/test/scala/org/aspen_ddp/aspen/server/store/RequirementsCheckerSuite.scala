@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, SetMax, SetRight, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, MissingObject, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, AppendMismatch, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, MissingObject, RequirementCheckFailure, RequirementError, ExclusiveRevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, AppendMismatch, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -196,7 +196,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(errs.isEmpty)
   }
 
-  test("RevisionLock okay") {
+  test("ExclusiveRevisionLock okay") {
     val o = new ObjectState(
       oid1,
       Metadata(rev1, ref1, ts1),
@@ -206,7 +206,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
     o.lockedToTransaction = Some(tx1)
 
-    val req = RevisionLock(p1, rev1)
+    val req = ExclusiveRevisionLock(p1, rev1)
 
     var objects: HashMap[ObjectId, ObjectState] = new HashMap
     var updates: HashMap[ObjectId, DataBuffer] = new HashMap
@@ -235,7 +235,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     kvNonObject shouldBe empty
 
     for req <- List[TransactionRequirement](
-           RevisionLock(p1, rev1),
+           ExclusiveRevisionLock(p1, rev1),
            SharedRevisionLock(p1, rev1),
            VersionBump(p1, rev1),
            DataUpdate(p1, rev1, DataUpdateOperation.Overwrite),
@@ -390,7 +390,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(errs.isEmpty)
   }
 
-  test("RevisionLock failure on tx collision") {
+  test("ExclusiveRevisionLock failure on tx collision") {
     val o = new ObjectState(
       oid1,
       Metadata(rev1, ref1, ts1),
@@ -400,7 +400,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
     o.lockedToTransaction = Some(tx2)
 
-    val req = RevisionLock(p1, rev1)
+    val req = ExclusiveRevisionLock(p1, rev1)
 
     var objects: HashMap[ObjectId, ObjectState] = new HashMap
     var updates: HashMap[ObjectId, DataBuffer] = new HashMap
@@ -416,7 +416,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(errs.isEmpty)
   }
 
-  test("RevisionLock failure on revision mismatch") {
+  test("ExclusiveRevisionLock failure on revision mismatch") {
     val o = new ObjectState(
       oid1,
       Metadata(rev1, ref1, ts1),
@@ -424,7 +424,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       DataBuffer(new Array[Byte](0))
     )
 
-    val req = RevisionLock(p1, rev2)
+    val req = ExclusiveRevisionLock(p1, rev2)
 
     var objects: HashMap[ObjectId, ObjectState] = new HashMap
     var updates: HashMap[ObjectId, DataBuffer] = new HashMap
@@ -442,7 +442,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   // A deleted object has no ObjectState on its stores, so a replay that pins it cannot pass there
   test("a revision requirement on an object absent from the store fails") {
-    for req <- List(RevisionLock(p1, rev1), DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)) do
+    for req <- List(ExclusiveRevisionLock(p1, rev1), DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)) do
       val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), HashMap[ObjectId, ObjectState](),
         HashMap[ObjectId, DataBuffer](oid1 -> DataBuffer.Empty))
       withClue(s"$req: ") {
@@ -1190,7 +1190,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   private val contentLock = KeyValueUpdate(kp1, None, Some(FullContentLock(List(KeyRevision(kk1, rev1)))), Nil)
   private val refcount = RefcountUpdate(kp1, ref1, ref2)
   private val versionBump = VersionBump(kp1, rev1)
-  private val revisionLock = RevisionLock(kp1, rev1)
+  private val revisionLock = ExclusiveRevisionLock(kp1, rev1)
   private val shared = SharedRevisionLock(kp1, rev1)
 
   /** tx1 locks `first`, then tx2 is checked with `second`. Returns tx2's errors */

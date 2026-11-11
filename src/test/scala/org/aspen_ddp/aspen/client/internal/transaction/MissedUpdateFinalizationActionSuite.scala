@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{Misse
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, RefcountUpdate, DataUpdate, DataUpdateOperation, RevisionLock, SharedRevisionLock, TransactionDescription, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, RefcountUpdate, DataUpdate, DataUpdateOperation, ExclusiveRevisionLock, SharedRevisionLock, TransactionDescription, TransactionId}
 
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceSetId
@@ -347,7 +347,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
   private def txdWithLocks(updated: ObjectPointer, shared: ObjectPointer, exclusive: ObjectPointer) =
     txdFor(updated).copy(requirements =
       List(DataUpdate(updated, revision, DataUpdateOperation.Overwrite),
-           SharedRevisionLock(updated, revision), SharedRevisionLock(shared, revision), RevisionLock(exclusive, revision)))
+           SharedRevisionLock(updated, revision), SharedRevisionLock(shared, revision), ExclusiveRevisionLock(exclusive, revision)))
 
   test("only objects locked and never changed by a transaction are lock-only"):
     val List(updated, shared, exclusive) = List.fill(3)(pointerWith(Array[Byte]()))

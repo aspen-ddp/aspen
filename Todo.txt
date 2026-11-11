@@ -1,9 +1,6 @@
 TODO
 ====
 
-Verify that RevisionLock transaction requirement is exclusive. If so, rename to ExclusiveRevisionLock to make this
-explicit.
-
 Unverified findings from the replay-pins work (check each before acting):
 - UnlinkFileTask step 2 runs unpinned transactions during step preparation.
 - DataObject TKVL deleteList uses lockRevision rather than bumpVersion.

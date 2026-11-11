@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.paxos.PersistentState
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, RevisionLock, SharedRevisionLock, VersionBump, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.TempDirManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
@@ -2617,7 +2617,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("a transaction that changes nothing here still reports committed") {
     val (frontend, backend, _, net) = commitWindowFixture()
-    prepare(frontend, net, lockTxd(txid1, List(RevisionLock(fencePtr, rev0)))).disposition shouldBe
+    prepare(frontend, net, lockTxd(txid1, List(ExclusiveRevisionLock(fencePtr, rev0)))).disposition shouldBe
       TransactionDisposition.VoteCommit
     resolve(frontend, net, txid1, committed = true)
     backend.heldCommits shouldBe 0

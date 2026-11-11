@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, NoClientPrepare, KeyValueUpdate, ObjectUpdate, RevisionLock, SharedRevisionLock, VersionBump, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -360,7 +360,7 @@ class Tx( trs: TransactionRecoveryState,
     requirements.exists:
       case r: DataUpdate => r.objectPointer.id == oid && r.requiredRevision == rev
       case r: VersionBump => r.objectPointer.id == oid && r.requiredRevision == rev
-      case r: RevisionLock => r.objectPointer.id == oid && r.requiredRevision == rev
+      case r: ExclusiveRevisionLock => r.objectPointer.id == oid && r.requiredRevision == rev
       case r: SharedRevisionLock => r.objectPointer.id == oid && r.requiredRevision == rev
       case r: KeyValueUpdate => r.objectPointer.id == oid && r.requiredRevision.contains(rev)
       case _ => false

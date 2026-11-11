@@ -84,7 +84,7 @@ final case class TransactionDescription (
   /** Objects this transaction locks without changing them */
   def lockOnlyObjects: Set[ObjectId] =
     val (locks, changes) = objectRequirements.partition:
-      case _: RevisionLock | _: SharedRevisionLock => true
+      case _: ExclusiveRevisionLock | _: SharedRevisionLock => true
       case _ => false
     locks.map(_.objectPointer.id).toSet -- changes.map(_.objectPointer.id)
 

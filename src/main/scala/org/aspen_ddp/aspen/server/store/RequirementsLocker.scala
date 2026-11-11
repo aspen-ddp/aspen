@@ -55,7 +55,7 @@ object RequirementsLocker extends Logging {
 
           case r: VersionBump => lockExclusive(getState(r.objectPointer.id), transactionId)
 
-          case r: RevisionLock => lockExclusive(getState(r.objectPointer.id), transactionId)
+          case r: ExclusiveRevisionLock => lockExclusive(getState(r.objectPointer.id), transactionId)
 
           case r: SharedRevisionLock => getState(r.objectPointer.id).sharedLocks += transactionId
         }
@@ -182,7 +182,7 @@ object RequirementsLocker extends Logging {
 
           case r: VersionBump => release(getState(r.objectPointer.id), transactionId)
 
-          case r: RevisionLock => release(getState(r.objectPointer.id), transactionId)
+          case r: ExclusiveRevisionLock => release(getState(r.objectPointer.id), transactionId)
 
           case r: SharedRevisionLock => getState(r.objectPointer.id).sharedLocks -= transactionId
         }

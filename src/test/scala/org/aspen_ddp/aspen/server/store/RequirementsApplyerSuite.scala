@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, RequirementCheckFailure, DataUpdateOperation, KeyValueUpdate, LocalTimeRequirement,
-  RefcountUpdate, RevisionLock, RevisionMismatch, SharedRevisionLock, TransactionId, VersionBump}
+  RefcountUpdate, ExclusiveRevisionLock, RevisionMismatch, SharedRevisionLock, TransactionId, VersionBump}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -233,7 +233,7 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
   test("changedObjects excludes objects only locked or checked, and non-object requirements") {
     val pool = PoolId(new UUID(0, 0))
     val reqs = List(
-      RevisionLock(DataObjectPointer(ObjectId(new UUID(0, 6)), pool, Array[Byte]()), rev1),
+      ExclusiveRevisionLock(DataObjectPointer(ObjectId(new UUID(0, 6)), pool, Array[Byte]()), rev1),
       SharedRevisionLock(DataObjectPointer(ObjectId(new UUID(0, 7)), pool, Array[Byte]()), rev1),
       LocalTimeRequirement(ts1, LocalTimeRequirement.Requirement.LessThan))
     RequirementsApplyer.changedObjects(reqs) shouldBe empty

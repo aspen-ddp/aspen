@@ -458,8 +458,6 @@ abstract class TransactionDriver(
     sendMessages()
   }
 
-  def mayBeDiscarded: Boolean = synchronized { finalized }
-
   /** Finalizes with the stores `owedStores` as the TxFinalized `owed`, set in the same critical section as the
     * finalization so a late resolution between them cannot send a non-empty `owed` with `late`. Aborts and late commits
     * owe nothing

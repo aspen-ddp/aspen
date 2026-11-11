@@ -71,6 +71,7 @@ object TransactionDriverSuite {
     def testResendPrepare(to: StoreId): Unit = sendPrepareMessage(to)
     def testHaveLocalProposal: Boolean = synchronized { proposer.haveLocalProposal }
     def testProposalId: ProposalId = synchronized { proposer.currentProposalId }
+    def testFinalized: Boolean = synchronized { finalized }
   }
 
   class TFinalizer(autoComplete: Boolean = true) extends TransactionFinalizer with TransactionFinalizer.Factory {
@@ -535,7 +536,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       ProposalId(1,0),
       Right(TxAcceptResponse.Accepted(false))))
 
-    driver.mayBeDiscarded should be (false)
+    driver.testFinalized should be (false)
     completed should be (false)
 
     driver.receiveTxAcceptResponse(TxAcceptResponse(
@@ -545,7 +546,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       ProposalId(1,0),
       Right(TxAcceptResponse.Accepted(false))))
 
-    driver.mayBeDiscarded should be (true)
+    driver.testFinalized should be (true)
     completed should be (true)
   }
 
@@ -565,7 +566,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       ProposalId(1,0),
       Right(TxAcceptResponse.Accepted(true))))
 
-    driver.mayBeDiscarded should be (false)
+    driver.testFinalized should be (false)
     completed should be (false)
     finalizer.created should be (false)
 
@@ -576,14 +577,14 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       ProposalId(1,0),
       Right(TxAcceptResponse.Accepted(true))))
 
-    driver.mayBeDiscarded should be (false)
+    driver.testFinalized should be (false)
     completed should be (false)
     finalizer.created should be (true)
     finalizer.cancelled should be (false)
 
     driver.receiveTxFinalized(TxFinalized(ds0, ds0, txd.transactionId, true, late = false, owed = Set()))
 
-    driver.mayBeDiscarded should be (true)
+    driver.testFinalized should be (true)
     completed should be (true)
     finalizer.cancelled should be (true)
   }
@@ -634,7 +635,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       ProposalId(1,0),
       Right(TxAcceptResponse.Accepted(false))))
 
-    driver.mayBeDiscarded should be (false)
+    driver.testFinalized should be (false)
     completed should be (false)
 
     driver.receiveTxAcceptResponse(TxAcceptResponse(
@@ -644,7 +645,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       ProposalId(1,0),
       Right(TxAcceptResponse.Accepted(false))))
 
-    driver.mayBeDiscarded should be (false)
+    driver.testFinalized should be (false)
     completed should be (false)
 
     driver.receiveTxAcceptResponse(TxAcceptResponse(
@@ -654,7 +655,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       ProposalId(1,0),
       Right(TxAcceptResponse.Accepted(false))))
 
-    driver.mayBeDiscarded should be (true)
+    driver.testFinalized should be (true)
     completed should be (true)
   }
 
@@ -700,7 +701,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
 
     completed should be (true)
-    driver.mayBeDiscarded should be (true)
+    driver.testFinalized should be (true)
     finalizer.createCount should be (0)
     abortAccepts(messenger) should be (Nil)
     messenger.messages.collect { case f: TxFinalized => f.to }.toSet should be (txd.allDataStores.toSet)
@@ -847,7 +848,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
     abortAccepts(messenger) should be (Nil)
     messenger.messages.collect { case a: TxAccept => a.value }.toSet should be (Set(true))
-    driver.mayBeDiscarded should be (false)
+    driver.testFinalized should be (false)
     outcomes(messenger) should be (Nil)
   }
 
@@ -885,7 +886,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     abortAccepts(messenger) should be (Nil)
     messenger.messages.collect { case a: TxAccept => a.value }.toSet should be (Set(true))
     finalizer.createCount should be (0)
-    driver.mayBeDiscarded should be (false)
+    driver.testFinalized should be (false)
   }
 
   test("a driver holding a proof without a prepare quorum neither resolves nor proposes") {
@@ -901,7 +902,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     promise(driver, txd, ds3, TransactionDisposition.VoteAbort)
 
     completed should be (false)
-    driver.mayBeDiscarded should be (false)
+    driver.testFinalized should be (false)
     driver.testHaveLocalProposal should be (false)
     finalizer.createCount should be (0)
     messenger.messages.collect { case a: TxAccept => a } should be (Nil)
@@ -964,8 +965,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
         Right(TxAcceptResponse.Accepted(true))))
     // The finalizer completes on another thread
     val deadline = System.nanoTime() + 5_000_000_000L
-    while !driver.mayBeDiscarded && System.nanoTime() < deadline do Thread.sleep(5)
-    driver.mayBeDiscarded should be (true)
+    while !driver.testFinalized && System.nanoTime() < deadline do Thread.sleep(5)
+    driver.testFinalized should be (true)
     messenger.clear()
     driver.heartbeat()
     owedSent(messenger) should be (Set(Set(ds1)))
@@ -1003,7 +1004,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       finalizer.cancelled should be (true)
       finalizer.readCancelled should be (Some(true))
       completed should be (true)
-      driver.mayBeDiscarded should be (true)
+      driver.testFinalized should be (true)
       val sent = messenger.messages.collect { case f: TxFinalized => (f.owed, f.late) }.toSet
       sent should be (Set((handedOff + ds1, false)))
       messenger.clear()
@@ -1044,7 +1045,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
         Right(TxAcceptResponse.Accepted(true))))
     driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
-    driver.mayBeDiscarded should be (true)
+    driver.testFinalized should be (true)
     calls.get should be (1)
 
     // The completion callback, on the global context, reaches onFinalized again: it must change nothing
@@ -1165,7 +1166,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
     factory.created(1).done.success(())
     completed should be (true)
-    driver.mayBeDiscarded should be (true)
+    driver.testFinalized should be (true)
     // The failed finalizer's planned stores are listed as owed with the completed one's
     messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set(ds1, ds2)))
   }
@@ -1224,7 +1225,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     messenger.clear()
 
     driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
-    driver.mayBeDiscarded should be (true)
+    driver.testFinalized should be (true)
     messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set(ds1, ds2)))
 
     tasks.runAll()
@@ -1241,7 +1242,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     commitBy(driver, txd)
     factory.created.head.done.failure(new Exception("action gave up"))
     driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set()))
-    driver.mayBeDiscarded should be (true)
+    driver.testFinalized should be (true)
     tasks.runAll()
     factory.created.size should be (1)
 
@@ -1257,6 +1258,6 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     tasks2.tasks.foreach(t => t.cancelled = false)
     tasks2.runAll()
     factory2.created.size should be (1)
-    driver2.mayBeDiscarded should be (false)
+    driver2.testFinalized should be (false)
   }
 }

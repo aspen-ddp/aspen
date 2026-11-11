@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.amoebafs
 import org.aspen_ddp.aspen.client.tkvl.{Root, SinglePoolNodeAllocator}
 import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying, Transaction, TransactionCreationError}
 import org.aspen_ddp.aspen.common.objects.{IntegerKeyOrdering, LexicalKeyOrdering, ObjectRevision}
-import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty, InvalidInode}
+import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty, InvalidInode, IsADirectory, NotADirectory}
 import org.aspen_ddp.aspen.amoebafs.impl.simple.CreateFileTask
 import scribe.Logging
 
@@ -39,6 +39,13 @@ trait Directory extends BaseFile with Logging {
     */
   def prepareMoveOut(name: String)(using tx: Transaction): Future[InodePointer]
 
+  /** Stages the insert of `pointer` as entry `name` by a move: the inode keeps its links. An existing entry is
+    * replaced and unlinked as by `prepareInsert`, but only as POSIX rename allows: a directory replaces only an empty
+    * directory and a non-directory only a non-directory, else NotADirectory, IsADirectory or DirectoryNotEmpty.
+    */
+  def prepareMoveIn(name: String, pointer: InodePointer)(using tx: Transaction): Future[Unit]
+
+  /** Renames entry `oldName` to `newName`, replacing an existing `newName` as POSIX rename does (see `prepareMoveIn`) */
   def prepareRename(oldName: String, newName: String)(using tx: Transaction): Future[Unit]
 
   def prepareHardLink(name: String, file: BaseFile)(using tx: Transaction): Future[Unit]
@@ -128,6 +135,8 @@ trait Directory extends BaseFile with Logging {
         case e: DirectoryNotEmpty => throw StopRetrying(e)
         case e: DirectoryEntryExists => throw StopRetrying(e)
         case e: DirectoryEntryDoesNotExist => throw StopRetrying(e)
+        case e: IsADirectory => throw StopRetrying(e)
+        case e: NotADirectory => throw StopRetrying(e)
         case _ =>
           logger.info(s"rename error $err")
           refresh().recover:
@@ -302,7 +311,8 @@ object Directory:
   /** Moves entry `oldName` of `src` to `newName` in `dst`, a different directory, retrying until it commits. Each
     * attempt reads both entries afresh (see `prepareMove`). As POSIX rename, and as `rename` within one directory,
     * an existing `newName` is replaced and unlinked on every attempt. Fails with DirectoryEntryDoesNotExist if
-    * `oldName` is gone and with DirectoryNotEmpty if `newName` is a non-empty directory.
+    * `oldName` is gone, and with DirectoryNotEmpty, NotADirectory or IsADirectory if POSIX rename refuses to replace
+    * `newName` (see `prepareMoveIn`).
     */
   def move(src: Directory, oldName: String, dst: Directory, newName: String): Future[Unit] =
     given ExecutionContext = src.fs.executionContext
@@ -312,6 +322,8 @@ object Directory:
       case e: DirectoryEntryExists => throw StopRetrying(e)
       case e: DirectoryEntryDoesNotExist => throw StopRetrying(e)
       case e: DirectoryNotEmpty => throw StopRetrying(e)
+      case e: IsADirectory => throw StopRetrying(e)
+      case e: NotADirectory => throw StopRetrying(e)
       case e: FatalReadError => throw StopRetrying(e)
       case e: TransactionCreationError => throw StopRetrying(e)
       case _ =>
@@ -349,6 +361,6 @@ object Directory:
           yield
             moved.prepareSetParentDirectory(dst)
         case _ => Future.unit
-      _ <- dst.prepareInsert(newName, iptr, incref = false)
+      _ <- dst.prepareMoveIn(newName, iptr)
     yield
       ()

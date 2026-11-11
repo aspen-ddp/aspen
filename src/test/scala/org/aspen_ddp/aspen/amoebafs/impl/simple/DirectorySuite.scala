@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.tkvl.{Root, RootAlreadyModified, SinglePoolNodeAllocator, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Key, KeyAlreadyExists, LexicalKeyOrdering, ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
-import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
+import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty, IsADirectory, NotADirectory}
 import org.aspen_ddp.aspen.amoebafs.{Directory, DirectoryInode, DirectoryPointer, FileInode, FileMode, FilePointer, FileSystem, Timespec}
 import org.aspen_ddp.aspen.common.DataBuffer
 
@@ -739,6 +739,61 @@ class DirectorySuite extends FilesSystemTestSuite:
       innerEntry shouldBe defined
 
   // The moved inode is the one under the name when the move runs, not one a caller read before
+  /** Renames (`crossDirectory` false) or moves `src` onto an existing `target` of the other type: a directory over a
+    * file fails with NotADirectory, a file over a directory with IsADirectory, and neither entry changes
+    */
+  private def replaceAcrossTypes(crossDirectory: Boolean, directoryOverFile: Boolean): Future[org.scalatest.Assertion] =
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      aPtr <- cdir(rootDir, "a", mode=0, uid=1, gid=2)
+      bPtr <- cdir(rootDir, "b", mode=0, uid=1, gid=2)
+      a <- fs.loadDirectory(aPtr)
+      b <- fs.loadDirectory(bPtr)
+      dst = if crossDirectory then b else a
+      srcPtr <- if directoryOverFile then cdir(a, "src", mode=0, uid=1, gid=2) else createFile(a, "src")
+      targetPtr <- if directoryOverFile then createFile(dst, "target") else cdir(dst, "target", mode=0, uid=1, gid=2)
+      fmove = if crossDirectory then Directory.move(a, "src", b, "target") else a.rename("src", "target")
+      err <- fmove.map(_ => None).recover { case e => Some(e) }
+      srcEntry <- a.getEntry("src")
+      targetEntry <- dst.getEntry("target")
+    yield
+      if directoryOverFile then
+        err.map(_.getClass) should be (Some(classOf[NotADirectory]))
+      else
+        err.map(_.getClass) should be (Some(classOf[IsADirectory]))
+      srcEntry.map(_.number) should be (Some(srcPtr.number))
+      targetEntry.map(_.number) should be (Some(targetPtr.number))
+
+  atest("a rename of a directory onto a file fails with NotADirectory"):
+    replaceAcrossTypes(crossDirectory = false, directoryOverFile = true)
+
+  atest("a rename of a file onto a directory fails with IsADirectory"):
+    replaceAcrossTypes(crossDirectory = false, directoryOverFile = false)
+
+  atest("a cross-directory move of a directory onto a file fails with NotADirectory"):
+    replaceAcrossTypes(crossDirectory = true, directoryOverFile = true)
+
+  atest("a cross-directory move of a file onto a directory fails with IsADirectory"):
+    replaceAcrossTypes(crossDirectory = true, directoryOverFile = false)
+
+  atest("a cross-directory move of a file onto a file replaces it"):
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      aPtr <- cdir(rootDir, "a", mode=0, uid=1, gid=2)
+      bPtr <- cdir(rootDir, "b", mode=0, uid=1, gid=2)
+      a <- fs.loadDirectory(aPtr)
+      b <- fs.loadDirectory(bPtr)
+      srcPtr <- createFile(a, "src")
+      _ <- createFile(b, "target")
+      _ <- Directory.move(a, "src", b, "target")
+      srcEntry <- a.getEntry("src")
+      targetEntry <- b.getEntry("target")
+    yield
+      srcEntry should be (None)
+      targetEntry.map(_.number) should be (Some(srcPtr.number))
+
   // POSIX rename: an existing destination is replaced on every attempt, not only on the first
   atest("a cross-directory move replaces an existing destination entry, also after a failed attempt"):
     for
@@ -756,9 +811,9 @@ class DirectorySuite extends FilesSystemTestSuite:
       // fails at commit with the destination name still present
       attempts = new java.util.concurrent.atomic.AtomicInteger(0)
       racingDst = new SimpleDirectory(bPtr, bRevision, bInode, fs):
-        override def prepareInsert(name: String, ptr: org.aspen_ddp.aspen.amoebafs.InodePointer, incref: Boolean)
+        override def prepareMoveIn(name: String, ptr: org.aspen_ddp.aspen.amoebafs.InodePointer)
                                   (using tx: Transaction): Future[Unit] =
-          super.prepareInsert(name, ptr, incref).flatMap: _ =>
+          super.prepareMoveIn(name, ptr).flatMap: _ =>
             if attempts.incrementAndGet() == 1 then b.rename("racer", "target") else Future.unit
       _ <- Directory.move(a, "src", racingDst, "target")
       srcEntry <- a.getEntry("src")

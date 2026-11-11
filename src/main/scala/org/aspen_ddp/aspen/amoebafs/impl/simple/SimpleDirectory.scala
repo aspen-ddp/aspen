@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetryin
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, KeyValueListNode, NoCache, PutRequirement, Root, TKVLInsert, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{Delete, Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
-import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
+import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty, IsADirectory, NotADirectory}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, Directory, DirectoryEntry, DirectoryInode, DirectoryPointer, FileSystem, InodePointer}
 import scribe.Logging
 import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
@@ -55,13 +55,25 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
 
   override def prepareInsert(name: String,
                              pointer: InodePointer,
-                             incref: Boolean)(using tx: Transaction): Future[Unit] = {
+                             incref: Boolean)(using tx: Transaction): Future[Unit] =
+    prepareInsertEntry(name, pointer, incref, renameRules = false)
+
+  override def prepareMoveIn(name: String, pointer: InodePointer)(using tx: Transaction): Future[Unit] =
+    prepareInsertEntry(name, pointer, incref = false, renameRules = true)
+
+  /** With `renameRules`, an entry replaced must be of a type POSIX rename lets `pointer` replace (`checkReplaceable`) */
+  private def prepareInsertEntry(name: String,
+                                 pointer: InodePointer,
+                                 incref: Boolean,
+                                 renameRules: Boolean)(using tx: Transaction): Future[Unit] = {
     val key = Key(name)
 
     val fcleanupOldEntry = tree.get(key).flatMap:
       case None => Future.successful(None)
       case Some(vs) =>
         val oldPtr = InodePointer(vs.value.bytes)
+        if renameRules then
+          checkReplaceable(name, pointer, oldPtr)
         checkForDeletion(oldPtr).flatMap: _ =>
           UnlinkFileTask.prepareTask(fs, oldPtr).map(_ => Some(vs.revision))
 
@@ -86,6 +98,17 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
       _ <- tree.set(key, Value(pointer.toArray), requirement)
     } yield ()
   }
+
+  /** POSIX rename's rule for `incoming` replacing `replaced`, the entry `name`: a directory replaces only a directory
+    * (else NotADirectory, ENOTDIR) and a non-directory only a non-directory (else IsADirectory, EISDIR). Checked
+    * against the same read of the entry that the replacement's requirement binds to.
+    */
+  private def checkReplaceable(name: String, incoming: InodePointer, replaced: InodePointer): Unit =
+    (incoming, replaced) match
+      case (_: DirectoryPointer, _: DirectoryPointer) =>
+      case (_: DirectoryPointer, _) => throw NotADirectory(this.pointer, name)
+      case (_, _: DirectoryPointer) => throw IsADirectory(this.pointer, name)
+      case _ =>
 
   private def checkForDeletion(ptr: InodePointer)(using tx: Transaction): Future[Unit] =
     ptr match
@@ -159,11 +182,12 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
         oold <- tr.get(oldKey)
         onew <- tr.get(newKey)
         old = oold.getOrElse(throw DirectoryEntryDoesNotExist(pointer, oldName))
-        // An entry already under the new name is replaced: unlink it
+        // An entry already under the new name is replaced, if POSIX rename allows: unlink it
         _ <- onew match
           case None => Future.unit
           case Some(vs) =>
             val iptr = InodePointer(vs.value.bytes)
+            checkReplaceable(newName, InodePointer(old.value.bytes), iptr)
             checkForDeletion(iptr).flatMap: _ =>
               UnlinkFileTask.prepareTask(fs, iptr)
         // One batch, so a node is updated once even when deleting the old key joins its node into the new key's.

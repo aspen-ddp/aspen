@@ -7,10 +7,12 @@ commits and the UnackedCommits tree instead. Line numbers in passages the refres
 refresh evidence is for `0d08e3c6`. Refreshed again 2026-11-10 against `c181375b` for the replay-pins addendum
 (`docs/superpowers/specs/2026-11-09-replay-pins-addendum-design.md`, with its "Amendments during implementation"):
 prefer-abort driver prepares (6.2), applied stubs and `TxFinalized.owed` (9.1, 10.5); its evidence is for `c181375b`
-and is marked "(addendum)". Every mechanism is cited as `path:line`; paths are relative
-to `src/main/scala/org/aspen_ddp/aspen/` unless they start with `docs/`. Where this document disagrees with
-`CLAUDE.md`, `Architecture.md` or `Todo.txt`, the code was taken as the truth and the disagreement is called out
-(section 2).
+and is marked "(addendum)". Every `path:line` citation was refreshed 2026-11-11 against `2df0c4f1`; a citation whose
+code has since been removed names the commit it was taken at (e.g. "`Frontend.scala:655` at `c3ad5493`"). The text of
+dated verification and refresh notes still describes the code of its date. Every mechanism is cited as `path:line`;
+paths are relative to `src/main/scala/org/aspen_ddp/aspen/` unless they start with `docs/`. Where this document
+disagrees with `CLAUDE.md`, `Architecture.md` or `Todo.txt`, the code was taken as the truth and the disagreement is
+called out (section 2).
 
 Related documents (siblings, not duplicated here): [crash-recovery-log.md](crash-recovery-log.md) (CRL interface and
 SimpleCRL), [transaction-requirements.md](transaction-requirements.md) (requirement checks, locks, commit-in-flight
@@ -33,11 +35,11 @@ Contents: 1 model; 2 design intent versus implementation; 3 invariants; 4 messag
 | Role | Who | Notes |
 |---|---|---|
 | Client | `ClientTransactionDriver` / `SimpleClientTransactionDriver` | Builds the `TransactionDescription` (txd) and the per-store object data, sends prepares, retransmits until it hears an outcome. Not a Paxos participant. |
-| Primary pool | the pool of `txd.primaryObject` | Chosen by `maxBy(poolIDAMap)` over all object requirements (`client/internal/transaction/TransactionBuilder.scala:113-116`). Its stores are the Paxos **acceptors**; its IDA gives the quorum (`ida.writeThreshold`). |
-| Secondary pools | other pools referenced by the txd | Their stores **vote** (VoteCommit/VoteAbort on their own objects) but are not acceptors: the driver ignores their promises for Paxos purposes (`server/transaction/TransactionDriver.scala:251-252`, `isValidAcceptor` at `:144-146`) and `TxAccept` is sent only to `primaryObjectDataStores` (`:443`). |
-| Designated leader | store `txd.designatedLeaderUID` of the primary pool | Chosen randomly by the client among stores believed online (`client/internal/transaction/DesignatedLeader.scala:19-28`). It hosts the normal-case **proposer and learner** (`TransactionDriver`). |
-| Recovery driver | any store whose `Tx` has been idle for `Host.txHeartbeatTimeout` (5 heartbeats) | Same `TransactionDriver` class; started by `Store.heartbeat` (`server/store/Store.scala:67-78`) or `SimpleDriverRecoveryMixin` (`server/SimpleDriverRecoveryMixin.scala:19-29`). |
-| Store-side participant | `Tx` (one per transaction per store, `server/transaction/Tx.scala`) inside a `Frontend` | Owns the **acceptor** (`Tx.scala:74`), the vote, the object locks, and commit application. |
+| Primary pool | the pool of `txd.primaryObject` | Chosen by `maxBy(poolIDAMap)` over all object requirements (`client/internal/transaction/TransactionBuilder.scala:122-125`). Its stores are the Paxos **acceptors**; its IDA gives the quorum (`ida.writeThreshold`). |
+| Secondary pools | other pools referenced by the txd | Their stores **vote** (VoteCommit/VoteAbort on their own objects) but are not acceptors: the driver ignores their promises for Paxos purposes (`server/transaction/TransactionDriver.scala:302-303`, `isValidAcceptor` at `:185-187`) and `TxAccept` is sent only to `primaryObjectDataStores` (`:544`). |
+| Designated leader | store `txd.designatedLeaderUID` of the primary pool | Chosen randomly by the client among stores believed online (`client/internal/transaction/DesignatedLeader.scala:20-28`). It hosts the normal-case **proposer and learner** (`TransactionDriver`). |
+| Recovery driver | any store whose `Tx` has been idle for `Host.txHeartbeatTimeout` (5 heartbeats) | Same `TransactionDriver` class; started by `Store.heartbeat` (`server/store/Store.scala:78-89`) or `SimpleDriverRecoveryMixin` (`server/SimpleDriverRecoveryMixin.scala:18-28`). |
+| Store-side participant | `Tx` (one per transaction per store, `server/transaction/Tx.scala`) inside a `Frontend` | Owns the **acceptor** (`Tx.scala:76`), the vote, the object locks, and commit application. |
 
 Everything for one store runs on that store's executor (see "Host threading model" in `CLAUDE.md`); `TransactionDriver`
 has its own lock and runs on timer/ec threads.
@@ -45,11 +47,11 @@ has its own lock and runs on timer/ec threads.
 ### 1.2 Identifiers
 
 * `ProposalId(number: Int, peer: Byte)` ordered by number then peer (`common/paxos/ProposalId.scala:3-11`). `peer` is
-  the **pool index** of the proposing store (`TransactionDriver.scala:88`: `new Proposer(storeId.poolIndex, ...)`).
+  the **pool index** of the proposing store (`TransactionDriver.scala:102`: `new Proposer(storeId.poolIndex, ...)`).
   The client's prepare carries `ProposalId.initialProposal(designatedLeaderUID) = (1, leader)`
   (`ClientTransactionDriver.scala:77`).
 * A leader driver starts at `(1, leader)`; a non-leader driver calls `nextRound()` in its constructor, giving
-  `(2, self)` (`SimpleTransactionDriver.scala:48`, `Proposer.scala:48-52`).
+  `(2, self)` (`SimpleTransactionDriver.scala:48`, `Proposer.scala:64-68`).
 * Paxos values are `Boolean` (true = commit). Store votes are `TransactionDisposition` {`Undetermined`, `VoteCommit`,
   `VoteAbort`} (`common/transaction/TransactionDisposition.scala`). Outcomes are `TransactionStatus` {`Unresolved`,
   `Committed`, `Aborted`}.
@@ -59,7 +61,7 @@ has its own lock and runs on timer/ec threads.
 Acceptors are primary-pool stores `0..w-1`, quorum `t = writeThreshold`. `Proposer`/`Learner` `require(t >= w/2 + 1)`
 (`Proposer.scala:8`, `Learner.scala:5`). The IDA constructors already enforce a majority write threshold: Replication
 `writeThreshold >= width/2 + 1` (`common/ida/IDA.scala:203`); ReedSolomon and RandomAccessReedSolomon require
-`restoreThreshold >= width/2+1` and `writeThreshold >= restoreThreshold` (`IDA.scala:408-415`, `:589-596`). So any two
+`restoreThreshold >= width/2+1` and `writeThreshold >= restoreThreshold` (`IDA.scala:408-415`, `:588-595`). So any two
 write quorums intersect, which both Paxos and the "two conflicting transactions cannot both reach `t` commit votes on
 one object" argument (see [transaction-requirements.md](transaction-requirements.md)) rely on.
 
@@ -67,7 +69,7 @@ one object" argument (see [transaction-requirements.md](transaction-requirements
 
 ## 2. Design intent versus implementation (read this first)
 
-`Architecture.md:139-155` and `Todo.txt:11-14` describe the intended protocol:
+`Architecture.md:139-155` and `Todo.txt:11-14` at `c3ad5493` describe the intended protocol:
 
 > each DataStore writes its VoteCommit with the Paxos state, sends the Promise to **all** DataStores, tracks the
 > promises, and once VoteCommits exceed the threshold for every object **self-generates the Accept** ... it is the only
@@ -77,10 +79,10 @@ one object" argument (see [transaction-requirements.md](transaction-requirements
 
 | Aspect | Documented intent | Code (verified) |
 |---|---|---|
-| Who receives the Promise/vote | every store | only the proposer named in the prepare's `from` (the leader): `TxPrepareResponse(m.from, ...)` at `Tx.scala:736` |
-| Who generates Accept | each acceptor, locally | only a `TransactionDriver`: the sole construction site of `TxAccept` is `TransactionDriver.scala:444` |
-| Who is the learner | each store (or the client) | the driver's `Learner` (`TransactionDriver.scala:89`, `:335`); the client's learner is commented out (`ClientTransactionDriver.scala:28`, `:45-59`) |
-| Round-1 commit-only rule | commit may only be proposed/accepted in round 1; abort needs round 2 | **No such rule exists.** `Acceptor.receiveAccept` accepts any value at any `>=` promised id (`common/paxos/Acceptor.scala:24-35`). A leader tallying an abort proposes `Accept((1,L), false)` directly in round 1; a recovery driver (round >= 2) may propose commit if it tallies `t` commit votes (`TransactionDriver.scala:254-306`). |
+| Who receives the Promise/vote | every store | only the proposer named in the prepare's `from` (the leader): `TxPrepareResponse(m.from, ...)` at `Tx.scala:873` |
+| Who generates Accept | each acceptor, locally | only a `TransactionDriver`: the sole construction site of `TxAccept` is `TransactionDriver.scala:545` |
+| Who is the learner | each store (or the client) | the driver's `Learner` (`TransactionDriver.scala:103`, `:394`); the client's learner is commented out (`ClientTransactionDriver.scala:28`, `:45-59`) |
+| Round-1 commit-only rule | commit may only be proposed/accepted in round 1; abort needs round 2 | **No such rule exists.** `Acceptor.receiveAccept` accepts any value at any `>=` promised id (`common/paxos/Acceptor.scala:24-35`). A leader tallying an abort proposes `Accept((1,L), false)` directly in round 1; a recovery driver (round >= 2) may propose commit if it tallies `t` commit votes (`TransactionDriver.scala:314-365`). |
 | Latency | one round trip | 5 sequential one-way hops to the client (section 5), with two serial durable CRL writes (vote, accept) on the path. |
 
 Consequences for readers of this spec:
@@ -108,22 +110,22 @@ Acceptors accept an Accept whose id equals their promise (`Acceptor.scala:31`), 
 
 **P3 Acceptor durability.** A `Promise` or `Accepted` (and the `Nack` that accompanies a same-path response) is sent
 only after the acceptor state (`promised`, `accepted`) that justifies it is durable in the device CRL together with the
-txd, the store's object data and its vote. Code: `Tx.scala:739-745` (prepare), `:420-431` (delayed prepare),
-`:759-765` (accept); the CRL calls the handler only after the log entry is written (`DSYNC`,
-`server/crl/simple/StreamWriter.scala:37-40`, `LogEntry.scala:38-53`).
+txd, the store's object data and its vote. Code: `Tx.scala:876-882` (prepare), `:499-516` (delayed prepare),
+`:896-902` (accept); the CRL calls the handler only after the log entry is written (`DSYNC`,
+`server/crl/simple/StreamWriter.scala:38-41`, `LogEntry.scala:46-69`).
 
 **P4 Vote immutability.** A store's non-`Undetermined` disposition for a transaction is computed once and never
 recomputed while the `Tx` lives; a recovered `Tx` keeps the persisted vote instead of recomputing it. Code:
-`Tx.scala:400-401` (recovered with a vote skips `determineDisposition`), `:717-718` (only `Undetermined` is decided),
-`:326` (`endCollisionWait`). (Exception: F13.)
+`Tx.scala:479-480` (recovered with a vote skips `determineDisposition`), `:844-846` (only `Undetermined` is decided),
+`:400` (`endCollisionWait`). (Exception: F13.)
 
 **P5 Vote and promise are one durable record.** The disposition travels in the same `TxPrepareResponse` as the
-`Promise` and is saved in the same `TransactionRecoveryState` (`Tx.scala:736-745`). A vote that a proposer has seen
+`Promise` and is saved in the same `TransactionRecoveryState` (`Tx.scala:873-882`). A vote that a proposer has seen
 therefore survives any crash of that store.
 
 **P6 A commit proposal requires `t` durable commit votes on every object.** The driver proposes commit only if, for
 every object in the txd, at least the pool's write threshold of that object's pool's stores reported `VoteCommit`
-in the current round (`TransactionDriver.scala:261-296`, analysed in 7.2). Combined with P5 and P12 this means a
+in the current round (`TransactionDriver.scala:321-356`, analysed in 7.2). Combined with P5 and P12 this means a
 decided commit is backed by locked, durable commit votes at a write quorum of every object's pool.
 
 **P7 Abort is always a valid free choice.** If no value has been chosen, any proposer may propose abort at any time
@@ -133,60 +135,60 @@ liveness/throughput but not safety, provided P8 holds.
 **P8 Single chosen value.** For one transaction at most one of {commit, abort} is chosen by the primary pool's
 acceptors, given P1-P3 and that the acceptor state of a possibly-chosen value is still held by a quorum-intersecting
 set of acceptors (P9). The proposer picks the highest accepted value reported in its promise quorum before it falls
-back to its tally (`Proposer.scala:27-36`, `receivePromise` `:76-84`).
+back to its tally (`Proposer.scala:41-51`, `receivePromise` `:93-103`).
 
 **P9 Acceptor-state retention (assumption).** The state of a *possibly chosen* value is retained until it can no
 longer matter. In code: a committed `Tx`'s CRL record (and in-memory acceptor) lives until `TxFinalized`
-(`Tx.scala:790-800`, `Frontend.scala:537-551`). An **aborted** `Tx`'s CRL record is deleted at *resolution*, earlier
-(`Tx.scala:624-627`, `Frontend.scala:481-483`); and after `TxFinalized` the store has no Paxos state at all. For a
+(`Tx.scala:949-960`, `Frontend.scala:659-667`). An **aborted** `Tx`'s CRL record is deleted at *resolution*, earlier
+(`Tx.scala:746-749`, `Frontend.scala:584-586`); and after `TxFinalized` the store has no Paxos state at all. For a
 transaction whose state a store has forgotten, safety is carried by *other* mechanisms: the pin rule (P16), the host
 status cache (7 s, P17), `Tx.proveCommitted` with the late-commit rule (P15, 10.5), and the UnackedCommits tree. Since
 the refresh nothing time-based remains in the prepare path. (addendum) A forgotten *abort* is carried by prefer-abort
 (6.2): a store that forgot T never gives a driver a fresh commit vote. A committed T's record may be replaced by an
-applied stub instead of deleted (`Frontend.concludeTransactionState`, `Frontend.scala:668-674`); a stub carries no
+applied stub instead of deleted (`Frontend.concludeTransactionState`, `Frontend.scala:677-683`); a stub carries no
 Paxos state, only "this store holds T's update" (crash-recovery-log.md 3.6).
 
 **P10 Only the chosen value is announced.** `TxResolved`, `TransactionResolved`, `TxFinalized` are sent by a driver
-only after its `Learner` has a quorum for one proposal id (`TransactionDriver.scala:337`, `:471-521`), or after
-another party's resolution reached it (`receiveTxResolved` `:345-353`, `receiveTxFinalized` `:363-372`). Any store may
+only after its `Learner` has a quorum for one proposal id (`TransactionDriver.scala:396`, `:690-726`), or after
+another party's resolution reached it (`receiveTxResolved` `:404-430`, `receiveTxFinalized` `:440-459`). Any store may
 originate a `TxResolved(committed=true)` by proof (`Tx.proveCommitted`, P15). All receivers trust any `TxResolved`.
 
 **P11 Application only on resolution.** A store applies a transaction's update to its objects only on: a non-late
-`TxResolved(true)` (`Tx.scala:855-869`), a non-late `TxFinalized(true)` (`:874-890`), a found UnackedCommits entry
-(`unackedCommitFound`, `:997-1026`), or a late commit that reaches a Tx holding its own commit vote whose entry is
-found (`lateCommit`, `:920-932`). Never on its own vote, on an Accept, or on a proof: a prover applies nothing
-(`applyNothing`, `:941-964`). (addendum) Never at a store that holds an applied stub for T: `doCommit` applies nothing
+`TxResolved(true)` (`Tx.scala:905-919`), a non-late `TxFinalized(true)` (`:924-947`), a found UnackedCommits entry
+(`unackedCommitFound`, `:1078-1120`), or a late commit that reaches a Tx holding its own commit vote whose entry is
+found (`lateCommit`, `:984-1007`). Never on its own vote, on an Accept, or on a proof: a prover applies nothing
+(`applyNothing`, `:1016-1040`). (addendum) Never at a store that holds an applied stub for T: `doCommit` applies nothing
 and reports T's changed objects as uncommitted (`Tx.scala:642-648`), and a late commit reaching an undecided commit
 vote with a stub applies nothing without a lookup (`:998-1000`, `:1087-1088`).
 
 **P12 Commit-vote locks.** From the moment a store votes commit until it learns the outcome, the requirements of that
-transaction hold locks on the store's object states (`Tx.scala:244-249`), including after a restart (a recovered commit
-vote re-takes them, `:394-403`; the Frontend holds all messages until every recovered vote has loaded,
-`Frontend.scala:279-312`). Details in [transaction-requirements.md](transaction-requirements.md).
+transaction hold locks on the store's object states (`Tx.scala:318-323`), including after a restart (a recovered commit
+vote re-takes them, `:472-482`; the Frontend holds all messages until every recovered vote has loaded,
+`Frontend.scala:319-352`). Details in [transaction-requirements.md](transaction-requirements.md).
 
 **P13 Object data lives in the CRL until the backend commit succeeds.** `crl.dropTransactionObjectData` is called only
-after every issued backend commit completed without error (`Tx.scala:604-613`, `Frontend.scala:542-551`); a failed
+after every issued backend commit completed without error (`Tx.scala:726-735`, `Frontend.scala:685-695`); a failed
 backend commit keeps the record for the life of the loaded store.
 
 **P14 Finalization ordering.** A driver sends `TxFinalized(commit)` and `TransactionFinalized` only after all
-FinalizationActions completed (`TransactionDriver.scala:496-499`). `TxFinalized(abort)` is sent immediately at
-resolution (`:502-503`). A store deletes a committed transaction's CRL record only after `TxFinalized` **and** its
-backend commits (`Frontend.scala:537-551`). (addendum) A commit `TxFinalized` carries `owed`, the stores for which the
+FinalizationActions completed (`TransactionDriver.scala:650-653`). `TxFinalized(abort)` is sent immediately at
+resolution (`:707-708`). A store deletes a committed transaction's CRL record only after `TxFinalized` **and** its
+backend commits (`Frontend.scala:659-695`). (addendum) A commit `TxFinalized` carries `owed`, the stores for which the
 finalizer's marker handed UnackedCommits entries off, set atomically with finalization and empty for aborts and late
-commits (`TransactionDriver.scala:438-442`); a store named there replaces its record by an applied stub at that same
-point (`Tx.scala:935-936,959`; no Tx: `Frontend.scala:768-778`). A driver reached by another driver's non-late commit
+commits (`TransactionDriver.scala:465-469`); a store named there replaces its record by an applied stub at that same
+point (`Tx.scala:935-936,959`; no Tx: `Frontend.scala:770-781`). A driver reached by another driver's non-late commit
 `TxFinalized` cancels its finalizer and finalizes at once with the received `owed` union its marker's planned set
-(`handedOffStores`, empty if nothing was handed off before the cancel): Ruling 7, `TransactionDriver.scala:411-430`,
+(`handedOffStores`, empty if nothing was handed off before the cancel): Ruling 7, `TransactionDriver.scala:440-459`,
 replacing Ruling 3's wait. Its entries may then become durable after its `TxFinalized` (P14's ordering holds for the
 first finalizer to complete, not for this driver's own late entries); the repair scan allows for that (Ruling 8).
 
 **P15 Proof of commit is sound.** If an object a store hosts shows revision `ObjectRevision(txid)` (or, for a
 revision-less KeyValueUpdate, some key carries it), the transaction committed, because only a committed transaction
 writes that revision (`RequirementsApplyer.appliedBy`, `server/store/RequirementsApplyer.scala:50-63`). A store that
-finds this on the abort path, with a memoryless acceptor (`mayProve`, `Tx.scala:203-204`), sends the proposer a
-`TxResolved(committed, late = false, proof = true)` instead of a vote (`Tx.scala:548-550`, `:585-597`). Since the
+finds this on the abort path, with a memoryless acceptor (`mayProve`, `Tx.scala:228-229`), sends the proposer a
+`TxResolved(committed, late = false, proof = true)` instead of a vote (`Tx.scala:584-586`, `:621-633`). Since the
 refresh the proof is not an outcome: the receiving driver only stops proposing abort and starts a post-proof round
-(10.5); stores ignore proofs (`Tx.scala:858`, `Frontend.scala:636`). Not available for traceless changes
+(10.5); stores ignore proofs (`Tx.scala:908`, `Frontend.scala:761`). Not available for traceless changes
 (refcount-only, key-delete) nor when later transactions have overwritten the revision.
 
 **P16 Pin rule (client-enforced).** Every client transaction built by `TransactionBuilder` carries a *pin* (a
@@ -196,24 +198,24 @@ with `UnpinnedTransaction` before anything is sent (`client/internal/transaction
 `TransactionBuilder.scala:140-141`). After a pinned T commits, at most `w - t` stores of the pinned object both hold the
 pre-T state and do not know T, so a replay cannot collect `t` commit votes on it. Stores do not check the rule (Q-N4 in
 transaction-requirements.md). The rule covers committed transactions only (P-N4). There is no age test left: a
-replayed *client* prepare is checked like a new one (`Frontend.scala:671-691`). (addendum) Aborted transactions are
+replayed *client* prepare is checked like a new one (`Frontend.scala:806-825`). (addendum) Aborted transactions are
 covered by prefer-abort instead (6.2): a driver's prepare never gathers a fresh commit vote, so only a delayed duplicate
 of the client's own prepare can re-decide a forgotten abort (P-N4, narrowed).
 
 **P17 Status cache (assumption).** The host-wide `TransactionStatusCache` remembers each transaction's status for
-`txStatusCacheDuration` (7 s) after its last write, bounded to 4 M entries (`server/Host.scala:66-73`,
-`server/transaction/TransactionStatusCache.scala:154-208`). A store answers prepares for transactions found there with
-`TxResolved`/`TxFinalized` instead of running Paxos (`Store.scala:154-180`). Entries carry `late`; a finalized
+`txStatusCacheDuration` (7 s) after its last write, bounded to 4 M entries (`server/Host.scala:66-67`,
+`server/transaction/TransactionStatusCache.scala:8-24`). A store answers prepares for transactions found there with
+`TxResolved`/`TxFinalized` instead of running Paxos (`Store.scala:163-189`). Entries carry `late`; a finalized
 committed entry is relayed as late (`late = entry.late || entry.finalized`, `TxFinalized(..., late = committed)`,
-`Store.scala:159,171`), which is late-commit evidence (10.5). It is in memory only.
+`Store.scala:168,180`), which is late-commit evidence (10.5). It is in memory only.
 
 **P18 Client outcome.** The client's future completes with the first `TransactionResolved` or `TransactionFinalized`
 it receives (`ClientTransactionDriver.scala:61-63`, `:37-44`); it never checks that two reports agree. Resolution
 precedes finalization, so a client can see "committed" before FinalizationActions have run and before any store has
 applied the update (the commit is durable only as votes and accepted state in CRLs; see P6, P13).
 
-**P19 First resolution wins.** `Tx.resolved` (`Tx.scala:647-649`), `TransactionDriver.onResolution` (`:473`),
-`Tx.receiveFinalized` (`:779`) and the client (`:37-44`) each keep the first outcome and silently ignore a different
+**P19 First resolution wins.** `Tx.resolved` (`Tx.scala:772`), `TransactionDriver.onResolution` (`:691`),
+`Tx.receiveFinalized` (`:925`) and the client (`:37-44`) each keep the first outcome and silently ignore a different
 later one. Nothing detects a split decision (F11).
 
 ---
@@ -222,17 +224,17 @@ later one. Nothing detects a split decision (F11).
 
 | Message | From -> to | Carries | Defined |
 |---|---|---|---|
-| `TxPrepare` | client or driver -> every store of every referenced pool | txd, proposal id, this store's object updates (client only), `fromClient`. `from` always names the **proposer store**, even for client-sent prepares. | `common/network/Message.scala:251-265` |
+| `TxPrepare` | client or driver -> every store of every referenced pool | txd, proposal id, this store's object updates (client only), `fromClient`. `from` always names the **proposer store**, even for client-sent prepares. | `common/network/Message.scala:251-264` |
 | `TxPrepareResponse` | store -> `m.from` | `Left(Nack(promised))` or `Right(Promise(lastAccepted))`, plus `disposition` and `collisions` | `Message.scala:267-280` |
 | `TxAccept` | driver -> primary-pool stores | proposal id, value | `Message.scala:282-288` |
 | `TxAcceptResponse` | acceptor -> driver | `Nack` or `Accepted(value)` | `Message.scala:290-301` |
-| `TxResolved` | driver -> all stores (+ `notifyOnResolution`); or store -> driver (cache reply, proof of commit) | `committed` | `Message.scala:303-308` |
-| `TransactionResolved` / `TransactionFinalized` | driver (or store cache reply) -> originating client | `committed` | `Message.scala:222-236` |
-| `TxCommitted` | store -> its last proposer | object ids this store could not apply | `Message.scala:310-316` |
-| `TxFinalized` | driver -> all stores; store cache reply -> proposer | `committed`, `late`, `owed` (addendum: stores the finalizer wrote UnackedCommits entries for; empty for aborts, late commits and the cache relay) | `Message.scala:321-329`; relay `Store.scala:178` |
-| `TxHeartbeat` | driver -> all stores | resets the stores' idle timers | `Message.scala:325-329` |
+| `TxResolved` | driver -> all stores (+ `notifyOnResolution`); or store -> driver (cache reply, proof of commit) | `committed` | `Message.scala:303-311` |
+| `TransactionResolved` / `TransactionFinalized` | driver (or store cache reply) -> originating client | `committed` | `Message.scala:222-234` |
+| `TxCommitted` | store -> its last proposer | object ids this store could not apply | `Message.scala:313-319` |
+| `TxFinalized` | driver -> all stores; store cache reply -> proposer | `committed`, `late`, `owed` (addendum: stores the finalizer wrote UnackedCommits entries for; empty for aborts, late commits and the cache relay) | `Message.scala:321-329`; relay `Store.scala:180` |
+| `TxHeartbeat` | driver -> all stores | resets the stores' idle timers | `Message.scala:331-335` |
 | `TxUnknownStore` | router -> sender | the addressed store is not on this host | `server/host/StoreRouter.scala:143-146` |
-| `TxStatusRequest/Response` | - | handled by `Tx.receiveStatusRequest` (`Tx.scala:858-862`) but **no code sends a request** | dead code |
+| `TxStatusRequest/Response` | - | handled by `Tx.receiveStatusRequest` (`Tx.scala:1146-1150`) but **no code sends a request** | dead code |
 
 No network guarantee is assumed beyond "messages may be lost, delayed, duplicated and reordered" (the QUIC plugin
 drops messages over budget, `CLAUDE.md`; Paxos and the retransmit loops tolerate the rest).
@@ -252,7 +254,7 @@ hosts an object of the transaction.
  |                 |    |    |      |    |         |
  |                 +----+----+----->L<---+----+----+   TxPrepareResponse(Promise(None), vote)  (hop 2)
  |                                  L: first client prepare at the leader created the driver
- |                                     (Store.scala:156-158); tally votes; setLocalProposal(v)
+ |                                     (Store.scala:191-193); tally votes; setLocalProposal(v)
  |                 <-- TxAccept((1,L), v) ---- L ----->  (primary pool stores only)           (hop 3)
  |                 each acceptor: acceptor.receiveAccept; crl.save{..., accepted=(1,L,v)};
  |                 ON DURABLE ->
@@ -271,29 +273,29 @@ Step table with code references:
 
 | # | Step | Code |
 |---|---|---|
-| 1 | Client builds txd: `startTimestamp = HLCTimestamp.now`, primary object, designated leader, `originatingClient`. | `TransactionBuilder.scala:89,113-127` |
+| 1 | Client builds txd: `startTimestamp = HLCTimestamp.now`, primary object, designated leader, `originatingClient`. | `TransactionBuilder.scala:98,122-136` |
 | 2 | Client sends `TxPrepare((1,L), from=L, fromClient=true)` with each store's own object slices to **every** store of every referenced pool, then retransmits all of it every `retransmitDelay` until an outcome arrives (never gives up; logs "HUNG" every 3rd retry). | `ClientTransactionDriver.scala:65-84`, `SimpleClientTransactionDriver.scala:37-50` |
-| 3 | Store entry: `Store.receiveTransactionMessage` applies CRL backpressure to unseen prepares (`admitPrepare`), then `handleTransactionMessage` consults the status cache (section 10.6) and, **if this store is the primary pool's designated leader**, calls `driveTransaction`. Then `Frontend` creates or finds the `Tx`. | `Store.scala:120-158,193`, `Frontend.scala:426-443,630-666` |
-| 4 | New `Tx`: loads hosted objects; `completeLoad` runs `determineDisposition` and `lock()`. | `Tx.scala:345-418,440-478,244-249` |
-| 5 | `respondToPrepare`: `acceptor.receivePrepare` (in memory), `crl.save(state)`, **then** send `TxPrepareResponse` to `m.from`. | `Tx.scala:730-749` |
-| 6 | Leader driver collects responses for its **current** proposal id only; records each vote; feeds primary-pool promises to the `Proposer`. At promise quorum plus a sufficient tally, sets the local proposal and sets `shouldSendAcceptMessages`. | `TransactionDriver.scala:230-312` |
-| 7 | `sendAcceptMessages`: `TxAccept` to primary-pool stores not yet in `acceptedPeers`. | `:438-450` |
-| 8 | Acceptor: `Acceptor.receiveAccept`, `crl.save`, **then** `TxAcceptResponse`. | `Tx.scala:751-766`, `Acceptor.scala:24-35` |
-| 9 | `Learner.receiveAccepted` counts distinct peers at the highest id; at `t` it fixes `resolvedValue`. | `Learner.scala:14-37`, `TransactionDriver.scala:335-337` |
-| 10 | `onResolution`: commit -> create finalizer (runs FinalizationActions) and queue `TxResolved` to all data stores plus `notifyOnResolution`; abort -> `onFinalized(false)` at once. Client gets `TransactionResolved`. | `:471-521` |
-| 11 | Stores apply/abort (section 9). | `Tx.scala:615-666` |
-| 12 | Finalizer completes -> `onFinalized(true)` -> `TxFinalized` to all stores, `TransactionFinalized` to client, driver shuts down. | `:376-400` |
-| 13 | Store `TxFinalized`: Tx forgotten, status cache `finalized=true`, CRL record deleted once backend commits are done. | `Tx.scala:778-800`, `Frontend.scala:616-624,537-551` |
+| 3 | Store entry: `Store.receiveTransactionMessage` applies CRL backpressure to unseen prepares (`admitPrepare`), then `handleTransactionMessage` consults the status cache (section 10.6) and, **if this store is the primary pool's designated leader**, calls `driveTransaction`. Then `Frontend` creates or finds the `Tx`. | `Store.scala:150-193`, `Frontend.scala:744-751,787-825` |
+| 4 | New `Tx`: loads hosted objects; `completeLoad` runs `determineDisposition` and `lock()`. | `Tx.scala:419-440,442-497,318-323` |
+| 5 | `respondToPrepare`: `acceptor.receivePrepare` (in memory), `crl.save(state)`, **then** send `TxPrepareResponse` to `m.from`. | `Tx.scala:857-886` |
+| 6 | Leader driver collects responses for its **current** proposal id only; records each vote; feeds primary-pool promises to the `Proposer`. At promise quorum plus a sufficient tally, sets the local proposal and sets `shouldSendAcceptMessages`. | `TransactionDriver.scala:281-365` |
+| 7 | `sendAcceptMessages`: `TxAccept` to primary-pool stores not yet in `acceptedPeers`. | `:539-551` |
+| 8 | Acceptor: `Acceptor.receiveAccept`, `crl.save`, **then** `TxAcceptResponse`. | `Tx.scala:888-903`, `Acceptor.scala:24-36` |
+| 9 | `Learner.receiveAccepted` counts distinct peers at the highest id; at `t` it fixes `resolvedValue`. | `Learner.scala:14-37`, `TransactionDriver.scala:394-396` |
+| 10 | `onResolution`: commit -> create finalizer (runs FinalizationActions) and queue `TxResolved` to all data stores plus `notifyOnResolution`; abort -> `onFinalized(false)` at once. Client gets `TransactionResolved`. | `:690-726` |
+| 11 | Stores apply/abort (section 9). | `Tx.scala:737-792` |
+| 12 | Finalizer completes -> `onFinalized(true)` -> `TxFinalized` to all stores, `TransactionFinalized` to client, driver shuts down. | `:471-496` |
+| 13 | Store `TxFinalized`: Tx forgotten, status cache `finalized=true`, CRL record deleted once backend commits are done. | `Tx.scala:924-960`, `Frontend.scala:763-781,659-683` |
 
 Note the abort ordering in `onResolution(false, true)`: `onFinalized(false)` runs first and sends `TxFinalized` (and
-`TransactionFinalized`) *before* the `TxResolved` messages queued afterwards (`TransactionDriver.scala:502-518`); the
-receiver ordering does not matter for correctness (a `TxResolved` for a finalized transaction is dropped,
-`Frontend.scala:609-615`).
+`TransactionFinalized`) *before* the `TxResolved` messages queued afterwards (`TransactionDriver.scala:707-717`); the
+receiver ordering does not matter for correctness (a `TxResolved` for a transaction the store no longer holds only
+updates the monotone status cache, which keeps a finalized entry finalized, `Frontend.scala:760-762`).
 
 In the commit case the order of `queueTxMessages(TxResolved)` and a concurrent `onFinalized` (from the finalizer's
 future, possibly with no actions) is not fixed; `queueTxMessages` replaces unsent messages and logs a warning
-(`:172-179`). Losing the `TxResolved` is harmless because `TxFinalized(commit)` implies resolution at the store
-(`Tx.scala:790-792`).
+(`:217-224`). Losing the `TxResolved` is harmless because `TxFinalized(commit)` implies resolution at the store
+(`Tx.scala:949-951`).
 
 ---
 
@@ -301,33 +303,33 @@ future, possibly with no actions) is not fixed; `queueTxMessages` replaces unsen
 
 ### 6.1 What a store votes on
 
-A `Tx` considers only the requirements of objects it hosts plus non-object requirements (`Tx.scala:59-61`). The vote
-is determined in `determineDisposition` (`:440-478`), in this priority order:
+A `Tx` considers only the requirements of objects it hosts plus non-object requirements (`Tx.scala:59-63`). The vote
+is determined in `determineDisposition` (`:525-571`), in this priority order:
 
 1. `muted` (a rebuilt store and a transaction started before its `acceptor-since`): `VoteAbort`, never sent; it proves
-   the commit if an object shows the update, and is otherwise forgotten unanswered (`Tx.scala:499-506`, `:807-813`).
+   the commit if an object shows the update, and is otherwise forgotten unanswered (`Tx.scala:529-536`, `:858-863`).
    Requirements are not checked and no locks are taken. (The horizon's `tooOld` and `TransactionTooOld` are gone.)
 1b. (addendum) No client prepare seen (prefer-abort, 6.2): `VoteAbort` with `NoClientPrepare`, requirements unchecked,
    once the wait for the client's prepare is over or the outcome is known; it still proves the commit if an object shows
    the update (`Tx.scala:537-542`, `:584-586`).
 2. Any hosted object whose earlier backend commit failed: `BackendCommitFailed` -> `VoteAbort`.
 3. Any hosted object with a transaction commit in flight (`Frontend.commitInFlight`): the vote is **withheld** and the
-   Tx registers to be told when the commit persists (`:454-460`); see [transaction-requirements.md](transaction-requirements.md).
+   Tx registers to be told when the commit persists (`:547-553`); see [transaction-requirements.md](transaction-requirements.md).
 4. Otherwise `RequirementsChecker.check`. If every failing requirement is a collision with a lock holder this
-   transaction is built on (`awaitableHolders`, `:273-281`), the vote is withheld for up to `Tx.CollisionWait`
+   transaction is built on (`awaitableHolders`, `:347-355`), the vote is withheld for up to `Tx.CollisionWait`
    (500 ms, evaluated at the store heartbeat, so up to ~1.5 s). Otherwise the result is `VoteCommit` (no errors) or
    `VoteAbort`.
 
 "Withheld" means *no response is sent* to a prepare, which Paxos allows; drivers retransmit
-(`SimpleTransactionDriver.scala:54-85`). A withheld Tx holds **no locks**, so waits cannot form cycles (`Tx.scala:268-270`).
+(`SimpleTransactionDriver.scala:59-90`). A withheld Tx holds **no locks**, so waits cannot form cycles (`Tx.scala:342-344`).
 
-`lock()` is called right after the vote is decided and **before** the vote is durable (`:403`, `:720`). That is safe:
+`lock()` is called right after the vote is decided and **before** the vote is durable (`:482`, `:847`). That is safe:
 locks are volatile, and a crash before the vote is durable simply discards them along with any chance the vote was
 observed (P3, P5).
 
 ### 6.2 Prefer-abort driver prepares (replaces "Missing data"; addendum)
 
-A driver's prepare carries no object data and has `fromClient = false` (`TransactionDriver.scala:415,434`). Every such
+A driver's prepare carries no object data and has `fromClient = false` (`TransactionDriver.scala:516,535`). Every such
 prepare is **prefer-abort**: it never gathers a fresh commit vote. A Tx with no vote (`Undetermined`, not muted, not
 recovered with a vote) that has seen no client prepare (`clientPrepared`, set only by `fromClient` prepares,
 `Tx.scala:808-811`) does not check its requirements (`awaitingClientPrepare`, `Tx.scala:205-208`):
@@ -358,23 +360,23 @@ adopted data is **not** re-saved to the CRL until the next save (F14).
 ### 6.3 Proof of commit on an unknown transaction
 
 If `decideDisposition` would vote abort, the acceptor is memoryless (`mayProve`: no accepted value and no recovered
-Paxos state, `Tx.scala:203-204`) and an object already shows the transaction's update, the store `proveCommitted`s
-(`Tx.scala:548-550`, `:585-597`): one `TxResolved(proof = true)` to `lastProposer`, no save, no locks, nothing in the
+Paxos state, `Tx.scala:228-229`) and an object already shows the transaction's update, the store `proveCommitted`s
+(`Tx.scala:584-586`, `:621-633`): one `TxResolved(proof = true)` to `lastProposer`, no save, no locks, nothing in the
 status cache, and no local resolution. The prover stays a live Tx: later prepares get an ordinary memoryless promise with
-its abort vote, saved to the CRL (`answerPrepareAsAcceptor`, `:786-788`); a muted prover re-sends the proof instead. On
-any real outcome it applies nothing and is forgotten (`applyNothing`, `:941-964`): it holds no commit vote, so it is not
+its abort vote, saved to the CRL (`answerPrepareAsAcceptor`, `:836-838`); a muted prover re-sends the proof instead. On
+any real outcome it applies nothing and is forgotten (`applyNothing`, `:1016-1040`): it holds no commit vote, so it is not
 owed the commit. Proof-first ordering is gone: the proof is tried only on the abort path. (addendum) A Tx reached only
 by driver prepares is on the abort path by construction (6.2), and its wait for the client's prepare is bypassed when a
 proof exists (`awaitingClientPrepare`, `Tx.scala:208`), so it proves at once to the driver that prepared it.
 
 ### 6.4 Recovered votes
 
-A `Tx` recovered from the CRL keeps its persisted disposition and acceptor state (`Tx.scala:76`, `:443-451`).
+A `Tx` recovered from the CRL keeps its persisted disposition and acceptor state (`Tx.scala:76`, `:472-480`).
 A recovered unresolved commit vote, of any transaction (not only traceless ones), looks up its UnackedCommits entry
-once loaded and again before accepting any abort (`needsUnackedCheck` `:158-160`, `holdAbort` `:972-982`), and its
+once loaded and again before accepting any abort (`needsUnackedCheck` `:176-178`, `holdAbort` `:1048-1058`), and its
 store starts no driver for it until the first lookup answers, nor while the store's CRL state loads
-(`Store.driveTransaction`, `Store.scala:95-98`). A found entry resolves it committed without forgetting it, and its
-driver starts holding a proof (`Tx.scala:997-1010`, `Store.scala:108-110`). See
+(`Store.driveTransaction`, `Store.scala:104-107`). A found entry resolves it committed without forgetting it, and its
+driver starts holding a proof (`Tx.scala:1078-1104`, `Store.scala:117-119`). See
 [transaction-recovery.md](transaction-recovery.md).
 
 ---
@@ -386,23 +388,23 @@ driver starts holding a proof (`Tx.scala:997-1010`, `Store.scala:108-110`). See
 `TransactionDriver` (`server/transaction/TransactionDriver.scala`) holds a `Proposer(self index, w, t)`, a
 `Learner(w, t)`, `peerDispositions` (votes seen in the current round), `acceptedPeers`, `knownResolved`,
 `resolved`/`resolvedValue`, and the finalizer. A new round clears `peerDispositions` and `acceptedPeers`
-(`:402-406`). The proposer's `localProposal` is **sticky**: once set it is never cleared (`Proposer.scala:38`), so later
+(`:498-502`). The proposer's `localProposal` is **sticky**: once set it is never cleared (`Proposer.scala:54`), so later
 rounds re-propose the same tally result unless a promise reports an accepted value.
 
-### 7.2 Tally (`TransactionDriver.scala:254-306`)
+### 7.2 Tally (`TransactionDriver.scala:314-365`)
 
 Run once, when the proposer has a promise quorum and no local proposal. For each object pointer `ptr` (iteration order
 of a Set), with `w`, `t` of `ptr`'s pool, `n` = stores of that pool that answered this round, `c` = those that voted
 `VoteCommit`, `a = n - c` (**every non-`VoteCommit` answer counts as an abort vote, including `Undetermined`**,
-`:272-275`):
+`:332-337`):
 
 | Condition | Effect |
 |---|---|
-| `n < t` | cannot decide: wait (`cantAttempt`, `:281-284`) |
-| `n != w` and `c < t` and `w - a >= t` | commit still possible with more answers: wait (`:286-289`) |
-| `w - a < t` | object cannot reach `t` commit votes: `canCommitObject = false` (`:291-292`) |
+| `n < t` | cannot decide: wait (`cantAttempt`, `:341-344`) |
+| `n != w` and `c < t` and `w - a >= t` | commit still possible with more answers: wait (`:346-349`) |
+| `w - a < t` | object cannot reach `t` commit votes: `canCommitObject = false` (`:351-352`) |
 
-Then `localProposal = canCommit(all objects)` (`:301-303`).
+Then `localProposal = canCommit(all objects)` (`:361-362`).
 
 Properties (verified by case analysis):
 
@@ -416,66 +418,66 @@ Properties (verified by case analysis):
 
 ### 7.3 Rounds, Nacks, backoff
 
-* On the first Nack for the current id the driver advances its round immediately (`onNack`, `:452-458`); it does not
+* On the first Nack for the current id the driver advances its round immediately (`onNack`, `:553-559`); it does not
   wait for a quorum of Nacks (`Proposer.receiveNack` exists but is unused). Nacks from secondary-pool stores count too
-  (the `Left` branch has no `isValidAcceptor` check, `:243-245`), though those stores never accept anything.
+  (the `Left` branch has no `isValidAcceptor` check, `:294-296`), though those stores never accept anything.
 * `SimpleTransactionDriver.nextRound` doubles a backoff capped at `maxDelay` and sleeps a random time below it
-  (`SimpleTransactionDriver.scala:87-99`). The driver re-broadcasts the current prepare/accept every `maxDelay`
-  (`:54-85`), interleaving prepares with accepts every third send so stores that forgot the Tx restart it.
+  (`SimpleTransactionDriver.scala:92-105`). The driver re-broadcasts the current prepare/accept every `maxDelay`
+  (`:59-90`), interleaving prepares with accepts every third send so stores that forgot the Tx restart it.
 * After a round change `shouldSendAcceptMessages` is not set again (the tally block is skipped because
-  `haveLocalProposal` is already true, `:254`); the Accept for the new round goes out at the next periodic send. Latency
+  `haveLocalProposal` is already true, `:314`); the Accept for the new round goes out at the next periodic send. Latency
   only (F12).
-* `TransactionDriver.receiveTxPrepare` (`:226-228`), which would feed other proposers' ids into `highestProposalId`,
+* `TransactionDriver.receiveTxPrepare` (`:277-279`), which would feed other proposers' ids into `highestProposalId`,
   has no caller.
 
 ### 7.4 Learner and resolution
 
 `Learner.receiveAccepted` counts distinct peers for the highest proposal id seen (`Learner.scala:14-37`); the driver
-only feeds it messages whose id equals its current id and whose sender is a valid acceptor (`TransactionDriver.scala:314-337`).
+only feeds it messages whose id equals its current id and whose sender is a valid acceptor (`TransactionDriver.scala:373-396`).
 Resolution can also arrive without the learner: `receiveTxResolved` calls `onResolution(msg.committed,
-sendResolutionMessage = false)` (`:345-353`) and trusts the sender (cache reply, proof of commit, another driver).
+sendResolutionMessage = false)` (`:404-423`) and trusts the sender (cache reply, proof of commit, another driver).
 
 ### 7.5 Who becomes a driver
 
 * The designated leader, on any `TxPrepare` it receives for a transaction not finalized in the cache
-  (`Store.scala:156-158`), including client retransmits. Guarded by pool id.
-* Any store whose `Tx` is idle for more than `txHeartbeatTimeout` (`Store.scala:73-77`) or `failedDriverDuration`
-  (`SimpleDriverRecoveryMixin.scala:19-29`). **Not guarded by pool id** (F4). A driver's own store is also one of its
+  (`Store.scala:191-193`), including client retransmits. Guarded by pool id.
+* Any store whose `Tx` is idle for more than `txHeartbeatTimeout` (`Store.scala:84-88`) or `failedDriverDuration`
+  (`SimpleDriverRecoveryMixin.scala:18-28`). **Not guarded by pool id** (F4). A driver's own store is also one of its
   recipients; it addresses its own `Tx` like any other.
-* A client's retransmitted prepare does not count as store activity (`Tx.scala:692-693`), so a dead leader cannot be kept
+* A client's retransmitted prepare does not count as store activity (`Tx.scala:818-819`), so a dead leader cannot be kept
   "alive" by the client.
-* A driver is created once per transaction per store (`Store.driveTransaction`, `:84-96`) and removed when its own
-  store receives `TxFinalized` (`:181-184`).
+* A driver is created once per transaction per store (`Store.driveTransaction`, `:104-126`) and removed when its own
+  store receives `TxFinalized` (`:216-219`).
 
 ---
 
 ## 8. Persistence ordering rules
 
-All CRL writes are `crl.save(txid, TransactionRecoveryState, handler)` (`server/crl/CrashRecoveryLog.scala:141`). A saved
+All CRL writes are `crl.save(txid, TransactionRecoveryState, handler)` (`server/crl/CrashRecoveryLog.scala:157`). A saved
 record contains: `storeId`, serialized txd, object updates (unless dropped), disposition, status, and the acceptor's
-`(promised, accepted)` (`server/crl/TransactionRecoveryState.scala:9-15`). Saves overwrite the whole record
-(`server/crl/simple/SimpleCRL.scala:266-289`). Each record always carries the then-current acceptor state, so a later save never loses an
+`(promised, accepted)` (`server/crl/TransactionRecoveryState.scala:8-13`). Saves overwrite the whole record
+(`server/crl/simple/SimpleCRL.scala:344-366`). Each record always carries the then-current acceptor state, so a later save never loses an
 earlier promise.
 
 | Message sent | Must be durable first | Code |
 |---|---|---|
-| `TxPrepareResponse` (Promise or Nack) | txd, data, disposition, acceptor state | `Tx.scala:739-745`; delayed variant `:420-431` |
-| `TxAcceptResponse` | acceptor state with `accepted=(id,v)` (disposition as it is then, possibly `Undetermined`) | `:759-765` |
-| `TxResolved`, `TransactionResolved` (from the driver) | `t` `Accepted` (each durable at its acceptor) | `TransactionDriver.scala:337,471-521` |
-| `TxCommitted` | all backend commits of this store for the transaction completed; CRL object data drop *enqueued* (not awaited) | `Tx.scala:604-613` |
-| `TxFinalized(commit)` | all FinalizationActions complete | `TransactionDriver.scala:496-499` |
+| `TxPrepareResponse` (Promise or Nack) | txd, data, disposition, acceptor state | `Tx.scala:876-882`; delayed variant `:499-516` |
+| `TxAcceptResponse` | acceptor state with `accepted=(id,v)` (disposition as it is then, possibly `Undetermined`) | `:896-902` |
+| `TxResolved`, `TransactionResolved` (from the driver) | `t` `Accepted` (each durable at its acceptor) | `TransactionDriver.scala:396,690-726` |
+| `TxCommitted` | all backend commits of this store for the transaction completed; CRL object data drop *enqueued* (not awaited) | `Tx.scala:726-735` |
+| `TxFinalized(commit)` | all FinalizationActions complete | `TransactionDriver.scala:650-653` |
 
 Not required durable before sending: `TxResolved(true)` from `proveCommitted` (the evidence is the already-durable
-backend state, `Tx.scala:516-525`); status-cache replies; `TxCommitted` re-sends.
+backend state, `Tx.scala:621-633`); status-cache replies; `TxCommitted` re-sends.
 
 State deletions:
 
 | Event | CRL effect |
 |---|---|
-| `TxResolved(false)` / `TxFinalized(false)` at a `Tx` | record deleted immediately (`Tx.scala:627`, `Frontend.scala:481-483`); a later accept or prepare handled by the lingering in-memory `Tx` re-creates it and `TxFinalized` deletes it again (`Tx.scala:794-799`). |
-| commit applied and all backend commits succeeded | object data dropped, record kept (`Tx.scala:604-613`) |
-| `TxFinalized(true)` and all backend commits succeeded | record deleted (`Frontend.scala:537-551`) |
-| a backend commit failed | record (with data) kept until the store reloads (`Frontend.scala:703-709`) |
+| `TxResolved(false)` / `TxFinalized(false)` at a `Tx` | record deleted immediately (`Tx.scala:749`, `Frontend.scala:584-586`); a later accept or prepare handled by the lingering in-memory `Tx` re-creates it and `TxFinalized` deletes it again (`Tx.scala:953-959`). |
+| commit applied and all backend commits succeeded | object data dropped, record kept (`Tx.scala:726-735`) |
+| `TxFinalized(true)` and all backend commits succeeded | record deleted (`Frontend.scala:659-695`) |
+| a backend commit failed | record (with data) kept until the store reloads (`Frontend.scala:862-868`) |
 
 Ordering inside one store relies on the store executor being single-threaded and on the CRL completing handlers in
 log order. The `CrashRecoveryLog.save` contract is specified in [crash-recovery-log.md](crash-recovery-log.md); this
@@ -483,7 +485,7 @@ spec only requires: *handler runs after the record, including everything saved b
 is saved on **every** prepare response (retransmits included), which is write amplification, not a safety issue.
 
 What is **not** persisted: the commit/abort *outcome* at a store (status is saved only incidentally by a later save,
-`Tx.scala:425-426,740-741,759-760`); the proposer's round number or local proposal; driver state of any kind; the
+`Tx.scala:509-510,877-878,896-897`); the proposer's round number or local proposal; driver state of any kind; the
 status cache. After a crash a store knows only its own vote and acceptor state; the outcome must be re-learned
 (driver, caches, proof and late commits, UnackedCommits).
 
@@ -491,45 +493,45 @@ status cache. After a crash a store knows only its own vote and acceptor state; 
 
 ## 9. Commit application and finalization
 
-### 9.1 Resolution at a store (`Tx.scala:647-666`, `:615-632`)
+### 9.1 Resolution at a store (`Tx.scala:772-792`, `:737-754`)
 
 * `resolved(c)` sets `oresolution` once, updates the status cache, and if all objects are loaded calls
-  `resolvedAndAllObjectsLoaded(c)`; otherwise the resolution is applied when loading finishes (`:405-408`).
+  `resolvedAndAllObjectsLoaded(c)`; otherwise the resolution is applied when loading finishes (`:484-487`).
 * Abort: `frontend.deleteTransactionState`, `unlock()`, `releaseObjects()`.
 * Commit: first the two holds:
-  * **commit overtook the data** (`commitAwaitsData`, `Tx.scala:239` at `c181375b`): not recovered, no data and no
+  * **commit overtook the data** (`commitAwaitsData`, `Tx.scala:239`): not recovered, no data and no
     client prepare seen and not finalized ->
     hold (`commitHeld`) with no `TxCommitted`, so the driver does not yet count this store as having missed the update.
     Ends with the data, a client prepare, or `TxFinalized`; after `TxFinalized` the store applies without the data,
     reports the object as uncommittable and repair restores it.
-  * **earlier commit of an object in flight** (`holdForTurn`, `:178-188`): queued per object; see
+  * **earlier commit of an object in flight** (`holdForTurn`, `:252-262`): queued per object; see
     [transaction-requirements.md](transaction-requirements.md).
-  Otherwise `doCommit` (`:527-602`): unlock, `RequirementsApplyer.apply` re-checking requirements with `applying=true`
+  Otherwise `doCommit` (`:635-724`): unlock, `RequirementsApplyer.apply` re-checking requirements with `applying=true`
   (objects that fail are skipped and reported in `TxCommitted.objectCommitErrors`; objects already showing the
   transaction are not re-applied), issue one backend commit per changed object, and send `TxCommitted` when all
-  complete (`:604-613`). (addendum) A store holding an applied stub for T applies nothing and reports T's changed
+  complete (`:726-735`). (addendum) A store holding an applied stub for T applies nothing and reports T's changed
   objects in `objectCommitErrors`, so a non-late finalizer marks it for repair rather than trusting it
   (`Tx.scala:642-648`).
 * (addendum) **Forgetting a committed T.** Where its CRL record would be deleted (after `TxFinalized` and its backend
   commits, Ruling 1), it is replaced by an applied stub if an UnackedCommits entry may name this store: `TxFinalized`
   listed it in `owed`, or it applied T through its entry (`stubDue`, `Tx.scala:935-936,1082,1092`;
-  `Frontend.transactionFinalized`/`concludeTransactionState`, `Frontend.scala:654-674`). A failed backend commit keeps
+  `Frontend.transactionFinalized`/`concludeTransactionState`, `Frontend.scala:659-683`). A failed backend commit keeps
   the record, so no stub replaces it. A finalization deferred by a commit held for its turn registers the Tx, so a
-  later `owed` reaches it (`Frontend.scala:221-224,768-773`; `Tx.scala:955-957`).
+  later `owed` reaches it (`Frontend.scala:221-224,777-781`; `Tx.scala:955-957`).
 
 ### 9.2 Driver after commit resolution
 
 `onResolution(true)` creates the finalizer immediately, passes it the commit voters (`countedCommitVoters`,
-`:464-469`) and `commitErrors` from `TxCommitted` messages (`:355-361`); the finalizer runs the txd's
-FinalizationActions (`server/RegisteredTransactionFinalizerFactory.scala:14-33`); at-least-once, idempotent. Missed
+`:565-570`) and `commitErrors` from `TxCommitted` messages (`:432-438`); the finalizer runs the txd's
+FinalizationActions (`server/RegisteredTransactionFinalizerFactory.scala:33-69`); at-least-once, idempotent. Missed
 updates are recorded by `MissedUpdateFinalizationAction` ([transaction-recovery.md](transaction-recovery.md)).
 
 ### 9.3 Heartbeats and lost messages
 
 Driver `heartbeat()` sends `TxHeartbeat` (not on its first tick) or, once finalized, repeats `TxFinalized`
-(`TransactionDriver.scala:184-191`). A store that sees nothing for `txHeartbeatTimeout` drives the transaction itself
-(`Store.scala:73-77`); that is the recovery path for a lost `TxFinalized` and works only because the status cache
-(7 s) outlasts the detection (5 s + one heartbeat) (`Host.scala:57-67`).
+(`TransactionDriver.scala:229-242`). A store that sees nothing for `txHeartbeatTimeout` drives the transaction itself
+(`Store.scala:84-88`); that is the recovery path for a lost `TxFinalized` and works only because the status cache
+(7 s) outlasts the detection (5 s + one heartbeat) (`Host.scala:59-67`).
 
 ---
 
@@ -538,31 +540,31 @@ Driver `heartbeat()` sends `TxHeartbeat` (not on its first tick) or, once finali
 ### 10.1 Duplicate prepares
 
 Re-processed idempotently: the acceptor re-promises (`Acceptor.scala:15-18`), the vote is unchanged (P4), the response is
-saved and sent again. A committed `Tx` also re-sends `TxCommitted` to the sender (`Tx.scala:695-699`). `lastProposer`
+saved and sent again. A committed `Tx` also re-sends `TxCommitted` to the sender (`Tx.scala:821-825`). `lastProposer`
 is overwritten by every prepare, including client retransmits (F10).
 
 ### 10.2 Late prepares
 
 * Tx known: handled above.
 * Tx unknown, status cache says finalized: answered `TxFinalized` (+ `TransactionFinalized` to the client) at the Store
-  and ignored by the Frontend (`Store.scala:144-151`, `Frontend.scala:639-647`).
+  and ignored by the Frontend (`Store.scala:179-186`, `Frontend.scala:796-804`).
 * Tx unknown, cache says Committed/Aborted but not finalized: the Store sends `TxResolved` to the sender and the Frontend
   creates a `Tx` with `outcomeDecided()`; it takes no locks, still votes, and learns the outcome only from `TxFinalized`
   because the driver treats the cache's reply as "this store knows" (`knownResolved`) and does not re-send
-  `TxResolved` to it (`TransactionDriver.scala:346-347`, `SimpleTransactionDriver.scala:62`; `Frontend.scala:649-665`).
+  `TxResolved` to it (`TransactionDriver.scala:406`, `SimpleTransactionDriver.scala:67`; `Frontend.scala:806-824`).
 * Tx unknown, no cache entry: a fresh `Tx`, checked normally whatever its age (the horizon is gone). A replay of a
   committed pinned transaction fails its pin; a store showing its update proves it (6.3), and the driver resolves late
   (10.5). Accepted cost: a replay whose other requirements pass holds commit-vote locks until a driver resolves it.
-* Dropped under CRL backpressure: `Store.scala:123-124`; the client retransmits, and the rest of the quorum can decide
+* Dropped under CRL backpressure: `Store.scala:153-154`; the client retransmits, and the rest of the quorum can decide
   without this store (repair catches up).
 
 ### 10.3 Duplicate and late accepts
 
-`TxAccept` for an unknown `Tx` is ignored (`Frontend.scala:608`), so a forgotten store never acts as an acceptor with
-fresh state through an Accept alone; the driver therefore interleaves prepares (`SimpleTransactionDriver.scala:67-73`).
+`TxAccept` for an unknown `Tx` is ignored (`Frontend.scala:752`), so a forgotten store never acts as an acceptor with
+fresh state through an Accept alone; the driver therefore interleaves prepares (`SimpleTransactionDriver.scala:72-78`).
 A duplicate Accept is re-accepted and re-answered; the driver's `acceptedPeers` set and the `Learner` bitset make
 this idempotent. An Accept may reach a store that has not voted yet; it accepts (Paxos allows this) and saves its
-then-current, possibly `Undetermined`, disposition (`Tx.scala:759-760`).
+then-current, possibly `Undetermined`, disposition (`Tx.scala:896-897`).
 
 ### 10.4 Prepares that overtake data / commits that overtake data
 
@@ -570,14 +572,14 @@ See 6.2 and 9.1. (addendum) A driver's prepare that overtakes the client's now m
 prepare whether or not the transaction carries data for it. The relevant constants: `Frontend.MissingDataWait = 5 s`
 (`Frontend.scala:27`), `Tx.LateClientPrepareAfter =
 500 ms` (log only, `Tx.scala:29`). A client prepare with data arriving after `TxFinalized` is ignored with a warning
-(`Frontend.scala:644-648`); the store is repaired later.
+(`Frontend.scala:801-804`); the store is repaired later.
 
 ### 10.5 Late commits (replaces the horizon)
 
 The horizon (`Host.txHorizon`, `TransactionTooOld`) was removed. In its place (design 1b/1c and its amendments):
 
 * **Proof holder.** A driver receiving a proof sets `holdsProof`, and the first proof starts a new round
-  (`TransactionDriver.scala:361-386`): promises to earlier rounds may predate another driver's choice of commit
+  (`TransactionDriver.scala:410-419`): promises to earlier rounds may predate another driver's choice of commit
   (Ruling 6). It skips the vote tally and sets no local proposal. Since Ruling 29 it adopts only an accepted *commit*
   reported in the current round (`Proposer.commitProven`): commit was chosen at some ballot c and every value accepted
   at c or higher is commit, so an accepted abort predates c and is never adopted. With such a commit it sends accepts
@@ -585,22 +587,22 @@ The horizon (`Host.txHorizon`, `TransactionTooOld`) was removed. In its place (d
 * **Late condition 1.** A proof plus a prepare quorum of valid acceptors in the current (post-proof) round, none
   carrying an accepted commit (`Proposer.prepareQuorumWithoutAcceptedCommit`; an older accepted abort counts as
   memoryless, Ruling 29):
-  `resolveLate` (`TransactionDriver.scala:262-263`, `:539-552`). Argument: the proof shows commit was chosen by some
+  `resolveLate` (`TransactionDriver.scala:310-311`, `:599-612`). Argument: the proof shows commit was chosen by some
   quorum Q; Q intersects the responders; an acceptor forgets a committed T only on `TxFinalized` or a late outcome;
   rebuilt acceptors are muted. So finalization completed.
-* **Late condition 2.** A `TxResolved` or `TxFinalized` with `late = true` (`:364-365`, `:399-400`), including the
-  finalized relay of a status cache (`Store.scala:158-171`).
+* **Late condition 2.** A `TxResolved` or `TxFinalized` with `late = true` (`:407-408`, `:443-444`), including the
+  finalized relay of a status cache (`Store.scala:167-189`).
 * **Late resolution** runs no finalization actions (it cancels any it started) and finalizes at once; every
-  `TxResolved`/`TxFinalized` it sends carries `late = true` (`:446-479`, `:539-552`).
-* **A Tx receiving a late commit** (`Tx.lateCommit`, `Tx.scala:920-932`): already resolved committed, it finalizes;
+  `TxResolved`/`TxFinalized` it sends carries `late = true` (`:465-496`, `:599-612`).
+* **A Tx receiving a late commit** (`Tx.lateCommit`, `Tx.scala:984-1007`): already resolved committed, it finalizes;
   holding its own undecided commit vote, it looks up its UnackedCommits entry and applies only if found
-  (`unackedCommitFound`/`unackedCommitAbsent`, `:997-1041`); otherwise it applies nothing (`applyNothing`, `:941-964`).
+  (`unackedCommitFound`/`unackedCommitAbsent`, `:1078-1140`); otherwise it applies nothing (`applyNothing`, `:1016-1040`).
   (addendum, `Tx.scala:984-1007`) An applied stub short-cuts both: a resolved Tx with a stub due or held finalizes, an
   undecided commit vote with a stub applies nothing. A Tx already resolved committed with neither (its `TxFinalized` was
   lost and its heartbeat driver resolved late or through the relay) looks up its own entry first, writes a stub if found
   and is forgotten either way (case 3, `forgetLookupHeld`, `:990-997,1079-1086,1127-1131`).
 * **Found entry as a proof** (Ruling 15): a recovered commit vote that found its entry gives its own driver a proof from
-  the start (`Store.scala:108-110`).
+  the start (`Store.scala:117-119`).
 
 Residuals: Ruling 17 (a late-acked store with an entry re-applies a replay's writes in pools where T has no pin of its
 own; transaction-recovery R-N1 and Ruling 32: it can reach a quorum when the whole pool acked late), the design's recovering-acceptor residual (P-N3), and a proof delivered to a
@@ -610,33 +612,34 @@ driver that never acts on it (P-N1). (addendum) Applied stubs close Ruling 17 at
 
 ### 10.6 Status cache
 
-* Write sites: `Tx` construction writes `Unresolved` (`Tx.scala:114`); `resolved` writes the status
-  (`:662`); `finalized` writes `finalized=true` (`:800`); a `TxResolved`/`TxFinalized` for an unknown Tx writes the
-  status (`Frontend.scala:609-624`).
-* Read sites: `Store.scala:131-158` (reply with `TxResolved`/`TxFinalized`), `Frontend.scala:432,639,651` (admission,
+* Write sites: `Tx` construction writes `Unresolved` (`Tx.scala:162`); `resolved` writes the status
+  (`:788`); `finalized` writes `finalized=true` (`:960`); a `TxResolved`/`TxFinalized` for an unknown Tx writes the
+  status (`Frontend.scala:753-772`).
+* Read sites: `Store.scala:167-189` (reply with `TxResolved`/`TxFinalized`), `Frontend.scala:520,796,809` (admission,
   ignore, `known`), `StoreRouter` completion queries.
 * One cache per **host**, shared by all its stores and keyed by transaction id only. Entries live 7 s after the *last
   write*. The early-eviction warning was removed with the horizon: an evicted entry only loses late-commit evidence
-  (`server/transaction/TransactionStatusCache.scala:8-24`).
-* An `Unresolved` entry counts as "no outcome" when a fresh Tx is created (`Frontend.scala:673-675`).
-* Since the refresh the no-Tx `TxResolved` path never overwrites a finalized entry and ignores proofs
-  (`Frontend.scala:636-637`); `Tx.resolved` still writes `finalized = false` unconditionally (`Tx.scala:737-738`), see F9.
+  (`server/transaction/TransactionStatusCache.scala:11`).
+* An `Unresolved` entry counts as "no outcome" when a fresh Tx is created (`Frontend.scala:808-810`).
+* The no-Tx `TxResolved` path ignores proofs (`Frontend.scala:760-762`). `updateStatus` is monotone
+  (`TransactionStatusCache.scala:34-44`), so no write site, `Tx.resolved` (`Tx.scala:787-788`) included, downgrades a
+  finalized entry (F9, FIXED).
 
 ### 10.7 Proof of commit interplay
 
 `Tx.awaitingClientPrepare` (formerly `awaitingData`) is bypassed when objects are loaded and show the update
 (`Tx.scala:208`, addendum). `doCommit` skips objects that
-already show the update and logs them as already applied (`:626-631` at `0d08e3c6`). A prover answers later prepares as
-an ordinary memoryless acceptor with its abort vote; only a muted prover repeats the proof (`Tx.scala:786-788`).
+already show the update and logs them as already applied (`:689-694`). A prover answers later prepares as
+an ordinary memoryless acceptor with its abort vote; only a muted prover repeats the proof (`Tx.scala:836-838`).
 
 ### 10.8 Unknown or moved stores
 
-`TxUnknownStore` makes the driver drop its endpoint cache for that store and not worry (`TransactionDriver.scala:216-224`);
+`TxUnknownStore` makes the driver drop its endpoint cache for that store and not worry (`TransactionDriver.scala:267-275`);
 the transaction proceeds without it if a quorum remains.
 
 ### 10.9 Nack / dueling proposers
 
-Resolved by backoff (7.3). Stale responses are filtered by proposal id (`TransactionDriver.scala:235,319`).
+Resolved by backoff (7.3). Stale responses are filtered by proposal id (`TransactionDriver.scala:286,378`).
 
 ---
 
@@ -650,15 +653,15 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 | Fault | Outcome | Why |
 |---|---|---|
 | Client `TxPrepare` lost to some stores | Safe, live | Client retransmits forever; a store that has seen no client prepare withholds its promise and vote up to 5 s (prefer-abort, 6.2) then votes abort; the tally needs `t` commit votes per object, else abort. |
-| `TxPrepare` lost to the leader | Live after delay | No driver is created at the leader; other stores' responses are cached 10 s for a later driver (`Store.scala:80-82,160-167`); the client retransmits; after 5 heartbeats of idleness a recovery driver starts. |
-| `TxPrepareResponse` lost | Safe, live | Driver retransmits the prepare (`SimpleTransactionDriver.scala:54-85`); the store re-answers with the same persisted vote. |
+| `TxPrepare` lost to the leader | Live after delay | No driver is created at the leader; other stores' responses are cached 10 s for a later driver (`Store.scala:91-93,195-202`); the client retransmits; after 5 heartbeats of idleness a recovery driver starts. |
+| `TxPrepareResponse` lost | Safe, live | Driver retransmits the prepare (`SimpleTransactionDriver.scala:59-90`); the store re-answers with the same persisted vote. |
 | `TxAccept` or `TxAcceptResponse` lost | Safe, live | Retransmitted; the learner needs `t` distinct acceptors. |
 | `TxResolved` lost | Safe, live | Driver re-sends `TxResolved` to stores not in `knownResolved` until finalized; otherwise `TxFinalized` carries the outcome. |
-| `TxFinalized` lost | Safe, live if the status cache still has the entry when the idle store's driver asks (5 s idle < 7 s cache); otherwise see F2/F6 | `Store.scala:73-77`, `Host.scala:57-67`. Meanwhile the store holds its locks. |
+| `TxFinalized` lost | Safe, live if the status cache still has the entry when the idle store's driver asks (5 s idle < 7 s cache); otherwise see F2/F6 | `Store.scala:84-88`, `Host.scala:59-67`. Meanwhile the store holds its locks. |
 | `TxCommitted` lost | Safe | Finalizer's missed-update logic marks the store for repair, which reconciles exactly. |
 | `TransactionResolved`/`Finalized` lost to client | Safe if the client's retransmit arrives within the cache lifetime (answered from the cache); otherwise a false abort is possible (F2) | |
 | Duplicates of any message | Safe | 10.1-10.3. |
-| Reordering | Safe | Proposal ids filter stale responses; `TxFinalized` before `TxResolved` is fine (5); a commit decision arriving before the prepare/data is held (9.1). A `TxResolved` arriving before any prepare is only remembered in the cache (`Frontend.scala:610-615`), so the later-created `Tx` learns it only at `TxFinalized`. |
+| Reordering | Safe | Proposal ids filter stale responses; `TxFinalized` before `TxResolved` is fine (5); a commit decision arriving before the prepare/data is held (9.1). A `TxResolved` arriving before any prepare is only remembered in the cache (`Frontend.scala:756-762`), so the later-created `Tx` learns it only at `TxFinalized`. |
 | Message to a store on another host after migration | Safe | `TxUnknownStore`, peer queries (`CLAUDE.md`). |
 
 ### 11.2 Slow or partitioned clients and stores
@@ -684,15 +687,15 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 | Client, after some prepares | Stores that got its prepare hold Tx; after 5 heartbeats of idleness a recovery driver (round >= 2, data-less) starts. | Commits only if stores that got the client's prepare supply `t` commit votes for every object; the others vote abort after 5 s (prefer-abort), data-less transactions included (P-N8). Either is safe. Client never learns (that is acceptable). |
 | Store, before the vote's save completes | No record, or an older record. Nothing was sent. | The store is as if it never saw the prepare; client/driver retransmit; a fresh vote is computed. |
 | Store, vote saved but response not sent | Record with disposition and acceptor state; locks re-taken for a commit vote | Retransmitted prepares are answered with the persisted vote (P4/P5). |
-| Store, after Accepted saved | Acceptor state recovered (`Tx.scala:74`) | Paxos state intact; P8 holds. |
+| Store, after Accepted saved | Acceptor state recovered (`Tx.scala:76`) | Paxos state intact; P8 holds. |
 | Store, after learning commit, before applying | Recovered as Unresolved with its vote and data; commit vote re-locks | Must re-learn: a live driver, status cache, a peer's proof, or the UnackedCommits lookup (`needsUnackedCheck`), which now runs for every recovered commit vote and gates its driver. If every other store finalized and forgot: an entry makes it apply; no entry means it acknowledged (or did not count), and a late commit applies nothing. Without a proof or entry, abort votes may decide abort (F2 residual). |
 | Store, after in-memory apply, before backend commit durable | Object data still in the CRL (P13); recovered like the previous row | Same. |
-| Store, after backend commit, before CRL data drop | Recovered Unresolved; `appliedBy` shows the update | `proveCommitted` on the next prepare or `doCommit` skips as already applied (`Tx.scala:556-561`). |
+| Store, after backend commit, before CRL data drop | Recovered Unresolved; `appliedBy` shows the update | `proveCommitted` on the next prepare or `doCommit` skips as already applied (`Tx.scala:689-694`). |
 | Leader/driver, before Accept sent | Driver state lost | Recovery driver after idle timeout; values for round 1 not reused (round >= 2). Leader's own restart restarts at `(1,L)` (F5). |
 | Leader, after quorum accepted, before `TxResolved` sent | Accepted state at `t` acceptors | Recovery driver's prepare quorum intersects the accepted set, so it re-proposes the same value (P8). |
 | Leader, after resolution, during FinalizationActions | Stores hold the committed Tx (not finalized), their CRL records kept | Recovery driver: stores still within cache reply `TxResolved`, or answer Promise with their retained accepted commit (P9); it re-runs the finalizer (at-least-once). |
 | Driver, after `TxFinalized` partly sent | Some stores finalized | Idle stores recover via their own driver and the cache (11.1). |
-| Backend commit failure at a store | Record kept, store votes abort on that object (`BackendCommitFailed`) until reload | `Frontend.scala:703-709`. |
+| Backend commit failure at a store | Record kept, store votes abort on that object (`BackendCommitFailed`) until reload | `Frontend.scala:862-868`. |
 | CRL thread death | Store stalls (no vote can be sent) | Liveness only. |
 
 ### 11.4 Concurrent drivers
@@ -702,7 +705,7 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
   round (`onNack`). Safe by P8; resolution is announced by whichever driver learns first; others learn via
   `TxResolved`/`TxFinalized`.
 * Both resolve and both run FinalizationActions: duplicates are permitted (at-least-once, idempotent). Both send
-  `TxFinalized`; stores handle it once (`Tx.scala:779`).
+  `TxFinalized`; stores handle it once (`Tx.scala:925`).
 * Two drivers with the **same id** (secondary-pool store sharing the index; restarted leader): not safe in principle (F4,
   F5).
 * A recovery driver racing a `TxResolved` from the cache: the first learned value wins in `onResolution` (P19).
@@ -718,21 +721,21 @@ about the finding, not the likelihood of occurrence.
 
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
-| F1 | unchanged | Only drivers send `TxAccept`; no round rule | `TransactionDriver.scala:481-493` |
-| F2 | **narrowed** | A driver holding a proof never proposes abort and resolves late; a driver with no proof (refcount or overwritten pin, proof lost or sent to another driver, P-N1) still decides abort | `TransactionDriver.scala:262-268,318-319,361-386`; `Tx.scala:594` |
-| F3 | **fixed** | The horizon is gone; replay is refused by the pin rule and the late-commit rule, not by clocks | `Frontend.scala:671-691` (no age test); `Pins.scala:18-33`; `TransactionBuilder.scala:140-141` |
-| F4 | unchanged | Proposer peer is still the pool index | `TransactionDriver.scala:88` |
+| F1 | unchanged | Only drivers send `TxAccept`; no round rule | `TransactionDriver.scala:539-551` |
+| F2 | **narrowed** | A driver holding a proof never proposes abort and resolves late; a driver with no proof (refcount or overwritten pin, proof lost or sent to another driver, P-N1) still decides abort | `TransactionDriver.scala:310-313,361-362,404-430`; `Tx.scala:630` |
+| F3 | **fixed** | The horizon is gone; replay is refused by the pin rule and the late-commit rule, not by clocks | `Frontend.scala:806-825` (no age test); `Pins.scala:18-33`; `TransactionBuilder.scala:140-141` |
+| F4 | unchanged | Proposer peer is still the pool index | `TransactionDriver.scala:102` |
 | F5 | unchanged | A new driver still starts at `(1,L)` | `Proposer.scala:11`; `SimpleTransactionDriver.scala` |
-| F6 | unchanged (reach widened) | Abort still deletes the CRL record at resolution; with no horizon a forgotten abort is re-decidable by any later prepare (P-N4) | `Tx.scala:699`; `Frontend.scala:501-503` |
-| F7 | unchanged | Every non-`VoteCommit` counts as abort | `TransactionDriver.scala:287-292` |
-| F8 | unchanged | Tally still `break()`s on the first short pool (a proof holder adopting an accepted value skips it) | `TransactionDriver.scala:296-304` |
+| F6 | unchanged (reach widened) | Abort still deletes the CRL record at resolution; with no horizon a forgotten abort is re-decidable by any later prepare (P-N4) | `Tx.scala:749`; `Frontend.scala:584-586` |
+| F7 | unchanged | Every non-`VoteCommit` counts as abort | `TransactionDriver.scala:332-337` |
+| F8 | unchanged | Tally still `break()`s on the first short pool (a proof holder adopting an accepted value skips it) | `TransactionDriver.scala:341-349` |
 | F9 | **fixed** (Ruling 30) | `TransactionStatusCache.updateStatus` is monotone (atomic compute): `finalized` and `late` are sticky and a resolved status never reverts to Unresolved, so neither `Tx.resolved` nor the `Tx` constructor can downgrade an entry (X3) | `TransactionStatusCache.scala` `updateStatus` |
-| F10 | unchanged | `lastProposer` still follows client prepares; the proof is sent there too (P-N1) | `Tx.scala:756,594` |
-| F11 | unchanged | Conflicting outcomes are still ignored silently; `resolveLate` logs an error only for late-after-abort | `Tx.scala:722`; `TransactionDriver.scala:541-542,569` |
-| F12 | unchanged | Rounds >= 2 still wait for the timer (the post-proof round sends prepares at once) | `TransactionDriver.scala:318-321,384-385` |
-| F13 | unchanged (now intended) | A prover's abort vote is saved on later prepares by design (Ruling 10); a recovered prover has Paxos state, so it no longer proves | `Tx.scala:203-204,786-788` |
-| F14 | unchanged | Adopted data still not re-saved | `Tx.scala:748-752` |
-| F15 | unchanged | `receiveTxPrepare` and `TxStatusRequest` still have no caller | `TransactionDriver.scala:234-236`; `Tx.scala:1047-1051` |
+| F10 | unchanged | `lastProposer` still follows client prepares; the proof is sent there too (P-N1) | `Tx.scala:806,630` |
+| F11 | unchanged | Conflicting outcomes are still ignored silently; `resolveLate` logs an error only for late-after-abort | `Tx.scala:772`; `TransactionDriver.scala:601-602,691` |
+| F12 | unchanged | Rounds >= 2 still wait for the timer (the post-proof round sends prepares at once) | `TransactionDriver.scala:361-364,428-429` |
+| F13 | unchanged (now intended) | A prover's abort vote is saved on later prepares by design (Ruling 10); a recovered prover has Paxos state, so it no longer proves | `Tx.scala:228-229,836-838` |
+| F14 | unchanged | Adopted data still not re-saved | `Tx.scala:798-802` |
+| F15 | unchanged | `receiveTxPrepare` and `TxStatusRequest` still have no caller | `TransactionDriver.scala:277-279`; `Tx.scala:1146-1150` |
 
 ### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
 
@@ -742,22 +745,22 @@ Findings the addendum touches. Every other finding of this document is unchanged
 |---|---|---|---|
 | F2 | unchanged | A store that forgot a committed T no longer checks requirements for a driver's prepare, but its answer is the same: a proof if an object shows T, otherwise abort (now after up to 5 s, without the requirement check). The false abort without a proof stands | `Tx.scala:205-208,537-542,584-586` |
 | F6 | **narrowed** | A forgotten abort re-decided by a later round needs fresh commit votes, and only a client prepare can produce one now; a driver-only round can only re-decide abort | `Tx.scala:537-542`; 6.2 |
-| F7 | unchanged | Undetermined answers still count as aborts | `TransactionDriver.scala:287-292` |
+| F7 | unchanged | Undetermined answers still count as aborts | `TransactionDriver.scala:332-337` |
 | F14 | unchanged | Adopted data still not re-saved; the commit's own data wait is unchanged | `Tx.scala:239,798-802` |
-| P-N1 | **narrowed** | A store reached first by a driver's prepare now proves to *that* driver as soon as its objects load (no abort vote goes out beside the proof), so a recovery driver whose prepare creates a store's Tx holds the proof. A second driver, or a proof that reaches a store with no driver yet, is still lost; the latter is now reproduced (Task 4) | `Tx.scala:806,208,584-586,630`; `Store.scala:206` |
+| P-N1 | **narrowed** | A store reached first by a driver's prepare now proves to *that* driver as soon as its objects load (no abort vote goes out beside the proof), so a recovery driver whose prepare creates a store's Tx holds the proof. A second driver, or a proof that reaches a store with no driver yet, is still lost; the latter is now reproduced (Task 4) | `Tx.scala:806,208,584-586,630`; `Store.scala:208` |
 | P-N3 | **narrowed** | A store holding an applied stub applies nothing on the non-late commit and reports its objects, so the finalizer re-marks it; stores without a stub (they acknowledged in time) still apply a concurrently replayed client prepare's blind writes. Ruling 3 added a second source of non-late commits for a forgotten T (P-N10); Ruling 7 removed it | `Tx.scala:642-648` |
-| P-N4 | **narrowed** to path 3 | Recovery and other store-side drivers can no longer re-decide a forgotten abort commit (prefer-abort, 6.2; tested by ReplayIntegrationSuite "an aborted data-less transaction re-driven by a recovered commit vote aborts again"). A delayed duplicate of the client's own prepare still can: the accepted corner case, documented in the `Transaction.commit` scaladoc | `Tx.scala:205-208,537-542`; `client/Transaction.scala:155-160` |
+| P-N4 | **narrowed** to path 3 | Recovery and other store-side drivers can no longer re-decide a forgotten abort commit (prefer-abort, 6.2; tested by ReplayIntegrationSuite "an aborted data-less transaction re-driven by a recovered commit vote aborts again"). A delayed duplicate of the client's own prepare still can: the accepted corner case, documented in the `Transaction.commit` scaladoc | `Tx.scala:205-208,537-542`; `client/Transaction.scala:156-161` |
 | P-N5, P-N6 | unchanged (REFUTED stands) | | |
 
 ### F1. Documented 1-RTT protocol is not what the code does. Confidence: high (informational, wrong docs)
 
-> **Verification 2026-11-09: CONFIRMED. Severity: doc-only.** Only TransactionDriver.sendAcceptMessages constructs TxAccept (TransactionDriver.scala:438-447; grep finds no other constructor). Stores answer a prepare with Promise+vote addressed to the prepare's sender (Tx.respondToPrepare, Tx.scala:730-749, `TxPrepareResponse(m.from,...)`) after a CRL save; the driver sets its local proposal only after tallying (TransactionDriver.scala:247-300) and no round check exists in Acceptor (Acceptor.scala:24-35). Error-free path: client TxPrepare -> store (CRL write #1: vote+promise, Tx.scala:743-746) -> leader -> TxAccept -> acceptors (CRL write #2, Tx.scala:751-766) -> TxAcceptResponse -> leader -> TransactionResolved -> client = 5 one-way hops (about 2.5 RTT) and 2 serial durable writes before the client learns; stores learn at a 6th hop (TxResolved). Aborts are decided in round 1; there is no commit-only round 1 and no self-generated Accept. Todo.txt:11-14 and Architecture.md describe a protocol the code does not implement (no partial 1RTT).
+> **Verification 2026-11-09: CONFIRMED. Severity: doc-only.** Only TransactionDriver.sendAcceptMessages constructs TxAccept (TransactionDriver.scala:539-548; grep finds no other constructor). Stores answer a prepare with Promise+vote addressed to the prepare's sender (Tx.respondToPrepare, Tx.scala:857-886, `TxPrepareResponse(m.from,...)`) after a CRL save; the driver sets its local proposal only after tallying (TransactionDriver.scala:298-360) and no round check exists in Acceptor (Acceptor.scala:24-35). Error-free path: client TxPrepare -> store (CRL write #1: vote+promise, Tx.scala:879-882) -> leader -> TxAccept -> acceptors (CRL write #2, Tx.scala:888-903) -> TxAcceptResponse -> leader -> TransactionResolved -> client = 5 one-way hops (about 2.5 RTT) and 2 serial durable writes before the client learns; stores learn at a 6th hop (TxResolved). Aborts are decided in round 1; there is no commit-only round 1 and no self-generated Accept. Todo.txt:11-14 at c3ad5493 and Architecture.md describe a protocol the code does not implement (no partial 1RTT).
 > *Fix sketch:* Fix the docs (Todo.txt, Architecture.md) now; if 1RTT is wanted, have stores self-accept commit in round 1 and restrict round >=2 to abort-or-recover, then re-derive P2/P6.
 
 
-`Architecture.md:139-155` and `Todo.txt:11-14` describe self-generated round-1 Accepts, a commit-only round 1 and
-abort-requires-round-2. The code routes all promises to one leader, which sends the only Accepts (`Tx.scala:736`,
-`TransactionDriver.scala:444`); there is no round restriction (`Acceptor.scala:24-35`). Hence: 5 one-way hops and two
+`Architecture.md:139-155` and `Todo.txt:11-14` at `c3ad5493` describe self-generated round-1 Accepts, a commit-only round 1 and
+abort-requires-round-2. The code routes all promises to one leader, which sends the only Accepts (`Tx.scala:873`,
+`TransactionDriver.scala:545`); there is no round restriction (`Acceptor.scala:24-35`). Hence: 5 one-way hops and two
 serial durable writes before the client learns; aborts are decided in round 1; recovery can commit. Anyone reasoning
 from the documented rule (for instance, "any accept in round >= 2 is an abort") will reach wrong conclusions.
 Recommendation: fix the docs or implement the fast path; if implemented, P2/P6 must be re-derived (acceptors would accept
@@ -766,29 +769,29 @@ commit without a leader tally).
 ### F2. A stale prepare after the cache expires can produce a false abort of a committed transaction. Confidence: medium-high
 
 > **Refresh (replay pins): NARROWED.** The stale prepare is now checked normally (no `TooOld`). A store showing T's
-> update proves it; the driver that receives the proof never proposes abort (`TransactionDriver.scala:318-319`), runs a
+> update proves it; the driver that receives the proof never proposes abort (`TransactionDriver.scala:361-362`), runs a
 > post-proof round, and resolves *late* on a memoryless quorum, telling the client committed and applying nothing
-> (`:539-552`). The false abort remains wherever no driver holds a proof: the pin is a refcount change or was
+> (`:599-612`). The false abort remains wherever no driver holds a proof: the pin is a refcount change or was
 > overwritten, the proof was sent once to a `lastProposer` with no driver (P-N1), or a second driver without the proof
 > tallies first. Consequence (c) is also narrowed: a live commit voter that learns a *late* commit looks up its entry and
-> applies it (`Tx.scala:926-930`); one that learns an abort still drops it (transaction-recovery F3).
+> applies it (`Tx.scala:1001-1005`); one that learns an abort still drops it (transaction-recovery F3).
 
-> **Verification 2026-11-09: CONFIRMED (mechanism); outcome damage narrower than claimed. Severity: split-decision (two outcomes for one txid; no applied store is rolled back).** Acceptor state is NOT retained past finalization: a committed Tx keeps its Paxos record until TxFinalized (Tx.scala:790-800 -> Frontend.transactionFinalized, Frontend.scala:537-551), an aborted one is deleted at resolution (Tx.scala:627 -> deleteTransactionState, Frontend.scala:481). After TxFinalized every data store has dropped Tx+acceptor, the leader's driver is removed (Store.scala:181-183) and the host cache forgets after 7 s, so a stale client retransmit (client retransmits until it hears: SimpleClientTransactionDriver.scala:30-50) at t > ~10 s starts a NEW consensus instance: Store.handleTransactionMessage finds no cache entry and, at the leader, driveTransaction (Store.scala:128-158); every store builds a fresh Tx with tooOld=true (Frontend.scala:651-658) which proves commit only if an object still shows the update (appliedBy: revision of DataUpdate/VersionBump/KV-with-revision, or a key carrying the txid) and otherwise votes VoteAbort(TooOld) (Tx.scala:444-449, 489-493). For a traceless or since-overwritten change all votes are abort, the tally aborts (TransactionDriver.scala:291-298), empty acceptors accept, and the driver sends TxResolved(false)/TxFinalized(false) plus TransactionResolved/Finalized(false) to the client (:471-521). Consequences: (a) client told ABORT for a committed tx (real, client-visible); (b) cache says Aborted for 7 s; (c) a live store still holding the commit vote drops it (Tx.receiveResolved Tx.scala:768-776 -> resolved(false)). NOT possible: rolling back stores that already applied (a fresh Tx resolves false and only deleteTransactionState runs; nothing undoes an applied commit), and stores whose Tx is already resolved(true) ignore the second outcome (Tx.resolved guards oresolution.isEmpty, Tx.scala:645). (c) is repaired because the original finalizer marks every store that did not send TxCommitted within errorTimeout (MissedUpdateFinalizationAction.scala:60-100). So it is a split of DECISIONS, not of store state, and it needs a client partitioned/paused > ~horizon (6 s) whose reply was lost.
+> **Verification 2026-11-09: CONFIRMED (mechanism); outcome damage narrower than claimed. Severity: split-decision (two outcomes for one txid; no applied store is rolled back).** Acceptor state is NOT retained past finalization: a committed Tx keeps its Paxos record until TxFinalized (Tx.scala:949-960 -> Frontend.transactionFinalized, Frontend.scala:659-695), an aborted one is deleted at resolution (Tx.scala:749 -> deleteTransactionState, Frontend.scala:584). After TxFinalized every data store has dropped Tx+acceptor, the leader's driver is removed (Store.scala:216-218) and the host cache forgets after 7 s, so a stale client retransmit (client retransmits until it hears: SimpleClientTransactionDriver.scala:30-50) at t > ~10 s starts a NEW consensus instance: Store.handleTransactionMessage finds no cache entry and, at the leader, driveTransaction (Store.scala:158-193); every store builds a fresh Tx with tooOld=true (Frontend.scala:651-658 at c3ad5493) which proves commit only if an object still shows the update (appliedBy: revision of DataUpdate/VersionBump/KV-with-revision, or a key carrying the txid) and otherwise votes VoteAbort(TooOld) (Tx.scala:444-449 at c3ad5493, 582-586). For a traceless or since-overwritten change all votes are abort, the tally aborts (TransactionDriver.scala:351-358), empty acceptors accept, and the driver sends TxResolved(false)/TxFinalized(false) plus TransactionResolved/Finalized(false) to the client (:690-726). Consequences: (a) client told ABORT for a committed tx (real, client-visible); (b) cache says Aborted for 7 s; (c) a live store still holding the commit vote drops it (Tx.receiveResolved Tx.scala:905-919 -> resolved(false)). NOT possible: rolling back stores that already applied (a fresh Tx resolves false and only deleteTransactionState runs; nothing undoes an applied commit), and stores whose Tx is already resolved(true) ignore the second outcome (Tx.resolved guards oresolution.isEmpty, Tx.scala:772). (c) is repaired because the original finalizer marks every store that did not send TxCommitted within errorTimeout (MissedUpdateFinalizationAction.scala:88-138). So it is a split of DECISIONS, not of store state, and it needs a client partitioned/paused > ~horizon (6 s) whose reply was lost.
 > *Fix sketch:* Do not let a TooOld-only tally resolve a transaction: report 'unknown' to the client (no TxResolved/TransactionResolved) and stop; or persist a small 'finalized(txid, outcome)' tombstone for longer than any client retransmit horizon.
 
 
 Scenario: transaction T commits and finalizes at t0 (stores forget T; caches hold it 7 s). The reply to the client is
 lost or the client is partitioned. At t0+20 s the client's retransmit reaches the designated leader L
 (`ClientTransactionDriver.scala:65-84`). `Store.handleTransactionMessage` finds no cache entry and starts a driver
-(`Store.scala:156-158`). Every store creates a fresh `Tx`, finds `tooOld` (age > 6 s), and votes `VoteAbort(TooOld)`
-unless an object still shows T's revision (`Tx.scala:444-449,491-493`). If T's change is traceless, or the object has
+(`Store.scala:191-193`). Every store creates a fresh `Tx`, finds `tooOld` (age > 6 s), and votes `VoteAbort(TooOld)`
+unless an object still shows T's revision (`Tx.scala:444-449` at `c3ad5493`, `:584-586`). If T's change is traceless, or the object has
 been overwritten by later transactions, there is no proof; all stores answer abort; L's driver tallies `w - a < t`
-(`TransactionDriver.scala:291`), proposes abort, all acceptors have empty state and accept, and L sends
-`TransactionResolved(false)` and `TxResolved/TxFinalized(false)` (`:471-521`). Effects: (a) the client is told T
+(`TransactionDriver.scala:351`), proposes abort, all acceptors have empty state and accept, and L sends
+`TransactionResolved(false)` and `TxResolved/TxFinalized(false)` (`:690-726`). Effects: (a) the client is told T
 aborted although it committed (retry of a non-idempotent operation may double-apply; contradicts the client-visible
 atomicity guarantee); (b) the status cache on every host now says `Aborted` for 7 s; (c) a store that is still holding T
 as a live unresolved commit vote receives `TxFinalized(false)`/`TxResolved(false)` and drops the committed update
-(`Tx.scala:771-773,779-788`). Repair is expected to restore (c) through the finalizer's ErrorTree/UnackedCommits
+(`Tx.scala:918-919,925-947`). Repair is expected to restore (c) through the finalizer's ErrorTree/UnackedCommits
 entries, but only if the finalizer actually recorded that store, which depends on the original driver having completed.
 The design note acknowledges the cost for *legitimate late* prepares (`traceless-commits-design.md` section 6) but not
 this case where the transaction already committed. Open question: should a `TooOld` abort be allowed to *resolve* a
@@ -797,17 +800,17 @@ transaction at all, rather than merely vote? An alternative is that a driver tha
 
 ### F3. The horizon trusts the client's clock; a client clock ahead of the hosts disables replay protection. Confidence: medium
 
-> **Refresh (replay pins): FIXED.** The horizon and `TransactionTooOld` are deleted (`Frontend.scala:671-691` has no age
+> **Refresh (replay pins): FIXED.** The horizon and `TransactionTooOld` are deleted (`Frontend.scala:806-825` has no age
 > test; grep finds no `txHorizon`/`tooOld`). A replayed blind write cannot re-commit through fresh votes, because its
 > transaction must carry a pin (`TransactionBuilder.scala:140-141`) that fails at more than `w - t` stores of the pinned
-> object. Residual clock dependence moved to the rebuilt store's mute (`acceptorSince`, `Frontend.scala:676`; P-N2).
+> object. Residual clock dependence moved to the rebuilt store's mute (`acceptorSince`, `Frontend.scala:811`; P-N2).
 
-> **Verification 2026-11-09: CONFIRMED (mechanism). Severity: resurrection (replay of blind writes).** tooOld = known.isEmpty && HLCTimestamp.now - txd.startTimestamp > horizon (Frontend.scala:655); startTimestamp is client-assigned and nothing on the server calls HLCTimestamp.update from received prepares (grep in server/ finds no such call), so a host's HLC only follows its own wall clock. A client whose clock/HLC is ahead by D makes a replay of age a look like a-D; ages in (7 s, 6 s + D) are treated as young. A replayed prepare then creates a fresh Tx that rechecks requirements; blind KV Insert/Delete have no state-dependent requirement (RequirementsChecker.scala:123-158), so t stores vote commit and the old write is re-applied. Client HLC ratchets forward from every object timestamp it reads (BaseReadDriver.scala:193-194), so ahead-skew needs no misconfigured NTP, only a faster clock elsewhere in the cluster.
+> **Verification 2026-11-09: CONFIRMED (mechanism). Severity: resurrection (replay of blind writes).** tooOld = known.isEmpty && HLCTimestamp.now - txd.startTimestamp > horizon (Frontend.scala:655 at c3ad5493); startTimestamp is client-assigned and nothing on the server calls HLCTimestamp.update from received prepares (grep in server/ finds no such call), so a host's HLC only follows its own wall clock. A client whose clock/HLC is ahead by D makes a replay of age a look like a-D; ages in (7 s, 6 s + D) are treated as young. A replayed prepare then creates a fresh Tx that rechecks requirements; blind KV Insert/Delete have no state-dependent requirement (RequirementsChecker.scala:127-162), so t stores vote commit and the old write is re-applied. Client HLC ratchets forward from every object timestamp it reads (BaseReadDriver.scala:193-194), so ahead-skew needs no misconfigured NTP, only a faster clock elsewhere in the cluster.
 > *Fix sketch:* Bound client timestamps at the receiving host (reject/clamp startTimestamp > hostNow + small epsilon), and also record the host-local receipt time of the first prepare it ever saw for a txid.
 
 
-`tooOld` compares host `HLCTimestamp.now` with `txd.startTimestamp`, which the client set (`TransactionBuilder.scala:89`;
-`Frontend.scala:655`). The cache covers only 7 s. If the client's clock (or its HLC, which ratchets forward from any
+`tooOld` compares host `HLCTimestamp.now` with `txd.startTimestamp`, which the client set (`TransactionBuilder.scala:98`;
+`Frontend.scala:655` at `c3ad5493`). The cache covers only 7 s. If the client's clock (or its HLC, which ratchets forward from any
 timestamp it reads, `client/internal/read/BaseReadDriver.scala:193-194`, and never backwards) is ahead of the hosts by
 D, the apparent age is `real age - D`, so real ages in (7 s, 6 s + D) are treated as young and unprotected whenever
 `D` exceeds ~1 s plus the finalization latency. A replayed prepare then creates a fresh `Tx`, rechecks requirements
@@ -821,14 +824,14 @@ or clamp future timestamps.
 
 ### F4. Secondary-pool stores can become drivers and share the proposal-id space of primary stores. Confidence: structural 85%, exploitability low
 
-> **Verification 2026-11-09: PLAUSIBLE. Severity: split-decision (only if proposers can compute different values).** Structure confirmed: designatedLeader compares only the pool index (TransactionDriver.scala:114) while Store.handleTransactionMessage checks the pool (Store.scala:156), Store.heartbeat starts a driver for ANY idle Tx (Store.scala:73-77), Proposer peerId = storeId.poolIndex (TransactionDriver.scala:88), and a secondary-pool store with the leader's index skips nextRound (SimpleTransactionDriver.scala:48) so it starts at the same (1,L). Acceptor accepts an equal id with any value (Acceptor.scala:31). But the tally decides only when conclusive (commit when every object has >= writeThreshold commit votes, abort when some object cannot reach it; TransactionDriver.scala:259-300) and votes are immutable, so same-id proposers compute the same value; a real split needs the non-vote inputs (F7 Undetermined, F2/F6).
+> **Verification 2026-11-09: PLAUSIBLE. Severity: split-decision (only if proposers can compute different values).** Structure confirmed: designatedLeader compares only the pool index (TransactionDriver.scala:155) while Store.handleTransactionMessage checks the pool (Store.scala:191), Store.heartbeat starts a driver for ANY idle Tx (Store.scala:84-88), Proposer peerId = storeId.poolIndex (TransactionDriver.scala:102), and a secondary-pool store with the leader's index skips nextRound (SimpleTransactionDriver.scala:48) so it starts at the same (1,L). Acceptor accepts an equal id with any value (Acceptor.scala:31). But the tally decides only when conclusive (commit when every object has >= writeThreshold commit votes, abort when some object cannot reach it; TransactionDriver.scala:319-360) and votes are immutable, so same-id proposers compute the same value; a real split needs the non-vote inputs (F7 Undetermined, F2/F6).
 > *Fix sketch:* Restrict driving to primary-pool stores, or make the proposer id the primary-pool index only.
 
 
 `Store.heartbeat` and `SimpleDriverRecoveryMixin` call `driveTransaction` for *any* idle `Tx` on any store
-(`Store.scala:73-77`, `SimpleDriverRecoveryMixin.scala:22-26`); only the designated-leader path checks the pool
-(`Store.scala:156`). `TransactionDriver.designatedLeader` compares only the index (`:114`) and the proposer id byte is
-`storeId.poolIndex` (`:88`), so a secondary-pool store with index equal to the leader's index starts at the **same**
+(`Store.scala:84-88`, `SimpleDriverRecoveryMixin.scala:22-26`); only the designated-leader path checks the pool
+(`Store.scala:191`). `TransactionDriver.designatedLeader` compares only the index (`:155`) and the proposer id byte is
+`storeId.poolIndex` (`:102`), so a secondary-pool store with index equal to the leader's index starts at the **same**
 `(1, L)` as the real leader and the client's prepare, and recovery drivers on `P_i` and `Q_i` both use `(2, i)`. Two
 different proposers with one id violate P2; `Acceptor.receiveAccept` accepts an equal id with a different value
 (`Acceptor.scala:31`). A split needs the two drivers to tally different values; the tally is monotone in immutable votes
@@ -858,11 +861,11 @@ its first Accept (it does not, because `receiveTxPrepare` is dead, 7.3).
 > prepare (a retransmit of a client that never learned the abort, or a delayed duplicate, P-N4) reaching stores that
 > forgot T.
 
-> **Verification 2026-11-09: PLAUSIBLE. Severity: split-decision (rare).** Abort resolution deletes the CRL record including `accepted` (Tx.scala:627, Frontend.scala:481), but the in-memory Tx (with its Acceptor) stays in Frontend.transactions until TxFinalized (Frontend.scala handleTransactionMessage TxFinalized), so a later round at a LIVE store still sees the accepted value; the loss needs a store restart (which also loses the host status cache) or a Tx dropped by close/recovery, plus a promise quorum made only of such stores and a young/skewed prepare so TooOld does not apply. Real but needs several coincidences.
+> **Verification 2026-11-09: PLAUSIBLE. Severity: split-decision (rare).** Abort resolution deletes the CRL record including `accepted` (Tx.scala:749, Frontend.scala:584), but the in-memory Tx (with its Acceptor) stays in Frontend.transactions until TxFinalized (Frontend.scala handleTransactionMessage TxFinalized), so a later round at a LIVE store still sees the accepted value; the loss needs a store restart (which also loses the host status cache) or a Tx dropped by close/recovery, plus a promise quorum made only of such stores and a young/skewed prepare so TooOld does not apply. Real but needs several coincidences.
 > *Fix sketch:* Keep the Paxos record until TxFinalized for aborts too (as for commits).
 
 
-`Tx.scala:624-627` deletes the CRL record (including `accepted`) at abort resolution, and at `TxFinalized` all Paxos
+`Tx.scala:746-749` deletes the CRL record (including `accepted`) at abort resolution, and at `TxFinalized` all Paxos
 state of either outcome is dropped. Subsequent safety depends on: the host status cache having the entry (in memory,
 lost on restart, evictable by size at 4 M entries, 7 s), the client-supplied timestamp being honest (F3), and proof of
 commit being available (F2). Concretely: an abort chosen by acceptors A,B,C that then forgot it; a later driver round
@@ -875,13 +878,13 @@ remove the restart variant at the cost of a longer-lived record.
 
 ### F7. `Undetermined` answers are counted as abort votes. Confidence: high that it happens, low impact
 
-> **Verification 2026-11-09: CONFIRMED. Severity: liveness/hardening (safe by P7 while some acceptor holds the chosen value).** TransactionDriver.scala:272-275: every non-VoteCommit disposition, including Undetermined, is counted as an abort vote. Tx.answerPrepare/respondToPrepare answer with disposition as-is once oresolution is set (Tx.scala:700-749 region; determineDisposition is skipped when oresolution.nonEmpty, :441-460).
+> **Verification 2026-11-09: CONFIRMED. Severity: liveness/hardening (safe by P7 while some acceptor holds the chosen value).** TransactionDriver.scala:332-335: every non-VoteCommit disposition, including Undetermined, is counted as an abort vote. Tx.answerPrepare/respondToPrepare answer with disposition as-is once oresolution is set (Tx.scala:835-886 region; determineDisposition is skipped when oresolution.nonEmpty, :526-553).
 > *Fix sketch:* Count Undetermined as no vote.
 
 
-`TransactionDriver.scala:272-275` treats every non-`VoteCommit` as an abort vote. A `Tx` that was resolved before it
+`TransactionDriver.scala:332-335` treats every non-`VoteCommit` as an abort vote. A `Tx` that was resolved before it
 voted (data-less prepare first, then `TxResolved`, then a driver's prepare) answers with `Undetermined`
-(`Tx.scala:717` skips `determineDisposition` once `oresolution` is set; `respondToPrepare` sends `disposition`
+(`Tx.scala:844` skips `determineDisposition` once `oresolution` is set; `respondToPrepare` sends `disposition`
 as-is). A later-round driver may therefore see up to `a` spurious aborts and, with no accepted value in its promise
 quorum, propose abort even though `t` real commit votes exist. Safe by P7 only while some acceptor still holds a chosen
 value; combined with F6 it widens the amnesia window. Fix: count `Undetermined` as "no vote" (do not count it toward
@@ -889,22 +892,22 @@ value; combined with F6 it widens the amnesia window. Fix: count `Undetermined` 
 
 ### F8. The tally cannot decide an abort while any referenced pool has fewer than `t` answers. Confidence: medium (liveness)
 
-> **Verification 2026-11-09: CONFIRMED. Severity: liveness.** The object loop iterates a Set and `break()`s with cantAttempt on the first object whose pool has fewer than writeThreshold replies (TransactionDriver.scala:281-284) even if an earlier or later object is already abort-certain; with one pool down, voters on the other objects keep their locks and the client retransmits forever.
+> **Verification 2026-11-09: CONFIRMED. Severity: liveness.** The object loop iterates a Set and `break()`s with cantAttempt on the first object whose pool has fewer than writeThreshold replies (TransactionDriver.scala:341-344) even if an earlier or later object is already abort-certain; with one pool down, voters on the other objects keep their locks and the client retransmits forever.
 > *Fix sketch:* Evaluate all objects first; decide abort as soon as any object cannot reach commit; only wait when no object is abort-certain.
 
 
-`TransactionDriver.scala:281-284`: `break()` out of the object loop with `cantAttempt` on the first (set-ordered)
+`TransactionDriver.scala:341-344`: `break()` out of the object loop with `cantAttempt` on the first (set-ordered)
 object whose pool has `n < t`, even if another object's pool already makes commit impossible. A transaction touching an
 object in a pool that is down (or whose stores are all withholding votes) neither commits nor aborts; stores that voted
 commit on the other objects keep their locks; the client retransmits forever (`SimpleClientTransactionDriver.scala:37-50`).
-The `TODO` at `:275` acknowledges the tally could be smarter. Fix: evaluate abort-certain objects first and decide abort
+The `TODO` at `:335` acknowledges the tally could be smarter. Fix: evaluate abort-certain objects first and decide abort
 as soon as any object cannot reach `t` commits.
 
 ### F9. The host-wide status cache is written by every store and by constructors. Confidence: medium, low impact
 
 > **Refresh (replay pins): NARROWED, impact raised.** `Frontend`'s no-Tx `TxResolved` path now skips a finalized entry
-> (`Frontend.scala:636-637`), but `Tx.resolved` still writes `(status, finalized = false)` over another store's finalized
-> entry (`Tx.scala:737-738`). Finalized entries are now late-commit evidence (`Store.scala:158-171`): a downgrade makes
+> (`Frontend.scala:636-637` at `0d08e3c6`), but `Tx.resolved` still writes `(status, finalized = false)` over another store's finalized
+> entry (`Tx.scala:787-788`). Finalized entries are now late-commit evidence (`Store.scala:167-180`): a downgrade makes
 > the relay answer a non-late `TxResolved`, so a replay's driver runs the finalization actions again and a fresh Tx at
 > that store applies a blind write again (X3).
 >
@@ -921,25 +924,25 @@ as soon as any object cannot reach `t` commits.
 > takes only its own flags (TransactionStatusCacheSuite "a false abort never replaces a finalized late commit", "a
 > commit replacing a finalized abort takes none of the abort's flags").
 
-> **Verification 2026-11-09: CONFIRMED. Severity: stale-replica / hygiene.** TransactionStatusCache.updateStatus is an unconditional put (TransactionStatusCache.scala:64-66); Tx's constructor writes Unresolved (Tx.scala:114) and resolved() writes finalized=false (Tx.scala:662) over an entry another store of the host may have marked finalized (Tx.scala:800). Frontend.receivePrepare restores status for new Txs only (Frontend.scala:660-664).
+> **Verification 2026-11-09: CONFIRMED. Severity: stale-replica / hygiene.** TransactionStatusCache.updateStatus is an unconditional put (TransactionStatusCache.scala:64-66 at c3ad5493); Tx's constructor writes Unresolved (Tx.scala:162) and resolved() writes finalized=false (Tx.scala:788) over an entry another store of the host may have marked finalized (Tx.scala:960). Frontend.receivePrepare restores status for new Txs only (Frontend.scala:660-664 at c3ad5493).
 > *Fix sketch:* Make updateStatus monotone (never downgrade finalized or a known outcome to Unresolved).
 
 
-`Tx` construction overwrites the entry with `Unresolved` (`Tx.scala:114`), including for a recovered `Tx` of another store
-on the same host; `resolved` writes `finalized=false` (`:662`) even over an entry another store marked finalized
-(`:800`). `Frontend.receivePrepare` restores the status for the new-Tx case but not the finalized flag, and not for
+`Tx` construction overwrites the entry with `Unresolved` (`Tx.scala:162`), including for a recovered `Tx` of another store
+on the same host; `resolved` writes `finalized=false` (`:788`) even over an entry another store marked finalized
+(`:960`). `Frontend.receivePrepare` restores the status for the new-Tx case but not the finalized flag, and not for
 recovered `Tx`s. Effect: a transaction finalized by store A can lose its "finalized" mark on that host while B finishes
 late, so A may recreate a young `Tx` from a stray prepare and wait for a `TxFinalized` no live driver will re-send,
 until its idle recovery fires or the entry expires. Mostly hygiene; it also widens the F6 window.
 
 ### F10. `lastProposer` is overwritten by client retransmits. Confidence: medium, low impact
 
-> **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (extra repair only).** Tx.receivePrepare sets lastProposer = m.from for every prepare, client prepares included (Tx.scala:680), and TxCommitted/proven TxResolved go to lastProposer (Tx.scala:~600, 519-525). After resolution drivers send TxResolved, not prepares, so the redirect is not corrected.
+> **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (extra repair only).** Tx.receivePrepare sets lastProposer = m.from for every prepare, client prepares included (Tx.scala:806), and TxCommitted/proven TxResolved go to lastProposer (Tx.scala:733, 621-633). After resolution drivers send TxResolved, not prepares, so the redirect is not corrected.
 > *Fix sketch:* Do not update lastProposer from fromClient prepares.
 
 
-`Tx.receivePrepare` sets `lastProposer = m.from` for every prepare (`Tx.scala:680`), and client prepares carry the
-leader's id. `TxCommitted` and the proven-commit `TxResolved` go to `lastProposer` (`:611`, `:525`). If the leader is dead and
+`Tx.receivePrepare` sets `lastProposer = m.from` for every prepare (`Tx.scala:806`), and client prepares carry the
+leader's id. `TxCommitted` and the proven-commit `TxResolved` go to `lastProposer` (`:733`, `:633`). If the leader is dead and
 a recovery driver R is running, a client retransmit after R's prepare redirects this store's later `TxCommitted`
 to the dead leader. R's finalizer then sees the store as not having committed, and
 `MissedUpdateFinalizationAction` ErrorTree and UnackedCommits entries are written for a store that did apply. Harmless to correctness
@@ -947,7 +950,7 @@ to the dead leader. R's finalizer then sees the store as not having committed, a
 
 ### F11. Split decisions are undetectable. Confidence: high (hardening)
 
-> **Verification 2026-11-09: CONFIRMED. Severity: doc-only (observability).** Tx.resolved (Tx.scala:645), onResolution (TransactionDriver.scala:471-474) and Tx.receiveFinalized (:783) silently ignore a conflicting second outcome.
+> **Verification 2026-11-09: CONFIRMED. Severity: doc-only (observability).** Tx.resolved (Tx.scala:772), onResolution (TransactionDriver.scala:690-693) and Tx.receiveFinalized (:925-930) silently ignore a conflicting second outcome.
 > *Fix sketch:* Log error plus a counter on any conflicting TxResolved/TxFinalized.
 
 
@@ -957,34 +960,34 @@ conflicting `TxResolved`/`TxFinalized` at every site and a counter.
 
 ### F12. After a round change, Accept relies on the timer; `localProposal` is sticky. Confidence: high, latency only
 
-> **Verification 2026-11-09: CONFIRMED. Severity: liveness (latency).** TransactionDriver.scala:254 `!proposer.haveLocalProposal` leaves shouldSendAcceptMessages false in rounds >= 2; SimpleTransactionDriver.sendPeerMessages sends the Accept on the next timer (:54-85).
+> **Verification 2026-11-09: CONFIRMED. Severity: liveness (latency).** TransactionDriver.scala:314 `!proposer.haveLocalProposal` leaves shouldSendAcceptMessages false in rounds >= 2; SimpleTransactionDriver.sendPeerMessages sends the Accept on the next timer (:59-90).
 > *Fix sketch:* Set shouldSendAcceptMessages when the new round's quorum is reached.
 
 
-`TransactionDriver.scala:254` skips the quorum handling when a local proposal already exists, so
+`TransactionDriver.scala:314` skips the quorum handling when a local proposal already exists, so
 `shouldSendAcceptMessages` is not set in rounds >= 2; the Accept goes out at the next periodic send (up to `maxDelay`)
-(`SimpleTransactionDriver.scala:54-85`). The `NoRecovery` driver used in some tests has no timer. Also the
-local proposal from round 1 is reused without re-tallying (`Proposer.scala:38`); safe because votes are immutable, but
+(`SimpleTransactionDriver.scala:59-90`). The `NoRecovery` driver used in some tests has no timer. Also the
+local proposal from round 1 is reused without re-tallying (`Proposer.scala:54`); safe because votes are immutable, but
 the invariant is implicit.
 
 ### F13. `proveCommitted` leaves an in-memory `VoteAbort` that a later save can persist. Confidence: low
 
-> **Verification 2026-11-09: CONFIRMED (mechanism). Severity: doc-only/low.** decideDisposition sets disposition = VoteAbort before proveCommitted (Tx.scala:489-493); answerPrepare then returns without respondToPrepare, but receiveAccept saves the in-memory disposition (Tx.scala:751-766).
+> **Verification 2026-11-09: CONFIRMED (mechanism). Severity: doc-only/low.** decideDisposition sets disposition = VoteAbort before proveCommitted (Tx.scala:582-586); answerPrepare then returns without respondToPrepare, but receiveAccept saves the in-memory disposition (Tx.scala:888-903).
 > *Fix sketch:* Set disposition only after the proof check, or reset it to Undetermined in proveCommitted.
 
 
-`decideDisposition` assigns `disposition = VoteAbort` before it calls `proveCommitted` (`Tx.scala:489-493`). That Tx
-never answers with it, but `receiveAccept` (`:759-760`) and a later prepare save `disposition` as it stands, so a restart
+`decideDisposition` assigns `disposition = VoteAbort` before it calls `proveCommitted` (`Tx.scala:582-586`). That Tx
+never answers with it, but `receiveAccept` (`:896-897`) and a later prepare save `disposition` as it stands, so a restart
 can recover a `VoteAbort` on a committed transaction (status `Committed`). It would be sent as an abort vote to a later
 driver. Practically masked by the proof, but P4's exception.
 
 ### F14. Adopted late object data is not persisted until the next save. Confidence: medium, low impact
 
-> **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (repaired).** adoptObjectUpdates mutates objectUpdates in memory (Tx.scala:672-676) and no CRL save follows.
+> **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (repaired).** adoptObjectUpdates mutates objectUpdates in memory (Tx.scala:798-802) and no CRL save follows.
 > *Fix sketch:* Save the Tx when new object data is adopted.
 
 
-`adoptObjectUpdates` (`Tx.scala:672-676`) changes `objectUpdates` in memory only. A store that had voted abort for
+`adoptObjectUpdates` (`Tx.scala:798-802`) changes `objectUpdates` in memory only. A store that had voted abort for
 missing data, adopted data, applied a commit decided by the others, and crashes before its backend commit completes
 recovers without the data (`TransactionRecoveryState` lacked it). It then reports an uncommittable object and repair
 restores it. Safe by repair; noted because P13 ("data lives in the CRL until the backend commit succeeds") does not hold
@@ -997,7 +1000,7 @@ for adopted data.
 
 
 `TransactionDriver.receiveTxPrepare` (never called), `Proposer.receiveNack`/`maySendAccept`/`currentPrepareMessage`, the
-whole `TxStatusRequest` path (`Tx.scala:858-862`; no sender), and the commented client learner
+whole `TxStatusRequest` path (`Tx.scala:1146-1150`; no sender), and the commented client learner
 (`ClientTransactionDriver.scala:45-59`). The unused `receiveTxPrepare` means a new round's id is learned only through
 Nacks (extra rounds under contention).
 
@@ -1006,10 +1009,10 @@ Nacks (extra rounds under contention).
 #### P-N1. A proof is sent once, to `lastProposer`; a driver that did not receive it may decide abort. Confidence: high (mechanism)
 
 > **Verdict: CONFIRMED (mechanism); trigger PLAUSIBLE. Severity: split-decision (client-visible false abort, as F2).**
-> `proveCommitted` sends one proof to `lastProposer` (`Tx.scala:585-597`); a non-muted prover answers every later
-> prepare as an acceptor with its abort vote (`:786-788`). The proof reaches a driver only if one exists on that store
-> when it arrives (`Store.scala:199-201`); stores ignore proofs (`Tx.scala:858`, `Frontend.scala:636`). Any other driver,
-> or a later one on the same store, has `holdsProof = false` and may set an abort proposal (`TransactionDriver.scala:318-319`).
+> `proveCommitted` sends one proof to `lastProposer` (`Tx.scala:621-633`); a non-muted prover answers every later
+> prepare as an acceptor with its abort vote (`:836-838`). The proof reaches a driver only if one exists on that store
+> when it arrives (`Store.scala:208-210`); stores ignore proofs (`Tx.scala:908`, `Frontend.scala:761`). Any other driver,
+> or a later one on the same store, has `holdsProof = false` and may set an abort proposal (`TransactionDriver.scala:361-362`).
 > Paths: the replayed client prepare names the designated leader, whose store has no driver (down, or its copy of the
 > prepare lost; F10 redirects `lastProposer` the same way); or a recovery driver tallies before the proof holder. The
 > consequence is F2's: no store state changes (forgotten stores apply nothing for an abort), the client may be told
@@ -1023,7 +1026,7 @@ Nacks (extra rounds under contention).
 > driver still gets the prover's abort vote (`answerPrepareAsAcceptor`, `:836-838`). The other path is now concrete:
 > the replayed client prepare names the designated leader as `from`, a prover in another pool can load and prove before
 > the leader's own copy of the prepare has created its driver, and `Store` hands a `TxResolved` only to an existing
-> driver (`Store.scala:206-208`; it caches prepare responses, not proofs). Task 4 hit exactly this while building
+> driver (`Store.scala:208-210`; it caches prepare responses, not proofs). Task 4 hit exactly this while building
 > ReplayIntegrationSuite's headline test with the default leader-last delivery: the replay resolved abort
 > (`task-4-report.md`, concern 4). The consequence is unchanged (no store state changes; the client may be told aborted).
 > *Fix sketch (additional):* cache proofs in `prepareResponseCache` beside prepare responses, as `driveTransaction`
@@ -1032,15 +1035,15 @@ Nacks (extra rounds under contention).
 #### P-N2. Late condition 1 relies on rebuilt acceptors being muted, and the mute relies on clocks. Confidence: low-medium
 
 > **Verdict: PLAUSIBLE. Severity: lost committed update (no ErrorTree marks).** The argument for `resolveLate`
-> (`TransactionDriver.scala:514-538`) needs every acceptor that accepted the chosen commit either to remember it or to
+> (`TransactionDriver.scala:572-598`) needs every acceptor that accepted the chosen commit either to remember it or to
 > have received `TxFinalized`. A rebuilt acceptor forgot without `TxFinalized`; it is excluded only by
-> `acceptorSince` (`Frontend.scala:676`: muted iff `txd.startTimestamp < acceptorSince`), and the start timestamp is
+> `acceptorSince` (`Frontend.scala:811`: muted iff `txd.startTimestamp < acceptorSince`), and the start timestamp is
 > client-chosen. A client clock fast by more than the rebuild's duration plus the 10 s margin (the X2 residual) makes
 > the rebuilt store answer a memoryless promise for a live T, and can also make it the prover (it got T's state from the
 > rebuild). With quorum intersection only through it (Replication(3,2): one store), a post-proof round sees a memoryless
 > quorum and resolves late while T is still live: no finalization actions run, so no ErrorTree marks or UnackedCommits
-> entries are written, and every live unresolved commit voter applies nothing on the late commit (`Tx.scala:926-932`,
-> lookup absent, `:1032-1035`). Needs a fast client clock, a rebuild completing while T is unresolved, and a minimal
+> entries are written, and every live unresolved commit voter applies nothing on the late commit (`Tx.scala:1001-1007`,
+> lookup absent, `:1132-1134`). Needs a fast client clock, a rebuild completing while T is unresolved, and a minimal
 > intersection. Before the refresh the same window gave X2's split decision.
 > *Fix sketch:* take `acceptorSince` from the host's receipt time of the first prepare, or bound client timestamps.
 
@@ -1049,10 +1052,10 @@ Nacks (extra rounds under contention).
 > **Verdict: PLAUSIBLE. Severity: resurrection (pin-only blind writes, `DoesNotExist` inserts after a later delete,
 > allocations).** The design's residual needs the pin object changed (no proof). The code shows it does not: with a
 > proof, a post-proof prepare quorum that includes the recovering acceptor's accepted value is not memoryless, so the
-> driver adopts the value and resolves *normally* (`TransactionDriver.scala:262-268`, Ruling 7), runs the finalization
-> actions again (Ruling 13) and sends non-late `TxResolved`/`TxFinalized` (`:602-605`). Whichever of the recovering store
+> driver adopts the value and resolves *normally* (`TransactionDriver.scala:310-313`, Ruling 7), runs the finalization
+> actions again (Ruling 13) and sends non-late `TxResolved`/`TxFinalized` (`:710-713`). Whichever of the recovering store
 > or the other acceptors answers first decides between late and normal. Fresh Txs made by a concurrently replayed client
-> prepare (which carries data) then apply on a non-late commit (`Tx.scala:866-869`), re-checked only by their own
+> prepare (which carries data) then apply on a non-late commit (`Tx.scala:916-919`), re-checked only by their own
 > requirements: per-write checked writes are skipped, pin-only blind writes, `DoesNotExist` inserts after a later delete
 > and allocations (whose `Allocating` state is built without a backend read, transaction-requirements F11) are applied.
 > Fresh Txs made by the recovering store's own data-less prepares cannot apply data and only report errors, which marks
@@ -1065,7 +1068,7 @@ Nacks (extra rounds under contention).
 > commit and reports T's objects in `objectCommitErrors` (`Tx.scala:642-648`), so the re-run finalizer marks it; this
 > covers the stores that acknowledged T late. Stores that acknowledged in time hold no stub and still apply the replay's
 > blind writes. The re-run marker's entries now come with a non-late `TxFinalized` listing them in `owed`, so stores
-> with no Tx write stubs for them (`Frontend.scala:763-773`), which closes the re-armed R-N1 half of X12 unless that
+> with no Tx write stubs for them (`Frontend.scala:772-781`), which closes the re-armed R-N1 half of X12 unless that
 > `TxFinalized` is lost. Prefer-abort can tilt the race the verdict describes toward the non-late outcome: memoryless
 > acceptors reached only by driver prepares withhold their promises for up to 5 s, while the recovering acceptor answers
 > at once (P-N7).
@@ -1074,10 +1077,10 @@ Nacks (extra rounds under contention).
 
 > **Verdict: PLAUSIBLE. Severity: split-decision (a transaction reported aborted later commits).** The pin argument
 > ("after T commits ...", P16) says nothing about an aborted T, whose pin precondition still holds. After
-> `TxFinalized(false)` every store forgets T (an abort deletes its CRL record at resolution, `Tx.scala:699`) and the cache
+> `TxFinalized(false)` every store forgets T (an abort deletes its CRL record at resolution, `Tx.scala:749`) and the cache
 > forgets it 7 s later. A later prepare of T, a delayed duplicate client prepare or the periodic prepares of a zombie
-> driver (X4), creates fresh Txs checked against current state with no age test (`Frontend.scala:671-691`,
-> `Tx.scala:518-534`). If the requirement that made T abort has since cleared (a `DoesNotExist` key deleted, a lock holder
+> driver (X4), creates fresh Txs checked against current state with no age test (`Frontend.scala:806-825`,
+> `Tx.scala:554-570`). If the requirement that made T abort has since cleared (a `DoesNotExist` key deleted, a lock holder
 > gone) and the pin object is unchanged, `t` stores vote commit and T commits after its client was told it aborted. A
 > zombie driver's prepares carry no data, so only data-less transactions (refcount changes, locks) can commit that way.
 > The horizon used to refuse prepares older than 6 s (with F3's clock hole). This widens F6.
@@ -1094,15 +1097,15 @@ Nacks (extra rounds under contention).
 > needs the delayed duplicates to reach a write threshold of the stores of every pool T writes (stores the duplicates
 > miss see only the replay leader's driver prepares and vote abort), more than the status-cache duration after the
 > abort, with T's requirements holding again. A successful client retry closes it, since the retry consumes the same
-> pin. Documented in the `Transaction.commit` scaladoc (`client/Transaction.scala:155-160`), `Architecture.md` and
+> pin. Documented in the `Transaction.commit` scaladoc (`client/Transaction.scala:156-161`), `Architecture.md` and
 > `UsageGuide.md`. Tested: ReplayIntegrationSuite "an aborted data-less transaction re-driven by a recovered commit vote
 > aborts again".
 
 #### P-N5. Liveness of "never propose abort while holding a proof". Confidence: medium
 
 > **Verdict: REFUTED (no new hang).** A proof holder resolves on a memoryless post-proof quorum, on an adopted accepted
-> value (sent without the tally, `TransactionDriver.scala:264-268`), or on any late message; a Nack moves it to another
-> post-proof round (`:495-501`). It waits only for a prepare quorum of the primary pool, which every driver needs; the
+> value (sent without the tally, `TransactionDriver.scala:312-313`), or on any late message; a Nack moves it to another
+> post-proof round (`:553-559`). It waits only for a prepare quorum of the primary pool, which every driver needs; the
 > secondary-pool tally stall (F8) does not apply to it. A competing driver's chosen abort is adopted (Ruling 2). The cost
 > is that a proof holder can never conclude an abort itself, which is correct since a proof implies commit.
 > *Refresh (Ruling 29):* a proof holder no longer adopts an accepted abort: such an abort predates the ballot at which
@@ -1111,10 +1114,10 @@ Nacks (extra rounds under contention).
 
 #### P-N6. The finalized relay reports every finalized commit as late. Confidence: medium
 
-> **Verdict: REFUTED.** `Store.scala:158-171` relays a finalized committed entry as `late`. A finalized entry is written
-> only on a real `TxFinalized` (`Tx.scala:902`, `Frontend.scala:646`) or a late outcome (`Tx.scala:959-961`,
-> `Frontend.scala:636-637`); proofs and found entries write nothing (`Tx.scala:1006`). A real `TxFinalized(true)` follows
-> the finalizer (`TransactionDriver.scala:593-596`), so the relayed late claim holds. The weakness runs the other way: a
+> **Verdict: REFUTED.** `Store.scala:167-180` relays a finalized committed entry as `late`. A finalized entry is written
+> only on a real `TxFinalized` (`Tx.scala:960`, `Frontend.scala:772`) or a late outcome (`Tx.scala:1035-1037`,
+> `Frontend.scala:761-762`); proofs and found entries write nothing (`Tx.scala:1100`). A real `TxFinalized(true)` follows
+> the finalizer (`TransactionDriver.scala:650-653`), so the relayed late claim holds. The weakness runs the other way: a
 > downgraded entry loses the evidence (F9, X3; fixed by Ruling 30).
 
 ### New findings from the addendum refresh (2026-11-10, `c181375b`)
@@ -1156,13 +1159,13 @@ Nacks (extra rounds under contention).
 > **Verdict: PLAUSIBLE (mechanism CONFIRMED). Severity: resurrection (blind writes at stores that acknowledged in
 > time).** See transaction-recovery R-N8 for the trace. A driver D1 finalized by D0's non-late commit `TxFinalized`
 > while its own marker has handed entries off sends its own non-late `TxFinalized` only once those entries are durable
-> (`TransactionDriver.scala:426-433`), which a slow metadata group can delay without bound. Once the stores' finalized
-> status-cache entries expire (7 s), a replayed client prepare creates fresh Txs (`Frontend.scala:797-810`), and D1's
+> (`TransactionDriver.scala:426-433` at `c181375b`), which a slow metadata group can delay without bound. Once the stores' finalized
+> status-cache entries expire (7 s), a replayed client prepare creates fresh Txs (`Frontend.scala:806-819`), and D1's
 > late-arriving non-late `TxFinalized(commit)` makes each of them apply T (`Tx.scala:945-946`, `doCommit`). This is
 > P-N3's consequence through a new source of non-late commits. Stores with a stub skip it.
 >
 > **Refresh (final fix wave, Ruling 7): FIXED.** D1 no longer waits for its entries: on D0's non-late commit
-> `TxFinalized` it finalizes at once with D0's `owed` union its planned set (`TransactionDriver.scala:411-430`), inside
+> `TxFinalized` it finalizes at once with D0's `owed` union its planned set (`TransactionDriver.scala:440-459`), inside
 > the window in which every store that forgot T still holds T's finalized status entry, and once finalized it sends
 > neither `TxResolved` nor a later `TxFinalized` with another value (see transaction-recovery R-N8's refresh). The
 > non-late messages that remain after the window are P-N3's own, which predate the addendum.
@@ -1170,18 +1173,18 @@ Nacks (extra rounds under contention).
 ### Verified safe (not flaws, listed so they are not re-investigated)
 
 * Quorum intersection: IDA constructors enforce a majority write threshold (1.3).
-* Vote and promise durability before send (`Tx.scala:739-745,759-765`), vote immutability across restart
-  (`:394-403`), and commit requiring `t` commit votes per object (7.2).
+* Vote and promise durability before send (`Tx.scala:876-882,896-902`), vote immutability across restart
+  (`:472-482`), and commit requiring `t` commit votes per object (7.2).
 * Commit-in-flight ordering and lock lifetime are in the sibling spec; nothing in the Paxos path bypasses them.
 * Commit applies only on resolution or proof (P11); `TxFinalized(true)` before `TxResolved` is handled
-  (`Tx.scala:790-799`).
-* Stale responses from older rounds are filtered by proposal id (`TransactionDriver.scala:235,319`).
+  (`Tx.scala:949-959`).
+* Stale responses from older rounds are filtered by proposal id (`TransactionDriver.scala:286,378`).
 * A decided commit survives the leader's death: the recovery driver's promise quorum intersects the acceptors that
   accepted it, and a committed `Tx` keeps its Paxos record until `TxFinalized` (P9).
 
 ### Verification summary (2026-11-09)
 
-* **1RTT:** not implemented. Only the designated leader (or a recovery driver) sends `TxAccept` (`TransactionDriver.scala:438-447`, the only constructor). Error-free: client prepare -> store (CRL write 1) -> leader -> Accept -> acceptors (CRL write 2) -> leader -> `TransactionResolved` to the client = 5 one-way hops, 2 serial durable writes. Aborts are decided in round 1.
+* **1RTT:** not implemented. Only the designated leader (or a recovery driver) sends `TxAccept` (`TransactionDriver.scala:539-548`, the only constructor). Error-free: client prepare -> store (CRL write 1) -> leader -> Accept -> acceptors (CRL write 2) -> leader -> `TransactionResolved` to the client = 5 one-way hops, 2 serial durable writes. Aborts are decided in round 1.
 * **Is a decision ever "fixed" by acceptor state after finalization?** No. Commit keeps acceptor state until `TxFinalized` at each store; abort drops it at resolution; after finalization a stale prepare starts a fresh consensus instance (F2). Applied stores are never rolled back by it, but the client and any still-live commit voter are told abort.
 * **Refresh 2026-11-09 (replay pins):** the fresh instance is now steered by the pin rule and the late-commit rule
   (10.5): with a proof it resolves late (nothing applied, client told committed), otherwise it aborts (F2 narrowed). A

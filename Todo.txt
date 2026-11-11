@@ -2,8 +2,6 @@ TODO
 ====
 
 Open items from the replay-pins work:
-- docs/safety/paxos-transactions.md cites line numbers (e.g. TransactionDriver.scala:262-263, :318-319) that are stale
-  after the replay-pins branch.
 - Frontend.finalizationDeferred overwrites a registration by txid without checking which Tx holds it. A tidiness issue
   (with the stub hand-off in transactionFinalized no path found misbehaves), but clean it up: make the registration's
   ownership explicit rather than relying on whichever Tx deferred last.

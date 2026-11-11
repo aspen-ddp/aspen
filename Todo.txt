@@ -2,8 +2,9 @@ TODO
 ====
 
 Pre-existing amoebafs bugs found during the replay-pins work:
-- SimpleDirectory.prepareDelete reads tree.get and the containing node separately; a NothingToDelete between them
-  leaves the transaction unpinned (enforcement then fails it).
+- Directory.move treats an existing destination entry inconsistently: the first attempt replaces it (prepareInsert
+  unlinks it), but after any failed attempt onFail stops with DirectoryEntryExists if the destination name exists.
+  Pick one behavior (POSIX rename replaces) and apply it on every attempt.
 
 Open items from the replay-pins work:
 - DiskCatalog.removeKey reads the key and then deletes it, so a concurrent change between the two makes the delete a

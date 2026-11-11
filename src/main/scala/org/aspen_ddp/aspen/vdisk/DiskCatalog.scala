@@ -197,6 +197,30 @@ object DiskCatalog:
             else
               Future.failed(e)
 
+  /** Removes `key` from the Radicle tree under `treeKey`. Skipped when already absent: a transaction that deletes
+    * nothing has nothing to commit. The delete requires the entry's revision as read (the pin), so a replay cannot
+    * remove a later registration of the key. A key gone by the time the delete reads its node (a concurrent delete)
+    * adds nothing, the pin included, so that transaction is abandoned rather than committed: the key is absent, as if
+    * `get` had found it so. `beforeDelete` runs between the read and the delete; tests use it to race a removal.
+    */
+  private[vdisk] def removeKey(client: AspenClient, treeKey: Key, key: Key,
+                               beforeDelete: () => Future[Unit] = () => Future.unit): Future[Unit] =
+    given ExecutionContext = client.clientContext
+    val tree = TieredKeyValueList(client, KVObjectRootManager(client, treeKey, Radicle.pointer))
+    client.retryStrategy.retryUntilSuccessful:
+      tree.get(key).flatMap:
+        case None => Future.unit
+        case Some(vs) => beforeDelete().flatMap: _ =>
+          val tx = client.newTransaction()
+          val fdeleted = tree.deleteIfPresent(key, None, List(KeyValueUpdate.KeyRevision(key, vs.revision)))(using tx)
+          fdeleted.failed.foreach(err => tx.abort(err))
+          fdeleted.flatMap: deleted =>
+            if deleted then
+              tx.commit().map(_ => ())
+            else
+              tx.abort(new IllegalStateException(s"Registry key $key is already gone"))
+              Future.unit
+
   /** Deletes the disk and everything it holds. Each step can be re-run, so a crash midway leaves a disk that
     * `delete` can finish. Takes ownership first, which fences any live owner.
     */
@@ -237,18 +261,6 @@ object DiskCatalog:
         yield
           ()
 
-    // Skipped when already absent: a transaction that deletes nothing has nothing to commit. The delete requires
-    // the entry's revision as read (the pin), so a replay cannot remove a later registration of the key
-    def removeKey(treeKey: Key, key: Key): Future[Unit] =
-      val tree = TieredKeyValueList(client, KVObjectRootManager(client, treeKey, Radicle.pointer))
-      client.retryStrategy.retryUntilSuccessful:
-        tree.get(key).flatMap:
-          case None => Future.unit
-          case Some(vs) =>
-            client.transact: tx =>
-              given Transaction = tx
-              tree.delete(key, None, List(KeyValueUpdate.KeyRevision(key, vs.revision)))
-
     // Only a vanished config proves another delete finished the job. Any other failure (a missing map node,
     // a missing fence under a live config) must leave the registrations so that delete can be re-run.
     def configGone(info: DiskInfo): Future[Boolean] =
@@ -271,8 +283,8 @@ object DiskCatalog:
                 if gone then Future.unit else Future.failed(e)
           case None => Future.unit
         // Object registration first: until the name is removed, a re-run still finds the disk to finish
-        _ <- removeKey(Radicle.ObjectRegistryKey, Key(diskId))
-        _ <- removeKey(Radicle.NamespacedRegistryKey,
+        _ <- removeKey(client, Radicle.ObjectRegistryKey, Key(diskId))
+        _ <- removeKey(client, Radicle.NamespacedRegistryKey,
           NamespacedUUIDRegistry.makeKey(DiskConfig.RegistryNamespace, name))
       yield
         ()

@@ -360,3 +360,22 @@ class DiskCatalogSuite extends IntegrationTestSuite:
       val deletes = kvUpdates(deleteAudit.built)
       deletes.exists(_.requirements.contains(KeyValueUpdate.KeyRevision(nameKey, nameVs.get.revision))) should be (true)
       deletes.exists(_.requirements.contains(KeyValueUpdate.KeyRevision(idKey, idVs.get.revision))) should be (true)
+
+  atest("removeKey of a key removed between its read and its delete finishes without committing"):
+    var attempts = 0
+    for
+      alloc <- allocator()
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      idKey = Key(info.diskId)
+      audit = new PinAudit(client)
+      _ <- DiskCatalog.removeKey(client, Radicle.ObjectRegistryKey, idKey, () =>
+        attempts += 1
+        removeKey(Radicle.ObjectRegistryKey, idKey))
+      _ = audit.stop()
+      objects = TieredKeyValueList(client, KVObjectRootManager(client, Radicle.ObjectRegistryKey, Radicle.pointer))
+      idVs <- objects.get(idKey)
+    yield
+      attempts should be (1)
+      idVs should be (None)
+      // Only the racing removal deletes the key: removeKey found it gone and built nothing
+      audit.builtExceptMarks.flatMap(_.kvOps).count((_, ops) => ops.exists { case d: org.aspen_ddp.aspen.common.objects.Delete => d.key == idKey; case _ => false }) should be (1)

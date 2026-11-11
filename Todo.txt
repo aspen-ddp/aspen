@@ -2,8 +2,6 @@ TODO
 ====
 
 Open items from the replay-pins work:
-- DiskCatalog.removeKey reads the key and then deletes it, so a concurrent change between the two makes the delete a
-  silent no-op. Use the deleteIfPresent helper.
 - A committed transaction can be reported to its client as aborted (docs/safety paxos F2). A client paused for more
   than ~10 s, whose reply was lost, retransmits its prepare; a fresh round decides abort if no object still shows the
   update. Store state stays correct and repair catches up the stores, but the client is told the wrong outcome.

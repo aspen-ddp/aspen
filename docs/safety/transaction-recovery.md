@@ -70,7 +70,7 @@ makes that safe.
 ## 3. Timers and their required relationships
 
 Defaults in production (`cmdline/Main.scala:1724-1749`): `txHeartbeatPeriod` = 1 s; driver `initialDelay` 100 ms,
-`maxDelay` ("txRetryCap") 3 s. In tests (`TestNetwork.scala:326`) recovery drivers use 10 ms / 100 ms.
+`maxDelay` ("txRetryCap") 3 s. In tests (`TestNetwork.scala:426`) recovery drivers use 10 ms / 100 ms.
 
 | Timer | Value (prod) | Defined at | Role |
 |-------|--------------|-----------|------|

@@ -1,16 +1,9 @@
 TODO
 ====
 
-Test environment:
-- TestNetwork creates missed updates that nothing repairs. The client sends a transaction's prepares one store at a
-  time and the test messenger drains events after each, so the first stores can decide and finalize before the last
-  sees its prepare (~100 such missed updates per DirectorySuite run). The test client has no opportunistic rebuild and
-  no repairer runs, so a later transaction requiring state two stores each missed aborts on every attempt (a hang).
-  TestNetwork.batchClientPrepares (opt-in, off by default) delivers a client's prepares together; only the
-  unlink-step tests in DirectorySuite use it. Enabling it globally (or batching in ClientTransactionDriver) breaks
-  AppendIntegrationSuite / RangedWriteIntegrationSuite (they rely on a store falling behind) and 4
-  PoolObjectAllocatorSuite tests (not investigated). Decide whether to make it the default, with those suites making
-  a store fall behind explicitly (dropTxMessage).
+Flaky tests:
+- TKVL "deleting entries that join tier-0 nodes removes their upper-tier entries" failed once in three full runs on
+  7d9c8847 (not investigated).
 
 Pre-existing amoebafs bugs found during the replay-pins work:
 - Cross-node rename whose delete joins into the target node updates that node twice, so the rename deterministically

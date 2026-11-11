@@ -481,6 +481,10 @@ class MigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
       _ <- waitForTransactionsToComplete()
       _ <- client.moveDeviceToSet(net.secondDeviceId, StorageDeviceSetId.BootstrapStorageDeviceSetId)
       _ <- waitForTransactionsToComplete()
+      // A pass that read the target set before the swap and the in-flight transfers after the abort would see a free
+      // slot and the second device still a member, and start a transfer toward it that nothing here completes. Two
+      // more passes guarantee one that began after the swap, so every later pass reads the new membership
+      _ <- awaitPasses(task.testingOnlyCompletedPasses, 2)
 
       _ <- client.abortStoreTransfer(s0)
       // Any store, not necessarily s0: a pass that read the in-flight set just before the abort

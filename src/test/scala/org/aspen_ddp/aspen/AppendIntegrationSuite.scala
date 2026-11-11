@@ -379,6 +379,9 @@ trait AppendIntegrationTests:
     * has the host install the store's re-encoded content (trailer included). Retried because the
     * errorTree entry is written asynchronously after the transaction.
     */
+  /** The store the "store behind" tests hold back */
+  private def laggingStore: StoreId = net.stores.last.storeId
+
   private def storeRevisions(id: ObjectId): List[Option[ObjectRevision]] =
     net.stores.toList.map(_.m.get(id).map(_.metadata.revision))
 
@@ -408,13 +411,13 @@ trait AppendIntegrationTests:
     for
       dp <- allocate(1)
       pos <- client.readAppendPosition(dp)
-      mid <- appendAll(pos, first)
+      mid <- net.withStoreBehind(laggingStore, dp.id)(appendAll(pos, first))
       before <- client.read(dp)
       _ = withClue("expected a store to be behind before repair: "):
             storeRevisions(dp.id).exists(!_.contains(mid.revision)) should be (true)
       _ <- repairUntilCurrent(dp.id, mid.revision)
       // Later appends apply as deltas on the repaired slices
-      last <- appendAll(mid, second)
+      last <- net.withStoreBehind(laggingStore, dp.id)(appendAll(mid, second))
       after <- client.read(dp)
       _ = withClue("expected a store to be behind after the later appends: "):
             storeRevisions(dp.id).exists(!_.contains(last.revision)) should be (true)

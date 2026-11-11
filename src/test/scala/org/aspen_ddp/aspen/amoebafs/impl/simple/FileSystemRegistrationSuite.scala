@@ -113,7 +113,7 @@ class FileSystemRegistrationSuite extends IntegrationTestSuite:
       _     <- SimpleFileSystem.create(client, alloc, "myfs")
       _     = audit.stop()
     yield
-      audit.builtExceptMarks.filterNot(_.hasPin) shouldBe empty
+      audit.unpinned shouldBe empty
       audit.built.flatMap(_.description.requirements).exists:
         case kvu: KeyValueUpdate =>
           kvu.requiredRevision.isDefined && kvu.requirements.contains(KeyValueUpdate.DoesNotExist(nameKey))

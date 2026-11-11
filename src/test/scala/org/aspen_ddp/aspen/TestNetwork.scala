@@ -245,8 +245,7 @@ class TestNetwork(executionContext: ExecutionContext,
     poolMaxSliceSize,
     backendMaxSliceSize)
 
-  // All transactions will miss the third store. Don't wait long before updating the
-  // error tree
+  // Tests that hold a store behind (withStoreBehind) should not wait long for the error tree to be updated
   MissedUpdateFinalizationAction.errorTimeout = Duration(50, MILLISECONDS)
 
   object FinalizerFactory extends TransactionFinalizer.Factory {
@@ -277,15 +276,32 @@ class TestNetwork(executionContext: ExecutionContext,
 
   private var recordedTx: List[TxMessage] = Nil
 
-  /** Opt-in: a client's initial prepares for a transaction are held until it has sent one to every store, then
-   *  delivered together before events are drained. The client sends them one at a time, and draining after each lets
-   *  the first stores decide and finalize before the last sees its prepare: that store misses the update, and
-   *  nothing here repairs it. Two stores each missing a different object a later transaction requires make that
-   *  transaction abort on every attempt. Off by default: suites that need a store behind rely on that ordering.
-   *  Set it in subFixtureSetup.
-   */
-  @volatile var batchClientPrepares: Boolean = false
+  private var behind: Option[(StoreId, ObjectId)] = None
 
+  /** The (store, transaction) pairs withStoreBehind recorded: every message of the transaction to the store is
+    * dropped, for good */
+  private var behindTx: Set[(StoreId, TransactionId)] = Set()
+
+  /** Runs `f` with `store` missing every transaction that updates `objectId` while `f` runs, as a store unreachable
+    * for those transactions alone (missed-update marks and repair still reach it). It is reported offline meanwhile,
+    * so none of them chooses it as leader. A transaction is recognised by any prepare naming the object
+    */
+  def withStoreBehind[T](store: StoreId, objectId: ObjectId)(f: => Future[T]): Future[T] =
+    given ExecutionContext = executionContext
+    synchronized:
+      behind = Some((store, objectId))
+    offlineStores += store
+    f.andThen: _ =>
+      synchronized:
+        behind = None
+      offlineStores -= store
+
+  /** A client's initial prepares for a transaction are held until it has sent one to every store, then delivered
+   *  together before events are drained. The client sends them one at a time, and draining after each would let the
+   *  first stores decide and finalize before the last sees its prepare: that store would miss the update, and nothing
+   *  here repairs it, so two stores each missing a different object a later transaction requires would make that
+   *  transaction abort on every attempt. A test that needs a store behind says so (withStoreBehind)
+   */
   private var heldPrepares: Map[TransactionId, List[TxPrepare]] = Map()
 
   /** The held batch for `p`'s transaction, oldest first, once it holds a prepare for every store */
@@ -308,7 +324,13 @@ class TestNetwork(executionContext: ExecutionContext,
     if recordTxMessage(msg) then
       synchronized:
         recordedTx = msg :: recordedTx
-    droppedTx.contains((msg.to, msg.transactionId)) || dropTxMessage(msg)
+    val missed = synchronized:
+      (behind, msg) match
+        case (Some((store, objectId)), p: TxPrepare) if p.txd.allReferencedObjectsSet.exists(_.id == objectId) =>
+          behindTx += ((store, p.transactionId))
+        case _ => ()
+      behindTx.contains((msg.to, msg.transactionId))
+    missed || droppedTx.contains((msg.to, msg.transactionId)) || dropTxMessage(msg)
 
   /** Delivers `msg` to its store as the client messenger does, bypassing the drop rules and the recording: a message
     * re-delivered late, as a network replay does
@@ -365,7 +387,7 @@ class TestNetwork(executionContext: ExecutionContext,
     }
 
     def sendTransactionMessage(msg: TxMessage): Unit = msg match
-      case p: TxPrepare if batchClientPrepares && p.fromClient =>
+      case p: TxPrepare if p.fromClient =>
         holdPrepare(p).foreach: batch =>
           handleEvents()
           batch.foreach(m => if !dropped(m) then hostFor(m.to).receiveTransactionMessage(m))

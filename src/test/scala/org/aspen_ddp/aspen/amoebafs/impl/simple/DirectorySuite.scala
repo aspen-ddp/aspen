@@ -792,12 +792,6 @@ class DirectorySuite extends FilesSystemTestSuite:
         case _ => false
       .should(be(true))
 
-  /** These tests await every step of an unlink, whose later steps require state earlier transactions wrote. A store
-    * that missed one of those (see TestNetwork.batchClientPrepares) would never catch up here, and two such stores
-    * would abort the step on every attempt
-    */
-  private def awaitsUnlinkSteps(): Unit = net.batchClientPrepares = true
-
   private def createFile(dir: Directory, name: String): Future[FilePointer] =
     client.transact { tx =>
       given Transaction = tx
@@ -806,7 +800,6 @@ class DirectorySuite extends FilesSystemTestSuite:
 
   // The unlink's completion includes the release of the content it enrolled
   atest("unlinking a file frees its content tree and data segments"):
-    awaitsUnlinkSteps()
     for
       fs <- bootstrap()
       rootDir <- fs.loadRoot()
@@ -831,7 +824,6 @@ class DirectorySuite extends FilesSystemTestSuite:
 
   // The content task must not depend on the inode the same unlink step deletes
   atest("unlinking a directory frees its content tree"):
-    awaitsUnlinkSteps()
     for
       fs <- bootstrap()
       rootDir <- fs.loadRoot()
@@ -853,7 +845,6 @@ class DirectorySuite extends FilesSystemTestSuite:
   // A create racing an rmdir can leave an entry in a directory whose last link is gone. Its content deletion
   // unlinks the entry, exactly once
   atest("deleting a non-empty directory's content unlinks each entry once"):
-    awaitsUnlinkSteps()
     for
       fs <- bootstrap()
       rootDir <- fs.loadRoot()

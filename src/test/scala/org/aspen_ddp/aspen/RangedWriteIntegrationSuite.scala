@@ -84,6 +84,9 @@ trait RangedWriteIntegrationTests:
                             zeroFill: Boolean = false): Future[ObjectRevision] =
     client.readRangedWriteState(dp, writes).flatMap(s => commitWrites(s, writes, zeroFill))
 
+  /** The store the "store behind" test holds back */
+  private def laggingStore: StoreId = net.stores.last.storeId
+
   private def storeRevisions(id: ObjectId): List[Option[ObjectRevision]] =
     net.stores.map(_.m.get(id).map(_.metadata.revision))
 
@@ -329,14 +332,14 @@ trait RangedWriteIntegrationTests:
           fetchAndWrite(dp, List(w)).map(rev => (applyWrites(cur, List(w)), rev))
     for
       dp <- allocateWith(1, content)
-      (first, midRev) <- writeAll(dp, content, 10)
+      (first, midRev) <- net.withStoreBehind(laggingStore, dp.id)(writeAll(dp, content, 10))
       before <- client.read(dp)
       _ = withClue("expected a store to be behind before repair: "):
             storeRevisions(dp.id).exists(!_.contains(midRev)) should be (true)
       _ <- repairUntilCurrent(dp.id, midRev)
       _ = slicesShouldEncode(dp.id, midRev, first, requireAll = true)
       // Later ranged writes apply as deltas on the repaired slices
-      (second, lastRev) <- writeAll(dp, first, 5)
+      (second, lastRev) <- net.withStoreBehind(laggingStore, dp.id)(writeAll(dp, first, 5))
       after <- client.read(dp)
       _ = withClue("expected a store to be behind after the later writes: "):
             storeRevisions(dp.id).exists(!_.contains(lastRev)) should be (true)

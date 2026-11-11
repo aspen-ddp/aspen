@@ -65,7 +65,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   val typeRegistry: TypeRegistry
 
-  protected var storagePoolCache: Map[PoolId, StoragePool] = Map.empty
+  protected var storagePoolCache: Map[PoolId, Future[StoragePool]] = Map.empty
 
   /** Tests only: handed every transaction this client commits, as built and before the pin check. Read at commit */
   @volatile private[aspen] var testingOnlyOnBuilt: Option[TransactionBuilder.Built => Unit] = None
@@ -103,20 +103,25 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   def getAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator]
 
+  /** One StoragePool per pool: concurrent callers share the load in flight, so every caller (the commit hooks
+    * included) holds the same instance and allocation strategy. A failed load is forgotten so the next call retries
+    */
   def getStoragePool(poolId: PoolId): Future[StoragePool] =
     given ExecutionContext = this.clientContext
     synchronized:
       storagePoolCache.get(poolId) match
-        case Some(pool) => Future.successful(pool)
+        case Some(pool) => pool
         case None =>
-          getStoragePoolPointer(poolId).flatMap: pointer =>
-            read(pointer).map: kvos =>
-              val pool = SimpleStoragePool(this, kvos)
-              synchronized:
-                storagePoolCache += poolId -> pool
-              pool
+          val load = getStoragePoolPointer(poolId).flatMap: pointer =>
+            read(pointer).map(kvos => SimpleStoragePool(this, kvos): StoragePool)
+          storagePoolCache += poolId -> load
+          load.failed.foreach: _ =>
+            synchronized:
+              if storagePoolCache.get(poolId).contains(load) then
+                storagePoolCache -= poolId
+          load
 
-  /** Forgets the cached StoragePool so the next getStoragePool rereads the pool object */
+  /** Forgets the cached StoragePool, and any load in flight, so the next getStoragePool rereads the pool object */
   private[aspen] def dropCachedStoragePool(poolId: PoolId): Unit = synchronized:
     storagePoolCache -= poolId
 

@@ -60,6 +60,10 @@
   `KeyNotAtRevision` (DataObject planning rejects it with `UnsupportedRequirement`). Together they move an entry under
   the state the caller read, as amoebafs rename does: other writes derived from the old value never commit against a
   changed one. Use a batch, not `set` plus `delete`, whenever the two keys may share a node or a join may merge theirs.
+- `TieredKeyValueList.prepareRequireRevisions` (KV only) checks keys without writing: one requirement-only update per
+  containing node, `KeyNotAtRevision` at once if a node read differs. It is no pin, so a transaction made only of it
+  needs `replaySafe` (harmless: it writes nothing). Used for decisions that change nothing, such as amoebafs rename
+  between two links of one file.
 - `TKVLInsert.requireDoesNotExist` (`MustNotExist`) works on both kinds: KV via `DoesNotExist`, DataObject via the
   node's revision guard (the key's range changes only through an update of its node). Only it fails with
   `KeyAlreadyExists`, when the node read holds the key. On DataObject trees `Checked` and `Blind` add nothing (every

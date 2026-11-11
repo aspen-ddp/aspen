@@ -83,6 +83,20 @@ class TieredKeyValueList(val client: AspenClient,
                      deletesAtRevision: List[(Key, ObjectRevision)] = Nil)(using t: Transaction): Future[Unit] =
     Future.delegate(engine.prepareUpdates(BatchOp.from(inserts, deletes, deletesAtRevision)))
 
+  /** Requires, at commit, that each key is still held at its revision as given, writing nothing: one
+    * requirement-only update of each containing node. Fails with `KeyNotAtRevision`, aborting the transaction, if a
+    * node read does not hold its key at the revision. The transaction must not otherwise update these nodes. Such a
+    * check alone is no pin: a transaction made of it writes nothing, so replaying it is harmless (`replaySafe`).
+    */
+  def prepareRequireRevisions(keys: List[(Key, ObjectRevision)])(using t: Transaction): Future[Unit] =
+    Future.sequence(keys.map((k, rev) => engine.getContainingNode(k).map(on => (k, rev, on)))).map: found =>
+      val located = found.map:
+        case (k, rev, Some(node)) if kvNode(node).contents.get(k).exists(_.revision == rev) => (k, rev, kvNode(node))
+        case (k, rev, _) => t.abortAndThrow(KeyNotAtRevision(k, rev))
+      located.groupBy(_._3.pointer.id).values.foreach: group =>
+        val reqs = group.map((k, rev, _) => KeyValueUpdate.KeyRevision(k, rev))
+        t.update(group.head._3.pointer, None, None, reqs, Nil)
+
   /** KeyValue-object trees only: the requirements are key-value requirements on the containing node */
   def delete(key: Key, 
              requiredRevision: Option[ObjectRevision],

@@ -738,7 +738,6 @@ class DirectorySuite extends FilesSystemTestSuite:
       movedInode.oparent.map(_.number) should be (Some(bPtr.number))
       innerEntry shouldBe defined
 
-  // The moved inode is the one under the name when the move runs, not one a caller read before
   /** Renames (`crossDirectory` false) or moves `src` onto an existing `target` of the other type: a directory over a
     * file fails with NotADirectory, a file over a directory with IsADirectory, and neither entry changes
     */
@@ -793,6 +792,60 @@ class DirectorySuite extends FilesSystemTestSuite:
     yield
       srcEntry should be (None)
       targetEntry.map(_.number) should be (Some(srcPtr.number))
+
+  /** Two hard links to one file, `x` in `a` and `y` in `a` or (`crossDirectory`) `b`: the file and both directories */
+  private def hardLinked(crossDirectory: Boolean): Future[(FileSystem, Directory, Directory, FilePointer)] =
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      aPtr <- cdir(rootDir, "a", mode=0, uid=1, gid=2)
+      bPtr <- cdir(rootDir, "b", mode=0, uid=1, gid=2)
+      a <- fs.loadDirectory(aPtr)
+      b <- fs.loadDirectory(bPtr)
+      dst = if crossDirectory then b else a
+      fPtr <- createFile(a, "x")
+      f <- fs.loadFile(fPtr)
+      _ <- dst.hardLink("y", f)
+    yield
+      (fs, a, dst, fPtr)
+
+  // POSIX: old and new naming the same file is a successful no-op
+  private def renameBetweenLinks(crossDirectory: Boolean): Future[org.scalatest.Assertion] =
+    for
+      (fs, a, dst, fPtr) <- hardLinked(crossDirectory)
+      _ <- if crossDirectory then Directory.move(a, "x", dst, "y") else a.rename("x", "y")
+      _ <- waitForTransactionsToComplete()
+      x <- a.getEntry("x")
+      y <- dst.getEntry("y")
+      (inode, _, _) <- fs.readInode(fPtr)
+    yield
+      x.map(_.number) should be (Some(fPtr.number))
+      y.map(_.number) should be (Some(fPtr.number))
+      inode.links should be (2)
+
+  atest("a rename between two hard links of one file does nothing"):
+    renameBetweenLinks(crossDirectory = false)
+
+  atest("a cross-directory move between two hard links of one file does nothing"):
+    renameBetweenLinks(crossDirectory = true)
+
+  // The no-op is decided from two reads: it commits only if both entries are still as read
+  private def linkNoOpRaced(crossDirectory: Boolean): Future[org.scalatest.Assertion] =
+    for
+      (fs, a, dst, fPtr) <- hardLinked(crossDirectory)
+      tx = client.newTransaction()
+      _ <- if crossDirectory then Directory.prepareMove(a, "x", dst, "y")(using tx)
+           else a.prepareRename("x", "y")(using tx)
+      _ <- dst.delete("y").flatMap(identity)
+      failed <- tx.commit().map(_ => false).recover(_ => true)
+    yield
+      failed should be (true)
+
+  atest("a rename between hard links fails to commit if an entry changes after it was read"):
+    linkNoOpRaced(crossDirectory = false)
+
+  atest("a cross-directory move between hard links fails to commit if an entry changes after it was read"):
+    linkNoOpRaced(crossDirectory = true)
 
   // POSIX rename: an existing destination is replaced on every attempt, not only on the first
   atest("a cross-directory move replaces an existing destination entry, also after a failed attempt"):
@@ -849,6 +902,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       srcEntry.map(_.number) should be (Some(movedPtr.number))
       targetEntry.map(_.number) should be (Some(targetPtr.number))
 
+  // The moved inode is the one under the name when the move runs, not one a caller read before
   atest("a cross-directory move moves the entry as it reads it, and a replacement after its read aborts it"):
     for
       fs <- bootstrap()

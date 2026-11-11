@@ -29,6 +29,14 @@ trait Directory extends BaseFile with Logging {
 
   def getEntry(name: String): Future[Option[InodePointer]]
 
+  /** The entry `name` and its revision, as `prepareRequireEntries` checks it */
+  def getEntryRevision(name: String): Future[Option[(InodePointer, ObjectRevision)]]
+
+  /** Requires, at commit, that each entry is still at its revision as given, writing nothing. Fails, aborting the
+    * transaction, if an entry read is not at its revision. The transaction must not otherwise change these entries.
+    */
+  def prepareRequireEntries(entries: List[(String, ObjectRevision)])(using tx: Transaction): Future[Unit]
+
   def prepareInsert(name: String, pointer: InodePointer, incref: Boolean=true)(using tx: Transaction): Future[Unit]
 
   def prepareDelete(name: String, decref: Boolean=true)(using tx: Transaction): Future[Future[Unit]]
@@ -344,12 +352,34 @@ object Directory:
     * the pointer it held is the one moved: a concurrent replacement of the entry aborts the attempt rather than
     * moving an inode no longer under the name. A moved directory has its parent pointer rewritten at its inode's
     * revision as read here. The destination entry is inserted under `DoesNotExist`, or under the KeyRevision of an
-    * entry it replaces, which is unlinked.
+    * entry it replaces, which is unlinked. When both names link the same file, nothing changes (POSIX), and the
+    * transaction only requires that both entries are still as read.
     */
   def prepareMove(src: Directory,
                   oldName: String,
                   dst: Directory,
                   newName: String)(using tx: Transaction): Future[Unit] =
+    given ExecutionContext = src.fs.executionContext
+    for
+      osrc <- src.getEntryRevision(oldName)
+      odst <- dst.getEntryRevision(newName)
+      _ <- (osrc, odst) match
+        // Both names link the same file: POSIX rename does nothing. Committed only if both entries are still as
+        // read, so the no-op is decided on one state of the two directories
+        case (Some((sp, srev)), Some((dp, drev))) if sp.number == dp.number =>
+          for
+            _ <- src.prepareRequireEntries(List(oldName -> srev))
+            _ <- dst.prepareRequireEntries(List(newName -> drev))
+          yield
+            tx.replaySafe("move between two links of one file only checks both entries")
+        case _ => prepareMoveEntry(src, oldName, dst, newName)
+    yield
+      ()
+
+  private def prepareMoveEntry(src: Directory,
+                               oldName: String,
+                               dst: Directory,
+                               newName: String)(using tx: Transaction): Future[Unit] =
     given ExecutionContext = src.fs.executionContext
     for
       iptr <- src.prepareMoveOut(oldName)

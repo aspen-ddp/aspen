@@ -296,6 +296,31 @@ class TKVLBatchRequirementSuite extends TKVLBatchSuiteSupport:
       assert(entries == Some(value(22).bytes.toList))
       assert(left == List(None, None, None))
 
+  atest("KeyValueObjects: a revision check writes nothing and commits only while every key is still as read"):
+    for
+      (_, rm) <- newTree(TreeKind.KeyValueObjects)
+      t = new TieredKeyValueList(client, rm)
+      _ <- inTransaction(tx => t.prepareUpdates(inserts(keys(1 to 3)), Nil)(using tx))
+      vs1 <- t.get(Key(1)).map(_.get)
+      vs2 <- t.get(Key(2)).map(_.get)
+      // Unchanged: commits, writing nothing
+      ok = TestTransactions.replaySafe(client.newTransaction())
+      _ <- t.prepareRequireRevisions(List(Key(1) -> vs1.revision, Key(2) -> vs2.revision))(using ok)
+      _ <- ok.commit()
+      after <- t.get(Key(1)).map(_.get)
+      // Changed between the check and its commit: the commit fails
+      raced = TestTransactions.replaySafe(client.newTransaction())
+      _ <- t.prepareRequireRevisions(List(Key(1) -> vs1.revision, Key(2) -> vs2.revision))(using raced)
+      _ <- inTransaction(tx => t.set(Key(2), value(22))(using tx))
+      racedFailed <- raced.commit().map(_ => false).recover(_ => true)
+      // Changed before the check: fails at once
+      stale = client.newTransaction()
+      err <- t.prepareRequireRevisions(List(Key(2) -> vs2.revision))(using stale).failed
+    yield
+      assert(after.revision == vs1.revision)
+      assert(racedFailed)
+      assert(err.isInstanceOf[KeyNotAtRevision])
+
   atest("DataObjects: a batch after a change to the same node in the transaction fails with NodeAlreadyModified"):
     for
       (tree, _) <- newTree(TreeKind.DataObjects)

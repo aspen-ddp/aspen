@@ -53,6 +53,12 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     }
   }
 
+  override def getEntryRevision(name: String): Future[Option[(InodePointer, ObjectRevision)]] =
+    tree.get(Key(name)).map(_.map(vs => (InodePointer(vs.value.bytes), vs.revision)))
+
+  override def prepareRequireEntries(entries: List[(String, ObjectRevision)])(using tx: Transaction): Future[Unit] =
+    tree.prepareRequireRevisions(entries.map((name, rev) => Key(name) -> rev))
+
   override def prepareInsert(name: String,
                              pointer: InodePointer,
                              incref: Boolean)(using tx: Transaction): Future[Unit] =
@@ -182,24 +188,40 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
         oold <- tr.get(oldKey)
         onew <- tr.get(newKey)
         old = oold.getOrElse(throw DirectoryEntryDoesNotExist(pointer, oldName))
-        // An entry already under the new name is replaced, if POSIX rename allows: unlink it
         _ <- onew match
-          case None => Future.unit
-          case Some(vs) =>
-            val iptr = InodePointer(vs.value.bytes)
-            checkReplaceable(newName, InodePointer(old.value.bytes), iptr)
-            checkForDeletion(iptr).flatMap: _ =>
-              UnlinkFileTask.prepareTask(fs, iptr)
-        // One batch, so a node is updated once even when deleting the old key joins its node into the new key's.
-        // Both keys are written under the state just read: the old one is deleted at its revision as read (the pin;
-        // a concurrent change of it aborts, so the value moved is the one read), the new one requires its revision
-        // as read, or that it is still absent, so the entry unlinked above is the one replaced
-        newInsert = onew match
-          case None => TKVLInsert(newKey, old.value, requireDoesNotExist = true)
-          case Some(vs) => TKVLInsert(newKey, old.value, requiredRevision = Some(vs.revision))
-        _ <- tr.prepareUpdates(List(newInsert), Nil, List(oldKey -> old.revision))
+          // Both names link the same file: POSIX rename does nothing. Committed only if both entries are still as
+          // read, so the no-op is decided on one state of the directory
+          case Some(vs) if InodePointer(vs.value.bytes).number == InodePointer(old.value.bytes).number =>
+            tr.prepareRequireRevisions(List(oldKey -> old.revision, newKey -> vs.revision)).map: _ =>
+              tx.replaySafe("rename between two links of one file only checks both entries")
+          case _ => prepareRenameEntry(tr, oldKey, old, newKey, onew)
       yield
         ()
+
+  private def prepareRenameEntry(tr: TieredKeyValueList,
+                                 oldKey: Key,
+                                 old: ValueState,
+                                 newKey: Key,
+                                 onew: Option[ValueState])(using tx: Transaction): Future[Unit] =
+    for
+      // An entry already under the new name is replaced, if POSIX rename allows: unlink it
+      _ <- onew match
+        case None => Future.unit
+        case Some(vs) =>
+          val iptr = InodePointer(vs.value.bytes)
+          checkReplaceable(newKey.stringValue, InodePointer(old.value.bytes), iptr)
+          checkForDeletion(iptr).flatMap: _ =>
+            UnlinkFileTask.prepareTask(fs, iptr)
+      // One batch, so a node is updated once even when deleting the old key joins its node into the new key's.
+      // Both keys are written under the state just read: the old one is deleted at its revision as read (the pin;
+      // a concurrent change of it aborts, so the value moved is the one read), the new one requires its revision
+      // as read, or that it is still absent, so the entry unlinked above is the one replaced
+      newInsert = onew match
+        case None => TKVLInsert(newKey, old.value, requireDoesNotExist = true)
+        case Some(vs) => TKVLInsert(newKey, old.value, requiredRevision = Some(vs.revision))
+      _ <- tr.prepareUpdates(List(newInsert), Nil, List(oldKey -> old.revision))
+    yield
+      ()
 
   override def prepareHardLink(name: String, file: BaseFile)(using tx: Transaction): Future[Unit] =
     getEntry(name).flatMap:

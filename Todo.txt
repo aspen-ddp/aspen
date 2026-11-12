@@ -1,9 +1,329 @@
 TODO
 ====
 
+Safety work list (from docs/safety/*, built 2026-11-11 against fcb50a85)
+-----------------------------------------------------------------------
+
+Every finding not marked FIXED or REFUTED in docs/safety/* is listed below once, grouped where one change addresses
+several ids. Each item's mechanism was spot-checked at HEAD and is still present unless noted. Priority is by the
+worst plausible consequence, then likelihood, then cost. A cheap fix with a large payoff moves up within its tier.
+
+Ordering of consequence: lost committed data or a split decision > systemic loss of many stores > resurrection,
+overwritten update or permanent replica divergence > liveness (hangs, stalls) > performance > analysis/docs.
+
+Working rule for every item:
+  1. Re-read the finding and the code. Line citations in the docs have drifted.
+  2. Reproduce it with a test (deterministic, LockstepThreading where possible). If it cannot be reproduced, say why in
+     the doc's verdict.
+  3. Fix it, then update the finding's status (dated note), the README ranked row, and the module CLAUDE.md.
+  4. If the fix narrows a finding rather than closing it, state the residual explicitly.
+
+Effort: S = hours, M = a day or two, L = a design plus several days.
+Doc keys: CRL = crash-recovery-log, P = paxos-transactions, R = transaction-recovery, Q/Req = transaction-requirements,
+RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-review, SL = systemic-loss-protection.
 
 
-Turn the findings in docs/safety/* into a prioritized work list of issues to address and in priority order recorded
-in this document. Correct operation is the foundation of this project and every potential issue must be thoroughly
-investigated and fixed if correctness guarantees are threatened.
+PRIORITY 1: lost committed data, split decisions, device-wide loss
+------------------------------------------------------------------
 
+1.1  CRL F4: a save after a delete in the same unwritten entry leaves a phantom live Tx                     [S]
+     SimpleCRL.onSaveTransaction creates the Tx, puts it at the queue head and registers it before
+     LogEntry.addTx skips the deleted id. The phantom pins oldestEntryNeeded. After the ring wraps, recovery
+     throws BrokenEntryChain, the CRL is declared lost, and every store on the device is rebuilt. It can also
+     resurrect a finalized Tx through readStoreState. The trigger is low today; the transfer-load path is the gap.
+     Fix: in onSaveTransaction, when currentLogEntry already deletes the id (and stubReplaced does not apply),
+     queue only the completion handler.
+
+1.2  P-N2 (+ X2 residual, Rebuild N3, G8): the acceptorSince mute trusts the client clock                    [M]
+     `muted = acceptorSince.exists(txd.startTimestamp < _)` (Frontend). A client clock running fast by more than
+     the rebuild duration plus 10 s leaves a rebuilt, memoryless acceptor unmuted. A live T can then resolve
+     late, which means no finalization, no marks, and voters apply nothing: a lost committed update.
+     Fix: base the mute on host-observed time, either the receiving host's HLC at the first prepare or clamping
+     client timestamps to the receiving host's HLC plus a bound. Re-derive late condition 1 afterwards.
+
+1.3  P-N1 + P-F2 + R-F3/F5/F8: false abort of a committed transaction; a live commit voter drops its update  [S-M]
+     a. The proof is sent once, to lastProposer (Tx.proveCommitted). Store drops a TxResolved when no driver
+        exists yet (Store.scala ~208), and ReplayIntegrationSuite reproduced this. Fix: cache proofs next to
+        prepareResponseCache and replay them into a new driver, as prepares are replayed. A prover re-sends to
+        each new proposer id it sees. Stop client retransmits from overwriting lastProposer (P-F10).
+     b. Without a proof (a refcount pin, or a pin overwritten since), a driver re-derives abort after the cache
+        expires. The client is told "aborted" and a non-idempotent retry double-applies. Decide between: a
+        no-proof driver whose votes are all driver-prepare aborts reports Unknown to the client instead of
+        resolving, or a longer-lived finalized-outcome tombstone per txid.
+     c. A live (non-recovered) commit voter accepts a TooOld-derived abort at once: needsUnackedCheck requires
+        `recovered` (Tx.scala:176). Apply the traceless hold to live voters too (R-F3, R-F5).
+
+1.4  Req F5 + F6: a commit voter can end up holding neither the lock nor the update                         [M]
+     F5: doCommit unlocks before issueCommits. If the apply fails, the voter has dropped its lock without
+     applying, so a conflicting transaction can gather T commit votes from stores that did not apply T (R2
+     weakened). F6: a recovered commit vote whose object fails to load takes no lock on it
+     (RequirementsLocker iterates isLoaded only).
+     Fix: keep the lock until the apply is durable, or make a failed apply of a voted commit fail-stop the store
+     (rebuild-required). Never vote on, or serve, objects of a recovered vote that has not loaded them all.
+
+1.5  CRL F10: no exclusion of a second opener of the same CRL files                                         [S]
+     A double mount, or an adoption while the old host still writes, makes two writers interleave and corrupt
+     entries. Fix: hold an exclusive FileChannel.tryLock on crl/lock while the CRL is open, and refuse to open
+     otherwise. Shared-storage double mounts still need real fencing (SL M9), so record that as a residual.
+
+1.6  CRL F5 (+ F19, Rebuild N2): no checksums on CRL entries                                                [M]
+     Bit rot, torn or reordered sectors become Paxos state or object data. Fix: a CRC32C over each entry's header
+     and body, checked in readEntry and readStreamLocation. Reject all-zero headers (F19). A mismatch should end
+     the chain loudly and be classified separately from "CRL lost" (feeds 3.1). The format may change freely.
+
+1.7  Systemic quick wins (SL S10, S5/S6/SC1/SC2, S3)                                                        [S-M]
+     a. failStorageDevice (BaseAspenClient ~720) has no pool-health guard; shutdownStorageDevice has one. Refuse
+        a fail that drops any pool below tolerance (SL Q2).
+     b. SizingMismatch is treated as "CRL lost", so a default change in an upgrade flags every CRL on every host.
+        Refuse to open the device and raise an alarm instead (SL M6). Persist the CRL sizing in the CRL itself,
+        and remove the code defaults from the "keys optional" path.
+     c. Rebuild pacing limits rebuilds, not discards (discardLostStore runs before the rebuildingStores check).
+        Count a store against the cap when it is flipped, before its state is discarded.
+
+1.8  CRL writer death: F9 (+ F7, F8, 11.1 table)                                                            [M]
+     F9: the CRL thread's death only logs (cmdline/Main.scala:1704). readStoreState, dropStore,
+     deleteTransactions and storesWithEntries then hang, and zombie stores keep serving reads but cannot vote.
+     Fix: fail pending futures, mark the device failed (unload its stores), and alarm.
+     Remove the realistic killers too:
+       F8: admission starts at zero, and recovered records of non-loading stores (Offline, rebuild-required,
+           awaiting-drop, transferring-out) are never charged, so `require(canWriteEntry)` can throw on the CRL
+           thread. Charge every recovered record at open, and release it on drop or transfer.
+       F7: stream files are sparse (a one-byte write at the end), so ENOSPC on a hole kills the writer.
+           Preallocate real blocks.
+     Correct server/crl/CLAUDE.md: "reads keep working" holds only for object reads.
+
+
+PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
+---------------------------------------------------------------------------
+
+2.1  Delete the opportunistic rebuild paths: Repair F1, F2, N1, N2, Req F3                                  [S]
+     Frontend.opportunisticRebuild and the pre-transaction rebuild (Tx.completeLoad) replace KV content without
+     refreshing kvState and move timestamps backwards. The pre-tx path also skips the commitInFlight guard, the
+     refcount max and ordered commit. Repair's own reads (StoreRepairer ~355) do not disable it (N2). Both paths
+     are nearly dead and duplicate what the ErrorTree/UnackedCommits scan and Reconcile already do. Delete them,
+     with their message and tests, rather than harden them (see the "simplicity over corner-case optimization"
+     memory). This also removes the healing that 2.10 currently leans on.
+
+2.2  Monotone applies for blind writes: Req F1, F2, F4, CRL F13, R-F4, Rebuild N1 (helps Repair F3, X7)     [M]
+     Blind KV puts and deletes, raw revision-less updates and refcount updates assign the value or timestamp
+     unconditionally (RequirementsApplyer ~110-145). A lagging store applies two blind writes of a key in
+     opposite order, a crash re-apply of a recovered vote with dropped data regresses a newer blind write
+     (dropTransactionObjectData is memory-only), and object timestamps go backwards. The divergence is permanent
+     and no entry is written.
+     Fix: apply blind KV writes last-writer-wins on (ValueState.timestamp, revision), with delete tombstones kept
+     until repair can no longer need them, and take max() for object timestamps. Also decide whether
+     DoesNotExist-only inserts after a later delete (ABA) need a per-key generation. Alternatively forbid blind
+     writes of unrevisioned keys outright, and enumerate which callers would break.
+
+2.3  Allocating writes must not overwrite an existing object: Req F11, X11 (narrows R-N1, P-N3, X12, X13)   [S-M]
+     An Allocating ObjectState is built without consulting the backend, so a replayed allocation delivered by a
+     late or non-late commit at a stubless store overwrites a live or deleted object with its initial content.
+     Fix: the store (or backend) fails the allocating write when the object or its tombstone exists, and marks
+     the store.
+
+2.4  Monotone missed-update marker: Repair F10, Q-N5 (marker), R-N6 (marker part)                           [S]
+     MissedUpdateMarker's blind, replaySafe upsert can lower a newer missedTimestamp (weakening the completion
+     gate) and re-create deleted UnackedCommits entries. Fix: upsert with max(missedTimestamp), and do not
+     re-create an UnackedCommits entry that a scan already deleted (or shadow it with the stub check). Re-check
+     whether the replaySafe justification in TransactionBuilder still holds afterwards.
+
+2.5  Repair scan correctness: Repair F13, F4, F11, F6                                                       [S each]
+     F13: Reconcile treats `read.timestamp < current.timestamp` as caught up. A store that missed data write D
+          but applied a later refcount update R2, which the read quorum has not applied yet, drops its entry
+          while still stale. Return stale, not complete, when revisions differ.
+     F4:  a blind key delete applied as a no-op between snapshot and install is invisible, because the snapshot
+          compares key revisions only. Add the store's timestamp or a change counter to RepairSnapshot.
+     F11: the object-level proof compares the revision only, and blind SetMin/Max/Left/Right do not move it.
+          Include the change counter there too.
+     F6:  deleteObjectForRepair has no pendingReads/commitInFlight guard, so a read can re-insert a stale cache
+          entry. Refuse and retry next pass.
+
+2.6  Absence from the AllocationTree treated as deletion: Repair F5, X6 residual, Rebuild F18               [M]
+     An allocation-tree record more than 60 s late makes repair delete a live slice and its entry, which only a
+     full rebuild restores. FSIF updateExt returns ObjectMismatch forever over a foreign occupant, so a missed
+     delete blocks repair of a reused slot. Fix: confirm the deletion authoritatively (a pool read showing
+     refcount 0 or absence at a read threshold) before repairDelete, and keep the entry on doubt. When a repair
+     of N meets a foreign occupant that the tree no longer lists, drop the occupant.
+
+2.7  Rebuild completion identity: Rebuild F3, F4                                                            [S]
+     start() treats any directory at the final path as a finished rebuild (F3). A crash between the staging move
+     and the flip leaves a loadable store that serves as a blank acceptor (F4). Fix: write a rebuild-complete
+     marker in staging before the move, and require it. Load a store whose tree entry is still Rebuilding as
+     offline until the flip commits.
+
+2.8  Recovered Tx resolution and entry coverage: R-F6, R-F13, R-F15, C5, C7 (decide with R-N4 in 4.7)       [S + M]
+     R-F6: oresolution is not restored from the persisted status, so a recovered Committed Tx skips locking and
+           the traceless check. Restore it (S).
+     R-F13/F15: late-uncounted voters and non-voters get no UnackedCommits entry, only an ErrorTree mark, yet
+           several documents assume an entry always exists (C5). Decide which stores get entries, together
+           with R-N4's growth (4.7), then make the documents agree (C5, C7).
+
+2.9  Replays through entries with no stub (accepted residuals; re-assess after 2.2-2.4)                     [L]
+     R-N1, R-N6, R-N7 (X13, G13), R-N9, RP-N4, P-N3 (X12). A store holding an UnackedCommits entry and no applied
+     stub re-applies T on a replay's commit. That covers blind writes, ABA DoesNotExist inserts and allocations,
+     and for R-N7 possibly a whole pool. R-N7 and R-N9 were accepted by ruling. Once 2.2-2.4 land, most write
+     classes become harmless: re-derive what remains and either close it or re-confirm the acceptance in writing.
+     Candidate fixes: treat an adopted accepted commit from a quorum that contains memoryless acceptors as late
+     when a proof exists (P-N3); D1 writes no entries for stores that D0 listed or that acknowledged (R-N7). Add
+     the missing test that kills D1's host between hand-off and TxFinalized (G13).
+
+2.10 Bootstrap-pool tracking hole: Rebuild F8, X9 (+ Repair F7)                                             [M-L]
+     Bootstrap-pool stores rebuild with stale, untracked ErrorTree/UnackedCommits nodes, because marker writes
+     use limitTracking and repair entry deletions disable tracking. Each bootstrap rebuild silently removes one
+     replica of redundancy, and today only the unsafe opportunistic rebuild (removed in 2.1) heals it. Fix: a
+     second walk over bootstrap metadata-tree nodes after the first, or periodic anti-entropy on node revisions
+     for the bootstrap pool. Re-examine whether repair deletions can use limitTracking (F7).
+
+2.11 Allocation-tree coverage for rebuilds: Rebuild F10, F17, G6                                            [M]
+     Audit every allocation path (FSIF index bitmap, pool creation, tasks) for an allocation-tree entry, and add a
+     test asserting that every allocated object is present. An allocation whose tree entry lands after the walk
+     passed its key is never restored: add a second walk pass over entries newer than the walk start.
+
+2.12 Store incarnation for repair entries and stubs: X10, Rebuild N3, G5                                    [M]
+     ErrorTree/UnackedCommits keys carry no store incarnation, and a rebuilt store has no stubs. Add an
+     incarnation epoch to entries (ignore mismatches) or carry inherited stubs into the rebuilt store. Write the
+     entry timeline for a T12 move (G5).
+
+2.13 Paxos hardening cluster: P-F4, F5, F6, F7, F11 (and R-F11)                                             [S-M]
+     None of these produces a split alone, but each removes a leg that other faults combine with.
+       F4/R-F11: secondary-pool stores can drive and share proposer ids. Drive only from primary-pool stores,
+                 or derive the proposer id from (pool, index).
+       F5: a restarted leader reuses (1,L). Start a restarted driver at round 2 or higher, or persist the
+           highest round used.
+       F6: aborts drop acceptor state at resolution. Keep the Paxos record until TxFinalized, as commits do.
+       F7: count Undetermined as no reply, not as an abort vote.
+       F11: log an error and count every conflicting resolution, as split-decision detection.
+
+2.14 Server-side validation of the description: Req F7, Q-N4, Req open question 1                           [M-L]
+     The pin rule, thresholds, primary object and one-update-per-object are enforced by the client only. Validate
+     at the store: thresholds against the pool IDA (and audit `2T > width` outside IDA construction), at most one
+     update per object, and a pin marker the store can check. Decide how much of the trust model to change.
+
+2.15 P-N4 (accepted corner case): a forgotten abort re-decided commit by a delayed duplicate client prepare  [-]
+     Documented in the Transaction.commit scaladoc. Revisit only if 2.13 F6 (keeping abort state until
+     TxFinalized) is done, since that narrows it further at no extra cost.
+
+
+PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
+-------------------------------------------------------------------------------
+
+3.1  Design protections S11-S15 (SL M1-M5, M11; scenarios SC3-SC7)                                          [L]
+     S11: prove that the rest of the pool can reconstruct a store before discarding it. S12: bound concurrent
+     discarded or rebuilding stores per pool, across hosts. S13: transient, configuration and version conditions
+     are never treated as corruption. S14: discarded state stays recoverable for a retention period. S15: detect
+     a burst of declarations and halt automatic destruction. The SL doc's suggested first step is a test that
+     forces openCRL to throw fleet-wide during a simulated rolling restart. Build that test first.
+     Include: S7/Q1 (crl.lost-<uuid> is kept but never used: define retention and salvage, or delete it), S8
+     (record each declaration durably with its cause, visible in show-* commands), SL Q3-Q6, and the destructive
+     4.2 rows X2/X3/X5/X6/X7 as false-positive amplifiers (X5 removes crl_save.log after a fail-stop).
+
+
+PRIORITY 4: liveness (hangs, stalls, livelocks)
+-----------------------------------------------
+
+4.1  Tally stalls on a silent store: P-F8, Rebuild F6                                                       [S-M]
+     cantAttempt breaks on the first pool short of answers. With one commit voter, one abort voter and a silent
+     store (any offline or Rebuilding store), locks are held for the whole outage. Fix: evaluate every object and
+     decide abort as soon as any object cannot reach its write threshold. The P2/P6 safety argument needs review.
+
+4.2  Hung backend commit: Req F12                                                                           [S-M]
+     awaitingCommits has no timer, so an FSIF ENOSPC freeze stalls the object forever. Add a long watchdog that
+     votes BackendCommitFailed or fail-stops the store.
+
+4.3  Admission vs finalization: X5, CRL F15, R-F14 (+ G10)                                                  [M]
+     No admission lane is exempt, so data-pool CRL pressure on a device shared with metadata stores blocks the
+     marker writes that would free it. Reserve admission for metadata-pool, marker-batch and TxFinalized
+     traffic, and write down the capacity argument (G10).
+
+4.4  Waits on the metadata group: R-N3, R-N10                                                               [M]
+     Recovered commit votes hold their locks with no driver until their first UnackedCommits lookup answers.
+     Case-3 holds applied Txs in memory. After a bound, start the driver while forbidding it to propose abort
+     until the lookup answers. Bound R-N10 the same way.
+
+4.5  Repair livelock: Repair F3, F8, F9, X7                                                                 [S-M]
+     F3/X7: the completion gate assumes monotone timestamps. 2.2 fixes the source; also consider gating on
+            post-install equality.
+     F8: stale outcomes never escalate. Count them, and escalate to a proof after N.
+     F9: a timed-out scan discards deferral state and doubles the interval. Keep the state, and treat the
+         timeout as "found entries".
+
+4.6  Stub accumulation: CRL F22, RP-N6                                                                      [S-M]
+     A stalled scan lets stubs grow against device admission (~4.5 M per device). Cap stubs per store and fall
+     back to the case-3 lookup.
+
+4.7  UnackedCommits growth: R-N4, RP-N3 (decide with 2.8)                                                   [M]
+     There is one entry per (store, transaction) for every silent voter, never merged, and each is reconciled in
+     addition to the ErrorTree entry. Write entries only where they are needed (traceless), or merge per store.
+     Skip in phase B objects already repaired in phase A.
+
+4.8  Rebuild liveness: Rebuild F5 residual, F11, F12, F15                                                   [S-M]
+     F5: pass failures other than join races wait the hourly device check. Add a backoff self-recheck.
+     F11: a flip failure re-enters start() through recheckAll. Exclude the device.
+     F12: placement can co-locate a pool's stores, and an ENOSPC destination is final. Alarm, and allow
+          re-placement.
+     F15: a permanently unreadable object blocks completion. Add an operator command that records the objects
+          as lost and lets the rebuild finish.
+
+4.9  Finalization stalls by design: R-N2, R-F14, 13.0b residual (NodeSizeExceeded on a tiny node)          [decide]
+     Failing actions keep marks unwritten, with logged backoff. Ruling 8 forbids the marker running alone. Either
+     accept and document it, or revisit Ruling 8. Add a metric or alarm for long-unfinalized transactions either
+     way.
+
+4.10 Prefer-abort costs and lock windows: P-N7, P-N8, Req F13, Q-N3, Q-N6                                   [S]
+     P-N7: let a recovered Undetermined Tx answer promptly (abort vote or its accepted value).
+     P-N8: restart the wait on each client retransmit, or document it.
+     F13: set exclusiveWaitUntil only when the colliding exclusive Tx survives.
+     Q-N6: use a shared lock in AllocationFinalizationAction, and back off SimpleTaskExecutor.allocateTask.
+     Q-N3 is by design: tune retries only.
+
+
+PRIORITY 5: performance and hygiene
+-----------------------------------
+
+5.1  RP-N7: batch the orphan-stub point lookups.                                                            [S]
+5.2  R-F16: start a leader driver only when the status cache has no outcome (not merely notFinalized).      [S]
+5.3  Rebuild F7: router.markOffline for a T12 rebuild on a new device, clearOffline on promotion.           [S]
+5.4  P-F12: send Accepts as soon as the new round's quorum is reached. P-F14: save the Tx when late object
+     data is adopted. P-F15: delete or wire up receiveTxPrepare and receiveStatusRequest.                   [S]
+5.5  Q-N5 split action: re-read before declaring a split node gone. Allocation action: make a re-run after a
+     deletion idempotent (no orphan entry).                                                                 [S-M]
+5.6  CRL F16: avoid rewriting the full live set on every open, or do it off the control thread. CRL F12: replace
+     dropStore's read-then-delete with a single CRL-thread DropStore request. CRL F11: syncDirectory after
+     creating the stream files.                                                                             [S-M]
+5.7  Repair F15: stop logging an error on every pass for deleted objects that still have an allocation entry. [S]
+5.8  Req F10: log an invariant violation when an apply overrides a commit voter's lock.                     [S]
+5.9  Repair F12 residual: reader ranking can prefer a stale store with a higher timestamp (exact ties are
+     already handled).                                                                                      [M]
+
+
+PRIORITY 6: coverage gaps (analysis and tests still to be written)
+------------------------------------------------------------------
+
+6.1  G11: replay where a driver's data-less prepare precedes the replayed client prepare. Unit-tested only; add
+     an end-to-end test.                                                                                    [S-M]
+6.2  G1: state the bound on how long a T may stay unresolved against the X2 mute, and add an end-to-end
+     blank-acceptor promotion test.                                                                         [S]
+6.3  G3: confirm that transfer-out and relinquish go through Store.close, so no driver or timer survives.   [S]
+6.4  G4: a host restart wiping the status cache (now late-commit evidence) combined with rolling restarts.  [M]
+6.5  G8: combined HLC-skew analysis (acceptorSince, repair age gates, rebuild timestamps) plus a
+     skewed-clock test. Do it together with 1.2.                                                            [M]
+6.6  G7: client caches and pointers against zombie slices and deleted objects.                             [M]
+6.7  G2/X8 residual: mixed-version rolling upgrades (message, CRL and txd formats, finalizer types). Carry a
+     feature version in the txd so old hosts cannot drive.                                                  [M-L]
+6.8  R-F17 (a recovered Tx whose objects fail to load) and R-F18 (driver traffic during recovery): add tests. [S]
+6.9  Repair 13.3 open questions 1-6 (4: a proof on a refcount-0 object is untested).                       [S each]
+
+
+PRIORITY 7: documentation corrections
+-------------------------------------
+
+7.1  P-F1: Architecture.md (~line 153) describes a 1-RTT round-1 commit that the code does not implement. Decide
+     whether to implement it or correct the description; until then, correct the text.
+7.2  README.md lists X8 as FIXED, but cross-document-review narrows it (finalizer types during version skew).
+7.3  SL 4.2 X14 (blank FSIF without its marker) appears fixed by Ruling 23 (revised). Verify and mark it.
+7.4  C1: SL doc cites a stale DeviceDiscovery line, and the Failed marker is now durable. C3: reword Rebuild F14
+     and CRL F18 to state the X2 mute plus its fast-clock residual. C4: state once that the status cache is
+     late-commit and finalization evidence. C6: narrow Rebuild 8.2's "repair closes the gap" until 2.5/4.5 land.
+7.5  P-F13 body: rewrite it as intended (Ruling 10). CRL F14: pick one status for readStoreState vs disk
+     recovery. CRL F17: document that MapBackend gives no durability. Req F9 remainder: LocalTimeRequirement
+     is per-store clock (test-only).

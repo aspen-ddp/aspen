@@ -891,6 +891,20 @@ clean shutdown.
 
 ### F4. A save after a delete in the same unwritten entry is acknowledged but never written, and leaves a phantom live transaction (reproduced, high confidence for the phantom; medium for real-world reachability)
 
+> **FIXED (2026-11-13) for the phantom; the unwritten acknowledgement is an accepted residual.**
+> `SimpleCRL.onSaveTransaction` now asks `LogEntry.deletesFinally` first: when the unwritten entry already deletes the
+> id (a deletion a stub's save made is excluded, since a later save cancels it), the save queues only its completion
+> handler. No `Tx` is created, queued or registered, so nothing pins `oldestEntryNeeded`, `readStoreState` and
+> `getFullRecoveryState` report nothing for the id, and the ring wraps cleanly. Covered by the SimpleCRLSuite tests
+> "Save after a delete in the same unwritten entry is skipped but reports success" (now also asserts the live state
+> and that `oldestEntryNeeded` advances) and "A save skipped after a delete in the same entry does not pin the log
+> across a full wrap" (14 saves over three streams, then reopen; it threw the `BrokenEntryChain` above before the
+> fix). Residual (consequence 1): the skipped save still reports success once the deletion is durable. That is
+> harmless on the abort/finalization path, where the deletion is the intended end state. For `loadStore` it would lose
+> the loaded state only if a deletion of the same (store, txid) landed in the same unwritten entry just before the
+> load. No path issues that sequence: `dropStore` deletes the entries of a store already made unservable, and a
+> transfer back in loads into a fresh store whose entries the drop does not cover (its scaladoc). Accepted.
+
 **Verification: mechanism CONFIRMED (E3, E4 re-run), real-world trigger PLAUSIBLE-low, severity liveness/data-loss when it fires.** In the host's normal flow the phantom is healed: an aborted transaction deletes its CRL record on resolution (`Tx.scala:627`), a late accept/prepare can re-save it (`Tx.scala:751-762`), but `TxFinalized` deletes again (`Tx.scala:790-799` comment: "a prepare after an abort ... may have saved this Tx again"; `Frontend.transactionFinalized` `:537-540`), and `SimpleCRL.onDeleteTransaction` (`:291-296`) removes whatever is in `transactions`, phantom included. After the final delete the Tx is removed from the Frontend (`Frontend.scala:619-623`) and prepares for it are ignored via the status cache (`:639`), so no permanent phantom path was found in the Frontend. What remains: the phantom lives until the finalization delete (briefly holds `oldestEntryNeeded`, shows up in `readStoreState`), and the load/transfer paths (`loadStore`, `crl_save.log` re-save) where no later delete is guaranteed. The "ack without durability" aspect is harmless on the abort path. Fix sketch: in `onSaveTransaction`, if `currentLogEntry` already deletes the id, do not create or queue a `Tx` (just add the completion handler).
 
 `LogEntry.addTx` skips a transaction whose id is in `txDelSet` but still records its handler (`LogEntry.scala:40-53`).

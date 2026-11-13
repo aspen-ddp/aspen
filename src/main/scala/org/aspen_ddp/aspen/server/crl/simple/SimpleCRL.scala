@@ -345,6 +345,14 @@ class SimpleCRL private (val maxSizeInBytes: Long,
                       state: TransactionRecoveryState,
                       completionHandler: () => Unit): Unit =
     val txid = TxId(state.storeId, transactionId)
+    // Deleted earlier in this unwritten entry: the save is skipped but still reports success once the deletion is
+    // durable (LogEntry.addTx). No record is created for it: one that is never written would pin oldestEntryNeeded
+    // until the ring wraps over it, and be reported live by readStoreState (crash-recovery-log F4). Every deletion
+    // removes the id from `transactions` too, so no record exists here
+    if currentLogEntry.deletesFinally(txid) then
+      currentLogEntry.addCompletionHandler(completionHandler)
+      startWrite()
+      return
     val tx = transactions.get(txid) match
       case Some(tx) => tx
       case None =>

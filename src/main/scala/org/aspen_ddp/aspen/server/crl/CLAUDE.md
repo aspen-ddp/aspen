@@ -20,6 +20,10 @@
 - `admissionLimitBytes` (SimpleCRL: half a stream, so a recycled stream's live copy-forward always fits) sizes the
   device's `CrlAdmission`, which drops prepares for unseen transactions past it. `Stream.writeEntry`'s `require` stays
   the fail-stop backstop
+- Deletions are final within an entry: a save of an id the unwritten entry already deletes is skipped, and its
+  handler runs once the deletion is durable. It creates no live record (`LogEntry.deletesFinally`): an unwritten one
+  would pin `oldestEntryNeeded` until recovery broke on the wrap. The exception is a deletion a stub's save made,
+  which a later save cancels
 - Applied stubs (`StoreRecoveryState`, `saveAppliedStub`/`deleteAppliedStub`): a (store, txid) entry meaning the store
   holds that transaction's update. A namespace apart from transaction state (own header counts and deletion list in
   each `LogEntry`), copied forward like a transaction (`Stub.anchor`); a stub's save replaces the transaction's state

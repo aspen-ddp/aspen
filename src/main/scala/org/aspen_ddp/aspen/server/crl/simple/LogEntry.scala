@@ -49,9 +49,10 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     // Do not check if txs already contains the transaction. Allow the duplicate insert so we queue
     // the completion handler for the subsequent insert attempts.
     //
-    // Deletions are final. A save of a transaction deleted earlier in this same entry is a timing
-    // artifact and is skipped, but it still reports success once the entry (and thus the delete)
-    // is durable.
+    // Deletions are final (deletesFinally). A save of a transaction deleted earlier in this same entry is a timing
+    // artifact and is skipped, but it still reports success once the entry (and thus the delete) is durable.
+    // SimpleCRL never creates a record for such a save: it queues only the handler (addCompletionHandler), since a
+    // record that is never written would pin oldestEntryNeeded and be reported as live (crash-recovery-log F4).
     //
     // A deletion made by a stub's save (deleteTxForStub) is not final: the stub replaced the state, and a save after
     // it is a new state of the transaction, live beside the stub. The save cancels that deletion, so it is written;
@@ -60,9 +61,13 @@ class LogEntry(val previousEntryLocation: StreamLocation,
       stubReplaced -= tx.id
       txDelSet -= tx.id
       txDeletions = txDeletions.filterNot(_ == tx.id)
-    if !txDelSet.contains(tx.id) then
+    if !deletesFinally(tx.id) then
       txs += (tx.id -> tx)
     completionHandlers = completionHandler :: completionHandlers
+
+  /** True when this entry deletes `txid` and a save of it would not cancel the deletion: the save is skipped (addTx) */
+  def deletesFinally(txid: TxId): Boolean =
+    txDelSet.contains(txid) && !stubReplaced.contains(txid)
 
   /** Runs `completionHandler` once this entry is durable */
   def addCompletionHandler(completionHandler: () => Unit): Unit =

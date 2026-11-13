@@ -26,14 +26,6 @@ RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-re
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.1  CRL F4: a save after a delete in the same unwritten entry leaves a phantom live Tx                     [S]
-     SimpleCRL.onSaveTransaction creates the Tx, puts it at the queue head and registers it before
-     LogEntry.addTx skips the deleted id. The phantom pins oldestEntryNeeded. After the ring wraps, recovery
-     throws BrokenEntryChain, the CRL is declared lost, and every store on the device is rebuilt. It can also
-     resurrect a finalized Tx through readStoreState. The trigger is low today; the transfer-load path is the gap.
-     Fix: in onSaveTransaction, when currentLogEntry already deletes the id (and stubReplaced does not apply),
-     queue only the completion handler.
-
 1.2  P-N2 (+ X2 residual, Rebuild N3, G8): the acceptorSince mute trusts the client clock                    [M]
      `muted = acceptorSince.exists(txd.startTimestamp < _)` (Frontend). A client clock running fast by more than
      the rebuild duration plus 10 s leaves a rebuilt, memoryless acceptor unmuted. A live T can then resolve

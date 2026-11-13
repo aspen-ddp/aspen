@@ -1053,13 +1053,49 @@ class SimpleCRLSuite extends FileBasedTests {
     val completed = Set(queue.poll(5, TimeUnit.SECONDS), queue.poll(5, TimeUnit.SECONDS))
     assert(completed == Set("save", "late save"))
 
+    // The skipped save leaves no live record behind (F4): nothing is reported for the store, and once the only other
+    // transaction is deleted no entry is needed any more
+    assert(i.crl.getFullRecoveryState(storeId).isEmpty)
+    i.crl.deleteTransaction(storeId2, transactionId2)
+    saveAndWait(i.crl, transactionId3, trsValidTxd4)
+    assert(i.crl.oldestEntryNeeded == i.crl.currentEntrySerialNumber - 1)
+
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i2.trsList.map(_.storeId) == List(storeId3))
 
-    assert(i2.trsList.length == 1)
-    assert(i2.trsList.head.storeId == storeId2)
+    i2.crl.shutdown()
+  }
 
+  test("A save skipped after a delete in the same entry does not pin the log across a full wrap") {
+    val queue = new LinkedBlockingQueue[String]()
+    val gate = new CountDownLatch(1)
+
+    // Three entries per stream
+    val i = SimpleCRL(tdir, 3, 4096 * 3)
+
+    // Hold the writer so that the save, delete and late save are batched into a single log entry
+    i.crl.save(transactionId2, trsValidTxd2, () => { queue.put("first"); gate.await() })
+    queue.take()
+    i.crl.save(transactionId, trsValidTxd, () => queue.put("save"))
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.save(transactionId, trsValidTxd, () => queue.put("late save"))
+    gate.countDown()
+    queue.take()
+    queue.take()
+
+    i.crl.deleteTransaction(storeId2, transactionId2)
+
+    // Wrap the ring several times with another transaction's saves
+    for _ <- 0 until 14 do
+      saveAndWait(i.crl, transactionId3, trsValidTxd4)
+
+    assert(i.crl.getFullRecoveryState(storeId).isEmpty)
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 4096 * 3)
+    assert(i2.trsList.map(_.storeId) == List(storeId3))
     i2.crl.shutdown()
   }
 

@@ -188,7 +188,11 @@ class Store(val storageDeviceId: StorageDeviceId,
             true
         }
 
-        if (notFinalized && m.txd.primaryObject.poolId == storeId.poolId && m.txd.designatedLeaderUID == storeId.poolIndex) {
+        // A transaction started too far ahead of this host's clock is muted here and likely at the other stores too
+        // (Frontend.MaxStartLead): a driver would only run data-less rounds, and could abort it for want of the
+        // client's prepare once the clocks catch up. The client's retransmission starts the driver then
+        if (notFinalized && m.txd.primaryObject.poolId == storeId.poolId && m.txd.designatedLeaderUID == storeId.poolIndex
+            && !frontend.startsTooFarAhead(m.txd)) {
           driveTransaction(m.txd)
         }
 

@@ -21,6 +21,11 @@
   prepare for an unknown transaction started earlier (`Tx.muted`): proven committed if an object shows its update,
   otherwise forgotten with no promise, vote, accept or CRL save, as if the store were offline. Its old incarnation
   may have accepted in such a transaction, and a fresh promise could let a quorum choose against the chosen value
+- Start-time lead (`Frontend.MaxStartLead`, 2 s): every store mutes, the same way, a prepare for an unknown transaction
+  whose client-chosen start timestamp leads the host's wall clock (`wallClockMillis`, not the JVM-wide HLC, which the
+  host's own client ratchets) by more; the designated leader does not drive it (`Store`). The client's retransmission
+  is answered once the clock catches up. This is what makes the `acceptorSince` mute independent of client clocks
+  (paxos P-N2), and it caps how far stored timestamps, and so client HLCs, run ahead of the hosts
 
 #### Commits
 - A store keeps a committed transaction's CRL state until its backend commits succeed; a failed commit keeps it (and

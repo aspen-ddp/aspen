@@ -40,11 +40,15 @@ object RebuildingStore:
 
   /** In a rebuilt store's directory: the HLC timestamp from which its Paxos acceptor state is complete
    *  (Frontend.acceptorSince). Written by finish before the store moves into place, and kept for good (a network
-   *  transfer carries it with the directory). The old incarnation stopped before the rebuild began, so every
-   *  transaction it took part in started earlier, unless a client's clock ran more than AcceptorSinceMargin fast */
+   *  transfer carries it with the directory). The old incarnation stopped before the rebuild began, and joined only
+   *  transactions started at most Frontend.MaxStartLead ahead of its host's clock, so every transaction it took part
+   *  in started earlier, whatever the clients' clocks, unless the two hosts' clocks differ by more than
+   *  AcceptorSinceMargin less MaxStartLead */
   val AcceptorSinceFile = "acceptor-since"
 
-  /** Added to the finish time: a client stamps its transactions' start with its own clock */
+  /** Added to the finish time. A client stamps its transactions' start with its own clock, which a store accepts up to
+   *  Frontend.MaxStartLead ahead of its host's: the margin covers that lead plus clock skew between the old
+   *  incarnation's host and the rebuilding one */
   val AcceptorSinceMargin: FiniteDuration = FiniteDuration(10, SECONDS)
 
   private def acceptorSinceAfter(now: HLCTimestamp): HLCTimestamp =

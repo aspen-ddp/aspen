@@ -41,7 +41,8 @@ Designs: `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2
   (`NoClientPrepare`). This holds for data-less transactions too, so their late resolution may take 5 s longer. A vote
   given stands, but later data is still used to apply a commit. Accepted corner case: a delayed duplicate client
   prepare of an aborted transaction (see the `Transaction.commit` scaladoc)
-- Muted prepares at rebuilt stores (`acceptor-since`): `server/store/CLAUDE.md`
+- Muted prepares at rebuilt stores (`acceptor-since`) and for start timestamps ahead of the host's clock
+  (`Frontend.MaxStartLead`): `server/store/CLAUDE.md`
 
 #### UnackedCommits
 - Written by the finalizer for each commit voter that sent no TxCommitted (`client/internal/transaction/CLAUDE.md`);

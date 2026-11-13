@@ -1114,6 +1114,88 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.transactions(txid1).holdsLocks shouldBe true
   }
 
+  // ---- A start timestamp ahead of the host's clock (Frontend.MaxStartLead) ----
+  //
+  // The start timestamp is the client's. A store takes part only in a transaction started no more than MaxStartLead
+  // ahead of its host's wall clock, so a transaction an old incarnation joined started before its rebuilt store's
+  // acceptor-since time, whatever the client's clock (paxos P-N2).
+
+  private def ahead(d: FiniteDuration): HLCTimestamp = HLCTimestamp((System.currentTimeMillis() + d.toMillis) << 16)
+
+  test("a rebuilt store gives no vote to a transaction its old incarnation may have joined, though a fast client " +
+       "stamped it after the acceptor-since time") {
+    // Fresh-rebuild shape: acceptor-since is the finish time plus the margin. The client runs 11 s fast
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val crl = new TestCrl
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
+      acceptorSince = Some(ahead(FiniteDuration(10, SECONDS))))
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ahead(FiniteDuration(11, SECONDS)))
+    frontend.receiveTransactionMessage(clientPrepare(txd))
+
+    votes(net) shouldBe Nil
+    crl.txSaved shouldBe false
+    frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("a store gives no promise or vote to a transaction started too far ahead of its clock, and saves nothing") {
+    val crl = new TestCrl
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ahead(FiniteDuration(3600, SECONDS)))
+    frontend.receiveTransactionMessage(clientPrepare(txd))
+    frontend.receiveTransactionMessage(TxAccept(storeId, StoreId(poolId, txd.designatedLeaderUID), txid1,
+      ProposalId.initialProposal(txd.designatedLeaderUID), true))
+
+    votes(net) shouldBe Nil
+    acceptResponses(net) shouldBe Nil
+    crl.txSaved shouldBe false
+    frontend.transactions.contains(txid1) shouldBe false
+    lockedWriteTransactions(frontend, net, op1) shouldBe empty
+  }
+
+  test("a store votes on a transaction started ahead of its clock by less than MaxStartLead") {
+    withPlainFrontend(): (frontend, _, net) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ahead(FiniteDuration(1, SECONDS)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+  }
+
+  test("a store votes on a retransmitted prepare once its clock catches up with the transaction's start") {
+    var clock = System.currentTimeMillis()
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, new TransactionStatusCache(),
+      wallClockMillis = () => clock)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp((clock + 60000) << 16))
+    frontend.receiveTransactionMessage(clientPrepare(txd))
+    votes(net) shouldBe Nil
+    frontend.transactions.contains(txid1) shouldBe false
+
+    clock += 59000
+    frontend.receiveTransactionMessage(clientPrepare(txd))
+    votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+  }
+
+  test("a store still proves committed a transaction started too far ahead whose update it shows") {
+    withPlainFrontend(): (frontend, backend, net) =>
+      appliedKVPrepare(frontend, backend, FiniteDuration(-3600, SECONDS))
+
+      resolvedMessages(net).map(r => (r.committed, r.proof)) shouldBe List((true, true))
+      votes(net) shouldBe Nil
+  }
+
   // ---- Write locks are held until a commit is applied ----
 
   test("a commit held for missing data has no vote and so no write locks; it applies when the data arrives") {
@@ -2891,7 +2973,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   /** A read of op1 newer than anything the fixtures commit, at revision txid2 */
   def newerRepairState(): DataObjectState =
-    val ts = HLCTimestamp((System.currentTimeMillis() + 3_600_000L) << 16)
+    val ts = HLCTimestamp((System.currentTimeMillis() + 1_000L) << 16)
     new DataObjectState(op1, ObjectRevision(txid2), ObjectRefcount(1, 1), ts, ts, ida, 1, DataBuffer(Array[Byte](5)))
 
   def repairSnapshot(frontend: Frontend, ptr: ObjectPointer): RepairSnapshot =

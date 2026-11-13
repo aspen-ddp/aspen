@@ -17,6 +17,7 @@ import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFin
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import java.util.UUID
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.*
@@ -108,6 +109,22 @@ class StoreSuite extends AnyFunSuite with Matchers:
     net.sentTx.collect { case r: TxResolved => (r.committed, r.late) } shouldBe List((true, true))
     net.sentTx.collect { case f: TxFinalized => (f.committed, f.late) } shouldBe List((true, true))
     store.frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("a designated leader does not drive a transaction started too far ahead of its clock") {
+    val (store, net, _) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS))
+    val ahead = HLCTimestamp((System.currentTimeMillis() + 3600000) << 16)
+    val early = TxPrepare(leader, leader, txd.copy(startTimestamp = ahead),
+      ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient = true)
+    store.receiveTransactionMessage(early)
+
+    store.hasTransactions shouldBe false
+    store.frontend.transactions.contains(txid1) shouldBe false
+    net.sentTx shouldBe Nil
+
+    // The retransmission once the clocks agree (here: the same transaction stamped within the bound) is driven
+    store.receiveTransactionMessage(prepare(leader, leader))
+    store.hasTransactions shouldBe true
   }
 
   // Ruling 31: a closed store's drivers would otherwise keep re-preparing its transactions from their timers

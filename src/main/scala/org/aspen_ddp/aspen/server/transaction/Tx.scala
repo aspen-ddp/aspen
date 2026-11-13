@@ -41,8 +41,10 @@ class Tx( trs: TransactionRecoveryState,
           val recovered: Boolean = false,
           /** A prepare for a transaction that started before its rebuilt store's acceptor existed
             * (Frontend.acceptorSince): the store may have promised or accepted in it before its Paxos state was lost, so
-            * it takes no part. Its requirements are never checked: proven committed if an object shows its update, or
-            * forgotten with no promise, vote, accept or CRL save. Never set for a recovered transaction
+            * it takes no part. Also set for one started too far ahead of the host's clock (Frontend.MaxStartLead), which
+            * the store joins only once its clock catches up. Its requirements are never checked: proven committed if an
+            * object shows its update, or forgotten with no promise, vote, accept or CRL save. Never set for a recovered
+            * transaction
             */
           val muted: Boolean = false) extends Logging {
 

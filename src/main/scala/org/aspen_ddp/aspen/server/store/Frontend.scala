@@ -31,6 +31,17 @@ object Frontend {
     */
   val UnackedLookupTimeout: FiniteDuration = FiniteDuration(5, SECONDS)
 
+  /** How far a transaction's start timestamp, which its client chose, may lead the receiving host's wall clock for the
+    * store to take part in it. A prepare for an unknown transaction started further ahead is muted (Tx.muted), as at a
+    * rebuilt store, and the client's retransmission is answered once the host's clock catches up. A store therefore
+    * joins a transaction only if it started at most this long after the host's clock when the store first saw it. An
+    * old incarnation stopped before its rebuild began, so every transaction it joined started before its rebuilt
+    * store's acceptor-since time, whatever the client's clock, provided this bound plus the skew between the hosts'
+    * clocks stays under RebuildingStore.AcceptorSinceMargin (paxos P-N2). It also bounds how far timestamps that
+    * clients ratchet their HLCs from can run ahead of the hosts' clocks
+    */
+  val MaxStartLead: FiniteDuration = FiniteDuration(2, SECONDS)
+
   sealed abstract class ReadKind
 
   case class NetworkRead(clientId: ClientId, requestUUID: UUID, readType: ReadType) extends ReadKind
@@ -69,14 +80,20 @@ class Frontend(val storeId: StoreId,
                  * transactions started at or after it. Its old incarnation may have promised or accepted in an older
                  * one before that state was lost, and a fresh promise or vote could then let a quorum choose against
                  * the value already chosen. A prepare for an older transaction it does not know is muted (Tx.muted):
-                 * proven committed, or forgotten unanswered, as if the store were offline. None: an ordinary store
+                 * proven committed, or forgotten unanswered, as if the store were offline. The prepare's start timestamp
+                 * is the client's, so this holds only because no store joins a transaction started ahead of its host's
+                 * clock by more than MaxStartLead (startsTooFarAhead). None: an ordinary store
                  */
                val acceptorSince: Option[HLCTimestamp] = None,
                /** Recovers nothing at construction: transaction messages are held until recover is called. For
                  * stores whose backend's completion handler is set after they are built (StoreLoader), where a read
                  * a recovered transaction issued in the constructor would never complete
                  */
-               deferRecovery: Boolean = false) extends Logging {
+               deferRecovery: Boolean = false,
+               /** The host's wall clock in milliseconds (startsTooFarAhead). Not HLCTimestamp.now: the host's own client
+                 * ratchets the JVM-wide HLC forward from the timestamps it reads. Injected by tests
+                 */
+               val wallClockMillis: () => Long = () => System.currentTimeMillis()) extends Logging {
 
   import Frontend._
 
@@ -87,6 +104,11 @@ class Frontend(val storeId: StoreId,
 
   /** Transactions waiting for a lock holder, by holder. See Tx.awaitableHolders */
   private val collisionWaiters = scala.collection.mutable.HashMap[TransactionId, List[Tx]]()
+
+  /** The transaction started more than MaxStartLead ahead of this host's wall clock: a prepare for it, if unknown, is
+    * muted (see MaxStartLead), and its designated leader does not drive it (Store) */
+  def startsTooFarAhead(txd: TransactionDescription): Boolean =
+    txd.startTimestamp.wallTime > wallClockMillis() + MaxStartLead.toMillis
 
   def holdsLocks(txid: TransactionId): Boolean = transactions.get(txid).exists(_.holdsLocks)
 
@@ -576,11 +598,13 @@ class Frontend(val storeId: StoreId,
       transactions -= tx.transactionId
       tx.releaseObjects() // Already done unless some of its objects had not loaded
 
-  /** Drops a muted Tx that was not proven committed (Tx.muted): it holds no locks and saved nothing */
+  /** Drops a muted Tx that was not proven committed (Tx.muted): it holds no locks and saved nothing. One muted for
+    * starting too far ahead was logged when it was created */
   def forgetMuted(tx: Tx): Unit =
     if transactions.get(tx.transactionId).exists(_ eq tx) then
-      logger.info(s"Store $storeId takes no part in transaction ${tx.transactionId}: it started before this rebuilt " +
-                  s"store's acceptor existed")
+      if acceptorSince.exists(tx.txd.startTimestamp < _) then
+        logger.info(s"Store $storeId takes no part in transaction ${tx.transactionId}: it started before this " +
+                    s"rebuilt store's acceptor existed")
       transactions -= tx.transactionId
       tx.releaseObjects()
       releaseAdmission(tx.transactionId)
@@ -814,7 +838,14 @@ class Frontend(val storeId: StoreId,
       val cached = statusCache.getStatus(m.txd.transactionId)
       val known = cached.filter(_.status != TransactionStatus.Unresolved)
       // An Unresolved entry counts as none: another store's Tx on this host wrote it, which says nothing of the outcome
-      val muted = acceptorSince.exists(m.txd.startTimestamp < _)
+      val beforeAcceptor = acceptorSince.exists(m.txd.startTimestamp < _)
+      val tooFarAhead = !beforeAcceptor && startsTooFarAhead(m.txd)
+      val muted = beforeAcceptor || tooFarAhead
+      if tooFarAhead then
+        val lead = m.txd.startTimestamp.wallTime - wallClockMillis()
+        logger.warn(s"Store $storeId takes no part in transaction ${m.txd.transactionId} yet: it started ${lead}ms " +
+                    s"ahead of this host's clock (limit ${MaxStartLead.toMillis}ms). The client's clock runs fast, " +
+                    s"or this host's runs slow")
       val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates, takeSerializedTxd(m.txd.transactionId))
       val pointers = m.txd.allHostedObjects(m.to)
       val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers,

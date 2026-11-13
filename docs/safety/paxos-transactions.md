@@ -804,6 +804,9 @@ transaction at all, rather than merely vote? An alternative is that a driver tha
 > test; grep finds no `txHorizon`/`tooOld`). A replayed blind write cannot re-commit through fresh votes, because its
 > transaction must carry a pin (`TransactionBuilder.scala:140-141`) that fails at more than `w - t` stores of the pinned
 > object. Residual clock dependence moved to the rebuilt store's mute (`acceptorSince`, `Frontend.scala:817`; P-N2).
+> *2026-11-13:* the verification's fix sketch is now implemented for P-N2. A store mutes an unknown transaction whose
+> start leads its host's wall clock by more than `Frontend.MaxStartLead` (2 s), which caps client-ahead skew D at 2 s
+> plus host skew.
 
 > **Verification 2026-11-09: CONFIRMED (mechanism). Severity: resurrection (replay of blind writes).** tooOld = known.isEmpty && HLCTimestamp.now - txd.startTimestamp > horizon (Frontend.scala:655 at c3ad5493); startTimestamp is client-assigned and nothing on the server calls HLCTimestamp.update from received prepares (grep in server/ finds no such call), so a host's HLC only follows its own wall clock. A client whose clock/HLC is ahead by D makes a replay of age a look like a-D; ages in (7 s, 6 s + D) are treated as young. A replayed prepare then creates a fresh Tx that rechecks requirements; blind KV Insert/Delete have no state-dependent requirement (RequirementsChecker.scala:127-162), so t stores vote commit and the old write is re-applied. Client HLC ratchets forward from every object timestamp it reads (BaseReadDriver.scala:193-194), so ahead-skew needs no misconfigured NTP, only a faster clock elsewhere in the cluster.
 > *Fix sketch:* Bound client timestamps at the receiving host (reject/clamp startTimestamp > hostNow + small epsilon), and also record the host-local receipt time of the first prepare it ever saw for a txid.
@@ -1033,6 +1036,28 @@ Nacks (extra rounds under contention).
 > already replays the cache into a new driver.
 
 #### P-N2. Late condition 1 relies on rebuilt acceptors being muted, and the mute relies on clocks. Confidence: low-medium
+
+> **FIXED (2026-11-13); residual: host clock skew beyond 8 s, and zombie old copies (X1, SL M9).** The receipt time of
+> the first prepare cannot help: a rebuilt store never received the first prepare of a transaction its old incarnation
+> joined. Instead every store now enforces the invariant *a store joins T only if `T.startTimestamp <= hostWall +
+> Frontend.MaxStartLead` (2 s) when it creates T's Tx*. `Frontend.receivePrepare` mutes (`Tx.muted`, the existing
+> mechanism: no promise, vote, accept or CRL save, still a prover) an unknown transaction whose start leads the
+> host's wall clock by more (`Frontend.startsTooFarAhead`). It reads `System.currentTimeMillis` through
+> `wallClockMillis`, not `HLCTimestamp.now`: the HLC is global to the JVM and the host's own client ratchets it from
+> object timestamps, so an HLC bound would creep forward by the lead on every round trip. The old incarnation stopped
+> before the rebuild began, so any T it joined has `start <= wall_old(stop) + 2 s`. That is earlier than
+> `acceptorSince = wall_new(finish) + 10 s` unless the two hosts' clocks differ by more than 8 s less the rebuild's
+> duration. Client clocks no longer enter the argument, so late condition 1 ("a rebuilt one is muted and does not
+> answer", `TransactionDriver.resolveLate`) holds under that host-skew bound. A fast client is delayed rather than
+> refused: its retransmission is answered once the host's clock catches up, and the designated leader does not drive
+> a too-far-ahead T meanwhile (`Store`), so no prefer-abort round aborts it. Since every accepted start, and so every
+> object timestamp, is at most the fastest host's wall clock plus 2 s, client HLCs ratcheted from them are capped the
+> same way. Tests: FrontendSuite "a rebuilt store gives no vote to a transaction its old incarnation may have joined,
+> though a fast client stamped it after the acceptor-since time" (failed before the fix), "a store gives no promise or
+> vote to a transaction started too far ahead of its clock, and saves nothing", "a store votes on a transaction
+> started ahead of its clock by less than MaxStartLead", "a store votes on a retransmitted prepare once its clock
+> catches up with the transaction's start", "a store still proves committed a transaction started too far ahead whose
+> update it shows"; StoreSuite "a designated leader does not drive a transaction started too far ahead of its clock".
 
 > **Verdict: PLAUSIBLE. Severity: lost committed update (no ErrorTree marks).** The argument for `resolveLate`
 > (`TransactionDriver.scala:572-598`) needs every acceptor that accepted the chosen commit either to remember it or to

@@ -578,7 +578,10 @@ abstract class TransactionDriver(
     *    predates c and shows nothing of Q's acceptance. That quorum intersects the responding one, so some acceptor in
     *    Q forgot the transaction. An acceptor forgets a
     *    committed transaction only on TxFinalized, or on a late commit, which follows it (Tx.unackedCommitFound
-    *    applies an owed update but keeps the Tx until then); a rebuilt one is muted and does not answer. A prover
+    *    applies an owed update but keeps the Tx until then); a rebuilt one is muted and does not answer. The mute
+    *    compares the client-chosen start timestamp with the rebuilt store's acceptor-since time, and holds because no
+    *    store joins a transaction started more than Frontend.MaxStartLead ahead of its host's clock: residual, hosts'
+    *    clocks skewed by more than RebuildingStore.AcceptorSinceMargin less that lead, or a zombie old copy. A prover
     *    (Tx.proveCommitted) answers the post-proof round with a promise carrying no accepted value: it holds no state
     *    for the transaction, so if it was in Q it forgot on TxFinalized too. Promises to earlier rounds never count: they may have been given
     *    before Q accepted, at a higher proposal of another driver, and then prove nothing (the prover may be a muted

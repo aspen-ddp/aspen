@@ -825,7 +825,10 @@ the old id succeeds was not traced. See [repair-process.md](repair-process.md).
 **New N2. Crash-recovery-log F2/F4 can raise `BrokenEntryChain` at a restart, which marks every store of the device rebuild-required and so feeds this process (see crash-recovery-log.md F2, Exp3).**
 
 **New (addendum) N3 (Low) A rebuilt store loses its applied stubs; only the mute keeps a replay from applying through
-an old incarnation's entry.** Verdict: PLAUSIBLE, low (inherits paxos P-N2). A rebuild discards the store's CRL
+an old incarnation's entry.** *2026-11-13: NARROWED.* The mute no longer depends on the client's clock (paxos P-N2
+FIXED: no store joins a transaction started more than `Frontend.MaxStartLead` ahead of its host's clock). The
+residual is host clock skew beyond 8 s, and the missing store incarnation on entries (X10, Todo 2.12).
+Verdict: PLAUSIBLE, low (inherits paxos P-N2). A rebuild discards the store's CRL
 entries, stubs included (`dropStore`; with a lost CRL they go with it). The addendum design calls this harmless because
 a rebuilt store is muted for older transactions (`Frontend.scala:802`: muted iff `txd.startTimestamp <
 acceptorSince`), and a muted Tx applies nothing on a late commit (`Tx.scala:1006-1007`). The mute rests on the

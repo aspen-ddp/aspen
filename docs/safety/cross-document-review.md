@@ -42,6 +42,12 @@ when the tree is reachable.
 
 ### X2. Blank rebuilt acceptor vs a transaction that is stuck unresolved (rebuild F14 x CRL F18 x paxos P9 x transaction-recovery)
 
+> **Refresh (2026-11-13): the fast-client residual is closed.** Every store mutes an unknown transaction whose start
+> leads its host's wall clock by more than `Frontend.MaxStartLead` (2 s), so an old incarnation joined only
+> transactions started before its rebuilt store's acceptor-since time, whatever the client's clock (paxos P-N2). The
+> "not covered" clause below now reads: a zombie old copy, or host clocks skewed by more than 8 s less the rebuild's
+> duration.
+
 > **Refresh (replay pins): unchanged (still FIXED).** The mute now also carries the late-commit premise (paxos P-N2).
 
 > **FIXED.** Fixed 2026-11-09. A rebuilt store's acceptor covers only transactions started at or after the HLC time in its
@@ -295,6 +301,9 @@ G5. ErrorTree/UnackedCommits entry-key incarnation (X10) and the time-line of en
 G6. Allocation-tree dependency: rebuild F10/F17, repair F5 and requirements F11 each mention an allocation recorded late or not at all, but nobody analyses the total effect (missing slice, stale deletion decision, replayed allocation) across rebuild, repair and horizon.
 G7. Client object caches/pointers (stale `ObjectPointer`, DataObject read caches) are outside all seven; resurrection by a client reading a zombie slice with a cached pointer is not discussed.
 G8. Clock: HLC skew no longer affects replay (the horizon is gone, paxos F3 fixed), but still affects the rebuilt store's `acceptorSince` mute, on which the late-commit rule now also rests (paxos P-N2), repair's 60 s age gate (entry timestamp is the marker transaction's), and rebuild timestamps; no document looks at them together.
+    *2026-11-13, partial:* the `acceptorSince` leg is settled (P-N2 FIXED). It now depends only on host-to-host skew
+    under 8 s, and `Frontend.MaxStartLead` caps every accepted start timestamp, and so every client HLC, at the fastest
+    host's wall clock plus 2 s. Still open: the repair age gate and rebuild timestamps under host skew.
 G9. Marker-batch size/limit: `TransactionCreationError` is treated as permanent (StopRetrying) and wedges finalization (recovery F2); no document asks which creation errors an oversized batch (256 entries x many objects) can hit. *(2026-11-11: no longer a wedge. The give-up fails the actions and their drivers re-run the finalizers with backoff, so a transient creation error heals; one that repeats forever is a logged stall. An oversized UnackedCommits entry surfaced as TKVL `NodeSizeExceeded`, retried in place forever: about 90 objects on one store with 4096-byte FSIF metadata segments. Fixed: such entries are written in chunks of at most half a leaf node (repair-process 13.0b), and a `NodeSizeExceeded` left over is permanent, taking the finalizer failure path. ErrorTree entries are fixed-size and small.)*
 G10. Capacity interaction: ErrorTree growth during long outages (repair 13.3-6) x CRL admission (X5) x rebuild in-progress counts as failure budget (rebuild 6.3): no combined capacity argument.
 

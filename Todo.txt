@@ -26,13 +26,6 @@ RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-re
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.2  P-N2 (+ X2 residual, Rebuild N3, G8): the acceptorSince mute trusts the client clock                    [M]
-     `muted = acceptorSince.exists(txd.startTimestamp < _)` (Frontend). A client clock running fast by more than
-     the rebuild duration plus 10 s leaves a rebuilt, memoryless acceptor unmuted. A live T can then resolve
-     late, which means no finalization, no marks, and voters apply nothing: a lost committed update.
-     Fix: base the mute on host-observed time, either the receiving host's HLC at the first prepare or clamping
-     client timestamps to the receiving host's HLC plus a bound. Re-derive late condition 1 afterwards.
-
 1.3  P-N1 + P-F2 + R-F3/F5/F8: false abort of a committed transaction; a live commit voter drops its update  [S-M]
      a. The proof is sent once, to lastProposer (Tx.proveCommitted). Store drops a TxResolved when no driver
         exists yet (Store.scala ~208), and ReplayIntegrationSuite reproduced this. Fix: cache proofs next to
@@ -297,8 +290,8 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
      blank-acceptor promotion test.                                                                         [S]
 6.3  G3: confirm that transfer-out and relinquish go through Store.close, so no driver or timer survives.   [S]
 6.4  G4: a host restart wiping the status cache (now late-commit evidence) combined with rolling restarts.  [M]
-6.5  G8: combined HLC-skew analysis (acceptorSince, repair age gates, rebuild timestamps) plus a
-     skewed-clock test. Do it together with 1.2.                                                            [M]
+6.5  G8: combined HLC-skew analysis of the repair age gates and rebuild timestamps, plus a skewed-clock test.
+     The acceptorSince leg is done (P-N2, Frontend.MaxStartLead, 2026-11-13).                              [M]
 6.6  G7: client caches and pointers against zombie slices and deleted objects.                             [M]
 6.7  G2/X8 residual: mixed-version rolling upgrades (message, CRL and txd formats, finalizer types). Carry a
      feature version in the txd so old hosts cannot drive.                                                  [M-L]

@@ -93,6 +93,12 @@ class SimpleCRLSuite extends FileBasedTests {
     crl.save(txid, trs, () => q.put(""))
     q.take()
 
+  /** A completion handler runs on the writer thread, possibly before the CRL thread has moved on to the next entry
+    * (writeCurrentLogEntry replaces currentLogEntry after handing the entry to the writer). A round trip through the
+    * CRL thread orders the test's reads of its state after that */
+  private def settle(crl: CrashRecoveryLog): Unit =
+    Await.result(crl.storesWithEntries(), 10.seconds)
+
   test("Save & Recover CRL Saved State File Foo") {
     val savePath = tdir / "crl_save_file.log"
     val queue = new LinkedBlockingQueue[String]()
@@ -410,12 +416,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     queue.take() // Block till completion handlers are run
 
-    // There's a race condition here where the currentLogEntry variable is updated after
-    // the completion callback is executed. It's possible for the take() operation to complete
-    // before this happens which causes the currentEntrySerialNumber to still be zero when it
-    // should be 1. Add a short sleep to reduce the likelihood of this happening
-    Thread.sleep(50)
-    
+    settle(i.crl)
     assert(i.crl.currentEntrySerialNumber == 1)
 
     i.crl.shutdown()
@@ -736,21 +737,21 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.save(transactionId3, trsValidTxd3, completionHandler)
     queue.take()
 
-    Thread.sleep(50)
+    settle(i.crl)
     assert(i.crl.oldestEntryNeeded == 0)
 
     // Delete oldest (tx1), flush with a save
     i.crl.deleteTransaction(storeId, transactionId)
     i.crl.save(transactionId3, trsValidTxd3, completionHandler)
     queue.take()
-    Thread.sleep(50)
+    settle(i.crl)
     assert(i.crl.oldestEntryNeeded == 1)
 
     // Delete new oldest (tx2), flush
     i.crl.deleteTransaction(storeId2, transactionId2)
     i.crl.save(transactionId3, trsValidTxd3, completionHandler)
     queue.take()
-    Thread.sleep(50)
+    settle(i.crl)
     assert(i.crl.oldestEntryNeeded == 2)
 
     i.crl.shutdown()
@@ -803,7 +804,7 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.save(transactionId3, trsValidTxd3, completionHandler)
     queue.take()
 
-    Thread.sleep(50)
+    settle(i.crl)
     assert(i.crl.oldestEntryNeeded == 0)
 
     // Delete the middle node (tx2)
@@ -812,7 +813,7 @@ class SimpleCRLSuite extends FileBasedTests {
     queue.take()
 
     // tx1 is still oldest, so oldestEntryNeeded should remain 0
-    Thread.sleep(50)
+    settle(i.crl)
     assert(i.crl.oldestEntryNeeded == 0)
 
     i.crl.shutdown()
@@ -1058,6 +1059,7 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(i.crl.getFullRecoveryState(storeId).isEmpty)
     i.crl.deleteTransaction(storeId2, transactionId2)
     saveAndWait(i.crl, transactionId3, trsValidTxd4)
+    settle(i.crl)
     assert(i.crl.oldestEntryNeeded == i.crl.currentEntrySerialNumber - 1)
 
     i.crl.shutdown()

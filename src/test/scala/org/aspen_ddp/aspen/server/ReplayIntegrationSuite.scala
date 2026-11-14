@@ -22,14 +22,19 @@ import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 /** A transaction's client prepares, re-delivered after every store finalized and forgot it, must not apply it again.
   *
   * The bootstrap host records its stores' CRL state and has recovery drivers, as UnackedCommitsIntegrationSuite's
-  * does. Its heartbeat is short so the status cache forgets a transaction quickly.
+  * does. Its heartbeat and transaction horizon are short so the status cache forgets a transaction quickly (7.4 s), and
+  * expiry starts soon (horizon + 3.8 s). Since the forget floor, every replay here comes after the cache forgot the
+  * transaction, so past every store's floor, and is refused outright; each test still checks that nothing is applied
+  * again. The tests need only that their transactions' prepares reach every store within the horizon, which the test
+  * thread's own deliveries do within milliseconds. Not below about 2 s, for slack under load
   */
 class ReplayIntegrationSuite extends IntegrationTestSuite:
 
   override def testIda: IDA = ReedSolomon(5, 3, 4)
 
   override def testHostOptions: TestNetwork.HostOptions =
-    TestNetwork.HostOptions(heartbeatPeriod = Duration(300, MILLISECONDS), recordCrl = true, recoveryDrivers = true)
+    TestNetwork.HostOptions(heartbeatPeriod = Duration(300, MILLISECONDS), recordCrl = true, recoveryDrivers = true,
+      transactionHorizon = Duration(3, SECONDS))
 
   /** The prefer-abort test waits out the missing-data wait of every store its recovery driver prepares: a short one
     * keeps it fast (Ruling 9). Other tests keep the default, which no step of theirs should reach
@@ -38,10 +43,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
 
   override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
     if name == reDrivenAbortTest then
-      // A short horizon too, so the status cache forgets T (7.4 s) and expiry starts (horizon + 3.8 s) quickly. The test
-      // needs only that T is forgotten and past every store's floor when store 1 restarts. Not below about 2 s: T0's
-      // and T's prepares must reach every store within the horizon under load
-      testHostOptions.copy(missingDataWait = Duration(200, MILLISECONDS), transactionHorizon = Duration(3, SECONDS))
+      testHostOptions.copy(missingDataWait = Duration(200, MILLISECONDS))
     else
       testHostOptions
 
@@ -119,6 +121,24 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
     val (leader, others) = prepares.partition(isLeader)
     others ++ leader
 
+  /** Replays `txid`'s client prepares (replayClientPrepares) and checks that every store refused them: the replay
+    * comes after the status cache forgot the transaction, which it outlasts the horizon by, so every store is past its
+    * forget floor (Frontend.forgetFloorMillis). No store creates a Tx, and nothing of the transaction is sent
+    */
+  private def replayRefused(txid: TransactionId): Future[Unit] =
+    net.recordTxMessage = (m: TxMessage) => m.transactionId == txid &&
+      !(m match { case p: TxPrepare => p.fromClient; case _ => false })
+    for
+      _ <- replayClientPrepares(txid)
+    yield
+      val refused = net.stores.forall: b =>
+        net.smgr.control.router.loaded.get(b.storeId).forall(!_.frontend.transactions.contains(txid))
+      net.recordTxMessage = _ => false
+      val sent = net.takeRecordedTxMessages()
+      withClue("every store refused the replay: no Tx, nothing sent: "):
+        refused shouldBe true
+        sent shouldBe Nil
+
   /** Completes once no store of the bootstrap pool holds a Tx for `txid` */
   private def forgottenByStores(txid: TransactionId): Future[Unit] =
     eventually("every store forgot the transaction", clock = true):
@@ -189,13 +209,14 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
               Future.successful(tx.id)
       _ <- settle(clock = false)
       _ = (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
-      _ <- replayClientPrepares(t)
+      _ <- replayRefused(t)
       _ <- settle(clock = true)
       _ <- forgottenByStores(t)
       yAfterReplay <- client.read(y)
     yield
-      // A store taking the replay proves T committed from x's revision (Tx.proveCommitted). The replay's driver then
-      // resolves it as a late commit, and no store applies T's blind delete again over T2's k: none is owed T
+      // Every store refuses the replay, so no store applies T's blind delete again over T2's k. Before the forget floor,
+      // a store taking the replay proved T committed from x's revision (Tx.proveCommitted), and the replay's driver
+      // resolved it as a late commit, owed to no store
       withClue("every store of y still holds k as T2 wrote it: "):
         (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
       yAfterReplay.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))
@@ -216,13 +237,14 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
               Future.successful(tx.id)
       _ <- settle(clock = false)
       _ = (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe None)
-      _ <- replayClientPrepares(t)
+      _ <- replayRefused(t)
       _ <- settle(clock = true)
       _ <- forgottenByStores(t)
       yAfterReplay <- client.read(y)
       xAfterReplay <- client.read(x)
     yield
-      // Checked afresh, T fails x's revision; every store proves it committed from x and applies nothing
+      // Every store refuses the replay and applies nothing. Before the forget floor, checked afresh, T failed x's
+      // revision, and every store proved it committed from x and applied nothing
       withClue("no store of y holds k again: "):
         (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe None)
       (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(ObjectRevision(t)))
@@ -241,12 +263,13 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
               Future.successful(tx.id)
       _ <- settle(clock = false)
       _ = (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(ObjectRevision(t2)))
-      _ <- replayClientPrepares(t)
+      _ <- replayRefused(t)
       _ <- settle(clock = true)
       _ <- forgottenByStores(t)
       xAfterReplay <- client.read(x)
     yield
-      // Checked afresh, T fails x's revision, and no object shows its update: every store votes abort
+      // Every store refuses the replay. Before the forget floor, checked afresh, T failed x's revision and no object
+      // showed its update: every store voted abort, and the replay aborted a committed transaction (paxos F2)
       withClue("every store of x still holds T2's overwrite: "):
         (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(ObjectRevision(t2)))
       xAfterReplay.revision shouldBe ObjectRevision(t2)

@@ -1,0 +1,414 @@
+package org.aspen_ddp.aspen.server
+
+import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
+import org.aspen_ddp.aspen.client.{TestTransactions, Transaction, TransactionAborted, TransactionOutcomeUnknown}
+import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
+import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
+import org.aspen_ddp.aspen.common.network.{ClientResponse, TransactionFinalized, TransactionResolved, TxFinalized,
+  TxMessage, TxPrepare, TxResolved, TxStatusRequest}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.{TransactionDisposition, TransactionId, TransactionStatus}
+import org.aspen_ddp.aspen.server.store.Frontend
+
+import scala.concurrent.Future
+import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS, SECONDS}
+import scala.util.{Failure, Success, Try}
+
+/** The transaction horizon end to end (design docs/superpowers/specs/2026-11-13-transaction-horizon-design.md, tests
+  * 1-6 and 9): the forget floor, the client's give-up and expiry, on the TestNetwork's lockstep hosts.
+  *
+  * The horizon is short, so the status cache forgets a transaction, and expiry starts, within seconds. Each test needs
+  * only that a transaction's prepares reach its stores within the horizon of its start, and the test's own deliveries
+  * do so on the test's thread within milliseconds: 2 s leaves the slack of a long scheduling stall. The bootstrap host
+  * records its stores' CRL state, and its non-leader stores drive idle transactions (recovery drivers), as
+  * ReplayIntegrationSuite's does. A second host (TestNetwork.newHost) stands in for one with its own status cache: one
+  * a store was transferred to, or one restarted.
+  */
+class HorizonIntegrationSuite extends IntegrationTestSuite:
+
+  override def testIda: IDA = ReedSolomon(5, 3, 4)
+
+  private val horizon: FiniteDuration = Duration(2, SECONDS)
+
+  override def testHostOptions: TestNetwork.HostOptions =
+    TestNetwork.HostOptions(heartbeatPeriod = Duration(100, MILLISECONDS), recordCrl = true, recoveryDrivers = true,
+      transactionHorizon = horizon)
+
+  private val nearHorizonTest = "a store first reached near the horizon after finalization learns the outcome from " +
+    "its peers' caches"
+
+  /** How long before the horizon the near-horizon test's late store is first reached */
+  private val nearHorizonLead: FiniteDuration = Duration(1200, MILLISECONDS)
+
+  override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
+    if name == nearHorizonTest then
+      // An idle Tx self-drives after txHeartbeatTimeout (5 heartbeats): 1.5 s here, longer than nearHorizonLead, so the
+      // late store's driver asks its peers only once they are past the horizon
+      testHostOptions.copy(heartbeatPeriod = Duration(300, MILLISECONDS))
+    else
+      testHostOptions
+
+  private def deadline(): Long = System.nanoTime() + Duration(30, SECONDS).toNanos
+
+  private def step(clock: Boolean): Unit =
+    if clock then net.heartbeat() else net.handleEvents()
+
+  private def pump[T](f: Future[T], clock: Boolean, until: Long = deadline()): Future[T] =
+    if f.isCompleted then
+      f
+    else if System.nanoTime() > until then
+      net.printTransactionStatus()
+      Future.failed(new AssertionError("Timed out pumping events"))
+    else
+      Future { Thread.sleep(1); step(clock) }.flatMap(_ => pump(f, clock, until))
+
+  /** `f`'s outcome, once it completes */
+  private def outcome[T](f: Future[T], clock: Boolean): Future[Try[T]] =
+    pump(f, clock).transform(r => Success(r))
+
+  /** Polls `cond`, pumping the hosts meanwhile */
+  private def eventually(what: String, clock: Boolean)(cond: => Boolean): Future[Unit] =
+    val until = deadline()
+    def loop(): Future[Unit] =
+      if cond then
+        Future.unit
+      else if System.nanoTime() > until then
+        net.printTransactionStatus()
+        Future.failed(new AssertionError(s"Never happened: $what"))
+      else
+        Future { Thread.sleep(1); step(clock) }.flatMap(_ => loop())
+    loop()
+
+  /** Completes once no host drives a transaction */
+  private def settle(clock: Boolean): Future[Unit] =
+    eventually("transactions completed", clock)(!net.hasTransactions)
+
+  private def sid(i: Int): StoreId = net.stores(i).storeId
+
+  /** Store `i`'s Frontend, on whichever host serves it */
+  private def frontend(i: Int): Option[Frontend] =
+    net.hostFor(sid(i)).control.router.loaded.get(sid(i)).map(_.frontend)
+
+  private def holds(i: Int, txid: TransactionId): Boolean = frontend(i).exists(_.transactions.contains(txid))
+
+  private def holders(txid: TransactionId): Set[Int] = (0 until 5).filter(holds(_, txid)).toSet
+
+  private def crlStores(txid: TransactionId): Set[Int] =
+    (0 until 5).filter(i => net.crl.getFullRecoveryState(sid(i)).exists(_.txd.transactionId == txid)).toSet
+
+  private def cachedStatus(txid: TransactionId): Option[TransactionStatus.Value] =
+    net.smgr.control.txStatusCache.getStatus(txid).map(_.status)
+
+  private def storeRevision(i: Int, x: DataObjectPointer): Option[ObjectRevision] =
+    net.stores(i).m.get(x.id).map(_.metadata.revision)
+
+  private def isClientPrepare(txid: TransactionId)(m: TxMessage): Boolean = m match
+    case p: TxPrepare => p.fromClient && p.transactionId == txid
+    case _ => false
+
+  private def isOutcome(txid: TransactionId)(m: TxMessage): Boolean =
+    m.transactionId == txid && (m.isInstanceOf[TxResolved] || m.isInstanceOf[TxFinalized])
+
+  private def isClientOutcome(txid: TransactionId)(r: ClientResponse): Boolean = r match
+    case m: TransactionResolved => m.transactionId == txid
+    case m: TransactionFinalized => m.transactionId == txid
+    case _ => false
+
+  private def recordedClientPrepares(txid: TransactionId): List[TxPrepare] =
+    net.takeRecordedTxMessages().collect { case p: TxPrepare if isClientPrepare(txid)(p) => p }
+
+  private def isLeader(m: TxPrepare): Boolean =
+    m.to.poolId == m.txd.primaryObject.poolId && m.to.poolIndex == m.txd.designatedLeaderUID
+
+  /** The designated leader's last, as a client's batch arrives (ReplayIntegrationSuite.leaderLast) */
+  private def leaderLast(prepares: List[TxPrepare]): List[TxPrepare] =
+    val (leader, others) = prepares.partition(isLeader)
+    others ++ leader
+
+  private def wallMillis(): Long = System.currentTimeMillis()
+
+  /** A data object every store holds */
+  private def allocateX(): Future[DataObjectPointer] =
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      x <- client.transactUntilSuccessful: tx =>
+             given Transaction = tx
+             tx.replaySafe("test")
+             pool.allocator.allocateDataObject(DataBuffer(Array[Byte](1)))
+      _ <- settle(clock = false)
+    yield x
+
+  /** Commits a pinned overwrite of `x` at `revision`, recording its client prepares */
+  private def commitRecorded(x: DataObjectPointer, revision: ObjectRevision): Future[(TransactionId, List[TxPrepare])] =
+    val tx = client.newTransaction()
+    net.recordTxMessage = isClientPrepare(tx.id)
+    tx.overwrite(x, revision, DataBuffer(Array[Byte](2)))
+    for
+      _ <- pump(tx.commit(), clock = false)
+      _ <- settle(clock = false)
+    yield
+      net.recordTxMessage = _ => false
+      (tx.id, recordedClientPrepares(tx.id))
+
+  /** Waits until the hosts' wall clock is past `millis` */
+  private def clockPast(millis: Long): Future[Unit] =
+    eventually(s"the clock passed $millis", clock = false)(wallMillis() > millis)
+
+  test("a stale retransmit of a finalized traceless commit past the horizon reports unknown, not aborted"):
+    for
+      x <- allocateX()
+      xBefore <- client.read(x)
+      // T: a refcount change, which leaves no trace a store could prove its commit from. The client never hears its
+      // outcome, as one partitioned from the stores right after sending its prepares
+      tx = client.newTransaction()
+      _ = net.recordTxMessage = isClientPrepare(tx.id)
+      _ = net.dropClientResponse = isClientOutcome(tx.id)
+      _ = tx.setRefcount(x, xBefore.refcount, xBefore.refcount.increment())
+      commit = tx.commit()
+      _ <- eventually("every store applied T", clock = false):
+             (0 until 5).forall(i => net.stores(i).m(x.id).metadata.refcount == xBefore.refcount.increment())
+      _ <- settle(clock = false)
+      prepares = recordedClientPrepares(tx.id)
+      _ = withClue("T committed and was finalized at every store, and forgotten by them: "):
+            prepares.size shouldBe 5
+            holders(tx.id) shouldBe Set()
+            cachedStatus(tx.id) shouldBe Some(TransactionStatus.Committed)
+            commit.isCompleted shouldBe false
+      // Past the horizon plus MaxStartLead the client gives up: it can no longer find out
+      result <- outcome(commit, clock = true)
+      _ = withClue("the client gives up with outcome unknown: "):
+            result should matchPattern { case Failure(_: TransactionOutcomeUnknown) => }
+      _ <- eventually("the status cache forgot T", clock = true)(cachedStatus(tx.id).isEmpty)
+      // A stale retransmit of T's prepares. Before the horizon the stores re-decided it from scratch: the refcount no
+      // longer matches, nothing proves the commit, and T aborted (paxos F2). Now every store is past its forget floor
+      // for T and refuses it: no Tx, no vote, no outcome
+      _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id && !isClientPrepare(tx.id)(m)
+      _ = leaderLast(prepares).foreach(net.deliverTransactionMessage)
+      _ = withClue("no store joins T again: ")(holders(tx.id) shouldBe Set())
+      _ <- settle(clock = true)
+      sent = net.takeRecordedTxMessages()
+      xAfter <- client.read(x)
+    yield
+      net.recordTxMessage = _ => false
+      withClue("no store sent anything for T's retransmit: ")(sent shouldBe Nil)
+      crlStores(tx.id) shouldBe Set()
+      xAfter.refcount shouldBe xBefore.refcount.increment()
+
+  test("a delayed client prepare of a forgotten abort does not commit inside or past the horizon"):
+    val blocked = Set(3, 4).map(sid)
+    def outcomeTo(txid: TransactionId)(m: TxMessage): Boolean = isOutcome(txid)(m) && blocked.contains(m.to)
+    for
+      x <- allocateX()
+      xBefore <- client.read(x)
+      // T0 exclusively locks x and commits, but stores 3 and 4 do not hear its outcome yet, so they keep its lock. They
+      // are reported offline meanwhile, so neither leads. No heartbeat runs until the lock clears, so no idle driver
+      // of theirs learns the outcome early
+      t0Outcomes <- {
+        val t0 = TestTransactions.replaySafe(client.newTransaction())
+        net.offlineStores = blocked
+        net.dropTxMessage = outcomeTo(t0.id)
+        net.recordTxMessage = outcomeTo(t0.id)
+        t0.exclusiveLockRevision(x, xBefore.revision)
+        for
+          _ <- pump(t0.commit(), clock = false)
+          _ <- settle(clock = false)
+        yield
+          net.recordTxMessage = _ => false
+          net.takeRecordedTxMessages()
+      }
+      // T: a pinned overwrite of x. Stores 3 and 4 vote abort on the collision with T0's lock, so T aborts
+      tx = client.newTransaction()
+      _ = net.recordTxMessage = isClientPrepare(tx.id)
+      _ = tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+      aborted <- outcome(tx.commit(), clock = false)
+      _ <- settle(clock = false)
+      prepares = recordedClientPrepares(tx.id)
+      _ = withClue("T aborted: "):
+            aborted should matchPattern { case Failure(_: TransactionAborted) => }
+            prepares.size shouldBe 5
+      // The collision clears: T0's outcome reaches stores 3 and 4, so T's requirements hold again everywhere
+      _ = net.dropTxMessage = _ => false
+      _ = net.offlineStores = Set()
+      _ = withClue("T0's outcomes to stores 3 and 4 were recorded: ")(t0Outcomes should not be empty)
+      _ = t0Outcomes.foreach(net.deliverTransactionMessage)
+      _ <- settle(clock = false)
+      _ = holders(tx.id) shouldBe Set()
+      // The host's last write of T's status-cache entry was before now
+      forgottenAt = wallMillis()
+      // Inside the horizon, but after the old status cache (7 heartbeats) would have forgotten T, a delayed duplicate of
+      // T's client prepares reaches every store. Stores that forgot the abort voted commit afresh, and T committed (P-N4
+      // path 3). Now the cache outlasts the horizon: the stores still know T aborted
+      _ <- clockPast(forgottenAt + 8 * testHostOptions.heartbeatPeriod.toMillis)
+      _ = withClue("the host still knows T aborted: ")(cachedStatus(tx.id) shouldBe Some(TransactionStatus.Aborted))
+      _ = net.recordTxMessage = isOutcome(tx.id)
+      _ = leaderLast(prepares).foreach(net.deliverTransactionMessage)
+      _ <- settle(clock = true)
+      _ <- eventually("every store forgot T again", clock = true)(holders(tx.id).isEmpty)
+      inside = net.takeRecordedTxMessages()
+      _ = withClue("inside the horizon the replay learns the abort, and nothing commits: "):
+            inside.collect { case m: TxResolved if m.committed => m } shouldBe Nil
+            inside.collect { case m: TxFinalized if m.committed => m } shouldBe Nil
+            (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(xBefore.revision))
+      // Past the horizon, once the cache forgot T, the same duplicate is refused everywhere
+      _ <- eventually("the status cache forgot T", clock = true)(cachedStatus(tx.id).isEmpty)
+      _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id && !isClientPrepare(tx.id)(m)
+      _ = leaderLast(prepares).foreach(net.deliverTransactionMessage)
+      _ = withClue("past the horizon no store joins T: ")(holders(tx.id) shouldBe Set())
+      _ <- settle(clock = true)
+      past = net.takeRecordedTxMessages()
+      xAfter <- client.read(x)
+    yield
+      net.recordTxMessage = _ => false
+      withClue("no store sent anything for the replay past the horizon: ")(past shouldBe Nil)
+      crlStores(tx.id) shouldBe Set()
+      (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(xBefore.revision))
+      xAfter.revision shouldBe xBefore.revision
+      xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](1)
+
+  test(nearHorizonTest):
+    val late = 4
+    for
+      x <- allocateX()
+      xBefore <- client.read(x)
+      // The late store on a host of its own, so its status cache knows nothing of T. It is loaded before T starts, so
+      // T is above its forget floor until the horizon
+      other = net.newHost()
+      _ <- pump(net.moveStore(net.stores(late), other, closeFirst = true), clock = false)
+      // T: a pinned overwrite of x, which commits and is finalized without the late store ever hearing of it. It is
+      // reported offline meanwhile, so it does not lead
+      tx = client.newTransaction()
+      _ = net.offlineStores = Set(sid(late))
+      _ = net.droppedTx = Set(sid(late) -> tx.id)
+      _ = net.recordTxMessage = (m: TxMessage) => isClientPrepare(tx.id)(m) && m.to == sid(late)
+      _ = tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+      _ <- pump(tx.commit(), clock = false)
+      _ <- settle(clock = false)
+      prepare = recordedClientPrepares(tx.id)
+      _ = net.recordTxMessage = _ => false
+      _ = net.droppedTx = Set()
+      _ = net.offlineStores = Set()
+      _ = withClue("T's client prepare to the late store was recorded, and T committed elsewhere: "):
+            prepare.size shouldBe 1
+            (0 until 4).foreach(i => storeRevision(i, x) shouldBe Some(ObjectRevision(tx.id)))
+            cachedStatus(tx.id) shouldBe Some(TransactionStatus.Committed)
+      start = prepare.head.txd.startTimestamp.wallTime
+      // The client's prepare reaches the late store just inside the horizon: the store joins T and votes, and its Tx
+      // learns no outcome until its idle driver asks the other stores, after the horizon
+      _ <- clockPast(start + horizon.toMillis - nearHorizonLead.toMillis)
+      _ = net.deliverTransactionMessage(prepare.head)
+      _ = withClue("the late store, above its floor, joins T: ")(holds(late, tx.id) shouldBe true)
+      _ <- eventually("the late store learned T's outcome", clock = true):
+             other.control.txStatusCache.getStatus(tx.id).exists(_.status != TransactionStatus.Unresolved)
+      learnedAt = wallMillis()
+      _ <- eventually("the late store forgot T", clock = true)(!holds(late, tx.id))
+      _ <- settle(clock = true)
+    yield
+      // The other stores were past the horizon when its driver asked, so only their status caches could answer it,
+      // which they outlast (horizon + MaxStartLead + 8 heartbeats from their last write)
+      withClue("the late store learned the outcome only after the horizon: ")(learnedAt should be > start + horizon.toMillis)
+      (0 until 4).foreach(i => frontend(i).exists(_.belowForgetFloor(prepare.head.txd)) shouldBe true)
+      withClue("it learned the commit: "):
+        other.control.txStatusCache.getStatus(tx.id).map(_.status) shouldBe Some(TransactionStatus.Committed)
+      crlStores(tx.id) shouldBe Set()
+
+  test("stuck holders short of a quorum all discard"):
+    val absent = Set(3, 4).map(sid)
+    for
+      x <- allocateX()
+      xBefore <- client.read(x)
+      // T: a pinned overwrite of x. Stores 3 and 4 hear nothing of it but status requests, so stores 0-2 vote commit
+      // and hold it: three holders, short of the write threshold of four, and two non-holders, more than
+      // width - writeThreshold = 1. Every holder's driver (the designated leader's, and the idle recovery drivers of
+      // the others) is stuck
+      tx = client.newTransaction()
+      _ = net.offlineStores = absent
+      _ = net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id && absent.contains(m.to) &&
+            !m.isInstanceOf[TxStatusRequest]
+      _ = tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+      commit = tx.commit()
+      _ <- eventually("stores 0-2 voted commit on T", clock = false):
+             (0 until 3).forall(i => net.crl.getFullRecoveryState(sid(i))
+               .exists(s => s.txd.transactionId == tx.id && s.disposition == TransactionDisposition.VoteCommit))
+      _ = withClue("only stores 0-2 hold T: ")(holders(tx.id) shouldBe Set(0, 1, 2))
+      // The client gives up past the horizon plus MaxStartLead; the holders, past the horizon plus the expiry margin,
+      // ask every store. Each holder reports itself a holder; stores 3 and 4, below their floors, report "unknown".
+      // So every holder discards T once its UnackedCommits lookup finds no entry; none keeps another alive
+      result <- outcome(commit, clock = true)
+      _ = withClue("the client gives up with outcome unknown: "):
+            result should matchPattern { case Failure(_: TransactionOutcomeUnknown) => }
+      _ <- eventually("every holder discarded T", clock = true)(holders(tx.id).isEmpty && crlStores(tx.id).isEmpty)
+      _ <- settle(clock = true)
+      _ = net.dropTxMessage = _ => false
+      _ = net.offlineStores = Set()
+      _ = withClue("no store applied T: ")((0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(xBefore.revision)))
+      // The holders' locks are released: a new overwrite at the same revision commits at a write threshold of stores
+      next = client.newTransaction()
+      _ = next.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](3)))
+      _ <- pump(next.commit(), clock = false)
+      _ <- settle(clock = false)
+      xAfter <- client.read(x)
+    yield
+      xAfter.revision shouldBe ObjectRevision(next.id)
+      xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](3)
+
+  /** Delivers T's client prepare to store `i`, which forgot T, once it is served by `host` and loaded after T started:
+    * it is refused there, though the host's status cache knows nothing of T and T is inside the horizon
+    */
+  private def refusedAfterLoad(i: Int, host: Host, prepare: TxPrepare): Unit =
+    val txid = prepare.transactionId
+    withClue(s"store $i is loaded on a host that knows nothing of T, after T started: "):
+      assert(net.hostFor(sid(i)) eq host)
+      host.control.txStatusCache.getStatus(txid) shouldBe None
+      frontend(i).map(_.loadedAtMillis).getOrElse(0L) should be > prepare.txd.startTimestamp.wallTime
+    net.recordTxMessage = (m: TxMessage) => m.transactionId == txid && m.from == sid(i)
+    net.deliverTransactionMessage(prepare)
+    net.recordTxMessage = _ => false
+    withClue(s"store $i refuses T: no Tx, no CRL state, no reply: "):
+      holds(i, txid) shouldBe false
+      crlStores(txid) shouldBe Set()
+      net.takeRecordedTxMessages() shouldBe Nil
+
+  test("a host restart does not let its stores rejoin a transaction they forgot"):
+    val moved = 4
+    for
+      x <- allocateX()
+      xBefore <- client.read(x)
+      first = net.newHost()
+      _ <- pump(net.moveStore(net.stores(moved), first, closeFirst = true), clock = false)
+      (t, prepares) <- commitRecorded(x, xBefore.revision)
+      prepare = prepares.filter(_.to == sid(moved))
+      _ = withClue("store 4 committed T and forgot it; its host remembers the outcome: "):
+            prepare.size shouldBe 1
+            storeRevision(moved, x) shouldBe Some(ObjectRevision(t))
+            holds(moved, t) shouldBe false
+            first.control.txStatusCache.getStatus(t).map(_.status) shouldBe Some(TransactionStatus.Committed)
+      // Its host restarts crash-only, losing its status cache: the store is loaded again, after T started, on a new
+      // host. Its load raises its forget floor past T's start
+      _ <- clockPast(prepare.head.txd.startTimestamp.wallTime)
+      second = net.newHost()
+      _ <- pump(net.moveStore(net.stores(moved), second, closeFirst = false), clock = false)
+    yield
+      refusedAfterLoad(moved, second, prepare.head)
+      storeRevision(moved, x) shouldBe Some(ObjectRevision(t))
+
+  test("a store transferred to another host does not rejoin a transaction it forgot"):
+    val moved = 4
+    for
+      x <- allocateX()
+      xBefore <- client.read(x)
+      (t, prepares) <- commitRecorded(x, xBefore.revision)
+      prepare = prepares.filter(_.to == sid(moved))
+      _ = withClue("store 4 committed T and forgot it: "):
+            prepare.size shouldBe 1
+            storeRevision(moved, x) shouldBe Some(ObjectRevision(t))
+            holds(moved, t) shouldBe false
+      // The store is transferred: closed on the bootstrap host, whose status cache still knows T, and loaded on another
+      // host, after T started. Its load there raises its forget floor past T's start
+      _ <- clockPast(prepare.head.txd.startTimestamp.wallTime)
+      other = net.newHost()
+      _ <- pump(net.moveStore(net.stores(moved), other, closeFirst = true), clock = false)
+    yield
+      cachedStatus(t) shouldBe Some(TransactionStatus.Committed)
+      refusedAfterLoad(moved, other, prepare.head)
+      storeRevision(moved, x) shouldBe Some(ObjectRevision(t))

@@ -7,9 +7,12 @@ import org.aspen_ddp.aspen.client.{AspenClient, ObjectCache, RegisteredTypeFacto
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.read.BaseReadDriver
-import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver, MissedUpdateFinalizationAction}
+import org.aspen_ddp.aspen.client.ReadDriverClient
+import org.aspen_ddp.aspen.client.internal.transaction.{ClientOutcome, ClientTransactionDriver,
+  MissedUpdateFinalizationAction}
+import org.aspen_ddp.aspen.client.internal.transaction.TransactionBuilder.TransactionData
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
-import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, Gossip, HostMessage, Read, ReadResponse, TxMessage, TxPrepare}
@@ -134,6 +137,8 @@ object TestNetwork {
     * @param recoveryDrivers drivers of transactions a store is not the designated leader of (recovery drivers) are
     *                        SimpleTransactionDrivers on TestNetwork.driverTimers
     * @param missingDataWait how long the stores' Txs wait for a client's prepare (Frontend.missingDataWait)
+    * @param transactionHorizon the hosts' (Host.transactionHorizon), and the client's too: its transactions give up
+    *                           with TransactionOutcomeUnknown past it (HorizonClientDriver)
     */
   final case class HostOptions(heartbeatPeriod: Duration = Duration(5, SECONDS),
                                recordCrl: Boolean = false,
@@ -154,7 +159,8 @@ object TestNetwork {
                 msngr: ClientMessenger,
                 radicle: KeyValueObjectPointer,
                 ida: IDA,
-                userTypeFactories: List[RegisteredTypeFactory] = Nil)
+                userTypeFactories: List[RegisteredTypeFactory] = Nil,
+                txDriverFactory: ClientTransactionDriver.Factory = ClientTransactionDriver.noErrorRecoveryFactory)
     extends BaseAspenClient(
       executionContext,
       radicle,
@@ -163,7 +169,7 @@ object TestNetwork {
       TransactionStatusCache.NoCache,
       ObjectCache.NoCache,
       BaseReadDriver.noErrorRecoveryReadDriver,
-      ClientTransactionDriver.noErrorRecoveryFactory,
+      txDriverFactory,
       userTypeFactories):
 
     override def opportunisticRebuildManager: OpportunisticRebuildManager =
@@ -183,6 +189,23 @@ object TestNetwork {
     // Single attempt, no retry: test failures must surface rather than being retried away.
     override protected def runCreate[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T]): Future[T] =
       transact(prepare)
+
+  /** The TestNetwork client's transaction driver. It sends its prepares once and never retransmits, as
+    * ClientTransactionDriver.noErrorRecoveryFactory's does, and gives up with ClientOutcome.Unknown once the client's
+    * clock is past the horizon plus MaxStartLead (TransactionHorizon.clientGiveUp), as SimpleClientTransactionDriver
+    * does. TestNetwork.heartbeat checks that, on the test's thread, so a lockstep host never sees another thread
+    */
+  final class HorizonClientDriver(horizon: FiniteDuration,
+                                  client: ReadDriverClient,
+                                  txd: TransactionDescription,
+                                  updateData: Map[StoreId, TransactionData])
+    extends ClientTransactionDriver(client, txd, updateData):
+
+    /** Gives up if past the horizon; whether the driver has completed */
+    def checkGiveUp(): Boolean =
+      if HLCTimestamp.now.wallTime - txd.startTimestamp.wallTime > TransactionHorizon.clientGiveUp(horizon).toMillis then
+        complete(ClientOutcome.Unknown)
+      result.isCompleted
 }
 
 
@@ -346,9 +369,16 @@ class TestNetwork(executionContext: ExecutionContext,
    */
   @volatile var poolHosts: Map[PoolId, Host] = Map()
 
-  private def hostFor(storeId: StoreId): Host = poolHosts.getOrElse(storeId.poolId, smgr)
+  /** Stores served by a host newHost built (moveStore), taking precedence over poolHosts */
+  @volatile var storeHosts: Map[StoreId, Host] = Map()
 
-  private def allHosts: List[Host] = smgr :: poolHosts.values.toList.distinct.filterNot(_ eq smgr)
+  /** The host serving `storeId` */
+  def hostFor(storeId: StoreId): Host =
+    storeHosts.getOrElse(storeId, poolHosts.getOrElse(storeId.poolId, smgr))
+
+  private def allHosts: List[Host] =
+    (poolHosts.values.toList ++ storeHosts.values.toList).foldLeft(List(smgr)): (hosts, h) =>
+      if hosts.exists(_ eq h) then hosts else hosts :+ h
 
   private val smgrThreading: HostThreading = threading(executionContext)
 
@@ -411,7 +441,18 @@ class TestNetwork(executionContext: ExecutionContext,
     override def isStoreOffline(storeId: StoreId): Boolean = offlineStores.contains(storeId)
   }
 
-  val client: AspenClient = new TClient(executionContext, cliMessenger, radicle, ida, userTypeFactories)
+  /** The client's transactions not yet completed (HorizonClientDriver), checked by heartbeat */
+  private var clientDrivers: List[HorizonClientDriver] = Nil
+
+  private def clientDriverFactory(c: ReadDriverClient, txd: TransactionDescription,
+                                  updateData: Map[StoreId, TransactionData]): ClientTransactionDriver =
+    val d = new HorizonClientDriver(hostOptions.transactionHorizon, c, txd, updateData)
+    synchronized:
+      clientDrivers = d :: clientDrivers
+    d
+
+  val client: AspenClient = new TClient(executionContext, cliMessenger, radicle, ida, userTypeFactories,
+    clientDriverFactory)
   FinalizerFactory.client = client
 
   /** The CRL of every store the bootstrap host loads */
@@ -478,11 +519,48 @@ class TestNetwork(executionContext: ExecutionContext,
     val now = System.nanoTime()
     if now - lastHeartbeat >= hostOptions.heartbeatPeriod.toNanos then
       lastHeartbeat = now
-      val router = smgr.control.router
-      router.loaded.keys.filterNot(except.contains).foreach(id => router.post(id)(_.heartbeat()))
+      allHosts.foreach: host =>
+        val router = host.control.router
+        router.loaded.keys.filterNot(except.contains).foreach(id => router.post(id)(_.heartbeat()))
     handleEvents()
     driverTimers.runDue()
     handleEvents()
+    val pending = synchronized:
+      val ds = clientDrivers
+      clientDrivers = Nil
+      ds
+    val live = pending.filterNot(_.checkGiveUp())
+    synchronized:
+      clientDrivers = live ++ clientDrivers
+    handleEvents()
+
+  private var hostsBuilt = 0
+
+  /** Another lockstep host like the bootstrap one (the same HostOptions and CRL), serving no store yet: moveStore. Its
+    * own status cache starts empty, as a host that restarted or never saw the bootstrap host's transactions
+    */
+  def newHost(): Host =
+    hostsBuilt += 1
+    new Host(client, HostId(new UUID(1, hostsBuilt)), new UUID(0, 0), os.root, executionContext,
+      new LockstepThreading(executionContext), objectCacheFactory, this, BackgroundTaskManager.NoBackgroundTaskManager,
+      TestCRL, FinalizerFactory, txDriverFactory, hostOptions.heartbeatPeriod, Duration(60, SECONDS),
+      seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
+        missingDataWait = hostOptions.missingDataWait),
+      transactionHorizon = hostOptions.transactionHorizon)
+
+  /** Serves store `backend` on `to` from now on: a new Store there recovers its transactions from `crl`, as a store
+    * transferred to `to`, or reloaded once its host restarted, does. With `closeFirst` the host that served it closes
+    * it first, as a transfer out does; otherwise that host is left as it is, as a crashed one. Completes once loaded;
+    * the caller drains events meanwhile
+    */
+  def moveStore(backend: MapBackend, to: Host, closeFirst: Boolean): Future[Unit] =
+    given ExecutionContext = executionContext
+    val from = hostFor(backend.storeId)
+    val closed =
+      if closeFirst then from.control.loader.closeStore(backend.storeId, extractCrl = false) else Future.unit
+    closed.flatMap: _ =>
+      storeHosts += backend.storeId -> to
+      to.loadStore(storageDeviceId, backend, storeMaxSliceSize)
 
   // ---- Rebalancing test helpers -------------------------------------------------
 
@@ -642,8 +720,14 @@ class TestNetwork(executionContext: ExecutionContext,
 
   // -------------------------------------------------------------------------------
 
+  /** Client responses to drop, as a test chooses (a client never hearing a transaction's outcome, say) */
+  @volatile var dropClientResponse: ClientResponse => Boolean = _ => false
+
   override def sendClientResponse(msg: ClientResponse): Unit = msg match {
     case rr: ReadResponse if readSilencedStores.contains(rr.fromStore) =>
+      handleEvents()
+
+    case _ if dropClientResponse(msg) =>
       handleEvents()
 
     case _ =>

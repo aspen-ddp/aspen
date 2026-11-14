@@ -82,6 +82,12 @@ These are facts about the code, each checked. They define the problem; none is a
   `rebuildingStores.size < maxConcurrentRebuilds` and then calls `discardLostStore`
   (`server/host/StoreRebuilds.scala:167-169`); `rebuildingStores` is populated only after `discardLostStore` returns
   true, so one reconcile pass starts the discard of every marked Rebuilding store on the device at once.
+  *Fixed 2026-11-14 (Todo 1.7c):* a store holds a rebuild slot from the start of its discard (`droppingCrlState`
+  counts against `maxConcurrentRebuilds`), and the slot passes straight to its rebuild once the drop is durable, so
+  at most `maxConcurrentRebuilds` stores per host are being discarded or rebuilt at once (DeviceCrlSuite
+  "maxConcurrentRebuilds bounds the discards of lost stores, not only their rebuilds"). The slot is taken at the
+  discard, the first destructive step, not at the flip to Rebuilding, which destroys nothing. Residual: the cap is
+  per host, not per pool across hosts (S12).
 * **S4 Destruction precedes reconstruction.** *Fixed 2026-11-09:* the discard now moves the copy, with its saved CRL
   entries, to `pending-delete/`, deleted only once the store is Active again (rebuild-process.md F2). Was: `discardLostStore` drops the store's device-CRL entries and deletes its
   directory before the rebuild reads anything (`StoreRebuilds.scala:499-540`). There is no feasibility check.
@@ -98,6 +104,11 @@ These are facts about the code, each checked. They define the problem; none is a
   the keys `crl-num-streams` and `crl-max-file-size-mb` are optional and default in code
   (`server/StorageDeviceConfig.scala:11-12,43-44`), so changing a default, or a config loader change, turns every
   existing CRL "unrecoverable" (`DeviceDiscovery.scala:508-515`).
+  *Fixed 2026-11-14 (Todo 1.7b):* a CRL records its sizing in `crl/sizing` when it is created and always opens with
+  it, so neither the config nor the defaults can change an existing CRL's sizing; the config keys are now required.
+  Stream files that disagree with the recorded sizing, or have none, throw `CrlSizingMismatch`, which refuses the
+  device (unloaded, error logged, retried each scan) and never declares its stores lost (DeviceCrlSuite "... keeps
+  its own sizing", "... is refused, never lost").
 * **S7 The only retained artefact is the old CRL directory.** `crl.lost-<uuid>` (`DeviceDiscovery.scala:518`) is never
   read, expired or referenced by any other code (repository search), and without the store directories it is useless.
   No store directory is ever quarantined.
@@ -109,6 +120,11 @@ These are facts about the code, each checked. They define the problem; none is a
   already failed and then enrolls the drain (`client/internal/BaseAspenClient.scala:719-`), unlike `shutdownStorageDevice`,
   which refuses when a pool would drop below its write threshold (`client/AspenClient.scala:644`). The tombstone is
   one-way (`client/AspenClient.scala:312-324`).
+  **BY DESIGN (2026-11-14, owner's ruling; not a flaw):** `failStorageDevice` is for a drive that has physically
+  failed and whose data is unrecoverable. A pool-health guard could save nothing (the data is already gone) and
+  would only delay rebuilding it elsewhere, so the command deliberately has none (comment at
+  `AspenClient.failStorageDevice`). Do not report its absence as a finding. A device that may still hold its data
+  goes through `shutdownStorageDevice`, which keeps its guard.
 
 ### Protections that would be needed (not satisfied)
 
@@ -132,7 +148,7 @@ These are facts about the code, each checked. They define the problem; none is a
 | ID | Trigger | Code | Immediate local effect | Notes on false positives |
 |---|---|---|---|---|
 | D1 | `<device>/crl` absent from a device that holds store directories | `server/host/DeviceDiscovery.scala:504` | marker on **every** store dir of the device; fresh empty CRL created | a partially restored or re-mounted device; a path/layout change in a release |
-| D2 | CRL open throws anything (`Throwable`) on a device that holds stores | `DeviceDiscovery.scala:508-515` | as D1, plus `crl/` renamed to `crl.lost-<uuid>` (`:517-518`) | `SizingMismatch` from changed defaults (S6); `Recovery.BrokenEntryChain` parse changes (`server/crl/simple/Recovery.scala:63-75`); EMFILE, ENOMEM, EIO, interrupts |
+| D2 | CRL open throws anything (`Throwable`) on a device that holds stores | `DeviceDiscovery.scala:508-515` | as D1, plus `crl/` renamed to `crl.lost-<uuid>` (`:517-518`) | (`SizingMismatch` from changed defaults, S6: fixed 2026-11-14, now refused and never lost); `Recovery.BrokenEntryChain` parse changes (`server/crl/simple/Recovery.scala:63-75`); EMFILE, ENOMEM, EIO, interrupts |
 | D3 | `crl_save.log` present but `loadValidStoreState` fails (missing/truncated/wrong store/any `Throwable`) at load | `server/host/StoreLoader.scala:293-296` ► `StoreRebuilds.crlSaveFileLost` `:344` | store closed unserved, marker, offline | the file is treated as the only copy (`StoreRebuilds.scala:336-343`) even if the device CRL still holds the same entries (the window between the save and `deleteTransactions`, `StoreLoader.scala:514-517`) |
 | D4 | Same, for a `transferring-out` store, during **adoption** | `DeviceDiscovery.adoptionClass` `:294-296`; `server/host/DeviceMetadata.scala:540-553` | marker written inside the adoption transaction's prepare closure; entry written Rebuilding | marker persists if the transaction later returns Changed/Unclean; verified harmless, since the marker states a fact about the disk (rebuild-process F13, refuted) |
 | D5 | `BackendStateLost` from backend open (FSIF `StoreLost`: no valid index, journal seq mismatch, corrupt journal, missing files) | `StoreLoader.scala:188-202`; `server/store/backend/fsif/FsifRecovery.scala:138-264` | marker, offline | a format/version change in a release; a file that is missing because a mount is incomplete (`FsifRecovery.load` returns None for an absent file `:106-109`) |
@@ -142,7 +158,7 @@ These are facts about the code, each checked. They define the problem; none is a
 | D9 | Backend fail-stop during a clean close | `StoreLoader.scala:525-527` ► `StoreRebuilds.failedOnClose` `:374-388` | marker; `crl_save.log` removed (`:385`) | |
 | D10 | Store marked when its device is adopted | `DeviceDiscovery.scala:289-290`, `DeviceMetadata.scala:540-553` | store comes in as Rebuilding | inherits any false positive that wrote the marker |
 | D11 | Transfer out requested for a marked store | `server/host/StoreTransfers.scala:604-611,636-641,668-` | transfer aborted, store sent down the rebuild path | |
-| D12 | Operator `fail-storage-device` | `client/internal/BaseAspenClient.scala:719`; `common/metadata/management/FailedStorageDeviceDurableTask.scala:186,317,386` | tombstone (ids zeroed, device removed from set and host), every store moved to Rebuilding elsewhere | not automatic; unguarded (S10) |
+| D12 | Operator `fail-storage-device` | `client/internal/BaseAspenClient.scala:719`; `common/metadata/management/FailedStorageDeviceDurableTask.scala:186,317,386` | tombstone (ids zeroed, device removed from set and host), every store moved to Rebuilding elsewhere | not automatic; unguarded by design (S10) |
 
 The reconcile step that follows D1-D11 is also unguarded: for every offline store with a marker whose entry is Active,
 `requestRebuild` flips it to Rebuilding with a transaction that checks only the device state
@@ -184,9 +200,10 @@ These are places where a software change or environmental fault would produce D-
   whose config omits the keys (`StorageDeviceConfig.scala:11-12,43-44`). Existing 3 x 300 MB CRLs no longer match;
   `SimpleCRL.apply` throws `SizingMismatch`; D2 fires on every device at every upgraded host. Each device's
   `crl.lost-*` (900 MB) is kept, every store directory is deleted by X3. Every pool loses `d` = (stores per upgraded
-  host) as each host is restarted.
+  host) as each host is restarted. *Fixed 2026-11-14:* the CRL keeps its recorded sizing (S6).
 * **SC2 CRL on-disk format or recovery code change.** `Recovery.recover` throwing for a previously valid file is D2 for
-  all devices; the code cannot tell format skew from damage.
+  all devices; the code cannot tell format skew from damage. *Narrowed 2026-11-14:* sizing is no longer a cause
+  (S6); a format or recovery-code change still takes the lost path (Todo 3.1).
 * **SC3 FSIF recovery change.** Any stricter validation in `FsifRecovery.recover` (`:138-264`) turns a store that older
   code opened into `StoreLost`; D5 on every FSIF store at upgrade.
 * **SC4 Resource exhaustion at start** (file descriptors, memory, threads during a restart storm): `openCRL` and
@@ -194,7 +211,8 @@ These are places where a software change or environmental fault would produce D-
 * **SC5 Incomplete mount or restored backup.** `crl/` absent while store directories exist (D1); FSIF files absent so
   `load` returns None (D5).
 * **SC6 Operator error.** `fail-storage-device` on the wrong id, or on two devices of one pool: no pool-health check,
-  one-way (S10).
+  one-way (S10). The missing pool-health check is by design (S10): the command is for drives whose data is already
+  lost, and operator error with it is accepted.
 * **SC7 Rolling restart faster than rebuild.** A correct system under a legitimate fault pattern: every host restart
   performs D-checks; if any check has a false-positive rate p per store, the expected number of simultaneously
   discarded stores per pool grows with the restart rate and the rebuild duration (hours for a large store, with
@@ -238,6 +256,7 @@ These are listed to seed design work. They are not requirements and not an order
 * **M6 Classify the cause before declaring.** Separate transient errors (retry with backoff across restarts before
   concluding), configuration/version mismatches (never treated as corruption: refuse to open and alert), and content
   corruption (checksum failure). `SizingMismatch` in particular should refuse the device, not declare its stores lost.
+  *Done for sizing 2026-11-14 (S6).*
 * **M7 Version-aware safety.** Hosts publish their software version/format version; destructive actions are disabled for
   a store whose on-disk format version differs from what the binary last wrote, or for a period after any version
   change, or while hosts disagree on version. Pair with a canary stage: upgrade a minority of hosts per pool and
@@ -251,7 +270,7 @@ These are listed to seed design work. They are not requirements and not an order
   peers rather than relying on the old host to stop.
 * **M10 Reversible tombstone and operator preconditions.** `fail-storage-device` refuses when the move would drop a pool
   below tolerance (as shutdown does, `AspenClient.scala:644`), and allows un-failing while the old media is intact and
-  no destination rebuild has completed.
+  no destination rebuild has completed. *2026-11-14: the refusal is rejected by design (S10).*
 * **M11 Alarming.** A durable record (counter, tree entry) of every declaration with its cause, visible in `show-*`
   commands, so a burst is visible even without log aggregation.
 
@@ -289,8 +308,11 @@ simultaneous discard count exceeds `w - kc`.
 
 1. What is the intended retention of `crl.lost-<uuid>` and who may use it? Nothing consumes it today (S7).
 2. Should `failStorageDevice` be allowed to proceed when it would leave a pool below `kc` readable stores (it is
-   today)?
-3. Is `SizingMismatch` ever a real corruption signal, or always configuration drift?
+   today)? *Answered 2026-11-14: yes, by design (S10). It is for a physically failed drive whose data is already
+   gone.*
+3. Is `SizingMismatch` ever a real corruption signal, or always configuration drift? *Answered 2026-11-14: with the
+   sizing recorded in the CRL, drift cannot cause it. What remains is damage or a hand edit of the CRL directory, which
+   on its own does not prove the state is gone, so the device is refused and never declared lost (S6).*
 4. Can the bootstrap pool, whose trees live in itself, ever be rebuilt if more than `w - kc` of its stores are
    discarded? (No: rebuild-process FS16.)
 5. What distinguishes a transient CRL read failure from damage for the purposes of `handleRecoveryFailed`? Today a
@@ -320,6 +342,7 @@ Each claim in sections 3 to 6 was re-derived from the code.
   first) CONFIRMED; F15 (no escape from an unreadable object) CONFIRMED; F12 (co-location) CONFIRMED.
 * **S10** (`failStorageDevice` has no pool-health guard) was not re-read in `BaseAspenClient`; the reconcile side
   confirmed that nothing stops a Failed device's host from continuing to serve (rebuild-process F1).
+  *2026-11-14: the missing guard is by design (see S10), not a finding.*
 
 ## 11. Refresh for replay pins (2026-11-09, `0d08e3c6`)
 

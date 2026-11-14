@@ -326,6 +326,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *
    *  The tombstone is one-way. A recovered device is re-introduced as a new device with a new id.
    *
+   *  For a drive that has physically failed and whose data is unrecoverable. Unlike shutdownStorageDevice there is,
+   *  by design, no pool-health check: the device's data is already gone, so refusing could save nothing and would only
+   *  delay rebuilding it elsewhere. Its absence is not a flaw (systemic-loss-protection.md S10); do not add one.
+   *
    *  Fails with NoSuchElementException if the device does not exist, or DeviceAlreadyFailed if it
    *  is already tombstoned. Two simultaneous calls both enroll, which is harmless: the task's
    *  steps are idempotent and racing drains lose on their KeyRevision requirements and retry.

@@ -85,7 +85,8 @@
 - A lost device CRL does the same to every store on the device: if `<device>/crl` is absent from a device holding store
   dirs, or `openCRL` throws (a corrupt CRL, `CrlCorrupt`, is logged as such), each store dir gets `rebuild-required`, the old directory is kept as `crl.lost-<uuid>`, and
   a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`). A CRL another writer holds open (`CrlLocked`) is never
-  lost: the device stays unloaded and each scan retries. A transient error (I/O or VM error,
+  lost: the device stays unloaded and each scan retries. Nor is a CRL whose files disagree with its recorded sizing
+  (`CrlSizingMismatch`): the device is refused, an error is logged once, and each scan retries. A transient error (I/O or VM error,
   `DeviceDiscovery.isTransient`) leaves the device unloaded for the next scan instead, until `CrlOpenAttempts` (3) in a row
 - `Host.StoreFailStopped` (a store's CRL recovery threw, or its Frontend fail-stopped, `server/store/CLAUDE.md`) is
   handled as a backend failure (`StoreRebuilds.handleFailStopped`), but only while that Store is still the one
@@ -95,7 +96,9 @@
 - A store's device-CRL entries are dropped for good (`CrashRecoveryLog.dropStore`, durable) only once it cannot be
   served: when a rebuild discards a `rebuild-required` directory (`StoreRebuilds.discardLostStore`: marker durable,
   then the entries saved into the directory's `lost-crl-state.log`, then the drop durable, then the directory moved
-  to `<device>/pending-delete/` and the rebuild started), or when an unloaded store's save file still
+  to `<device>/pending-delete/` and the rebuild started at once in the same callback). A discard holds a rebuild
+  slot from its start (`maxConcurrentRebuilds` counts `droppingCrlState` as well as running rebuilds), and the slot
+  passes straight to the rebuild, so one reconcile pass cannot discard every marked store at once. Or when an unloaded store's save file still
   holds them, or when the reconcile deletes the directory of a store transferred away (`DeviceReconciler`, retried
   on failure). Without the marker on disk, entries stay in the device CRL. A transfer out reads them
   (`readStoreState`, leaving them live) into `crl_save.log` (loaded or not, `StoreTransfers.closeForTransferOut`)

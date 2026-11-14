@@ -10,8 +10,12 @@
   recycled), so a torn rotation write only ever overwrites entries no recovery needs. Needs at least 2 streams
 - One CRL per storage device, in `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`), opened by
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
-- Sizing (`crl-num-streams`, `crl-max-file-size-mb`) is fixed when the device's CRL is created: `SimpleCRL.apply`
-  throws `SizingMismatch` for stream files of another count or size, and the device's CRL is then treated as lost
+- Sizing (`crl-num-streams`, `crl-max-file-size-mb`, both required in the device config) is fixed when the device's
+  CRL is created and recorded durably in `crl/sizing` (`SimpleCRL.SizingFile`) before any stream file. An existing
+  CRL always opens with its recorded sizing, whatever the config asks (a warning is logged), so config edits and
+  default changes are harmless. `SimpleCRL.apply` throws `CrlSizingMismatch` for stream files without a readable
+  sizing file or of another count or size than recorded. That is damage or a hand edit, never declared a lost CRL:
+  the device is refused until repaired (`DeviceDiscovery.openDeviceCrl`)
 - Each entry header carries CRC32Cs of the header and of the body (`LogEntry`). Recovery drops a torn newest entry
   (only the write in flight at a crash can be torn) and throws `CrlCorrupt` for any other failed checksum, or when an
   intact entry newer than the last one found exists in that stream or the next. Data is read only from entries

@@ -72,7 +72,9 @@ on changes: administration means writing desired state here, not sending message
   does until the transfer completes
 - `DeviceStatus`: Operational; ShuttingDown and Shutdown bracket a planned physical move; Failed is the one-way
   tombstone written by `failStorageDevice`. A failed device stays readable (its store map is the list awaiting
-  rebuild) but is in no set or host and is never a destination
+  rebuild) but is in no set or host and is never a destination. `failStorageDevice` is for a physically failed drive
+  whose data is unrecoverable, so it deliberately has no pool-health guard (unlike `shutdownStorageDevice`): refusing
+  could save nothing. This is by design (systemic-loss-protection.md S10), not a missing check
 - `serviceStatus`: every transaction that makes an entry Active (store creation, rebuild or transfer in finishing, a
   transfer out rolled back) reads the state under a KeyRevision and writes this: Active, or Offline while the device
   is ShuttingDown/Shutdown. That is what keeps a shut-down device from ever holding an Active entry; only a restart

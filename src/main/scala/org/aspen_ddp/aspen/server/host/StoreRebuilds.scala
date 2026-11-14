@@ -42,7 +42,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  not start a second one. */
   private var pendingRebuildRequests: Set[StoreId] = Set()
   // Stores whose device-CRL entries are being dropped before their marked directory is discarded
-  // (discardLostStore). Each one's rebuild waits for the drop to be durable.
+  // (discardLostStore). Each one's rebuild waits for the drop to be durable. Each holds a rebuild slot, as a
+  // running rebuild does: the discard is the first destructive step, so maxConcurrentRebuilds bounds discards too
+  // (systemic-loss-protection.md S3).
   private var droppingCrlState: Set[StoreId] = Set()
 
   /** The stores whose rebuild is running here, for any device. */
@@ -170,9 +172,14 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  (`Adopt`, `Discard`, and a permanently failed flip) additionally re-check this device, to
    *  start the next store queued behind the slot just freed. The walk-failure path does not: see
    *  its comment.
+   *
+   *  A slot is taken from the start of a lost store's discard (`droppingCrlState`), not only once its walk runs, and
+   *  passes straight from the discard to the rebuild: otherwise one pass would discard every marked store on the
+   *  device at once (systemic-loss-protection.md S3).
    */
   def startRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    if !rebuildingStores.contains(storeId) && rebuildingStores.size < ctx.maxConcurrentRebuilds &&
+    if !rebuildingStores.contains(storeId) &&
+       rebuildingStores.size + droppingCrlState.size < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && discardLostStore(local, storeId) then
       val sr = ctx.storeRebuildFactory.createRebuild(
         ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends)
@@ -498,8 +505,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  a rebuild onto this device would recover them otherwise), then the directory renamed into pending-delete. A
    *  crash at any point leaves the marker, so the next attempt saves (unless already saved) and drops again. The
    *  store is never served meanwhile, so the entries cannot change. The save and drop complete asynchronously: this
-   *  returns false meanwhile, and once the drop is durable the directory is moved and the device checked, whose
-   *  Rebuilding pass then starts the rebuild. A failure leaves everything in place for a later check.
+   *  returns false meanwhile, the store holding a rebuild slot (`droppingCrlState`). Once the drop is durable the
+   *  directory is moved and the rebuild started at once, in the same callback, so the slot passes to it with no gap
+   *  in which another store's discard could take it. A failure frees the slot and leaves everything in place for a
+   *  later check.
    */
   private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
     val storePath = local.devicePath / storeId.directoryName
@@ -529,7 +538,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               // A device unloaded meanwhile is discarded by whichever load of it comes next
               if ctx.devices.devices.get(local.storageDeviceId).exists(_ eq local) then
                 if moveLostStoreToPendingDelete(local, storeId) then
-                  ctx.reconciler.checkStorageDevice(local.storageDeviceId)
+                  startRebuild(local, storeId)
       false
 
   /** Renames a discarded store's directory into pending-delete, durably. Returns whether the path is clear. */

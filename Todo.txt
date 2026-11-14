@@ -28,15 +28,6 @@ RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-re
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.7  Systemic quick wins (SL S10, S5/S6/SC1/SC2, S3)                                                        [S-M]
-     a. failStorageDevice (BaseAspenClient ~720) has no pool-health guard; shutdownStorageDevice has one. Refuse
-        a fail that drops any pool below tolerance (SL Q2).
-     b. SizingMismatch is treated as "CRL lost", so a default change in an upgrade flags every CRL on every host.
-        Refuse to open the device and raise an alarm instead (SL M6). Persist the CRL sizing in the CRL itself,
-        and remove the code defaults from the "keys optional" path.
-     c. Rebuild pacing limits rebuilds, not discards (discardLostStore runs before the rebuildingStores check).
-        Count a store against the cap when it is flipped, before its state is discarded.
-
 1.8  CRL writer death: F9 (+ F7, F8, 11.1 table)                                                            [M]
      F9: the CRL thread's death only logs (cmdline/Main.scala:1704). readStoreState, dropStore,
      deleteTransactions and storesWithEntries then hang, and zombie stores keep serving reads but cannot vote.

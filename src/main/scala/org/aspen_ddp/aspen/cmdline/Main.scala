@@ -900,7 +900,7 @@ object Main {
     Command("add-pool-to-group", "Adds a storage pool to an allocation group", addPoolToGroupArgs),
     Command("add-group-to-group", "Nests one allocation group inside another", addGroupToGroupArgs),
     Command("move-device-to-set", "Moves a storage device into a different level-0 device set", moveDeviceToSetArgs),
-    Command("fail-storage-device", "Declares a storage device dead and rebuilds its stores elsewhere", failStorageDeviceArgs),
+    Command("fail-storage-device", "Declares a physically failed storage device dead and rebuilds its stores elsewhere", failStorageDeviceArgs),
     Command("shutdown-device", "Shuts down a storage device so that its disk may be moved to another host", failStorageDeviceArgs),
     Command("restart-device", "Returns a shut down storage device to service", failStorageDeviceArgs),
     Command("add-host", "Registers a new host and initializes its root directory", addHostArgs),

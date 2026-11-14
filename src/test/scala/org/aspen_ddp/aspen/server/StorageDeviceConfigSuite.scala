@@ -30,16 +30,16 @@ class StorageDeviceConfigSuite extends AnyFunSuite with Matchers:
     finally
       os.remove(f)
 
-  test("CRL sizing round-trips and defaults when absent"):
+  test("CRL sizing round-trips, and a config missing either key fails rather than taking a code default"):
     val sized = sample.copy(crlNumStreams = 5, crlFileSizeMb = 2)
     val f = os.temp(prefix = "aspen-storage-device-crl", suffix = ".yaml")
     try
       os.write.over(f, sized.yamlConfig)
       StorageDeviceConfig.loadStorageDeviceConfig(f) should be(sized)
-      os.write.over(f, s"storage-device-id: $zero\naspen-system-id: $zero\n")
-      val defaulted = StorageDeviceConfig.loadStorageDeviceConfig(f)
-      defaulted.crlNumStreams should be(StorageDeviceConfig.DefaultCrlNumStreams)
-      defaulted.crlFileSizeMb should be(StorageDeviceConfig.DefaultCrlFileSizeMb)
+      val ids = s"storage-device-id: $zero\naspen-system-id: $zero\n"
+      for keys <- List("", "crl-num-streams: 3\n", "crl-max-file-size-mb: 300\n") do
+        os.write.over(f, ids + keys)
+        an[Exception] should be thrownBy StorageDeviceConfig.loadStorageDeviceConfig(f)
     finally
       os.remove(f)
 

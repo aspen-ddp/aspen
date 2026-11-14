@@ -79,12 +79,15 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
 
   /** Completed when dropStore is first called */
   val dropCalled: Promise[Unit] = Promise()
+  /** How many times dropStore has been called */
+  val dropCalls = new AtomicInteger(0)
   /** While set, dropStore waits for it before dropping */
   @volatile var dropGate: Option[Future[Unit]] = None
   /** Completed when a dropStore has completed */
   val dropDone: Promise[Unit] = Promise()
   override def dropStore(storeId: StoreId): Future[Unit] =
     dropCalled.trySuccess(())
+    dropCalls.incrementAndGet()
     val dropped = dropGate match
       case None => inner.dropStore(storeId)
       case Some(gate) => gate.flatMap(_ => inner.dropStore(storeId))(using ExecutionContext.parasitic)
@@ -190,12 +193,13 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
   /** A real Host, which opens RocksDB backends and its devices' CRLs through `crlFactory`, over `hostRoot` */
   private def newCrlHost(hostRoot: os.Path, crlFactory: CrashRecoveryLogFactory,
                          hostId: HostId = HostId.BootstrapHostId, seams: Host.Seams = Host.Seams.default,
-                         rebuilds: StoreRebuildFactory = StoreRebuildFactory.Filesystem): Host =
+                         rebuilds: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
+                         maxConcurrentRebuilds: Int = 2): Host =
     new Host(client, hostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net,
       BackgroundTaskManager.NoBackgroundTaskManager, crlFactory, net.FinalizerFactory,
       TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
-      StoreTransferService.Disabled, rebuilds, 2, seams = seams)
+      StoreTransferService.Disabled, rebuilds, maxConcurrentRebuilds, seams = seams)
 
   /** Drains `host`'s events and yields until `condition` holds. The caller asserts it.
    *
@@ -1082,6 +1086,47 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       leftInCrl should be(Set())
       heldOnDisk(deviceDir, storeId) should be(Set())
 
+  atest("maxConcurrentRebuilds bounds the discards of lost stores, not only their rebuilds"):
+    given ExecutionContext = executionContext
+    val second = StoreId(poolId, 1)
+    val first = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    val gate = Promise[Unit]()
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    createCrl(deviceDir)
+    val rebuilding = StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None)
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map(storeId -> rebuilding, second -> rebuilding)))
+      _ <- waitForTransactionsToComplete()
+      firstDir <- writeRocksStore(deviceDir, storeId)
+      secondDir <- writeRocksStore(deviceDir, second)
+      _ = os.write.over(marker(firstDir), "")
+      _ = os.write.over(marker(secondDir), "")
+      host = newCrlHost(hostRoot, first, rebuilds = rebuilds, maxConcurrentRebuilds = 1)
+      crl = first.opened.head
+      _ = crl.dropGate = Some(gate.future)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpWithTx(host, crl.dropCalled.isCompleted)
+      // The single slot is held by the first store's discard: further checks discard nothing more
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpWithTx(host, false, rounds = 20)
+      dropsWhileHeld = crl.dropCalls.get
+      secondKeptWhileHeld = os.exists(marker(secondDir))
+      _ = gate.success(())
+      // The slot passes from the first store's discard to its rebuild, with no gap a second discard could take
+      _ <- pumpWithTx(host, rebuilds.created.nonEmpty)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpWithTx(host, false, rounds = 20)
+    yield
+      dropsWhileHeld should be(1)
+      secondKeptWhileHeld should be(true)
+      rebuilds.created.map(_.storeId).toList should be(List(storeId))
+      os.exists(firstDir) should be(false)
+      crl.dropCalls.get should be(1)
+      os.exists(marker(secondDir)) should be(true)
+
   atest("a failed backend whose rebuild-required marker cannot be written keeps its CRL entries on disk"):
     given ExecutionContext = executionContext
     val factory = newFactory()
@@ -1419,32 +1464,74 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       leftInCrl should be(Set())
       heldOnDisk(deviceDir, storeId) should be(Set())
 
-  /** Opens a device whose CRL was created with 3 streams of 1 MB, holding a store, with `config` instead */
+  /** Opens a device whose CRL was created with 3 streams of 1 MB, holding a store, with `config` instead. A change of
+   *  config (or of the code defaults it once took) must neither lose the CRL nor resize it */
   private def resizedCrlDevice(config: StorageDeviceConfig => StorageDeviceConfig): Future[org.scalatest.Assertion] =
     val hostRoot = newHostDir()
     val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
     val storeDir = writeStoreDir(deviceDir)
     createCrl(deviceDir)
     val crlDir = CrashRecoveryLog.deviceCrlDir(deviceDir)
-    val oldFiles = os.list(crlDir).map(_.last).toSet
+    def files = os.list(crlDir).filter(_.ext == "crl").map(f => f.last -> os.size(f)).toSet
+    val oldFiles = files
     os.write.over(deviceDir / StorageDeviceConfig.configFilename,
       config(StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = 1)).yamlConfig)
     val factory = newFactory()
     val host = newCrlHost(hostRoot, factory)
 
     Future.successful:
-      os.exists(marker(storeDir)) should be(true)
-      host.control.router.loaded.contains(storeId) should be(false)
-      val lost = os.list(deviceDir).filter(_.last.startsWith("crl.lost-"))
-      lost.size should be(1)
-      os.list(lost.head).map(_.last).toSet should be(oldFiles)
-      host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.last
+      os.exists(marker(storeDir)) should be(false)
+      os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.head
+      factory.opened.head.admissionLimitBytes should be(1024 * 1024 / 2)
+      files should be(oldFiles)
 
-  atest("a device CRL opened with fewer streams than it was created with is treated as lost"):
+  atest("a device CRL opened with fewer configured streams than it was created with keeps its own sizing"):
     resizedCrlDevice(_.copy(crlNumStreams = 2))
 
-  atest("a device CRL opened with more streams than it was created with is treated as lost"):
+  atest("a device CRL opened with more configured streams than it was created with keeps its own sizing"):
     resizedCrlDevice(_.copy(crlNumStreams = 4))
 
-  atest("a device CRL opened with another file size than it was created with is treated as lost"):
+  atest("a device CRL opened with another configured file size than it was created with keeps its own sizing"):
     resizedCrlDevice(_.copy(crlFileSizeMb = 2))
+
+  /** A device holding a store whose CRL `damage` leaves disagreeing with the sizing it recorded: refused on every
+   *  scan, never declared lost, and loaded once `repair` restores it */
+  private def sizingMismatchDevice(damage: os.Path => Unit, repair: os.Path => Unit): Future[org.scalatest.Assertion] =
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    createCrl(deviceDir)
+    val crlDir = CrashRecoveryLog.deviceCrlDir(deviceDir)
+    damage(crlDir)
+    val factory = newFactory()
+    val host = newCrlHost(hostRoot, factory)
+
+    host.control.devices.devices.contains(deviceA) should be(false)
+    for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
+      host.control.discovery.checkForNewDevices() should be(Nil)
+    os.exists(marker(storeDir)) should be(false)
+    os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
+    factory.opened should be(Nil)
+
+    repair(crlDir)
+    host.control.discovery.checkForNewDevices() should be(List(deviceA))
+    Future.successful:
+      os.exists(marker(storeDir)) should be(false)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.head
+
+  atest("a device CRL whose stream file disagrees with its recorded sizing is refused, never lost"):
+    var saved = Array[Byte]()
+    sizingMismatchDevice(
+      crlDir =>
+        saved = os.read.bytes(crlDir / "2.crl")
+        os.write.over(crlDir / "2.crl", "truncated"),
+      crlDir => os.write.over(crlDir / "2.crl", saved))
+
+  atest("a device CRL with stream files but no recorded sizing is refused, never lost"):
+    var saved = ""
+    sizingMismatchDevice(
+      crlDir =>
+        saved = os.read(crlDir / SimpleCRL.SizingFile)
+        os.remove(crlDir / SimpleCRL.SizingFile),
+      crlDir => os.write(crlDir / SimpleCRL.SizingFile, saved))

@@ -119,7 +119,8 @@ Items marked **(intended)** are what the design requires; section 11 lists where
   recycled stream forward always fits (`SimpleCRL.scala:104-107`). Enforced only by prepare admission, which has
   gaps (F8). `Stream.writeEntry`'s `require` is the fail-stop backstop (`Stream.scala:28`).
 - **C12 (sizing is fixed).** The count and file size of the streams are fixed at creation. Opening with another sizing
-  throws `SizingMismatch` (`SimpleCRL.scala:84-93`).
+  throws `SizingMismatch` (`SimpleCRL.scala:84-93`). *2026-11-14:* the sizing is recorded in `crl/sizing` at creation
+  and an existing CRL always opens with it; only files disagreeing with that record throw (`CrlSizingMismatch`).
 
 **Ownership**
 
@@ -264,7 +265,8 @@ is never recovered as a transaction: the Frontend keeps the stub txids as a set 
   a second open in the same process (A3).
 - Sizing: `crl-num-streams` (default 3) and `crl-max-file-size-mb` (default 300) come from the device's yaml
   (`S/StorageDeviceConfig.scala:30-31`). The config travels with the device. Editing it on an existing device makes
-  `SizingMismatch` and therefore a lost CRL (F6).
+  `SizingMismatch` and therefore a lost CRL (F6). *2026-11-14:* no longer. The keys are required and size only a new
+  CRL; an existing one keeps its recorded sizing (10.15).
 
 ---
 
@@ -717,9 +719,12 @@ a fresh one (`DeviceDiscovery.scala:512-520`). A crash between the markers and t
 `crl/`: the next open may succeed (e.g. transient error) but the stores stay unservable behind their markers. The
 decision is irreversible and made from local evidence only (F6).
 
-**10.15 Sizing mismatch.** `SizingMismatch` is thrown before any file is read; the handling in 10.14 follows. State
-is not harmed (the files are kept as `crl.lost-*`), but all stores are rebuilt. A crash during the creation of the
-stream files of a new CRL produces the same mismatch; harmless only if the device holds no stores yet.
+**10.15 Sizing mismatch.** *Revised 2026-11-14 (Todo 1.7b):* the CRL writes its sizing durably to `crl/sizing`
+before creating any stream file, and opens an existing CRL with that sizing whatever the config asks. A
+`CrlSizingMismatch` (stream files without a readable sizing file, or disagreeing with it) is thrown before any stream
+file is read, and refuses the device: it stays unloaded with its files and stores untouched, an error is logged, and
+each scan retries; 10.14 does not follow. A crash after the sizing file and before or during the stream files' creation
+opens as a new CRL at the recorded sizing. *Was:* the handling in 10.14 followed and every store was rebuilt.
 
 **10.16 A completion handler throws.** `runCompletionHandlers` is called inside the writer loop
 (`StreamWriter.scala:74-75`, `Stream.scala:35-38`): the exception escapes the loop, the writer thread dies, remaining
@@ -973,8 +978,9 @@ checksum would convert silent corruption into C8 (a loud failure).
 > **FIXED (2026-11-09), as scoped by the owner.** A CRL that cannot be loaded does mean its stores must be rebuilt;
 > only transient errors are now suppressed. `openDeviceCrl` rethrows an I/O or VM error (`DeviceDiscovery.isTransient`),
 > leaving the device unloaded and its stores untouched for the next scan, and declares the CRL lost only after
-> `CrlOpenAttempts` (3) such failures in a row. Everything else (`BrokenEntryChain`, `CorruptedEntry`, `SizingMismatch`,
-> decode errors, bugs) is lost at once, as before. Protection against fleet-wide declarations belongs at a higher
+> `CrlOpenAttempts` (3) such failures in a row. Everything else (`BrokenEntryChain`, `CorruptedEntry`,
+> decode errors, bugs) is lost at once, as before. *2026-11-14:* a sizing mismatch is no longer among them: it refuses
+> the device and is never lost (10.15). Protection against fleet-wide declarations belongs at a higher
 > level (systemic-loss-protection.md). Covered by the DeviceCrlSuite tests "a transient CRL open failure leaves the
 > stores untouched and a later scan loads the device" and "a CRL open failing transiently CrlOpenAttempts times in a
 > row is treated as lost".

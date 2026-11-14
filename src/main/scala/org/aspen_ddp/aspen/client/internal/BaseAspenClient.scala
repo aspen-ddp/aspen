@@ -717,6 +717,8 @@ abstract class BaseAspenClient(
     migrated.recover:
       case _: SameSetNoOp => ()
 
+  // Deliberately no pool-health guard (shutdownStorageDevice has one): this is for a physically failed drive whose data
+  // is already unrecoverable, so refusing would only delay the rebuild of what was lost (AspenClient.failStorageDevice)
   override def failStorageDevice(deviceId: StorageDeviceId): Future[Unit] =
     given ExecutionContext = clientContext
 

@@ -2,9 +2,9 @@ package org.aspen_ddp.aspen.server.crl.simple
 
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.server.StorageDeviceConfig
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlLocked, StoreRecoveryState,
-  TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.{DurableFiles, StorageDeviceConfig}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlLocked, CrlSizingMismatch,
+  StoreRecoveryState, TransactionRecoveryState}
 import scribe.Logging
 
 import java.util.UUID
@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.immutable.HashMap
 import scala.concurrent.{Future, Promise}
 
-object SimpleCRL:
+object SimpleCRL extends Logging:
 
   sealed abstract class ActionRequest()
 
@@ -51,45 +51,64 @@ object SimpleCRL:
                              trsList: List[TransactionRecoveryState],
                              appliedStubs: Set[TxId])
 
-  /** Opens each device's SimpleCRL in `CrashRecoveryLog.deviceCrlDir`, creating the directory if absent, sized by
-   *  the device's config. `onThreadDeath` is called if a CRL thread dies: that device's transactions stop. */
+  /** Opens each device's SimpleCRL in `CrashRecoveryLog.deviceCrlDir`, creating the directory if absent. A new CRL is
+   *  sized by the device's config; an existing one keeps the sizing it recorded (SizingFile). `onThreadDeath` is
+   *  called if a CRL thread dies: that device's transactions stop. */
   case class DeviceFactory(onThreadDeath: Throwable => Unit = _ => ()) extends CrashRecoveryLogFactory:
     def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
       val dir = CrashRecoveryLog.deviceCrlDir(devicePath)
       os.makeDir.all(dir)
       SimpleCRL(dir, config.crlNumStreams, config.crlFileSizeMb * 1024L * 1024L, onThreadDeath).crl
 
-  /** Thrown by apply when the stream files on disk were created with another count or size than it is given */
-  class SizingMismatch(streamsDir: os.Path, reason: String)
-    extends Exception(s"CRL stream files in $streamsDir do not match the configured sizing: $reason")
+  /** The CRL's own record of its sizing, written durably when it is created, before any stream file. The sizing is
+   *  fixed then: an existing CRL is always opened with the sizing it recorded, whatever it is asked for, so a change
+   *  of the device config or of the code defaults cannot make it unopenable */
+  val SizingFile = "sizing"
 
-  /** @param onThreadDeath called if a CRL thread dies. No transaction of the CRL's stores can make progress after
+  /** The sizing a CRL was created with */
+  case class Sizing(numStreams: Int, maxSizeInBytes: Long):
+    def encode: String = s"num-streams: $numStreams\nmax-size-in-bytes: $maxSizeInBytes\n"
+
+  object Sizing:
+    /** None if `text` is not a sizing file's content */
+    def decode(text: String): Option[Sizing] =
+      val fields = text.linesIterator.map(_.split(":", 2)).collect:
+        case Array(k, v) => k.trim -> v.trim
+      .toMap
+      for
+        n <- fields.get("num-streams").flatMap(_.toIntOption)
+        m <- fields.get("max-size-in-bytes").flatMap(_.toLongOption)
+      yield Sizing(n, m)
+
+  /** @param numStreams     the stream count of a CRL created by this call. An existing CRL keeps its recorded count
+    * @param maxSizeInBytes the stream size of a CRL created by this call. An existing CRL keeps its recorded size
+    * @param onThreadDeath called if a CRL thread dies. No transaction of the CRL's stores can make progress after
     *                      that: stores vote only once a save completes.
     * @throws CrlLocked if the CRL is open elsewhere (CrlLock). Nothing in `streamsDir` is read or written then.
-    * @throws SizingMismatch if `streamsDir` holds stream files other than `numStreams` of `maxSizeInBytes` each.
-    *                        The sizing is fixed when the CRL is created: recovering with another would silently
-    *                        ignore files holding live entries, so such a CRL is treated as unrecoverable.
+    * @throws CrlSizingMismatch if `streamsDir` holds stream files but no readable SizingFile, or stream files other
+    *                           than the recorded count of the recorded size each. Recovering with another sizing would
+    *                           silently ignore files holding live entries, so the CRL is not opened. Nothing in
+    *                           `streamsDir` is written then.
     */
   def apply(streamsDir: os.Path,
             numStreams: Int,
             maxSizeInBytes: Long,
             onThreadDeath: Throwable => Unit = _ => ()): InitialCRLState =
-    // A rotation copies the next stream's live data into the one it recycles, which needs a second stream
-    require(numStreams >= 2, s"A CRL needs at least 2 streams, not $numStreams")
-    val files: List[(StreamId, os.Path)] = (0 until numStreams).map(i =>
-      (StreamId(i), streamsDir / s"$i.crl")
-    ).toList
-
     // Held from before the files are read until the writer has closed them. A failed open releases it
     val lock = CrlLock.acquire(streamsDir)
     try
-      checkSizing(streamsDir, files.map(_._2).toSet, maxSizeInBytes)
+      val sizing = recordedSizing(streamsDir, Sizing(numStreams, maxSizeInBytes))
+      val files: List[(StreamId, os.Path)] = (0 until sizing.numStreams).map(i =>
+        (StreamId(i), streamsDir / s"$i.crl")
+      ).toList
+
+      checkSizing(streamsDir, files.map(_._2).toSet, sizing.maxSizeInBytes)
 
       val r = Recovery.recover(files)
 
       InitialCRLState(
         new SimpleCRL(
-          maxSizeInBytes,
+          sizing.maxSizeInBytes,
           files,
           r,
           onThreadDeath,
@@ -100,18 +119,41 @@ object SimpleCRL:
       lock.release()
       throw t
 
+  private def streamFiles(streamsDir: os.Path): Set[os.Path] =
+    if os.isDir(streamsDir) then os.list(streamsDir).filter(_.ext == "crl").toSet else Set[os.Path]()
+
+  /** The sizing `streamsDir`'s CRL recorded. A directory with neither a SizingFile nor stream files is a new CRL: it
+    * records `requested` first. A SizingFile with no stream files is a creation that crashed before them: its sizing
+    * stands. Stream files without a readable SizingFile throw CrlSizingMismatch */
+  private def recordedSizing(streamsDir: os.Path, requested: Sizing): Sizing =
+    val file = streamsDir / SizingFile
+    if os.exists(file) then
+      val recorded = Sizing.decode(os.read(file)).filter(_.numStreams >= 2).getOrElse:
+        throw CrlSizingMismatch(streamsDir, s"its $SizingFile file is unreadable")
+      if recorded != requested then
+        logger.warn(s"The CRL in $streamsDir was created with ${recorded.numStreams} streams of " +
+                    s"${recorded.maxSizeInBytes} bytes, not the ${requested.numStreams} of " +
+                    s"${requested.maxSizeInBytes} configured. Opening it with the sizing it was created with")
+      recorded
+    else if streamFiles(streamsDir).nonEmpty then
+      throw CrlSizingMismatch(streamsDir, s"it holds stream files but no $SizingFile file")
+    else
+      // A rotation copies the next stream's live data into the one it recycles, which needs a second stream
+      require(requested.numStreams >= 2, s"A CRL needs at least 2 streams, not ${requested.numStreams}")
+      DurableFiles.write(file, requested.encode)
+      requested
+
   /** A directory with no stream files is a new CRL. Otherwise its files must be exactly `expected`, each
     * `maxSizeInBytes` long (StreamWriter creates them at that size) */
   private def checkSizing(streamsDir: os.Path, expected: Set[os.Path], maxSizeInBytes: Long): Unit =
-    val present =
-      if os.isDir(streamsDir) then os.list(streamsDir).filter(_.ext == "crl").toSet else Set[os.Path]()
+    val present = streamFiles(streamsDir)
     if present.nonEmpty then
       if present != expected then
-        throw SizingMismatch(streamsDir, s"found ${present.map(_.last).toList.sorted.mkString(", ")}, expected " +
+        throw CrlSizingMismatch(streamsDir, s"found ${present.map(_.last).toList.sorted.mkString(", ")}, expected " +
           s"${expected.size} streams")
       present.foreach: f =>
         if os.size(f) != maxSizeInBytes then
-          throw SizingMismatch(streamsDir, s"${f.last} is ${os.size(f)} bytes, expected $maxSizeInBytes")
+          throw CrlSizingMismatch(streamsDir, s"${f.last} is ${os.size(f)} bytes, expected $maxSizeInBytes")
 
 class SimpleCRL private (val maxSizeInBytes: Long,
                          files: List[(StreamId, os.Path)],

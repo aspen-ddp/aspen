@@ -9,7 +9,8 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation, Tx}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlCorrupt, CrlLocked, StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlCorrupt, CrlLocked, CrlSizingMismatch, StoreRecoveryState,
+  TransactionRecoveryState}
 
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -655,8 +656,56 @@ class SimpleCRLSuite extends FileBasedTests {
 
   test("A failed open releases the CRL lock") {
     SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
-    assertThrows[SimpleCRL.SizingMismatch](SimpleCRL(tdir, 3, 2 * 1024 * 1024))
+    os.write.over(tdir / "2.crl", "truncated")
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+    // Refused for its sizing again, not for a lock still held
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+  }
+
+  test("Creating a CRL records its sizing before any stream file") {
+    SimpleCRL(tdir, 4, 1024 * 1024).crl.shutdown()
+    assert(SimpleCRL.Sizing.decode(os.read(tdir / SimpleCRL.SizingFile)) == Some(SimpleCRL.Sizing(4, 1024 * 1024)))
+    assert(os.list(tdir).filter(_.ext == "crl").map(_.last).toSet == Set("0.crl", "1.crl", "2.crl", "3.crl"))
+  }
+
+  test("An existing CRL opens with the sizing it recorded, whatever it is asked for, and keeps its entries") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    i.crl.shutdown()
+
+    for (n, size) <- List((2, 1024L * 1024), (4, 1024L * 1024), (3, 2L * 1024 * 1024)) do
+      val i2 = SimpleCRL(tdir, n, size)
+      assert(i2.trsList.map(_.storeId) == List(storeId))
+      assert(i2.crl.admissionLimitBytes == 1024 * 1024 / 2)
+      i2.crl.shutdown()
+    assert(os.list(tdir).filter(_.ext == "crl").map(_.last).toSet == Set("0.crl", "1.crl", "2.crl"))
+  }
+
+  test("A sizing file without stream files is a CRL whose creation crashed: it is created with that sizing") {
+    os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(4, 1024 * 1024).encode)
+    val i = SimpleCRL(tdir, 3, 2 * 1024 * 1024)
+    assert(i.crl.admissionLimitBytes == 1024 * 1024 / 2)
+    i.crl.shutdown()
+    assert(os.list(tdir).filter(_.ext == "crl").size == 4)
+  }
+
+  test("Stream files without a readable sizing file are a sizing mismatch, and nothing is written") {
     SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
+    os.remove(tdir / SimpleCRL.SizingFile)
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+    assert(!os.exists(tdir / SimpleCRL.SizingFile))
+    os.write(tdir / SimpleCRL.SizingFile, "garbage")
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(1, 1024 * 1024).encode)
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+  }
+
+  test("Stream files disagreeing with the recorded sizing are a sizing mismatch") {
+    SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
+    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(4, 1024 * 1024).encode)
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(3, 2 * 1024 * 1024).encode)
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
   }
 
   test("A CRL whose thread died has released its lock once its shutdown returns") {
@@ -1397,6 +1446,8 @@ class SimpleCRLSuite extends FileBasedTests {
 
   test("Zero-filled stream files open as an empty CRL that writes from the start of stream 0") {
     val size = 4096L * 3
+    // As a creation that recorded its sizing and crashed once its files were allocated
+    os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(3, size).encode)
     for n <- 0 until 3 do
       os.write(tdir / s"$n.crl", new Array[Byte](size.toInt))
     val i = SimpleCRL(tdir, 3, size)

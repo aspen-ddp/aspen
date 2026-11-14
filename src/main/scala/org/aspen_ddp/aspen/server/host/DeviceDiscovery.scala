@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
 import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, Host, StorageDeviceConfig, StorageDeviceManager,
   StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlLocked}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlLocked, CrlSizingMismatch}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -523,6 +523,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  CRL is opened. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
    *  A corrupt CRL (CrlCorrupt) is lost too, logged under its own cause.
    *  A CRL another writer holds open (CrlLocked) is never lost: it is rethrown each time, uncounted.
+   *  Nor is a CRL whose files do not match the sizing it recorded (CrlSizingMismatch): configuration cannot cause that,
+   *  so it is a hand edit or damage of the directory, never by itself proof that the state is gone. The device is
+   *  refused (left unloaded, an error logged once) until an operator repairs it (systemic-loss-protection.md S6, M6).
    *  A device without stores simply gets its CRL created. */
   private def openDeviceCrl(devicePath: os.Path,
                             sdCfg: StorageDeviceConfig,
@@ -543,6 +546,14 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             // Another writer has the files open: a double mount, or a host still running that this one adopted from.
             // Its CRL is in use, not lost, so nothing is marked or moved aside, and the next scan retries
             transientCrlFailures -= devicePath
+            throw t
+          case t: CrlSizingMismatch =>
+            transientCrlFailures -= devicePath
+            if !reportedDirs.contains(devicePath) then
+              reportedDirs += devicePath
+              logger.error(s"Refusing to load storage device $devicePath: its CRL does not match the sizing it was " +
+                           s"created with. Its stores are not declared lost. Restore the CRL directory's stream " +
+                           s"files and sizing file, then the next scan loads it: $t")
             throw t
           case t: Throwable =>
             if storeDirs.isEmpty then

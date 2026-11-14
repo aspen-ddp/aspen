@@ -227,7 +227,11 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
   private def overwriteTxd(id: TransactionId, leader: Byte, pool: PoolId = poolId): TransactionDescription =
     val p = DataObjectPointer(oid, pool, Array[Byte]())
-    TransactionDescription(id, HLCTimestamp.now, p, leader,
+    // A few ms ahead of now, so it starts after the stores this host loaded before it was built, even within their
+    // load millisecond (Frontend.loadedAt: a store refuses a transaction started before its load). Well inside
+    // MaxStartLead
+    val start = HLCTimestamp(HLCTimestamp.now.asLong + (5L << 16))
+    TransactionDescription(id, start, p, leader,
       List(DataUpdate(p, rev0, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida, Map(pool -> ida))
 
   /** A RocksDB store `sid` in `deviceDir` holding the suite's object at rev0 */

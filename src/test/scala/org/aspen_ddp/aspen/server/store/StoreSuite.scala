@@ -37,13 +37,14 @@ class StoreSuite extends AnyFunSuite with Matchers:
   private def mkStore(id: StoreId, statusCache: TransactionStatusCache, heartbeatTimeout: Duration,
                       backendOverride: Option[MapBackend] = None,
                       backgroundTasks: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager,
-                      driverFactory: TransactionDriver.Factory = TransactionDriver.noErrorRecoveryFactory) =
+                      driverFactory: TransactionDriver.Factory = TransactionDriver.noErrorRecoveryFactory,
+                      loadedAt: Option[Long] = FrontendSuite.longLoaded) =
     val backend = backendOverride.getOrElse(new MapBackend(id))
     val net = new TestNet
     val crl = new TestCrl
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.global, backend,
       new HostObjectCache(1024 * 1024).forStore(id), net, backgroundTasks, crl, statusCache,
-      null, driverFactory, heartbeatTimeout, None)
+      null, driverFactory, heartbeatTimeout, None, loadedAt = loadedAt)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     val os = mkObjectState(oid1)
     backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
@@ -131,7 +132,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
   test("the designated leader starts no driver for a prepare below its forget floor") {
     // Started before the store loaded: below its floor, and unknown to it
     val start = HLCTimestamp((System.currentTimeMillis() - 1000) << 16)
-    val (store, net, crl) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS))
+    val (store, net, crl) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS),
+      loadedAt = Some(System.currentTimeMillis()))
     val old = TxPrepare(leader, leader, txd.copy(startTimestamp = start),
       ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient = true)
     store.receiveTransactionMessage(old)
@@ -247,7 +249,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     // Parasitic: the driver's finalizer completion runs inline, so the test sees its TxFinalized
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.parasitic, backend, cache, net,
       BackgroundTaskManager.NoBackgroundTaskManager, crl, new TransactionStatusCache(), finalizer,
-      TransactionDriver.noErrorRecoveryFactory, Duration.Zero, None, unackedLookup = lookup)
+      TransactionDriver.noErrorRecoveryFactory, Duration.Zero, None, unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     (store, net, finalizer, lookup, backend)
 

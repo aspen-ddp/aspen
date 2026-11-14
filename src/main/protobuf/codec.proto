@@ -285,6 +285,7 @@ message TxStatusRequest {
   StoreId from = 2;
   UUID transaction_uuid = 3;
   UUID request_uuid = 4;
+  uint64 start_timestamp = 5;
 }
 
 message TxStatusResponse {
@@ -296,6 +297,7 @@ message TxStatusResponse {
   bool have_status = 6;
   bool is_finalized = 7;
   bool late = 8;
+  bool holds_acceptor_state = 9;
 }
 
 message TxUnknownStore {

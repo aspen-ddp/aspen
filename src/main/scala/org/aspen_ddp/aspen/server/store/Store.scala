@@ -48,7 +48,9 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** How long a Tx waits for its client's prepare (Frontend.missingDataWait). A test seam */
             missingDataWait: Duration = Frontend.MissingDataWait,
             /** How long after its start a transaction may be joined (Frontend.horizon) */
-            horizon: FiniteDuration = TransactionHorizon.Horizon) extends Logging {
+            horizon: FiniteDuration = TransactionHorizon.Horizon,
+            /** When the store was loaded (Frontend.loadedAt). None: now. A test seam */
+            loadedAt: Option[Long] = None) extends Logging {
 
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
@@ -57,7 +59,8 @@ class Store(val storageDeviceId: StorageDeviceId,
     post = postToStore match
       case None => task => task()
       case Some(postTo) => task => postTo(s => if s eq this then task()),
-    acceptorSince = acceptorSince, deferRecovery = deferRecovery, horizon = horizon)
+    acceptorSince = acceptorSince, deferRecovery = deferRecovery, horizon = horizon,
+    loadedAt = loadedAt)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's

@@ -4,7 +4,7 @@ import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, OpportunisticRebuild, ReadResponse, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, OpportunisticRebuild, ReadResponse, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, FullObject, Insert, Key, KeySet, KeyValueOperation, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -41,6 +41,9 @@ object FrontendSuite {
   val clientId = ClientId(new UUID(0,4))
   val txid1 = TransactionId(new UUID(0,5))
   val txid2 = TransactionId(new UUID(0,6))
+  /** Loaded long before any test transaction starts: the default (construction time) would refuse a transaction
+    * built in the same millisecond before the Frontend. Tests of the load floor pass their own */
+  val longLoaded: Option[Long] = Some(0L)
   val rev0 = new ObjectRevision(new UUID(0, 7))
   val ida = Replication(3, 2)
   val op1 = DataObjectPointer(oid1, poolId, Array[Byte]())
@@ -209,7 +212,7 @@ object FrontendSuite {
     val backend = new MapBackend(storeId)
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val frontend = new Frontend(storeId, backend, cache, new TestNet, new TestCrl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     (frontend, backend, cache)
 
   /** Like mkFrontend but also returns the TestNet and routes backend completions to the Frontend */
@@ -218,7 +221,7 @@ object FrontendSuite {
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, cache, net, new TestCrl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, backend, cache, net)
 
@@ -399,7 +402,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
           Right(CommitError.IOFailure))))
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, new TransactionStatusCache())
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
 
     val os = mkObjectState(oid1)
@@ -464,7 +467,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
     val crl = new TestCrl
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), None, missingDataWait)
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), None, missingDataWait, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     val os = mkObjectState(oid1)
     backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
@@ -678,7 +681,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
     val crl = new TestCrl
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
       DataBuffer(appliedData))
@@ -735,7 +738,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val net = new TestNet
     val crl = new TestCrl
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
       DataBuffer(appliedData))
@@ -758,7 +761,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.deferReads = true
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
       DataBuffer(appliedData))
@@ -779,7 +782,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val net = new TestNet
     val crl = new TestCrl
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
-      statusCache)
+      statusCache, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
       DataBuffer(appliedData))
@@ -813,7 +816,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
     val net = new TestNet
     // No vote and no client prepare: it answers a driver's prepare only once the wait for the client's is over
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), None, Duration.Zero)
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), None, Duration.Zero, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
 
     val p = driverPrepare(dataUpdateTxd)
@@ -834,7 +837,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.deferReads = true
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
       DataBuffer(appliedData))
@@ -852,7 +855,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val backend = new MapBackend(storeId)
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
-      statusCache)
+      statusCache, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
       DataBuffer(appliedData))
@@ -908,7 +911,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val backend = new MapBackend(storeId)
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
-      statusCache)
+      statusCache, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)),
       DataBuffer(appliedData))
@@ -1137,7 +1140,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val net = new TestNet
     val crl = new TestCrl
     val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
-      acceptorSince = Some(ahead(FiniteDuration(10, SECONDS))))
+      acceptorSince = Some(ahead(FiniteDuration(10, SECONDS))), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
     val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ahead(FiniteDuration(11, SECONDS)))
@@ -1153,7 +1156,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val backend = new MapBackend(storeId)
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
     val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ahead(FiniteDuration(3600, SECONDS)))
@@ -1182,7 +1185,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, new TransactionStatusCache(),
-      wallClockMillis = () => clock)
+      wallClockMillis = () => clock, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
     val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp((clock + 60000) << 16))
@@ -1432,7 +1435,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         handler.foreach(_.complete(Commit(storeId, state.objectId, transactionId, Right(CommitError.IOFailure))))
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
     (frontend, backend, net)
@@ -1627,7 +1630,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
-      unackedLookup = lookup)
+      unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, net)
@@ -1786,7 +1789,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("locks are honoured by a store without an object cache") {
     val backend = new MapBackend(storeId)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, ObjectCache.NoCache, net, new TestCrl, new TransactionStatusCache())
+    val frontend = new Frontend(storeId, backend, ObjectCache.NoCache, net, new TestCrl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
 
@@ -1807,7 +1810,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val crl = new TestCrl:
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = recoverable
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     frontend.awaitRecovery()
 
@@ -1865,7 +1868,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = recoverable
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     frontend.awaitRecovery()
 
@@ -1891,7 +1894,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val backend = new MapBackend(storeId)
     populate(backend)
     val f = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet, crl,
-      new TransactionStatusCache(), deferRecovery = true)
+      new TransactionStatusCache(), deferRecovery = true, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => f.backendOperationComplete(op))
     frontend = Some(f)
 
@@ -1908,14 +1911,14 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val crl = new TestCrl:
       override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = Set(txid1)
     val f = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet, crl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     f.hasAppliedStub(txid1) shouldBe true
     f.hasAppliedStub(txid2) shouldBe false
     f.transactions shouldBe empty
 
     // Deferred, as a host recovers: from the state it read
     val deferred = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
-      new TestCrl, new TransactionStatusCache(), deferRecovery = true)
+      new TestCrl, new TransactionStatusCache(), deferRecovery = true, loadedAt = FrontendSuite.longLoaded)
     deferred.hasAppliedStub(txid2) shouldBe false
     deferred.recover(StoreRecoveryState(Nil, Set(txid2)))
     deferred.hasAppliedStub(txid2) shouldBe true
@@ -1930,7 +1933,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val crl = new TestCrl
     crl.holdStubSaves = true
     val f = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet, crl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     var durable = false
     f.recordAppliedStub(txid1) { durable = true }
     f.hasAppliedStub(txid1) shouldBe true
@@ -1955,7 +1958,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         List(commitVote(txid1, List(overwrite(op1))))
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
 
     sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
@@ -1982,7 +1985,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         List(commitVote(txid1, List(overwrite(op1))))
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
 
     frontend.readObjectForNetwork(clientId, new UUID(1, 1), op1, FullObject())
@@ -2003,7 +2006,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
         List(commitVote(txid1, List(overwrite(op1))))
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
-      crl, new TransactionStatusCache())
+      crl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
 
     val snap = RepairSnapshot.missing(oid1)
@@ -2047,7 +2050,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
     cache.insert(os)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
 
     sendPrepare(frontend, lockTxd(txid1, List(stale)))
@@ -2061,7 +2064,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         List(commitVote(txid1, List(overwrite(op1))))
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
 
     sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
@@ -2090,7 +2093,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val crl = new TestCrl:
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = recoverable
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     frontend.awaitRecovery()
 
@@ -2119,7 +2122,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         recoveryState(txid2, List(overwrite(op1)), TransactionDisposition.Undetermined))
     val net = new TestNet
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     // The shared read of op1 is dispatched to the newest waiter, the undetermined transaction, first
     backend.deliver()
@@ -2139,7 +2142,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
           List(recoveryState(txid1, List(overwrite(op1)), TransactionDisposition.VoteCommit))
       val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
-        crl, new TransactionStatusCache())
+        crl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
       backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
       backend.deliver()
       frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false, late = false, proof = false))
@@ -2177,7 +2180,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = stubs
     val net = new TestNet
     val lookup = new ManualLookup
-    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup)
+    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, backend, net, crl, lookup)
@@ -2246,7 +2249,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, cache, new TestNet, crl, new TransactionStatusCache(),
-      unackedLookup = lookup)
+      unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     lookup.requests shouldBe List(unackedTxid)
@@ -2441,7 +2444,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = stubs
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
-      statusCache, unackedLookup = lookup)
+      statusCache, unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, backend, net, crl, lookup)
@@ -2790,7 +2793,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       backend.bootstrapAllocate(p.id, os.objectType, os.metadata, os.data)
     val cache = new HostObjectCache(cacheBytes).forStore(storeId)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache)
+    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, backend, cache, net)
 
@@ -3160,7 +3163,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     populate(backend)
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, ObjectCache.NoCache, net, new TestCrl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     backend.deferRepairs = true
 
@@ -3332,7 +3335,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val crl = new TestCrl:
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = saved
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet, crl,
-      new TransactionStatusCache())
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     frontend.transactions.contains(txid1) shouldBe true
   }
@@ -3650,7 +3653,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val store = new Store(StorageDeviceId(new UUID(0, 99)), scala.concurrent.ExecutionContext.parasitic, backend,
       new HostObjectCache(1024 * 1024).forStore(storeId), net, BackgroundTaskManager.NoBackgroundTaskManager, crl,
       new TransactionStatusCache(), null, TransactionDriver.noErrorRecoveryFactory, Duration(60, SECONDS), None,
-      admission)
+      admission, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     (store, backend, net)
 
@@ -3729,7 +3732,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val backend = new MapBackend(storeId)
     populate(backend)
     val recovering = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
-      new TestCrl, new TransactionStatusCache(), admission = full, deferRecovery = true)
+      new TestCrl, new TransactionStatusCache(), admission = full, deferRecovery = true, loadedAt = FrontendSuite.longLoaded)
     recovering.recover(StoreRecoveryState(Nil, Set(txid1, txid2)))
     full.admittedBytes shouldBe 1 + 2 * CrlAdmission.AppliedStubBytes
     recovering.releaseAllAdmissions()
@@ -3903,7 +3906,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val net = new TestNet
     val store = new Store(StorageDeviceId(new UUID(0, 99)), scala.concurrent.ExecutionContext.parasitic, backend,
       new HostObjectCache(1024 * 1024).forStore(storeId), net, BackgroundTaskManager.NoBackgroundTaskManager,
-      new TestCrl, statusCache, null, TransactionDriver.noErrorRecoveryFactory, Duration(60, SECONDS), None, admission)
+      new TestCrl, statusCache, null, TransactionDriver.noErrorRecoveryFactory, Duration(60, SECONDS), None, admission, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
 
@@ -3941,7 +3944,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val net = new TestNet
     val store = new Store(StorageDeviceId(new UUID(0, 99)), scala.concurrent.ExecutionContext.parasitic, backend,
       new HostObjectCache(1024 * 1024).forStore(storeId), net, BackgroundTaskManager.NoBackgroundTaskManager,
-      new TestCrl, statusCache, null, TransactionDriver.noErrorRecoveryFactory, Duration(60, SECONDS), None, admission)
+      new TestCrl, statusCache, null, TransactionDriver.noErrorRecoveryFactory, Duration(60, SECONDS), None, admission, loadedAt = FrontendSuite.longLoaded)
 
     store.receiveTransactionMessage(dataPrepare(ledTxd(txid1, List(overwrite(op1)))))
     net.sentTx.collect { case f: TxFinalized => f.transactionId } shouldBe List(txid1)
@@ -3977,7 +3980,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     cache.insert(mkObjectState(oid1))
     val frontend = new Frontend(storeId, backend, cache, new TestNet, crl, new TransactionStatusCache(),
-      admission = admission, unackedLookup = lookup)
+      admission = admission, unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, crl, CrlAdmission.TxOverheadBytes + trs.serializedTxd.size + CrlAdmission.objectUpdateBytes(3))
@@ -4018,7 +4021,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     cache.insert(mkObjectState(oid1))
     val frontend = new Frontend(storeId, backend, cache, new TestNet, crl, new TransactionStatusCache(),
-      admission = admission)
+      admission = admission, loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     frontend.awaitRecovery()
 
@@ -4030,5 +4033,66 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.recover(StoreRecoveryState(recoverable))
     frontend.transactions.contains(txid1) shouldBe true
     admission.admittedBytes shouldBe admissionBytes(p1)
+  }
+
+  // ---- Status query: every store answers (spec section 2) ----
+
+  private val reqUUID = new UUID(1, 99)
+  private def statusRequest(startTimestamp: HLCTimestamp): TxStatusRequest =
+    TxStatusRequest(storeId, StoreId(poolId, 1), txid1, reqUUID, startTimestamp)
+  private def statusResponses(net: TestNet): List[TxStatusResponse] =
+    net.sentTx.collect { case r: TxStatusResponse => r }
+
+  test("a store holding T answers a status request with its status and acceptor state") {
+    withFloorFrontend(): (frontend, _, net, _) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = startedAgo(1_000))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      net.sentTx = Nil
+      frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
+
+      statusResponses(net).map(r => (r.to, r.requestUUID, r.status)) shouldBe
+        List((StoreId(poolId, 1), reqUUID,
+          Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
+            holdsAcceptorState = true))))
+  }
+
+  test("a store with only a cached outcome answers with it") {
+    val statusCache = new TransactionStatusCache(wallClockMillis = () => floorNow)
+    withFloorFrontend(statusCache = statusCache): (frontend, _, net, _) =>
+      // Above the floor: only the cached outcome makes it answer
+      statusCache.updateStatus(txid1, TransactionStatus.Committed, finalized = true, late = true)
+      frontend.receiveTransactionMessage(statusRequest(startedAgo(1_000)))
+
+      statusResponses(net).map(_.status) shouldBe
+        List(Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = true, late = true,
+          holdsAcceptorState = false)))
+  }
+
+  test("a store that neither holds nor remembers T answers unknown only below its floor") {
+    withFloorFrontend(): (frontend, _, net, _) =>
+      frontend.receiveTransactionMessage(statusRequest(startedAgo(5_000)))
+      net.sentTx shouldBe empty
+
+      frontend.receiveTransactionMessage(statusRequest(startedAgo(21_000)))
+      statusResponses(net).map(r => (r.transactionId, r.status)) shouldBe List((txid1, None))
+  }
+
+  test("an Unresolved cache entry counts as no entry for a status request") {
+    val statusCache = new TransactionStatusCache(wallClockMillis = () => floorNow)
+    withFloorFrontend(statusCache = statusCache): (frontend, _, net, _) =>
+      statusCache.updateStatus(txid1, TransactionStatus.Unresolved, finalized = false)
+      frontend.receiveTransactionMessage(statusRequest(startedAgo(5_000)))
+      net.sentTx shouldBe empty
+  }
+
+  test("a muted Tx answers with holdsAcceptorState = false") {
+    withAcceptorSince(): (frontend, backend, net, _) =>
+      // The muted prover of a transaction older than the acceptor whose update the store shows
+      appliedKVPrepare(frontend, backend, FiniteDuration(3, SECONDS))
+      val txd = frontend.transactions(txid1).txd
+      frontend.transactions(txid1).muted shouldBe true
+      frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
+
+      statusResponses(net).map(_.status.map(_.holdsAcceptorState)) shouldBe List(Some(false))
   }
 }

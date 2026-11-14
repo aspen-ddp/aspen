@@ -338,7 +338,8 @@ final case class TxStatusRequest(
                                   to: StoreId,
                                   from: StoreId,
                                   transactionId: TransactionId,
-                                  requestUUID: UUID) extends TxMessage:
+                                  requestUUID: UUID,
+                                  startTimestamp: HLCTimestamp) extends TxMessage:
   override def toString: String = f"TxStatusRequest to $to from $from tx $transactionId request $requestUUID"
 
 final case class TxStatusResponse(
@@ -350,6 +351,10 @@ final case class TxStatusResponse(
   override def toString: String = f"TxStatusResponse to $to from $from tx $transactionId request $requestUUID status $status"
 
 object TxStatusResponse {
-  case class TxStatus(status: TransactionStatus.Value, finalized: Boolean, late: Boolean)
+  /** `holdsAcceptorState`: the replying store has a Tx for the transaction that takes part in Paxos (not muted).
+    * A response with no status means: not held, not remembered, and below the store's forget floor, so it can never
+    * join the transaction
+    */
+  case class TxStatus(status: TransactionStatus.Value, finalized: Boolean, late: Boolean, holdsAcceptorState: Boolean)
 }
 

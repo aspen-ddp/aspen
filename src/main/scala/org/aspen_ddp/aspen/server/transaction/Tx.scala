@@ -1147,7 +1147,7 @@ class Tx( trs: TransactionRecoveryState,
 
   def receiveStatusRequest(m: TxStatusRequest): Unit = {
     val r = TxStatusResponse(m.from, storeId, transactionId, m.requestUUID,
-      Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = lateOutcome)))
+      Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = lateOutcome, holdsAcceptorState = !muted)))
     net.sendTransactionMessage(r)
   }
 

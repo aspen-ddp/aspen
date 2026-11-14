@@ -671,18 +671,19 @@ object Codec extends Logging:
       to = Some(encode(o.to)),
       from = Some(encode(o.from)),
       transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
-      requestUuid = Some(encodeUUID(o.requestUUID))
+      requestUuid = Some(encodeUUID(o.requestUUID)),
+      startTimestamp = o.startTimestamp.asLong
     )
 
   def decode(m: codec.TxStatusRequest): TxStatusRequest =
     TxStatusRequest(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
-      decodeUUID(m.requestUuid.get))
+      decodeUUID(m.requestUuid.get), HLCTimestamp(m.startTimestamp))
 
 
   def encode(o: TxStatusResponse): codec.TxStatusResponse =
-    val (haveStatus, isFinalized, late, status) = o.status match
-      case None => (false, false, false, codec.TransactionStatus.TRANSACTION_STATUS_UNRESOLVED)
-      case Some(stat) => (true, stat.finalized, stat.late, encodeTransactionStatus(stat.status))
+    val (haveStatus, isFinalized, late, holds, status) = o.status match
+      case None => (false, false, false, false, codec.TransactionStatus.TRANSACTION_STATUS_UNRESOLVED)
+      case Some(stat) => (true, stat.finalized, stat.late, stat.holdsAcceptorState, encodeTransactionStatus(stat.status))
 
     codec.TxStatusResponse(
       to = Some(encode(o.to)),
@@ -692,12 +693,13 @@ object Codec extends Logging:
       haveStatus = haveStatus,
       isFinalized = isFinalized,
       late = late,
+      holdsAcceptorState = holds,
       status = status
     )
 
   def decode(m: codec.TxStatusResponse): TxStatusResponse =
     val status = if m.haveStatus then
-      Some(TxStatusResponse.TxStatus(decodeTransactionStatus(m.status), m.isFinalized, m.late))
+      Some(TxStatusResponse.TxStatus(decodeTransactionStatus(m.status), m.isFinalized, m.late, m.holdsAcceptorState))
     else
       None
 

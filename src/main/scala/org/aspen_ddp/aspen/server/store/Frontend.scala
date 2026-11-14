@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
+import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
@@ -119,7 +119,9 @@ class Frontend(val storeId: StoreId,
   /** The transaction started below the forget floor: a prepare for it, unless the store holds it or the status cache
     * knows its outcome, is refused (receivePrepare), and its designated leader does not drive it (Store)
     */
-  def belowForgetFloor(txd: TransactionDescription): Boolean = txd.startTimestamp.wallTime < forgetFloorMillis
+  def belowForgetFloor(txd: TransactionDescription): Boolean = belowForgetFloor(txd.startTimestamp)
+
+  def belowForgetFloor(startTimestamp: HLCTimestamp): Boolean = startTimestamp.wallTime < forgetFloorMillis
 
   /** Written only on the store's executor. `@volatile` so that `mayHoldTransaction` may read one snapshot of it from
     * another thread (the repair scan), as Store.hasTransactions reads `transactionDrivers`
@@ -834,9 +836,22 @@ class Frontend(val storeId: StoreId,
             // Txs take the stub
             transactionFinalized(m.transactionId, writeStub = true)
     case m: TxHeartbeat => transactions.get(m.transactionId).foreach(tx => tx.receiveHeartbeat(m))
-    case m: TxStatusRequest => transactions.get(m.transactionId).foreach(tx => tx.receiveStatusRequest(m))
+    case m: TxStatusRequest =>
+      transactions.get(m.transactionId) match
+        case Some(tx) => tx.receiveStatusRequest(m)
+        case None => receiveStatusRequestWithoutTx(m)
     case _ => // Other TxMessages are not relevant
   }
+
+  /** A store with no Tx answers with a cached outcome, or "unknown" when it can never join the transaction (below its
+    * forget floor, so the answer is permanent). Above the floor it could still create a Tx: no reply
+    */
+  private def receiveStatusRequestWithoutTx(m: TxStatusRequest): Unit =
+    val reply = statusCache.getStatus(m.transactionId).filter(_.status != TransactionStatus.Unresolved) match
+      case Some(e) => Some(TxStatusResponse.TxStatus(e.status, e.finalized, e.late, holdsAcceptorState = false))
+      case None if belowForgetFloor(m.startTimestamp) => None
+      case None => return
+    net.sendTransactionMessage(TxStatusResponse(m.from, storeId, m.transactionId, m.requestUUID, reply))
 
   private def receivePrepare(m: TxPrepare): Unit = transactions.get(m.txd.transactionId) match {
     case Some(tx) =>

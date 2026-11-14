@@ -61,6 +61,13 @@ class SimpleFileRootManager(client: AspenClient,
     p.future
   
 
+  def readStoredRoot(): Future[Root] =
+    client.read(inodePointer).map: inodeDos =>
+      try
+        FileInode(client, inodeDos.data).contents
+      catch
+        case cause: Throwable => throw new InvalidRoot(cause)
+
   def getTree(): Future[TieredKeyValueList] = Future.successful(new TieredKeyValueList(client, this))
 
   def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = 

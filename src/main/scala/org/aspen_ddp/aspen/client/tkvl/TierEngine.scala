@@ -177,11 +177,14 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
     resume(None, 0)
 
-  /** Hands every node of every tier to `fn` as `(tier, pointer)`, once each. Reads a fresh root, finds each tier's
+  /** Hands every node of every tier to `fn` as `(tier, pointer)`, once each. Reads the stored root
+    * (`readStoredRoot`, not `getFreshRootNode`, whose empty-tree fallback would report a root a reduction just
+    * deleted as a complete walk of an empty tree) and its root node, finds each tier's
     * leftmost node by following `Key.AbsoluteMinimum` down from it, and walks each tier left to right through its
     * links, from the root's tier down to tier 0. Nothing is read from the cache.
     *
-    * A read failing with InvalidObject means a join, tail removal or root reduction deleted the node: that tier's
+    * A read failing with InvalidObject, the root node's included, means a join, tail removal or root reduction
+    * deleted the node: that tier's
     * walk ends (and, on the descent, so do the walks of the tiers below it), and the result is `complete = false`.
     * The other tiers are still walked. A failing `fn` is logged and the walk continues, as in `foreach`. Any other
     * read failure fails the result.
@@ -232,16 +235,19 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
         case Nil => Future.unit
         case (tier, node) :: rest => walkTier(encoding, tier, node).flatMap(_ => walkTiers(encoding, rest))
 
-    rootManager.getFreshRootNode().flatMap: (rootTier, _, oroot) =>
-      oroot match
+    rootManager.readStoredRoot().flatMap: stored =>
+      stored.orootObject match
         case None => Future.successful(NodeWalk(0, complete = true))
-        case Some(root) =>
-          val encoding = encodingFor(root)
-          for
-            tiers <- leftmostNodes(encoding, rootTier, root)
-            _ <- walkTiers(encoding, tiers)
-          yield
-            NodeWalk(visited, complete)
+        case Some(rootPointer) =>
+          val encoding = NodeEncoding(stored.kind)
+          read(encoding, rootPointer, Key.AbsoluteMinimum, stored.ordering, s"root node ${rootPointer.id}").flatMap:
+            case None => Future.successful(NodeWalk(visited, complete))
+            case Some(root) =>
+              for
+                tiers <- leftmostNodes(encoding, stored.tier, root)
+                _ <- walkTiers(encoding, tiers)
+              yield
+                NodeWalk(visited, complete)
 
   /** Reads the node `link` points to, the right neighbour of `node`. `label` names the walk, for diagnostics. */
   private def readRight(node: ListNode, link: NodeLink, label: String): Future[ListNode] =

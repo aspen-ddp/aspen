@@ -62,6 +62,16 @@ class KVObjectRootManager(val client: AspenClient,
     p.future
   }
 
+  def readStoredRoot(): Future[Root] =
+    client.read(pointer, s"Object hosting TKVL Root for tree $treeKey").map: container =>
+      container.contents.get(treeKey) match
+        case None => throw new InvalidRoot
+        case Some(v) =>
+          try
+            Root(client, v.value.bytes)
+          catch
+            case cause: Throwable => throw new InvalidRoot(cause)
+
   def getTree(): Future[TieredKeyValueList] = getRData().map { rd =>
     new TieredKeyValueList(client, this)
   }

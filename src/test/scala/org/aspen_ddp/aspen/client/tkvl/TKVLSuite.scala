@@ -497,6 +497,7 @@ class TKVLSuite extends IntegrationTestSuite {
     def cache: TierCache = real.cache
     def getRoot(): Future[Root] = real.getRoot()
     def getFreshRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = real.getFreshRootNode()
+    def readStoredRoot(): Future[Root] = real.readStoredRoot()
     def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] =
       if served then
         real.getKeyValueRootNode()
@@ -507,6 +508,27 @@ class TKVLSuite extends IntegrationTestSuite {
       real.createInitialNode(contents)
     def getAllocatorForTier(tier: Int): Future[ObjectAllocator] =
       real.getAllocatorForTier(tier)
+    def getMaxNodeSize(tier: Int): Future[Int] = real.getMaxNodeSize(tier)
+    def prepareRootUpdate(newTier: Int, onewRoot: Option[ObjectPointer])
+                         (using tx: Transaction): Future[Unit] = real.prepareRootUpdate(newTier, onewRoot)
+    def encode(): Array[Byte] = real.encode()
+    def typeId: RootManagerTypeId = real.typeId
+
+  /** A root manager caught mid root reduction: the host object, read just before the reduction committed, still
+   *  names `deadRoot` at tier 1, but the reduction has deleted that node. `getFreshRootNode` answers as
+   *  KVObjectRootManager's read does when the root node cannot be read: an empty tree. Everything else defers to
+   *  `real`.
+   */
+  private class MidReductionRootManager(real: RootManager, deadRoot: ObjectPointer) extends RootManager:
+    def cache: TierCache = real.cache
+    def getRoot(): Future[Root] = real.getRoot()
+    def getRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = getFreshRootNode()
+    def getFreshRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] =
+      real.getRoot().map(r => (0, r.ordering, None))
+    def readStoredRoot(): Future[Root] = real.readStoredRoot().map(_.copy(tier = 1, orootObject = Some(deadRoot)))
+    def createInitialNode(contents: Map[Key, Value])(using tx: Transaction): Future[Unit] =
+      real.createInitialNode(contents)
+    def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = real.getAllocatorForTier(tier)
     def getMaxNodeSize(tier: Int): Future[Int] = real.getMaxNodeSize(tier)
     def prepareRootUpdate(newTier: Int, onewRoot: Option[ObjectPointer])
                          (using tx: Transaction): Future[Unit] = real.prepareRootUpdate(newTier, onewRoot)
@@ -960,5 +982,30 @@ class TKVLSuite extends IntegrationTestSuite {
       joined shouldBe true
       v2.isEmpty shouldBe false
       walk.complete shouldBe false
+  }
+
+  atest("foreachNode reports incomplete when a root reduction deletes the root node it is about to read") {
+    var visits = 0
+    for
+      (tree, root, _) <- buildSplitTree(3)
+      ikvos <- client.read(radicle)
+      pool <- client.getStoragePool(Radicle.poolId)
+      tx0 = TestTransactions.replaySafe(client.newTransaction())
+      _ = tx0.exclusiveLockRevision(radicle, ikvos.revision)
+      deadRoot <- pool.allocator.allocateKeyValueObject(Map[Key, Value]())(using tx0)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
+      state <- client.read(deadRoot)
+      tx1 = client.newTransaction()
+      _ = tx1.setRefcount(deadRoot, state.refcount, state.refcount.decrement())
+      _ <- tx1.commit()
+      _ <- waitForTransactionsToComplete()
+      midReduction = new TieredKeyValueList(client, new MidReductionRootManager(root, deadRoot))
+      walk <- midReduction.foreachNode: (_, _) =>
+        visits += 1
+        Future.unit
+    yield
+      visits shouldBe 0
+      walk shouldBe NodeWalk(0, complete = false)
   }
 }

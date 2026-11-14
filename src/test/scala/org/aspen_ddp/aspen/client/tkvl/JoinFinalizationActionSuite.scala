@@ -52,6 +52,7 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
     def getRoot(): Future[Root] = inner.getRoot()
     def getRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = inner.getRootNode()
     def getFreshRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = inner.getFreshRootNode()
+    def readStoredRoot(): Future[Root] = inner.readStoredRoot()
     def createInitialNode(contents: Map[Key, Value])(using tx: Transaction): Future[Unit] =
       inner.createInitialNode(contents)
     def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = inner.getAllocatorForTier(tier)

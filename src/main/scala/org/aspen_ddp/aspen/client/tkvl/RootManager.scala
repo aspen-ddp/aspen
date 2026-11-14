@@ -20,6 +20,12 @@ trait RootManager {
   /** getRootNode, bypassing the cache. The result refreshes the cache. */
   def getFreshRootNode(): Future[(Int, KeyOrdering, Option[ListNode])]
 
+  /** The root as stored in its host object, read fresh and never cached. Unlike `getFreshRootNode` it does not read
+   *  the root node, so it cannot mistake an unreadable root node (one a root reduction just deleted) for an empty
+   *  tree. A host read failure fails the result; an unparseable root fails it with InvalidRoot.
+   */
+  def readStoredRoot(): Future[Root]
+
   /** getRootNode for trees whose nodes are KeyValueObjects. */
   final def getKeyValueRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] =
     given ExecutionContext = ExecutionContext.parasitic

@@ -67,6 +67,13 @@ class SimpleDirectoryRootManager(client: AspenClient,
     p.future
   }
 
+  def readStoredRoot(): Future[Root] =
+    client.read(inodePointer).map: inodeDos =>
+      try
+        DirectoryInode(client, inodeDos.data).contents
+      catch
+        case cause: Throwable => throw new InvalidRoot(cause)
+
   def getTree(): Future[TieredKeyValueList] = getRData().map { rd =>
     new TieredKeyValueList(client, this)
   }

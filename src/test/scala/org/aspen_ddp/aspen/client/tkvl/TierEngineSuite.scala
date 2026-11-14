@@ -38,6 +38,7 @@ class TierEngineSuite extends IntegrationTestSuite:
     def getRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] =
       Future.successful((0, node.ordering, Some(node)))
     def getFreshRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = getRootNode()
+    def readStoredRoot(): Future[Root] = Future.failed(new NotImplementedError)
     def createInitialNode(contents: Map[Key, Value])(using tx: Transaction): Future[Unit] =
       Future.failed(new NotImplementedError)
     def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = Future.failed(new NotImplementedError)

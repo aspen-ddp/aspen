@@ -27,9 +27,10 @@
   the walk's snapshot, so a delete through it neither sees that it empties the node nor registers the upper-tier
   finalization actions
 - `foreachNode` (`TierEngine`, KV facade on `TieredKeyValueList`) hands `fn` every node of every tier as `(tier,
-  pointer)`: a fresh root, each tier's leftmost node by descent along `Key.AbsoluteMinimum`, then each tier left to
-  right through its links. It does not restart on joins: an `InvalidObject` ends that tier (the descent: the tiers
-  below too) and returns `NodeWalk(visited, complete = false)`, so a periodic caller (the repair sweep) retries on
+  pointer)`: the root as stored (`RootManager.readStoredRoot`, which, unlike `getFreshRootNode`, has no empty-tree
+  fallback for an unreadable root node) and its root node, each tier's leftmost node by descent along
+  `Key.AbsoluteMinimum`, then each tier left to right through its links. It does not restart on joins: an
+  `InvalidObject` ends that tier (the root node or the descent: the tiers below too) and returns `NodeWalk(visited, complete = false)`, so a periodic caller (the repair sweep) retries on
   its next pass. A failing `fn` is logged; other read failures fail the walk
 - A join absorbs a node's right neighbor, so a tier's rightmost node is never joined away. A join is also declined when
   the joined node would be larger than the neighbor, which happens when the emptied node's minimum is longer than the

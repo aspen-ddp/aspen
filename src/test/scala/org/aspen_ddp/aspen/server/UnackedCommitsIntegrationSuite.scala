@@ -38,7 +38,7 @@ import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
   * their fresh votes, dropping the update; now they refuse it, and without the UnackedCommits lookup the Tx would be
   * discarded by expiry, which waits for that lookup to find no entry.
   */
-class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
+class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scalatest.ParallelTestExecution:
 
   override def testIda: IDA = ReedSolomon(5, 3, 4)
 

@@ -27,7 +27,7 @@ import scala.util.{Failure, Success, Try}
   * ReplayIntegrationSuite's does. A second host (TestNetwork.newHost) stands in for one with its own status cache: one
   * a store was transferred to, or one restarted.
   */
-class HorizonIntegrationSuite extends IntegrationTestSuite:
+class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.ParallelTestExecution:
 
   override def testIda: IDA = ReedSolomon(5, 3, 4)
 

@@ -28,7 +28,7 @@ import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
   * again. The tests need only that their transactions' prepares reach every store within the horizon, which the test
   * thread's own deliveries do within milliseconds. Not below about 2 s, for slack under load
   */
-class ReplayIntegrationSuite extends IntegrationTestSuite:
+class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.ParallelTestExecution:
 
   override def testIda: IDA = ReedSolomon(5, 3, 4)
 

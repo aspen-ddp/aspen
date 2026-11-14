@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.network.{HostHeartbeat, OpportunisticRebuild}
+import org.aspen_ddp.aspen.common.network.{HostHeartbeat, TxPrepare}
 import org.aspen_ddp.aspen.common.network.tls.CertificateAuthority
 import io.netty.handler.codec.quic.{QuicSslContext, QuicSslContextBuilder}
 import org.aspen_ddp.aspen.common.network.tls.{AspenTrustManager, CertificateVerifier, InvalidPeerCertificate, Pem}
@@ -118,12 +118,12 @@ class QuicTlsSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll with
     srv.awaitReceived().message shouldBe small
 
     val payload = Array.tabulate[Byte](64 * 1024)(i => (i * 31).toByte)
-    val big = QuicNetFixture.rebuildOf(StoreId(PoolId.BootstrapPoolId, 0), payload)
+    val big = QuicNetFixture.dataMsgOf(StoreId(PoolId.BootstrapPoolId, 0), payload)
     QuicTestPeer.sendStream(ch, big)
     val s = srv.awaitReceived()
     s.transport shouldBe a [QuicTestPeer.Transport.Stream]
     s.message match
-      case m: OpportunisticRebuild => m.data.getByteArray shouldBe payload
+      case m: TxPrepare => QuicNetFixture.payloadOf(m).getByteArray shouldBe payload
       case other => fail(s"unexpected $other")
     srv.protocolErrors.isEmpty shouldBe true
 
@@ -194,7 +194,7 @@ class QuicTlsSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll with
     val srv = track(QuicTestPeer.server(QuicTls.serverContext(goodCreds()), config, stallStreams = true))
     val cli = track(QuicTestPeer.client(QuicTls.clientContext(goodCreds()), config))
     val ch = cli.connect(srv.localAddress).fold(t => fail(t), identity)
-    val msg = QuicNetFixture.rebuildOf(StoreId(PoolId.BootstrapPoolId, 0), new Array[Byte]((window * 2).toInt))
+    val msg = QuicNetFixture.dataMsgOf(StoreId(PoolId.BootstrapPoolId, 0), new Array[Byte]((window * 2).toInt))
     val stream = QuicTestPeer.openStream(ch)
     val write = QuicTestPeer.writeFrame(stream, msg)
     write.await(500) shouldBe false

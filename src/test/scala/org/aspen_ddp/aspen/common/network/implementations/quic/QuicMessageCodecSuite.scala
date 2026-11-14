@@ -51,15 +51,12 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
         Set(TransactionId(uuid(5)), TransactionId(uuid(6))))))
 
   /** A single-section message (the payload is its only out-of-band data section) */
-  private def rebuildMsg(data: DataBuffer): OpportunisticRebuild =
-    OpportunisticRebuild(storeId(1), ClientId(uuid(2)), dataPtr(3), rev(4), ObjectRefcount(1, 5),
-      HLCTimestamp(1000L), data)
+  private def rebuildMsg(data: DataBuffer): TxPrepare =
+    prepare(List(ObjectUpdate(ObjectId(uuid(7)), data)), Nil)
 
   private def fixtures: List[Message] = List(
     HostHeartbeat(HostId(uuid(1))),
     Read(storeId(10), ClientId(uuid(20)), uuid(30), dataPtr(1), FullObject()),
-    OpportunisticRebuild(storeId(1), ClientId(uuid(2)), dataPtr(3), rev(4), ObjectRefcount(1, 5),
-      HLCTimestamp(1000L), DataBuffer(bytes(20))),
     TransactionCompletionQuery(storeId(1), ClientId(uuid(2)), uuid(3), TransactionId(uuid(4))),
     ReadResponse(ClientId(uuid(1)), storeId(2), uuid(3), HLCTimestamp(1000L), Left(ReadError.ObjectNotFound)),
     readResponse(Some(DataBuffer(bytes(50)))),
@@ -152,16 +149,16 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val m = rebuildMsg(slice)
     val enc = QuicMessageCodec.encode(m, alloc)
     enc.size shouldBe 4 + enc.prefix.readableBytes() + 10
-    val decoded = streamRoundTrip(enc).toOption.get.msg.asInstanceOf[OpportunisticRebuild]
-    decoded.data.getByteArray.toList shouldBe arr.slice(5, 15).toList
+    val decoded = streamRoundTrip(enc).toOption.get.msg.asInstanceOf[TxPrepare]
+    decoded.objectUpdates.head.data.getByteArray.toList shouldBe arr.slice(5, 15).toList
 
     val enc2 = QuicMessageCodec.encode(m, alloc)
     val frame = enc2.toStreamFrame(alloc)
     val view = frame.retainedDuplicate()
-    val decoded2 = decodeFrame(view).toOption.get.msg.asInstanceOf[OpportunisticRebuild]
+    val decoded2 = decodeFrame(view).toOption.get.msg.asInstanceOf[TxPrepare]
     view.release()
     frame.release()
-    decoded2.data.getByteArray.toList shouldBe arr.slice(5, 15).toList
+    decoded2.objectUpdates.head.data.getByteArray.toList shouldBe arr.slice(5, 15).toList
 
   private def roundTrip(m: Message): Message =
     val enc = QuicMessageCodec.encode(m, alloc)
@@ -237,30 +234,27 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     nio.get(1999) shouldBe 77.toByte
     frame.release()
 
-  private def rebuild(data: DataBuffer): OpportunisticRebuild =
-    OpportunisticRebuild(storeId(1), ClientId(uuid(2)), dataPtr(3), rev(4), ObjectRefcount(1, 5),
-      HLCTimestamp(1000L), data)
+  private def rebuild(data: DataBuffer): TxPrepare = rebuildMsg(data)
 
-  test("OpportunisticRebuild data travels as its one section, outside the protobuf header"):
+  test("a one-update TxPrepare carries its data as its one section, outside the protobuf header"):
     val m = rebuild(DataBuffer(bytes(5000)))
     val enc = QuicMessageCodec.encode(m, alloc)
     enc.sections.length shouldBe 1
     enc.sections(0).size shouldBe 5000
     val p = QuicMessageCodec.parsePrefix(enc.prefix).toOption.get
     p.sectionSizes.toList shouldBe List(5000)
-    p.header.msg.opportunisticRebuild.get.data.size() shouldBe 0
     val frame = enc.toStreamFrame(alloc)
     val result = decodeFrame(frame)
     frame.release()
     result.map(_.msg) shouldBe Right(m)
 
-  test("OpportunisticRebuild with empty data round-trips"):
+  test("a one-update TxPrepare with empty data round-trips"):
     val m = rebuild(DataBuffer.Empty)
     val enc = QuicMessageCodec.encode(m, alloc)
     val result = streamRoundTrip(enc)
     result.map(_.msg) shouldBe Right(m)
 
-  test("OpportunisticRebuild send path does not copy its data"):
+  test("a one-update TxPrepare send path does not copy its data"):
     val arr = bytes(2000)
     val enc = QuicMessageCodec.encode(rebuild(DataBuffer(arr)), alloc)
     val frame = enc.toStreamFrame(alloc).asInstanceOf[CompositeByteBuf]
@@ -273,7 +267,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     nio.get(1999) shouldBe 77.toByte
     frame.release()
 
-  test("OpportunisticRebuild requires exactly one section"):
+  test("a one-update TxPrepare requires exactly one section"):
     val enc = QuicMessageCodec.encode(rebuild(DataBuffer(bytes(8))), alloc)
     val p = QuicMessageCodec.parsePrefix(enc.prefix).toOption.get
     enc.release()

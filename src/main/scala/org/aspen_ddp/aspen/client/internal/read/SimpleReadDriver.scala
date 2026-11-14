@@ -20,10 +20,9 @@ object SimpleReadDriver {
                ida: IDA,
                readUUID:UUID,
                comment: String,
-               disableOpportunisticRebuild: Boolean,
                readType: ReadType): ReadDriver = {
       new SimpleReadDriver(initialDelay, maxDelay, client,
-        objectPointer, ida, readUUID, comment, disableOpportunisticRebuild, readType)
+        objectPointer, ida, readUUID, comment, readType)
     }
   }
 }
@@ -40,9 +39,8 @@ class SimpleReadDriver(
                         ida: IDA,
                         readUUID:UUID,
                         comment: String,
-                        disableOpportunisticRebuild: Boolean,
                         readType: ReadType = FullObject()) extends BaseReadDriver( client,
-  objectPointer, ida, readUUID, comment, disableOpportunisticRebuild, readType) {
+  objectPointer, ida, readUUID, comment, readType) {
 
   given ec: ExecutionContext = client.clientContext
 

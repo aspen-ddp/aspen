@@ -7,11 +7,13 @@ import io.netty.util.ResourceLeakDetector
 import io.netty.util.concurrent.{Future as NFuture, GenericFutureListener}
 import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild}
+import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.network.TxPrepare
+import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.common.network.tls.CertificateAuthority
 import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach}
 import org.scalatest.funsuite.AnyFunSuite
@@ -77,7 +79,7 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
         fail(f.cause())
       f.getNow
 
-    def submit(m: OpportunisticRebuild): (Boolean, QuicMessageCodec.Encoded) =
+    def submit(m: TxPrepare): (Boolean, QuicMessageCodec.Encoded) =
       val enc = QuicMessageCodec.encode(m, PooledByteBufAllocator.DEFAULT)
       (conn.submit(enc), enc)
 
@@ -113,7 +115,7 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
         fail(s"timed out waiting for $what")
       Thread.sleep(5)
 
-  private def seqOf(r: Received): Long = r.message.asInstanceOf[OpportunisticRebuild].pointer.id.uuid.getLeastSignificantBits
+  private def seqOf(r: Received): Long = r.message.asInstanceOf[TxPrepare].objectUpdates.head.objectId.uuid.getLeastSignificantBits
 
   private def streamId(r: Received): Long = r.transport match
     case Transport.Stream(id) => id
@@ -256,10 +258,10 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val (ok, enc) = fx.submit(msg)
     ok shouldBe true
     val r = fx.srv.awaitReceived()
-    val got = r.message.asInstanceOf[OpportunisticRebuild]
-    got.pointer.id shouldBe msg.pointer.id
-    got.data.size shouldBe msg.data.size
-    java.util.Arrays.equals(got.data.getByteArray, msg.data.getByteArray) shouldBe true
+    val got = r.message.asInstanceOf[TxPrepare].objectUpdates.head
+    got.objectId shouldBe msg.objectUpdates.head.objectId
+    got.data.size shouldBe msg.objectUpdates.head.data.size
+    java.util.Arrays.equals(got.data.getByteArray, msg.objectUpdates.head.data.getByteArray) shouldBe true
     enc.prefix.refCnt() shouldBe 0
     fx.conn.drops shouldBe 0
 
@@ -473,15 +475,20 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
 
 object QuicConnectionSuite:
   private val toStore = StoreId(PoolId.BootstrapPoolId, 0)
-  private val fromClient = ClientId(UUID.randomUUID())
   private val revision = ObjectRevision(TransactionId(UUID.randomUUID()))
 
-  private def rebuildOf(seq: Long, data: DataBuffer): OpportunisticRebuild =
+  /** A one-update TxPrepare: `data` is its one out-of-band section */
+  private def rebuildOf(seq: Long, data: DataBuffer): TxPrepare =
     val ptr = DataObjectPointer(ObjectId(new UUID(0, seq)), PoolId.BootstrapPoolId, Array[Byte](1))
-    OpportunisticRebuild(toStore, fromClient, ptr, revision, ObjectRefcount(1, 1), HLCTimestamp(1000L), data)
+    val ida = Replication(4, 3)
+    val txd = TransactionDescription(TransactionId(new UUID(0, seq)), HLCTimestamp(1000L), ptr, 1.toByte,
+      List(DataUpdate(ptr, revision, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida,
+      Map(ptr.poolId -> ida))
+    TxPrepare(toStore, StoreId(PoolId.BootstrapPoolId, 1), txd, ProposalId(1, 1.toByte),
+      List(ObjectUpdate(ptr.id, data)), Nil, fromClient = true)
 
-  /** An OpportunisticRebuild carrying `seq` (as its object id) whose encoded size is exactly `total` bytes */
-  def sized(seq: Long, total: Int): OpportunisticRebuild =
+  /** A one-update TxPrepare carrying `seq` (as its object id) whose encoded size is exactly `total` bytes */
+  def sized(seq: Long, total: Int): TxPrepare =
     val empty = QuicMessageCodec.encode(rebuildOf(seq, DataBuffer.Empty), PooledByteBufAllocator.DEFAULT)
     val base = empty.size.toInt
     empty.release()

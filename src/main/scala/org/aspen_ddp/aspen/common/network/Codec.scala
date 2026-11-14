@@ -863,28 +863,6 @@ object Codec extends Logging:
     ReadResponse(toClient, fromStore, readUuid, readTime, result)
 
 
-  def encode(o: OpportunisticRebuild): codec.OpportunisticRebuild =
-    codec.OpportunisticRebuild(
-      toStore = Some(encode(o.toStore)),
-      fromClient = Some(encodeUUID(o.fromClient.uuid)),
-      pointer = Some(encode(o.pointer)),
-      revision = Some(encode(o.revision)),
-      refcount = Some(encode(o.refcount)),
-      timestamp = o.timestamp.asLong,
-      data = ByteString.copyFrom(o.data.asReadOnlyBuffer())
-    )
-
-  def decode(m: codec.OpportunisticRebuild): OpportunisticRebuild =
-    val toStore = decode(m.toStore.get)
-    val fromClient = ClientId(decodeUUID(m.fromClient.get))
-    val pointer = decode(m.pointer.get)
-    val revision = decode(m.revision.get)
-    val refcount = decode(m.refcount.get)
-    val timestamp = HLCTimestamp(m.timestamp)
-    val data = DataBuffer(m.data.toByteArray)
-    OpportunisticRebuild(toStore, fromClient, pointer, revision, refcount, timestamp, data)
-
-
   def encode(o: TransactionCompletionQuery): codec.TransactionCompletionQuery =
     codec.TransactionCompletionQuery(
       toStore = Some(encode(o.toStore)),

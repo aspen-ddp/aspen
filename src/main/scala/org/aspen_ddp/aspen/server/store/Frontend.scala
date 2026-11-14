@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
+import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
@@ -69,8 +69,6 @@ object Frontend {
   case class NetworkRead(clientId: ClientId, requestUUID: UUID, readType: ReadType) extends ReadKind
 
   case class TransactionRead(transactionId: TransactionId) extends ReadKind
-
-  case class OpportuneRebuild(or: OpportunisticRebuild) extends ReadKind
 
   /** A repair's snapshot of the store's copy, taken before the repair reads the object */
   case class SnapshotRead(pointer: ObjectPointer, p: Promise[RepairSnapshot]) extends ReadKind
@@ -1227,24 +1225,6 @@ class Frontend(val storeId: StoreId,
             backend.read(pointer)
   }
 
-  def readObjectForOpportunisticRebuild(op: OpportunisticRebuild): Unit = if !stopped then {
-    val objectId = op.pointer.id
-    servableState(objectId) match {
-      case Some(os) => opportunisticRebuild(op, os)
-      case None if deleting.contains(objectId) => // Being deleted: nothing to rebuild
-      case None =>
-        if op.pointer.poolId == storeId.poolId then
-          pendingReads.get(objectId) match {
-            case Some(lst) =>
-              pendingReads += (objectId -> (OpportuneRebuild(op) :: lst))
-
-            case None =>
-              pendingReads += (objectId -> (OpportuneRebuild(op) :: Nil))
-              backend.read(op.pointer)
-          }
-    }
-  }
-
   /** Records the store's copy of the object for a repair (Reconcile): first step, before the repair reads it. An
     * object the store does not hold, or is deleting, gives an empty snapshot
     */
@@ -1332,23 +1312,6 @@ class Frontend(val storeId: StoreId,
               pendingReads += (objectId -> (tr :: Nil))
               logger.trace(s"Loading object from Backend for Tx: ${transaction.transactionId}. Object: $objectId")
               backend.read(pointer)
-
-  private def opportunisticRebuild(op: OpportunisticRebuild, os: ObjectState): Unit = {
-    // Backend writes of one object are unordered: skipped while another is outstanding
-    if (os.metadata.revision == op.revision && !commitInFlight(op.pointer.id)) {
-      val rc = if (op.refcount.updateSerial > os.metadata.refcount.updateSerial)
-        op.refcount
-      else
-        os.metadata.refcount
-
-      os.metadata = Metadata(op.revision, rc, op.timestamp)
-      os.data = op.data
-      val cs = CommitState(op.pointer, os.metadata, os.objectType, os.data)
-      val txid = TransactionId(op.revision.lastUpdateTxUUID)
-      // Not awaited, but ordered: transactions and repairs on the object wait behind the write
-      commit(os, cs, txid, ordered = true)
-    }
-  }
 
   /** Applies Reconcile.plan to `loaded`, the store's copy (None when it holds none), and hands the result to the
     * backend. Keys and object-level parts this store holds locked are deferred along with those the read reports: a
@@ -1492,10 +1455,6 @@ class Frontend(val storeId: StoreId,
               logger.trace(s"Completed read for transaction ${tr.transactionId}. Object: ${os.objectId}")
               transactions.get(tr.transactionId).foreach { tx => tx.objectLoaded(stateForTransaction(objectId).getOrElse(os)) }
 
-            case OpportuneRebuild(op) =>
-              logger.trace(s"Completed read for OpportuneRebuild. Object: ${os.objectId}")
-              opportunisticRebuild(op, os)
-
             case SnapshotRead(_, p) => p.success(RepairSnapshot.of(os))
 
             case ReconcileRead(snapshot, read, p) =>
@@ -1516,8 +1475,6 @@ class Frontend(val storeId: StoreId,
               net.sendClientResponse(rr)
 
             case tr: TransactionRead => transactions.get(tr.transactionId).foreach { tx => tx.objectLoadFailed(objectId, err) }
-
-            case _: OpportuneRebuild => // Can't guarantee correctness so we need to ignore this
 
             case SnapshotRead(_, p) => p.success(RepairSnapshot.missing(objectId))
 

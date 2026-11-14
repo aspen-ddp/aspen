@@ -263,13 +263,9 @@ any time.
 One point to note is that transactions modifying the missed transactions tree disable the usual 
 FinalizationAction that updates the missed transaction tree when DataStores may not have successfully 
 handled the transaction. This prevents an infinite loop from forming when DataStores hosting the 
-missed transaction tree are unavailable. Repairs to the objects comprising the tree rely on 
-Opportunistic Rebuilds which are performed during object reads. If, when an object is read, the 
-reader sees that the state for an object returned by one of the stores is behind its peers, it will 
-send the repair state to the store “opportunisticly” to help it recover. This is an insufficient 
-general solution as it wouldn’t be an effective solution for infrequently read objects. In this case, 
-however, the missed transaction tree is constantly being traversed so this mechanism is sufficient to 
-ensure timely repairs.
+missed transaction tree are unavailable. Repairs to the objects comprising the tree are made by the repair service's periodic sweep of those 
+trees on each store of the bootstrap pool, which reconciles the store's copy of every node against the 
+other stores.
 
 ### Recovering Lost DataStores
 In addition to a missed transaction tree, each StorgePool also has an “allocation tree”. When objects 

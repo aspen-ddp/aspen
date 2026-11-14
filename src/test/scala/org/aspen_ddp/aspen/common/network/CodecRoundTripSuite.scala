@@ -489,17 +489,6 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     back.lockedKeys shouldBe Set(k1, k2)
     back.objectLocked shouldBe true
 
-  test("OpportunisticRebuild round-trip"):
-    val original = OpportunisticRebuild(
-      storeId(1), ClientId(uuid(2)), dataPtr(3), rev(4),
-      ObjectRefcount(1, 5), HLCTimestamp(1000L), DataBuffer(Array[Byte](10, 20))
-    )
-    val decoded = Codec.decode(Codec.encode(original))
-    decoded.toStore shouldBe original.toStore
-    decoded.fromClient shouldBe original.fromClient
-    decoded.pointer.id shouldBe original.pointer.id
-    decoded.timestamp shouldBe original.timestamp
-
   test("TransactionCompletionQuery round-trip"):
     val original = TransactionCompletionQuery(storeId(1), ClientId(uuid(2)), uuid(3), TransactionId(uuid(4)))
     val decoded = Codec.decode(Codec.encode(original))

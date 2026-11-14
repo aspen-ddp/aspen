@@ -4,7 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.{DataObjectRangeState, DataObjectRangesState, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState, ReadDriverClient, ReadError}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
+import org.aspen_ddp.aspen.common.network.{Read, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{ByteRanges, DataObjectPointer, FullObject, KeyRange, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -19,14 +19,13 @@ abstract class BaseReadDriver(
                                val ida: IDA,
                                val readUUID:UUID,
                                val comment: String,
-                               val disableOpportunisticRebuild: Boolean = false,
                                val readType: ReadType = FullObject()
                     ) extends ReadDriver with Logging {
 
   logger.info(s"Read UUID $readUUID: Beginning read of ${objectPointer.objectType} object ${objectPointer.id}. Comment: $comment")
 
-  /** Partial results must never be cached or used for opportunistic rebuilds: the entries they omit would
-    * be mistaken for deletions. Metadata-only results carry no content at all */
+  /** Partial results must never be cached: the entries they omit would be mistaken for deletions.
+    * Metadata-only results carry no content at all */
   private val isPartial: Boolean = readType match
     case _: KeySet | _: KeyRange | _: MetadataOnly | _: ByteRanges => true
     case _ => false
@@ -98,8 +97,6 @@ abstract class BaseReadDriver(
         s"Retries: $retryCount. Re-reads for locks of committed transactions: $committedLockRereads. " +
         s"Last replies: $responseSummary")
 
-  private var rebuildsSent: Set[StoreId] = Set()
-
   protected val promise: Promise[ObjectState] = Promise()
 
   def readResult: Future[ObjectState] = promise.future
@@ -134,15 +131,6 @@ abstract class BaseReadDriver(
       }
     }
     (0 until ida.width).foreach(i => sendReadRequest(StoreId(objectPointer.poolId, i.toByte)))
-  }
-
-  protected def sendOpportunisticRebuild(storeId: StoreId, os: ObjectState): Unit = {
-    if (!rebuildsSent.contains(storeId)) {
-      logger.info(s"Read UUID $readUUID: Sending Opportunistic Rebuild to store $storeId for object ${objectPointer.id}")
-      rebuildsSent += storeId
-      client.messenger.sendClientRequest(OpportunisticRebuild(storeId, client.clientId, objectPointer, os.revision,
-        os.refcount, os.timestamp, os.getRebuildDataForStore(storeId).get))
-    }
   }
 
   def receiveReadResponse(response:ReadResponse): Boolean = synchronized {
@@ -223,28 +211,6 @@ abstract class BaseReadDriver(
               onComplete()
           }
         }
-
-        if (promise.isCompleted && !isPartial) {
-          e match {
-            case Right(os) =>
-
-              val repairNeeded: Set[Byte] = if (disableOpportunisticRebuild)
-                Set()
-              else
-                objectReader.rereadCandidates.keys.map(_.poolIndex).toSet
-
-              client.opportunisticRebuildManager.markRepairNeeded(os, repairNeeded)
-
-            case _ =>
-          }
-        }
-
-        e match {
-          case Right(os) =>
-            if (!isPartial && objectReader.rereadCandidates.contains(response.fromStore))
-              sendOpportunisticRebuild(response.fromStore, os)
-          case _ =>
-        }
       }
     }
     if !promise.isCompleted && undecidedLockStores.nonEmpty then
@@ -282,7 +248,6 @@ object BaseReadDriver:
                                  ida: IDA,
                                  readUUID:UUID,
                                  comment: String,
-                                 disableOpportunisticRebuild: Boolean,
                                  readType: ReadType): ReadDriver =
 
     new BaseReadDriver(client, objectPointer, ida, readUUID, comment, readType = readType):

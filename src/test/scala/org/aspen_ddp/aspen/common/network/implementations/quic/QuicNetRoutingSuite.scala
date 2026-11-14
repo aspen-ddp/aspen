@@ -94,19 +94,19 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     assume(io.netty.channel.epoll.Epoll.isAvailable, "path MTU discovery needs epoll")
     val entry = entryFor(fx.a.net, fx.hostIdB)
     val conn = connected(fx.a.net, entry)
-    fx.a.net.sendToHost(entry, rebuild(fx.storesB.head, 4 * 1024 * 1024, 0))
-    await(fx.b.handler.clientRequests, 1, 30000)
+    fx.a.net.sendToHost(entry, dataMsg(fx.storesB.head, 4 * 1024 * 1024, 0))
+    await(fx.b.handler.txMessages, 1, 30000)
     eventually("path MTU discovered", 5000):
       conn.attachedChannel.collectPathStats(0).get(5, TimeUnit.SECONDS).pmtu == fx.config.maxUdpPayloadBytes
 
   test("16 MiB arrives intact without UDP offload"):
     val c = fx.client(QuicConfig(gossip = GossipConfig.ForTests, udpOffload = false))
     c.net.groForTests.foreach(_ shouldBe false)
-    val m = rebuild(fx.storesB.head, 16 * 1024 * 1024, 7)
+    val m = dataMsg(fx.storesB.head, 16 * 1024 * 1024, 7)
     val entry = entryFor(c.net, fx.hostIdB)
     c.net.sendToHost(entry, m)
-    val got = await(fx.b.handler.clientRequests, 1, 30000).head.message.asInstanceOf[OpportunisticRebuild]
-    java.util.Arrays.equals(got.data.getByteArray, m.data.getByteArray) shouldBe true
+    val got = await(fx.b.handler.txMessages, 1, 30000).head.message.asInstanceOf[TxPrepare]
+    java.util.Arrays.equals(payloadOf(got).getByteArray, payloadOf(m).getByteArray) shouldBe true
 
   test("client request reaches the host owning the store"):
     val c = fx.client()
@@ -170,13 +170,13 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
   test("three back-to-back 16 MiB messages to an idle connection all arrive"):
     val entry = entryFor(fx.a.net, fx.hostIdB)
     val conn = connected(fx.a.net, entry)
-    val msgs = (0 until 3).map(i => rebuild(fx.storesB.head, 16 * 1024 * 1024, i))
+    val msgs = (0 until 3).map(i => dataMsg(fx.storesB.head, 16 * 1024 * 1024, i))
     msgs.foreach(m => fx.a.net.sendToHost(entry, m)) // faster than the loop drains: all three queue at once
-    val got = await(fx.b.handler.clientRequests, 3, 30000).map(_.message.asInstanceOf[OpportunisticRebuild])
-    got.map(_.pointer.id).toSet shouldBe msgs.map(_.pointer.id).toSet
+    val got = await(fx.b.handler.txMessages, 3, 30000).map(_.message.asInstanceOf[TxPrepare])
+    got.map(_.transactionId).toSet shouldBe msgs.map(_.transactionId).toSet
     got.foreach: g =>
-      val e = msgs.find(_.pointer.id == g.pointer.id).get
-      java.util.Arrays.equals(g.data.getByteArray, e.data.getByteArray) shouldBe true
+      val e = msgs.find(_.transactionId == g.transactionId).get
+      java.util.Arrays.equals(payloadOf(g).getByteArray, payloadOf(e).getByteArray) shouldBe true
     conn.drops shouldBe 0
 
   test("a host whose address is a name is resolved and reached"):
@@ -231,7 +231,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     c.handler.total shouldBe 0
 
   test("peer restart mid-transfer recovers"):
-    val big = rebuild(fx.storesB.head, 64 * 1024 * 1024)
+    val big = dataMsg(fx.storesB.head, 64 * 1024 * 1024)
     // Host membership dials B as soon as A is built, possibly before B is bound; a handshake still retrying then
     // could complete against the restarted B, so the transfer must start on a connection to the original B
     val conn = connected(fx.a.net, fx.hostIdB)
@@ -239,7 +239,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val enc = QuicMessageCodec.encode(big, PooledByteBufAllocator.DEFAULT)
     conn.submit(enc) shouldBe true
     Thread.sleep(100)
-    val completedBeforeRestart = !fx.b.handler.clientRequests.isEmpty
+    val completedBeforeRestart = !fx.b.handler.txMessages.isEmpty
     info(s"64 MiB message completed before restart: $completedBeforeRestart")
     fx.restartB()
 
@@ -247,8 +247,8 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(LoadProbe.scaleMillis(15000))
     var delivered = false
     while !delivered && System.nanoTime() - deadline < 0 do
-      fx.a.net.clientMessenger.sendClientRequest(rebuild(fx.storesB.head, 100))
-      delivered = fx.b.handler.clientRequests.poll(200, TimeUnit.MILLISECONDS) != null
+      fx.a.net.clientMessenger.sendTransactionMessage(dataMsg(fx.storesB.head, 100))
+      delivered = fx.b.handler.txMessages.poll(200, TimeUnit.MILLISECONDS) != null
     delivered shouldBe true
 
     eventually("the 64 MiB message's buffers are released", 5000):
@@ -283,7 +283,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
           for i <- 0 until perThread do
             val to = if (i + t) % 2 == 0 then fx.storesA.head else fx.storesB.head
             val size = 1100 + ((i * 7919 + t * 104729) % (16 * 1024))
-            c.net.clientMessenger.sendClientRequest(rebuild(to, size, i))
+            c.net.clientMessenger.sendTransactionMessage(dataMsg(to, size, i))
             // Every tenth send also goes host-routed, so host routing is exercised under the same load
             if i % 10 == 0 then
               val toHost = if to == fx.storesA.head then fx.hostIdA else fx.hostIdB
@@ -295,10 +295,10 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     threads.foreach(_.join(AwaitMillis))
     failures.isEmpty shouldBe true
     val half = nThreads * perThread / 2
-    val gotA = await(fx.a.handler.clientRequests, half, 20000)
-    val gotB = await(fx.b.handler.clientRequests, half, 20000)
-    gotA.forall(_.message.toStore == fx.storesA.head) shouldBe true
-    gotB.forall(_.message.toStore == fx.storesB.head) shouldBe true
+    val gotA = await(fx.a.handler.txMessages, half, 20000)
+    val gotB = await(fx.b.handler.txMessages, half, 20000)
+    gotA.forall(_.message.asInstanceOf[TxPrepare].to == fx.storesA.head) shouldBe true
+    gotB.forall(_.message.asInstanceOf[TxPrepare].to == fx.storesB.head) shouldBe true
     val halfHost = nThreads * (perThread / 10) / 2
     val hostA = await(fx.a.handler.hostMessages, halfHost, 20000)
     val hostB = await(fx.b.handler.hostMessages, halfHost, 20000)

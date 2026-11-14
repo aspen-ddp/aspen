@@ -362,16 +362,6 @@ message ReadResponse {
   bool object_locked = 15; // An object-level write lock is held
 }
 
-message OpportunisticRebuild {
-  StoreId to_store = 1;
-  UUID from_client = 2;
-  ObjectPointer pointer = 3;
-  ObjectRevision revision = 4;
-  ObjectRefcount refcount = 5;
-  uint64 timestamp = 6;
-  bytes data = 7;
-}
-
 message TransactionCompletionQuery {
   StoreId to_store = 1;
   UUID from_client = 2;
@@ -515,7 +505,6 @@ message Message {
     TxHeartbeat heartbeat = 8;
     Read read = 11;
     ReadResponse read_response = 12;
-    OpportunisticRebuild opportunistic_rebuild = 13;
     TransactionCompletionQuery transaction_completion_query = 14;
     TransactionCompletionResponse transaction_completion_response = 15;
     TransactionResolved tx_resolved = 16;

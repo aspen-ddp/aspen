@@ -4,7 +4,7 @@ import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, OpportunisticRebuild, ReadResponse, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, FullObject, Insert, Key, KeySet, KeyValueOperation, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -3192,85 +3192,6 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.deliverCommits()
     cache.pinnedCount shouldBe 0
     cache.sizeInBytes shouldBe HostObjectCache.EntryOverhead + 1
-  }
-
-  test("a transaction on an object waits behind an opportunistic rebuild's backend write") {
-    // Backend writes of one object are unordered: a transaction's commit issued while the rebuild's write is
-    // outstanding could land first and be overwritten by it
-    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
-    frontend.readObjectForNetwork(clientId, new UUID(1, 1), op1, FullObject())
-    net.clientMessage() should not be empty
-    val os = mkObjectState(oid1)
-    frontend.readObjectForOpportunisticRebuild(OpportunisticRebuild(storeId, clientId, op1, rev0,
-      os.metadata.refcount, HLCTimestamp(50), DataBuffer(Array[Byte](4))))
-    backend.heldCommits shouldBe 1
-
-    sendPrepare(frontend, lockTxd(txid1, List(overwrite(op1))))
-    prepareResponses(net, txid1) shouldBe Nil
-
-    backend.deliverCommits()
-    prepareResponses(net, txid1).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
-  }
-
-  test("a commit of a fresh state does not replace a discarded state whose locks are held") {
-    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
-    prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(kvPtr, rev0)))).disposition shouldBe
-      TransactionDisposition.VoteCommit
-    frontend.discard(kvPtr.id)
-
-    // A network read loads a fresh state, which an opportunistic rebuild then commits
-    frontend.readObjectForNetwork(clientId, new UUID(1, 1), kvPtr, FullObject())
-    net.clientMessage() should not be empty
-    val kv = mkKVObjectState()
-    val rebuilt = KVObjectState.encode(Some(k(0)), None, None, None, Map(k(1) ->
-      new ValueState(Value(Array[Byte](9)), rev0, HLCTimestamp(1), None)))
-    frontend.readObjectForOpportunisticRebuild(OpportunisticRebuild(storeId, clientId, kvPtr, rev0,
-      kv.metadata.refcount, HLCTimestamp(50), rebuilt))
-    backend.heldCommits shouldBe 1
-    backend.deliverCommits()
-
-    // The shared lock is still honoured
-    prepare(frontend, net, lockTxd(txid3, List(keyRevision(2)))).disposition shouldBe TransactionDisposition.VoteAbort
-
-    // Once its holder resolves, the rebuilt state is served from memory
-    resolve(frontend, net, txid1, committed = false)
-    val reads = backend.reads
-    frontend.readObjectForNetwork(clientId, new UUID(1, 2), kvPtr, FullObject())
-    net.clientMessage() match
-      case Some(rr: ReadResponse) => rr.result.toOption.get.objectData.get.getByteArray.toList shouldBe rebuilt.getByteArray.toList
-      case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
-    backend.reads shouldBe reads
-  }
-
-  test("a backend read completing during a commit does not cache the state the commit replaces") {
-    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
-    prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(kvPtr, rev0)))).disposition shouldBe
-      TransactionDisposition.VoteCommit
-    frontend.discard(kvPtr.id)
-    frontend.readObjectForNetwork(clientId, new UUID(1, 1), kvPtr, FullObject())
-    net.clientMessage() should not be empty
-    val kv = mkKVObjectState()
-    val rebuilt = KVObjectState.encode(Some(k(0)), None, None, None, Map(k(1) ->
-      new ValueState(Value(Array[Byte](9)), rev0, HLCTimestamp(1), None)))
-    frontend.readObjectForOpportunisticRebuild(OpportunisticRebuild(storeId, clientId, kvPtr, rev0,
-      kv.metadata.refcount, HLCTimestamp(50), rebuilt))
-    backend.heldCommits shouldBe 1
-
-    // A read issued before the rebuild's commit returns the state that commit replaces
-    frontend.backendReadComplete(oid2, Left(ReadState(oid2, kv.metadata, kv.objectType, kv.data, Set())))
-
-    def served(): List[Byte] =
-      frontend.readObjectForNetwork(clientId, new UUID(1, 2), kvPtr, FullObject())
-      net.clientMessage() match
-        case Some(rr: ReadResponse) => rr.result.toOption.get.objectData.get.getByteArray.toList
-        case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
-
-    served() shouldBe rebuilt.getByteArray.toList
-    backend.deliverCommits()
-    resolve(frontend, net, txid1, committed = false)
-    val reads = backend.reads
-    served() shouldBe rebuilt.getByteArray.toList
-    backend.reads shouldBe reads
   }
 
   /** 0x20 is not a KeyValueOperation code, so this update fails its requirement check */

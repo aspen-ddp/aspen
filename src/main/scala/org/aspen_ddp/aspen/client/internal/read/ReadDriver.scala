@@ -29,9 +29,8 @@ object ReadDriver {
     * ida: IDA,
     * readUUID:UUID,
     * comment: String Comment describing purpose of the read for debug/trace logs
-    * disableOpportunisticRebuild: Boolean
     * readType: ReadType
     */
-  type Factory = (ReadDriverClient, ObjectPointer, IDA, UUID, String, Boolean, ReadType) => ReadDriver
+  type Factory = (ReadDriverClient, ObjectPointer, IDA, UUID, String, ReadType) => ReadDriver
 
 }

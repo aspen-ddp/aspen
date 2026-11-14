@@ -195,16 +195,6 @@ object ReadResponse {
   }
 }
 
-final case class OpportunisticRebuild(
-                                       toStore: StoreId,
-                                       fromClient: ClientId,
-                                       pointer: ObjectPointer,
-                                       revision: ObjectRevision,
-                                       refcount: ObjectRefcount,
-                                       timestamp: HLCTimestamp,
-                                       data: DataBuffer) extends ClientRequest:
-  override def toString: String = f"OpportunisticRebuild to $toStore from $fromClient object ${pointer.id}"
-
 final case class TransactionCompletionQuery(
                                              toStore: StoreId,
                                              fromClient: ClientId,

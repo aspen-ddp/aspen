@@ -162,7 +162,6 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
         if r.objectPointer.poolId == store.storeId.poolId then
           store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, r.objectPointer, r.readType)
 
-    case op: OpportunisticRebuild => post(op.toStore)(_.frontend.readObjectForOpportunisticRebuild(op))
 
     case s: TransactionCompletionQuery =>
       // Reads only the thread-safe txStatusCache, so it is answered in the dispatch step

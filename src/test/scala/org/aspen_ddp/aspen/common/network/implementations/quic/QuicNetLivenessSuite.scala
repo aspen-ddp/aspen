@@ -71,7 +71,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     TxHeartbeat(to, from, TransactionId(UUID.randomUUID()))
 
   /** Stream-sized, so delivery is reliable */
-  private def rebuildData(to: StoreId): OpportunisticRebuild = rebuild(to, 2000)
+  private def bigMsg(to: StoreId): TxPrepare = dataMsg(to, 2000)
 
   private def entryFor(net: QuicNet, hostId: HostId): QuicHostEntry =
     net.metadataManager.peekHostEntry(hostId).getOrElse(fail(s"no host entry for $hostId"))
@@ -155,14 +155,14 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
       stale.isClosed
     fx.startB()
     // A message sent while A's re-dial is still failing or handshaking is dropped, so send it until one arrives
-    val m = rebuildData(fx.storesB.head)
+    val m = bigMsg(fx.storesB.head)
     val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AwaitMillis)
-    var got: Delivery[ClientRequest] = null
+    var got: Delivery[TxMessage] = null
     while got == null do
       if System.nanoTime() - deadline > 0 then
         throw new AssertionError(s"no message reached the restarted B within ${AwaitMillis}ms")
-      fx.a.net.clientMessenger.sendClientRequest(m)
-      got = fx.b.handler.clientRequests.poll(LoadProbe.scaleMillis(500), TimeUnit.MILLISECONDS)
+      fx.a.net.clientMessenger.sendTransactionMessage(m)
+      got = fx.b.handler.txMessages.poll(LoadProbe.scaleMillis(500), TimeUnit.MILLISECONDS)
     got.message shouldBe m
 
   test("fast restart re-dials and is reported as restarted"):

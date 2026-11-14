@@ -111,7 +111,7 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
   test("large payload arrives in many chunks"):
     val size = 64 * 1024 * 1024
     val payload = bytes(size, 3)
-    val m = QuicNetFixture.rebuildOf(StoreId(PoolId.BootstrapPoolId, 0), payload)
+    val m = QuicNetFixture.dataMsgOf(StoreId(PoolId.BootstrapPoolId, 0), payload)
     // A private allocator, so suites running in parallel don't show up in the peak
     val local = new PooledByteBufAllocator(true)
     val frame = QuicMessageCodec.encode(m, local).toStreamFrame(local)
@@ -129,9 +129,10 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
     frame.release()
     peak should be < (4L * 1024 * 1024)
     h.msgs.size shouldBe 1
-    val got = h.msgs.head.asInstanceOf[OpportunisticRebuild]
-    got.data.size shouldBe size
-    java.util.Arrays.equals(got.data.getByteArray, payload) should be (true)
+    val got = h.msgs.head.asInstanceOf[TxPrepare]
+    val gotData = QuicNetFixture.payloadOf(got)
+    gotData.size shouldBe size
+    java.util.Arrays.equals(gotData.getByteArray, payload) should be (true)
     h.finish()
 
   test("TxPrepare with 4 x 64 MiB updates in 64 KiB chunks decodes intact"):

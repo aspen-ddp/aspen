@@ -263,14 +263,14 @@ class QuicNetWrongHostSuite extends AnyFunSuite with Matchers with BeforeAndAfte
       val poolLookupsBefore = fx.directory.poolLookups.size
 
       (1 to 20).foreach: i =>
-        d.net.clientMessenger.sendClientRequest(rebuild(store, 16, i))
+        d.net.clientMessenger.sendTransactionMessage(dataMsg(store, 16, i))
         // What a TxUnknownStore reply from the wrong host would make the sender do
-        if fx.b.handler.clientRequests.asScala.exists(_.message.toStore == store) then
+        if fx.b.handler.txMessages.asScala.exists(_.message.to == store) then
           d.net.serverMessenger.dropCacheForStore(store)
         Thread.sleep(25)
 
       eventually("D marks C's entry known-wrong", WaitMillis):
         d.net.metadataManager.peekHostEntry(hostIdC).exists(_.knownWrong)
-      fx.b.handler.clientRequests.asScala.count(_.message.toStore == store) shouldBe 0
+      fx.b.handler.txMessages.asScala.count(_.message.to == store) shouldBe 0
       (fx.directory.poolLookups.size - poolLookupsBefore) should be <= 1
       d.net.metadataManager.peekStoreHost(store) shouldBe Some(hostIdC)

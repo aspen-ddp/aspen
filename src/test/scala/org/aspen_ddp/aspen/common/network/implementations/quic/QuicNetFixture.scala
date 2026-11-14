@@ -12,7 +12,8 @@ import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.GossipConf
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.common.paxos.ProposalId
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.common.store.StoreId
 
 import java.net.{DatagramSocket, InetAddress, InetSocketAddress}
@@ -110,14 +111,22 @@ final class QuicNetFixture(val config: QuicConfig = QuicConfig(gossip = GossipCo
 
 object QuicNetFixture:
   /** A single-section message addressed to a store, carrying `size` bytes of seeded data */
-  def rebuild(to: StoreId, size: Int, seed: Int = 0): OpportunisticRebuild =
-    rebuildOf(to, Array.tabulate[Byte](size)(i => (i * 31 + seed).toByte))
+  def dataMsg(to: StoreId, size: Int, seed: Int = 0): TxPrepare =
+    dataMsgOf(to, Array.tabulate[Byte](size)(i => (i * 31 + seed).toByte))
 
-  /** A single-section message addressed to a store, carrying exactly `payload` */
-  def rebuildOf(to: StoreId, payload: Array[Byte]): OpportunisticRebuild =
+  /** A single-section message addressed to a store, carrying exactly `payload` as its one object update. Its
+    * transactionId is unique, identifying the message */
+  def dataMsgOf(to: StoreId, payload: Array[Byte]): TxPrepare =
     val ptr = DataObjectPointer(ObjectId(UUID.randomUUID()), PoolId.BootstrapPoolId, Array[Byte](1))
-    OpportunisticRebuild(to, ClientId(UUID.randomUUID()), ptr, ObjectRevision(TransactionId(UUID.randomUUID())),
-      ObjectRefcount(1, 1), HLCTimestamp(1000L), DataBuffer(payload))
+    val ida = Replication(4, 3)
+    val txd = TransactionDescription(TransactionId(UUID.randomUUID()), HLCTimestamp(1000L), ptr, 1.toByte,
+      List(DataUpdate(ptr, ObjectRevision(TransactionId(UUID.randomUUID())), DataUpdateOperation.Overwrite)),
+      Nil, None, Nil, Nil, ida, Map(ptr.poolId -> ida))
+    TxPrepare(to, StoreId(PoolId.BootstrapPoolId, 1), txd, ProposalId(1, 1.toByte),
+      List(ObjectUpdate(ptr.id, DataBuffer(payload))), Nil, fromClient = true)
+
+  /** The payload of a message built by `dataMsg` */
+  def payloadOf(m: TxPrepare): DataBuffer = m.objectUpdates.head.data
 
   /** Upper bound for waits; stretched on a loaded machine (see `LoadProbe`), and free when the wait succeeds */
   def AwaitMillis: Long = LoadProbe.scaleMillis(10000)

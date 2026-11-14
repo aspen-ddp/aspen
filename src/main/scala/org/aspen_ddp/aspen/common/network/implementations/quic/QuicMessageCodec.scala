@@ -101,7 +101,6 @@ object QuicMessageCodec:
     case m: TxStatusResponse => codec.Message.Msg.StatusResponse(Codec.encode(m))
     case m: TxUnknownStore => codec.Message.Msg.UnknownStore(Codec.encode(m))
     case m: Read => codec.Message.Msg.Read(Codec.encode(m))
-    case m: OpportunisticRebuild => codec.Message.Msg.OpportunisticRebuild(Codec.encode(m))
     case m: TransactionCompletionQuery => codec.Message.Msg.TransactionCompletionQuery(Codec.encode(m))
     case m: ReadResponse => codec.Message.Msg.ReadResponse(Codec.encode(m))
     case m: TransactionCompletionResponse => codec.Message.Msg.TransactionCompletionResponse(Codec.encode(m))
@@ -143,9 +142,6 @@ object QuicMessageCodec:
 
     case m @ ReadResponse(_, _, _, _, Right(cs)) if cs.objectData.exists(!_.isEmpty) =>
       (m.copy(result = Right(cs.copy(objectData = None))), ByteBuffer.allocate(0), Array(cs.objectData.get))
-
-    case m: OpportunisticRebuild =>
-      (m.copy(data = DataBuffer.Empty), ByteBuffer.allocate(0), Array(m.data))
 
     case m => (m, ByteBuffer.allocate(0), NoSections)
 
@@ -252,11 +248,6 @@ object QuicMessageCodec:
                 case (Right(cs), Some(data)) => Right(rr.copy(result = Right(cs.copy(objectData = Some(data)))))
                 case (Left(_), Some(_)) => Left("ReadResponse error result cannot carry a data section")
                 case _ => Right(rr)
-          case codec.Message.Msg.OpportunisticRebuild(r) =>
-            if sections.length != 1 then
-              Left(s"OpportunisticRebuild requires exactly one section, got ${sections.length}")
-            else
-              Right(Codec.decode(r).copy(data = sections(0)))
           case other if sections.nonEmpty => Left(s"Unexpected ${sections.length} sections for message")
           case codec.Message.Msg.HostHeartbeat(r) => Right(Codec.decode(r))
           case codec.Message.Msg.Read(r) => Right(Codec.decode(r))

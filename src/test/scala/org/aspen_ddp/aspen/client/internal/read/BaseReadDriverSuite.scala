@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.client.{KeyValueObjectState, MetadataObjectState, ObjectCache, ObjectState, TransactionStatusCache}
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
-import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, OpportunisticRebuild, Read, TxMessage}
+import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, Read, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{ByteRanges, DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError, ReadType, Value}
 import org.aspen_ddp.aspen.server.store.{KVObjectState, ValueState => StoreValueState}
 import org.aspen_ddp.aspen.common.transaction.PreTransactionOpportunisticRebuild
@@ -57,9 +57,8 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
                objectPointer: ObjectPointer = ptr,
                readUUID:UUID = readUUID,
                comment: String = "",
-               disableOpportunisticRebuild: Boolean = false,
                readType: ReadType = FullObject()) = {
-    new BaseReadDriver(client, objectPointer, ida, readUUID, comment, disableOpportunisticRebuild, readType) {
+    new BaseReadDriver(client, objectPointer, ida, readUUID, comment, readType) {
       given ec: ExecutionContext = this.client.clientContext
     }
   }
@@ -251,35 +250,26 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     val (m, result) = runStaleStoreReadOf(readType, kvptr)
     (m, Await.result(result, awaitDuration).asInstanceOf[KeyValueObjectState])
 
-  def rebuildsSent(m: RecordingClient): List[OpportunisticRebuild] =
-    m.requests.collect { case o: OpportunisticRebuild => o }
-
-  test("full KV read caches and rebuilds stale stores") {
+  test("full KV read caches and sends no rebuild to a stale store") {
     val (m, kvos) = runStaleStoreRead(FullObject())
     kvos.partial should be (false)
     m.puts.size should be (1)
-    m.repairMarks should not be empty
-    m.repairMarks.foreach(_ should be (Set[Byte](1)))
-    rebuildsSent(m).map(_.toStore) should be (List(ds1))
+    m.requests should be (Nil)
   }
 
-  test("partial KV read neither caches nor rebuilds") {
+  test("partial KV read is not cached") {
     val (m, kvos) = runStaleStoreRead(KeySet(List(kvKey)))
     kvos.partial should be (true)
     kvos.contents.contains(kvKey) should be (true)
     kvos.getRebuildDataForStore(ds1) should be (None)
     m.puts should be (Nil)
-    m.repairMarks should be (Nil)
-    rebuildsSent(m) should be (Nil)
   }
 
-  test("partial Data ByteRanges read neither caches nor rebuilds") {
+  test("partial Data ByteRanges read is not cached") {
     val (m, result) = runStaleStoreReadOf(ByteRanges(List((0, 4)), 0), ptr)
     val dos = Await.result(result, awaitDuration)
     dos.getRebuildDataForStore(ds1) should be (None)
     m.puts should be (Nil)
-    m.repairMarks should be (Nil)
-    rebuildsSent(m) should be (Nil)
   }
 
   test("partial KV read sends its read type") {
@@ -300,14 +290,12 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
         mos.refcount should be (ref)
       case other => fail(s"Expected a MetadataObjectState, got $other")
     m.puts should be (Nil)
-    m.repairMarks should be (Nil)
-    rebuildsSent(m) should be (Nil)
 
-  test("metadata-only KV read neither caches nor rebuilds") {
+  test("metadata-only KV read is not cached") {
     checkMetadataOnlyRead(kvptr)
   }
 
-  test("metadata-only Data read neither caches nor rebuilds") {
+  test("metadata-only Data read is not cached") {
     checkMetadataOnlyRead(ptr)
   }
 
@@ -454,7 +442,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
         def sendTransactionMessages(msg: List[TxMessage]): Unit = ()
         def sendHostMessage(msg: HostMessage): Unit = ()
         def dropCacheForStore(storeId: StoreId): Unit = ()
-    val r = BaseReadDriver.noErrorRecoveryReadDriver(m, kvptr, ida, readUUID, "", disableOpportunisticRebuild = true,
+    val r = BaseReadDriver.noErrorRecoveryReadDriver(m, kvptr, ida, readUUID, "",
       FullObject())
     val insertTx = TransactionId(new UUID(0, 7))
     val ts = HLCTimestamp.now

@@ -932,6 +932,32 @@ calls this "a timing artifact", so it is expected to occur.
 
 ### F5. No checksum anywhere; sector reordering is undetected, and garbage becomes state (medium confidence, severe if reachable)
 
+> **FIXED (2026-11-14).** Each entry header carries two CRC32C values (`LogEntry`): `header_crc` over the header
+> fields and `body_crc` over the dynamic and static data through the trailing UUID. `Recovery.recover` takes nothing
+> from an entry that fails them:
+> - The newest entry is the last one in the highest-head stream whose header is intact. If its body fails, it was the
+>   write in flight at a crash: it is dropped with a warning and the entry before it is the last. A stream whose only
+>   entry is a torn head (a rotation write in flight) yields to the stream before it.
+> - No intact entry may be newer than the last one found. Recovery scans its stream past it and all of the next
+>   stream (hopping intact headers by size, other regions by 4 KiB). A hit means a corrupt entry hid newer ones (mid-
+>   stream rot, or a rotted head hiding the real active stream).
+> - Every entry the backward walk visits must pass both checksums, and object data and txds are read only from the
+>   dynamic data of entries it verified.
+>
+> Failures throw `CrlCorrupt` (a corrupt header or body, or a newer intact entry). Links that end, or lead to another
+> cycle or to a newer entry, stay `BrokenEntryChain`, and so does data outside the verified entries. Decided with the
+> owner: `DeviceDiscovery.openDeviceCrl` handles `CrlCorrupt` like any other failed recovery (stores rebuild-required,
+> `crl.lost-<uuid>` kept), but logs the cause as corruption so systemic-loss work (Todo 3.1) can count it.
+> Tests: SimpleCRLSuite "A flipped byte in a needed entry's txd, object data or static record fails the open with
+> CrlCorrupt", "A torn newest entry is dropped and the state before it recovers", "A corrupt entry followed by
+> valid newer ones fails the open…", "A corrupt head of the active stream fails the open…"; DeviceCrlSuite "a device
+> whose CRL fails its checksums marks its stores rebuild-required". The torn-rotation test passes unchanged.
+> **Residuals:**
+> - A torn write and rot can't be told apart in the newest entry. Rot that hits exactly the newest acknowledged entry
+>   loses that entry (its promise, vote or data), as a torn write would.
+> - Rot in an entry recovery no longer needs still makes the CRL lost when it hides a newer entry, or sits in an
+>   entry the walk reads. That is simple rather than optimized: a rebuild.
+
 **Verification: CONFIRMED as a design gap (no CRC/checksum anywhere under `server/crl`; grep empty), severity data-loss only if the device reorders or corrupts sectors.** Not triggerable by software alone. Fix sketch: a CRC32C per entry header and per entry body, checked in `readEntry` and `readStreamLocation`.
 
 The only integrity checks are two UUIDs and a 3-valued disposition byte (`StreamReader.scala:47-74`,
@@ -1114,6 +1140,11 @@ transaction older than its rebuild, and whether the quorum structure makes the c
 [rebuild-process.md](rebuild-process.md) and [paxos-transactions.md](paxos-transactions.md) to settle.
 
 ### F19. Zero-filled regions parse as valid empty entries (low confidence; derived by reading, not executed)
+
+> **FIXED (2026-11-14)** with F5. A zero header fails `header_crc`, and a zero stream UUID is rejected outright
+> (`StreamReader.readHeader`). A never-written or zero-filled CRL now opens empty at stream 0, offset 0, instead of at
+> the file end with a rotation on its first write (SimpleCRLSuite "Zero-filled stream files open as an empty CRL that
+> writes from the start of stream 0").
 
 **Verification: CONFIRMED by derivation (header size 70; an all-zero file parses as 4096-byte empty entries), severity doc-only.** Harmless today because ties in `highestHead` keep stream 0 and serial numbers start at 0.
 

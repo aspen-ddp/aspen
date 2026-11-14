@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
 import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, Host, StorageDeviceConfig, StorageDeviceManager,
   StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlLocked}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlLocked}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -521,6 +521,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  CrlOpenAttempts times in a row. The stores' transaction state was in it, so each is marked rebuild-required
    *  (the reconcile pass turns them into rebuilds), the old directory is kept aside as `crl.lost-<uuid>`, and a fresh
    *  CRL is opened. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
+   *  A corrupt CRL (CrlCorrupt) is lost too, logged under its own cause.
    *  A CRL another writer holds open (CrlLocked) is never lost: it is rethrown each time, uncounted.
    *  A device without stores simply gets its CRL created. */
   private def openDeviceCrl(devicePath: os.Path,
@@ -554,7 +555,12 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                              s"${DeviceDiscovery.CrlOpenAttempts}). Retrying on the next scan: $t")
                 throw t
             transientCrlFailures -= devicePath
-            logger.error(s"Failed to recover the CRL of storage device $devicePath. Its stores must be rebuilt: $t")
+            t match
+              case _: CrlCorrupt =>
+                logger.error(s"The CRL of storage device $devicePath is corrupt: an entry fails its checksums. Its " +
+                             s"stores must be rebuilt: $t")
+              case _ =>
+                logger.error(s"Failed to recover the CRL of storage device $devicePath. Its stores must be rebuilt: $t")
             true
     storeDirs.foreach(ctx.rebuilds.markRebuildRequired)
     if os.exists(crlDir) then

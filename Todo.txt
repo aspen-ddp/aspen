@@ -28,11 +28,6 @@ RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-re
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.6  CRL F5 (+ F19, Rebuild N2): no checksums on CRL entries                                                [M]
-     Bit rot, torn or reordered sectors become Paxos state or object data. Fix: a CRC32C over each entry's header
-     and body, checked in readEntry and readStreamLocation. Reject all-zero headers (F19). A mismatch should end
-     the chain loudly and be classified separately from "CRL lost" (feeds 3.1). The format may change freely.
-
 1.7  Systemic quick wins (SL S10, S5/S6/SC1/SC2, S3)                                                        [S-M]
      a. failStorageDevice (BaseAspenClient ~720) has no pool-health guard; shutdownStorageDevice has one. Refuse
         a fail that drops any pool below tolerance (SL Q2).

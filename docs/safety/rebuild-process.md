@@ -823,6 +823,9 @@ the old id succeeds was not traced. See [repair-process.md](repair-process.md).
 **New (verification pass) N1 (Medium) Replay of a recovered commit vote can regress a newer blind write.** A store that crashes between a transaction's backend commit and its CRL record deletion recovers the record and re-applies it; revision requirements stop the replay but blind KV inserts, Exists-guarded deletes and ABA refcounts are applied over newer committed values. Details and fix in crash-recovery-log.md F13. Relevant here because a rebuilt or adopted store recovers through the same path.
 
 **New N2. Crash-recovery-log F2/F4 can raise `BrokenEntryChain` at a restart, which marks every store of the device rebuild-required and so feeds this process (see crash-recovery-log.md F2, Exp3).**
+*2026-11-14:* F2 and F4 are fixed. Media corruption is now detected by entry checksums (crash-recovery-log F5) and
+named apart as `CrlCorrupt`. It still feeds this process, by decision: a CRL that cannot be trusted means rebuilds,
+but its cause is logged separately for the systemic-loss work (Todo 3.1).
 
 **New (addendum) N3 (Low) A rebuilt store loses its applied stubs; only the mute keeps a replay from applying through
 an old incarnation's entry.** *2026-11-13: NARROWED.* The mute no longer depends on the client's clock (paxos P-N2

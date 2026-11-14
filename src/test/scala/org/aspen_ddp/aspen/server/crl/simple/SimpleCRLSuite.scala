@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation, Tx}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlLocked, StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlCorrupt, CrlLocked, StoreRecoveryState, TransactionRecoveryState}
 
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -1162,8 +1162,9 @@ class SimpleCRLSuite extends FileBasedTests {
     // Corrupt the trailing UUID of the second entry in stream 0
     val streamFile = tdir / "0.crl"
     val reader = StreamReader(StreamId(0), streamFile)
-    val Some((entry1Start, _)) = reader.readEntry(0): @unchecked
-    val Some((_, entry1Header)) = reader.readEntry(entry1Start): @unchecked
+    val Some(entry0Header) = reader.readEntry(0): @unchecked
+    val entry1Start = entry0Header.entrySize
+    val Some(entry1Header) = reader.readEntry(entry1Start): @unchecked
     val corruptOffset = entry1Start + entry1Header.trailingUUIDOffset
 
     os.write.over(streamFile, Array.fill(16)(0xFF.toByte), offset = corruptOffset, truncate = false)
@@ -1309,6 +1310,105 @@ class SimpleCRLSuite extends FileBasedTests {
       List(), None, List(), List(), ida, Map(poolId -> ida))
     val ous = (0 until numUpdates).map(i => ObjectUpdate(ObjectId(new UUID(9, i)), DataBuffer(Array[Byte](1, 2, 3)))).toList
     (tid, TransactionRecoveryState(storeId, d.serialize(), ous, disp, status, pax))
+
+  // ===== Entry checksums (crash-recovery-log F5, F19) =====
+
+  private def headerAt(file: os.Path, offset: Int): LogEntry.EntryHeader =
+    LogEntry.loadHeader(ByteBuffer.wrap(os.read.bytes(file), offset, LogEntry.StaticEntryHeaderSize).slice())
+
+  private def flip(file: os.Path, pos: Long): Unit =
+    val bytes = os.read.bytes(file)
+    bytes(pos.toInt) = (bytes(pos.toInt) ^ 0x5a).toByte
+    os.write.over(file, bytes)
+
+  /** A in the entry at offset 0 and B (storeId2) in the entry at 4096 of stream 0, both live */
+  private def twoEntries(dir: os.Path): Unit =
+    val i = SimpleCRL(dir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    saveAndWait(i.crl, transactionId2, trsValidTxd2)
+    i.crl.shutdown()
+    assert(headerAt(dir / "0.crl", 4096).entrySerialNumber == headerAt(dir / "0.crl", 0).entrySerialNumber + 1)
+
+  test("A flipped byte in a needed entry's txd, object data or static record fails the open with CrlCorrupt") {
+    val h = LogEntry.StaticEntryHeaderSize
+    val txdSize = trsValidTxd.serializedTxd.size
+    // Offsets within the entry at 0, which holds only A: its txd comes first, then its object data, then its record,
+    // whose bytes 49 to 52 are the promise number
+    val positions = List("txd" -> (h + 1), "object data" -> (h + txdSize), "promise" -> -1)
+    for (what, at) <- positions do
+      val dir = tdir / what.replace(' ', '-')
+      twoEntries(dir)
+      val e0 = headerAt(dir / "0.crl", 0)
+      val pos = if at >= 0 then at.toLong else h + e0.dynamicDataSize + 52
+      flip(dir / "0.crl", pos)
+      val r =
+        try Left(SimpleCRL(dir, 3, 1024 * 1024))
+        catch case t: Throwable => Right(t)
+      r match
+        case Left(opened) =>
+          opened.crl.shutdown()
+          fail(s"$what: the corrupted CRL opened")
+        case Right(t) => assert(t.isInstanceOf[CrlCorrupt], s"$what: $t")
+  }
+
+  test("A torn newest entry is dropped and the state before it recovers") {
+    twoEntries(tdir)
+    // B's entry was being written when the host crashed: part of its body never reached the disk
+    val f = tdir / "0.crl"
+    val bytes = os.read.bytes(f)
+    java.util.Arrays.fill(bytes, 4096 + LogEntry.StaticEntryHeaderSize, 4096 + LogEntry.StaticEntryHeaderSize + 10, 0.toByte)
+    os.write.over(f, bytes)
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i2.trsList.map(_.storeId) == List(storeId))
+    saveAndWait(i2.crl, transactionId2, trsValidTxd2)
+    i2.crl.shutdown()
+    val i3 = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i3.trsList.map(_.storeId).toSet == Set(storeId, storeId2))
+    i3.crl.shutdown()
+  }
+
+  test("A corrupt entry followed by valid newer ones fails the open instead of rolling back to the entry before it") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    saveAndWait(i.crl, transactionId2, trsValidTxd2)
+    saveAndWait(i.crl, transactionId3, trsValidTxd4)
+    i.crl.shutdown()
+    // The stream UUID in the middle entry's header
+    flip(tdir / "0.crl", 4096)
+    assertThrows[CrlCorrupt](SimpleCRL(tdir, 3, 1024 * 1024))
+  }
+
+  test("A corrupt head of the active stream fails the open instead of recovering from the stream before it") {
+    val size = 4096L * 3
+    val y = mkTx(2, 2)
+    val i = SimpleCRL(tdir, 3, size)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    while i.crl.currentStreamNumber == 0 do
+      saveAndWait(i.crl, y._1, y._2)
+    // A second entry in stream 1 holding a transaction no earlier entry has
+    saveAndWait(i.crl, transactionId3, trsValidTxd4)
+    settle(i.crl)
+    assert(i.crl.currentStreamNumber == 1)
+    i.crl.shutdown()
+    flip(tdir / "1.crl", 0)
+    assertThrows[CrlCorrupt](SimpleCRL(tdir, 3, size))
+  }
+
+  test("Zero-filled stream files open as an empty CRL that writes from the start of stream 0") {
+    val size = 4096L * 3
+    for n <- 0 until 3 do
+      os.write(tdir / s"$n.crl", new Array[Byte](size.toInt))
+    val i = SimpleCRL(tdir, 3, size)
+    assert(i.trsList.isEmpty)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    settle(i.crl)
+    assert(i.crl.currentStreamNumber == 0)
+    i.crl.shutdown()
+    val i2 = SimpleCRL(tdir, 3, size)
+    assert(i2.trsList.map(_.storeId) == List(storeId))
+    i2.crl.shutdown()
+  }
 
   test("StreamWriter writes every buffer of a write with more buffers than IOV_MAX") {
     val sw = StreamWriter(1024 * 1024, streams(1))

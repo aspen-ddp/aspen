@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig,
   StorageDeviceManager, StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlCorrupt, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, SimpleCRL}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome,
   TransferOutcome}
@@ -605,6 +605,26 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       calls.get should be(2)
       inner.opened.size should be(1)
       os.exists(crlDir / "0.crl") should be(true)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
+
+  atest("a device whose CRL fails its checksums marks its stores rebuild-required"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    createCrl(deviceDir)
+    val inner = newFactory()
+    val calls = new AtomicInteger(0)
+    val corruptFirst = new CrashRecoveryLogFactory:
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+        if calls.incrementAndGet() == 1 then
+          throw CrlCorrupt("corrupt")
+        inner.openCRL(devicePath, config)
+    val host = newCrlHost(hostRoot, corruptFirst)
+
+    Future.successful:
+      os.exists(marker(storeDir)) should be(true)
+      os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
+      calls.get should be(2)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
 
   /** A device holding a store whose CRL opens fail with an I/O error the first `failures` times */

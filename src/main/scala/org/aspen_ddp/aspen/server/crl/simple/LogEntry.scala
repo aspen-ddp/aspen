@@ -4,6 +4,7 @@ import scribe.Logging
 
 import java.nio.ByteBuffer
 import java.util.UUID
+import java.util.zip.CRC32C
 import scala.collection.immutable.HashMap
 
 class LogEntry(val previousEntryLocation: StreamLocation,
@@ -119,8 +120,10 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     hbuff.putInt(txDeletions.length)
     hbuff.putInt(stubs.size)
     hbuff.putInt(stubDeletions.size)
+    // body_crc and header_crc are filled in once the body is built
 
     buffers = ByteBuffer.wrap(harr) :: buffers
+    val bodyCrc = new CRC32C
 
     // DynamicData ---------
     var offset = startingOffset + StaticEntryHeaderSize
@@ -129,6 +132,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
       val loc = StreamLocation(streamId, offset, buff.remaining())
       offset += buff.remaining()
       buffers = buff :: buffers
+      bodyCrc.update(buff.duplicate())
       loc
 
     txs.valuesIterator.foreach: tx =>
@@ -159,6 +163,10 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
     buffers = ByteBuffer.wrap(staticArr) :: buffers
 
+    bodyCrc.update(staticArr)
+    hbuff.putInt(BodyCrcOffset, bodyCrc.getValue.toInt)
+    hbuff.putInt(HeaderCrcOffset, headerCrc(harr))
+
     // Pad to 4k alignment
     val nPadBytes = padTo4k(startingOffset + StaticEntryHeaderSize + dynDataSize + statDataSize)
 
@@ -170,7 +178,20 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
 object LogEntry:
 
-  val StaticEntryHeaderSize: Int = 16 + 8 + 8 + 14 + 8 + 8 + 4 + 4 + 4 + 4
+  val StaticEntryHeaderSize: Int = 16 + 8 + 8 + 14 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4
+
+  private val BodyCrcOffset: Int = StaticEntryHeaderSize - 8
+  private val HeaderCrcOffset: Int = StaticEntryHeaderSize - 4
+
+  /** CRC32C of a header's bytes before its header_crc */
+  def headerCrc(header: Array[Byte]): Int =
+    val crc = new CRC32C
+    crc.update(header, 0, HeaderCrcOffset)
+    crc.getValue.toInt
+
+  /** Whether `header` (StaticEntryHeaderSize bytes) carries the checksum of its own fields */
+  def headerIntact(header: Array[Byte]): Boolean =
+    ByteBuffer.wrap(header).getInt(HeaderCrcOffset) == headerCrc(header)
 
   /// Entry Header
   ///   stream_uuid - 16
@@ -183,6 +204,10 @@ object LogEntry:
   ///   num_tx_deletions - 4
   ///   num_applied_stubs - 4
   ///   num_applied_stub_deletions - 4
+  ///   body_crc - 4: CRC32C of the dynamic and static data, through the trailing UUID (not the padding)
+  ///   header_crc - 4: CRC32C of the header bytes before it
+  ///
+  /// Recovery takes nothing from an entry whose checksums fail (Recovery, crash-recovery-log F5)
   ///
   /// Static data: transactions, applied stubs (TxId each), transaction deletions, applied stub deletions, stream UUID
   case class EntryHeader(streamUUID: UUID,
@@ -194,7 +219,8 @@ object LogEntry:
                          numTransactions: Int,
                          numDeletedTransactions: Int,
                          numAppliedStubs: Int,
-                         numDeletedAppliedStubs: Int):
+                         numDeletedAppliedStubs: Int,
+                         bodyCrc: Int):
     def trailingUUIDOffset: Long =
       StaticEntryHeaderSize + dynamicDataSize + staticDataSize - 16
 
@@ -220,9 +246,10 @@ object LogEntry:
     val numTxDeletions = hbuff.getInt()
     val numStubs = hbuff.getInt()
     val numStubDeletions = hbuff.getInt()
+    val bodyCrc = hbuff.getInt()
 
     EntryHeader(streamUUID, entrySerialNumber, oldestEntryNeeded, previousEntryLocation, dynamicDataSize,
-      staticDataSize, numTransactions, numTxDeletions, numStubs, numStubDeletions)
+      staticDataSize, numTransactions, numTxDeletions, numStubs, numStubDeletions, bodyCrc)
 
 
   def loadStaticEntryContent(header: EntryHeader,

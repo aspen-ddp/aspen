@@ -12,6 +12,10 @@
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
 - Sizing (`crl-num-streams`, `crl-max-file-size-mb`) is fixed when the device's CRL is created: `SimpleCRL.apply`
   throws `SizingMismatch` for stream files of another count or size, and the device's CRL is then treated as lost
+- Each entry header carries CRC32Cs of the header and of the body (`LogEntry`). Recovery drops a torn newest entry
+  (only the write in flight at a crash can be torn) and throws `CrlCorrupt` for any other failed checksum, or when an
+  intact entry newer than the last one found exists in that stream or the next. Data is read only from entries
+  the walk verified. All-zero regions are not entries
 - A failed open shuts its writer down before throwing, so a retry never runs two writers over the same files
 - An open CRL holds an exclusive lock on `crl/lock` (`simple/CrlLock`), from before its files are read until its writer
   has closed them; a second opener, in this process or another, gets `CrlLocked` and touches nothing. Never open

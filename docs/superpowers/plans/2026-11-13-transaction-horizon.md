@@ -31,7 +31,8 @@ The client stops retransmitting past the horizon and fails with a new sibling of
 - Invariant: **a store never rejoins a transaction it forgot.**
 - Scala 3 quiet syntax, indented if/then/else; os-lib for files; tests deterministic (LockstepThreading /
   FrontendSuite's synchronous harness where possible). No flaky tests; keep every test as fast as correctness allows.
-- Full test run: `sbt test` with a 70 s hang budget per the user's rules.
+- Full test run: `sbt test` with a 70 s hang budget per the user's rules (normal load).
+- Tests that use a short injected horizon must not flake under load: Task 6 runs the full suite under 100 % CPU.
 - Commit directly on `main`. End every commit message with
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -386,7 +387,17 @@ The client stops retransmitting past the horizon and fails with a new sibling of
 - [ ] **Step 3: Update `ReplayIntegrationSuite` expectations** that assumed today's outcomes.
 - [ ] **Step 4: Full run** — `timeout 70 sbt test` (repeat once to catch flakes; investigate any failure, CPU at
   100 % allowed). Expected: all PASS, twice.
-- [ ] **Step 5: Commit** — `git commit -m "HorizonIntegrationSuite: end-to-end horizon, floor and expiry"`
+- [ ] **Step 5: Runs under 100 % CPU load.** Short test horizons (about 1 s) must not turn scheduling delays into
+  refusals, give-ups or expiries. Saturate the machine with busy loops, 24-48 on 24 cores (`load.sh N` if it exists
+  in the repo root or scratchpad; otherwise
+  `for i in $(seq N); do (while :; do :; done) & done`, and kill them afterwards). Then run the full suite at least
+  **twice** (`sbt test`; one sbt JVM at a time, since test ports collide), plus one run pinned with
+  `taskset -c 0-2 sbt test`. Under load the 70 s hang budget does not apply. Expected: every run passes.
+  - Any failure in a suite touched by Tasks 1-6 is treated as a real flake. Fix it by deriving the test's horizon
+    and waits from what the test needs, or by driving time explicitly (an injected clock), never by adding sleeps.
+  - Then repeat the loaded runs until two consecutive runs pass.
+  - Record the run count and outcomes in the commit message.
+- [ ] **Step 6: Commit** — `git commit -m "HorizonIntegrationSuite: end-to-end horizon, floor and expiry"`
 
 ---
 

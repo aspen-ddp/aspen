@@ -16,6 +16,13 @@
   splits of errorTree inserts already do; the entry delete itself is tracked too, with `MissedUpdateFinalizationAction.limitTracking(storeId.poolId, tx)` turning
   tracking off only for the bootstrap pool's own trees (an entry about P lives one level closer to the bootstrap pool, so
   the chain ends). `newRepairTransaction` is for repair proofs only
+- `StoreRepairer.sweepBootstrapTrees` reconciles one bootstrap store's copy of every node (all tiers,
+  `TieredKeyValueList.foreachNode`) of the bootstrap pool's own errorTree and unackedCommitsTree, whose writes run
+  untracked so a miss leaves no entry. Each node goes through `repairUpdate` with no minimum timestamp and no proofs
+  (they would collide with marker traffic), keyed `sweepDeferralKey` (prefix 2, kept by `DeferralState.retain`;
+  pruned by `retainSweep` after a complete walk). It creates and deletes no entries; an unreadable node counts as
+  incomplete. `SweepResult.needsAnotherPass` is true when anything was reconciled or left incomplete, or a walk
+  missed nodes
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
 - A repair scan runs only while the store's pool entry names this host, so a superseded copy never consumes the

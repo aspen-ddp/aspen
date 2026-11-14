@@ -484,13 +484,21 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     */
   private def missedBy(i: Int)(build: Transaction => Unit): Future[Unit] = missedByTx(i)(build).map(_ => ())
 
-  /** missedBy, completing with the missed transaction's id */
-  private def missedByTx(i: Int)(build: Transaction => Unit): Future[TransactionId] =
+  /** missedBy, completing with the missed transaction's id. `newTx` makes the transaction: a
+    * `client.newRepairTransaction()` commits an untracked write, one the store misses with no entry recorded
+    */
+  private def missedByTx(i: Int, newTx: => Transaction = client.newTransaction())
+                        (build: Transaction => Unit): Future[TransactionId] =
+    missedByTxAsync(i, newTx)(tx => { build(tx); Future.unit })
+
+  /** missedByTx for a `build` that completes asynchronously, as a TKVL write does */
+  private def missedByTxAsync(i: Int, newTx: => Transaction)(build: Transaction => Future[Unit]): Future[TransactionId] =
     net.offlineStores = Set(sid(i))
-    val tx = TestTransactions.replaySafe(client.newTransaction())
-    build(tx)
-    net.droppedTx = net.droppedTx + ((sid(i), tx.id))
-    pump(tx.commit(), deadline()).transformWith: committed =>
+    val tx = TestTransactions.replaySafe(newTx)
+    build(tx).flatMap: _ =>
+      net.droppedTx = net.droppedTx + ((sid(i), tx.id))
+      pump(tx.commit(), deadline())
+    .transformWith: committed =>
       settle().transform: settled =>
         net.droppedTx = net.droppedTx - ((sid(i), tx.id))
         net.offlineStores = Set()
@@ -1207,3 +1215,128 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       proven shouldBe true
       audit.unpinned shouldBe empty
       audit.replaySafeWith("repair proof changes nothing").size shouldBe 1
+
+  // ---- The bootstrap tree sweep ---------------------------------------------------------------------------------
+  //
+  // Writes to the bootstrap pool's own ErrorTree and UnackedCommits nodes run untracked, so a bootstrap store that
+  // misses one gets no entry; only sweepBootstrapTrees heals its copy.
+
+  /** Inserts `key` into the bootstrap errorTree in an untracked transaction store `i` misses */
+  private def untrackedErrorTreeWrite(i: Int, key: Key, value: Value): Future[Unit] =
+    errorTree.flatMap: tree =>
+      missedByTxAsync(i, client.newRepairTransaction())(tx => tree.set(key, value)(using tx).map(_ => ()))
+    .map(_ => ())
+
+  /** Every node of `tree`, with its tier */
+  private def treeNodes(tree: TieredKeyValueList): Future[List[(Int, KeyValueObjectPointer)]] =
+    @volatile var nodes: List[(Int, KeyValueObjectPointer)] = Nil
+    tree.foreachNode((tier, ptr) => { synchronized { nodes = (tier, ptr) :: nodes }; Future.unit })
+      .map(_ => nodes.reverse)
+
+  private def nodeKeys(i: Int, id: ObjectId): Set[Key] =
+    stored(i, id).flatMap(_.kvState).map(_.content.keySet).getOrElse(Set())
+
+  /** Store `i`'s copy of a node: its keys and revision */
+  private def nodeCopy(i: Int, id: ObjectId): Option[(Set[Key], org.aspen_ddp.aspen.common.objects.ObjectRevision)] =
+    stored(i, id).map(s => (nodeKeys(i, id), s.metadata.revision))
+
+  private def sweep(i: Int, repairer: StoreRepairer, deferral: DeferralState): Future[SweepResult] =
+    for
+      _ <- settle()
+      result <- pump(repairer.sweepBootstrapTrees(sid(i), RepairPolicy.Default, deferral), deadline())
+      _ <- settle()
+    yield result
+
+  test("a bootstrap store that missed an untracked errorTree write is reconciled by a sweep"):
+    val key = buildErrorKey(1.toByte, ObjectId(UUID.randomUUID()))
+    for
+      _ <- settle()
+      _ <- untrackedErrorTreeWrite(2, key, buildErrorValue(HLCTimestamp.now, Array[Byte](1)))
+      tree <- errorTree
+      nodes <- treeNodes(tree)
+      tier0 = nodes.collect { case (0, ptr) => ptr }
+      heldBefore = tier0.exists(ptr => nodeKeys(2, ptr.id).contains(key))
+      heldElsewhere = tier0.exists(ptr => nodeKeys(0, ptr.id).contains(key))
+      entries <- errorEntries(2)
+      result <- sweep(2, StoreRepairer(client, net.smgr), DeferralState())
+    yield
+      heldElsewhere shouldBe true
+      withClue("store 2 missed the write, with no entry: "):
+        heldBefore shouldBe false
+        entries shouldBe empty
+      tier0.exists(ptr => nodeKeys(2, ptr.id).contains(key)) shouldBe true
+      result.reconciled should be >= 1
+
+  test("a sweep reconciles a stale upper-tier node"):
+    // Each entry carries a 400 KiB store pointer, so the 1 MiB tier-0 nodes hold two each and the tree grows a tier
+    val bigPointer = Array.fill[Byte](400 * 1024)(3)
+    def entryKey(n: Int) = buildErrorKey(1.toByte, ObjectId(new UUID(12, n)))
+    def seed(ns: Range): Future[Unit] =
+      ns.foldLeft(Future.unit): (f, n) =>
+        f.flatMap(_ => untrackedErrorTreeWrite(2, entryKey(n), buildErrorValue(HLCTimestamp.Zero, bigPointer)))
+    val repairer = StoreRepairer(client, net.smgr)
+    val deferral = DeferralState()
+    def sweepUntilConverged(passes: Int): Future[Int] =
+      sweep(2, repairer, deferral).flatMap: result =>
+        if !result.needsAnotherPass then Future.successful(passes)
+        else if passes <= 1 then Future.failed(new AssertionError(s"the sweep never converged: $result"))
+        else sweepUntilConverged(passes - 1)
+    for
+      _ <- settle()
+      _ <- seed(1 to 4)
+      tree <- errorTree
+      (tier, _, root) <- tree.rootManager.getFreshRootNode()
+      // Store 2 also misses the splits' (tracked) writes of the upper tier: their entries are dropped below, so only
+      // the sweep can heal its copy
+      _ <- net.withStoreBehind(sid(2), root.get.pointer.id)(seed(5 to 8))
+      _ <- dropErrorEntries(2)
+      before <- treeNodes(tree)
+      staleUpper = before.filter((t, ptr) => t >= 1 && nodeCopy(2, ptr.id) != nodeCopy(0, ptr.id))
+      _ <- sweepUntilConverged(5)
+      after <- treeNodes(tree)
+    yield
+      tier should be >= 1
+      staleUpper should not be empty
+      after.foreach: (t, ptr) =>
+        withClue(s"tier $t node ${ptr.id}: "):
+          nodeCopy(2, ptr.id) shouldBe nodeCopy(0, ptr.id)
+      succeed
+
+  test("a sweep of a converged store changes nothing and needs no further pass"):
+    val repairer = StoreRepairer(client, net.smgr)
+    val deferral = DeferralState()
+    for
+      _ <- scanAllUntilQuiet()
+      _ <- sweep(2, repairer, deferral)
+      second <- sweep(2, repairer, deferral)
+    yield
+      second.reconciled shouldBe 0
+      second.needsAnotherPass shouldBe false
+
+  test("a sweep runs no proofs"):
+    val target = SeamTarget()
+    @volatile var proofs = 0
+    val repairer = StoreRepairer(client, target, testingOnlyOnProof = (_, _, _) => proofs += 1)
+    val deferral = DeferralState()
+    val key = buildErrorKey(1.toByte, ObjectId(UUID.randomUUID()))
+    val n = RepairPolicy.Default.proofAfterDeferrals + 1
+    def sweeps(left: Int, results: List[SweepResult]): Future[List[SweepResult]] =
+      if left == 0 then Future.successful(results.reverse)
+      else sweep(2, repairer, deferral).flatMap(r => sweeps(left - 1, r :: results))
+    for
+      _ <- untrackedErrorTreeWrite(2, key, buildErrorValue(HLCTimestamp.now, Array[Byte](1)))
+      tree <- errorTree
+      nodes <- treeNodes(tree)
+      holder = nodes.collect { case (0, ptr) if nodeKeys(0, ptr.id).contains(key) => ptr }.head
+      _ = target.lockedKeys += holder.id -> Set(key)
+      results <- sweeps(n, Nil)
+    yield
+      proofs shouldBe 0
+      results.foreach(_.incomplete should be >= 1)
+      nodeKeys(2, holder.id) should not contain key
+
+  test("sweeping a store of another pool is rejected"):
+    val repairer = StoreRepairer(client, net.smgr)
+    recoverToSucceededIf[IllegalArgumentException]:
+      repairer.sweepBootstrapTrees(StoreId(PoolId(UUID.randomUUID()), 0.toByte), RepairPolicy.Default,
+                                   DeferralState())

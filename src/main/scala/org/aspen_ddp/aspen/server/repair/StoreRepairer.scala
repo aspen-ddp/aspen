@@ -36,6 +36,20 @@ case class ScanResult(seen: Int, repaired: Int, deferred: Int, unackedSeen: Int 
 object ScanResult:
   val Empty: ScanResult = ScanResult(0, 0, 0)
 
+/** What one sweep of a bootstrap store's copies of the bootstrap pool's own ErrorTree and UnackedCommits nodes did
+  * (StoreRepairer.sweepBootstrapTrees).
+  *
+  * @param nodes nodes reconciled or attempted
+  * @param reconciled nodes whose reconcile changed the store's copy
+  * @param incomplete nodes left not complete: deferred, stale, or failed (unreadable, or deleted under the walk)
+  * @param walkComplete false when either tree's walk missed nodes deleted under it
+  */
+final case class SweepResult(nodes: Int, reconciled: Int, incomplete: Int, walkComplete: Boolean):
+  def needsAnotherPass: Boolean = reconciled > 0 || incomplete > 0 || !walkComplete
+
+object SweepResult:
+  val Empty: SweepResult = SweepResult(0, 0, 0, walkComplete = true)
+
 /** Lock deferrals of one store's repair entries, and its suspected orphan stubs (`confirmOrphans`), kept in memory
   * across its scans by RepairService. A host restart forgets them: the next pass then reconciles each whole object
   * again and restarts the count, and an orphan stub needs two more scans to be dropped.
@@ -86,9 +100,15 @@ final class DeferralState:
   def deferredKeys(entryKey: Key): Option[Set[Key]] = synchronized:
     entries.get(entryKey).flatMap(_.only)
 
-  /** Forgets every entry not in `entryKeys`: those a completed scan did not see are gone or were rewritten */
+  /** Forgets every entry not in `entryKeys`: those a completed scan did not see are gone or were rewritten. Sweep keys
+    * (StoreRepairer.sweepDeferralKey) are kept: they belong to the sweep, which prunes them with `retainSweep`
+    */
   private[repair] def retain(entryKeys: Set[Key]): Unit = synchronized:
-    entries = entries.filter((k, _) => entryKeys.contains(k))
+    entries = entries.filter((k, _) => StoreRepairer.isSweepDeferralKey(k) || entryKeys.contains(k))
+
+  /** Forgets every sweep key not in `sweepKeys`: the nodes a complete sweep did not visit are gone */
+  private[repair] def retainSweep(sweepKeys: Set[Key]): Unit = synchronized:
+    entries = entries.filter((k, _) => !StoreRepairer.isSweepDeferralKey(k) || sweepKeys.contains(k))
 
   private[repair] def size: Int = synchronized(entries.size)
 
@@ -170,6 +190,58 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           deferral.retain(counts.touchedKeys)
           counts.result
 
+  /** Reconciles the store's copy of every node of the bootstrap pool's own errorTree, then of its unackedCommitsTree,
+    * every tier. Writes to those nodes run with missed-update tracking off (`limitTracking`, `newRepairTransaction`),
+    * so a bootstrap store that misses one gets no entry: this sweep is what heals it. Each node goes through
+    * `repairUpdate` with no minimum timestamp (complete means the store's copy matches the read) and no proofs: a
+    * proof is an untracked write that would collide with the marker traffic these nodes carry, so a key locked at
+    * every attempt waits for a later sweep. No entries are created or deleted.
+    *
+    * A node that cannot be read (deleted under the walk by a join or root reduction, or the pool degraded) counts as
+    * incomplete, not as a failure of the sweep. Once the store stops being repairable here the remaining nodes are
+    * skipped.
+    */
+  def sweepBootstrapTrees(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState): Future[SweepResult] =
+    if storeId.poolId != PoolId.BootstrapPoolId then
+      Future.failed(new IllegalArgumentException(s"Only stores of the bootstrap pool are swept, not $storeId"))
+    else
+      val nodes = AtomicInteger(0)
+      val reconciled = AtomicInteger(0)
+      val incomplete = AtomicInteger(0)
+      var sweepKeys = Set[Key]()
+
+      def sweepNode(tier: Int, pointer: KeyValueObjectPointer): Future[Unit] =
+        if abandoned(storeId) then
+          Future.unit
+        else
+          nodes.incrementAndGet()
+          val key = sweepDeferralKey(pointer.id)
+          synchronized { sweepKeys += key }
+          Future.delegate(repairUpdate(storeId, pointer, HLCTimestamp.Zero, key, policy, deferral, allowProof = false))
+            .map: result =>
+              if result.changed then reconciled.incrementAndGet()
+              if !result.complete then incomplete.incrementAndGet()
+            .recover:
+              case err =>
+                logger.info(s"Sweep of tier $tier node ${pointer.id} on $storeId failed: $err")
+                incomplete.incrementAndGet()
+
+      ownedHere(storeId).flatMap: owned =>
+        if !owned then
+          logger.warn(s"Not sweeping store $storeId: its pool records it on another host")
+          Future.successful(SweepResult.Empty)
+        else
+          for
+            pool <- client.getStoragePool(storeId.poolId)
+            errorWalk <- pool.errorTree.foreachNode(sweepNode)
+            unackedWalk <- pool.unackedCommitsTree.foreachNode(sweepNode)
+          yield
+            val walkComplete = errorWalk.complete && unackedWalk.complete
+            if walkComplete && !abandoned(storeId) then deferral.retainSweep(synchronized(sweepKeys))
+            val result = SweepResult(nodes.get, reconciled.get, incomplete.get, walkComplete)
+            logger.info(s"Swept the bootstrap trees' nodes on $storeId: $result")
+            result
+
   /** Drops the stubs of the store that no UnackedCommits entry needs any more: those that this scan and the
     * previous successful one of the store both found orphaned (Ruling 8). A scan finds a stub orphaned when it is in
     * `before`, the store's stubs read before the walk, its transaction had no entry in the walk, and a point lookup
@@ -243,7 +315,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           _ <- oAllocation match
             case Some(allocation) =>
               repairUpdate(storeId, ObjectPointer(allocation.value.bytes), missedTimestamp, entryKey, policy,
-                           deferral).flatMap: result =>
+                           deferral, allowProof = true).flatMap: result =>
                 if result.complete then
                   deferral.clear(entryKey)
                   deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key).map(_ => counts.repaired.incrementAndGet())
@@ -315,7 +387,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                                s"UnackedCommits entry is too recent to treat as a deletion")
                   Future.successful(false)
                 case Some(_) =>
-                  repairUpdate(storeId, ptr, entry.timestamp, entryKey, policy, deferral)
+                  repairUpdate(storeId, ptr, entry.timestamp, entryKey, policy, deferral, allowProof = true)
                     .map(result => allComplete && result.complete)
 
           completed.flatMap: allComplete =>
@@ -337,10 +409,11 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * stale result, so `complete` says exactly whether the entry may be dropped. The result is recorded in `deferral`
     * under `entryKey`: a later pass reconciles only the keys deferred before, and once parts have been deferred by a
     * lock for `policy.proofAfterDeferrals` passes they are proven (RepairProofs) and, where proven, reconciled from
-    * the same read.
+    * the same read. Without `allowProof` (the bootstrap sweep) deferred parts are only retried on later passes.
     */
   private def repairUpdate(storeId: StoreId, ptr: ObjectPointer, minTimestamp: HLCTimestamp, entryKey: Key,
-                           policy: RepairPolicy, deferral: DeferralState): Future[ReconcileResult] =
+                           policy: RepairPolicy, deferral: DeferralState,
+                           allowProof: Boolean): Future[ReconcileResult] =
     val snapshot = Promise[RepairSnapshot]()
     target.snapshot(storeId, ptr, snapshot)
 
@@ -361,7 +434,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       first <- reconcile(snap, os)
       passes = deferral.record(entryKey, first)
       result <-
-        if passes < policy.proofAfterDeferrals then
+        if !allowProof || passes < policy.proofAfterDeferrals then
           Future.successful(first)
         else
           logger.info(s"Repair of object ${ptr.id} on store $storeId deferred by locks for $passes passes " +
@@ -454,6 +527,12 @@ object StoreRepairer:
   /** The DeferralState key of one object of a UnackedCommits entry */
   private[repair] def unackedDeferralKey(entryKey: Key, objectId: ObjectId): Key =
     Key(Array[Byte](1) ++ entryKey.bytes ++ objectId.toBytes)
+
+  /** The DeferralState key of a node of the bootstrap pool's own trees, swept by sweepBootstrapTrees */
+  private[repair] def sweepDeferralKey(nodeId: ObjectId): Key =
+    Key(Array[Byte](2) ++ nodeId.toBytes)
+
+  private[repair] def isSweepDeferralKey(key: Key): Boolean = key.bytes.nonEmpty && key.bytes(0) == 2
 
   /** Decodes the ObjectId from an errorTree key: one poolIndex byte then the UUID, big-endian. */
   private[repair] def decodeObjectId(key: Key): ObjectId =

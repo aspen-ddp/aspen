@@ -4,9 +4,11 @@ TODO
 Safety work list (from docs/safety/*, built 2026-11-11 against fcb50a85)
 -----------------------------------------------------------------------
 
-Every finding not marked FIXED or REFUTED in docs/safety/* is listed below once, grouped where one change addresses
-several ids. Each item's mechanism was spot-checked at HEAD and is still present unless noted. Priority is by the
-worst plausible consequence, then likelihood, then cost. A cheap fix with a large payoff moves up within its tier.
+Every open finding (not FIXED, REFUTED or CLOSED) in docs/safety/* is listed below once, grouped where one change
+addresses several ids. Completed items are removed; their record is in the docs and git history. Item numbers are
+stable (other documents cite them), so gaps are expected. Each item's mechanism was spot-checked at HEAD and is still
+present unless noted. Priority is by the worst plausible consequence, then likelihood, then cost. A cheap fix with a
+large payoff moves up within its tier.
 
 Ordering of consequence: lost committed data or a split decision > systemic loss of many stores > resurrection,
 overwritten update or permanent replica divergence > liveness (hangs, stalls) > performance > analysis/docs.
@@ -25,20 +27,6 @@ RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-re
 
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
-
-1.3  DONE 2026-11-13 (transaction horizon, docs/superpowers/specs/2026-11-13-transaction-horizon-design.md):
-     P-N1 + P-F2 + R-F3/F5/F8, false abort of a committed transaction. Past a 20 s horizon no store joins a
-     transaction it does not hold (Frontend.forgetFloorMillis), outcomes are remembered 30 s, stuck Txs expire from
-     their peers' status, and the client fails with TransactionOutcomeUnknown instead of a false abort (1.3b). 1.3a
-     (proof caching, P-F10's lastProposer) and 1.3c (traceless hold for live voters) were dropped, not implemented:
-     closed by the horizon. Residuals: post-load refusals (paxos 10.10), and retried Unknowns (see 5.10).
-
-1.4  DONE 2026-11-14: Req F5 + F6. A commit voter that cannot hold the update it voted for fail-stops the store
-     (Frontend.failStop -> Host.StoreFailStopped -> rebuilt as a failed backend is). Triggers: an apply that
-     throws; a live voter's failed apply re-check; a recovered commit vote whose object fails to load with
-     anything but ObjectNotFound. A write-frozen store poisons the object instead (abort votes until reload) and
-     keeps serving. Residual: a recovered vote's failed re-check is only logged, since superseded and invalidated
-     cannot be told apart. Every fail-stop is a lost-store declaration (Backlog: correlated declarations).
 
 1.5  CRL F10: no exclusion of a second opener of the same CRL files                                         [S]
      A double mount, or an adoption while the old host still writes, makes two writers interleave and corrupt
@@ -69,7 +57,7 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
            thread. Charge every recovered record at open, and release it on drop or transfer.
        F7: stream files are sparse (a one-byte write at the end), so ENOSPC on a hole kills the writer.
            Preallocate real blocks. ENOSPC on the CRL must freeze the device's writes, not mark the device failed
-           (2026-11-14 note; Backlog "Full storage devices").
+           (Backlog "Full storage devices").
      Correct server/crl/CLAUDE.md: "reads keep working" holds only for object reads.
 
 
@@ -170,20 +158,27 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
                  or derive the proposer id from (pool, index).
        F5: a restarted leader reuses (1,L). Start a restarted driver at round 2 or higher, or persist the
            highest round used.
-       F6: aborts drop acceptor state at resolution. Keep the Paxos record until TxFinalized, as commits do.
-           Re-assessed 2026-11-13: the transaction horizon makes a forgotten abort non-re-decidable, so this no
-           longer buys safety (residual: a host wall clock stepped back > ~8 s, paxos F6). Low priority.
+       F6: aborts drop acceptor state at resolution. The transaction horizon makes a forgotten abort
+           non-re-decidable, so this matters only if a host wall clock steps back by more than ~8 s (paxos F6).
+           Fix if that residual matters: keep the Paxos record until TxFinalized, as commits do. Low priority.
        F7: count Undetermined as no reply, not as an abort vote.
-       F11: log an error and count every conflicting resolution, as split-decision detection. The host status
-            cache does so since 2026-11-13 (TransactionStatusCache.splitDecisions); Tx, driver and client do not.
+       F11: Tx, driver and client accept a conflicting resolution silently. Log an error and count it, as split-
+            decision detection, the way the host status cache already does (TransactionStatusCache.splitDecisions).
 
 2.14 Server-side validation of the description: Req F7, Q-N4, Req open question 1                           [M-L]
      The pin rule, thresholds, primary object and one-update-per-object are enforced by the client only. Validate
      at the store: thresholds against the pool IDA (and audit `2T > width` outside IDA construction), at most one
      update per object, and a pin marker the store can check. Decide how much of the trust model to change.
 
-2.15 CLOSED 2026-11-13: P-N4's delayed duplicate client prepare is closed by the transaction horizon (1.3); the
-     accepted corner case is gone from the Transaction.commit scaladoc.
+2.16 Recovered commit vote whose apply re-check fails (residual of Req F5)                                    [S-M]
+     A live commit voter that cannot apply its committed update fail-stops the store (Tx.issueCommits). A
+     recovered one only logs, because a later transaction built on it may have superseded its update before the
+     crash (10.5a), and that legitimate skip looks the same as a state invalidated under the recovered locks. An
+     invalidated one leaves the vote counted with neither the lock nor the update.
+     Fix: tell the cases apart. Treat the skip as superseded only when the object's timestamp is later than T's
+     start and its revision is neither T's nor the one T requires, and fail-stop otherwise. Or, simpler to reason
+     about, persist an "applied" mark with T's CRL record once its backend commits succeed, so a recovered vote
+     knows whether it already applied.
 
 
 PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
@@ -197,7 +192,10 @@ PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
      forces openCRL to throw fleet-wide during a simulated rolling restart. Build that test first.
      Include: S7/Q1 (crl.lost-<uuid> is kept but never used: define retention and salvage, or delete it), S8
      (record each declaration durably with its cause, visible in show-* commands), SL Q3-Q6, and the destructive
-     4.2 rows X2/X3/X5/X6/X7 as false-positive amplifiers (X5 removes crl_save.log after a fail-stop).
+     4.2 rows X2/X3/X5/X6/X7 as false-positive amplifiers (X5 removes crl_save.log after a fail-stop). Every
+     automatic fail-stop (backend I/O error, failed CRL recovery, Frontend.failStop) is a lost-store declaration
+     and falls under the same check (Backlog: "System-level protection against correlated lost store
+     declarations").
 
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)
@@ -210,7 +208,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 4.2  Hung backend commit: Req F12                                                                           [S-M]
      awaitingCommits has no timer, so an FSIF ENOSPC freeze stalls the object forever. Add a long watchdog that
-     votes BackendCommitFailed and keeps the store serving. Never fail-stop for out of space (2026-11-14 note).
+     votes BackendCommitFailed and keeps the store serving. Never fail-stop for out of space.
      RocksDBBackend.commit completes only on success (fcommit.foreach), so a failed put hangs its commit the same
      way. Backlog "Full storage devices".
 
@@ -268,7 +266,7 @@ PRIORITY 5: performance and hygiene
 5.2  R-F16: start a leader driver only when the status cache has no outcome (not merely notFinalized).      [S]
 5.3  Rebuild F7: router.markOffline for a T12 rebuild on a new device, clearOffline on promotion.           [S]
 5.4  P-F12: send Accepts as soon as the new round's quorum is reached. P-F14: save the Tx when late object
-     data is adopted. P-F15: delete or wire up receiveTxPrepare (TxStatusRequest wired up, 2026-11-13).    [S]
+     data is adopted. P-F15: delete or wire up the unused receiveTxPrepare.                                  [S]
 5.5  Q-N5 split action: re-read before declaring a split node gone. Allocation action: make a re-run after a
      deletion idempotent (no orphan entry).                                                                 [S-M]
 5.6  CRL F16: avoid rewriting the full live set on every open, or do it off the control thread. CRL F12: replace
@@ -291,10 +289,12 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 6.2  G1: state the bound on how long a T may stay unresolved against the X2 mute, and add an end-to-end
      blank-acceptor promotion test.                                                                         [S]
 6.3  G3: confirm that transfer-out and relinquish go through Store.close, so no driver or timer survives.   [S]
-6.4  G4: a host restart wiping the status cache (now late-commit evidence) combined with rolling restarts.  [M]
-     Safety half covered by the forget floor (2026-11-13); left: the liveness cost of post-load refusals.
-6.5  G8: combined HLC-skew analysis of the repair age gates and rebuild timestamps, plus a skewed-clock test.
-     The acceptorSince leg is done (P-N2, Frontend.MaxStartLead, 2026-11-13).                              [M]
+6.4  G4: liveness cost of post-load refusals. After a restart a store refuses, for up to the horizon, every
+     transaction started before its load (forget floor), so rolling restarts can push many transactions to
+     TransactionOutcomeUnknown and a retry. Measure it in a rolling-restart test, and consider a durable
+     high-water mark of joined transactions to shorten the refusal window.                                 [M]
+6.5  G8: combined HLC-skew analysis of the repair age gates and rebuild timestamps, plus a skewed-clock test
+     (the acceptorSince leg is covered by Frontend.MaxStartLead).                                           [M]
 6.6  G7: client caches and pointers against zombie slices and deleted objects.                             [M]
 6.7  G2/X8 residual: mixed-version rolling upgrades (message, CRL and txd formats, finalizer types). Carry a
      feature version in the txd so old hosts cannot drive.                                                  [M-L]

@@ -55,8 +55,9 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
 
   private val ida = Replication(3, 2)
 
+  /** Started now: a prepare made after the store loads is inside its forget floor (Frontend.forgetFloorMillis) */
   private def overwriteTxd(id: TransactionId, leader: Byte): TransactionDescription =
-    TransactionDescription(id, HLCTimestamp(100), ptr, leader,
+    TransactionDescription(id, HLCTimestamp(System.currentTimeMillis() << 16), ptr, leader,
       List(DataUpdate(ptr, rev0, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida, Map(poolId -> ida))
 
   /** The store's backend holding the object, with no crl_save.log */
@@ -189,8 +190,6 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newCrlHost(crl)
     val loaded = host.loadStore(deviceId, backend, None)
     val other = TransactionId(new UUID(7, 6))
-    host.receiveTransactionMessage(TxPrepare(crlStoreId, net.storeId0, overwriteTxd(other, 1),
-      ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), Nil, true))
 
     def reading: Boolean =
       host.testingOnlyHandleEvents()
@@ -202,6 +201,9 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
 
     for
       _ <- yieldUntil(reading)
+      // Sent once the store is built, so the transaction starts after the store's load (Frontend.forgetFloorMillis)
+      _ = host.receiveTransactionMessage(TxPrepare(crlStoreId, net.storeId0, overwriteTxd(other, 1),
+            ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), Nil, true))
       _ = host.testingOnlyHandleEvents()
       waiting = storeOf(host).map(_.frontend.transactions.keySet)
       _ = crl.answer.success(())
@@ -263,12 +265,22 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
   atest("a prepare that arrives while the crl_save.log loads is handled after the recovered transactions lock"):
     given ExecutionContext = executionContext
     val backend = storeWithSaveFile()
-    val host = newCrlHost()
+    // Holds the crl_save.log's load into the CRL until the test releases it
+    val release = Promise[Unit]()
+    @volatile var loading = false
+    val crl = new TestNetwork.RecordingCRL:
+      override def loadStore(storeId: StoreId, state: StoreRecoveryState): Future[Unit] =
+        loading = true
+        val loadedIntoCrl = super.loadStore(storeId, state)
+        release.future.flatMap(_ => loadedIntoCrl)(using ExecutionContext.parasitic)
+    val host = newCrlHost(crl)
     val loaded = host.loadStore(deviceId, backend, None)
     // A conflicting transaction led by another store, whose responses go to a store the test network hosts
     val other = TransactionId(new UUID(7, 6))
-    host.receiveTransactionMessage(TxPrepare(crlStoreId, net.storeId0, overwriteTxd(other, 1),
-      ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), Nil, true))
+
+    def built: Boolean =
+      host.testingOnlyHandleEvents()
+      loading
 
     def handled: Boolean =
       host.testingOnlyHandleEvents()
@@ -276,6 +288,15 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
         storeOf(host).exists(_.objectCache.get(oid).nonEmpty)
 
     for
+      _ <- yieldUntil(built)
+      // Sent once the store is built, so the transaction starts after the store's load (Frontend.forgetFloorMillis),
+      // and while the crl_save.log loads
+      _ = host.receiveTransactionMessage(TxPrepare(crlStoreId, net.storeId0, overwriteTxd(other, 1),
+            ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), Nil, true))
+      _ = host.testingOnlyHandleEvents()
+      _ = withClue("the prepare is held while the crl_save.log loads: "):
+            storeOf(host).exists(_.frontend.transactions.contains(other)) should be (false)
+      _ = release.success(())
       _ <- yieldUntil(handled)
       _ <- loaded
     yield

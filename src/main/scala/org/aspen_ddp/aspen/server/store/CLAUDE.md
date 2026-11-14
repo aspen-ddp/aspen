@@ -26,6 +26,17 @@
   host's own client ratchets) by more; the designated leader does not drive it (`Store`). The client's retransmission
   is answered once the clock catches up. This is what makes the `acceptorSince` mute independent of client clocks
   (paxos P-N2), and it caps how far stored timestamps, and so client HLCs, run ahead of the hosts
+- Forget floor (`Frontend.forgetFloorMillis`, transaction horizon design section 1): a prepare for a transaction the
+  store does not hold (no Tx, no non-Unresolved status-cache entry) whose start is below the floor is refused: no Tx,
+  no promise, vote, reply or CRL save, its admission released, a warning with the lag for a client's prepare. The floor
+  is the latest of `wallClockMillis() - horizon` (`TransactionHorizon.Horizon`, 20 s, threaded Host → DeviceControl →
+  StoreLoader → Store → Frontend), the store's load on this host (`loadedAtMillis`, taken when the Frontend is built:
+  every restart, adoption and transfer-in builds a new Store through `StoreLoader`), and the status cache's
+  `evictionWatermarkMillis`. A Tx the store holds (recovered ones included) is unaffected, as is a prepare whose
+  outcome the cache knows (finalized: the relay; resolved: a Tx that learns the outcome). An `acceptorSince` mute
+  is checked first and keeps its muted, possibly proving Tx. The designated leader starts no driver for a prepare
+  below the floor it does not hold (`Store`). A store therefore never rejoins a transaction it may have forgotten;
+  for up to the horizon after a load it looks offline to transactions started before it
 
 #### Commits
 - A store keeps a committed transaction's CRL state until its backend commits succeed; a failed commit keeps it (and

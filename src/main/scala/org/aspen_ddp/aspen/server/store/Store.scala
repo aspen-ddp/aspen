@@ -6,7 +6,7 @@ import com.github.blemale.scaffeine.Scaffeine
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionHorizon, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission}
 import org.aspen_ddp.aspen.server.network.Messenger
@@ -46,7 +46,9 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** Recover the CRL's transactions only when frontend.recover is called (Frontend.deferRecovery) */
             deferRecovery: Boolean = false,
             /** How long a Tx waits for its client's prepare (Frontend.missingDataWait). A test seam */
-            missingDataWait: Duration = Frontend.MissingDataWait) extends Logging {
+            missingDataWait: Duration = Frontend.MissingDataWait,
+            /** How long after its start a transaction may be joined (Frontend.horizon) */
+            horizon: FiniteDuration = TransactionHorizon.Horizon) extends Logging {
 
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
@@ -55,7 +57,7 @@ class Store(val storageDeviceId: StorageDeviceId,
     post = postToStore match
       case None => task => task()
       case Some(postTo) => task => postTo(s => if s eq this then task()),
-    acceptorSince = acceptorSince, deferRecovery = deferRecovery)
+    acceptorSince = acceptorSince, deferRecovery = deferRecovery, horizon = horizon)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's
@@ -190,9 +192,13 @@ class Store(val storageDeviceId: StorageDeviceId,
 
         // A transaction started too far ahead of this host's clock is muted here and likely at the other stores too
         // (Frontend.MaxStartLead): a driver would only run data-less rounds, and could abort it for want of the
-        // client's prepare once the clocks catch up. The client's retransmission starts the driver then
+        // client's prepare once the clocks catch up. The client's retransmission starts the driver then. Nor is one
+        // started below the store's forget floor for a transaction it does not hold: the Frontend refuses the prepare
+        // (or, with an outcome cached, needs no driver to learn it), and a driver could only run rounds with stores
+        // that may have forgotten the transaction
+        val refused = frontend.belowForgetFloor(m.txd) && !frontend.transactions.contains(m.txd.transactionId)
         if (notFinalized && m.txd.primaryObject.poolId == storeId.poolId && m.txd.designatedLeaderUID == storeId.poolIndex
-            && !frontend.startsTooFarAhead(m.txd)) {
+            && !frontend.startsTooFarAhead(m.txd) && !refused) {
           driveTransaction(m.txd)
         }
 

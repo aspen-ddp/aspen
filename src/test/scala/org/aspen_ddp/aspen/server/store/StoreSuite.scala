@@ -27,7 +27,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
   private val leader = StoreId(poolId, 1)
   private val peer = StoreId(poolId, 2)
-  private val txd = mktxd().copy(designatedLeaderUID = 1.toByte,
+  /** Made per use, so it starts after the stores built before it loaded (Frontend.forgetFloorMillis) */
+  private def txd = mktxd().copy(designatedLeaderUID = 1.toByte,
     requirements = List(DataUpdate(op1, rev0, DataUpdateOperation.Overwrite)))
 
   private def prepare(to: StoreId, from: StoreId) =
@@ -125,6 +126,20 @@ class StoreSuite extends AnyFunSuite with Matchers:
     // The retransmission once the clocks agree (here: the same transaction stamped within the bound) is driven
     store.receiveTransactionMessage(prepare(leader, leader))
     store.hasTransactions shouldBe true
+  }
+
+  test("the designated leader starts no driver for a prepare below its forget floor") {
+    // Started before the store loaded: below its floor, and unknown to it
+    val start = HLCTimestamp((System.currentTimeMillis() - 1000) << 16)
+    val (store, net, crl) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS))
+    val old = TxPrepare(leader, leader, txd.copy(startTimestamp = start),
+      ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient = true)
+    store.receiveTransactionMessage(old)
+
+    store.hasTransactions shouldBe false
+    store.frontend.transactions.contains(txid1) shouldBe false
+    net.sentTx shouldBe Nil
+    crl.txSaved shouldBe false
   }
 
   // Ruling 31: a closed store's drivers would otherwise keep re-preparing its transactions from their timers

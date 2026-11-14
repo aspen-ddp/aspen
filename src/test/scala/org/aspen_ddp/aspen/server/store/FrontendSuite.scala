@@ -246,8 +246,9 @@ object FrontendSuite {
     TxPrepare(storeId, StoreId(poolId, txd.designatedLeaderUID), txd,
       ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient)
 
+  /** Started now on the wall clock: after the Frontends built before it loaded, inside the forget floor */
   def mktxd(): TransactionDescription =
-    TransactionDescription(txid1, HLCTimestamp(100), op1, 0, Nil, Nil, Some(clientId), Nil, Nil, ida,
+    TransactionDescription(txid1, HLCTimestamp(System.currentTimeMillis() << 16), op1, 0, Nil, Nil, Some(clientId), Nil, Nil, ida,
       Map(poolId -> ida))
 
   def mkObjectState(objectId: ObjectId): ObjectState =
@@ -953,19 +954,23 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
   }
 
-  // ---- A prepare for an unknown transaction that started long ago ----
+  // ---- A prepare for an unknown transaction that started a while ago ----
   //
-  // There is no age limit: replay safety comes from pins, not from refusing old prepares. Such a prepare is checked
-  // afresh, and proven committed only on the abort path.
+  // Inside the forget floor there is no other age limit: replay safety comes from pins, not from refusing old
+  // prepares. Such a prepare is checked afresh, and proven committed only on the abort path. Below the floor it is
+  // refused (see "The forget floor" below).
 
-  private def ago(d: FiniteDuration): HLCTimestamp = HLCTimestamp((HLCTimestamp.now.wallTime - d.toMillis) << 16)
+  /** On the host's wall clock, as Frontend.wallClockMillis reads it */
+  private def ago(d: FiniteDuration): HLCTimestamp = HLCTimestamp((System.currentTimeMillis() - d.toMillis) << 16)
 
-  private def withPlainFrontend(statusCache: TransactionStatusCache = new TransactionStatusCache())
+  /** `loadedAt`: Frontend.loadedAt. Set back for transactions started before the test built the Frontend */
+  private def withPlainFrontend(statusCache: TransactionStatusCache = new TransactionStatusCache(),
+                                loadedAt: Option[Long] = None)
                          (f: (Frontend, MapBackend, TestNet) => Unit): Unit =
     val backend = new MapBackend(storeId)
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, statusCache)
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, statusCache, loadedAt = loadedAt)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
     f(frontend, backend, net)
@@ -985,9 +990,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       objectUpdates = List(ObjectUpdate(oid2, insert))))
 
   test("an old unknown prepare whose requirements pass is voted on, though an object shows it") {
-    // The proof runs only on the abort path, whatever the transaction's age
-    withPlainFrontend(): (frontend, backend, net) =>
-      appliedKVPrepare(frontend, backend, FiniteDuration(60, SECONDS))
+    // The proof runs only on the abort path, whatever the transaction's age inside the horizon
+    withPlainFrontend(loadedAt = Some(0L)): (frontend, backend, net) =>
+      appliedKVPrepare(frontend, backend, FiniteDuration(10, SECONDS))
 
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
       resolvedMessages(net) shouldBe Nil
@@ -1004,8 +1009,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
     val crl = new TestCrl
+    // Loaded when its acceptor started, as a store is once its rebuild finishes
+    val since = ago(FiniteDuration(2, SECONDS))
     val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache,
-      acceptorSince = Some(ago(FiniteDuration(2, SECONDS))))
+      acceptorSince = Some(since), loadedAt = Some(since.wallTime))
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
     f(frontend, backend, net, crl)
@@ -1105,9 +1112,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       lockedWriteTransactions(frontend, net, op1) shouldBe empty
   }
 
-  test("an unknown prepare older than the status cache duration is checked afresh") {
-    withPlainFrontend(): (frontend, _, net) =>
-      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(60, SECONDS)))
+  test("an unknown prepare inside the horizon with no status cache entry is checked afresh") {
+    withPlainFrontend(loadedAt = Some(0L)): (frontend, _, net) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(10, SECONDS)))
       frontend.receiveTransactionMessage(clientPrepare(txd))
 
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
@@ -1194,6 +1201,135 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
       resolvedMessages(net).map(r => (r.committed, r.proof)) shouldBe List((true, true))
       votes(net) shouldBe Nil
+  }
+
+  // ---- The forget floor (Frontend.forgetFloorMillis) ----
+  //
+  // A store refuses a prepare for a transaction it does not hold, and whose outcome the status cache does not know,
+  // that started below its floor: the horizon before now, the store's load, or the status cache's eviction watermark.
+  // No Tx, no promise, no vote, no reply. A fixed injected clock keeps these deterministic
+
+  private val floorNow = 1_000_000_000_000L
+  private def startedAgo(ms: Long): HLCTimestamp = HLCTimestamp((floorNow - ms) << 16)
+
+  private def withFloorFrontend(loadedAt: Long = floorNow - 60_000,
+                                statusCache: TransactionStatusCache =
+                                  new TransactionStatusCache(wallClockMillis = () => floorNow),
+                                crl: TestCrl = new TestCrl,
+                                missingDataWait: Duration = Frontend.MissingDataWait,
+                                admission: CrlAdmission = CrlAdmission.Unlimited)
+                               (f: (Frontend, MapBackend, TestNet, TestCrl) => Unit): Unit =
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    populate(backend)
+    // Cached so a recovered transaction's object loads during Frontend construction
+    cache.insert(mkObjectState(oid1))
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, missingDataWait = missingDataWait,
+      admission = admission, wallClockMillis = () => floorNow, horizon = FiniteDuration(20, SECONDS),
+      loadedAt = Some(loadedAt))
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    f(frontend, backend, net, crl)
+
+  /** Admits the prepare as Store does, then delivers it */
+  private def admitAndReceive(frontend: Frontend, m: TxPrepare): Unit =
+    frontend.admitPrepare(m) shouldBe true
+    frontend.receiveTransactionMessage(m)
+
+  test("a prepare for an unknown transaction older than the horizon creates no Tx, sends nothing and saves nothing") {
+    val admission = new CrlAdmission(1024 * 1024)
+    withFloorFrontend(admission = admission): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = startedAgo(21_000))
+      frontend.belowForgetFloor(txd) shouldBe true
+      admitAndReceive(frontend, clientPrepare(txd))
+      admitAndReceive(frontend, driverPrepare(txd))
+      frontend.receiveTransactionMessage(TxAccept(storeId, recoveryDriver, txid1,
+        ProposalId.initialProposal(txd.designatedLeaderUID), true))
+
+      frontend.transactions.contains(txid1) shouldBe false
+      net.sentTx shouldBe empty
+      crl.txSaved shouldBe false
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
+      admission.admittedBytes shouldBe 0
+  }
+
+  test("a prepare for an unknown transaction started before the store loaded is refused") {
+    withFloorFrontend(loadedAt = floorNow): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = startedAgo(1_000))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      frontend.transactions.contains(txid1) shouldBe false
+      net.sentTx shouldBe empty
+      crl.txSaved shouldBe false
+  }
+
+  test("a prepare below the eviction watermark is refused") {
+    val statusCache = new TransactionStatusCache(wallClockMillis = () => floorNow)
+    withFloorFrontend(statusCache = statusCache): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = startedAgo(1_000))
+      frontend.belowForgetFloor(txd) shouldBe false
+      // Some transaction's entry is dropped for size after T started: T's may have been among those dropped
+      statusCache.updateStatus(txid2, TransactionStatus.Committed, finalized = true)
+      statusCache.evictForTest(txid2)
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      frontend.transactions.contains(txid1) shouldBe false
+      net.sentTx shouldBe empty
+      crl.txSaved shouldBe false
+  }
+
+  test("a prepare inside the horizon after load is answered as today") {
+    withFloorFrontend(): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = startedAgo(19_000))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      frontend.transactions(txid1).holdsLocks shouldBe true
+      crl.txSaved shouldBe true
+  }
+
+  test("a recovered Tx older than the floor still answers its peers' prepares") {
+    // Restarted: the store loaded now, and recovered a transaction started long before from its CRL
+    val txd = dataUpdateTxd.copy(startTimestamp = startedAgo(30_000))
+    val trs = TransactionRecoveryState(storeId, txd.serialize(), Nil, TransactionDisposition.Undetermined,
+      TransactionStatus.Unresolved, PersistentState.initial)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+    // No client prepare will come: it answers a driver's once the (zero) wait for it is over
+    withFloorFrontend(loadedAt = floorNow, crl = crl, missingDataWait = Duration.Zero): (frontend, _, net, _) =>
+      frontend.belowForgetFloor(txd) shouldBe true
+      frontend.receiveTransactionMessage(driverPrepare(txd))
+
+      votes(net).map(v => (v.disposition, v.response)) shouldBe
+        List((TransactionDisposition.VoteAbort, Right(TxPrepareResponse.Promise(None))))
+  }
+
+  test("a prepare below the floor with a resolved status-cache entry still learns the outcome") {
+    val statusCache = new TransactionStatusCache(wallClockMillis = () => floorNow)
+    statusCache.updateStatus(txid1, TransactionStatus.Committed)
+    withFloorFrontend(statusCache = statusCache): (frontend, _, net, _) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = startedAgo(25_000))
+      frontend.belowForgetFloor(txd) shouldBe true
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      // As inside the horizon: checked, the outcome known, no locks, the cached status kept
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      frontend.transactions(txid1).holdsLocks shouldBe false
+      statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
+  }
+
+  test("a refused prepare from a client clock slower than the horizon logs a warning with the lag") {
+    val slowTxid = TransactionId(new UUID(0, 77))
+    withFloorFrontend(): (frontend, _, _, _) =>
+      val txd = lockTxd(slowTxid, List(overwrite(op1))).copy(startTimestamp = startedAgo(25_000))
+      val log = logNaming(slowTxid):
+        frontend.receiveTransactionMessage(clientPrepare(txd))
+        // A driver's prepare is not the client's clock: not logged
+        frontend.receiveTransactionMessage(driverPrepare(txd))
+
+      log.map(_._1) shouldBe List(scribe.Level.Warn)
+      log.head._2 should include ("25000ms")
+      frontend.transactions.contains(slowTxid) shouldBe false
   }
 
   // ---- Write locks are held until a commit is applied ----
@@ -2055,11 +2191,14 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
 
   /** Runs `f`, returning the Tx log lines naming T, with their levels */
-  private def unackedLog(f: => Unit): List[(scribe.Level, String)] =
+  private def unackedLog(f: => Unit): List[(scribe.Level, String)] = logNaming(unackedTxid)(f)
+
+  /** Runs `f`, returning the log lines at info or above naming `txid`, with their levels */
+  private def logNaming(txid: TransactionId)(f: => Unit): List[(scribe.Level, String)] =
     val lines = new LinkedBlockingQueue[(scribe.Level, String)]()
     val handler = scribe.handler.LogHandler(scribe.Level.Info): r =>
       val text = r.logOutput.plainText
-      if text.contains(unackedTxid.toString) then
+      if text.contains(txid.toString) then
         lines.add(r.level -> text)
     scribe.Logger.root.withHandler(handler).replace()
     try f
@@ -2641,7 +2780,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     (20 to 22).toList.map(n => DataObjectPointer(ObjectId(new UUID(0, n)), poolId, Array[Byte]()))
 
   /** A Frontend over a DeferredCommitBackend, with a cache that holds two empty data objects */
-  def commitWindowFixture(cacheBytes: Long = 2 * HostObjectCache.EntryOverhead, crl: CrashRecoveryLog = new TestCrl)
+  def commitWindowFixture(cacheBytes: Long = 2 * HostObjectCache.EntryOverhead, crl: CrashRecoveryLog = new TestCrl,
+                          statusCache: TransactionStatusCache = new TransactionStatusCache())
       : (Frontend, DeferredCommitBackend, StoreObjectCache, TestNet) =
     val backend = new DeferredCommitBackend
     populate(backend)
@@ -2650,7 +2790,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       backend.bootstrapAllocate(p.id, os.objectType, os.metadata, os.data)
     val cache = new HostObjectCache(cacheBytes).forStore(storeId)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, backend, cache, net)
 
@@ -3084,12 +3224,21 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   // ---- A store keeps a committed transaction's CRL state until its backend commits succeed ----
 
   /** Prepares txid1 overwriting op1 and resolves it committed, its backend commit held */
-  def heldCommit(crl: CrashRecoveryLog): (Frontend, DeferredCommitBackend, TestNet) =
-    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024, crl = crl)
+  def heldCommit(crl: CrashRecoveryLog, statusCache: TransactionStatusCache = new TransactionStatusCache())
+      : (Frontend, DeferredCommitBackend, TestNet) =
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024, crl = crl,
+      statusCache = statusCache)
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
     resolve(frontend, net, txid1, committed = true)
     backend.heldCommits shouldBe 1
     (frontend, backend, net)
+
+  /** A status cache whose size evictions leave the forget floor below the transactions here: its clock reads the
+    * epoch, so the eviction watermark stays decades in the past. A replay after an eviction is otherwise refused
+    * (Frontend.forgetFloorMillis), so the replay paths tested with it are defensive: they hold should a replay ever
+    * reach a store that forgot its transaction
+    */
+  def replayableStatusCache(): TransactionStatusCache = new TransactionStatusCache(wallClockMillis = () => 0L)
 
   def finalizeTx1(frontend: Frontend): Unit =
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
@@ -3352,7 +3501,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   // M2: the registration is removed only by the Tx that made it
   test("a replay's Tx forgotten while a finalized commit is held for its turn leaves the held Tx registered") {
     val crl = new TestCrl
-    val (frontend, backend, net) = heldCommit(crl)
+    val (frontend, backend, net) = heldCommit(crl, replayableStatusCache())
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     resolve(frontend, net, txid2, committed = true)
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
@@ -3379,7 +3528,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   // The stub a replay's Tx is owed when it is forgotten passes to the held Tx: the guard above must not drop it
   test("a replay's Tx forgotten owing a stub while a finalized commit is held hands the stub to the held Tx") {
     val crl = new TestCrl
-    val (frontend, backend, net) = heldCommit(crl)
+    val (frontend, backend, net) = heldCommit(crl, replayableStatusCache())
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     resolve(frontend, net, txid2, committed = true)
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
@@ -3404,7 +3553,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   // The held Tx owes the stub first; a replay's Tx then defers its own finalization behind the same commit
   test("a stub owed to a held commit survives a replay's Tx deferring its finalization for the same transaction") {
     val crl = new TestCrl
-    val (frontend, backend, net) = heldCommit(crl)
+    val (frontend, backend, net) = heldCommit(crl, replayableStatusCache())
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     resolve(frontend, net, txid2, committed = true)
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))

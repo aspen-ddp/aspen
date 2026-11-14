@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.TransactionHorizon
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
@@ -16,7 +17,7 @@ import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFin
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration.{Duration, FiniteDuration}
 
 /** Runs only on the control thread. See HostThreading.scala.
  *
@@ -78,7 +79,9 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           /** Looks up recovered commit votes in their pools' UnackedCommits trees, for the stores */
                           val unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
                           /** How long the stores' Txs wait for a client's prepare (Frontend.missingDataWait) */
-                          val missingDataWait: Duration = Frontend.MissingDataWait):
+                          val missingDataWait: Duration = Frontend.MissingDataWait,
+                          /** How long after its start the stores join a transaction (Frontend.horizon) */
+                          val transactionHorizon: FiniteDuration = TransactionHorizon.Horizon):
   given ExecutionContext = threading.control
 
   lazy val router: StoreRouter = new StoreRouter(this)

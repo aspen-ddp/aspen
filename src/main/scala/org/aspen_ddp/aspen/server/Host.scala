@@ -260,7 +260,8 @@ class Host(val client: AspenClient,
     ec = ec,
     writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker),
     unackedLookup = seams.wrapUnackedLookup.fold(unackedLookup)(wrap => wrap(unackedLookup)),
-    missingDataWait = seams.missingDataWait)
+    missingDataWait = seams.missingDataWait,
+    transactionHorizon = transactionHorizon)
 
   private val shutdownPromise: Promise[Unit] = Promise()
 

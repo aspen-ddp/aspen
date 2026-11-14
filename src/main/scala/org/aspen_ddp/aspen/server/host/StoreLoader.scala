@@ -338,7 +338,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 // Its backend's completion handler is set below, after the Store is built: recovered transactions read
                 // their objects once it is installed (awaitCrlLoad)
                 deferRecovery = true,
-                missingDataWait = ctx.missingDataWait)
+                missingDataWait = ctx.missingDataWait,
+                horizon = ctx.transactionHorizon)
               madeStore = Some(store)
               val entry = new StoreRouter.Entry(store, executor)
               // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any

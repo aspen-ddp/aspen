@@ -93,9 +93,33 @@ class Frontend(val storeId: StoreId,
                /** The host's wall clock in milliseconds (startsTooFarAhead). Not HLCTimestamp.now: the host's own client
                  * ratchets the JVM-wide HLC forward from the timestamps it reads. Injected by tests
                  */
-               val wallClockMillis: () => Long = () => System.currentTimeMillis()) extends Logging {
+               val wallClockMillis: () => Long = () => System.currentTimeMillis(),
+               /** How long after its start a transaction may be joined (forgetFloorMillis). Injected by tests */
+               val horizon: FiniteDuration = TransactionHorizon.Horizon,
+               /** When the store was loaded on this host, in wallClockMillis milliseconds (forgetFloorMillis). None:
+                 * now. Every load builds a new Frontend, restart and transfer-in included. Injected by tests
+                 */
+               loadedAt: Option[Long] = None) extends Logging {
 
   import Frontend._
+
+  /** When the store was loaded on this host: it remembers nothing of transactions it saw before (forgetFloorMillis) */
+  val loadedAtMillis: Long = loadedAt.getOrElse(wallClockMillis())
+
+  /** The earliest start, in milliseconds of the host's wall clock, of a transaction this store may join without
+    * holding it already. Below it, the store may have known the transaction and forgotten its outcome: it no longer
+    * holds a Tx for it, and the host's status cache may have dropped its entry. Joining afresh could then decide it
+    * again, against its outcome. The floor is the latest of: the horizon before now (the status cache outlasts it, so
+    * an entry expires only once its transaction is below it); the store's load on this host (a restart, or a transfer
+    * from a host whose cache this one lacks); and the status cache's eviction watermark (an entry dropped for size)
+    */
+  def forgetFloorMillis: Long =
+    math.max(math.max(wallClockMillis() - horizon.toMillis, loadedAtMillis), statusCache.evictionWatermarkMillis)
+
+  /** The transaction started below the forget floor: a prepare for it, unless the store holds it or the status cache
+    * knows its outcome, is refused (receivePrepare), and its designated leader does not drive it (Store)
+    */
+  def belowForgetFloor(txd: TransactionDescription): Boolean = txd.startTimestamp.wallTime < forgetFloorMillis
 
   /** Written only on the store's executor. `@volatile` so that `mayHoldTransaction` may read one snapshot of it from
     * another thread (the repair scan), as Store.hasTransactions reads `transactionDrivers`
@@ -839,26 +863,47 @@ class Frontend(val storeId: StoreId,
       val known = cached.filter(_.status != TransactionStatus.Unresolved)
       // An Unresolved entry counts as none: another store's Tx on this host wrote it, which says nothing of the outcome
       val beforeAcceptor = acceptorSince.exists(m.txd.startTimestamp < _)
-      val tooFarAhead = !beforeAcceptor && startsTooFarAhead(m.txd)
-      val muted = beforeAcceptor || tooFarAhead
-      if tooFarAhead then
-        val lead = m.txd.startTimestamp.wallTime - wallClockMillis()
-        logger.warn(s"Store $storeId takes no part in transaction ${m.txd.transactionId} yet: it started ${lead}ms " +
-                    s"ahead of this host's clock (limit ${MaxStartLead.toMillis}ms). The client's clock runs fast, " +
-                    s"or this host's runs slow")
-      val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates, takeSerializedTxd(m.txd.transactionId))
-      val pointers = m.txd.allHostedObjects(m.to)
-      val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers,
-        muted = muted)
-      transactions += (m.txd.transactionId -> tx)
-      tx.receivePrepare(m)
-      // The new Tx recorded itself as Unresolved, which the monotone cache does not let replace a known outcome
-      known.foreach { _ =>
-        // A muted Tx takes no part, a cached outcome included
-        if !muted then
-          tx.outcomeDecided()
-      }
-      pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
+      // The rebuilt store's mute (acceptorSince) keeps its semantics: its muted Tx may still prove the commit
+      if known.isEmpty && !beforeAcceptor && belowForgetFloor(m.txd) then
+        refusePrepare(m)
+      else
+        createTx(m, known, beforeAcceptor)
+  }
+
+  /** Refuses a prepare for a transaction started below the forget floor that the store does not hold: no Tx, no
+    * promise, no vote, no reply, as if the store were offline. It may have forgotten the transaction, and a store
+    * never rejoins a transaction it forgot
+    */
+  private def refusePrepare(m: TxPrepare): Unit =
+    // Admitted (Store.receiveTransactionMessage) for a Tx that is not created
+    releaseAdmission(m.txd.transactionId)
+    if m.fromClient then
+      val lag = wallClockMillis() - m.txd.startTimestamp.wallTime
+      logger.warn(s"Store $storeId takes no part in transaction ${m.txd.transactionId}: it started ${lag}ms before " +
+                  s"this host's clock, below the store's forget floor (horizon ${horizon.toMillis}ms, or the store's " +
+                  s"load or a status cache eviction since). The client's clock runs slow, or the transaction is that old")
+
+  private def createTx(m: TxPrepare, known: Option[TransactionStatusCache.Entry], beforeAcceptor: Boolean): Unit = {
+    val tooFarAhead = !beforeAcceptor && startsTooFarAhead(m.txd)
+    val muted = beforeAcceptor || tooFarAhead
+    if tooFarAhead then
+      val lead = m.txd.startTimestamp.wallTime - wallClockMillis()
+      logger.warn(s"Store $storeId takes no part in transaction ${m.txd.transactionId} yet: it started ${lead}ms " +
+                  s"ahead of this host's clock (limit ${MaxStartLead.toMillis}ms). The client's clock runs fast, " +
+                  s"or this host's runs slow")
+    val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates, takeSerializedTxd(m.txd.transactionId))
+    val pointers = m.txd.allHostedObjects(m.to)
+    val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers,
+      muted = muted)
+    transactions += (m.txd.transactionId -> tx)
+    tx.receivePrepare(m)
+    // The new Tx recorded itself as Unresolved, which the monotone cache does not let replace a known outcome
+    known.foreach { _ =>
+      // A muted Tx takes no part, a cached outcome included
+      if !muted then
+        tx.outcomeDecided()
+    }
+    pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
   }
 
   private def statusOf(committed: Boolean): TransactionStatus.Value =

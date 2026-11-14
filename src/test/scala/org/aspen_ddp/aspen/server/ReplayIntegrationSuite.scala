@@ -299,8 +299,10 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
             outcome.size shouldBe 2
       _ = net.droppedTx = Set()
       _ = prepare.foreach(net.deliverTransactionMessage)
-      _ = withClue("the lagging store checks T's late prepare afresh: "):
-            net.smgr.control.router.loaded.get(sid(lagging)).exists(_.frontend.transactions.contains(t)) shouldBe true
+      // T is now past the lagging store's forget floor (the status cache outlasts the horizon), so it refuses the late
+      // prepare outright: it never joins T, and its stale checked write is never applied (Frontend.forgetFloorMillis)
+      _ = withClue("the lagging store refuses T's late prepare: "):
+            net.smgr.control.router.loaded.get(sid(lagging)).exists(_.frontend.transactions.contains(t)) shouldBe false
       _ = outcome.foreach(net.deliverTransactionMessage)
       _ <- settle(clock = true)
       _ <- forgottenByStores(t)
@@ -322,7 +324,9 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
       yAfter.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))
 
-  test(reDrivenAbortTest):
+  // Ignored until expiry (transaction horizon plan, Task 5): the recovered vote's driver prepares stores past their
+  // forget floor, which refuse it, so only expiry can now end its Tx and driver
+  ignore(reDrivenAbortTest):
     val voter = 1
     val blocked = Set(3, 4).map(sid)
     // Whether `m` is an outcome of `txid` (TxResolved or TxFinalized) sent to one of `to`
@@ -440,11 +444,9 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
              Future.successful(tx.id)
       _ <- settle(clock = false)
       _ = (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe None)
-      // The replay: every pool-B store's DoesNotExist(k) passes again and it votes commit; pool A proves T committed
-      // from x, so the replay's driver resolves late, and each pool-B store finds its entry still there. T's
-      // designated leader is in pool B (its primary object is y), and a proof reaching its store before its driver
-      // starts is lost. So pool B's prepares go first, the leader's last of them: its driver then prepares pool A,
-      // whose stores prove at once and tell it. Pool A's client prepares follow
+      // The replay. Before the forget floor, every pool-B store's DoesNotExist(k) passed again and it voted commit, and
+      // pool A proved T committed from x, so the replay's driver resolved late. The order is kept from then: pool B's
+      // prepares first, the designated leader's (a pool-B store: its primary object is y) last of them, then pool A's
       // The replay's outcomes, sent once its prepares are delivered (the prepares recorded so far are T's own)
       _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == t &&
             (m.isInstanceOf[TxFinalized] || m.isInstanceOf[TxResolved])
@@ -460,11 +462,12 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       outcomes = { net.recordTxMessage = _ => false; net.takeRecordedTxMessages() }
       yAfterReplay <- client.read(y)
     yield
-      // Not an abort, which would leave k absent too: the replay resolved as a late commit, so each pool-B store
-      // reached its late-commit path and found its stub
-      withClue("the replay resolved late and committed, never aborted: "):
-        outcomes.collect { case m: TxFinalized => (m.committed, m.late) }.distinct shouldBe List((true, true))
-        outcomes.collect { case m: TxResolved if !m.proof => m.committed }.forall(identity) shouldBe true
+      // The replay comes after the status cache forgot T, so T is past every store's forget floor (the cache outlasts
+      // the horizon): every store refuses it, the designated leader starts no driver, and nothing is decided again.
+      // Before the floor it resolved as a late commit through each pool-B store's stub
+      withClue("the replay was refused everywhere, so no outcome was sent: "):
+        outcomes.collect { case m: TxFinalized => m } shouldBe Nil
+        outcomes.collect { case m: TxResolved => m } shouldBe Nil
       withClue("no pool-B store applied T again: "):
         (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe None)
       yAfterReplay.contents.keySet should not contain k

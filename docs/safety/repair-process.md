@@ -903,10 +903,9 @@ head first".
 > **Verification 2026-11-09: CONFIRMED (mechanism); doc scenario premise is WRONG. Severity: stale-replica.** ObjectState.kvState is a var initialised once from data (ObjectState.scala:34-37) and no code reassigns it (grep); Frontend.opportunisticRebuild writes os.metadata/os.data only (Frontend.scala:867-881) and the next KV apply does state.data = kvs.encode() from kvState (RequirementsApplyer.scala:133), so the rebuilt content is served and persisted, then silently replaced by stale kvState on the next write; requirement checks and locks also use the stale kvState. Premise error: the client marks a store knownBehind only when its REVISION differs from the chosen one (BaseObjectReader.getStoreStates, :112-130; KeyValueObjectReader.scala:122), while the store applies the rebuild only if its revision EQUALS the read's (Frontend.scala:869). A store that merely missed blind writes (same revision) is never targeted, and a revision-lagging store is skipped; the rebuild fires only when the store caught up between the read and the message. So the 'S missed blind insert of k, then rebuilt' scenario cannot occur as written.
 > *Fix sketch:* After replacing os.data for a KeyValue object rebuild kvState from it (or route through Reconcile and delete the opportunistic path).
 
-**F1. Opportunistic rebuild leaves `kvState` stale** (`server/store/Frontend.scala:867-881`; `server/store/ObjectState.scala:
+**F1. Opportunistic rebuild leaves `kvState` stale. FIXED 2026-11-14 (path deleted).** (`server/store/Frontend.scala:867-881`; `server/store/ObjectState.scala:34-37`; `server/transaction/Tx.scala:381-390`).
 
 > **FIXED 2026-11-14 (path deleted).** The opportunistic rebuild (read-triggered message and pre-transaction piggyback) and the client object cache were removed; repair is the ErrorTree path only. See docs/superpowers/specs/2026-11-14-opportunistic-rebuild-removal-design.md.
-34-37`; `server/transaction/Tx.scala:381-390`).
 `opportunisticRebuild` and the pre-transaction path assign `os.metadata` and `os.data` and commit. `ObjectState.kvState`
 (the structure requirement checks, locks and the next apply use) is a `var` initialised once from `data` at
 construction; nothing refreshes it (grep: only `reconcileSettled` mutates `kvs` and re-encodes). For a KeyValue object
@@ -996,7 +995,7 @@ request was issued and re-insert it into the cache. For a truly deleted object t
 > **Verification 2026-11-09: CONFIRMED (documented trade-off). Severity: stale-replica (low).** AspenClient.newRepairTransaction disables missed-update tracking for every entry deletion (AspenClient.scala:96-99).
 > *Fix sketch:* Use limitTracking for entry deletions as for marker writes.
 
-**F7. Entry deletion never records its own misses** *(FIXED 2026-11-14: deletions use `newTransaction()` plus `limitTracking(entryPool, tx)`, so a miss is recorded; residual: deletions of entries in the bootstrap pool's own trees still run untracked, covered by the bootstrap tree sweep, which lands in a later task)* (`client/AspenClient.scala:~89-100`; `StoreRepairer.scala:337-361`).
+**F7. Entry deletion never records its own misses** *(FIXED 2026-11-14: deletions use `newTransaction()` plus `limitTracking(entryPool, tx)`, so a miss is recorded; residual: deletions of entries in the bootstrap pool's own trees still run untracked; the bootstrap tree sweep is in place, and cross-document-review X9 records the remaining staleness window)* (`client/AspenClient.scala:~89-100`; `StoreRepairer.scala:337-361`).
 `newRepairTransaction` disables tracking for every entry deletion, although `limitTracking` (used for marker writes)
 is selective by pool. A store of the metadata pool that misses the deletion's commit keeps an ErrorTree node (or
 UnackedCommits node) holding an entry that was removed. Reads are correct (quorum), and the next write to the node

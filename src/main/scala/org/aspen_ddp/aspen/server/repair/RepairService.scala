@@ -57,8 +57,8 @@ class RepairService(client: AspenClient,
   protected def scanStore(storeId: StoreId, policy: RepairPolicy): Future[ScanResult] =
     repairer.scan(storeId, policy, deferralOf(storeId))
 
-  /** Overridable like scanStore. Sweeps the bootstrap pool's tree nodes. A sweep abandoned because the store left this
-    * host reports needsAnotherPass = false, which is fine: the store then drops out of the repairable set.
+  /** Overridable like scanStore. Sweeps the bootstrap pool's tree nodes. A sweep that skipped nodes because the store
+    * stopped being repairable here reports needsAnotherPass = true: the store may be repairable again at the next tick.
     */
   protected def sweepStore(storeId: StoreId, policy: RepairPolicy): Future[SweepResult] =
     repairer.sweepBootstrapTrees(storeId, policy, deferralOf(storeId))

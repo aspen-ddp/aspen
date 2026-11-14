@@ -44,8 +44,9 @@ object ScanResult:
   * @param incomplete nodes left not complete: deferred, stale, or failed (unreadable, or deleted under the walk)
   * @param walkComplete false when either tree's walk missed nodes deleted under it
   *
-  * A sweep abandoned because the store left this host reports needsAnotherPass = false; the store then drops out of
-  * the repairable set, so nothing is lost.
+  * A node skipped because the store stopped being repairable here (left the host, went offline, is rebuilding) counts
+  * as incomplete: that may last only until the next tick, so the sweep reports needsAnotherPass = true and the store
+  * keeps its short scan interval. If the store has left for good it drops out of the repairable set anyway.
   */
 final case class SweepResult(nodes: Int, reconciled: Int, incomplete: Int, walkComplete: Boolean):
   def needsAnotherPass: Boolean = reconciled > 0 || incomplete > 0 || !walkComplete
@@ -215,6 +216,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
 
       def sweepNode(tier: Int, pointer: KeyValueObjectPointer): Future[Unit] =
         if abandoned(storeId) then
+          // Not repairable here, which may be only until the next tick (offline, rebuilding): the node was not swept
+          incomplete.incrementAndGet()
           Future.unit
         else
           nodes.incrementAndGet()

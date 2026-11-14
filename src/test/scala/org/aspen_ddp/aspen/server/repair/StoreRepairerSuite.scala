@@ -1313,6 +1313,24 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       second.reconciled shouldBe 0
       second.needsAnotherPass shouldBe false
 
+  test("a store that becomes unrepairable mid-sweep leaves the sweep needing another pass"):
+    // Unrepairable means not repairable here (offline, rebuilding), not only departed: it may be repairable again at
+    // the next tick, so the skipped nodes must keep the store's pacing at the floor
+    val unrepairable = new AtomicBoolean(false)
+    val target = new SeamTarget:
+      override def isRepairable(storeId: StoreId): Boolean = !unrepairable.get && super.isRepairable(storeId)
+      override def reconcile(storeId: StoreId, snapshot: RepairSnapshot, read: ClientObjectState,
+                             p: Promise[ReconcileResult]): Unit =
+        unrepairable.set(true)
+        super.reconcile(storeId, snapshot, read, p)
+    for
+      _ <- scanAllUntilQuiet()
+      _ <- settle()
+      result <- pump(StoreRepairer(client, target).sweepBootstrapTrees(sid(2), RepairPolicy.Default, DeferralState()),
+                     deadline())
+    yield
+      result.needsAnotherPass shouldBe true
+
   test("a sweep runs no proofs"):
     val target = SeamTarget()
     @volatile var proofs = 0

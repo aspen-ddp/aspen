@@ -1459,8 +1459,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         case Some(rr: ReadResponse) => rr.result.toOption.get.lockedWriteTransactions
         case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
 
-    // txid2 votes commit and locks op1 and the fence
-    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1), overwrite(fencePtr))))
+    // txid2 votes commit and locks op1 and the fence. Its fence write is a refcount change, which txid1's overwrite
+    // below does not invalidate: an update txid1 did invalidate could not be applied, and the store would fail-stop
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1),
+      RefcountUpdate(fencePtr, ObjectRefcount(1, 1), ObjectRefcount(2, 2)))))
       .disposition shouldBe TransactionDisposition.VoteCommit
     // txid1 collides on the fence but is committed by the other stores' votes; its backend commit is held
     prepare(frontend, net, lockTxd(txid1, List(overwrite(fencePtr)))).disposition shouldBe TransactionDisposition.VoteAbort
@@ -1477,7 +1479,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     // txid1 persists: txid2 is applied in memory, and only then are its locks released
     backend.deliverOne()
-    backend.issued shouldBe List(txid1, txid2)
+    // One backend commit per object txid2 changes
+    backend.issued shouldBe List(txid1, txid2, txid2)
     locksOn(op1) shouldBe Set()
     locksOn(fencePtr) shouldBe Set()
     frontend.transactions.get(txid2).forall(!_.holdsLocks) shouldBe true
@@ -1781,6 +1784,131 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       .collisions shouldBe List(txid1)
     resolve(frontend, net, txid1, committed = true)
     backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(2, 2)
+  }
+
+  // ---- Fail-stop of a commit voter that cannot hold the update it voted for (transaction-requirements F5, F6) ----
+
+  /** lockFixture whose Frontend records its fail-stops */
+  def failStopFixture(): (Frontend, MapBackend, TestNet, () => List[Throwable]) =
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    var stops = List[Throwable]()
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, new TransactionStatusCache(),
+      loadedAt = FrontendSuite.longLoaded, onFailStop = err => stops = stops :+ err)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    (frontend, backend, net, () => stops)
+
+  test("a commit voter whose state is invalidated under its locks fail-stops rather than hold neither (Req F5)") {
+    val (frontend, backend, net, stops) = failStopFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+
+    // The cached state can no longer be served while txid1 holds its locks (a failed apply of another transaction, a
+    // repair deletion): the committed update cannot be applied, and its locks are dropped
+    frontend.discard(oid1)
+    resolve(frontend, net, txid1, committed = true)
+    backend.get(oid1).get.metadata.revision shouldBe rev0
+    stops().size shouldBe 1
+    frontend.failStopped shouldBe true
+
+    // Without the fail-stop, a transaction built on the pre-txid1 state would get this store's commit vote, which
+    // together with txid1's own counted vote could commit both
+    frontend.receiveTransactionMessage(mkPrepare(lockTxd(txid2, List(overwrite(op1))), fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
+    net.txMessage() shouldBe None
+    frontend.readObjectForNetwork(clientId, new UUID(1, 1), op1, FullObject())
+    net.clientMessage() shouldBe None
+  }
+
+  test("an abort voter that cannot apply a committed update does not fail-stop") {
+    val (frontend, backend, net, stops) = failStopFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    // txid2 collides here and is committed by the votes of other stores; txid1 then aborts
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid1, committed = false)
+    frontend.discard(oid1)
+    resolve(frontend, net, txid2, committed = true)
+    stops() shouldBe Nil
+    frontend.failStopped shouldBe false
+    prepare(frontend, net, lockTxd(txid3, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("a failed backend commit of a commit voter's update does not fail-stop the store") {
+    val crl = new TestCrl
+    val (frontend, backend, net) = heldCommit(crl)
+    backend.deliverCommits(Right(CommitError.IOFailure))
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
+    frontend.failStopped shouldBe false
+  }
+
+  /** A Frontend recovering a commit vote of txid1 (overwrite op1 at rev0) whose object the backend holds as `stored`,
+    * or answers with `readError`. Records its fail-stops
+    */
+  def recoveredVote(stored: ObjectState, readError: Option[ReadError.Value] = None,
+                    frozen: Boolean = false): (Frontend, TestNet, () => List[Throwable]) =
+    val backend = new MapBackend(storeId):
+      private var failNext = readError
+      private var handler: Option[CompletionHandler] = None
+      override def isWriteFrozen: Boolean = frozen
+      override def setCompletionHandler(h: CompletionHandler): Unit =
+        handler = Some(h)
+        super.setCompletionHandler(h)
+      override def read(pointer: ObjectPointer): Unit = failNext match
+        case Some(err) =>
+          failNext = None
+          handler.foreach(_.complete(org.aspen_ddp.aspen.server.store.backend.Read(storeId, pointer.id, Right(err))))
+        case None => super.read(pointer)
+    backend.bootstrapAllocate(stored.objectId, stored.objectType, stored.metadata, stored.data)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val txd = lockTxd(txid1, List(overwrite(op1)))
+    val trs = TransactionRecoveryState(storeId, txd.serialize(), List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))),
+      TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+    val net = new TestNet
+    var stops = List[Throwable]()
+    val lookup = new ManualLookup
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
+      unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded, deferRecovery = true,
+      onFailStop = err => stops = stops :+ err)
+    lookup.frontend = Some(frontend)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    frontend.recover(StoreRecoveryState(List(trs), Set()))
+    (frontend, net, () => stops)
+
+  test("a recovered commit vote whose object fails to load fail-stops the store (Req F6)") {
+    val (frontend, net, stops) = recoveredVote(mkObjectState(oid1), Some(ReadError.CorruptedObject))
+    stops().size shouldBe 1
+    // The object loads now, with no lock on it: nothing may vote on it
+    frontend.receiveTransactionMessage(mkPrepare(lockTxd(txid2, List(overwrite(op1))), fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
+    net.sentTx.collect { case r: TxPrepareResponse if r.transactionId == txid2 => r } shouldBe Nil
+  }
+
+  test("a recovered commit vote whose object is not found does not fail-stop") {
+    val (frontend, _, stops) = recoveredVote(mkObjectState(oid1), Some(ReadError.ObjectNotFound))
+    stops() shouldBe Nil
+    frontend.failStopped shouldBe false
+  }
+
+  test("a recovered commit vote whose object fails to load on a write-frozen store poisons it instead of fail-stopping") {
+    val (frontend, net, stops) = recoveredVote(mkObjectState(oid1), Some(ReadError.CorruptedObject), frozen = true)
+    stops() shouldBe Nil
+    frontend.failStopped shouldBe false
+    // The object now loads, with no lock on it: every transaction on it votes abort
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteAbort
+    frontend.readObjectForNetwork(clientId, new UUID(1, 1), op1, FullObject())
+    net.clientMessage().isDefined shouldBe true
+  }
+
+  test("a recovered commit vote whose update a later transaction superseded applies nothing and does not fail-stop") {
+    val later = mkObjectState(oid1)
+    later.metadata = later.metadata.copy(revision = ObjectRevision(txid2))
+    val (frontend, net, stops) = recoveredVote(later)
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
+    stops() shouldBe Nil
   }
 
   test("a prepare arriving after its transaction was finalized starts no transaction and takes no locks") {

@@ -41,8 +41,10 @@ object Host:
    *  threw. A backend may be opened off the event thread, so the event can be handled before then:
    *  the backend is not served yet, and LoadStore retires it on seeing it failed. */
   private[server] case class BackendFailed(storeId: StoreId, backend: AtomicReference[Backend], err: Throwable) extends Event
-  /** An installed store's recovery of its CRL transactions threw: it is fail-stopped as a failed backend is */
-  private[server] case class StoreRecoveryFailed(store: Store, err: Throwable) extends Event
+  /** An installed store can no longer be trusted: its recovery of its CRL transactions threw, or it fail-stopped
+   *  (Frontend.failStop). It is fail-stopped as a failed backend is, if it is still the store installed. `what` says
+   *  why, for the log */
+  private[server] case class StoreFailStopped(store: Store, err: Throwable, what: String) extends Event
 
   /** The close of a store (ShutdownStore) found its backend failed-stop: the store was marked rebuild-required
    *  rather than closed cleanly, so a caller must not mark it as cleanly closed (transfer-out marker) or ship it. */
@@ -470,8 +472,8 @@ class Host(val client: AspenClient,
       case e: BackendFailed =>
         deviceControl.rebuilds.handleBackendFailed(e)
 
-      case e: StoreRecoveryFailed =>
-        deviceControl.rebuilds.handleRecoveryFailed(e)
+      case e: StoreFailStopped =>
+        deviceControl.rebuilds.handleFailStopped(e)
 
       case e: BackendOpened =>
         deviceControl.loader.handleBackendOpened(e)

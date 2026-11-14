@@ -61,10 +61,17 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   def handleBackendFailed(e: Host.BackendFailed): Unit =
     backendFailed(e.storeId, Option(e.backend.get), e.err)
 
-  /** A served store failed to recover its CRL transactions: it may be missing some of their votes and locks, so it
-   *  can no longer be trusted, and is fail-stopped and rebuilt as a failed backend is */
-  def handleRecoveryFailed(e: Host.StoreRecoveryFailed): Unit =
-    backendFailed(e.store.storeId, Some(e.store.backend), e.err, "failed to recover its transactions from its CRL")
+  /** A served store can no longer be trusted: it failed to recover its CRL transactions (it may be missing some of
+   *  their votes and locks), or it fail-stopped (Frontend.failStop: a commit voter that cannot hold the update it
+   *  voted for). It is fail-stopped and rebuilt as a failed backend is, but only while it is still the store installed
+   *  under its id: one already closed (transferred out, unloaded, replaced by a reload) is left alone, since
+   *  backendFailed would mark the directory of a store it no longer serves */
+  def handleFailStopped(e: Host.StoreFailStopped): Unit =
+    val storeId = e.store.storeId
+    if ctx.router.entry(storeId).exists(_.store eq e.store) then
+      backendFailed(storeId, Some(e.store.backend), e.err, e.what)
+    else
+      logger.warn(s"Ignoring the fail-stop of store $storeId, which is no longer served (${e.what}): ${e.err}")
 
   /** Creates and loads an Initializing store, then flips its entry out of Initializing.
    *
@@ -547,6 +554,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         false
 
 object StoreRebuilds:
+  /** Host.StoreFailStopped's `what` for a store whose CRL recovery failed */
+  val RecoveryFailed = "failed to recover its transactions from its CRL"
+  /** Host.StoreFailStopped's `what` for a store that fail-stopped (Frontend.failStop) */
+  val FailStopped = "fail-stopped: it cannot hold an update it voted to commit"
+
   /** Writes the rebuild-required marker of the store at `storePath`, durably */
   def writeRebuildRequiredMarker(storePath: os.Path): Unit =
     DurableFiles.write(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")

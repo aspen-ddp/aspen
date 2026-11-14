@@ -229,7 +229,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private def readAndRecover(store: Store): Unit =
     val failed: Throwable => Unit = err =>
       logger.error(s"Store ${store.storeId} failed to read its transactions from its CRL: $err")
-      ctx.post(Host.StoreRecoveryFailed(store, err))
+      ctx.post(Host.StoreFailStopped(store, err, StoreRebuilds.RecoveryFailed))
     // The default readStoreState reads getFullRecoveryState inline, which may throw
     val read =
       try store.crl.readStoreState(store.storeId)
@@ -256,7 +256,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
     catch
       case NonFatal(err) =>
         logger.error(s"Store ${store.storeId} failed to recover its transactions from its CRL: $err")
-        ctx.post(Host.StoreRecoveryFailed(store, err))
+        ctx.post(Host.StoreFailStopped(store, err, StoreRebuilds.RecoveryFailed))
 
   /** The CRL holds the state loaded from `store`'s crl_save.log. On its executor, if it is still the store
    *  installed: removes the save file and recovers its transactions. `p` is completed either way. A store closed

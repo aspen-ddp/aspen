@@ -56,7 +56,11 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** The host's heartbeat period, which calls heartbeat (Frontend.expiryMargin) */
             heartbeatPeriod: FiniteDuration = FiniteDuration(1, SECONDS),
             /** The host's wall clock (Frontend.wallClockMillis). A test seam */
-            wallClockMillis: () => Long = () => System.currentTimeMillis()) extends Logging {
+            wallClockMillis: () => Long = () => System.currentTimeMillis(),
+            /** Called on the store's executor when the store fail-stops (Frontend.failStop): its host takes it
+              * offline and rebuilds it (Host.StoreFailStopped)
+              */
+            onFailStop: (Store, Throwable) => Unit = (_, _) => ()) extends Logging {
 
   /** How long past the horizon an unresolved Tx starts its status queries: Frontend.expiryMargin */
   val expiryMargin: FiniteDuration = Frontend.expiryMargin(
@@ -73,7 +77,8 @@ class Store(val storageDeviceId: StorageDeviceId,
       case None => task => task()
       case Some(postTo) => task => postTo(s => if s eq this then task()),
     acceptorSince = acceptorSince, deferRecovery = deferRecovery, wallClockMillis = wallClockMillis,
-    horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, expiryMargin = expiryMargin)
+    horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, expiryMargin = expiryMargin,
+    onFailStop = err => onFailStop(this, err))
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's
@@ -93,7 +98,8 @@ class Store(val storageDeviceId: StorageDeviceId,
 
   def estimateSize(): Long = backend.estimateSize()
 
-  def heartbeat(): Unit = {
+  /** A fail-stopped store (Frontend.failStop) does nothing more: its drivers and Txs wait for its unload */
+  def heartbeat(): Unit = if !frontend.failStopped then {
     transactionDrivers.values.foreach { td =>
       td.heartbeat()
     }
@@ -183,6 +189,8 @@ class Store(val storageDeviceId: StorageDeviceId,
     transactionDrivers.values.foreach(_.printState(log))
 
   def receiveTransactionMessage(msg: TxMessage): Unit = msg match {
+    case _ if frontend.failStopped =>
+      logger.trace(s"Store $storeId dropped $msg: fail-stopped")
     // Backpressure: while the device's CRL is filling, a prepare for a transaction this store has not seen is dropped
     // without a reply. The client retransmits; other stores may commit it without this one, which repair catches up
     case m: TxPrepare if !frontend.admitPrepare(m) =>

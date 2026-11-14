@@ -1066,6 +1066,38 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // Left in the device CRL: a restart, which may serve the unmarked store, recovers them
       heldOnDisk(deviceDir, storeId) should be(Set(txid))
 
+  atest("a store that fail-stops is unloaded and marked rebuild-required"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, _, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ = host.control.router.loaded(storeId).frontend.failStop("test")
+      _ <- pumpUntil(host, !host.control.router.loaded.contains(storeId))
+      marked = os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile)
+      _ <- pumpUntil(host, false, rounds = 50)
+      _ = factory.shutdownAll()
+    yield
+      marked should be(true)
+
+  atest("the fail-stop of a store no longer served is ignored"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, _, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      store = host.control.router.loaded(storeId)
+      closed = host.closeStore(storeId)
+      _ <- pumpUntil(host, closed.isCompleted)
+      _ <- closed
+      _ = store.frontend.failStop("test")
+      _ <- pumpUntil(host, false, rounds = 50)
+      _ = factory.shutdownAll()
+    yield
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+
   atest("a full device slows only its own stores"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()

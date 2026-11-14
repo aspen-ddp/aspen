@@ -128,7 +128,11 @@ class Frontend(val storeId: StoreId,
                  */
                arrivedAt: Option[Long] = None,
                /** How long past the horizon an unresolved Tx starts its status queries (Frontend.expiryMargin) */
-               val expiryMargin: FiniteDuration = Frontend.DefaultExpiryMargin) extends Logging {
+               val expiryMargin: FiniteDuration = Frontend.DefaultExpiryMargin,
+               /** Called once, on the store's executor, when the store fail-stops (failStop): its host takes it
+                 * offline and rebuilds it. The default only logs, for tests
+                 */
+               onFailStop: Throwable => Unit = _ => ()) extends Logging {
 
   import Frontend._
 
@@ -239,6 +243,12 @@ class Frontend(val storeId: StoreId,
 
   /** A transaction's backend commit of `oid` failed: every later transaction on it votes abort until the store reloads */
   def commitFailed(oid: ObjectId): Boolean = failedCommits.contains(oid)
+
+  /** Treats `oid` as if a backend commit of it had failed (commitFailed): every later transaction on it votes abort, and
+    * repair leaves it alone, until the store reloads. For an object a recovered commit vote could not load on a store
+    * whose writes are frozen (Tx.objectLoadFailed), which must keep serving rather than fail-stop
+    */
+  def poisonObject(oid: ObjectId): Unit = failedCommits += oid
 
   /** `waiter` withholds its vote until each of `oids` has no commit in flight: it is then told through
     * Tx.commitPersisted, once per object
@@ -967,8 +977,32 @@ class Frontend(val storeId: StoreId,
   private def cachedState(objectId: ObjectId): Option[ObjectState] =
     objectCache.get(objectId).filter(!_.reloadRequired)
 
+  /** The store can no longer be trusted (failStop): it handles nothing more and waits for its host to unload it.
+    * `@volatile` for reads from other threads
+    */
+  @volatile private var stopped: Boolean = false
+
+  def failStopped: Boolean = stopped
+
+  /** Fail-stops the store: it can no longer be trusted to hold what its votes promised. From now on it drops every
+    * transaction message, read and repair, as an offline store would, and `onFailStop` tells its host, which marks it
+    * rebuild-required and unloads it. Never for a condition that freezes writes, such as a full device: such a store
+    * keeps serving reads (Backlog: "Full storage devices").
+    *
+    * The triggers (Tx.issueCommits, Tx.objectLoadFailed) are a commit voter that cannot hold the update it voted for:
+    * its locks are gone, so without the update a conflicting transaction could count this store's commit vote against
+    * the committed one (transaction-requirements F5, F6).
+    */
+  def failStop(reason: String): Unit =
+    if !stopped then
+      stopped = true
+      logger.error(s"Store $storeId fail-stops: $reason. It handles nothing more and will be rebuilt")
+      onFailStop(new IllegalStateException(s"Store $storeId fail-stopped: $reason"))
+
   def receiveTransactionMessage(msg: TxMessage): Unit =
-    if holding || heldMessages.nonEmpty then
+    if stopped then
+      ()
+    else if holding || heldMessages.nonEmpty then
       heldMessages = msg :: heldMessages
     else
       handleTransactionMessage(msg)
@@ -1155,7 +1189,9 @@ class Frontend(val storeId: StoreId,
     * transaction replaces, unlocked, and a repair trusting the read could undo that commit on a store that applied it
     */
   def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType): Unit =
-    if holding then
+    if stopped then
+      logger.trace(s"Store $storeId dropped read $readUUID: fail-stopped")
+    else if holding then
       logger.trace(s"Store $storeId dropped read $readUUID: holding for recovered transactions")
     else
       readForNetwork(clientId, readUUID, pointer, readType)
@@ -1191,7 +1227,7 @@ class Frontend(val storeId: StoreId,
             backend.read(pointer)
   }
 
-  def readObjectForOpportunisticRebuild(op: OpportunisticRebuild): Unit = {
+  def readObjectForOpportunisticRebuild(op: OpportunisticRebuild): Unit = if !stopped then {
     val objectId = op.pointer.id
     servableState(objectId) match {
       case Some(os) => opportunisticRebuild(op, os)
@@ -1214,7 +1250,8 @@ class Frontend(val storeId: StoreId,
     */
   def snapshotForRepair(pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
     val objectId = pointer.id
-    servableState(objectId) match
+    if stopped then p.failure(new IllegalStateException(s"Store $storeId fail-stopped"))
+    else servableState(objectId) match
       case Some(os) => p.success(RepairSnapshot.of(os))
       case None if deleting.contains(objectId) => p.success(RepairSnapshot.missing(objectId))
       case None if pointer.poolId != storeId.poolId =>
@@ -1226,7 +1263,8 @@ class Frontend(val storeId: StoreId,
     */
   def reconcileForRepair(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult]): Unit =
     val objectId = read.pointer.id
-    servableState(objectId) match
+    if stopped then p.failure(new IllegalStateException(s"Store $storeId fail-stopped"))
+    else servableState(objectId) match
       case Some(os) => reconcile(snapshot, read, p, Some(os))
       // A repair would write the repairer's state after the deletion, resurrecting the slice. Left for a later pass
       case None if deleting.contains(objectId) => p.success(ReconcileResult(Set(), false, stale = true))
@@ -1250,9 +1288,12 @@ class Frontend(val storeId: StoreId,
   def deleteObjectForRepair(objectId: ObjectId,
                             storePointer: Array[Byte],
                             completion: Promise[Unit]): Unit =
-    logger.trace(s"Repairing missed deletion of object $objectId")
-    discard(objectId)
-    backend.repairDelete(objectId, storePointer, completion)
+    if stopped then
+      completion.failure(new IllegalStateException(s"Store $storeId fail-stopped"))
+    else
+      logger.trace(s"Repairing missed deletion of object $objectId")
+      discard(objectId)
+      backend.repairDelete(objectId, storePointer, completion)
 
   private def readObjectForTransaction(transaction: Tx, pointer: ObjectPointer): Unit =
     val objectId = pointer.id

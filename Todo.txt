@@ -33,13 +33,12 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
      (proof caching, P-F10's lastProposer) and 1.3c (traceless hold for live voters) were dropped, not implemented:
      closed by the horizon. Residuals: post-load refusals (paxos 10.10), and retried Unknowns (see 5.10).
 
-1.4  Req F5 + F6: a commit voter can end up holding neither the lock nor the update                         [M]
-     F5: doCommit unlocks before issueCommits. If the apply fails, the voter has dropped its lock without
-     applying, so a conflicting transaction can gather T commit votes from stores that did not apply T (R2
-     weakened). F6: a recovered commit vote whose object fails to load takes no lock on it
-     (RequirementsLocker iterates isLoaded only).
-     Fix: keep the lock until the apply is durable, or make a failed apply of a voted commit fail-stop the store
-     (rebuild-required). Never vote on, or serve, objects of a recovered vote that has not loaded them all.
+1.4  DONE 2026-11-14: Req F5 + F6. A commit voter that cannot hold the update it voted for fail-stops the store
+     (Frontend.failStop -> Host.StoreFailStopped -> rebuilt as a failed backend is). Triggers: an apply that
+     throws; a live voter's failed apply re-check; a recovered commit vote whose object fails to load with
+     anything but ObjectNotFound. A write-frozen store poisons the object instead (abort votes until reload) and
+     keeps serving. Residual: a recovered vote's failed re-check is only logged, since superseded and invalidated
+     cannot be told apart. Every fail-stop is a lost-store declaration (Backlog: correlated declarations).
 
 1.5  CRL F10: no exclusion of a second opener of the same CRL files                                         [S]
      A double mount, or an adoption while the old host still writes, makes two writers interleave and corrupt
@@ -69,7 +68,8 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
            awaiting-drop, transferring-out) are never charged, so `require(canWriteEntry)` can throw on the CRL
            thread. Charge every recovered record at open, and release it on drop or transfer.
        F7: stream files are sparse (a one-byte write at the end), so ENOSPC on a hole kills the writer.
-           Preallocate real blocks.
+           Preallocate real blocks. ENOSPC on the CRL must freeze the device's writes, not mark the device failed
+           (2026-11-14 note; Backlog "Full storage devices").
      Correct server/crl/CLAUDE.md: "reads keep working" holds only for object reads.
 
 
@@ -210,7 +210,9 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 4.2  Hung backend commit: Req F12                                                                           [S-M]
      awaitingCommits has no timer, so an FSIF ENOSPC freeze stalls the object forever. Add a long watchdog that
-     votes BackendCommitFailed or fail-stops the store.
+     votes BackendCommitFailed and keeps the store serving. Never fail-stop for out of space (2026-11-14 note).
+     RocksDBBackend.commit completes only on success (fcommit.foreach), so a failed put hangs its commit the same
+     way. Backlog "Full storage devices".
 
 4.3  Admission vs finalization: X5, CRL F15, R-F14 (+ G10)                                                  [M]
      No admission lane is exempt, so data-pool CRL pressure on a device shared with metadata stores blocks the

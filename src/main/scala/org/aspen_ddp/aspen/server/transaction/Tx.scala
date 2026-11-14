@@ -538,6 +538,19 @@ class Tx( trs: TransactionRecoveryState,
   def objectLoadFailed(objectId: ObjectId, err: ReadError.Value): Unit = {
     logger.warn(s"Failed to load object $objectId: $err")
 
+    // A recovered commit vote takes its locks only on the objects that load (RequirementsLocker.lock). A failure other
+    // than ObjectNotFound may be transient, and a later load of the object would then find no lock: a conflicting
+    // transaction could vote commit on it while this vote stands (transaction-requirements F6). A store whose writes
+    // are frozen (a full device) must keep serving instead: the object is poisoned, so every later transaction on it
+    // votes abort until the store reloads, as after a failed backend commit
+    if recovered && disposition == TransactionDisposition.VoteCommit && err != ReadError.ObjectNotFound then
+      if frontend.backend.isWriteFrozen then
+        logger.error(s"Tx $transactionId: recovered commit vote on store $storeId failed to load object $objectId " +
+          s"($err) while the store's writes are frozen. Every transaction on it votes abort until the store reloads")
+        frontend.poisonObject(objectId)
+      else
+        frontend.failStop(s"recovered commit vote of Tx $transactionId failed to load object $objectId: $err")
+
     pendingObjectLoads -= 1
 
     if (allObjectsLoaded)
@@ -804,6 +817,20 @@ class Tx( trs: TransactionRecoveryState,
       logger.warn(s"Tx $transactionId. Store $storeId cannot apply the committed update of object $objectId: $reason. " +
         s"Vote: $disposition. Client prepare seen: $clientPrepared. Revision on store: $current")
     }
+
+    // A commit voter that cannot hold the update it voted for has already dropped its locks (doCommit): its vote, which
+    // may count towards the write threshold, would then stand for neither. So the store fail-stops (Frontend.failStop)
+    // when an apply threw, and when a live voter's apply re-check fails: it has held its locks since its own check, so
+    // the state changed under them (transaction-requirements F5). A recovered vote's re-check may fail legitimately: a
+    // later transaction built on it superseded its update before the crash. An earlier failed backend commit poisons
+    // the object instead (failedHere: every later transaction on it votes abort)
+    if disposition == TransactionDisposition.VoteCommit then
+      val unapplied =
+        if recovered then result.failed -- failedHere
+        else result.uncommittable -- alreadyApplied -- failedHere
+      if unapplied.nonEmpty then
+        frontend.failStop(s"Tx $transactionId voted commit but cannot apply its committed update of objects " +
+          s"$unapplied: ${result.skippedReasons.filter((oid, _) => unapplied.contains(oid))}")
 
     val uncommittable = result.uncommittable -- alreadyApplied
 

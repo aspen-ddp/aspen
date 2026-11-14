@@ -125,6 +125,21 @@ System-level protection against correlated "lost store" declarations
     - Only when the loss is judged isolated and not potentially systemic does the system issue an explicit
       deletion instruction for the retained content, through the usual object-based admin channel so it can't
       be lost.
+  - Every automatic fail-stop is a lost-store declaration and needs the same systematic handling, not only the
+    paths listed above. A fail-stop marks the store `rebuild-required`, so a bug introduced by an update can fire it
+    across the board: on every host running the new version, possibly on every store of a pool at once, taking the
+    pool below threshold (an outage) and then destroying the content its rebuild needs. Inventory them and route all
+    of them through the system-level check below. Known today:
+    - backend fail-stop on an I/O error (`StoreRebuilds.backendFailed`, FSIF's `onFatal`);
+    - a store whose CRL transactions fail to recover (`Host.StoreFailStopped`, from `StoreRouter.recoverOrFail` and
+      `readAndRecover`);
+    - (2026-11-14, Todo 1.4) a commit voter that cannot apply the committed update it voted for (its in-memory apply
+      throws, or a live voter's apply re-check fails), and a recovered commit vote whose object fails to load with
+      anything but ObjectNotFound (`Frontend.failStop`). A bug in the requirement checker or applier would trip this
+      on every replica of an object at once;
+    - a failure during a store's close (`StoreRebuilds.failedOnClose`), an unusable `crl_save.log`
+      (`crlSaveFileLost`), a lost or unopenable device CRL (`DeviceDiscovery.openDeviceCrl`).
+    - Out of space must never be one of them: it freezes writes and keeps serving reads (see "Full storage devices").
   - Related: a rebuild that can't find enough healthy peers must fail loudly rather than rebuild from what's left.
   - Track suspected-loss space use per device, including `crl.lost-*` directories, since retained copies compete
     with live stores; see the "Full storage devices" item.
@@ -237,6 +252,11 @@ Full storage devices: keep stores serving and route around them system-wide
       migrate off the device. Frozen writes then resume, followed by repair of the missed updates.
   - FSIF (docs/superpowers/specs/2026-10-29-fsif-backend-design.md) implements only the backend side: freeze
     writes on ENOSPC, keep serving reads, retry until space returns.
+  - (2026-11-14) Gaps against that policy, to fix together: `RocksDBBackend.commit` completes only on success
+    (`fcommit.foreach`), so a failed put (ENOSPC) hangs its commit with no completion; the hung-commit watchdog
+    (Todo 4.2) must vote `BackendCommitFailed` and keep the store serving, never fail-stop it; the CRL writer's ENOSPC
+    (Todo 1.8, CRL F7) must freeze the device's writes, not mark the device failed. Out of space is never a fail-stop
+    or a lost-store declaration (see "System-level protection against correlated lost store declarations").
 
 Traceless commits follow-ups (minor, from the 2026-11-08 reviews):
 - TracelessCommits entries are one per transaction (not merged per object like ErrorTree entries), but only for

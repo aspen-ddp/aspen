@@ -70,6 +70,14 @@
   release when a commit is applied in memory: the in-flight marker orders followers. After a failed backend commit
   every transaction on that object votes abort (`BackendCommitFailed`) until the store reloads. Objects a
   transaction only checks or locks get no backend commit, so concurrent `SharedRevisionLock` holders never wait
+- Fail-stop (`Frontend.failStop`, transaction-requirements F5/F6): a commit voter has dropped its locks before it
+  applies, so one that cannot hold the update it voted for fail-stops the store. That covers an apply that throws, a
+  live voter's failed apply re-check (a recovered voter's may legitimately fail: superseded before the crash), and a
+  recovered commit vote whose object fails to load with anything but `ObjectNotFound`. A fail-stopped store drops
+  every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
+  store is rebuilt as a failed backend is. Never for a full device: a write-frozen store poisons the object instead
+  (`poisonObject`, the `BackendCommitFailed` rule) and keeps serving. Every fail-stop is a lost-store declaration
+  (Backlog: correlated declarations)
 - Ranged-write/append deltas are read through `EncodedAppendDelta`, which parses only the header and region table
   and XORs straight from the encoded buffer, so checking and applying never copy the delta
 

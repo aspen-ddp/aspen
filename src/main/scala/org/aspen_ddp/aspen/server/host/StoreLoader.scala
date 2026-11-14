@@ -355,7 +355,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 horizon = ctx.transactionHorizon,
                 loadedAt = if isNew then Some(0L) else ctx.storeLoadedAt(storeId),
                 arrivedAt = if isNew then None else StoreLoader.readArrivedAt(backend.path),
-                heartbeatPeriod = FiniteDuration(ctx.heartbeatPeriod.toMillis, MILLISECONDS))
+                heartbeatPeriod = FiniteDuration(ctx.heartbeatPeriod.toMillis, MILLISECONDS),
+                // On the store's executor: only posts to the control thread
+                onFailStop = (s, err) => ctx.post(Host.StoreFailStopped(s, err, StoreRebuilds.FailStopped)))
               madeStore = Some(store)
               val entry = new StoreRouter.Entry(store, executor)
               // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any

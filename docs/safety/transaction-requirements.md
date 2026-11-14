@@ -473,7 +473,7 @@ the first (`Locker:15-21`). This is harmless because A's outcome is committed; A
 is reported via `TxCommitted` as a missed object for repair, which reconciles exactly. (b) A recovered commit vote on a
 KV update that has no required revision and whose data was already dropped from the CRL after the backend commit is
 skipped with `MissingObjectUpdate` (data missing) rather than replayed (`Tx.scala:604-613`). (c) If the data was not yet
-dropped, a blind write is replayed: F2. (d) A recovered object that fails to load holds no lock on it: F6.
+dropped, a blind write is replayed: F2. (d) A recovered object that fails to load holds no lock on it: F6, fixed by a fail-stop (2026-11-14).
 
 ### 10.6 Failed backend commit
 
@@ -571,6 +571,14 @@ under reordering/crash; Low = needs an unusual precondition or a trust-model vio
 | F11 | **narrowed** | A replayed allocation reaching a late or non-late commit is no longer applied at a store holding an applied stub for T. It still applies at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) and at stores that acknowledged in time on a non-late commit (paxos P-N3, P-N10) | `Tx.scala:642-648,998-1000` |
 | Q-N5 | **narrowed** (marker site) | A re-run marker's re-created UnackedCommits entries now come with a `TxFinalized` listing them, so stores write stubs for them (transaction-recovery R-N6); the ErrorTree regression is unchanged | `Frontend.scala:763-773` |
 
+### Re-assessment for commit-voter fail-stop (2026-11-14)
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F5 | **fixed** | A commit voter whose apply throws, or a live commit voter whose apply re-check fails, fail-stops the store | `Tx.issueCommits`; `Frontend.failStop`; `StoreRebuilds.handleFailStopped` |
+| F6 | **fixed** | A recovered commit vote whose object fails to load with anything but `ObjectNotFound` fail-stops the store; a write-frozen store poisons the object instead | `Tx.objectLoadFailed`; `Frontend.poisonObject` |
+| F10 | unchanged | An apply still ignores locks; when it invalidates a commit voter's update, that voter now fail-stops instead of skipping silently | FrontendSuite "a commit held behind an in-flight commit ..." needed a non-conflicting fence write |
+
 ### F1. Sequential blind KV writes of one key (or object-level field) can be applied in opposite orders by a lagging store; permanent divergence with no repair entry. Confidence: Medium.
 
 > **Refresh (replay pins): NARROWED.** TKVL puts now carry `KeyRevision`/`DoesNotExist` and deletes `KeyRevision`
@@ -645,6 +653,19 @@ diverges by design.
 
 ### F5. A commit voter that does not apply the committed update drops its lock and becomes, effectively, a lost commit vote that still counts toward `T`. Confidence: Low.
 
+> **Fixed 2026-11-14: fail-stop.** Keeping the lock would not help, because the store never gets the update. Instead
+> `Tx.issueCommits` fail-stops the store (`Frontend.failStop`: it drops every message, read and repair from then on,
+> and its host marks it rebuild-required and unloads it, `Host.StoreFailStopped`) when a commit voter's apply throws
+> (`result.failed`), or when a **live** commit voter's apply re-check fails for an object it neither applied nor
+> already shows (`appliedBy`) and whose earlier backend commit did not fail (R10 covers those). Applied objects need
+> no lock after the apply: the in-flight commit marker makes every later transaction on them wait until they persist,
+> and a failed backend commit poisons them. *Residual:* a recovered commit vote's failed re-check is still only
+> logged. A later transaction built on it may have superseded its update before the crash (10.5a), and that cannot
+> be told apart from an invalidated state. A fail-stop is a lost-store declaration, so a bug that trips it on many
+> stores at once is a systemic risk (Backlog: "System-level protection against correlated lost store declarations").
+> Test: FrontendSuite "a commit voter whose state is invalidated under its locks fail-stops rather than hold neither
+> (Req F5)".
+
 > **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica.** doCommit unlocks before applying (Tx.scala:527-533) and a failed apply re-check is only logged (Tx.scala:549-575); needs a state change between vote and apply (F3 or repair/rebuild writes can cause it).
 > *Fix sketch:* Keep the lock until the apply succeeded, or abort the store (rebuild-required) on a failed apply of a voted-commit.
 
@@ -659,6 +680,14 @@ a lost device CRL (rebuild) as treated in [systemic-loss-protection.md](systemic
 during apply or a state invalidation between vote and apply on several stores.
 
 ### F6. A recovered commit vote whose object fails to load takes no lock on it; a later load can succeed. Confidence: Low.
+
+> **Fixed 2026-11-14: fail-stop.** `Tx.objectLoadFailed` fail-stops the store when a recovered commit vote's object
+> fails to load with anything but `ObjectNotFound`, which is permanent (the object is gone or being deleted, so no
+> later load succeeds). *Exception:* a store whose writes are frozen (`Backend.isWriteFrozen`, a full FSIF device)
+> poisons the object instead (`Frontend.poisonObject`, the failed-backend-commit rule R10), because out of space must
+> never lead to a rebuild: every later transaction on the object votes abort, and repair leaves it alone, until the
+> store reloads. Tests: FrontendSuite "a recovered commit vote whose object fails to load fail-stops the store (Req
+> F6)", "... on a write-frozen store poisons it instead of fail-stopping".
 
 > **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica (low).** RequirementsLocker.lock skips objects that are not loaded; transient read errors are not distinguished.
 > *Fix sketch:* Retry loads of a recovered vote's objects; never serve until all loaded.

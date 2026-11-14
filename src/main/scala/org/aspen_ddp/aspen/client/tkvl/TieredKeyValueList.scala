@@ -167,6 +167,18 @@ class TieredKeyValueList(val client: AspenClient,
                   stopWhen: () => Boolean = () => false): Future[Unit] =
     engine.foreachFrom(minKey, withValueState(fn), stopWhen)
 
+  /** Hands every node of every tier to `fn` as `(tier, pointer)`, once each, tier by tier from the root's tier down,
+   *  each left to right. `complete` is false when a join, tail removal or root reduction deleted a node the walk was
+   *  about to read: that tier's walk ended there, so a caller wanting every node walks again later. A failing `fn`
+   *  is logged and the walk continues; a read failing for any other reason fails the result. See
+   *  TierEngine.foreachNode.
+   */
+  def foreachNode(fn: (Int, KeyValueObjectPointer) => Future[Unit]): Future[NodeWalk] =
+    engine.foreachNode: (tier, pointer) =>
+      pointer match
+        case kvp: KeyValueObjectPointer => fn(tier, kvp)
+        case other => Future.failed(new IllegalStateException(s"Expected a KeyValueObjectPointer but found $other"))
+
   /** `fn` as a TierEngine walk callback, handed the KeyValueListNode and the entry's ValueState */
   private def withValueState(fn: (KeyValueListNode, Key, ValueState) => Future[Unit])
                             : (ListNode, Key, Value) => Future[Unit] =

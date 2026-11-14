@@ -16,6 +16,12 @@ import scala.util.{Failure, Success}
   * The kind-specific facades (`TieredKeyValueList`, `DataObjectTKVL`) sit on top of this and convert nodes and
   * entries to the types their callers see.
   */
+/** The result of `foreachNode`: how many nodes were handed to `fn`, and whether every tier was walked to its end.
+  * An incomplete walk ran into a node that a join, tail removal or root reduction deleted while it ran; walking
+  * again later covers what it missed.
+  */
+final case class NodeWalk(visited: Int, complete: Boolean)
+
 private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootManager) extends Logging:
 
   given ExecutionContext = client.clientContext
@@ -170,6 +176,72 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       withContainingNode(after.getOrElse(minKey), ())(node => advance(node, after, restarts))
 
     resume(None, 0)
+
+  /** Hands every node of every tier to `fn` as `(tier, pointer)`, once each. Reads a fresh root, finds each tier's
+    * leftmost node by following `Key.AbsoluteMinimum` down from it, and walks each tier left to right through its
+    * links, from the root's tier down to tier 0. Nothing is read from the cache.
+    *
+    * A read failing with InvalidObject means a join, tail removal or root reduction deleted the node: that tier's
+    * walk ends (and, on the descent, so do the walks of the tiers below it), and the result is `complete = false`.
+    * The other tiers are still walked. A failing `fn` is logged and the walk continues, as in `foreach`. Any other
+    * read failure fails the result.
+    */
+  def foreachNode(fn: (Int, ObjectPointer) => Future[Unit]): Future[NodeWalk] =
+    var visited = 0
+    var complete = true
+
+    def read(encoding: NodeEncoding, pointer: ObjectPointer, minimum: Key, ordering: KeyOrdering,
+             label: String): Future[Option[ListNode]] =
+      Future.delegate(encoding.read(client, pointer, minimum, ordering, s"foreachNode() $label")).map(Some(_))
+        .recover:
+          case _: InvalidObject =>
+            complete = false
+            None
+
+    // The leftmost node of every tier from `tier` down to the lowest one reached, highest tier first
+    def leftmostNodes(encoding: NodeEncoding, tier: Int, node: ListNode): Future[List[(Int, ListNode)]] =
+      if tier == 0 then
+        Future.successful(List((tier, node)))
+      else
+        node.get(Key.AbsoluteMinimum) match
+          case None =>
+            logger.warn(s"TKVL foreachNode: tier $tier node ${node.pointer.id} has no minimum-key entry")
+            complete = false
+            Future.successful(List((tier, node)))
+          case Some(v) =>
+            read(encoding, ObjectPointer(v.bytes), Key.AbsoluteMinimum, node.ordering,
+              s"leftmost child of tier $tier node ${node.pointer.id}").flatMap:
+              case None => Future.successful(List((tier, node)))
+              case Some(down) => leftmostNodes(encoding, tier - 1, down).map((tier, node) :: _)
+
+    def walkTier(encoding: NodeEncoding, tier: Int, node: ListNode): Future[Unit] =
+      visited += 1
+      Future.delegate(fn(tier, node.pointer)).recover:
+        case err => logger.error(s"Failure in TKVL foreachNode: $err", err)
+      .flatMap: _ =>
+        node.link match
+          case None => Future.unit
+          case Some(link) =>
+            read(encoding, link.pointer, link.minimum, node.ordering,
+              s"right of tier $tier node ${node.pointer.id}").flatMap:
+              case None => Future.unit
+              case Some(right) => walkTier(encoding, tier, right)
+
+    def walkTiers(encoding: NodeEncoding, tiers: List[(Int, ListNode)]): Future[Unit] =
+      tiers match
+        case Nil => Future.unit
+        case (tier, node) :: rest => walkTier(encoding, tier, node).flatMap(_ => walkTiers(encoding, rest))
+
+    rootManager.getFreshRootNode().flatMap: (rootTier, _, oroot) =>
+      oroot match
+        case None => Future.successful(NodeWalk(0, complete = true))
+        case Some(root) =>
+          val encoding = encodingFor(root)
+          for
+            tiers <- leftmostNodes(encoding, rootTier, root)
+            _ <- walkTiers(encoding, tiers)
+          yield
+            NodeWalk(visited, complete)
 
   /** Reads the node `link` points to, the right neighbour of `node`. `label` names the walk, for diagnostics. */
   private def readRight(node: ListNode, link: NodeLink, label: String): Future[ListNode] =

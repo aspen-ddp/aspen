@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.TestTransactions
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{InvalidObject, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 
 import scala.concurrent.Future
@@ -401,7 +401,8 @@ class TKVLSuite extends IntegrationTestSuite {
    *  inserted keys in ascending order.
    */
   private def buildSplitTree(numKeys: Int,
-                             valueSize: Int = 512 * 1024): Future[(TieredKeyValueList, KVObjectRootManager, List[Key])] =
+                             valueSize: Int = 512 * 1024,
+                             maxNodeSize: Int = SinglePoolNodeAllocator.DefaultMaxNodeSize): Future[(TieredKeyValueList, KVObjectRootManager, List[Key])] =
     val treeKey = Key(Array[Byte](0))
     val bigValue = Value(new Array[Byte](valueSize))
     val keys = (1 to numKeys).map(i => Key(i)).toList
@@ -429,7 +430,7 @@ class TKVLSuite extends IntegrationTestSuite {
       _ <- tx0.commit()
       _ <- waitForTransactionsToComplete()
 
-      nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
+      nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId, maxNodeSize)
       tx1 = TestTransactions.replaySafe(client.newTransaction())
       froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, IntegerKeyOrdering,
         nodeAllocator, Map())(using tx1)
@@ -456,7 +457,12 @@ class TKVLSuite extends IntegrationTestSuite {
     tier0Nodes(tree).map(_.map(_.minimum))
 
   /** Every tier-0 node, in left-to-right list order. See tier0NodeMinimums. */
-  private def tier0Nodes(tree: TieredKeyValueList): Future[List[KeyValueListNode]] =
+  private def tier0Nodes(tree: TieredKeyValueList): Future[List[KeyValueListNode]] = tierNodes(tree, 0)
+
+  /** Every node of `tier`, in left-to-right list order, found by descending along the minimum key and following
+   *  each node's right pointer.
+   */
+  private def tierNodes(tree: TieredKeyValueList, tier: Int): Future[List[KeyValueListNode]] =
 
     def walkRight(node: KeyValueListNode): Future[List[KeyValueListNode]] =
       node.tail match
@@ -467,9 +473,9 @@ class TKVLSuite extends IntegrationTestSuite {
               .map(node :: _)
 
     for
-      (tier, ordering, oroot) <- tree.rootManager.getKeyValueRootNode()
+      (rootTier, ordering, oroot) <- tree.rootManager.getKeyValueRootNode()
       root = oroot.getOrElse(throw new BrokenTree())
-      e <- TieredKeyValueList.fetchContainingNode(client, tier, 0, ordering,
+      e <- TieredKeyValueList.fetchContainingNode(client, rootTier, tier, ordering,
              Key.AbsoluteMinimum, root, Set())
       leftmost = e match
         case Left(_) => throw new BrokenTree()
@@ -901,5 +907,58 @@ class TKVLSuite extends IntegrationTestSuite {
       assert(visited.reverse == keys.filter(k => IntegerKeyOrdering.compare(k, last.minimum) < 0))
       assert(foreachResult.failed.get.isInstanceOf[InvalidObject])
       assert(foldResult.failed.get.isInstanceOf[InvalidObject])
+  }
+
+  atest("foreachNode visits every node of every tier exactly once") {
+    var visits = List[(Int, ObjectId)]()
+    for
+      // 512-byte nodes hold one 300-byte value each, and ten tier-0 nodes split tier 1 as well
+      (tree, root, keys) <- buildSplitTree(10, valueSize = 300, maxNodeSize = 512)
+      (rootTier, _, _) <- root.getFreshRootNode()
+      byHand <- Future.sequence((0 to rootTier).map(t => tierNodes(tree, t).map(_.map(n => (t, n.pointer.id)))))
+      walk <- tree.foreachNode: (tier, pointer) =>
+        visits = (tier, pointer.id) :: visits
+        Future.unit
+    yield
+      rootTier should be >= 2
+      byHand(1).size should be > 1
+      visits.toSet shouldBe byHand.flatten.toSet
+      visits.map(_._1).toSet shouldBe (0 to rootTier).toSet
+      walk.visited shouldBe visits.toSet.size
+      walk.visited shouldBe visits.size
+      walk.complete shouldBe true
+  }
+
+  atest("foreachNode of an empty tree visits nothing") {
+    for
+      (tree, _, _) <- buildSplitTree(0)
+      walk <- tree.foreachNode((_, _) => Future.failed(new Exception("visited a node of an empty tree")))
+    yield
+      walk shouldBe NodeWalk(0, true)
+  }
+
+  atest("foreachNode reports incomplete when a join deletes a node mid-walk") {
+    var joined = false
+    for
+      (tree, _, keys) <- buildSplitTree(3)
+      nodesBefore <- tier0Nodes(tree)
+      walk <- tree.foreachNode: (tier, pointer) =>
+        if tier == 0 && !joined then
+          joined = true
+          // Deleting the leftmost node's only key joins its right neighbour, the next node of the walk, into it
+          val tx = client.newTransaction()
+          for
+            _ <- tree.delete(Key(1))(using tx)
+            _ <- tx.commit()
+            _ <- waitForTransactionsToComplete()
+          yield ()
+        else
+          Future.unit
+      v2 <- tree.get(Key(2))
+    yield
+      nodesBefore.size shouldBe 3
+      joined shouldBe true
+      v2.isEmpty shouldBe false
+      walk.complete shouldBe false
   }
 }

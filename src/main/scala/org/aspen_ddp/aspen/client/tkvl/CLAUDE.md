@@ -26,6 +26,11 @@
   A delete from inside a walk must go through the tree (`deleteIfPresent`), not the node handed to `fn`: that node is
   the walk's snapshot, so a delete through it neither sees that it empties the node nor registers the upper-tier
   finalization actions
+- `foreachNode` (`TierEngine`, KV facade on `TieredKeyValueList`) hands `fn` every node of every tier as `(tier,
+  pointer)`: a fresh root, each tier's leftmost node by descent along `Key.AbsoluteMinimum`, then each tier left to
+  right through its links. It does not restart on joins: an `InvalidObject` ends that tier (the descent: the tiers
+  below too) and returns `NodeWalk(visited, complete = false)`, so a periodic caller (the repair sweep) retries on
+  its next pass. A failing `fn` is logged; other read failures fail the walk
 - A join absorbs a node's right neighbor, so a tier's rightmost node is never joined away. A join is also declined when
   the joined node would be larger than the neighbor, which happens when the emptied node's minimum is longer than the
   neighbor's. In both cases the node is left empty and `TailRemovalFinalizationAction` removes it: its predecessor

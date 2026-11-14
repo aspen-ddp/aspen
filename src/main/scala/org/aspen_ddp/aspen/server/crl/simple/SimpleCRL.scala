@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.crl.simple
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.StorageDeviceConfig
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, StoreRecoveryState,
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlLocked, StoreRecoveryState,
   TransactionRecoveryState}
 import scribe.Logging
 
@@ -65,6 +65,7 @@ object SimpleCRL:
 
   /** @param onThreadDeath called if a CRL thread dies. No transaction of the CRL's stores can make progress after
     *                      that: stores vote only once a save completes.
+    * @throws CrlLocked if the CRL is open elsewhere (CrlLock). Nothing in `streamsDir` is read or written then.
     * @throws SizingMismatch if `streamsDir` holds stream files other than `numStreams` of `maxSizeInBytes` each.
     *                        The sizing is fixed when the CRL is created: recovering with another would silently
     *                        ignore files holding live entries, so such a CRL is treated as unrecoverable.
@@ -79,18 +80,25 @@ object SimpleCRL:
       (StreamId(i), streamsDir / s"$i.crl")
     ).toList
 
-    checkSizing(streamsDir, files.map(_._2).toSet, maxSizeInBytes)
+    // Held from before the files are read until the writer has closed them. A failed open releases it
+    val lock = CrlLock.acquire(streamsDir)
+    try
+      checkSizing(streamsDir, files.map(_._2).toSet, maxSizeInBytes)
 
-    val r = Recovery.recover(files)
+      val r = Recovery.recover(files)
 
-    InitialCRLState(
-      new SimpleCRL(
-        maxSizeInBytes,
-        files,
-        r,
-        onThreadDeath),
-      r.trsList,
-      r.appliedStubs)
+      InitialCRLState(
+        new SimpleCRL(
+          maxSizeInBytes,
+          files,
+          r,
+          onThreadDeath,
+          lock),
+        r.trsList,
+        r.appliedStubs)
+    catch case t: Throwable =>
+      lock.release()
+      throw t
 
   /** A directory with no stream files is a new CRL. Otherwise its files must be exactly `expected`, each
     * `maxSizeInBytes` long (StreamWriter creates them at that size) */
@@ -108,7 +116,8 @@ object SimpleCRL:
 class SimpleCRL private (val maxSizeInBytes: Long,
                          files: List[(StreamId, os.Path)],
                          r: Recovery.Result,
-                         onThreadDeath: Throwable => Unit) extends CrashRecoveryLog with Logging:
+                         onThreadDeath: Throwable => Unit,
+                         lock: CrlLock) extends CrashRecoveryLog with Logging:
 
   import SimpleCRL._
 
@@ -140,6 +149,12 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   private var initializing = true
   private var writeInProgress = false
 
+  /** Shuts the writer down, releasing the lock once it has closed the stream files and before `completionHandler` */
+  private def shutdownWriter(completionHandler: () => Unit): Unit =
+    writer.shutdown: () =>
+      lock.release()
+      completionHandler()
+
   files.foreach: tpl =>
     if tpl._1 == r.activeStreamId then
       streams(tpl._1.number) = new Stream(r.activeStreamId, writer,
@@ -160,7 +175,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
         case event => ioQueue.put(event) // The WriteComplete, for the CRL thread
   catch case t: Throwable =>
     val closed = new CountDownLatch(1)
-    writer.shutdown(() => closed.countDown())
+    shutdownWriter(() => closed.countDown())
     closed.await()
     throw t
 
@@ -178,7 +193,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
         // Nothing takes the Shutdown that shutdown() queues now, so the shutdown is completed here: the files are
         // closed and the latch counted down once the writer finishes what it holds. Without it the device could not
         // be loaded again (its path stays in closingCrls) and the host's stop would wait forever.
-        writer.shutdown(() => shutdownComplete.countDown())
+        shutdownWriter(() => shutdownComplete.countDown())
         onThreadDeath(t)
   }
   ioThread.start()
@@ -275,7 +290,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
           completion((transactions.keysIterator ++ stubs.keysIterator).map(_.storeId).toSet)
 
         case Shutdown(completionHandler) =>
-          writer.shutdown(completionHandler)
+          shutdownWriter(completionHandler)
           return
 
   private def moveToQueueHead(lc: Record): Unit =

@@ -28,11 +28,6 @@ RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-re
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.5  CRL F10: no exclusion of a second opener of the same CRL files                                         [S]
-     A double mount, or an adoption while the old host still writes, makes two writers interleave and corrupt
-     entries. Fix: hold an exclusive FileChannel.tryLock on crl/lock while the CRL is open, and refuse to open
-     otherwise. Shared-storage double mounts still need real fencing (SL M9), so record that as a residual.
-
 1.6  CRL F5 (+ F19, Rebuild N2): no checksums on CRL entries                                                [M]
      Bit rot, torn or reordered sectors become Paxos state or object data. Fix: a CRC32C over each entry's header
      and body, checked in readEntry and readStreamLocation. Reject all-zero headers (F19). A mismatch should end

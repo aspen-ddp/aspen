@@ -13,6 +13,10 @@
 - Sizing (`crl-num-streams`, `crl-max-file-size-mb`) is fixed when the device's CRL is created: `SimpleCRL.apply`
   throws `SizingMismatch` for stream files of another count or size, and the device's CRL is then treated as lost
 - A failed open shuts its writer down before throwing, so a retry never runs two writers over the same files
+- An open CRL holds an exclusive lock on `crl/lock` (`simple/CrlLock`), from before its files are read until its writer
+  has closed them; a second opener, in this process or another, gets `CrlLocked` and touches nothing. Never open
+  the lock file elsewhere: closing any descriptor of it drops the process's POSIX lock, which is why in-process
+  openers are refused by a registry first. It does not fence shared-storage double mounts (safety SL M9)
 - A transfer out reads a store's state (`readStoreState`, which leaves it live) and removes it with
   `deleteTransactions` only once its `crl_save.log` is durable: entries leave the log only through a written deletion
 - Stores vote only after a save completes, so a dead CRL thread stops every transaction on its device while reads

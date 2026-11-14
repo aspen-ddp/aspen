@@ -84,7 +84,8 @@
   failure, since the source still holds the state
 - A lost device CRL does the same to every store on the device: if `<device>/crl` is absent from a device holding store
   dirs, or `openCRL` throws, each store dir gets `rebuild-required`, the old directory is kept as `crl.lost-<uuid>`, and
-  a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`). A transient error (I/O or VM error,
+  a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`). A CRL another writer holds open (`CrlLocked`) is never
+  lost: the device stays unloaded and each scan retries. A transient error (I/O or VM error,
   `DeviceDiscovery.isTransient`) leaves the device unloaded for the next scan instead, until `CrlOpenAttempts` (3) in a row
 - `Host.StoreFailStopped` (a store's CRL recovery threw, or its Frontend fail-stopped, `server/store/CLAUDE.md`) is
   handled as a backend failure (`StoreRebuilds.handleFailStopped`), but only while that Store is still the one

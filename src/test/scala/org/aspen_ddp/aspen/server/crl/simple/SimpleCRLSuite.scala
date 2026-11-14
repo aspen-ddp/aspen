@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation, Tx}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlLocked, StoreRecoveryState, TransactionRecoveryState}
 
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -585,7 +585,8 @@ class SimpleCRLSuite extends FileBasedTests {
     saveAndWait(i.crl, transactionId, trsValidTxd)
     saveAndWait(i.crl, transactionId2, trsValidTxd2)
 
-    // Simulate crash: do NOT call shutdown
+    // Simulate a crash: the CRL stops with no further write (its lock goes with it, as with a dead process)
+    i.crl.shutdown()
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 2)
@@ -595,7 +596,6 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(byStore(storeId).head.paxosAcceptorState == pax)
     assert(byStore(storeId2).head.serializedTxd == trsValidTxd2.serializedTxd)
 
-    i.crl.shutdown()
     i2.crl.shutdown()
   }
 
@@ -637,6 +637,49 @@ class SimpleCRLSuite extends FileBasedTests {
       assert(r != null, s"reopen $n did not finish its recovery")
       assert(r.trsList.map(_.txd.transactionId) == List(transactionId), s"reopen $n")
       r.crl.shutdown()
+  }
+
+  test("A second open of a CRL that is open fails with CrlLocked and leaves the first working") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+
+    assertThrows[CrlLocked](SimpleCRL(tdir, 3, 1024 * 1024))
+
+    // The refused opener wrote nothing: the first CRL still saves, and its state recovers intact
+    saveAndWait(i.crl, transactionId2, trsValidTxd2)
+    i.crl.shutdown()
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i2.trsList.map(_.storeId).toSet == Set(storeId, storeId2))
+    i2.crl.shutdown()
+  }
+
+  test("A failed open releases the CRL lock") {
+    SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
+    assertThrows[SimpleCRL.SizingMismatch](SimpleCRL(tdir, 3, 2 * 1024 * 1024))
+    SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
+  }
+
+  test("A CRL whose thread died has released its lock once its shutdown returns") {
+    val died = new LinkedBlockingQueue[Throwable]()
+    val i = SimpleCRL(tdir, 3, 8192, t => died.put(t))
+    val tooBig = ObjectUpdate(ou1.objectId, DataBuffer(new Array[Byte](8192)))
+    i.crl.save(transactionId, trsValidTxd.copy(objectUpdates = List(tooBig)), () => ())
+    assert(died.poll(10, TimeUnit.SECONDS) != null)
+
+    i.crl.shutdown()
+    SimpleCRL(tdir, 3, 8192).crl.shutdown()
+  }
+
+  test("A CRL whose writer thread died keeps its lock until its shutdown") {
+    val died = new LinkedBlockingQueue[Throwable]()
+    val i = SimpleCRL(tdir, 3, 1024 * 1024, t => died.put(t))
+    i.crl.save(transactionId, trsValidTxd, () => throw new RuntimeException("completion handler failed"))
+    assert(died.poll(10, TimeUnit.SECONDS) != null)
+
+    // The CRL thread still runs, so the CRL is still open
+    assertThrows[CrlLocked](SimpleCRL(tdir, 3, 1024 * 1024))
+    i.crl.shutdown()
+    SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
   }
 
   test("A dead CRL thread is reported") {
@@ -711,7 +754,8 @@ class SimpleCRLSuite extends FileBasedTests {
 
     assert(i.crl.currentStreamNumber == 0)
 
-    // Simulate crash, then recover
+    // Simulate a crash (the CRL stops with no further write), then recover
+    i.crl.shutdown()
     val i2 = SimpleCRL(tdir, 3, 4096 * 3)
 
     assert(i2.trsList.length == 1)
@@ -720,7 +764,6 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(i2.trsList.head.objectUpdates == trsValidTxd.objectUpdates)
     assert(i2.trsList.head.paxosAcceptorState == pax)
 
-    i.crl.shutdown()
     i2.crl.shutdown()
   }
 

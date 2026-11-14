@@ -653,6 +653,31 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       calls.get should be(DeviceDiscovery.CrlOpenAttempts + 1)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
 
+  atest("a device whose CRL another opener holds is left unloaded, never lost, and loads once it is released"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    createCrl(deviceDir)
+    // A second writer of the same files: another host process, or a double mount
+    val holder = newFactory().openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
+      deviceDir / StorageDeviceConfig.configFilename))
+    val factory = newFactory()
+    val host = newCrlHost(hostRoot, factory)
+
+    // Not a transient failure counting towards CrlOpenAttempts, nor a lost CRL, however often it is retried
+    host.control.devices.devices.contains(deviceA) should be(false)
+    for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
+      host.control.discovery.checkForNewDevices() should be(Nil)
+    os.exists(marker(storeDir)) should be(false)
+    os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
+    factory.opened should be(Nil)
+
+    holder.shutdown()
+    host.control.discovery.checkForNewDevices() should be(List(deviceA))
+    Future.successful:
+      os.exists(marker(storeDir)) should be(false)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.head
+
   atest("a device with stores but no crl dir marks them rebuild-required"):
     val hostRoot = newHostDir()
     val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)

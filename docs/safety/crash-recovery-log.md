@@ -1002,6 +1002,19 @@ the read path, not answered here.
 
 ### F10. No exclusion of a second opener of the same CRL files (medium confidence; high severity if it happens)
 
+> **FIXED (2026-11-14) for openers that share the lock; double mounts of shared storage are a residual.**
+> `SimpleCRL.apply` takes an exclusive lock on `crl/lock` (`CrlLock`) before it reads the stream files, and holds it
+> until the writer has closed them (shutdown, a failed open, or the CRL thread's death). A second opener, in this
+> process or another, gets `CrlLocked` and reads or writes nothing. `DeviceDiscovery.openDeviceCrl` treats it as
+> "in use", never as lost or transient: the device stays unloaded, no store is marked, and every scan retries.
+> In-process openers are refused by a registry keyed by the lock file's identity before any descriptor is opened,
+> because closing any descriptor of a file drops the process's POSIX locks on it (checked on OpenJDK 25).
+> Tests: SimpleCRLSuite "A second open of a CRL that is open fails with CrlLocked and leaves the first working",
+> "A failed open releases the CRL lock", the two dead-thread lock tests; DeviceCrlSuite "a device whose CRL another
+> opener holds is left unloaded, never lost, and loads once it is released".
+> **Residual:** the lock fences only writers that take it on the same file system. Two hosts mounting one shared
+> device (SAN, network file systems with unreliable lock semantics) still need real fencing (systemic-loss M9).
+
 **Verification: CONFIRMED (no `FileLock`/`tryLock` anywhere in `src/main`), severity data-loss only with a double mount, which the adoption design declines to fence.** Fix sketch: take an exclusive `FileChannel.tryLock` on `crl/lock` while open.
 
 Nothing takes a `FileLock` on the stream files (searched: no `FileLock`/`tryLock` in the tree). `closingCrls` guards

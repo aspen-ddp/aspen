@@ -168,8 +168,8 @@ trait Transaction {
     */
   protected[client] def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit
 
-  /** Used by AspenClient.newRepairTransaction and, via MissedUpdateFinalizationAction.limitTracking,
-    *  by ErrorTree writes that reference the pool the entry is about. Such a write could miss an
+  /** Used by AspenClient.newRepairTransaction (repair proofs) and, via MissedUpdateFinalizationAction.limitTracking,
+    *  by ErrorTree writes and repair entry deletions that reference the pool the entry is about. Such a write could miss an
     *  update on the very tree it writes, a circular loop. ErrorTree writes for other pools keep
     *  tracking since their trees live in other pools.
     *  This method should NOT be used for any other purposes.

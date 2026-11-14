@@ -13,7 +13,9 @@
 - An entry is deleted through its tree (`TieredKeyValueList.deleteIfPresent`, under the entry's `KeyRevision`), not
   through the node the walk handed over, so a delete that empties a node registers the join/tail-removal finalization
   actions and the trees shrink as repair drains them. Those actions run in ordinary (tracked) transactions, as the
-  splits of errorTree inserts already do; only the entry delete itself is a `newRepairTransaction`
+  splits of errorTree inserts already do; the entry delete itself is tracked too, with `MissedUpdateFinalizationAction.limitTracking(storeId.poolId, tx)` turning
+  tracking off only for the bootstrap pool's own trees (an entry about P lives one level closer to the bootstrap pool, so
+  the chain ends). `newRepairTransaction` is for repair proofs only
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
 - A repair scan runs only while the store's pool entry names this host, so a superseded copy never consumes the

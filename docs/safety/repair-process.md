@@ -996,7 +996,7 @@ request was issued and re-insert it into the cache. For a truly deleted object t
 > **Verification 2026-11-09: CONFIRMED (documented trade-off). Severity: stale-replica (low).** AspenClient.newRepairTransaction disables missed-update tracking for every entry deletion (AspenClient.scala:96-99).
 > *Fix sketch:* Use limitTracking for entry deletions as for marker writes.
 
-**F7. Entry deletion never records its own misses** (`client/AspenClient.scala:~89-100`; `StoreRepairer.scala:337-361`).
+**F7. Entry deletion never records its own misses** *(FIXED 2026-11-14: deletions use `newTransaction()` plus `limitTracking(entryPool, tx)`, so a miss is recorded; residual: deletions of entries in the bootstrap pool's own trees still run untracked, covered by the bootstrap tree sweep, which lands in a later task)* (`client/AspenClient.scala:~89-100`; `StoreRepairer.scala:337-361`).
 `newRepairTransaction` disables tracking for every entry deletion, although `limitTracking` (used for marker writes)
 is selective by pool. A store of the metadata pool that misses the deletion's commit keeps an ErrorTree node (or
 UnackedCommits node) holding an entry that was removed. Reads are correct (quorum), and the next write to the node

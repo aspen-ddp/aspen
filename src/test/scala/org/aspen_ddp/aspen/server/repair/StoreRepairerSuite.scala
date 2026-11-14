@@ -130,6 +130,29 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       os <- client.read(ptr)
     yield os.timestamp
 
+  private def entryDeletionTracking(entryPool: PoolId): Future[(Boolean, Boolean)] =
+    val oid = ObjectId(UUID.randomUUID())
+    @volatile var tracked = false
+    val repairer = StoreRepairer(client, RecordingTarget(List(storeId)),
+                                 testingOnlyBeforeEntryDelete = (_, tx) => tracked = tx.missedUpdateTrackingEnabled)
+    for
+      _ <- seedErrorEntry(oid, Array[Byte](1))
+      tree <- errorTree
+      value <- tree.get(buildErrorKey(0.toByte, oid))
+      _ <- repairer.deleteEntryIfUnchanged(entryPool, tree, value.get.revision, buildErrorKey(0.toByte, oid))
+      exists <- errorEntryExists(oid)
+    yield (tracked, exists)
+
+  test("an entry deletion about another pool keeps missed-update tracking"):
+    entryDeletionTracking(PoolId(UUID.randomUUID())).map: (tracked, exists) =>
+      tracked should be (true)
+      exists should be (false)
+
+  test("an entry deletion in the bootstrap pool's own trees runs untracked"):
+    entryDeletionTracking(PoolId.BootstrapPoolId).map: (tracked, exists) =>
+      tracked should be (false)
+      exists should be (false)
+
   test("an entry whose object is in the allocation tree is repaired and the entry removed"):
     val target = RecordingTarget(List(storeId))
     val repairer = StoreRepairer(client, target)

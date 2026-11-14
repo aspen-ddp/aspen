@@ -2,13 +2,14 @@ package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.common.metadata.HostId
 
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ReadLocks, StoragePool,
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ReadLocks, StoragePool, Transaction,
                                    ObjectState as ClientObjectState}
 import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateFinalizationAction, UnackedCommitEntry}
 import org.aspen_ddp.aspen.client.tkvl.{KeyValueListNode, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer,
                                            ObjectId, ObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
@@ -121,7 +122,9 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                     /** Test seam: runs between a repair's read and its install */
                     testingOnlyBeforeReconcile: (StoreId, ObjectPointer) => Future[Unit] = (_, _) => Future.unit,
                     /** Test seam: told the parts each proof run proved */
-                    testingOnlyOnProof: (StoreId, ObjectPointer, ReadLocks) => Unit = (_, _, _) => ())
+                    testingOnlyOnProof: (StoreId, ObjectPointer, ReadLocks) => Unit = (_, _, _) => (),
+                    /** Test seam: sees an entry deletion's transaction just before it commits */
+                    testingOnlyBeforeEntryDelete: (PoolId, Transaction) => Unit = (_, _) => ())
                    (using ec: ExecutionContext) extends Logging:
 
   import StoreRepairer.*
@@ -243,7 +246,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                            deferral).flatMap: result =>
                 if result.complete then
                   deferral.clear(entryKey)
-                  deleteEntryIfUnchanged(pool.errorTree, value.revision, key).map(_ => counts.repaired.incrementAndGet())
+                  deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key).map(_ => counts.repaired.incrementAndGet())
                 else
                   counts.deferred.incrementAndGet()
                   Future.unit
@@ -259,7 +262,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                 // entry. Empty means "delete by ObjectId alone".
                 for
                   _ <- repairDeletion(storeId, objectId, storePointer)
-                  _ <- deleteEntryIfUnchanged(pool.errorTree, value.revision, key)
+                  _ <- deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key)
                 yield
                   counts.repaired.incrementAndGet()
               else
@@ -318,7 +321,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           completed.flatMap: allComplete =>
             if allComplete then
               entryKeys.foreach((_, entryKey) => deferral.clear(entryKey))
-              deleteEntryIfUnchanged(pool.unackedCommitsTree, value.revision, key).map: _ =>
+              deleteEntryIfUnchanged(storeId.poolId, pool.unackedCommitsTree, value.revision, key).map: _ =>
                 // Only the head's deletion drops the stub: the lookups that decide whether the store applies a
                 // late commit name the head (UnackedCommitEntry.key), so the stub must outlive it, not the other
                 // chunks, which only carry more objects to repair
@@ -423,13 +426,22 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * handed over: a delete that empties its node joins it with its right neighbor or leaves it empty, and the tree's
     * delete registers the finalization action that removes the deleted node's upper-tier entry (and so lets the tree
     * shrink). Fails if the entry is gone, as the requirement on it did before.
+    *
+    * An ordinary (tracked) transaction: a store that misses the deletion is recorded like any other miss. The entry
+    * is about `entryPool`, and its tree lives one level closer to the bootstrap pool, so the chain of entries ends
+    * there. `limitTracking` turns tracking off only when the deletion touches `entryPool` itself, which is the
+    * bootstrap pool's own trees (a miss recorded there would be an entry in the very tree being deleted from).
     */
-  private def deleteEntryIfUnchanged(tree: TieredKeyValueList, entryRevision: ObjectRevision, key: Key): Future[Unit] =
-    val tx = client.newRepairTransaction()
-    for
-      deleted <- tree.deleteIfPresent(key, None, List(KeyValueUpdate.KeyRevision(key, entryRevision)))(using tx)
-      _ <- if deleted then tx.commit() else Future.failed(new IllegalStateException(s"Repair entry $key is gone"))
-    yield ()
+  private[repair] def deleteEntryIfUnchanged(entryPool: PoolId, tree: TieredKeyValueList,
+                                             entryRevision: ObjectRevision, key: Key): Future[Unit] =
+    val tx = client.newTransaction()
+    tree.deleteIfPresent(key, None, List(KeyValueUpdate.KeyRevision(key, entryRevision)))(using tx).flatMap: deleted =>
+      if deleted then
+        MissedUpdateFinalizationAction.limitTracking(entryPool, tx)
+        testingOnlyBeforeEntryDelete(entryPool, tx)
+        tx.commit().map(_ => ())
+      else
+        Future.failed(new IllegalStateException(s"Repair entry $key is gone"))
 
 object StoreRepairer:
 

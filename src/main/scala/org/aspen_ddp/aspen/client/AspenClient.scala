@@ -89,12 +89,12 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   def newTransaction(): Transaction
 
-  /** A transaction for the repair service's errorTree deletes.
+  /** A transaction for the repair service's proofs only.
     *
-    * Missed-update tracking must be off: if the delete's own commit misses a store, the
-    * MissedUpdateFinalizationAction writes a fresh errorTree entry for the errorTree node
-    * itself, which the next sweep repairs, which writes another. A one-shot CLI pass survived
-    * that; a service that runs forever does not.
+    * Missed-update tracking is off: a proof's no-op commit would otherwise record misses on the very objects being
+    * repaired. Entry deletions do not use this: an entry about pool P lives one level closer to the bootstrap pool, so
+    * the chain of entries ends and the deletion runs tracked, with `MissedUpdateFinalizationAction.limitTracking`
+    * turning tracking off only for the bootstrap pool's own trees.
     */
   private[aspen] def newRepairTransaction(): Transaction =
     val tx = newTransaction()

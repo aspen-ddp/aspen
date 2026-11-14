@@ -104,4 +104,5 @@
   (`client/internal/allocation/CLAUDE.md`)
 - Opening is backend-neutral (`BackendOpener`; only `DefaultBackendOpener` names concrete backends): see
   `server/host/CLAUDE.md`
-- `Reconcile` (exact repair install): `server/repair/CLAUDE.md`; `ReconcileResult.changed` is true only when the install was applied (every deferred, stale or no-op path reports false)
+- `Reconcile` (exact repair install): `server/repair/CLAUDE.md`; `ReconcileResult.changed` is true only when the
+  install was applied (every deferred, stale or no-op path reports false)

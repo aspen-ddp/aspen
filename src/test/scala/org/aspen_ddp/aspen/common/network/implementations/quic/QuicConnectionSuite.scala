@@ -478,7 +478,7 @@ object QuicConnectionSuite:
   private val revision = ObjectRevision(TransactionId(UUID.randomUUID()))
 
   /** A one-update TxPrepare: `data` is its one out-of-band section */
-  private def rebuildOf(seq: Long, data: DataBuffer): TxPrepare =
+  private def dataPrepareOf(seq: Long, data: DataBuffer): TxPrepare =
     val ptr = DataObjectPointer(ObjectId(new UUID(0, seq)), PoolId.BootstrapPoolId, Array[Byte](1))
     val ida = Replication(4, 3)
     val txd = TransactionDescription(TransactionId(new UUID(0, seq)), HLCTimestamp(1000L), ptr, 1.toByte,
@@ -489,7 +489,7 @@ object QuicConnectionSuite:
 
   /** A one-update TxPrepare carrying `seq` (as its object id) whose encoded size is exactly `total` bytes */
   def sized(seq: Long, total: Int): TxPrepare =
-    val empty = QuicMessageCodec.encode(rebuildOf(seq, DataBuffer.Empty), PooledByteBufAllocator.DEFAULT)
+    val empty = QuicMessageCodec.encode(dataPrepareOf(seq, DataBuffer.Empty), PooledByteBufAllocator.DEFAULT)
     val base = empty.size.toInt
     empty.release()
     val payload = new Array[Byte](total - base)
@@ -497,7 +497,7 @@ object QuicConnectionSuite:
     while i < payload.length do
       payload(i) = (i * 31 + seq).toByte
       i += 1
-    rebuildOf(seq, DataBuffer(payload))
+    dataPrepareOf(seq, DataBuffer(payload))
 
   def runnable(body: => Unit): Runnable = () => body
 

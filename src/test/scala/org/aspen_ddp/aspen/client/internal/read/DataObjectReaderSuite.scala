@@ -163,26 +163,6 @@ class DataObjectReaderSuite extends AnyFunSuite with Matchers {
     }
   }
 
-//  test("Use highest revision") {
-//    val r = TestReader(5,3)
-//    r.receiveReadResponse(ok(0, r0, t0))
-//    r.rstates should be (None)
-//    r.receiveReadResponse(ok(1, r0, t0))
-//    r.rstates should be (None)
-//    r.receiveReadResponse(ok(2, r1, t1))
-//    r.rstates should be (None)
-//    r.rereadCandidates.keySet should be (Set(s0,s1))
-//    //rereads should be (Set(0,1))
-//    r.receiveReadResponse(ok(3, r0, t0))
-//    r.rstates should be (None)
-//    r.rereadCandidates.keySet should be (Set(s0,s1,s3))
-//    r.receiveReadResponse(ok(0, r1, t1))
-//    r.rstates should be (None)
-//    r.receiveReadResponse(ok(1, r1, t1))
-//    r.rereadCandidates.keySet should be (Set(s3))
-//    r.rstates.nonEmpty should be (true)
-//  }
-
   test("Resolve with errors") {
     val r = TestReader(5,3)
     r.receiveReadResponse(err(0, ReadError.CorruptedObject))

@@ -36,7 +36,6 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
   private def dataPtr(n: Int): DataObjectPointer = DataObjectPointer(ObjectId(uuid(n)), PoolId(uuid(n + 100)), Array[Byte](n.toByte))
   private def rev(n: Int): ObjectRevision = ObjectRevision(TransactionId(uuid(n)))
   private def bytes(n: Int, seed: Int = 0): Array[Byte] = Array.tabulate[Byte](n)(i => (i * 7 + seed).toByte)
-  private def meta(n: Int) = Metadata(rev(n), ObjectRefcount(n, n + 1), HLCTimestamp(1000L + n))
 
   private val ida: IDA = Replication(3, 2)
   private def txd = TransactionDescription(

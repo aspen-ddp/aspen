@@ -3117,7 +3117,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   /** A commit of op1 holding `b`, at the revision `txid` writes, without a Tx */
-  def rebuildCommit(frontend: Frontend, txid: TransactionId, b: Byte): Unit =
+  def bareCommit(frontend: Frontend, txid: TransactionId, b: Byte): Unit =
     val metadata = Metadata(ObjectRevision(txid), ObjectRefcount(1, 1), HLCTimestamp(200))
     val data = DataBuffer(Array[Byte](b))
     frontend.commit(new ObjectState(oid1, metadata, ObjectType.Data, data),
@@ -3125,8 +3125,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("two in-flight commits of one object serve the newest state") {
     val (frontend, backend, _, net) = commitWindowFixture()
-    rebuildCommit(frontend, txid1, 1)
-    rebuildCommit(frontend, txid2, 2)
+    bareCommit(frontend, txid1, 1)
+    bareCommit(frontend, txid2, 2)
     backend.heldCommits shouldBe 2
 
     val reads = backend.reads

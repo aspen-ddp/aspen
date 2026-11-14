@@ -34,7 +34,6 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
   private def dataPtr(n: Int): DataObjectPointer = DataObjectPointer(ObjectId(uuid(n)), PoolId(uuid(n + 100)), Array[Byte](n.toByte))
   private def rev(n: Int): ObjectRevision = ObjectRevision(TransactionId(uuid(n)))
   private def bytes(n: Int, seed: Int = 0): Array[Byte] = Array.tabulate[Byte](n)(i => (i * 7 + seed).toByte)
-  private def meta(n: Int) = Metadata(rev(n), ObjectRefcount(n, n + 1), HLCTimestamp(1000L + n))
 
   private val ida: IDA = Replication(3, 2)
   private def txd = TransactionDescription(
@@ -51,7 +50,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
         Set(TransactionId(uuid(5)), TransactionId(uuid(6))))))
 
   /** A single-section message (the payload is its only out-of-band data section) */
-  private def rebuildMsg(data: DataBuffer): TxPrepare =
+  private def dataPrepare(data: DataBuffer): TxPrepare =
     prepare(List(ObjectUpdate(ObjectId(uuid(7)), data)))
 
   private def fixtures: List[Message] = List(
@@ -83,7 +82,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     TxUnknownStore(storeId(1), storeId(2), TransactionId(uuid(3))),
     StartStoreTransfer(HostId(uuid(1)), ClientId(uuid(2)), StorageDeviceId(uuid(3)), storeId(4),
       HLCTimestamp(1000L), uuid(5)),
-    rebuildMsg(DataBuffer(bytes(100))),
+    dataPrepare(DataBuffer(bytes(100))),
     CheckStorageDevice(HostId(uuid(1)), ClientId(uuid(2)), StorageDeviceId(uuid(3))),
     ServiceMessage(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), bytes(5)),
     ExecuteSystemTask(HostId(uuid(1)), ClientId(uuid(2)), uuid(3),
@@ -143,7 +142,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
   test("payload slices with non-zero position encode only their visible bytes"):
     val arr = bytes(40)
     val slice = DataBuffer(arr).slice(5, 10)
-    val m = rebuildMsg(slice)
+    val m = dataPrepare(slice)
     val enc = QuicMessageCodec.encode(m, alloc)
     enc.size shouldBe 4 + enc.prefix.readableBytes() + 10
     val decoded = streamRoundTrip(enc).toOption.get.msg.asInstanceOf[TxPrepare]
@@ -202,7 +201,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val msgs: List[Message] = List(
       prepare(List(ObjectUpdate(ObjectId(uuid(1)), DataBuffer.Empty))),
       readResponse(None),
-      rebuildMsg(DataBuffer.Empty))
+      dataPrepare(DataBuffer.Empty))
     msgs.foreach: m =>
       val enc = QuicMessageCodec.encode(m, alloc)
       val result = streamRoundTrip(enc)
@@ -217,7 +216,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
 
   test("send path does not copy payloads"):
     val arr = bytes(2000)
-    val m = rebuildMsg(DataBuffer(arr))
+    val m = dataPrepare(DataBuffer(arr))
     val enc = QuicMessageCodec.encode(m, alloc)
     val frame = enc.toStreamFrame(alloc)
     frame shouldBe a[CompositeByteBuf]
@@ -231,10 +230,9 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     nio.get(1999) shouldBe 77.toByte
     frame.release()
 
-  private def rebuild(data: DataBuffer): TxPrepare = rebuildMsg(data)
 
   test("a one-update TxPrepare carries its data as its one section, outside the protobuf header"):
-    val m = rebuild(DataBuffer(bytes(5000)))
+    val m = dataPrepare(DataBuffer(bytes(5000)))
     val enc = QuicMessageCodec.encode(m, alloc)
     enc.sections.length shouldBe 1
     enc.sections(0).size shouldBe 5000
@@ -246,14 +244,14 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     result.map(_.msg) shouldBe Right(m)
 
   test("a one-update TxPrepare with empty data round-trips"):
-    val m = rebuild(DataBuffer.Empty)
+    val m = dataPrepare(DataBuffer.Empty)
     val enc = QuicMessageCodec.encode(m, alloc)
     val result = streamRoundTrip(enc)
     result.map(_.msg) shouldBe Right(m)
 
   test("a one-update TxPrepare send path does not copy its data"):
     val arr = bytes(2000)
-    val enc = QuicMessageCodec.encode(rebuild(DataBuffer(arr)), alloc)
+    val enc = QuicMessageCodec.encode(dataPrepare(DataBuffer(arr)), alloc)
     val frame = enc.toStreamFrame(alloc).asInstanceOf[CompositeByteBuf]
     val last = frame.componentAtOffset(frame.readableBytes() - 1)
     last.readableBytes() shouldBe 2000
@@ -265,7 +263,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     frame.release()
 
   test("a one-update TxPrepare requires exactly one section"):
-    val enc = QuicMessageCodec.encode(rebuild(DataBuffer(bytes(8))), alloc)
+    val enc = QuicMessageCodec.encode(dataPrepare(DataBuffer(bytes(8))), alloc)
     val p = QuicMessageCodec.parsePrefix(enc.prefix).toOption.get
     enc.release()
     val none = p.copy(sectionSizes = Array.empty[Int])
@@ -276,15 +274,15 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
   test("a message is small up to SmallMessageBytes"):
     def sized(target: Int): QuicMessageCodec.Encoded =
       val base = QuicMessageCodec.encode(
-        rebuildMsg(DataBuffer.Empty), alloc)
+        dataPrepare(DataBuffer.Empty), alloc)
       // an empty payload still adds a section length entry, so measure with one byte
       base.release()
       val one = QuicMessageCodec.encode(
-        rebuildMsg(DataBuffer(bytes(1))), alloc)
+        dataPrepare(DataBuffer(bytes(1))), alloc)
       val overhead = one.size - 1
       one.release()
       QuicMessageCodec.encode(
-        rebuildMsg(DataBuffer(bytes((target - overhead).toInt))),
+        dataPrepare(DataBuffer(bytes((target - overhead).toInt))),
         alloc)
     List((1023, true), (1024, true), (1025, false)).foreach: (target, expectSmall) =>
       val enc = sized(target)
@@ -305,7 +303,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     finally buf.release()
 
   test("malformed input returns Left"):
-    val good = validPrefixBytes(rebuildMsg(DataBuffer(bytes(8))))
+    val good = validPrefixBytes(dataPrepare(DataBuffer(bytes(8))))
     parse(good).isRight shouldBe true
 
     // truncated at several points

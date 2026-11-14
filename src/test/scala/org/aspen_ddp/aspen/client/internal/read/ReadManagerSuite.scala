@@ -5,7 +5,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.{DataObjectState, ReadDriverClient}
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, ReadResponse, TxMessage}
+import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, Read, ReadResponse, TxMessage}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.objects.{ObjectRevision, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -44,7 +44,7 @@ class ReadManagerSuite extends AnyFunSuite with Matchers:
     val recording = new InlineClient:
       override private[client] val messenger: Messenger = new Messenger:
         def sendClientRequest(msg: ClientRequest): Unit = msg match
-          case r: org.aspen_ddp.aspen.common.network.Read => sent.updateAndGet(r.readUUID :: _)
+          case r: Read => sent.updateAndGet(r.readUUID :: _)
           case _ => ()
         def sendTransactionMessage(msg: TxMessage): Unit = ()
         def sendTransactionMessages(msg: List[TxMessage]): Unit = ()
@@ -76,7 +76,7 @@ class ReadManagerSuite extends AnyFunSuite with Matchers:
     val recording = new InlineClient:
       override private[client] val messenger: Messenger = new Messenger:
         def sendClientRequest(msg: ClientRequest): Unit = msg match
-          case r: org.aspen_ddp.aspen.common.network.Read => sent.updateAndGet(r.readUUID :: _)
+          case r: Read => sent.updateAndGet(r.readUUID :: _)
           case _ => ()
         def sendTransactionMessage(msg: TxMessage): Unit = ()
         def sendTransactionMessages(msg: List[TxMessage]): Unit = ()

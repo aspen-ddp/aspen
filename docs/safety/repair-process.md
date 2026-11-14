@@ -905,7 +905,9 @@ head first".
 
 **F1. Opportunistic rebuild leaves `kvState` stale. FIXED 2026-11-14 (path deleted).** (`server/store/Frontend.scala:867-881`; `server/store/ObjectState.scala:34-37`; `server/transaction/Tx.scala:381-390`).
 
-> **FIXED 2026-11-14 (path deleted).** The opportunistic rebuild (read-triggered message and pre-transaction piggyback) and the client object cache were removed; repair is the ErrorTree path only. See docs/superpowers/specs/2026-11-14-opportunistic-rebuild-removal-design.md.
+> The opportunistic rebuild (read-triggered message and pre-transaction piggyback) and the client object cache were
+> removed; repair is the ErrorTree path only. See docs/superpowers/specs/2026-11-14-opportunistic-rebuild-removal-design.md.
+
 `opportunisticRebuild` and the pre-transaction path assign `os.metadata` and `os.data` and commit. `ObjectState.kvState`
 (the structure requirement checks, locks and the next apply use) is a `var` initialised once from `data` at
 construction; nothing refreshes it (grep: only `reconcileSettled` mutates `kvs` and re-encodes). For a KeyValue object

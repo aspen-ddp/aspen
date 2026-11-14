@@ -2,26 +2,16 @@ package org.aspen_ddp.aspen.common
 
 import scala.concurrent.duration._
 
+/** A hybrid logical clock timestamp: wall time in milliseconds in the high 48 bits, a logical counter in the low 16.
+  * The encoding orders exactly as (wallTime, logical), so timestamps compare as their encoded Longs.
+  */
 final class HLCTimestamp private (private val longValue: Long) extends AnyVal with Ordered[HLCTimestamp] {
   def asLong: Long = longValue
   def wallTime: Long = longValue >> 16
-  def logical: Byte = (longValue & 0xFFFFL).toByte
+  def logical: Int = (longValue & 0xFFFFL).toInt
   def asDuration: Duration = Duration(wallTime, MILLISECONDS)
 
-  def compare(t: HLCTimestamp): Int = {
-    val pdelta = wallTime - t.wallTime
-
-    if (pdelta == 0)
-      logical - t.logical
-    else {
-      if (pdelta > 0)
-        1
-      else if (pdelta < 0)
-        -1
-      else
-        0
-    }
-  }
+  def compare(t: HLCTimestamp): Int = java.lang.Long.compare(longValue, t.longValue)
 
   def -(rhs: HLCTimestamp): Duration = this.asDuration - rhs.asDuration
 
@@ -52,13 +42,8 @@ object HLCTimestamp {
   def happensAfter(ts: HLCTimestamp): HLCTimestamp = {
     val n = HLCTimestamp(currentWallTime)
 
-    val next = if (n > ts)
-      n
-    else {
-      val wall = ts.asLong & ~0xFFFFL
-      val logical = (ts.asLong & 0xFFFF) + 1
-      HLCTimestamp(wall | logical)
-    }
+    // Past ts's wall time, the clock's own; else one tick later, a full logical counter carrying into the wall time
+    val next = if (n > ts) n else HLCTimestamp(ts.asLong + 1)
 
     if (!(next > ts)) {
       println(s"INVALID HLC!!!! Old $ts New $next")

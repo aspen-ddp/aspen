@@ -51,6 +51,8 @@ class Store(val storageDeviceId: StorageDeviceId,
             horizon: FiniteDuration = TransactionHorizon.Horizon,
             /** When the store was loaded (Frontend.loadedAt). None: now. A test seam */
             loadedAt: Option[Long] = None,
+            /** When the store last arrived on this host from another (Frontend.arrivedAt). None: never */
+            arrivedAt: Option[Long] = None,
             /** The host's heartbeat period, which calls heartbeat (Frontend.expiryMargin) */
             heartbeatPeriod: FiniteDuration = FiniteDuration(1, SECONDS),
             /** The host's wall clock (Frontend.wallClockMillis). A test seam */
@@ -71,7 +73,7 @@ class Store(val storageDeviceId: StorageDeviceId,
       case None => task => task()
       case Some(postTo) => task => postTo(s => if s eq this then task()),
     acceptorSince = acceptorSince, deferRecovery = deferRecovery, wallClockMillis = wallClockMillis,
-    horizon = horizon, loadedAt = loadedAt, expiryMargin = expiryMargin)
+    horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, expiryMargin = expiryMargin)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's

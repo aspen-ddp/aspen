@@ -59,20 +59,17 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
 
   @volatile private var lookups: HoldingLookup = scala.compiletime.uninitialized
 
+  /** A short horizon, so the status cache forgets a transaction (horizon + MaxStartLead + 8 heartbeats: 7.4 s) and
+    * expiry starts (horizon + 3.8 s margin) quickly. Each test needs only that its transaction is finalized, forgotten
+    * and past every store's floor when its stores restart; until then they get no heartbeat, so nothing expires early.
+    * Not below about 2 s: the setup transactions' prepares must reach every store within the horizon under load
+    */
   override def testHostOptions: TestNetwork.HostOptions =
     TestNetwork.HostOptions(heartbeatPeriod = Duration(300, MILLISECONDS), recordCrl = true, recoveryDrivers = true,
+      transactionHorizon = Duration(3, SECONDS),
       wrapUnackedLookup = Some(inner => { lookups = new HoldingLookup(inner); lookups }))
 
   private val twoStoresTest = "two stores recovering commit votes for a committed TKVL delete both apply it"
-
-  /** A short horizon, so the status cache forgets T (horizon + MaxStartLead + 8 heartbeats: 7.4 s) and expiry starts
-    * (horizon + 3.8 s margin) quickly. The test needs only that T is finalized, forgotten and past every store's floor
-    * when the stores restart; until then they get no heartbeat, so nothing expires early. Not below about 2 s: the
-    * setup transactions' prepares must reach every store within the horizon under load
-    */
-  override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
-    if name == twoStoresTest then testHostOptions.copy(transactionHorizon = Duration(3, SECONDS))
-    else testHostOptions
 
   private val k = Key(Array[Byte](1))
 

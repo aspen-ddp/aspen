@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.{Host, StoreConfig}
+import org.aspen_ddp.aspen.server.{DurableFiles, Host, StoreConfig}
 import org.aspen_ddp.aspen.server.Host.{BackendFailed, BackendOpened, LoadStore, LoadStoreById, ShutdownStore,
   SpaceWait, StoreFailedOnClose, UnloadFailedStore}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState}
@@ -51,7 +51,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // Stores whose backend this process created (startOpen with `create`: a new pool's store, StoreRebuilds.createNewStore),
   // from their open until their Store is built. Such a store has never served, so it cannot have joined and forgotten a
   // transaction: it records no load time (Frontend.loadedAt), and joins transactions started at once. Every other load
-  // (a restart, an adoption, a transfer in) records its load, which raises its forget floor
+  // (a restart, an adoption, a transfer in) records its load, which raises its forget floor: by MaxStartLead, or by
+  // RebuildingStore.AcceptorSinceMargin soon after the store arrived from another host (StoreLoader.ArrivedAtFile)
   private var newStores: Set[StoreId] = Set()
 
   /** SpaceRetryCap in device scans, at least 1 */
@@ -353,6 +354,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 missingDataWait = ctx.missingDataWait,
                 horizon = ctx.transactionHorizon,
                 loadedAt = if isNew then Some(0L) else ctx.storeLoadedAt(storeId),
+                arrivedAt = if isNew then None else StoreLoader.readArrivedAt(backend.path),
                 heartbeatPeriod = FiniteDuration(ctx.heartbeatPeriod.toMillis, MILLISECONDS))
               madeStore = Some(store)
               val entry = new StoreRouter.Entry(store, executor)
@@ -547,3 +549,26 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             case Failure(t) =>
               logger.error(s"Failed to close store $storeId: $t")
               completion.failure(t)
+
+object StoreLoader:
+  /** In a store directory: this host's wall clock, in milliseconds, when the store arrived from another host, by a
+   *  transfer in (StoreTransfers.clearTransferredInMarker) or an adoption of its device (DeviceDiscovery). The store
+   *  may have joined, and forgotten, a transaction there started up to MaxStartLead ahead of that host's clock, which
+   *  may lead this one's: a load less than RebuildingStore.AcceptorSinceMargin after the arrival raises its forget floor
+   *  by that margin (Frontend.arrivedAt). Durable and written before the store can load here, so a crash between the
+   *  arrival and the load, or a restart soon after it, keeps the margin. Kept for good: once the margin has passed it
+   *  changes nothing, and the next arrival rewrites it. A network transfer may carry the source's copy, which the
+   *  arrival here then replaces before the store loads */
+  val ArrivedAtFile = "arrived-at"
+
+  def writeArrivedAt(storePath: os.Path): Unit =
+    DurableFiles.write(storePath / ArrivedAtFile, System.currentTimeMillis().toString)
+
+  /** The store's last arrival from another host, if any. A file that cannot be read counts as an arrival now: later
+   *  than the truth, which only refuses more transactions */
+  def readArrivedAt(storePath: os.Path): Option[Long] =
+    val file = storePath / ArrivedAtFile
+    if !os.exists(file) then
+      None
+    else
+      Some(Try(os.read(file).trim.toLong).getOrElse(System.currentTimeMillis()))

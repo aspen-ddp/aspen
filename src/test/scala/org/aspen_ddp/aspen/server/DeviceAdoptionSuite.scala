@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
+import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService, StoreLoader}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -185,6 +185,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
       os.exists(marker(d0)) should be(false)
       os.exists(marker(d2)) should be(true)
+      // Adopted from another host, whose clock may lead this one's: their load floors take the cross-host margin
+      List(d0, d2).foreach(d => os.exists(d / StoreLoader.ArrivedAtFile) should be(true))
       loadedDevices(host).contains(deviceA) should be(true)
       recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
       val moves = storeMoves()
@@ -453,6 +455,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       st.status should be(DeviceStatus.Operational)
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
       os.exists(marker(d0)) should be(false)
+      // Back on the host that shut it down, one clock: the load floor takes only MaxStartLead
+      os.exists(d0 / StoreLoader.ArrivedAtFile) should be(false)
       recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
       storeMoves().map(_.storeId) should be(List(s0))
 

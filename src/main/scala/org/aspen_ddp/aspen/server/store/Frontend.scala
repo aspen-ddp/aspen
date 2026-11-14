@@ -11,6 +11,8 @@ import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitState, Completion, Read}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{ExpiryTally, TransactionStatusCache, Tx}
+import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
+import org.aspen_ddp.aspen.common.util.LogRateLimit
 import scribe.Logging
 import org.aspen_ddp.aspen.client.{ReadLocks, ObjectState as ClientObjectState}
 
@@ -56,6 +58,11 @@ object Frontend {
 
   /** The most store heartbeats between an expiring Tx's status queries: they start one heartbeat apart and double */
   val MaxExpiryQueryInterval: Int = 8
+
+  /** How often, at most, a store warns of a client prepare it refuses (refusePrepare). While a status cache eviction's
+    * watermark is the binding part of the floor, every client prepare is refused
+    */
+  val RefusalLogPeriod: FiniteDuration = FiniteDuration(10, SECONDS)
 
   sealed abstract class ReadKind
 
@@ -115,10 +122,18 @@ class Frontend(val storeId: StoreId,
                  * now. Every load builds a new Frontend, restart and transfer-in included. Injected by tests
                  */
                loadedAt: Option[Long] = None,
+               /** When the store last arrived on this host from another (a transfer in, an adoption), in wallClockMillis
+                 * milliseconds (StoreLoader.ArrivedAtFile; loadFloorMillis). None: never, or a new store. Injected by
+                 * tests
+                 */
+               arrivedAt: Option[Long] = None,
                /** How long past the horizon an unresolved Tx starts its status queries (Frontend.expiryMargin) */
                val expiryMargin: FiniteDuration = Frontend.DefaultExpiryMargin) extends Logging {
 
   import Frontend._
+
+  // A refused client prepare is warned of once per RefusalLogPeriod at most (refusePrepare)
+  private val refusalLog = new LogRateLimit(RefusalLogPeriod.toMillis, wallClockMillis)
 
   /** When the store was loaded on this host: it remembers nothing of transactions it saw before (forgetFloorMillis) */
   val loadedAtMillis: Long = loadedAt.getOrElse(wallClockMillis())
@@ -128,18 +143,26 @@ class Frontend(val storeId: StoreId,
     * holds a Tx for it, and the host's status cache may have dropped its entry. Joining afresh could then decide it
     * again, against its outcome. The floor is the latest of: the horizon before now (the status cache outlasts it, so
     * an entry expires only once its transaction is below it); the store's load on this host (a restart, or a transfer
-    * from a host whose cache this one lacks) plus MaxStartLead, since before its load the store may have joined, and
-    * forgotten, a transaction started up to MaxStartLead ahead of its host's clock; and the status cache's eviction
-    * watermark (an entry dropped for size, which adds the lead the same way)
+    * from a host whose cache this one lacks) plus a lead (loadFloorMillis); and the status cache's eviction watermark
+    * (an entry dropped for size, which adds MaxStartLead the same way)
     */
   def forgetFloorMillis: Long =
     math.max(math.max(wallClockMillis() - horizon.toMillis, loadFloorMillis), statusCache.evictionWatermarkMillis)
 
-  /** The load's part of the forget floor: the load plus MaxStartLead */
-  val loadFloorMillis: Long = loadedAtMillis + MaxStartLead.toMillis
+  /** The load's part of the forget floor: the load plus MaxStartLead, since before its load the store may have joined,
+    * and forgotten, a transaction started up to MaxStartLead ahead of its host's clock. Plus
+    * RebuildingStore.AcceptorSinceMargin instead while the store's arrival from another host (a transfer in, an
+    * adoption) is less than that margin before the load: it may have joined such a transaction on that host, whose
+    * clock may lead this one's by up to the skew the margin also covers (paxos P-N2). A restart within the margin of
+    * the arrival keeps it, as the restarted store may still have forgotten one
+    */
+  val loadFloorMillis: Long =
+    val margin = RebuildingStore.AcceptorSinceMargin.toMillis
+    if arrivedAt.exists(_ + margin > loadedAtMillis) then loadedAtMillis + margin
+    else loadedAtMillis + MaxStartLead.toMillis
 
   /** Whether a transaction started now on this host's clock is at or above the load's part of the floor, so the store
-    * may join it: past MaxStartLead after the store's load. Tests wait for it after a reload
+    * may join it: past the load's lead (loadFloorMillis). Tests wait for it after a reload
     */
   def loadFloorPassed: Boolean = wallClockMillis() >= loadFloorMillis
 
@@ -1040,10 +1063,12 @@ class Frontend(val storeId: StoreId,
     // Admitted (Store.receiveTransactionMessage) for a Tx that is not created
     releaseAdmission(m.txd.transactionId)
     if m.fromClient then
-      val lag = wallClockMillis() - m.txd.startTimestamp.wallTime
-      logger.warn(s"Store $storeId takes no part in transaction ${m.txd.transactionId}: it started ${lag}ms before " +
-                  s"this host's clock, below the store's forget floor (horizon ${horizon.toMillis}ms, or the store's " +
-                  s"load or a status cache eviction since). The client's clock runs slow, or the transaction is that old")
+      refusalLog.admit().foreach: held =>
+        val lag = wallClockMillis() - m.txd.startTimestamp.wallTime
+        logger.warn(s"Store $storeId takes no part in transaction ${m.txd.transactionId}: it started ${lag}ms before " +
+                    s"this host's clock, below the store's forget floor (horizon ${horizon.toMillis}ms, or the store's " +
+                    s"load or a status cache eviction since). The client's clock runs slow, or the transaction is that " +
+                    s"old${LogRateLimit.heldText(held)}")
 
   private def createTx(m: TxPrepare, known: Option[TransactionStatusCache.Entry], beforeAcceptor: Boolean): Unit = {
     val tooFarAhead = !beforeAcceptor && startsTooFarAhead(m.txd)

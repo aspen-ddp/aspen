@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server.transaction
 import com.github.blemale.scaffeine.{Cache, Scaffeine}
 import com.github.benmanes.caffeine.cache.{RemovalCause, Ticker}
 import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId, TransactionStatus}
+import org.aspen_ddp.aspen.common.util.LogRateLimit
 import scribe.Logging
 
 import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
@@ -13,6 +14,11 @@ object TransactionStatusCache {
 
   /** A safety net of about 700 MB, at about 175 bytes an entry. An evicted entry behaves like an expired one */
   val DefaultMaxEntries: Long = 4_000_000
+
+  /** How often, at most, a size eviction is logged (recordSizeEviction). Under the overload that fills the cache,
+    * about one entry is evicted per insert
+    */
+  val EvictionLogPeriod: FiniteDuration = FiniteDuration(10, SECONDS)
 }
 
 class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, SECONDS),
@@ -24,6 +30,8 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
   private val watermark = new AtomicLong(0)
   private val sizeEvictionCount = new AtomicLong(0)
   private val splitDecisionCount = new AtomicLong(0)
+  // A size eviction is logged once per EvictionLogPeriod at most
+  private val evictionLog = new LogRateLimit(EvictionLogPeriod.toMillis, wallClockMillis)
 
   /** Zero until a size eviction. Then the wall clock at the latest size eviction plus MaxStartLead (monotone): a
     * transaction whose startTimestamp is not past it may have had an entry evicted, so a store must not trust the
@@ -40,8 +48,10 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
   private def recordSizeEviction(txid: TransactionId): Unit =
     val mark = wallClockMillis() + TransactionHorizon.MaxStartLead.toMillis
     watermark.accumulateAndGet(mark, math.max)
-    sizeEvictionCount.incrementAndGet()
-    logger.error(s"Transaction status cache is full: evicted the entry of $txid before it expired. Lower the transaction rate or raise the cache size")
+    val total = sizeEvictionCount.incrementAndGet()
+    evictionLog.admit().foreach: held =>
+      logger.error(s"Transaction status cache is full: evicted the entry of $txid before it expired. $total size " +
+        s"evictions so far${LogRateLimit.heldText(held)}. Lower the transaction rate or raise the cache size")
 
   // The listener runs synchronously with the removal, so a reader that finds the entry gone sees the raised watermark
   private val cache: Cache[TransactionId,Entry] =

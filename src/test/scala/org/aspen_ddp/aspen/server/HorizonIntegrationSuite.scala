@@ -268,7 +268,11 @@ class HorizonIntegrationSuite extends IntegrationTestSuite:
       known = cachedStatus(tx.id)
       _ = net.recordTxMessage = isOutcome(tx.id)
       _ = leaderLast(prepares).foreach(net.deliverTransactionMessage)
-      // Read after the replay: if T was not past the horizon then, the replay reached every store inside it
+      // Read after the replay was processed: TestNetwork.deliverTransactionMessage drains the host's events
+      // (handleEvents) before and after each delivery, and lockstep threading runs the store inline, so each replayed
+      // prepare's floor check and the finalized relay's answer ran inside its own call. If T was not past the horizon
+      // now, the replay reached every store inside it. Reading it after settle would only add false retries: settle
+      // drains follow-on work, which depends on the cache entry, not the floor
       spoiled = pastHorizon(start)
       _ <- settle(clock = true)
       _ <- eventually("every store forgot T again", clock = true)(holders(tx.id).isEmpty)

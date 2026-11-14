@@ -285,10 +285,13 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
   /** Removes the transferred-in marker from a promoted store, returning whether the store may now
    *  be loaded. A store loaded with the marker still in place would be skipped by the next
    *  restart's scan, so on failure it is left unloaded for reconcileDeviceState's
-   *  transferred-in pass to try again.
+   *  transferred-in pass to try again. The store's arrival (StoreLoader.ArrivedAtFile) is recorded
+   *  first, while the marker still keeps it from loading: it came from another host, whose clock
+   *  may lead this one's, and its load floor must cover that.
    */
   private[host] def clearTransferredInMarker(storeId: StoreId, storePath: os.Path): Boolean =
     try
+      StoreLoader.writeArrivedAt(storePath)
       os.remove(storePath / StoreTransfer.TransferredInMarkerFile)
       true
     catch

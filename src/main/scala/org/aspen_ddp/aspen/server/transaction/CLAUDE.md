@@ -124,7 +124,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   heartbeat, asserted (`Host.checkStatusCacheDuration`) to be at least horizon + `MaxStartLead` + that timeout + one
   heartbeat, so a Tx first created near the horizon still finds its peers' entries when its idle driver starts, and an
   entry expires only once its transaction is below its store's floor. At high volume the cache is costly (about 175
-  bytes per transaction, capped at `DefaultMaxEntries`); a size eviction is logged as an error and raises the host's
+  bytes per transaction, capped at `DefaultMaxEntries`); a size eviction is logged as an error (at most once per
+  `EvictionLogPeriod`, 10 s, with the count) and raises the host's
   eviction watermark. A driver that still learns nothing past the horizon meets refusals, and the Tx ends by expiry
 - `TransactionStatusCache.updateStatus` keeps Committed over an opposite outcome (Ruling 30). Under the horizon an
   opposite outcome should never arise: one that does is logged as an error ("Split decision") and counted

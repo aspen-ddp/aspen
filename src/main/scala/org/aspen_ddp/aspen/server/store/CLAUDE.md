@@ -27,19 +27,24 @@
   is answered once the clock catches up. This is what makes the `acceptorSince` mute independent of client clocks
   (paxos P-N2), and it caps how far stored timestamps, and so client HLCs, run ahead of the hosts
 - Status query (`TxStatusRequest`, carrying the transaction's `startTimestamp`; horizon design section 2): every
-  store answers. A store with a Tx replies with its status, finalized, late and `holdsAcceptorState = !muted`. With no
+  store answers. A store with a Tx replies with its status, finalized, late and `holdsAcceptorState`, false only for a Tx
+  muted for good (before `acceptorSince`, or below the floor): one muted only for starting too far ahead may yet join. With no
   Tx but a non-Unresolved status-cache entry it replies with that entry (`holdsAcceptorState = false`). With neither it
   replies `status = None` ("unknown") only when the start is below its forget floor (`belowForgetFloor(HLCTimestamp)`),
   which makes the answer permanent; above the floor it stays silent, as it could still join the transaction
 - Forget floor (`Frontend.forgetFloorMillis`, transaction horizon design section 1): a prepare for a transaction the
   store does not hold (no Tx, no non-Unresolved status-cache entry) whose start is below the floor is refused: no Tx,
-  no promise, vote, reply or CRL save, its admission released, a warning with the lag for a client's prepare. The floor
+  no promise, vote, reply or CRL save, its admission released, a warning with the lag for a client's prepare (at most
+  once per `RefusalLogPeriod`, 10 s, with the count held back). The floor
   is the latest of `wallClockMillis() - horizon` (`TransactionHorizon.Horizon`, 20 s, threaded Host → DeviceControl →
   StoreLoader → Store → Frontend), the store's load on this host plus `MaxStartLead` (`loadedAtMillis`, taken when
   the Frontend is built: every restart, adoption and transfer-in builds a new Store through `StoreLoader`; the lead
   because before its load the store may have joined, and forgotten, a transaction started up to `MaxStartLead` ahead
   of its clock; a new pool's store the host just created, `StoreRebuilds.createNewStore`, has never served and records
-  no load), and the status cache's `evictionWatermarkMillis` (which adds the lead too). A Tx the store holds
+  no load; a load less than `RebuildingStore.AcceptorSinceMargin` after the store's arrival from another host, recorded
+  durably in `StoreLoader.ArrivedAtFile` by a transfer in or an adoption and passed as `arrivedAt`, adds that 10 s
+  margin instead, since it joined there by a clock that may lead this host's by up to the P-N2 skew), and the status
+  cache's `evictionWatermarkMillis` (which adds the lead too). A Tx the store holds
   (recovered ones included) is unaffected, as is a prepare whose outcome the cache knows (finalized: the relay;
   resolved: a Tx that learns the outcome). An `acceptorSince` mute is checked first and keeps its muted, possibly
   proving Tx. The designated leader starts no driver for a prepare below the floor it does not hold (`Store`). A

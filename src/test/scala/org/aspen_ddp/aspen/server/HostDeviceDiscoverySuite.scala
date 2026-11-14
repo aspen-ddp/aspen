@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
-import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, LockstepThreading, StagedSendService, StagedTransferService, StoreTransfers}
+import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, LockstepThreading, StagedSendService, StagedTransferService, StoreLoader, StoreTransfers}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
@@ -1744,6 +1744,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       // Loaded only once the pool names this device, and the marker goes with it.
       recorded(host2).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
       os.exists(promoted / StoreTransfer.TransferredInMarkerFile) should be(false)
+      // It came from another host, whose clock may lead this one's: its load floor takes the cross-host margin
+      os.exists(promoted / StoreLoader.ArrivedAtFile) should be(true)
 
   atest("a promoted copy left by a different transfer is discarded and the store shipped again"):
     given ExecutionContext = executionContext
@@ -1821,6 +1823,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       os.exists(activeDir / StoreTransfer.TransferredInMarkerFile) should be(false)
       os.exists(pendingDir / StoreTransfer.TransferredInMarkerFile) should be(true)
+      os.exists(activeDir / StoreLoader.ArrivedAtFile) should be(true)
+      os.exists(pendingDir / StoreLoader.ArrivedAtFile) should be(false)
       recorded(host).storeLoadAttempts.toList.drop(before) should be(List((deviceA, activeDir)))
 
   /** A real Host, which opens RocksDB backends and honours the markers, over `hostRoot`. */

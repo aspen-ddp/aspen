@@ -401,7 +401,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  -- has committed. Each step is idempotent, so a crash between any two of them is finished by
    *  the next scan, which finds shutdown.state still present and lands here again:
    *  1. `owning-host` is rewritten to name this host (adoption only), so once shutdown.state is
-   *     gone the device loads here on its own.
+   *     gone the device loads here on its own. Each store's arrival (StoreLoader.ArrivedAtFile) is
+   *     recorded just before, for its load floor.
    *  2. A stray transfer-out marker (a rebuilt store's, keepRebuiltStoreOffline, or an abandoned
    *     transfer's) is removed from every store now Active, except one whose entry still names a
    *     transfer or that this process is sending: there the marker belongs to a transfer. Offline
@@ -427,6 +428,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                                state: StorageDeviceState,
                                rewriteOwner: Boolean): Unit =
     if rewriteOwner then
+      // Each store arrives from another host, whose clock may lead this one's: its load floor must cover that. Before
+      // the owner is rewritten, so that a crash between the two finds the adoption still to finish
+      state.stores.keys.map(storeId => path / storeId.directoryName).filter(os.isDir(_))
+        .foreach(StoreLoader.writeArrivedAt)
       DeviceMarkers.writeOwningHost(path, ctx.hostId)
 
     val active = state.stores.collect {

@@ -27,7 +27,11 @@
   `storeId`, `path`, `crlSaveFile` and the thread-safe `hasFailed`/`isWriteFrozen`. `release` frees the slot
 - Load time and the forget floor (`server/store/CLAUDE.md`): every Store `StoreLoader` builds records its load
   (`Frontend.loadedAt`), so after a restart, adoption or transfer in it refuses, for good, each transaction it does
-  not hold that started before the load plus `MaxStartLead`. The exception is a store this process just created
+  not hold that started before the load plus `MaxStartLead`. A store that arrived from another host had joined by that
+  host's clock: `StoreTransfers.clearTransferredInMarker` (before the marker goes) and an adopting
+  `DeviceDiscovery.bringIntoService` (before `owning-host` is rewritten) durably write `StoreLoader.ArrivedAtFile`, and
+  a load less than `RebuildingStore.AcceptorSinceMargin` (10 s) after it adds that margin instead (`Frontend.arrivedAt`).
+  A same-host restart past the margin adds only the lead. The exception is a store this process just created
   (`StoreLoader.newStores`: a `startOpen` with `create`, made only by `StoreRebuilds.createNewStore` for a new pool's
   store with no directory yet). It has never served, so it records no load and joins at once. Tests set load times
   through `Host.Seams.storeLoadedAt`

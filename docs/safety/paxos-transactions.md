@@ -654,7 +654,7 @@ abort for a forgotten commit, since no store that forgot T answers it, 10.10). (
 * One cache per **host**, shared by all its stores and keyed by transaction id only. Entries live 7 s after the *last
   write*. The early-eviction warning was removed with the horizon: an evicted entry only loses late-commit evidence
   (`server/transaction/TransactionStatusCache.scala:11`). (horizon) Entries now live 30 s after the last write (P17).
-  A size eviction is logged as an error, counted, and raises the host-wide eviction watermark (wall clock +
+  A size eviction is logged as an error (at most once per 10 s, with the count), counted, and raises the host-wide eviction watermark (wall clock +
   `MaxStartLead`), a forget-floor component, so an evicted entry's absence is never trusted (10.10). Expiry by time
   raises nothing: an entry expires only once its transaction is below the floor anyway.
 * (horizon) An opposite outcome reaching `updateStatus` should never arise now; it is logged as an error ("Split
@@ -702,10 +702,16 @@ against the receiving host's wall clock (`Frontend.wallClockMillis`, not the JVM
 **The forget floor** (`Frontend.forgetFloorMillis`, `server/store/Frontend.scala:126-139`) is the latest of:
 
 * `wallClockMillis() - horizon`;
-* the store's load on this host plus `MaxStartLead` (`loadFloorMillis`, `:139`; `loadedAtMillis`, `:124`). Every
+* the store's load on this host plus `MaxStartLead` (`loadFloorMillis`; `loadedAtMillis`). Every
   restart, adoption and transfer-in builds a new Frontend through `StoreLoader`, so the host's lack of a cache for the
   store's past is covered. The lead is there because before its load the store may have joined, and forgotten, a
-  transaction started up to `MaxStartLead` ahead of its clock. Exemption: a store this process just created for a
+  transaction started up to `MaxStartLead` ahead of its clock. A store that arrived from another host (a transfer in,
+  `StoreTransfers.clearTransferredInMarker`; an adoption, `DeviceDiscovery.bringIntoService`) joined there by that
+  host's clock, which may lead this one's: each arrival durably writes `StoreLoader.ArrivedAtFile` (this host's wall
+  clock) before the store can load here, and a load less than `RebuildingStore.AcceptorSinceMargin` (10 s) after it
+  adds that margin instead of the lead (`Frontend.arrivedAt`). The margin covers the lead plus the inter-host skew
+  P-N2 already assumes. Being durable, it also covers a crash between the arrival and the load, and a same-host
+  restart within the margin of the arrival. Exemption: a store this process just created for a
   pool's Initializing slot (`StoreRebuilds.createNewStore` -> `StoreLoader.newStores`,
   `server/host/StoreLoader.scala:53-55,193,281-282,355`) records no load time, since it has never served. Rebuilt
   stores keep `acceptorSince` (P-N2), checked first, whose muted Tx may still prove;
@@ -725,9 +731,14 @@ transaction they forgot", "a store transferred to another host does not rejoin a
 **Why the floor timing is safe without cross-host clock agreement.** A store writes its cache entry for T after it saw
 T, and by `MaxStartLead` its own clock then read at least `start - 2 s` (it mutes any T further ahead). The entry lives
 30 s past its last write, so when it expires the store's clock reads past `start + 28 s`, beyond the 20 s horizon: the
-store already refuses T. A restart, transfer-in or size eviction loses memory at a moment that raises the floor past
-every T the store might have joined before it (hence the `+ MaxStartLead`). So a store never forgets T while it would
-still join it. Only the store's own clock is used; client and peer clocks enter only through `MaxStartLead`. Residual:
+store already refuses T. A restart or size eviction loses memory at a moment that raises the floor past every T the
+store might have joined before it on this host (hence the `+ MaxStartLead`). A transfer-in or adoption loses the
+previous host's memory: every T the store joined there started at most `MaxStartLead` ahead of that host's clock at
+the join, before the arrival here, so at most `MaxStartLead` plus the skew between the two hosts' clocks ahead of this
+host's clock at the arrival, which is within `AcceptorSinceMargin` under the P-N2 skew bound (hence the arrival's
+margin). So a store never forgets T while it would still join it. A same-host restart uses only the store's own clock;
+a store's arrival from another host relies on the same inter-host skew bound as P-N2 (under 8 s); client clocks enter
+only through `MaxStartLead`. Residual:
 a host wall clock stepped *backward* by more than about 8 s (30 - 20 - 2) between a store joining T and its entry
 expiring (Caffeine's expiry runs on `nanoTime`, the floor on the wall clock) reopens the window for that T.
 
@@ -765,7 +776,10 @@ it concludes, `Unknown` included (`client/internal/transaction/TransactionManage
 **Why rule 3 is safe.** An acceptor forgets T only once T is decided: an abort at resolution, a commit at `TxFinalized`
 (P9). So a committed but unfinalized T is still held by a full quorum (`t`) of the primary pool's acceptors, and more
 than `w - t` non-holders rule it out. A non-holder can never become a holder, because it answered "unknown" only below
-its floor (or holds a muted `Tx`, which accepts nothing). The third kind of non-holder `ExpiryTally` counts is an
+its floor, or holds a `Tx` muted for good, which accepts nothing: one started before the rebuilt store's
+`acceptorSince`, or below the store's floor (`Tx.receiveStatusRequest`). A `Tx` muted only for starting too far ahead
+reports itself a possible holder, since once forgotten a retransmission after the clock catches up creates an unmuted
+one. The third kind of non-holder `ExpiryTally` counts is an
 outcome reply without acceptor state (a status-cache answer) when the asking `Tx` already knows its outcome: a cache
 entry exists only for a decided T, so counting it cannot discard an undecided one, and the asking `Tx` concludes the
 outcome it knows rather than discarding (`concludeKnownOutcome`), while a finalized or late commit is adopted by rule 1.
@@ -797,7 +811,8 @@ horizon reports unknown, not aborted".
 **Residual costs.**
 
 * *Post-load refusal.* After a reload a store refuses, for good, every T it does not hold that started before
-  `load + MaxStartLead` (`Frontend.scala:135-139`). For Ts started before the load that only anticipates the horizon
+  `load + MaxStartLead` (`Frontend.loadFloorMillis`), or `load + AcceptorSinceMargin` within that margin of its arrival
+  from another host. For Ts started before the load that only anticipates the horizon
   by up to 20 s; the extra cost is the Ts started in `[load, load + MaxStartLead)`, which the store would otherwise
   have joined. Those see it as offline and most commit through the other stores. On a single host, or after a restart of most of a pool's
   stores, too few stores remain and such Ts end `TransactionOutcomeUnknown` at about 22 s, and are retried. A durable
@@ -809,7 +824,9 @@ horizon reports unknown, not aborted".
   retried.
 * *Size eviction* can raise the floor to about "now" on its host (eviction is not oldest-first), making its stores
   refuse every not-yet-held transaction started before it. It needs about 130 k transactions/s per host sustained; it
-  fails safe and is logged as an error and counted.
+  fails safe and is counted, and logged as an error at most once per 10 s with the count
+  (`TransactionStatusCache.EvictionLogPeriod`); the refusal warning is likewise limited to once per 10 s per store
+  (`Frontend.RefusalLogPeriod`).
 * *Slow client clocks.* A client clock more than 20 s slow has its transactions refused (logged with the lag).
 * *Retried unknowns.* An Unknown may have committed; retry-by-default sites that are not idempotent may duplicate work
   (`SimpleTaskExecutor.allocateTask` is known to; Todo audit entry).

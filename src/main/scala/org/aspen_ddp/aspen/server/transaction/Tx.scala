@@ -1252,9 +1252,15 @@ class Tx( trs: TransactionRecoveryState,
     updateLastEvent()
   }
 
+  /** A muted Tx holds no acceptor state. It is a permanent non-holder only if muted for good: started before the
+    * rebuilt store's acceptor, or below the store's forget floor. One muted for starting too far ahead is forgotten once
+    * its objects load, and a retransmission once the clock catches up then creates an unmuted Tx, so it may yet hold
+    */
   def receiveStatusRequest(m: TxStatusRequest): Unit = {
+    val mutedForGood = frontend.acceptorSince.exists(txd.startTimestamp < _) || frontend.belowForgetFloor(txd)
     val r = TxStatusResponse(m.from, storeId, transactionId, m.requestUUID,
-      Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = lateOutcome, holdsAcceptorState = !muted)))
+      Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = lateOutcome,
+        holdsAcceptorState = !muted || !mutedForGood)))
     net.sendTransactionMessage(r)
   }
 

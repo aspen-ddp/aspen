@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
   TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState, TransactionRecoveryState}
-import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading}
+import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading, StoreLoader}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.{Frontend, Store}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
@@ -306,3 +306,41 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       val store = storeOf(host).get
       store.frontend.transactions.keySet should be (Set(txid, other))
       store.objectCache.get(oid).flatMap(_.lockedToTransaction) should be (Some(txid))
+
+  /** The store's backend holding the object, in its own directory, with no crl_save.log */
+  private def storeInDirectory(): MapBackend =
+    val root = os.temp.dir()
+    tempRoots += root
+    val storeDir = root / "store"
+    os.makeDir.all(storeDir)
+    val backend = new MapBackend(crlStoreId):
+      override def path: os.Path = storeDir
+    backend.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
+      DataBuffer(Array[Byte](0)))
+    backend
+
+  private def loadFloorLead(backend: MapBackend): Future[Long] =
+    given ExecutionContext = executionContext
+    val host = newCrlHost()
+    val loaded = host.loadStore(deviceId, backend, None)
+    def served: Boolean =
+      host.testingOnlyHandleEvents()
+      loaded.isCompleted && storeOf(host).isDefined
+    for
+      _ <- yieldUntil(served)
+      _ <- loaded
+    yield
+      val frontend = storeOf(host).get.frontend
+      frontend.loadFloorMillis - frontend.loadedAtMillis
+
+  // The previous host's clock may lead this one's: a store that arrived from it (StoreLoader.ArrivedAtFile, written
+  // at a transfer in or an adoption) refuses, for AcceptorSinceMargin after its load, what it may have forgotten
+  atest("a store that arrived from another host loads with AcceptorSinceMargin on its load floor"):
+    given ExecutionContext = executionContext
+    val backend = storeInDirectory()
+    StoreLoader.writeArrivedAt(backend.path)
+    loadFloorLead(backend).map(_ should be (RebuildingStore.AcceptorSinceMargin.toMillis))
+
+  atest("a store restarted on its own host loads with MaxStartLead on its load floor"):
+    given ExecutionContext = executionContext
+    loadFloorLead(storeInDirectory()).map(_ should be (Frontend.MaxStartLead.toMillis))

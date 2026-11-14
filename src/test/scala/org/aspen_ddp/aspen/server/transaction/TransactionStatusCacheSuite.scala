@@ -163,3 +163,33 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     cache.updateStatus(aborted, TransactionStatus.Committed)
     cache.splitDecisions shouldBe 2
   }
+
+  /** The log lines, at Info or above, that name `txid` */
+  private def logNaming(txids: TransactionId*)(f: => Unit): List[(TransactionId, scribe.Level, String)] =
+    val lines = new java.util.concurrent.LinkedBlockingQueue[(TransactionId, scribe.Level, String)]()
+    val handler = scribe.handler.LogHandler(scribe.Level.Info): r =>
+      val text = r.logOutput.plainText
+      txids.find(t => text.contains(t.toString)).foreach(t => lines.add((t, r.level, text)))
+    scribe.Logger.root.withHandler(handler).replace()
+    try f
+    finally scribe.Logger.root.withoutHandler(handler).replace()
+    lines.toArray(Array.empty[(TransactionId, scribe.Level, String)]).toList
+
+  // Under the overload that fills the cache, about one entry is evicted per insert: one error line each would flood
+  // the log exactly when the host is overloaded
+  test("size evictions are logged once, then at most once per period with the count since") {
+    var clock = 1_000_000L
+    val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), wallClockMillis = () => clock)
+    val List(first, held, later) = List(91, 92, 93).map(i => TransactionId(new UUID(77, i))): @unchecked
+    val log = logNaming(first, held, later):
+      List(first, held).foreach: txid =>
+        cache.updateStatus(txid, TransactionStatus.Committed)
+        cache.evictForTest(txid)
+      clock += TransactionStatusCache.EvictionLogPeriod.toMillis
+      cache.updateStatus(later, TransactionStatus.Committed)
+      cache.evictForTest(later)
+
+    log.map((txid, level, _) => (txid, level)) shouldBe List((first, scribe.Level.Error), (later, scribe.Level.Error))
+    log(1)._3 should include ("3 size evictions")
+    cache.sizeEvictions shouldBe 3
+  }

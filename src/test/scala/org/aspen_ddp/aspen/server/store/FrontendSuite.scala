@@ -14,9 +14,10 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
 import org.aspen_ddp.aspen.TempDirManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
-import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, LogRateLimit}
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
+import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend, UpdateForm}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache, StoreObjectCache}
@@ -1219,6 +1220,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   private def startedAgo(ms: Long): HLCTimestamp = HLCTimestamp((floorNow - ms) << 16)
 
   private def withFloorFrontend(loadedAt: Long = floorNow - 60_000,
+                                arrivedAt: Option[Long] = None,
                                 statusCache: TransactionStatusCache =
                                   new TransactionStatusCache(wallClockMillis = () => floorNow),
                                 crl: TestCrl = new TestCrl,
@@ -1233,7 +1235,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, missingDataWait = missingDataWait,
       admission = admission, wallClockMillis = () => floorNow, horizon = FiniteDuration(20, SECONDS),
-      loadedAt = Some(loadedAt))
+      loadedAt = Some(loadedAt), arrivedAt = arrivedAt)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     f(frontend, backend, net, crl)
 
@@ -1297,6 +1299,47 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         withClue(s"started ${start - loaded} ms after the load: "):
           votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
           crl.txSaved shouldBe true
+  }
+
+  // A store that arrived from another host (a transfer in, an adoption) may have joined there, and forgotten, a
+  // transaction started up to MaxStartLead ahead of that host's clock, which may lead this one's: the load raises the
+  // floor to the load plus AcceptorSinceMargin, which covers the lead and the skew between hosts (paxos P-N2)
+  private val margin: Long = RebuildingStore.AcceptorSinceMargin.toMillis
+
+  test("a store that arrived from another host refuses transactions started inside AcceptorSinceMargin after its load") {
+    val loaded = floorNow - 500
+    for start <- List(loaded + lead, loaded + margin - 1) do
+      withFloorFrontend(loadedAt = loaded, arrivedAt = Some(loaded - 100)): (frontend, _, net, crl) =>
+        val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp(start << 16))
+        frontend.loadFloorMillis shouldBe loaded + margin
+        frontend.receiveTransactionMessage(clientPrepare(txd))
+
+        withClue(s"started ${start - loaded} ms after the load: "):
+          frontend.transactions.contains(txid1) shouldBe false
+          net.sentTx shouldBe empty
+          crl.txSaved shouldBe false
+  }
+
+  test("a store that arrived from another host answers a transaction started AcceptorSinceMargin after its load") {
+    val loaded = floorNow - margin - 500
+    withFloorFrontend(loadedAt = loaded, arrivedAt = Some(loaded)): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp((loaded + margin) << 16))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+  }
+
+  test("a restart on the same host within AcceptorSinceMargin of the store's arrival keeps the arrival's margin") {
+    // The restarted store may still have forgotten a transaction it joined on the host it came from
+    val loaded = floorNow - 500
+    withFloorFrontend(loadedAt = loaded, arrivedAt = Some(loaded - margin + 1)): (frontend, _, _, _) =>
+      frontend.loadFloorMillis shouldBe loaded + margin
+  }
+
+  test("a restart on the same host once AcceptorSinceMargin has passed since the store's arrival adds only the lead") {
+    val loaded = floorNow - 500
+    withFloorFrontend(loadedAt = loaded, arrivedAt = Some(loaded - margin)): (frontend, _, _, _) =>
+      frontend.loadFloorMillis shouldBe loaded + lead
   }
 
   test("a prepare below the eviction watermark is refused") {
@@ -1366,6 +1409,30 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       log.map(_._1) shouldBe List(scribe.Level.Warn)
       log.head._2 should include ("25000ms")
       frontend.transactions.contains(slowTxid) shouldBe false
+  }
+
+  test("refused client prepares are warned of once, then at most once per period with the count since") {
+    // While a status cache eviction's watermark binds, every client prepare is refused: one warning each would flood
+    // the log
+    var clock = floorNow
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
+      new TestCrl, new TransactionStatusCache(wallClockMillis = () => clock), wallClockMillis = () => clock,
+      horizon = FiniteDuration(20, SECONDS), loadedAt = Some(floorNow - 60_000))
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    val List(first, held, later) = List(81, 82, 83).map(i => TransactionId(new UUID(0, i))): @unchecked
+    def refuse(txid: TransactionId): Unit =
+      val txd = lockTxd(txid, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp((clock - 25_000) << 16))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.transactions.contains(txid) shouldBe false
+    val log = logNaming(first)(refuse(first)) ++ logNaming(held)(refuse(held)) ++
+      logNaming(later) { clock += Frontend.RefusalLogPeriod.toMillis; refuse(later) }
+
+    log.map(_._1) shouldBe List(scribe.Level.Warn, scribe.Level.Warn)
+    log.head._2 should include (first.toString)
+    log(1)._2 should include (later.toString)
+    log(1)._2 should include (LogRateLimit.heldText(1))
   }
 
   // ---- Write locks are held until a commit is applied ----
@@ -4127,6 +4194,26 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
 
       statusResponses(net).map(_.status.map(_.holdsAcceptorState)) shouldBe List(Some(false))
+  }
+
+  test("a Tx muted for starting too far ahead answers holdsAcceptorState = true: it may join once forgotten") {
+    // Its objects are still loading, so it is not forgotten yet (forgetMuted). Once it is, a retransmission after the
+    // clock catches up creates an unmuted Tx, so it is a possible holder, not a permanent non-holder
+    val backend = new DeferredCommitBackend
+    backend.deferReads = true
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net,
+      new TestCrl, new TransactionStatusCache(wallClockMillis = () => floorNow), wallClockMillis = () => floorNow,
+      loadedAt = Some(floorNow - 60_000))
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp((floorNow + 60_000) << 16))
+    frontend.receiveTransactionMessage(clientPrepare(txd))
+    frontend.transactions(txid1).muted shouldBe true
+    net.sentTx = Nil
+    frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
+
+    statusResponses(net).map(_.status.map(_.holdsAcceptorState)) shouldBe List(Some(true))
   }
 
   // ---- Expiry: an unresolved Tx past the horizon decides from its peers' status (spec section 2) ----

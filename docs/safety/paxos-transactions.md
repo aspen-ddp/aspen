@@ -744,8 +744,8 @@ expiring (Caffeine's expiry runs on `nanoTime`, the floor on the wall clock) reo
 
 **Status query** (`TxStatusRequest`, which carries `startTimestamp`, and `TxStatusResponse.TxStatus`, which carries
 `holdsAcceptorState`: `common/network/Message.scala:337-358`; this wires up the half-built path of F15). A store with
-a `Tx` answers with its status, finalized, late and `holdsAcceptorState = !muted` (`Tx.receiveStatusRequest`,
-`server/transaction/Tx.scala:1255-1257`). A store without one answers from its cache entry if it has a non-Unresolved
+a `Tx` answers with its status, finalized, late and `holdsAcceptorState = !muted || !mutedForGood` (`Tx.receiveStatusRequest`,
+`server/transaction/Tx.scala:1259-1265`). A store without one answers from its cache entry if it has a non-Unresolved
 one (`holdsAcceptorState = false`); otherwise it answers `None` ("unknown") **only if T's start is below its floor**,
 which makes the answer permanent, and above the floor it stays silent, since it could still join T
 (`receiveStatusRequestWithoutTx`, `Frontend.scala:996-1001`). FrontendSuite "a store that neither holds nor remembers T
@@ -916,7 +916,7 @@ Findings the horizon (10.10) touches. Every other finding of this document is un
 | F6 | **re-assessed**: no longer a split path; residual stated | An abort still deletes its CRL record at resolution, but a forgotten abort is no longer re-decidable: the store keeps its cache entry past the horizon, and a restart, transfer-in or eviction raises its floor, so it never rejoins T. What remains: the timing relies on each host's own wall clock not stepping back by more than about 8 s (10.10), and the post-load refusal cost. Todo 2.13 F6 (keep the record until `TxFinalized`) is no longer needed for safety | `Frontend.scala:126-139`; `TransactionStatusCache.scala:32,49-51` |
 | F10 | **closed by the horizon** (not fixed directly) | `lastProposer` still follows client prepares (`Tx.receivePrepare`), but its safety leg, a proof sent to a proposer without a driver (P-N1), no longer matters (below). The `TxCommitted` redirect to a dead leader still costs an extra ErrorTree mark and repair (harmless, unchanged) | `Tx.scala:909-911` (`receivePrepare`) |
 | F11 | **narrowed** | The host status cache logs an error ("Split decision") and counts every opposite outcome it is given (`splitDecisions`); `Tx.resolved`, `onResolution`, `receiveFinalized` and the client still ignore one silently | `TransactionStatusCache.updateStatus`; TransactionStatusCacheSuite "an opposite outcome is logged as a split decision" |
-| F15 | **narrowed**: `TxStatusRequest` wired up | Expiry sends it and every store answers (10.10); `receiveTxPrepare` and the other dead `Proposer` methods are unchanged | `Frontend.scala:607-640,985-1001`; `Tx.scala:1255-1257` |
+| F15 | **narrowed**: `TxStatusRequest` wired up | Expiry sends it and every store answers (10.10); `receiveTxPrepare` and the other dead `Proposer` methods are unchanged | `Frontend.scala:607-640,985-1001`; `Tx.scala:1259-1265` |
 | P-N1 | **closed by the horizon** (not fixed directly) | A proof is still sent once. But a driver without it can decide abort only from a promise quorum of acceptors that forgot T, and inside the window those still answer from their `Tx` or cache entry, while past the floor they refuse. Proofs are now an optimisation inside the window, not load-bearing | 10.10; 10.5 |
 | P-N4 | **closed** (FIXED by the horizon) | A delayed duplicate of the client's own prepare finds every store that took part in the abort still remembering it (finalized abort in the cache, relayed) inside the window, and refused past the floor. The `Transaction.commit` scaladoc's accepted exception is removed; `TransactionAborted` is final | HorizonIntegrationSuite "a delayed client prepare of a forgotten abort does not commit inside or past the horizon"; `client/Transaction.scala:150-162` |
 | P-N2 | unchanged (FIXED stands) | `MaxStartLead` is now `TransactionHorizon.MaxStartLead`, the same 2 s; the floor's timing argument uses it too | `common/transaction/TransactionHorizon.scala:16` |
@@ -1226,9 +1226,9 @@ for adopted data.
 ### F15. Dead or unused protocol code. Confidence: high (informational)
 
 > **Refresh (horizon, 2026-11-13): NARROWED; `TxStatusRequest` is wired up.** Expiry sends it to every other store of
-> T, it now carries `startTimestamp`, and every store answers: with a `Tx` (`holdsAcceptorState = !muted`), from a
+> T, it now carries `startTimestamp`, and every store answers: with a `Tx` (`holdsAcceptorState = !muted || !mutedForGood`), from a
 > cache entry, "unknown" below its floor, or nothing (10.10; `Frontend.scala:607-640,985-1001`,
-> `Tx.scala:1255-1257`). `receiveTxPrepare`, `Proposer.receiveNack`/`maySendAccept`/`currentPrepareMessage` and the
+> `Tx.scala:1259-1265`). `receiveTxPrepare`, `Proposer.receiveNack`/`maySendAccept`/`currentPrepareMessage` and the
 > commented client learner remain dead.
 
 > **Verification 2026-11-09: CONFIRMED. Severity: doc-only.** No caller of TransactionDriver.receiveTxPrepare, no constructor of TxStatusRequest outside codec/tests (grep).

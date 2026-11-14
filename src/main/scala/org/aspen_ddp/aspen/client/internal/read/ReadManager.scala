@@ -63,9 +63,11 @@ class ReadManager(val client: ReadDriverClient, val driverFactory: ReadDriver.Fa
   }
 
   private def deliver(driver: ReadDriver, m: ReadResponse): Unit = {
-    val allResponded = driver.receiveReadResponse(m)
+    // Every store having replied once does not decide the read: replies that cannot be restored leave it alive
+    // to be re-sent, and its later responses must still reach the driver
+    driver.receiveReadResponse(m)
 
-    if (allResponded || driver.readResult.isCompleted)
+    if (driver.readResult.isCompleted)
       synchronized { outstandingReads -= m.readUUID }
   }
 

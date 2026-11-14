@@ -6,7 +6,8 @@ import org.aspen_ddp.aspen.client.{DataObjectState, ReadDriverClient}
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, ReadResponse, TxMessage}
-import org.aspen_ddp.aspen.common.objects.{ObjectPointer, ReadError, ReadType}
+import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.common.objects.{ObjectRevision, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -67,6 +68,39 @@ class ReadManagerSuite extends AnyFunSuite with Matchers:
 
     // The silent store answers: accepted and dropped, with no read left to deliver it to
     mgr.receive(respond(ds2, ts).copy(readUUID = uuid))
+    mgr.outstandingReadCount should be (0)
+  }
+
+  test("a read stays registered when every store has replied but the result is still undecided") {
+    val sent = new java.util.concurrent.atomic.AtomicReference[List[UUID]](Nil)
+    val recording = new InlineClient:
+      override private[client] val messenger: Messenger = new Messenger:
+        def sendClientRequest(msg: ClientRequest): Unit = msg match
+          case r: org.aspen_ddp.aspen.common.network.Read => sent.updateAndGet(r.readUUID :: _)
+          case _ => ()
+        def sendTransactionMessage(msg: TxMessage): Unit = ()
+        def sendTransactionMessages(msg: List[TxMessage]): Unit = ()
+        def sendHostMessage(msg: HostMessage): Unit = ()
+        def dropCacheForStore(storeId: StoreId): Unit = ()
+    val mgr = new ReadManager(recording, factory)
+    val result = mgr.read(ptr, ida, "test")
+    val uuid = sent.get.head
+    val ts = HLCTimestamp.now
+    def revOf(n: Long) = ObjectRevision(TransactionId(new UUID(0, n)))
+    def reply(store: StoreId, r: ObjectRevision) =
+      ReadResponse(client, store, uuid, ts,
+        Right(ReadResponse.CurrentState(r, ref, ts, 5, Some(odata), Set())))
+
+    // Three different revisions: no two stores agree, so the read cannot be decided yet
+    mgr.receive(reply(ds0, revOf(1)))
+    mgr.receive(reply(ds1, revOf(2)))
+    mgr.receive(reply(ds2, revOf(3)))
+    result.isCompleted should be (false)
+    mgr.outstandingReadCount should be (1)
+
+    // A later response still reaches the driver and decides the read
+    mgr.receive(reply(ds0, revOf(3)))
+    result.isCompleted should be (true)
     mgr.outstandingReadCount should be (0)
   }
 

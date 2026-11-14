@@ -103,7 +103,7 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 | Paxos F6 | **RE-ASSESSED** 2026-11-13: no longer a split path | An abort still drops its record at resolution, but a forgotten abort cannot be re-decided (forget floor). Residual: the floor's timing relies on each host's wall clock not stepping back by more than about 8 s |
 | Repair F5 | PLAUSIBLE | An allocation-tree record more than 60 s late is treated as a delete |
 | Requirements Q-N5 | PLAUSIBLE (new) | `replaySafe` audit: proofs and the split action hold; the allocation action's orphan entry is less rare than stated; the marker's "idempotent" blind batch can regress newer entries and re-create deleted UnackedCommits entries |
-| X6, X7, X9, C5, C6 | PLAUSIBLE | Repair coverage holes compose: marker-batch give-up, FSIF slot reuse depending on a delete entry, a non-monotone completion gate after a rebuild, untracked bootstrap-pool ErrorTree writes |
+| X6, X7, X9, C5, C6 | PLAUSIBLE (X9 **NARROWED** 2026-11-14) | Repair coverage holes compose: marker-batch give-up, FSIF slot reuse depending on a delete entry, a non-monotone completion gate after a rebuild, untracked bootstrap-pool ErrorTree writes. X9 (with Rebuild F8 **FIXED**): every bootstrap-store scan sweeps the bootstrap trees; residual is a staleness window of about one `scanIntervalCap` (15 min) after a missed write (`Backlog.txt`) |
 
 ### Tier 3: liveness (hangs, stalls, leaks)
 

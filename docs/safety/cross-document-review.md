@@ -200,6 +200,14 @@ Fix sketch: refuse to drive a transaction whose types are unknown; carry a proto
 
 ### X9. Metadata recursion: bootstrap-pool tracking hole composes with repair-entry deletion tracking disabled (rebuild F8 x repair F7 x systemic)
 
+> **NARROWED (2026-11-14).** Opportunistic rebuild is removed, repair F7 is fixed (entry deletions are tracked except in
+> the bootstrap pool's own trees), and every scan of a bootstrap-pool store now sweeps its copy of every node of the
+> bootstrap pool's ErrorTree and UnackedCommits trees (rebuild F8 FIXED). Residual: after a missed untracked write the
+> store stays stale until its next scan, a worst-case window of about one `scanIntervalCap` (15 min) plus a scan, and
+> inside that window two bootstrap stores stale on different nodes could still let a quorum read lose a just-written
+> entry. Accepted for now; see the "Bootstrap tree sweep staleness window" entry in `Backlog.txt` (suggested fix: a
+> separate, short sweep interval in `RepairPolicy`).
+
 > **Refresh (replay pins): UNCHANGED.** `limitTracking` is unchanged; the untracked bootstrap batches now also hold
 > UnackedCommits entries.
 Verdict: PLAUSIBLE.  Severity: stale-replica of the repair metadata itself.

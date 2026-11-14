@@ -722,6 +722,12 @@ in-place path.
 
 **Verification: CONFIRMED (code), severity liveness/efficiency only.** `startRebuild` gossips `StoreOffline` but never calls `router.markOffline` (the callers are all in lost-CRL, transfer and shutdown paths), and `StoreRouter.answersUnknown` (`:82-84`) is true for a store that is neither offline, loading nor awaiting its device. Fix sketch: `router.markOffline(storeId)` in `startRebuild` on the new-device path and `clearOffline` on promotion.
 
+> **F8 FIXED (2026-11-14).** The opportunistic rebuild is deleted, and the first repair scan of a bootstrap-pool store
+> after promotion (or load) sweeps its copy of every node of the bootstrap pool's ErrorTree and UnackedCommits trees
+> (`StoreRepairer.sweepBootstrapTrees`, run by `RepairService.scanOne`), reconciling stale ones. A sweep that
+> reconciled or left anything incomplete keeps the store at the scan floor until its trees converge. Residual:
+> cross-document-review X9 (the staleness window before the sweep runs).
+
 **F8 (Medium) Bootstrap-pool stores rebuilt with untracked stale nodes.**
 The bootstrap pool's ErrorTree and UnackedCommits nodes live in the bootstrap pool; writes to them have missed-update
 tracking disabled (`MissedUpdateFinalizationAction.limitTracking` `:130`). Scenario: a bootstrap-pool store S is

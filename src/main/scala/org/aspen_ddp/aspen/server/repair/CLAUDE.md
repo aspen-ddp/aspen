@@ -24,6 +24,12 @@
   pruned by `retainSweep` after a complete walk). It creates and deletes no entries; an unreadable node counts as
   incomplete. `SweepResult.needsAnotherPass` is true when anything was reconciled or left incomplete, or a walk
   missed nodes
+- `RepairService.scanOne` runs the sweep for a store of the bootstrap pool right after its entry scan settles (success
+  or failure), under its own deadline (`SweepDeadline`, 90 s; `SweepTimedOut` drops the store's DeferralState as
+  `ScanTimedOut` does). The store's pacing is advanced with `foundEntries || sweep.needsAnotherPass`: a failed or
+  timed-out sweep counts as needing another pass (unlike a failed entry scan), so the store stays at
+  `scanIntervalFloor` until its trees converge and a clean sweep lets it back off to `scanIntervalCap`. A missed
+  untracked write is therefore healed within about one cap interval (Backlog.txt "Bootstrap tree sweep staleness window")
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
 - A repair scan runs only while the store's pool entry names this host, so a superseded copy never consumes the

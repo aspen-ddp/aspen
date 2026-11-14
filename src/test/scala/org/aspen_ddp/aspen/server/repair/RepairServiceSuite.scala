@@ -245,6 +245,80 @@ class RepairServiceSuite extends IntegrationTestSuite:
       svc.cancel()
       bgTasks.shutdown(FiniteDuration(2, SECONDS))
 
+  /** One store (a bootstrap-pool store by default), scanned with the given scan and sweep outcomes. */
+  private class SweepingService(clock: AtomicLong, stores: List[StoreId],
+                                scan: => Future[ScanResult], sweepOf: => Future[SweepResult],
+                                bgTasks: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager,
+                                deadline: FiniteDuration = RepairService.SweepDeadline)
+    extends RepairService(client, HostId.BootstrapHostId,
+                          new FixedTarget { override def repairableStoreIds: List[StoreId] = stores },
+                          bgTasks, () => clock.get):
+    @volatile var swept: List[StoreId] = Nil
+
+    def touchDeferrals(storeId: StoreId): DeferralState = deferralOf(storeId)
+
+    override protected def sweepDeadline: FiniteDuration = deadline
+    override protected def scanStore(storeId: StoreId, policy: RepairPolicy): Future[ScanResult] = scan
+    override protected def sweepStore(storeId: StoreId, policy: RepairPolicy): Future[SweepResult] =
+      synchronized { swept = storeId :: swept }
+      sweepOf
+
+  private val bootstrapStore = StoreId(PoolId.BootstrapPoolId, 0)
+  private val metadataStore = StoreId(PoolId(new java.util.UUID(5, 5)), 0)
+
+  private def ticks(svc: RepairService, clock: AtomicLong, n: Int): Future[Unit] =
+    (0 until n).foldLeft(svc.sweep()): (f, i) =>
+      f.flatMap: _ =>
+        clock.addAndGet(20 * 60_000L)
+        svc.sweep()
+
+  test("a bootstrap store's scan also sweeps; a metadata pool store's does not"):
+    val clock = AtomicLong(0L)
+    val svc = SweepingService(clock, List(bootstrapStore, metadataStore), Future.successful(ScanResult.Empty),
+                              Future.successful(SweepResult.Empty))
+    ticks(svc, clock, 1).map: _ =>
+      svc.swept shouldBe List(bootstrapStore)
+
+  test("a sweep that needs another pass keeps the store at the floor"):
+    val clock = AtomicLong(0L)
+    val svc = SweepingService(clock, List(bootstrapStore), Future.successful(ScanResult.Empty),
+                              Future.successful(SweepResult(3, 1, 0, true)))
+    ticks(svc, clock, 3).map: _ =>
+      svc.swept.size shouldBe 3
+      svc.testingOnlyScanStates(bootstrapStore).currentInterval shouldBe RepairPolicy.Default.scanIntervalFloor
+
+  test("a clean sweep lets the store back off"):
+    val clock = AtomicLong(0L)
+    val svc = SweepingService(clock, List(bootstrapStore), Future.successful(ScanResult.Empty),
+                              Future.successful(SweepResult(3, 0, 0, true)))
+    ticks(svc, clock, 1).map: _ =>
+      svc.testingOnlyScanStates(bootstrapStore).currentInterval shouldBe
+        RepairPolicy.Default.scanIntervalFloor * 2
+
+  test("a sweep cut off by its deadline keeps the store at the floor and drops its deferrals"):
+    val clock = AtomicLong(0L)
+    val bgTasks = BackgroundTaskManager(scala.concurrent.ExecutionContext.global)
+    val svc = SweepingService(clock, List(bootstrapStore), Future.successful(ScanResult.Empty),
+                              Promise[SweepResult]().future, bgTasks, FiniteDuration(50, MILLISECONDS))
+    val f = for
+      _ <- svc.sweep()
+      _ = svc.touchDeferrals(bootstrapStore)
+      _ = clock.set(60_000L)
+      _ <- svc.sweep()
+    yield
+      svc.testingOnlyScanStates(bootstrapStore).currentInterval shouldBe RepairPolicy.Default.scanIntervalFloor
+      svc.testingOnlyDeferrals.keySet should not contain bootstrapStore
+    f.andThen: _ =>
+      svc.cancel()
+      bgTasks.shutdown(FiniteDuration(2, SECONDS))
+
+  test("a failed entry scan still runs the sweep"):
+    val clock = AtomicLong(0L)
+    val svc = SweepingService(clock, List(bootstrapStore), Future.failed(RuntimeException("scan failed")),
+                              Future.successful(SweepResult.Empty))
+    ticks(svc, clock, 1).map: _ =>
+      svc.swept shouldBe List(bootstrapStore)
+
   test("the sweep tick period matches the default scan floor"):
     Future.successful:
       RepairService.TickPeriod shouldBe RepairPolicy.Default.scanIntervalFloor

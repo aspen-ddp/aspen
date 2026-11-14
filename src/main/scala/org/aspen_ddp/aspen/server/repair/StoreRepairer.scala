@@ -43,6 +43,9 @@ object ScanResult:
   * @param reconciled nodes whose reconcile changed the store's copy
   * @param incomplete nodes left not complete: deferred, stale, or failed (unreadable, or deleted under the walk)
   * @param walkComplete false when either tree's walk missed nodes deleted under it
+  *
+  * A sweep abandoned because the store left this host reports needsAnotherPass = false; the store then drops out of
+  * the repairable set, so nothing is lost.
   */
 final case class SweepResult(nodes: Int, reconciled: Int, incomplete: Int, walkComplete: Boolean):
   def needsAnotherPass: Boolean = reconciled > 0 || incomplete > 0 || !walkComplete

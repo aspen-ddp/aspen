@@ -20,6 +20,8 @@ Working rule for every item:
   3. Fix it, then update the finding's status (dated note), the README ranked row, and the module CLAUDE.md.
   4. If the fix narrows a finding rather than closing it, state the residual explicitly.
 
+As items are completed, remove them from this document but keep the numbers the same for remaining items.
+
 Effort: S = hours, M = a day or two, L = a design plus several days.
 Doc keys: CRL = crash-recovery-log, P = paxos-transactions, R = transaction-recovery, Q/Req = transaction-requirements,
 RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-review, SL = systemic-loss-protection.
@@ -33,14 +35,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
-
-2.1  Delete the opportunistic rebuild paths: Repair F1, F2, N1, N2, Req F3                                  [S]
-     Frontend.opportunisticRebuild and the pre-transaction rebuild (Tx.completeLoad) replace KV content without
-     refreshing kvState and move timestamps backwards. The pre-tx path also skips the commitInFlight guard, the
-     refcount max and ordered commit. Repair's own reads (StoreRepairer ~355) do not disable it (N2). Both paths
-     are nearly dead and duplicate what the ErrorTree/UnackedCommits scan and Reconcile already do. Delete them,
-     with their message and tests, rather than harden them (see the "simplicity over corner-case optimization"
-     memory). This also removes the healing that 2.10 currently leans on.
 
 2.2  Monotone applies for blind writes: Req F1, F2, F4, CRL F13, R-F4, Rebuild N1 (helps Repair F3, X7)     [M]
      Blind KV puts and deletes, raw revision-less updates and refcount updates assign the value or timestamp
@@ -104,13 +98,6 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
      Candidate fixes: treat an adopted accepted commit from a quorum that contains memoryless acceptors as late
      when a proof exists (P-N3); D1 writes no entries for stores that D0 listed or that acknowledged (R-N7). Add
      the missing test that kills D1's host between hand-off and TxFinalized (G13).
-
-2.10 Bootstrap-pool tracking hole: Rebuild F8, X9 (+ Repair F7)                                             [M-L]
-     Bootstrap-pool stores rebuild with stale, untracked ErrorTree/UnackedCommits nodes, because marker writes
-     use limitTracking and repair entry deletions disable tracking. Each bootstrap rebuild silently removes one
-     replica of redundancy, and today only the unsafe opportunistic rebuild (removed in 2.1) heals it. Fix: a
-     second walk over bootstrap metadata-tree nodes after the first, or periodic anti-entropy on node revisions
-     for the bootstrap pool. Re-examine whether repair deletions can use limitTracking (F7).
 
 2.11 Allocation-tree coverage for rebuilds: Rebuild F10, F17, G6                                            [M]
      Audit every allocation path (FSIF index bitmap, pool creation, tasks) for an allocation-tree entry, and add a

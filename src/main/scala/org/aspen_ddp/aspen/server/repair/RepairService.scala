@@ -14,6 +14,9 @@ import scala.util.Random
 case class ScanTimedOut(storeId: StoreId, after: Duration)
   extends Exception(s"Repair scan of $storeId did not complete within $after")
 
+case class SweepTimedOut(storeId: StoreId, after: Duration)
+  extends Exception(s"Repair sweep of $storeId did not complete within $after")
+
 case class MetadataReadTimedOut(what: String, after: Duration)
   extends Exception(s"Repair metadata read for $what did not complete within $after")
 
@@ -53,6 +56,15 @@ class RepairService(client: AspenClient,
   /** Overridable so tests can count concurrency without doing I/O. */
   protected def scanStore(storeId: StoreId, policy: RepairPolicy): Future[ScanResult] =
     repairer.scan(storeId, policy, deferralOf(storeId))
+
+  /** Overridable like scanStore. Sweeps the bootstrap pool's tree nodes. A sweep abandoned because the store left this
+    * host reports needsAnotherPass = false, which is fine: the store then drops out of the repairable set.
+    */
+  protected def sweepStore(storeId: StoreId, policy: RepairPolicy): Future[SweepResult] =
+    repairer.sweepBootstrapTrees(storeId, policy, deferralOf(storeId))
+
+  /** Overridable so the sweep deadline can be tested without waiting for it. */
+  protected def sweepDeadline: FiniteDuration = SweepDeadline
 
   /** The store's DeferralState, created on first use */
   protected def deferralOf(storeId: StoreId): DeferralState = synchronized {
@@ -203,7 +215,30 @@ class RepairService(client: AspenClient,
         logger.warn(s"Repair scan of $storeId failed: $t")
         false
 
-    recovered.map: foundEntries =>
+    // The bootstrap pool's trees are also written by untracked marker and deletion writes, so a store of it sweeps
+    // every node after its entry scan settles, whether or not the scan succeeded. A sweep that failed or timed out
+    // counts as needing another pass.
+    def sweepNeedsAnotherPass: Future[Boolean] =
+      if storeId.poolId != PoolId.BootstrapPoolId then
+        Future.successful(false)
+      else
+        Future.unit
+          .flatMap(_ => withDeadline(sweepDeadline, SweepTimedOut(storeId, sweepDeadline)):
+            sweepStore(storeId, policy))
+          .map(_.needsAnotherPass)
+          .recover:
+            case t: SweepTimedOut =>
+              synchronized:
+                deferrals -= storeId
+              logger.warn(s"Repair sweep of $storeId failed: $t")
+              true
+            case t: Throwable =>
+              logger.warn(s"Repair sweep of $storeId failed: $t")
+              true
+
+    val settled = recovered.flatMap(foundEntries => sweepNeedsAnotherPass.map(foundEntries || _))
+
+    settled.map: foundEntries =>
       synchronized:
         scanStates.get(storeId).foreach: prev =>
           scanStates = scanStates +
@@ -233,6 +268,11 @@ object RepairService:
     * resumes from the tree head.
     */
   val ScanDeadline: FiniteDuration = FiniteDuration(90, SECONDS)
+
+  /** The sweep of a bootstrap store's tree nodes runs as its own step so the entry scan cannot starve it. A cut-off
+    * sweep counts as needing another pass and the next one starts from the beginning.
+    */
+  val SweepDeadline: FiniteDuration = FiniteDuration(90, SECONDS)
 
   /** Metadata reads are advisory -- the fallback is a cached or default policy, which is cheap
     * and correct -- so they get a far tighter bound than a scan. Long enough to ride out ordinary

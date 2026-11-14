@@ -43,9 +43,10 @@
   below the floor it does not hold (`Store`). A store therefore never rejoins a transaction it may have forgotten;
   for up to the horizon after a load it looks offline to transactions started before it
 - Expiry (`server/transaction/CLAUDE.md`): `Store.heartbeat` calls `Frontend.expiryHeartbeat`, which queries the
-  peers of each Tx unresolved past the horizon plus `expiryMargin` and decides from their `TxStatusResponse`s
+  peers of each Tx unfinalized past the horizon plus `expiryMargin` and decides from their `TxStatusResponse`s
   (`ExpiryTally`): adopt an outcome, keep holding, or discard (`expireTransaction`: locks and objects released, CRL
-  state deleted, status cache untouched; a commit vote only once a later UnackedCommits lookup finds no entry). Then
+  state deleted, status cache untouched; a commit vote only once a later UnackedCommits lookup finds no entry; a
+  resolved Tx concludes as finalized). Then
   `removeExpiredDrivers` stops each driver past the horizon with no outcome whose store holds no Tx for it. Store
   takes `heartbeatPeriod` and a `wallClockMillis` test seam for this
 

@@ -144,7 +144,7 @@ class Frontend(val storeId: StoreId,
     * and a driver for it with no outcome is stopped once its store holds no Tx (Store.heartbeat)
     */
   def pastExpiry(txd: TransactionDescription): Boolean =
-    txd.startTimestamp.wallTime + horizon.toMillis + expiryMargin.toMillis < wallClockMillis()
+    Tx.pastHorizon(txd, wallClockMillis(), horizon, expiryMargin)
 
   /** Written only on the store's executor. `@volatile` so that `mayHoldTransaction` may read one snapshot of it from
     * another thread (the repair scan), as Store.hasTransactions reads `transactionDrivers`
@@ -587,10 +587,12 @@ class Frontend(val storeId: StoreId,
                                   var countdown: Int, var interval: Int, var decided: Boolean)
   private val expiryRounds = scala.collection.mutable.HashMap[TransactionId, ExpiryRound]()
 
-  /** Store heartbeat: each Tx still unresolved past the horizon plus the expiry margin queries the status of every
-    * other store of its transaction, first at the heartbeat it is found so, then after 1, 2, 4 and then every
-    * MaxExpiryQueryInterval heartbeats, until it decides from the replies (ExpiryTally): it adopts an outcome, is
-    * discarded, or keeps holding. Only the replies decide, so a Tx whose peers still hold T loses nothing by asking
+  /** Store heartbeat: each Tx still unfinalized past the horizon plus the expiry margin (Tx.mayExpire: unresolved, or
+    * resolved and waiting for a TxFinalized that may never come) queries the status of every other store of its
+    * transaction, first at the heartbeat it is found so, then after 1, 2, 4 and then every MaxExpiryQueryInterval
+    * heartbeats, until it decides from the replies (ExpiryTally): it adopts an outcome, is discarded (concluded, if it
+    * knows its outcome: Tx.concludeKnownOutcome), or keeps holding. Only the replies decide, so a Tx whose peers still
+    * hold T loses nothing by asking
     */
   def expiryHeartbeat(): Unit =
     val now = wallClockMillis()
@@ -615,8 +617,8 @@ class Frontend(val storeId: StoreId,
     round.decided = false
     round.countdown = round.interval
     round.interval = math.min(round.interval * 2, MaxExpiryQueryInterval)
-    // Its own acceptor state: a muted Tx holds none. Never an outcome: one known only from its UnackedCommits entry
-    // (Tx.provesCommitToItsDriver) is what its peers are asked to confirm or end
+    // Its own acceptor state: a muted Tx holds none. Never an outcome: one it already knows is what its peers are asked
+    // to confirm or end (ExpiryTally.decide's `known`)
     round.replies = Map(storeId -> Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false,
       late = false, holdsAcceptorState = !tx.muted)))
     val txd = tx.txd
@@ -634,7 +636,7 @@ class Frontend(val storeId: StoreId,
       decideExpiry(tx, round)
 
   private def decideExpiry(tx: Tx, round: ExpiryRound): Unit =
-    ExpiryTally.decide(tx.txd, round.replies) match
+    ExpiryTally.decide(tx.txd, round.replies, tx.knownOutcome) match
       case ExpiryTally.Decision.Hold => ()
       case ExpiryTally.Decision.Adopt(committed, finalizedOrLate) =>
         round.decided = true
@@ -653,9 +655,9 @@ class Frontend(val storeId: StoreId,
         handleTransactionMessage(adopted)
       case ExpiryTally.Decision.Discard =>
         round.decided = true
-        if tx.provesCommitToItsDriver then
+        if tx.knownOutcome.nonEmpty then
           expiryRounds.remove(tx.transactionId)
-          tx.concludeOwedCommit()
+          tx.concludeKnownOutcome()
         else if tx.needsUnackedCheck then
           // A commit vote may be owed T: discarded only once a lookup started now finds no entry (unackedLookupComplete)
           if tx.decideExpiryDiscard() then

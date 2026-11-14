@@ -56,9 +56,10 @@ Designs: `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2
   driver, so such a Tx ends by expiry (below)
 
 #### Expiry (transaction horizon design, section 2)
-- A Tx still unresolved past the horizon plus the expiry margin (`Frontend.expiryMargin`: `MaxStartLead` +
-  `Host.txHeartbeatTimeout` + one heartbeat; T's start against the host's wall clock) is `expiring`. So is a commit
-  vote that applied T from its UnackedCommits entry and waits for a TxFinalized (`provesCommitToItsDriver`). At store
+- A Tx still unfinalized past the horizon plus the expiry margin (`Frontend.expiryMargin`: `MaxStartLead` +
+  `Host.txHeartbeatTimeout` + one heartbeat; T's start against the host's wall clock) is `expiring` (`Tx.mayExpire`):
+  unresolved, or resolved and waiting for a TxFinalized that its host missed for longer than the caches remember T
+  (resolved by Paxos, or applied from its UnackedCommits entry: `provesCommitToItsDriver`). At store
   heartbeat (`Frontend.expiryHeartbeat`) it sends `TxStatusRequest` to every other store of T, at once, then after 1,
   2, 4 and every 8 heartbeats. Each round has a fresh `requestUUID` and counts only its own replies, plus the Tx's own
   acceptor state (a muted Tx holds none)
@@ -66,11 +67,15 @@ Designs: `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2
   committed one through `TxResolved` (late if finalized or late, so a commit vote looks up its entry), an aborted one
   as a `TxFinalized` abort; (2) otherwise the primary pool's (`txd.primaryObjectIDA`) stores that replied "unknown" or
   without acceptor state are non-holders, and silent ones possible holders; (3) more than `width - writeThreshold`
-  non-holders: `Discard`; (4) else `Hold` and ask again
+  non-holders: `Discard`; (4) else `Hold` and ask again. A Tx that knows its outcome passes it (`known`): rule 1 then
+  adopts only a finalized or late commit of a known commit, and an outcome reply without acceptor state (a status
+  cache answering) is a non-holder, since re-adopting the known outcome would change nothing
 - `Discard`: an abort voter, a Tx with no vote, a prover or a muted Tx is discarded at once. A commit voter
   (`needsUnackedCheck`, which covers expiring Txs too) first looks up its entry: none found by a lookup started after
   the decision discards it; one found applies T and concludes it as a late commit; a failed lookup keeps it holding and
-  is retried at heartbeat. It never discards on a failure. An entry-applied Tx concludes as finalized (applied stub).
+  is retried at heartbeat. It never discards on a failure. A Tx that knows its outcome concludes instead
+  (`Tx.concludeKnownOutcome`): an entry-applied one as finalized with its applied stub; another commit as a late commit
+  of a transaction applied here (its own lookup decides the stub); an abort as finalized.
   Discarding releases locks and objects, deletes the CRL state as for a forgotten abort, forgets the Tx, and leaves the
   status cache alone (no outcome is known). An expiring commit vote also holds an abort for a lookup, as a recovered
   one does, but its store drives it meanwhile (`awaitsFirstUnackedLookup` is for recovered votes only)

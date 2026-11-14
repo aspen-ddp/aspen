@@ -38,7 +38,10 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
 
   override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
     if name == reDrivenAbortTest then
-      testHostOptions.copy(missingDataWait = Duration(200, MILLISECONDS))
+      // A short horizon too, so the status cache forgets T (7.4 s) and expiry starts (horizon + 3.8 s) quickly. The test
+      // needs only that T is forgotten and past every store's floor when store 1 restarts. Not below about 2 s: T0's
+      // and T's prepares must reach every store within the horizon under load
+      testHostOptions.copy(missingDataWait = Duration(200, MILLISECONDS), transactionHorizon = Duration(3, SECONDS))
     else
       testHostOptions
 

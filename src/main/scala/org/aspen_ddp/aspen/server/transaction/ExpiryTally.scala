@@ -26,14 +26,23 @@ object ExpiryTally:
     *                A store absent from it was silent, and counts as a possible holder. `None`: "unknown", from a
     *                store with no Tx and no cached outcome, whose forget floor is above T's start, so it can never
     *                join T. A reply without acceptor state (a muted Tx) counts as a non-holder too
+    * @param known the outcome the asking Tx already knows (it resolved, and waits for a TxFinalized that may never
+    *              come), if any. Re-adopting it would change nothing, so rule 1 adopts only a finalized or late commit
+    *              of a known commit (which concludes it), and every other reply is classified by its acceptor state:
+    *              one with an outcome but none (a status cache answering) is a non-holder
     */
-  def decide(txd: TransactionDescription, replies: Map[StoreId, Option[TxStatusResponse.TxStatus]]): Decision =
+  def decide(txd: TransactionDescription, replies: Map[StoreId, Option[TxStatusResponse.TxStatus]],
+             known: Option[Boolean] = None): Decision =
     val outcomes = replies.valuesIterator.flatten.filter(_.status != TransactionStatus.Unresolved).toList
-    if outcomes.nonEmpty then
+    val adoptable = known match
+      case None => outcomes
+      case Some(true) => outcomes.filter(s => s.status == TransactionStatus.Committed && (s.finalized || s.late))
+      case Some(false) => Nil
+    if adoptable.nonEmpty then
       // Opposite outcomes should never arise (a split decision); a commit is preferred, as a proof is, so that a store
       // owed the commit never drops it
-      val committed = outcomes.filter(_.status == TransactionStatus.Committed)
-      val adopted = if committed.nonEmpty then committed else outcomes
+      val committed = adoptable.filter(_.status == TransactionStatus.Committed)
+      val adopted = if committed.nonEmpty then committed else adoptable
       Decision.Adopt(committed.nonEmpty, adopted.exists(s => s.finalized || s.late))
     else
       val ida = txd.primaryObjectIDA

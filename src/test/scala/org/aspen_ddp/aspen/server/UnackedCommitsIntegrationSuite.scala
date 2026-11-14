@@ -63,6 +63,17 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
     TestNetwork.HostOptions(heartbeatPeriod = Duration(300, MILLISECONDS), recordCrl = true, recoveryDrivers = true,
       wrapUnackedLookup = Some(inner => { lookups = new HoldingLookup(inner); lookups }))
 
+  private val twoStoresTest = "two stores recovering commit votes for a committed TKVL delete both apply it"
+
+  /** A short horizon, so the status cache forgets T (horizon + MaxStartLead + 8 heartbeats: 7.4 s) and expiry starts
+    * (horizon + 3.8 s margin) quickly. The test needs only that T is finalized, forgotten and past every store's floor
+    * when the stores restart; until then they get no heartbeat, so nothing expires early. Not below about 2 s: the
+    * setup transactions' prepares must reach every store within the horizon under load
+    */
+  override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
+    if name == twoStoresTest then testHostOptions.copy(transactionHorizon = Duration(3, SECONDS))
+    else testHostOptions
+
   private val k = Key(Array[Byte](1))
 
   private def sid(i: Int): StoreId = net.stores(i).storeId
@@ -206,7 +217,7 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
         (0 until 5).foreach(i => storeKeys(i, nodePtr) should contain (k))
       (tree, nodePtr)
 
-  test("two stores recovering commit votes for a committed TKVL delete both apply it"):
+  test(twoStoresTest):
     // Store 2 voted commit but never accepted; store 3 accepted too. Store 2 recovers first, while store 3 is still
     // down, so no store it hears from holds the accepted commit. Each applies the delete from its UnackedCommits entry
     // and would wait for a TxFinalized: past the horizon its peers refuse its driver (their forget floor), so it ends by

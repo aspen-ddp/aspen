@@ -4386,4 +4386,100 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
       finalized = true, late = true))
   }
+
+  // ---- Expiry of a Tx that knows its outcome but missed its TxFinalized ----
+
+  private val cacheOnlyCommit = Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = false,
+    late = false, holdsAcceptorState = false))
+
+  test("a committed Tx whose TxFinalized was lost concludes past the horizon once its peers can no longer decide it") {
+    for found <- List(false, true) do
+      withExpiryFrontend: (frontend, backend, net, crl, lookup, clock, statusCache) =>
+        frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+        frontend.receiveTransactionMessage(TxResolved(storeId, peer1, txid1, committed = true, late = false,
+          proof = false))
+        backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+        frontend.transactions(txid1).status shouldBe TransactionStatus.Committed
+        // Its TxFinalized never arrives, and its peers forgot T
+        passHorizon(clock)
+        frontend.expiryHeartbeat()
+        // Store 1's host cache still knows the commit, with no Tx: a non-holder. Re-adopting it would change nothing
+        reply(frontend, net, peer1, cacheOnlyCommit)
+        frontend.transactions.contains(txid1) shouldBe true
+        reply(frontend, net, peer2, None)
+
+        // Concluded as a late commit of a transaction applied here: its own entry decides whether a stub is owed
+        lookup.requests shouldBe List(txid1)
+        lookup.answer(txid1, Success(found))
+        frontend.transactions.contains(txid1) shouldBe false
+        if found then crl.stubsSaved should contain (txid1) else crl.deleted should contain (txid1)
+        lockedWriteTransactions(frontend, net, op1) shouldBe empty
+        statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
+          finalized = true, late = true))
+  }
+
+  test("a committed Tx whose TxFinalized was lost keeps holding while a quorum of acceptor-state holders remains") {
+    withExpiryFrontend: (frontend, _, net, _, lookup, clock, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      frontend.receiveTransactionMessage(TxResolved(storeId, peer1, txid1, committed = true, late = false,
+        proof = false))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = false,
+        late = false, holdsAcceptorState = true)))
+      reply(frontend, net, peer2, cacheOnlyCommit)
+      lookup.requests shouldBe Nil
+      frontend.transactions.contains(txid1) shouldBe true
+
+      // A later round learns it was finalized: the late-commit path concludes it
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = true,
+        late = false, holdsAcceptorState = false)))
+      lookup.answer(txid1, Success(false))
+      frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("an aborted Tx whose TxFinalized was lost concludes past the horizon once its peers can no longer decide it") {
+    withExpiryFrontend: (frontend, _, net, crl, lookup, clock, statusCache) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      frontend.receiveTransactionMessage(TxResolved(storeId, peer1, txid1, committed = false, late = false,
+        proof = false))
+      frontend.transactions(txid1).status shouldBe TransactionStatus.Aborted
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, None)
+      reply(frontend, net, peer2, None)
+
+      frontend.transactions.contains(txid1) shouldBe false
+      lookup.requests shouldBe Nil
+      crl.deleted should contain (txid1)
+      statusCache.getStatus(txid1).map(s => (s.status, s.finalized)) shouldBe Some((TransactionStatus.Aborted, true))
+  }
+
+  test("a discarded Tx waiting out a collision is not woken when its lock holder releases") {
+    // Nothing schedules a call into a Tx: waits are checked at heartbeat over the live Txs, and wake-ups (a holder's
+    // release, a persisted commit) find the discarded Tx with nothing left to wait for
+    withExpiryFrontend: (frontend, _, net, _, lookup, clock, _) =>
+      // T2 votes commit on op1 and holds its lock; T1 builds on T2's write and waits for it (Tx.awaitableHolders)
+      val t2 = lockTxd(txid2, List(overwrite(op1))).copy(startTimestamp = startedAgo(1_000))
+      frontend.receiveTransactionMessage(clientPrepare(t2))
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwriteAfter(txid2)))))
+      votes(net).map(v => (v.transactionId, v.disposition)) shouldBe List((txid2, TransactionDisposition.VoteCommit))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      for txid <- List(txid1, txid2); from <- List(peer1, peer2) do
+        val round = statusRequests(net).filter(_.transactionId == txid).last.requestUUID
+        frontend.receiveTransactionMessage(TxStatusResponse(storeId, from, txid, round, None))
+      // T1 has no vote: discarded at once. T2 waits for its lookup
+      frontend.transactions.contains(txid1) shouldBe false
+      frontend.transactions.contains(txid2) shouldBe true
+      net.sentTx = Nil
+
+      lookup.answer(txid2, Success(false)) // T2 is discarded, releasing its locks
+      frontend.transactions.contains(txid2) shouldBe false
+      frontend.expiryHeartbeat()
+      frontend.transactions.values.foreach(_.checkCollisionWait(Long.MaxValue))
+      net.sentTx.collect { case r: TxPrepareResponse => r } shouldBe Nil
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
+  }
 }

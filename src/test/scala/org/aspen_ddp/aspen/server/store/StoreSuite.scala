@@ -39,13 +39,15 @@ class StoreSuite extends AnyFunSuite with Matchers:
                       backgroundTasks: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager,
                       driverFactory: TransactionDriver.Factory = TransactionDriver.noErrorRecoveryFactory,
                       loadedAt: Option[Long] = FrontendSuite.longLoaded,
-                      wallClockMillis: () => Long = () => System.currentTimeMillis()) =
+                      wallClockMillis: () => Long = () => System.currentTimeMillis(),
+                      unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never) =
     val backend = backendOverride.getOrElse(new MapBackend(id))
     val net = new TestNet
     val crl = new TestCrl
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.global, backend,
       new HostObjectCache(1024 * 1024).forStore(id), net, backgroundTasks, crl, statusCache,
-      null, driverFactory, heartbeatTimeout, None, loadedAt = loadedAt, wallClockMillis = wallClockMillis)
+      null, driverFactory, heartbeatTimeout, None, unackedLookup = unackedLookup, loadedAt = loadedAt,
+      wallClockMillis = wallClockMillis)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     val os = mkObjectState(oid1)
     backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
@@ -145,14 +147,19 @@ class StoreSuite extends AnyFunSuite with Matchers:
     crl.txSaved shouldBe false
   }
 
+  /** A fixed start on the injected clock: the store's view of time is the test's alone */
+  private val fixedStart = 1_000_000_000_000L
+  private def fixedTxd = txd.copy(startTimestamp = HLCTimestamp(fixedStart << 16))
+
   test("a driver past the horizon is removed once its store's Tx expired") {
-    var now = System.currentTimeMillis()
+    var now = fixedStart
     val (store, net, _) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS),
       wallClockMillis = () => now)
     // A client's prepare without the data: an abort vote at once
-    store.receiveTransactionMessage(prepare(leader, leader).copy(fromClient = true))
+    store.receiveTransactionMessage(TxPrepare(leader, leader, fixedTxd, ProposalId.initialProposal(1.toByte), Nil, Nil,
+      fromClient = true))
     store.hasTransactions shouldBe true
-    val start = store.frontend.transactions(txid1).txd.startTimestamp.wallTime
+    val start = fixedStart
 
     now = start + 20_000 + store.expiryMargin.toMillis + 1
     store.heartbeat()
@@ -162,6 +169,31 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
     round.foreach(r => store.receiveTransactionMessage(TxStatusResponse(leader, r.to, txid1, r.requestUUID, None)))
     store.frontend.transactions.contains(txid1) shouldBe false
+    store.heartbeat()
+    store.hasTransactions shouldBe false
+  }
+
+  test("a committed Tx whose TxFinalized was lost concludes past the horizon, and its driver is removed") {
+    var now = fixedStart
+    val lookup = new ManualLookup
+    val (store, net, crl) = mkStore(storeId, new TransactionStatusCache(), Duration.Zero,
+      wallClockMillis = () => now, unackedLookup = lookup)
+    store.receiveTransactionMessage(TxPrepare(storeId, leader, fixedTxd, ProposalId.initialProposal(1.toByte),
+      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), Nil, fromClient = true))
+    store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true, late = false, proof = false))
+    // Its TxFinalized is lost: idle, it gets a driver, which its peers (past their floor) never answer
+    store.heartbeat()
+    store.hasTransactions shouldBe true
+
+    now = fixedStart + 20_000 + store.expiryMargin.toMillis + 1
+    store.heartbeat()
+    val round = net.sentTx.collect { case r: TxStatusRequest => r }
+    round.map(_.to).toSet shouldBe Set(leader, peer)
+    round.foreach(r => store.receiveTransactionMessage(TxStatusResponse(storeId, r.to, txid1, r.requestUUID, None)))
+    lookup.answer(txid1, scala.util.Success(false)) // Not owed a stub
+    store.frontend.transactions.contains(txid1) shouldBe false
+    crl.deleted should contain (txid1)
+
     store.heartbeat()
     store.hasTransactions shouldBe false
   }

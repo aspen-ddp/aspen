@@ -72,3 +72,30 @@ class ExpiryTallySuite extends AnyFunSuite with Matchers:
       Decision.Discard
     ExpiryTally.decide(txd, Map(primary(0) -> muted, primary(1) -> unknown, primary(2) -> holder)) shouldBe
       Decision.Hold
+
+  // ---- A Tx that already knows the outcome (resolved, waiting for a TxFinalized that may never come) ----
+
+  private def cached(status: TransactionStatus.Value) = outcome(status)
+  private def heldOutcome(status: TransactionStatus.Value) =
+    Some(TxStatus(status, finalized = false, late = false, holdsAcceptorState = true))
+
+  test("a known-outcome Tx with cache-only replies discards"):
+    // Re-adopting a known, unfinalized outcome would change nothing: cache-only replies are non-holders
+    ExpiryTally.decide(txd, Map(primary(0) -> cached(TransactionStatus.Committed),
+      primary(1) -> cached(TransactionStatus.Committed), primary(2) -> unknown), known = Some(true)) shouldBe
+      Decision.Discard
+    ExpiryTally.decide(txd, Map(primary(0) -> cached(TransactionStatus.Aborted),
+      primary(1) -> unknown, primary(2) -> unknown), known = Some(false)) shouldBe Decision.Discard
+
+  test("a known-outcome Tx with acceptor-state holders holds"):
+    ExpiryTally.decide(txd, Map(primary(0) -> heldOutcome(TransactionStatus.Committed),
+      primary(1) -> heldOutcome(TransactionStatus.Committed), primary(2) -> holder,
+      primary(3) -> cached(TransactionStatus.Committed), primary(4) -> unknown), known = Some(true)) shouldBe
+      Decision.Hold
+
+  test("a known commit still adopts a finalized or late commit"):
+    ExpiryTally.decide(txd, Map(primary(0) -> outcome(TransactionStatus.Committed, finalized = true)),
+      known = Some(true)) shouldBe Decision.Adopt(true, true)
+    // A known abort adopts nothing: it concludes or holds by the classification
+    ExpiryTally.decide(txd, Map(primary(0) -> outcome(TransactionStatus.Committed, finalized = true)),
+      known = Some(false)) shouldBe Decision.Hold

@@ -27,6 +27,10 @@ object Tx {
 
   /** How long after a transaction started its client's prepare may first reach a store before the store logs it */
   val LateClientPrepareAfter: FiniteDuration = FiniteDuration(500, MILLISECONDS)
+
+  /** `txd` started more than `horizon` plus `margin` before `nowMillis`, on the host's wall clock (expiry) */
+  def pastHorizon(txd: TransactionDescription, nowMillis: Long, horizon: FiniteDuration, margin: FiniteDuration): Boolean =
+    txd.startTimestamp.wallTime + horizon.toMillis + margin.toMillis < nowMillis
 }
 
 class Tx( trs: TransactionRecoveryState,
@@ -186,8 +190,8 @@ class Tx( trs: TransactionRecoveryState,
 
   // ---- Expiry (transaction horizon design, section 2) ----
 
-  /** Unresolved past the horizon plus the expiry margin: its store queries its peers' status and decides from their
-    * replies (Frontend.expiryHeartbeat, ExpiryTally). Never cleared
+  /** Unfinalized past the horizon plus the expiry margin (mayExpire): its store queries its peers' status and decides
+    * from their replies (Frontend.expiryHeartbeat, ExpiryTally). Never cleared
     */
   private var expiringTx = false
 
@@ -200,16 +204,40 @@ class Tx( trs: TransactionRecoveryState,
 
   /** T started more than `horizon` plus `margin` before `nowMillis`, on the host's wall clock */
   def pastHorizon(nowMillis: Long, horizon: FiniteDuration, margin: FiniteDuration): Boolean =
-    txd.startTimestamp.wallTime + horizon.toMillis + margin.toMillis < nowMillis
+    Tx.pastHorizon(txd, nowMillis, horizon, margin)
 
-  /** Whether expiry applies: the outcome is unknown, or known only from this store's UnackedCommits entry while it
-    * waits for a TxFinalized (provesCommitToItsDriver) that may never come; the objects have loaded (completeLoad ran,
-    * so a recovered Tx is no longer holding its store's messages); and no late commit waits for its lookup, which ends
-    * the Tx itself
+  /** Whether expiry applies: the Tx is not finalized, so either the outcome is unknown, or it is known (resolved,
+    * possibly only from this store's UnackedCommits entry: provesCommitToItsDriver) and the Tx waits for a TxFinalized
+    * that may never come, its host having missed it for longer than the status caches remember T; the objects have
+    * loaded (completeLoad ran, so a recovered Tx is no longer holding its store's messages); and no late commit waits
+    * for its lookup, which ends the Tx itself
     */
   def mayExpire: Boolean =
-    (oresolution.isEmpty || provesCommitToItsDriver) && ofinalized.isEmpty && loadCompleted && !lateCommitHeld &&
-      !forgetLookupHeld
+    ofinalized.isEmpty && loadCompleted && !lateCommitHeld && !forgetLookupHeld
+
+  /** The outcome this Tx knows, if resolved: see ExpiryTally.decide */
+  def knownOutcome: Option[Boolean] = oresolution
+
+  /** ExpiryTally decided Discard for a Tx that knows its outcome: no quorum holds T past the horizon, so no TxFinalized
+    * will come, and a commit was finalized (a quorum forgets a commit only then). It concludes as finalized:
+    *  - applied from its UnackedCommits entry: concludeOwedCommit;
+    *  - another commit: as a late commit of a transaction resolved here (lateCommit): an applied stub if one is owed,
+    *    which its own UnackedCommits lookup decides, and forgotten;
+    *  - an abort: finalized, its state already deleted at resolution, and forgotten.
+    */
+  def concludeKnownOutcome(): Unit =
+    oresolution match
+      case Some(true) if provesCommitToItsDriver => concludeOwedCommit()
+      case Some(true) =>
+        logger.info(s"Tx $transactionId on store $storeId: resolved committed, and its peers can no longer decide it " +
+          s"past the transaction horizon: concluded as a late commit")
+        lateCommit()
+      case Some(false) =>
+        logger.info(s"Tx $transactionId on store $storeId: resolved aborted, and its peers can no longer decide it " +
+          s"past the transaction horizon: concluded as finalized")
+        finalized(false)
+        frontend.forget(this)
+      case None => ()
 
   /** ExpiryTally decided Discard for a Tx that applied T through its UnackedCommits entry (provesCommitToItsDriver):
     * no quorum holds T, so no TxFinalized will come, and T committed and was finalized (its entry is durable only once
@@ -226,7 +254,7 @@ class Tx( trs: TransactionRecoveryState,
   def beginExpiry(): Unit =
     if !expiringTx then
       expiringTx = true
-      logger.info(s"Tx $transactionId on store $storeId is unresolved past the transaction horizon: querying its " +
+      logger.info(s"Tx $transactionId on store $storeId is unfinalized past the transaction horizon: querying its " +
         s"peers' status. ${stateSummary(System.nanoTime())}")
 
   /** ExpiryTally decided Discard for this commit vote: returns false if it was already decided. See

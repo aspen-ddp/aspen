@@ -335,7 +335,9 @@ requirement attached, and that difference is everything: `DoesNotExist` makes th
 insert-if-absent, while `KeyRevision` makes the second a compare-and-swap.
 
 Aspen has no separate "set" operation — `Insert` overwrites an existing key. An unguarded `Insert`
-is a blind clobber, so the requirement is the part you have to think about.
+is a blind clobber, so the requirement is the part you have to think about. (Stores order blind
+inserts of one key by transaction timestamp, so the latest one wins everywhere. A `Delete` gets no such
+help: one without the key's `KeyRevision` is refused with `BlindKeyValueWrite` when the transaction is built.)
 
 These also show the transaction being driven by hand, rather than through `transact`, so the commit
 is visible. `commit()` returns a Future that fails if the transaction aborts.
@@ -414,12 +416,15 @@ for
   _ <- client.transact { t =>
          given tx: Transaction = t
 
-         // Exists is the mirror of DoesNotExist: refuse to delete something already gone.
+         // A delete names the revision of the key it removes, read just above: it is refused if the
+         // key is gone or was rewritten since. A delete without one (or guarded only by Exists) is
+         // refused when the transaction is built, because stores keep no record of a deleted key
+         // to order a late or replayed delete against later writes.
          tx.update(
            indexPtr,
            None,
            None,
-           List(KeyValueUpdate.Exists(ScalaKey)),
+           List(KeyValueUpdate.KeyRevision(ScalaKey, current.contents(ScalaKey).revision)),
            List(Delete(ScalaKey)))
 
          // DataObjects have no per-key structure, so `overwrite` replaces the whole blob and
@@ -439,6 +444,7 @@ for
   // job, and the transaction is the tool for it.
   // -------------------------------------------------------------------------------------
   noteState <- client.read(notePtr)
+  indexState <- client.read(indexPtr)
 
   _ <- client.transact { t =>
          given tx: Transaction = t
@@ -447,7 +453,7 @@ for
            indexPtr,
            None,
            None,
-           List(KeyValueUpdate.Exists(NotePointerKey)),
+           List(KeyValueUpdate.KeyRevision(NotePointerKey, indexState.contents(NotePointerKey).revision)),
            List(Delete(NotePointerKey)))
 
          tx.setRefcount(notePtr, noteState.refcount, noteState.refcount.decrement())

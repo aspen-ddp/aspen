@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.internal.allocation.DeletionFinalizationAction
-import org.aspen_ddp.aspen.client.{UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
+import org.aspen_ddp.aspen.client.{BlindKeyValueWrite, UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -108,6 +108,8 @@ class TransactionBuilder(
           requirements = DataUpdate(dptr, ObjectRevision.Allocating, DataUpdateOperation.Overwrite) :: requirements
         case kvptr: KeyValueObjectPointer =>
           keyValueUpdates += (kvptr -> KVUpdate(kvptr, None, None, Nil, Nil))
+
+    keyValueUpdates.valuesIterator.foreach(refuseBlindWrites)
 
     keyValueUpdates.valuesIterator.foreach: kvu =>
       requirements = KeyValueUpdate(kvu.pointer, kvu.requiredRevision, kvu.contentLock, kvu.requirements,
@@ -293,6 +295,25 @@ class TransactionBuilder(
     dataObjectUpdates += (objectPointer -> data)
     requirements  = DataUpdate(objectPointer, requiredRevision, DataUpdateOperation.Overwrite) :: requirements
   }
+
+  /** Stores apply a blind key Insert last-writer-wins on (timestamp, revision), so a lagging store or a crash
+    * re-apply cannot regress a later write of the key (KVObjectState.insertWins). A Delete leaves no tombstone and
+    * object-level parts carry no timestamp, so the same cannot be done for them: an update with neither a required
+    * revision nor a content lock must not delete a key it holds no KeyRevision on, or change an object-level part,
+    * unless it is the initial content of an object this transaction allocates (transaction-requirements F1).
+    */
+  private def refuseBlindWrites(kvu: KVUpdate): Unit =
+    val pinned = kvu.requiredRevision.nonEmpty || kvu.contentLock.nonEmpty ||
+      allocatingObjects.exists(_.id == kvu.pointer.id)
+    if !pinned then
+      val revisionChecked = kvu.requirements.collect { case r: KeyValueUpdate.KeyRevision => r.key }.toSet
+      kvu.operations.foreach:
+        case _: Insert =>
+        case d: Delete =>
+          if !revisionChecked.contains(d.key) then
+            throw BlindKeyValueWrite(kvu.pointer, "Delete of a key with no KeyRevision")
+        case op =>
+          throw BlindKeyValueWrite(kvu.pointer, s"${op.getClass.getSimpleName} with no required revision")
 
   def update(
               pointer: KeyValueObjectPointer,

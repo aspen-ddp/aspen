@@ -45,7 +45,8 @@ object RequirementsApplyer extends Logging {
     * a committed update, or repair and rebuild copying a committed state, gives an object that revision. An object
     * shows it when its revision is the transaction's, for an update that moves the revision (DataUpdate, VersionBump,
     * KeyValueUpdate with a required revision), or when a key carries it, for a KeyValueUpdate without one. A
-    * RefcountUpdate, or a KeyValueUpdate that only deletes, leaves no trace.
+    * RefcountUpdate, a KeyValueUpdate that only deletes, or one whose Inserts later writes superseded
+    * (`KVObjectState.insertWins`), leaves no trace.
     */
   def appliedBy(transactionId: TransactionId,
                 requirements: List[TransactionRequirement],
@@ -75,6 +76,11 @@ object RequirementsApplyer extends Logging {
 
     var failedObjects: Set[ObjectId] = Set()
 
+    // Object timestamps are monotone (transaction-requirements F4). A revision-moving update's check already rejects
+    // an object timestamp later than the transaction's (ObjectTimestampError); blind KeyValue and Refcount updates
+    // have no such check, and a late one must not lower the timestamp
+    def later(current: HLCTimestamp): HLCTimestamp = if current > timestamp then current else timestamp
+
     // Filter out all non-object requirements and any objects not fit for accepting tx changes
     val reqIter = requirements.iterator.filter(r => r.isInstanceOf[TransactionObjectRequirement]).map { r =>
       val tr = r.asInstanceOf[TransactionObjectRequirement]
@@ -90,7 +96,7 @@ object RequirementsApplyer extends Logging {
             val s = objects(ptr.id)
             s.metadata = s.metadata.copy(
               revision=ObjectRevision(transactionId),
-              timestamp=timestamp)
+              timestamp=later(s.metadata.timestamp))
 
             r.operation match {
               case DataUpdateOperation.Overwrite => s.data = objectUpdates(ptr.id)
@@ -104,11 +110,13 @@ object RequirementsApplyer extends Logging {
             val state = objects(ptr.id)
             val kvs = state.kvState.get
 
-            // Every update advances the object's timestamp, so the object's timestamp tells repair whether a store
-            // has caught up. Only an update with a required revision moves the revision.
+            // Every update advances the object's timestamp, never lowers it, so the object's timestamp tells repair
+            // whether a store has caught up whatever order it applied updates in. Only an update with a required
+            // revision moves the revision.
             state.metadata = r.requiredRevision match {
-              case Some(_) => state.metadata.copy(revision=ObjectRevision(transactionId), timestamp=timestamp)
-              case None => state.metadata.copy(timestamp=timestamp)
+              case Some(_) => state.metadata.copy(revision=ObjectRevision(transactionId),
+                                                  timestamp=later(state.metadata.timestamp))
+              case None => state.metadata.copy(timestamp=later(state.metadata.timestamp))
             }
 
             val kvops = KeyValueOperation.decode(objectUpdates(ptr.id), ObjectRevision(transactionId), timestamp)
@@ -124,8 +132,10 @@ object RequirementsApplyer extends Logging {
                 case _: DeleteLeft => kvs.left = None
                 case _: DeleteRight => kvs.right = None
                 case o: Insert =>
-                  val vs = new ValueState(Value(o.value), ObjectRevision(transactionId), timestamp, None)
-                  kvs.content += (o.key -> vs)
+                  // Last writer wins: an Insert a later write of the key superseded leaves the key alone
+                  if KVObjectState.insertWins(kvs.content.get(o.key), ObjectRevision(transactionId), timestamp) then
+                    val vs = new ValueState(Value(o.value), ObjectRevision(transactionId), timestamp, None)
+                    kvs.content += (o.key -> vs)
                 case o: Delete => kvs.content -= o.key
               }
             }
@@ -136,13 +146,13 @@ object RequirementsApplyer extends Logging {
             val s = objects(ptr.id)
             s.metadata = s.metadata.copy(
               refcount=r.newRefcount,
-              timestamp=timestamp)
+              timestamp=later(s.metadata.timestamp))
 
           case _: VersionBump =>
             val s = objects(ptr.id)
             s.metadata = s.metadata.copy(
               revision=ObjectRevision(transactionId),
-              timestamp=timestamp)
+              timestamp=later(s.metadata.timestamp))
 
           case _: ExclusiveRevisionLock =>
 

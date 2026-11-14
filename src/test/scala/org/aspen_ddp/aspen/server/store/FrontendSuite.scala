@@ -1786,6 +1786,30 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(2, 2)
   }
 
+  test("a store applying two blind inserts of a key in opposite order keeps the later one (Req F1)") {
+    val (frontend, backend, net, stops) = failStopFixture()
+    val now = System.currentTimeMillis()
+    def blindInsert(txid: TransactionId, startMs: Long) =
+      lockTxd(txid, List(KeyValueUpdate(kvPtr, None, None, Nil))).copy(startTimestamp = HLCTimestamp(startMs << 16))
+    def insertOf(v: Byte) = KeyValueOperation.encode(List(new Insert(k(1), Array[Byte](v))), ida)(0)
+
+    // A votes commit here and holds k(1). B, started after A committed elsewhere, collides here but is committed by
+    // the other stores, and its resolution reaches this store before A's (delayed) one
+    prepare(frontend, net, blindInsert(txid1, now - 10), insertOf(1)).disposition shouldBe TransactionDisposition.VoteCommit
+    prepare(frontend, net, blindInsert(txid2, now), insertOf(2)).disposition shouldBe TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid2, committed = true)
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+    net.txMessage() match
+      case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
+      case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+
+    val stored = backend.get(oid2).get
+    val vs = KVObjectState.decode(stored.data).content(k(1))
+    vs.revision shouldBe ObjectRevision(txid2)
+    stored.metadata.timestamp shouldBe HLCTimestamp(now << 16)
+    stops() shouldBe Nil
+  }
+
   // ---- Fail-stop of a commit voter that cannot hold the update it voted for (transaction-requirements F5, F6) ----
 
   /** lockFixture whose Frontend records its fail-stops */

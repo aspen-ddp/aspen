@@ -175,6 +175,11 @@ Fix sketch: repair of N over a foreign occupant should drop the occupant if the 
 
 ### X7. Rebuild-written timestamps feed the repair completion gate that is not monotone (rebuild 5.2 x repair F3/F13 x requirements F4)
 
+> **2026-11-14 (Todo 2.2): NARROWED.** Requirements F4 is fixed: applies no longer lower an object timestamp, so blind
+> writes and refcount updates cannot move timestamps backwards. Part (b), the DataObject skip on
+> `read.timestamp < current.timestamp` (repair F13), and the gate's reliance on copied timestamps remain (Todo 2.5,
+> 4.5).
+
 > **Refresh (replay pins): unchanged.**
 Verdict: PLAUSIBLE.  Severity: liveness / silent early completion.
 `rebuildWrite` stores the read's revision/refcount/timestamp. Repair declares an entry complete when the read timestamp is at least the entry's `missedTimestamp`

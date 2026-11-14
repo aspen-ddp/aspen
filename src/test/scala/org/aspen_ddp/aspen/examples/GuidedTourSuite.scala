@@ -231,12 +231,15 @@ class GuidedTourSuite extends IntegrationTestSuite:
       _ <- client.transact { t =>
              given tx: Transaction = t
 
-             // Exists is the mirror of DoesNotExist: refuse to delete something already gone.
+             // A delete names the revision of the key it removes, read just above: it is refused if the
+             // key is gone or was rewritten since. A delete without one (or guarded only by Exists) is
+             // refused when the transaction is built, because stores keep no record of a deleted key
+             // to order a late or replayed delete against later writes.
              tx.update(
                indexPtr,
                None,
                None,
-               List(KeyValueUpdate.Exists(ScalaKey)),
+               List(KeyValueUpdate.KeyRevision(ScalaKey, current.contents(ScalaKey).revision)),
                List(Delete(ScalaKey)))
 
              // DataObjects have no per-key structure, so `overwrite` replaces the whole blob and
@@ -256,6 +259,7 @@ class GuidedTourSuite extends IntegrationTestSuite:
       // job, and the transaction is the tool for it.
       // -------------------------------------------------------------------------------------
       noteState <- client.read(notePtr)
+      indexState <- client.read(indexPtr)
 
       _ <- client.transact { t =>
              given tx: Transaction = t
@@ -264,7 +268,7 @@ class GuidedTourSuite extends IntegrationTestSuite:
                indexPtr,
                None,
                None,
-               List(KeyValueUpdate.Exists(NotePointerKey)),
+               List(KeyValueUpdate.KeyRevision(NotePointerKey, indexState.contents(NotePointerKey).revision)),
                List(Delete(NotePointerKey)))
 
              tx.setRefcount(notePtr, noteState.refcount, noteState.refcount.decrement())

@@ -158,7 +158,7 @@ object RequirementsChecker extends Logging {
             // The measure is the serialized KVObjectState, which is what the store persists for the object
             // (RequirementsApplyer sets data = kvs.encode()).
             maxSliceSize.foreach { limit =>
-              checkSliceSize(r.objectPointer.id, kvs.encodedSize.toLong, kvs.encodedSizeAfter(ops.get).toLong, limit)
+              checkSliceSize(r.objectPointer.id, kvs.encodedSize.toLong, kvs.encodedSizeAfter(ops.get, ObjectRevision(transactionId), txTimestamp).toLong, limit)
             }
 
           case r: RefcountUpdate => checkRefcount(getState(r.objectPointer.id), r.requiredRefcount)

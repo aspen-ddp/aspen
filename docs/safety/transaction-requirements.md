@@ -546,10 +546,10 @@ under reordering/crash; Low = needs an unusual precondition or a trust-model vio
 
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
-| F1 | **narrowed** | Per-write checked writes (every TKVL put and delete by default) fail their key check at apply on a store that applied a newer write, and are skipped, reported and marked; blind writes are unchanged | `KeyValueListNode.scala:489-506`; `RequirementsChecker.scala:141`; `Tx.scala:615-652` |
-| F2 | **narrowed** | Same re-check for the crash re-apply; blind writes and `DoesNotExist` inserts after a later delete still re-apply | as F1; `RequirementsApplyer.scala:65+` |
+| F1 | **narrowed** (FIXED for blind Inserts 2026-11-14) | Per-write checked writes (every TKVL put and delete by default) fail their key check at apply on a store that applied a newer write, and are skipped, reported and marked. *2026-11-14:* blind Inserts apply last-writer-wins; blind deletes and object-level ops are refused by the builder; residual: resurrection after a later delete | `KeyValueListNode.scala:501-518`; `RequirementsChecker.scala:141`; `KVObjectState.insertWins` |
+| F2 | **narrowed** (FIXED for blind Inserts 2026-11-14) | Same re-check for the crash re-apply. *2026-11-14:* a re-applied older blind Insert is a no-op; blind and `DoesNotExist` inserts after a later delete still re-apply | as F1 |
 | F3 | unchanged | Pre-transaction rebuild untouched | `Tx.scala:429-441` |
-| F4 | unchanged | Blind and refcount timestamps still assigned unconditionally (TKVL KV updates still carry no required revision) | `RequirementsApplyer.scala` (not in the diff) |
+| F4 | **FIXED** 2026-11-14 | Object timestamps are the max of current and transaction timestamps at every apply | `RequirementsApplyer.apply` |
 | F5 | unchanged | `doCommit` still unlocks before applying | `Tx.scala:602` |
 | F6 | unchanged | `RequirementsLocker.lock` untouched | not in the diff |
 | F7 | unchanged (extended) | Stores also do not check the pin rule (Q-N4) | `TransactionBuilder.scala:140-141` |
@@ -581,6 +581,11 @@ under reordering/crash; Low = needs an unusual precondition or a trust-model vio
 
 ### F1. Sequential blind KV writes of one key (or object-level field) can be applied in opposite orders by a lagging store; permanent divergence with no repair entry. Confidence: Medium.
 
+> **FIXED 2026-11-14 for blind Inserts (Todo 2.2).** Stores apply every key `Insert` last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`, `RequirementsApplyer`): an Insert that a later write of the key superseded is a no-op, not a skip, so it is neither reported nor a fail-stop, and a lagging store or a crash re-apply converges with the others. `TransactionBuilder` refuses (`BlindKeyValueWrite`) a key `Delete` with no `KeyRevision` on that key, an `Exists`-guarded one included, and an object-level operation, in an update with neither a required revision nor a content lock, outside an allocation's initial content: a delete leaves no tombstone to order by. No production caller issued either. *Residual:* a late or replayed blind Insert that arrives after a later checked delete of its key resurrects the key, the same as the `DoesNotExist` ABA. There is no per-key generation for now; Todo 2.9 re-assesses it. The refusal is enforced by the client only (Todo 2.14). Tests: RequirementsApplyerSuite "two
+> blind inserts of a key applied in opposite orders converge to the later one (Req F1)"; FrontendSuite "a store
+> applying two blind inserts of a key in opposite order keeps the later one (Req F1)"; TransactionBuilderSuite
+> "a blind Delete is refused even when replay-safe".
+
 > **Refresh (replay pins): NARROWED.** TKVL puts now carry `KeyRevision`/`DoesNotExist` and deletes `KeyRevision`
 > (`KeyValueListNode.scala:489-506`); the apply re-check enforces them (`RequirementsChecker.scala:141`), so a lagging
 > store skips the older write and reports it in `TxCommitted.objectCommitErrors` (`Tx.scala:640-652`), which the finalizer
@@ -606,6 +611,11 @@ already present at this store). *Possible direction:* last-writer-wins on `(Valu
 time for blind writes, with tombstones for deletes, or forbid blind writes.
 
 ### F2. A blind KV write can be replayed over newer state after a crash between "backend commit persisted" and "CRL object data dropped". Confidence: Low-Medium.
+
+> **FIXED 2026-11-14 for blind Inserts (Todo 2.2).** The crash re-apply of an older blind Insert over a newer write of
+> its key is a no-op (last writer wins, see F1), and a re-apply of the same Insert writes the same value. Blind
+> deletes are refused by the builder. *Residual:* a late or replayed blind Insert that arrives after a later checked delete of its key resurrects the key, the same as the `DoesNotExist` ABA. There is no per-key generation for now; Todo 2.9 re-assesses it. The refusal is enforced by the client only (Todo 2.14). Test: RequirementsApplyerSuite "a re-applied older blind insert
+> does not regress a newer one; the same insert re-applies idempotently (Req F2)".
 
 > **Refresh (replay pins): NARROWED.** As F1 for checked writes. A derived `DoesNotExist(k)` insert is not ABA-free: if
 > k was deleted after A, A's re-apply passes and resurrects k.
@@ -639,6 +649,12 @@ cache can lower the store's refcount serial, timestamp or (for KV) data below th
 limited; I did not trace whether KV objects can reach it.
 
 ### F4. The object timestamp is last-applied-wins, not monotone, and differs by apply order. Confidence: Medium (certain behaviour, uncertain impact).
+
+> **FIXED 2026-11-14 (Todo 2.2).** Every apply sets the object timestamp to the later of its current value and the
+> transaction's (`RequirementsApplyer.apply`, `later`). Revision-moving updates were already guarded by
+> `ObjectTimestampError`, so only blind KeyValue and `RefcountUpdate` applies change. Replicas that applied the same
+> set of updates in different orders now hold the same object timestamp. Test: RequirementsApplyerSuite "the object
+> timestamp never goes backwards for blind KeyValue and Refcount updates (Req F4)".
 
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness (repair livelock) / stale metadata.** RequirementsApplyer sets timestamp := txd.startTimestamp unconditionally for blind KV and RefcountUpdate (RequirementsApplyer.scala:109-112, 137-139), without max. See repair F3 for the consequence.
 > *Fix sketch:* Use max(existing, tx) timestamp for blind updates.
@@ -887,7 +903,8 @@ can starve shared lockers. Documented behaviour.
 3. Should `Frontend.opportunisticRebuild` and `Tx.completeLoad`'s pre-transaction rebuild share one guarded implementation (F3)?
 4. Should object-level KV operations without a required revision be flagged like `deletesKeys` for the traceless path (F8)?
 5. Should the key `ValueState.timestamp` take part in apply (F1, F2), so that blind writes become last-writer-wins by
-   transaction timestamp?
+   transaction timestamp? *Answered 2026-11-14:* yes for Inserts, on (timestamp, revision); blind deletes and
+   object-level operations are refused instead, since nothing records a deleted key's timestamp.
 
 ## 12. Todo question: is `RevisionLock` exclusive?
 

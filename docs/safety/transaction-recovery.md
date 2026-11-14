@@ -722,7 +722,7 @@ Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding 
 | F1 | unchanged | `getType(...).get` still throws inside `onResolution` | `RegisteredTransactionFinalizerFactory.scala:66-70`; `TransactionDriver.scala:585` |
 | F2 | unchanged (consequence worse) | Still no failure path; and the marker now runs only after every other action succeeds, so a failed action also loses the ErrorTree marks and UnackedCommits entries (R-N2) | `TransactionDriver.scala:593-596`; `RegisteredTransactionFinalizerFactory.scala:39-42` |
 | F3 | **narrowed** | A late commit reaches a live commit voter's lookup and is applied (`lateCommit`); an abort still is accepted at once by a non-recovered Tx | `Tx.scala:158-160,926-930` |
-| F4 | **narrowed** | TKVL puts and deletes now carry per-write checks, re-checked at apply; blind writes and `DoesNotExist` inserts after a later delete still re-apply | `KeyValueListNode.scala:489-500`; `RequirementsChecker.scala:141` |
+| F4 | **narrowed** | TKVL puts and deletes now carry per-write checks, re-checked at apply; blind writes and `DoesNotExist` inserts after a later delete still re-apply. *2026-11-14:* a blind Insert re-applied over a newer write is a no-op; inserts after a later delete remain | `KeyValueListNode.scala:501-518`; `RequirementsChecker.scala:141`; `KVObjectState.insertWins` |
 | F5 | **narrowed** | A re-derived outcome is a late commit when a proof exists; abort only without one | `TransactionDriver.scala:262-263,318-319` |
 | F6 | unchanged | Persisted status still not restored into `oresolution`; such a Tx is excluded from the lookup | `Tx.scala:68-69,158-160` |
 | F7 | **fixed** | The horizon is gone; no clock decides replay | `Frontend.scala:671-691` |
@@ -830,6 +830,11 @@ key before repair) applies equally to this non-crash case. Trigger: GC pause, VM
 > (`MissedUpdateMarker`), raw revision-less `tx.update` writes, and `DoesNotExist` inserts whose key was deleted since
 > (ABA). A recovered acceptor holding an accepted commit learns a non-late commit from its own driver (paxos P-N3), so
 > its re-apply is still reachable for those writes.
+
+> **2026-11-14 (Todo 2.2): NARROWED further.** A replayed blind Insert over a newer write of its key is a no-op
+> (last writer wins on (timestamp, revision), transaction-requirements F1/F2), also through `unackedCommitFound`. Blind
+> deletes are refused by the builder. Residual: a blind or `DoesNotExist` Insert replayed after a later delete of its
+> key resurrects it (Todo 2.9).
 
 **F4 (L-M) Replay of a blind KV write or refcount change from a CRL entry that was already applied.** The applied-data
 drop is only in memory (`SimpleCRL.scala:299`, `LogContent.scala:206`), so a crash after the backend commit but before the

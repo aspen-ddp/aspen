@@ -62,7 +62,8 @@
   requires the key's `KeyRevision`, and a key the node does not hold is not deleted; rename's new key gets
   `KeyRevision` or `DoesNotExist`. These are per key: no node-level serialization. A competing write fails them as an
   ordinary abort that the caller retries, never `KeyAlreadyExists`. `PutRequirement.Blind` (`TKVLInsert.blind`) opts
-  out, for idempotent upserts only; `AtRevision(rev)` requires a given revision.
+  out, for idempotent upserts only (stores apply it last-writer-wins on the transaction's timestamp; there is no
+  blind delete); `AtRevision(rev)` requires a given revision.
 - KV trees only: `TKVLInsert(requiredRevision = Some(rev))` is an `AtRevision` put, and `prepareUpdates`'
   `deletesAtRevision` deletes a key only if the node read holds it at the given revision, else the batch aborts with
   `KeyNotAtRevision` (DataObject planning rejects it with `UnsupportedRequirement`). Together they move an entry under

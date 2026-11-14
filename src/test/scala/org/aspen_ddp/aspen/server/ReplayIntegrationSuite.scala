@@ -183,7 +183,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       _ <- settle(clock = false)
     yield xy
 
-  test("a replayed pinned transaction does not re-apply its blind delete over a re-inserted key"):
+  test("a replayed pinned transaction does not re-apply its delete over a re-inserted key"):
     for
       pool <- client.getStoragePool(Radicle.poolId)
       (x, y) <- client.transactUntilSuccessful: tx =>
@@ -195,10 +195,12 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
                   yield (x, y)
       _ <- settle(clock = false)
       xBefore <- client.read(x)
-      // T: the overwrite of x at its revision is the pin; the delete of k from y is blind
+      yBefore <- client.read(y)
+      // T: the overwrite of x at its revision is a pin, and so is the delete of k from y at k's revision. (A blind
+      // delete, the original subject here, is now refused by the builder: BlindKeyValueWrite)
       t <- commitRecorded: tx =>
              tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
-             tx.update(y, None, None, Nil, List(Delete(k)))
+             tx.update(y, None, None, List(KeyValueUpdate.KeyRevision(k, yBefore.contents(k).revision)), List(Delete(k)))
              Future.unit
       yAfterT <- client.read(y)
       _ = yAfterT.contents.keySet should not contain k
@@ -214,7 +216,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       _ <- forgottenByStores(t)
       yAfterReplay <- client.read(y)
     yield
-      // Every store refuses the replay, so no store applies T's blind delete again over T2's k. Before the forget floor,
+      // Every store refuses the replay, so no store applies T's delete again over T2's k. Before the forget floor,
       // a store taking the replay proved T committed from x's revision (Tx.proveCommitted), and the replay's driver
       // resolved it as a late commit, owed to no store
       withClue("every store of y still holds k as T2 wrote it: "):

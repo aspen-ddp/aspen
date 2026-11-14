@@ -1,12 +1,12 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
-import org.aspen_ddp.aspen.client.{UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject}
+import org.aspen_ddp.aspen.client.{BlindKeyValueWrite, UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject}
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, IDA, ReedSolomon}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, VersionBump}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.network.ClientId
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, DeleteLeft, DeleteMax, DeleteMin, DeleteRight, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectId, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, DeleteLeft, DeleteMax, DeleteMin, DeleteRight, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectId, ObjectRevision, SetLeft, SetMax, SetMin, SetRight}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, Exists, KeyRevision}
@@ -41,7 +41,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   private def kvDeletesKeys(ops: List[KeyValueOperation]): Boolean =
     val bldr = mkBuilder()
     bldr.replaySafe("test")
-    bldr.update(kvp, None, None, Nil, ops)
+    bldr.update(kvp, Some(rev1), None, Nil, ops)
     val (txd, _, _) = bldr.buildTranaction(Map(kvp.poolId -> Replication(3, 2)),
       Map(kvp.poolId -> None), Map())
     txd.requirements.collectFirst { case r: KeyValueUpdate => r.deletesKeys }.get
@@ -173,10 +173,10 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
       val b = mkBuilder(); b.update(kvp, None, None, List(DoesNotExist(k1)), List(ins1))
       intercept[UnpinnedTransaction](buildPin(b))
   }
-  test("no pin: Exists with a Delete") {
+  test("a Delete guarded only by Exists is a blind write") {
     withPins:
       val b = mkBuilder(); b.update(kvp, None, None, List(Exists(k1)), List(Delete(k1)))
-      intercept[UnpinnedTransaction](buildPin(b))
+      intercept[BlindKeyValueWrite](buildPin(b))
   }
   test("no pin: KeyRevision with an Insert of another key") {
     withPins:
@@ -187,6 +187,41 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
     withPins:
       val b = mkBuilder(); b.setRefcount(p1, rc1, rc1)
       intercept[UnpinnedTransaction](buildPin(b))
+  }
+
+  // Blind writes (todo 2.2): stores apply a blind Insert last-writer-wins, but keep no tombstone for a Delete and no
+  // timestamps for object-level parts, so the builder refuses those blind
+
+  test("a blind Delete is refused even when replay-safe") {
+    val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, Nil, List(Delete(k1)))
+    intercept[BlindKeyValueWrite](buildPin(b))
+  }
+  test("a Delete of one key does not borrow another key's KeyRevision") {
+    val b = mkBuilder(); b.update(kvp, None, None, List(KeyRevision(k2, rev1)), List(Delete(k1), Insert(k2, Array[Byte](1))))
+    intercept[BlindKeyValueWrite](buildPin(b))
+  }
+  test("a Delete under a required object revision is not blind") {
+    val b = mkBuilder(); b.update(kvp, Some(rev1), None, Nil, List(Delete(k1))); buildPin(b)
+  }
+  test("each blind object-level operation is refused") {
+    for op <- List(SetMin(Key(Array[Byte](1))), SetMax(Key(Array[Byte](1))), SetLeft(Array[Byte](1)), SetRight(Array[Byte](1)),
+                   DeleteMin(), DeleteMax(), DeleteLeft(), DeleteRight()) do
+      val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, Nil, List(op))
+      intercept[BlindKeyValueWrite](buildPin(b))
+  }
+  test("an object-level operation under a required object revision is not blind") {
+    val b = mkBuilder(); b.update(kvp, Some(rev1), None, Nil, List(SetMin(Key(Array[Byte](1))))); buildPin(b)
+  }
+  test("a blind Insert is allowed") {
+    val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, Nil, List(ins1)); buildPin(b)
+  }
+  test("an allocated object's initial content may set object-level parts and keys") {
+    val b = mkBuilder()
+    b.addAllocatingObject(kvp)
+    b.update(kvp, None, None, Nil, List(SetMin(Key(Array[Byte](1))), SetRight(Array[Byte](2)), ins1))
+    b.setRefcount(kvp, ObjectRefcount.Allocating, ObjectRefcount.Default)
+    b.replaySafe("test")
+    buildPin(b)
   }
 
   test("replaySafe lets a pinless transaction through and records the reason in its notes") {

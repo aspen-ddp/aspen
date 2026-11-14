@@ -257,7 +257,7 @@ trait ReedSolomonIntegrationTests:
 
       deleteTx = TestTransactions.replaySafe(client.newTransaction())
       _ = deleteTx.update(kp, None, None,
-                          List(KeyValueUpdate.Exists(key)),
+                          List(KeyValueUpdate.KeyRevision(key, afterUpdate.contents(key).revision)),
                           List(Delete(key)))
       _ <- deleteTx.commit()
 

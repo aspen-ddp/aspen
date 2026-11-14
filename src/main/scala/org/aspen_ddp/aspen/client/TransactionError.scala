@@ -41,6 +41,13 @@ final case class ObjectSizeLimitExceeded(objectPointer:ObjectPointer, newLength:
   */
 final case class UnpinnedTransaction(transactionId: TransactionId) extends TransactionCreationError
 
+/** Thrown for a KeyValue update with neither a required revision nor a content lock that deletes a key it holds no
+  * `KeyRevision` on, or changes min, max, left or right, outside an allocated object's initial content. Stores apply
+  * blind Inserts last-writer-wins, but keep no tombstone or timestamp to order those writes by, so two of them applied
+  * in opposite orders, or a crash re-apply, would leave a store permanently diverged (transaction-requirements F1).
+  */
+final case class BlindKeyValueWrite(objectPointer: ObjectPointer, reason: String) extends TransactionCreationError
+
 /** Used if multiple refcount modifications are attempted on the same object within a single transaction */
 final case class MultipleRefcountUpdatesToObject(objectPointer:ObjectPointer) extends TransactionCreationError
 

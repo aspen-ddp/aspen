@@ -10,8 +10,13 @@
   to that object
 - A KeyValue update's operations lock what they write, as requirements do (`KVWrites`): each key an
   Insert or Delete names (an absent key through `absentKeyLocks`, shared with `DoesNotExist`/`MayExist`), and the
-  whole object for a min/max/left/right change. Blind writes of one key collide, so stores applying committed
-  transactions in different orders cannot diverge
+  whole object for a min/max/left/right change. Concurrent blind writes of one key collide
+- Apply is order-independent for what the builder lets through (transaction-requirements F1, F2, F4): every key
+  Insert is last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`; `encodedSizeAfter`
+  uses the same rule). A superseded Insert is a no-op, not a skip: no report and no fail-stop. The object timestamp
+  is the max of its value and the transaction's. No tombstones, so `TransactionBuilder` refuses blind key deletes
+  and blind object-level ops (`BlindKeyValueWrite`). Residual: a late or replayed Insert after a later delete of its
+  key resurrects it, like a `DoesNotExist` ABA (Todo 2.9)
 - A prepare that reaches a store after its transaction was finalized is not applied there: the store relies on
   missed-update repair. A collision is an ordinary abort vote, even with an already-completed transaction, except
   one with a lock holder the transaction is built on (it requires the revision the holder writes): the store then

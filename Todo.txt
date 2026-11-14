@@ -36,17 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.2  Monotone applies for blind writes: Req F1, F2, F4, CRL F13, R-F4, Rebuild N1 (helps Repair F3, X7)     [M]
-     Blind KV puts and deletes, raw revision-less updates and refcount updates assign the value or timestamp
-     unconditionally (RequirementsApplyer ~110-145). A lagging store applies two blind writes of a key in
-     opposite order, a crash re-apply of a recovered vote with dropped data regresses a newer blind write
-     (dropTransactionObjectData is memory-only), and object timestamps go backwards. The divergence is permanent
-     and no entry is written.
-     Fix: apply blind KV writes last-writer-wins on (ValueState.timestamp, revision), with delete tombstones kept
-     until repair can no longer need them, and take max() for object timestamps. Also decide whether
-     DoesNotExist-only inserts after a later delete (ABA) need a per-key generation. Alternatively forbid blind
-     writes of unrevisioned keys outright, and enumerate which callers would break.
-
 2.3  Allocating writes must not overwrite an existing object: Req F11, X11 (narrows R-N1, P-N3, X12, X13)   [S-M]
      An Allocating ObjectState is built without consulting the backend, so a replayed allocation delivered by a
      late or non-late commit at a stubless store overwrites a live or deleted object with its initial content.
@@ -90,11 +79,13 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
            several documents assume an entry always exists (C5). Decide which stores get entries, together
            with R-N4's growth (4.7), then make the documents agree (C5, C7).
 
-2.9  Replays through entries with no stub (accepted residuals; re-assess after 2.2-2.4)                     [L]
+2.9  Replays through entries with no stub (accepted residuals; re-assess after 2.3-2.4)                     [L]
      R-N1, R-N6, R-N7 (X13, G13), R-N9, RP-N4, P-N3 (X12). A store holding an UnackedCommits entry and no applied
      stub re-applies T on a replay's commit. That covers blind writes, ABA DoesNotExist inserts and allocations,
-     and for R-N7 possibly a whole pool. R-N7 and R-N9 were accepted by ruling. Once 2.2-2.4 land, most write
-     classes become harmless: re-derive what remains and either close it or re-confirm the acceptance in writing.
+     and for R-N7 possibly a whole pool. R-N7 and R-N9 were accepted by ruling. 2.2 landed (blind Inserts are
+     last-writer-wins, blind deletes refused). Once 2.3-2.4 land too, most write classes become harmless. Re-derive
+     what remains, including an Insert replayed after a later delete of its key (blind or DoesNotExist ABA: decide on
+     a per-key generation), and either close it or re-confirm the acceptance in writing.
      Candidate fixes: treat an adopted accepted commit from a quorum that contains memoryless acceptors as late
      when a proof exists (P-N3); D1 writes no entries for stores that D0 listed or that acknowledged (R-N7). Add
      the missing test that kills D1's host between hand-off and TxFinalized (G13).
@@ -180,8 +171,8 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
      until the lookup answers. Bound R-N10 the same way.
 
 4.5  Repair livelock: Repair F3, F8, F9, X7                                                                 [S-M]
-     F3/X7: the completion gate assumes monotone timestamps. 2.2 fixes the source; also consider gating on
-            post-install equality.
+     F3/X7: applies are now monotone (2.2, done 2026-11-14), but the gate still trusts timestamps that rebuild
+            and Reconcile copy from reads. Consider gating on post-install equality.
      F8: stale outcomes never escalate. Count them, and escalate to a proof after N.
      F9: a timed-out scan discards deferral state and doubles the interval. Keep the state, and treat the
          timeout as "found entries".

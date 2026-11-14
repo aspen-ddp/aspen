@@ -219,6 +219,102 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     assert(o.data.getByteArray sameElements Array[Byte](1, 2, 3))
   }
 
+  // Blind writes (todo 2.2: Req F1, F2, F4, CRL F13, R-F4, Rebuild N1)
+
+  // Wall-clock milliseconds: the low 16 bits of an HLCTimestamp are its logical counter
+  private def wall(ms: Long): HLCTimestamp = HLCTimestamp(ms << 16)
+
+  private val blindKey = Key(Array[Byte](7))
+  private val txA = TransactionId(new UUID(0, 10))
+  private val txB = TransactionId(new UUID(0, 11))
+
+  private def emptyKVObject(): ObjectState =
+    val kvos = new KVObjectState
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, kvos.encode())
+    o.kvState = Some(kvos)
+    o
+
+  /** Applies a blind Insert(blindKey, value) by `txid` at `ts` (no required revision, no key requirement) */
+  private def applyBlindInsert(o: ObjectState, txid: TransactionId, ts: HLCTimestamp, value: Array[Byte],
+                               maxSliceSize: Option[Long] = None): RequirementsApplyer.Result =
+    val payload = KeyValueOperation.encode(List(Insert(blindKey, value)), Replication(3, 2))(0)
+    RequirementsApplyer.apply(txid, ts, List(KeyValueUpdate(kp1, None, None, Nil)), HashMap(oid1 -> o),
+      HashMap(oid1 -> payload), maxSliceSize)
+
+  private def blindValue(o: ObjectState): (Seq[Byte], ObjectRevision, HLCTimestamp) =
+    val vs = o.kvState.get.content(blindKey)
+    (vs.value.bytes.toSeq, vs.revision, vs.timestamp)
+
+  test("two blind inserts of a key applied in opposite orders converge to the later one (Req F1)") {
+    val a = Array[Byte](1)
+    val b = Array[Byte](2)
+    val inOrder = emptyKVObject()
+    applyBlindInsert(inOrder, txA, wall(100), a)
+    applyBlindInsert(inOrder, txB, wall(200), b)
+
+    val reversed = emptyKVObject()
+    applyBlindInsert(reversed, txB, wall(200), b)
+    val late = applyBlindInsert(reversed, txA, wall(100), a)
+
+    // The superseded insert is neither a requirement failure nor an error
+    assert(late.uncommittable.isEmpty)
+    blindValue(reversed) shouldBe ((b.toSeq, ObjectRevision(txB), wall(200)))
+    blindValue(reversed) shouldBe blindValue(inOrder)
+    assert(reversed.kvState.get.encode().getByteArray sameElements inOrder.kvState.get.encode().getByteArray)
+  }
+
+  test("a re-applied older blind insert does not regress a newer one; the same insert re-applies idempotently (Req F2)") {
+    val o = emptyKVObject()
+    applyBlindInsert(o, txA, wall(100), Array[Byte](1))
+    applyBlindInsert(o, txB, wall(200), Array[Byte](2))
+
+    // A crash re-apply of A's recovered vote
+    applyBlindInsert(o, txA, wall(100), Array[Byte](1))
+    blindValue(o) shouldBe ((Seq[Byte](2), ObjectRevision(txB), wall(200)))
+
+    applyBlindInsert(o, txB, wall(200), Array[Byte](2))
+    blindValue(o) shouldBe ((Seq[Byte](2), ObjectRevision(txB), wall(200)))
+  }
+
+  test("blind inserts at equal timestamps are ordered by revision") {
+    val ts = wall(100)
+    val first = emptyKVObject()
+    applyBlindInsert(first, txA, ts, Array[Byte](1))
+    applyBlindInsert(first, txB, ts, Array[Byte](2))
+    val second = emptyKVObject()
+    applyBlindInsert(second, txB, ts, Array[Byte](2))
+    applyBlindInsert(second, txA, ts, Array[Byte](1))
+    blindValue(first) shouldBe blindValue(second)
+  }
+
+  test("the object timestamp never goes backwards for blind KeyValue and Refcount updates (Req F4)") {
+    val o = emptyKVObject()
+    applyBlindInsert(o, txB, wall(200), Array[Byte](2))
+    applyBlindInsert(o, txA, wall(100), Array[Byte](1))
+    assert(o.metadata.timestamp == wall(200))
+
+    val d = mkDataObject()
+    d.metadata = d.metadata.copy(timestamp = wall(500))
+    val result = RequirementsApplyer.apply(txA, wall(300), List(RefcountUpdate(p1, ref1, ObjectRefcount(2, 2))),
+      HashMap(oid1 -> d), HashMap())
+    assert(result.uncommittable.isEmpty)
+    assert(d.metadata.refcount == ObjectRefcount(2, 2))
+    assert(d.metadata.timestamp == wall(500))
+  }
+
+  test("the slice size checked for a superseded insert is the size applied") {
+    val o = emptyKVObject()
+    applyBlindInsert(o, txB, wall(200), new Array[Byte](40))
+    val size = o.kvState.get.encodedSize
+    // The late, smaller insert keeps the larger value, so the size is unchanged: a limit equal to it passes and the
+    // estimate must not be the smaller value's
+    val late = applyBlindInsert(o, txA, wall(100), Array[Byte](1), maxSliceSize = Some(size.toLong))
+    assert(late.uncommittable.isEmpty)
+    assert(o.kvState.get.encodedSize == size)
+    assert(o.kvState.get.encodedSizeAfter(List(Insert(blindKey, Array[Byte](1))), ObjectRevision(txA),
+      wall(100)) == size)
+  }
+
   test("changedObjects includes every object a DataUpdate, KeyValueUpdate, RefcountUpdate or VersionBump names") {
     val ids = (2 to 5).map(i => ObjectId(new UUID(0, i))).toList
     val pool = PoolId(new UUID(0, 0))

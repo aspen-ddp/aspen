@@ -29,12 +29,13 @@ class KVObjectState(
   /** Size in bytes of encode(): the serialized slice this store holds for the object. Lock state is not counted */
   def encodedSize: Int = KVObjectState.encodedSize(min, max, left, right, content)
 
-  /** encodedSize of the state that applying ops (as RequirementsApplyer does) would produce. This state is not
-    * modified. Every Insert counts the fixed 16-byte revision and 8-byte timestamp, so the transaction's actual
-    * revision and timestamp do not affect the result.
+  /** encodedSize of the state that applying ops by the transaction writing `revision` at `timestamp` (as
+    * RequirementsApplyer does) would produce. This state is not modified. They decide only which Inserts win
+    * (`KVObjectState.insertWins`): every Insert counts the fixed 16-byte revision and 8-byte timestamp.
     */
-  def encodedSizeAfter(ops: List[KeyValueOperation]): Int =
-    val (nmin, nmax, nleft, nright, ncontent) = KVObjectState.applyOps(min, max, left, right, content, ops)
+  def encodedSizeAfter(ops: List[KeyValueOperation], revision: ObjectRevision, timestamp: HLCTimestamp): Int =
+    val (nmin, nmax, nleft, nright, ncontent) =
+      KVObjectState.applyOps(min, max, left, right, content, ops, Some((revision, timestamp)))
     KVObjectState.encodedSize(nmin, nmax, nleft, nright, ncontent)
 }
 
@@ -42,15 +43,32 @@ object KVObjectState {
 
   def apply(dataBuffer: DataBuffer): KVObjectState = decode(dataBuffer)
 
+  /** Whether an Insert by the transaction writing `revision` at `timestamp` replaces `existing`: last writer wins on
+    * (timestamp, revision). Equal is the same transaction applying again, which writes the same value. An Insert a
+    * later one has superseded is a no-op, so a store that applies sequential writes of a key out of order (a lagging
+    * store, or a crash re-apply of a recovered vote) converges with the others (transaction-requirements F1, F2).
+    * A checked Insert (KeyRevision, DoesNotExist, a required object revision) always wins: its check rejects a key
+    * written later, and the client's HLC puts the transaction after the state it read.
+    */
+  def insertWins(existing: Option[ValueState], revision: ObjectRevision, timestamp: HLCTimestamp): Boolean =
+    existing match
+      case None => true
+      case Some(vs) =>
+        val byTime = timestamp.compare(vs.timestamp)
+        byTime > 0 || (byTime == 0 && revision.lastUpdateTxUUID.compareTo(vs.revision.lastUpdateTxUUID) >= 0)
+
   /** The min, max, left, right and content that applying `ops` in order (as RequirementsApplyer does) to the given
-    * ones produces. Inserted entries get a null revision and zero timestamp: only their sizes matter here.
+    * ones produces. With `writer` (the transaction's revision and timestamp) an Insert applies only where it wins
+    * (`insertWins`); without it every Insert applies, as for an empty state, and inserted entries get a null revision
+    * and zero timestamp: only their sizes matter then.
     */
   def applyOps(min: Option[Key],
                max: Option[Key],
                left: Option[Value],
                right: Option[Value],
                content: Map[Key, ValueState],
-               ops: List[KeyValueOperation])
+               ops: List[KeyValueOperation],
+               writer: Option[(ObjectRevision, HLCTimestamp)] = None)
       : (Option[Key], Option[Key], Option[Value], Option[Value], Map[Key, ValueState]) =
     var nmin = min
     var nmax = max
@@ -66,8 +84,10 @@ object KVObjectState {
       case _: DeleteMax => nmax = None
       case _: DeleteLeft => nleft = None
       case _: DeleteRight => nright = None
-      case o: Insert =>
-        ncontent += (o.key -> new ValueState(Value(o.value), ObjectRevision.Null, HLCTimestamp.Zero, None))
+      case o: Insert if writer.forall((rev, ts) => insertWins(ncontent.get(o.key), rev, ts)) =>
+        val (rev, ts) = writer.getOrElse((ObjectRevision.Null, HLCTimestamp.Zero))
+        ncontent += (o.key -> new ValueState(Value(o.value), rev, ts, None))
+      case _: Insert =>
       case o: Delete => ncontent -= o.key
     }
     (nmin, nmax, nleft, nright, ncontent)

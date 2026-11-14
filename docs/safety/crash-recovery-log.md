@@ -760,7 +760,7 @@ described. Only findings whose *consequence* runs through the transaction layer 
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
 | F1-F12, F14-F17, F19-F21 | unchanged (earlier FIXED marks stand) | CRL code not in the diff | `server/crl/` |
-| F13 | **narrowed** | The re-apply after a crash now meets per-write checks for TKVL writes and is skipped; blind writes, `DoesNotExist` inserts after a later delete, and a recovered acceptor's non-late commit remain | `KeyValueListNode.scala:489-506`; paxos P-N3 |
+| F13 | **narrowed** | The re-apply after a crash now meets per-write checks for TKVL writes and is skipped; blind writes, `DoesNotExist` inserts after a later delete, and a recovered acceptor's non-late commit remain. *2026-11-14:* a re-applied blind Insert over a newer write is a no-op, `Exists`-guarded deletes are refused, refcount ABA refuted; remaining: inserts after a later delete | `KeyValueListNode.scala:501-518`; `KVObjectState.insertWins`; paxos P-N3 |
 | F18 | unchanged (still RESOLVED by the X2 mute) | Its reasoning no longer rests on `TransactionTooOld`; the late-commit rule now also relies on the mute (paxos P-N2) | `Frontend.scala:676` |
 
 New, CRL-facing: every recovered unresolved commit vote now waits for its UnackedCommits lookup before its store drives
@@ -1118,6 +1118,14 @@ delete is removed by it. Reachable only if a store of that id is loaded again du
 no equivalent guard in the transfer-in path was verified.
 
 ### F13. `dropTransactionObjectData` is memory-only; the durable record can point into recycled space (low confidence)
+
+> **2026-11-14 (Todo 2.2): NARROWED further.** The re-apply cases listed below: (1) a blind KV Insert is now a no-op
+> over a newer write of its key (last writer wins on (timestamp, revision), transaction-requirements F1/F2); (2) an
+> `Exists`-guarded Delete is refused by `TransactionBuilder` (`BlindKeyValueWrite`), and had no caller; (3) the
+> refcount ABA cannot occur: `checkRefcount` compares the whole `ObjectRefcount` including `updateSerial`, and every
+> count change bumps the serial, so T1's replay does not match after T2 (transaction-recovery F4 already refuted it).
+> Residual: a blind or `DoesNotExist` Insert re-applied after a later delete of its key resurrects it (Todo 2.9).
+> The second half (a durable record pointing into recycled space) is unchanged.
 
 > **Refresh (replay pins): NARROWED.** Unchanged CRL mechanism. The re-apply it enables is now skipped for per-write
 > checked writes: TKVL puts carry `KeyRevision`/`DoesNotExist` and deletes `KeyRevision` (`KeyValueListNode.scala:489-506`),

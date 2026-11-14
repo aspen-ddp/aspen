@@ -838,8 +838,8 @@ completion gate are unchanged.
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
 | F1, F2 | unchanged | Opportunistic rebuild paths untouched | `Frontend.scala` rebuild path, `Tx.scala:429-441` |
-| F3 | unchanged | Blind/refcount timestamps still unconditional | `RequirementsApplyer.scala` (not in the diff) |
-| F4 | **narrowed** | TKVL deletes now carry `KeyRevision(k, rev)`, so a delete of k at a store where k is absent fails at apply, is reported and marked instead of applying as an invisible no-op; blind deletes unchanged | `KeyValueListNode.scala:505-506`; `RequirementsChecker.scala:141` |
+| F3 | **narrowed** 2026-11-14 | Applies take the max object timestamp (requirements F4); the gate still relies on copied timestamps (X7) | `RequirementsApplyer.apply` |
+| F4 | **narrowed** | TKVL deletes now carry `KeyRevision(k, rev)`, so a delete of k at a store where k is absent fails at apply, is reported and marked instead of applying as an invisible no-op; blind deletes unchanged. *2026-11-14:* `TransactionBuilder` refuses blind deletes (`BlindKeyValueWrite`), so the invisible no-op needs a client that bypasses the builder | `KeyValueListNode.scala:505-506`; `RequirementsChecker.scala:141` |
 | F5 | unchanged | Absence heuristic unchanged; the allocation action never skips an entry now (Ruling 28), which does not shorten its delay | `StoreRepairer.scala:249-256` |
 | F6 | unchanged | `deleteObjectForRepair` untouched | |
 | F7 | unchanged | Entry deletions still untracked; `deleteEntry` now pins on `KeyRevision` of the value read | `StoreRepairer.scala` |
@@ -939,6 +939,11 @@ Confidence: medium (depends on a blind-write workload and on the timing; the cod
 > *Fix sketch:* Gate on post-install equality with the read, or apply max() to blind updates.
 
 **F3. Completion gate assumes monotone timestamps** (`StoreRepairer.scala:266-271`; Q8).
+
+> **2026-11-14 (Todo 2.2): source FIXED.** Applies now keep the object timestamp monotone (max of current and
+> transaction, transaction-requirements F4), so the scenario below no longer lowers it. The gate itself is unchanged:
+> it still trusts timestamps that rebuild and Reconcile copy from reads (X7), and Todo 4.5 keeps the post-install
+> equality option.
 `stale` is set when `os.timestamp < minTimestamp`, with `os.timestamp` = max over matching stores of the *last applied*
 transaction's start timestamp. Updates without a required revision (blind KeyValue inserts/deletes) never check the
 object timestamp (`RequirementsChecker.scala:220-226` is called only for revision-bearing requirements;

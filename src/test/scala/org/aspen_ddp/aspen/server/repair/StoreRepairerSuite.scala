@@ -556,9 +556,16 @@ class StoreRepairerSuite extends IntegrationTestSuite:
         (0 until net.stores.size).foreach(i => storeKeys(i, ptr) shouldBe initial.keySet)
       ptr
 
+  /** A revision-less update of `ptr`. Each Delete requires its key's revision as an online store holds it: the
+    * builder refuses a blind delete (BlindKeyValueWrite)
+    */
   private def kvUpdate(ptr: KeyValueObjectPointer, ops: List[org.aspen_ddp.aspen.common.objects.KeyValueOperation])
                       (tx: Transaction): Unit =
-    tx.update(ptr, None, None, Nil, ops)
+    val online = (0 until net.stores.size).filterNot(i => net.offlineStores.contains(sid(i)))
+    val revisions = ops.collect { case d: org.aspen_ddp.aspen.common.objects.Delete => d.key }.map: key =>
+      val rev = online.iterator.flatMap(i => stored(i, ptr.id).flatMap(_.kvState).flatMap(_.content.get(key))).next()
+      KeyValueUpdate.KeyRevision(key, rev.revision)
+    tx.update(ptr, None, None, revisions, ops)
 
   test("a store that missed a KV insert and then applied a later update to another key gets the missed key"):
     for

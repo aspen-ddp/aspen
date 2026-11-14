@@ -13,7 +13,7 @@ or spans modules, Read the relevant guides below explicitly.**
 | Guide (relative to package root) | Covers |
 |---|---|
 | `client/CLAUDE.md` | AspenClient API, bootstrap/config, IDA data ops (append, ranged reads/writes) |
-| `client/internal/CLAUDE.md` | Read/Transaction Managers and Drivers, opportunistic rebuild |
+| `client/internal/CLAUDE.md` | Read/Transaction Managers and Drivers, read completion, transaction outcomes |
 | `client/internal/transaction/CLAUDE.md` | TransactionBuilder pin rule, missed-update marking, UnackedCommits writing |
 | `client/internal/allocation/CLAUDE.md` | Allocation strategies, FSIF index bitmap |
 | `client/tkvl/CLAUDE.md` | TKVL trees: TierEngine, encodings, batches, requirements, caches, split/join |

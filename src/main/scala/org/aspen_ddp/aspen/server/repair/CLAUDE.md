@@ -13,9 +13,10 @@
 - An entry is deleted through its tree (`TieredKeyValueList.deleteIfPresent`, under the entry's `KeyRevision`), not
   through the node the walk handed over, so a delete that empties a node registers the join/tail-removal finalization
   actions and the trees shrink as repair drains them. Those actions run in ordinary (tracked) transactions, as the
-  splits of errorTree inserts already do; the entry delete itself is tracked too, with `MissedUpdateFinalizationAction.limitTracking(storeId.poolId, tx)` turning
-  tracking off only for the bootstrap pool's own trees (an entry about P lives one level closer to the bootstrap pool, so
-  the chain ends). `newRepairTransaction` is for repair proofs only
+  splits of errorTree inserts already do; the entry delete itself is tracked too, with
+  `MissedUpdateFinalizationAction.limitTracking(storeId.poolId, tx)` turning tracking off only for the bootstrap
+  pool's own trees (an entry about P lives one level closer to the bootstrap pool, so the chain ends).
+  `newRepairTransaction` is for repair proofs only
 - `StoreRepairer.sweepBootstrapTrees` reconciles one bootstrap store's copy of every node (all tiers,
   `TieredKeyValueList.foreachNode`) of the bootstrap pool's own errorTree and unackedCommitsTree, whose writes run
   untracked so a miss leaves no entry. Each node goes through `repairUpdate` with no minimum timestamp and no proofs
@@ -28,8 +29,11 @@
   or failure), under its own deadline (`SweepDeadline`, 90 s; `SweepTimedOut` drops the store's DeferralState as
   `ScanTimedOut` does). The store's pacing is advanced with `foundEntries || sweep.needsAnotherPass`: a failed or
   timed-out sweep counts as needing another pass (unlike a failed entry scan), so the store stays at
-  `scanIntervalFloor` until its trees converge and a clean sweep lets it back off to `scanIntervalCap`. A missed
-  untracked write is therefore healed within about one cap interval (Backlog.txt "Bootstrap tree sweep staleness window")
+  `scanIntervalFloor` until its trees converge and a clean sweep lets it back off to `scanIntervalCap`. A node
+  skipped because the store stopped being repairable here counts as incomplete too. A missed untracked write is
+  therefore healed within about one cap interval (Backlog.txt "Bootstrap tree sweep staleness window"). While the
+  bootstrap pool is unreadable, a bootstrap store's scan and sweep each run to their 90 s deadline, so it holds a scan
+  slot most of each floor interval (spec-mandated)
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
 - A repair scan runs only while the store's pool entry names this host, so a superseded copy never consumes the

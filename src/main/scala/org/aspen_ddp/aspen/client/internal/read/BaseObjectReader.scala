@@ -28,18 +28,11 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
 
   protected var responses: Map[StoreId, Either[CommonReadError.Value, StoreStateType]] = Map()
   protected var endResult: Option[Either[ClientReadError, ObjectState]] = None
-  protected var knownBehind: Map[StoreId, HLCTimestamp] = Map()
   protected var lastRestoreError: Option[String] = None
 
   def receivedResponseFrom(storeId: StoreId): Boolean = responses.contains(storeId)
 
   def noResponses: Set[StoreId] = allStores &~ responses.keySet
-
-  /** Returns the map of store ids that are known to have returned responses with out-of-date results. The value
-    * is the read time of the returned read response. If a reread is also out-of-date the timestamp value will be
-    * updated. If the response is fully up-to-date, the store's entry will be removed from the map
-    */
-  def rereadCandidates: Map[StoreId, HLCTimestamp] = knownBehind
 
   def result: Option[Either[ClientReadError, ObjectState]] = endResult
 
@@ -93,8 +86,6 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
 
   def receiveReadResponse(response:ReadResponse): Option[Either[ClientReadError, ObjectState]] = {
     if endResult.isEmpty then
-      knownBehind -= response.fromStore // Start fresh for this host
-
       response.result match {
         case Left(err) => responses += response.fromStore -> Left(err)
 
@@ -153,12 +144,8 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
       case (_, revision) :: _ => Some(revision)
       case Nil => None
 
-    val matchingStoreStates = if mostRecent.isEmpty then Nil else allStoreStates.filter: ss =>
-      if mostRecent.contains(ss.revision) then
-        true
-      else
-        knownBehind += ss.storeId -> ss.readTimestamp
-        false
+    val matchingStoreStates =
+      if mostRecent.isEmpty then Nil else allStoreStates.filter(ss => mostRecent.contains(ss.revision))
 
     (allStoreStates, matchingStoreStates)
 

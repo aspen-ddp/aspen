@@ -836,7 +836,7 @@ class Tx( trs: TransactionRecoveryState,
       val form = UpdateForm.of(os.objectId, requirements, ou, allocating)
       val cs = CommitState(pointerOf(os.objectId), os.metadata, os.objectType, os.data, allocating, form)
 
-      frontend.commit(os, cs, transactionId, forTransaction = true)
+      frontend.commit(os, cs, transactionId)
     }
   }
 

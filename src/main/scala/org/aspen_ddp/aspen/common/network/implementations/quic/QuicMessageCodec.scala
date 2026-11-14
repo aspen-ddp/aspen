@@ -5,8 +5,8 @@ import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.metadata.HostId
-import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId}
-import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate}
+import org.aspen_ddp.aspen.common.objects.ObjectId
+import org.aspen_ddp.aspen.common.transaction.ObjectUpdate
 
 import java.nio.ByteBuffer
 import java.util.UUID

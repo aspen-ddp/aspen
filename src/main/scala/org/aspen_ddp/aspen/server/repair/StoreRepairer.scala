@@ -195,15 +195,15 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           counts.result
 
   /** Reconciles the store's copy of every node of the bootstrap pool's own errorTree, then of its unackedCommitsTree,
-    * every tier. Writes to those nodes run with missed-update tracking off (`limitTracking`, `newRepairTransaction`),
-    * so a bootstrap store that misses one gets no entry: this sweep is what heals it. Each node goes through
-    * `repairUpdate` with no minimum timestamp (complete means the store's copy matches the read) and no proofs: a
-    * proof is an untracked write that would collide with the marker traffic these nodes carry, so a key locked at
-    * every attempt waits for a later sweep. No entries are created or deleted.
+    * every tier. Writes to those nodes run with missed-update tracking off (`limitTracking`: marker writes and entry
+    * deletions in these trees), so a bootstrap store that misses one gets no entry: this sweep is what heals it. Each
+    * node goes through `repairUpdate` with no minimum timestamp (complete means the store's copy matches the read) and
+    * no proofs: a proof is an untracked write that would collide with the marker traffic these nodes carry, so a key
+    * locked at every attempt waits for a later sweep. No entries are created or deleted.
     *
     * A node that cannot be read (deleted under the walk by a join or root reduction, or the pool degraded) counts as
     * incomplete, not as a failure of the sweep. Once the store stops being repairable here the remaining nodes are
-    * skipped.
+    * skipped and counted incomplete.
     */
   def sweepBootstrapTrees(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState): Future[SweepResult] =
     if storeId.poolId != PoolId.BootstrapPoolId then
@@ -234,7 +234,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
 
       ownedHere(storeId).flatMap: owned =>
         if !owned then
-          logger.warn(s"Not sweeping store $storeId: its pool records it on another host")
+          // The entry scan of the same pass has already warned
+          logger.debug(s"Not sweeping store $storeId: its pool records it on another host")
           Future.successful(SweepResult.Empty)
         else
           for
@@ -245,7 +246,10 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
             val walkComplete = errorWalk.complete && unackedWalk.complete
             if walkComplete && !abandoned(storeId) then deferral.retainSweep(synchronized(sweepKeys))
             val result = SweepResult(nodes.get, reconciled.get, incomplete.get, walkComplete)
-            logger.info(s"Swept the bootstrap trees' nodes on $storeId: $result")
+            if result.needsAnotherPass then
+              logger.info(s"Swept the bootstrap trees' nodes on $storeId: $result")
+            else
+              logger.debug(s"Swept the bootstrap trees' nodes on $storeId: $result")
             result
 
   /** Drops the stubs of the store that no UnackedCommits entry needs any more: those that this scan and the
@@ -324,7 +328,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                            deferral, allowProof = true).flatMap: result =>
                 if result.complete then
                   deferral.clear(entryKey)
-                  deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key).map(_ => counts.repaired.incrementAndGet())
+                  deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key)
+                    .map(_ => counts.repaired.incrementAndGet())
                 else
                   counts.deferred.incrementAndGet()
                   Future.unit
@@ -456,9 +461,15 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
               afterProof
     yield
       if result.complete then
-        logger.info(s"Repair complete for object ${ptr.id} on store $storeId")
-      else
+        // A sweep's node that was already converged is the common case
+        if allowProof || result.changed then
+          logger.info(s"Repair complete for object ${ptr.id} on store $storeId")
+        else
+          logger.debug(s"Sweep of node ${ptr.id} on store $storeId: unchanged")
+      else if allowProof then
         logger.info(s"Repair of object ${ptr.id} on store $storeId left $result. Leaving the entry for the next pass")
+      else
+        logger.info(s"Sweep of node ${ptr.id} on store $storeId left $result. The next sweep retries it")
       result
 
   /** Proves the parts `result` left deferred by a lock, from `read`, one proof at a time: proofs of one object would
@@ -497,13 +508,6 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     completion.future.map: _ =>
       logger.info(s"Repair complete (deletion) for object $objectId on store $storeId")
 
-  /** Deletion of the entry is best effort. A transient error or a collision only costs another
-    * pass. The revision guard is the point: the caller compared the repaired state against the
-    * missed timestamp it scanned, and a store that misses another update while the repair is
-    * underway rewrites the entry with that newer timestamp. Requiring the scanned revision makes
-    * the delete fail in that case, which is how the next pass learns to try again. The KeyRevision of the deleted
-    * key is also the transaction's pin, so a replay deletes no newer entry.
-    */
   /** Deletes `key` from `tree` if its value is still at `entryRevision`. Through the tree rather than the node the walk
     * handed over: a delete that empties its node joins it with its right neighbor or leaves it empty, and the tree's
     * delete registers the finalization action that removes the deleted node's upper-tier entry (and so lets the tree
@@ -513,6 +517,12 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * is about `entryPool`, and its tree lives one level closer to the bootstrap pool, so the chain of entries ends
     * there. `limitTracking` turns tracking off only when the deletion touches `entryPool` itself, which is the
     * bootstrap pool's own trees (a miss recorded there would be an entry in the very tree being deleted from).
+    *
+    * Best effort: a transient error or a collision only costs another pass. The revision guard is the point: the
+    * caller compared the repaired state against the missed timestamp it scanned, and a store that misses another
+    * update while the repair is underway rewrites the entry with that newer timestamp. Requiring the scanned revision
+    * makes the delete fail in that case, which is how the next pass learns to try again. The KeyRevision of the
+    * deleted key is also the transaction's pin, so a replay deletes no newer entry.
     */
   private[repair] def deleteEntryIfUnchanged(entryPool: PoolId, tree: TieredKeyValueList,
                                              entryRevision: ObjectRevision, key: Key): Future[Unit] =

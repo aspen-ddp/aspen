@@ -118,10 +118,7 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
       else h
     }._2
 
-    val matches = segments.filter { s => if (s.revision == highestRevision) true else {
-      storeStates.find(p => p.storeId == s.storeID).foreach(ss => knownBehind += s.storeID -> ss.readTimestamp)
-      false
-    }}
+    val matches = segments.filter(s => s.revision == highestRevision)
 
     //println(s"Resolving $what. hrev: $highestRevision matches: $matches")
 

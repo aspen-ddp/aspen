@@ -3116,7 +3116,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         afterPressure shouldBe reads + others.size
   }
 
-  /** A rebuild-like commit of op1 holding `b`, at the revision `txid` writes: not a transaction's commit */
+  /** A commit of op1 holding `b`, at the revision `txid` writes, without a Tx */
   def rebuildCommit(frontend: Frontend, txid: TransactionId, b: Byte): Unit =
     val metadata = Metadata(ObjectRevision(txid), ObjectRefcount(1, 1), HLCTimestamp(200))
     val data = DataBuffer(Array[Byte](b))
@@ -3125,7 +3125,6 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("two in-flight commits of one object serve the newest state") {
     val (frontend, backend, _, net) = commitWindowFixture()
-    // Transactions' commits of one object are never in flight together; rebuilds' may be
     rebuildCommit(frontend, txid1, 1)
     rebuildCommit(frontend, txid2, 2)
     backend.heldCommits shouldBe 2
@@ -3141,14 +3140,6 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     readData(frontend, net, op1) shouldBe Right(List[Byte](2))
     backend.get(oid1).get.data.getByteArray.toList shouldBe List[Byte](2)
     afterPressure shouldBe reads + others.size
-  }
-
-  test("a transaction does not wait for a rebuild's in-flight commit") {
-    val (frontend, backend, _, net) = commitWindowFixture()
-    rebuildCommit(frontend, txid1, 1)
-    backend.heldCommits shouldBe 1
-    prepare(frontend, net, lockTxd(txid2, List(overwriteAfter(txid1)))).disposition shouldBe
-      TransactionDisposition.VoteCommit
   }
 
   test("an aborted transaction leaves its objects cached") {
@@ -3375,7 +3366,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.reconcileForRepair(snapshot, newerRepairState(), done)
     backend.reads shouldBe 1
 
-    // A rebuild's commit: the read may return the state it replaces, which is then not the state served
+    // A commit: the read may return the state it replaces, which is then not the state served
     val metadata = Metadata(ObjectRevision(txid1), ObjectRefcount(1, 1), HLCTimestamp(200))
     frontend.commit(new ObjectState(oid1, metadata, ObjectType.Data, DataBuffer(Array[Byte](3))),
       CommitState(op1, metadata, ObjectType.Data, DataBuffer(Array[Byte](3))), txid1)

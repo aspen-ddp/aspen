@@ -19,8 +19,6 @@ trait ObjectReader {
 
   def noResponses: Set[StoreId]
 
-  def rereadCandidates: Map[StoreId, HLCTimestamp]
-
   def result: Option[Either[ReadError, ObjectState]]
 
   def receiveReadResponse(response:ReadResponse): Option[Either[ReadError, ObjectState]]

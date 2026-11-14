@@ -8,8 +8,8 @@
 - Subpackages with their own guides: `transaction/` (builder, pin rule, missed-update marking), `allocation/`
 - `ReadManager` releases a read the moment its result completes. A response that arrives after that is dropped
   (logged at trace), except that a late `StoreNotFound` still drops the sender's cached endpoint. Stale stores found by
-  a read are not repaired by the read: repair is the server's job (`server/repair`). The client keeps no object cache, and a `TxPrepare` carries only the
-  transaction's object updates (no pre-transaction rebuilds).
+  a read are not repaired by the read: repair is the server's job (`server/repair`). The client keeps no object
+  cache, and a `TxPrepare` carries only the transaction's object updates (no pre-transaction rebuilds).
 - `ClientTransactionDriver.result` is a `ClientOutcome` (`Committed`, `Aborted`, `Unknown`). `SimpleClientTransactionDriver`
   stops retransmitting and completes `Unknown` once the client's clock is past `startTimestamp + horizon + MaxStartLead`
   (`TransactionHorizon.clientGiveUp`), checked at each retransmit tick. A transaction already that late at `begin()`

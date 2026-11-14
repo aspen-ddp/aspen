@@ -26,17 +26,12 @@ RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-re
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.3  P-N1 + P-F2 + R-F3/F5/F8: false abort of a committed transaction; a live commit voter drops its update  [S-M]
-     a. The proof is sent once, to lastProposer (Tx.proveCommitted). Store drops a TxResolved when no driver
-        exists yet (Store.scala ~208), and ReplayIntegrationSuite reproduced this. Fix: cache proofs next to
-        prepareResponseCache and replay them into a new driver, as prepares are replayed. A prover re-sends to
-        each new proposer id it sees. Stop client retransmits from overwriting lastProposer (P-F10).
-     b. Without a proof (a refcount pin, or a pin overwritten since), a driver re-derives abort after the cache
-        expires. The client is told "aborted" and a non-idempotent retry double-applies. Decide between: a
-        no-proof driver whose votes are all driver-prepare aborts reports Unknown to the client instead of
-        resolving, or a longer-lived finalized-outcome tombstone per txid.
-     c. A live (non-recovered) commit voter accepts a TooOld-derived abort at once: needsUnackedCheck requires
-        `recovered` (Tx.scala:176). Apply the traceless hold to live voters too (R-F3, R-F5).
+1.3  DONE 2026-11-13 (transaction horizon, docs/superpowers/specs/2026-11-13-transaction-horizon-design.md):
+     P-N1 + P-F2 + R-F3/F5/F8, false abort of a committed transaction. Past a 20 s horizon no store joins a
+     transaction it does not hold (Frontend.forgetFloorMillis), outcomes are remembered 30 s, stuck Txs expire from
+     their peers' status, and the client fails with TransactionOutcomeUnknown instead of a false abort (1.3b). 1.3a
+     (proof caching, P-F10's lastProposer) and 1.3c (traceless hold for live voters) were dropped, not implemented:
+     closed by the horizon. Residuals: post-load refusals (paxos 10.10), and retried Unknowns (see 5.10).
 
 1.4  Req F5 + F6: a commit voter can end up holding neither the lock nor the update                         [M]
      F5: doCommit unlocks before issueCommits. If the apply fails, the voter has dropped its lock without
@@ -176,17 +171,19 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
        F5: a restarted leader reuses (1,L). Start a restarted driver at round 2 or higher, or persist the
            highest round used.
        F6: aborts drop acceptor state at resolution. Keep the Paxos record until TxFinalized, as commits do.
+           Re-assessed 2026-11-13: the transaction horizon makes a forgotten abort non-re-decidable, so this no
+           longer buys safety (residual: a host wall clock stepped back > ~8 s, paxos F6). Low priority.
        F7: count Undetermined as no reply, not as an abort vote.
-       F11: log an error and count every conflicting resolution, as split-decision detection.
+       F11: log an error and count every conflicting resolution, as split-decision detection. The host status
+            cache does so since 2026-11-13 (TransactionStatusCache.splitDecisions); Tx, driver and client do not.
 
 2.14 Server-side validation of the description: Req F7, Q-N4, Req open question 1                           [M-L]
      The pin rule, thresholds, primary object and one-update-per-object are enforced by the client only. Validate
      at the store: thresholds against the pool IDA (and audit `2T > width` outside IDA construction), at most one
      update per object, and a pin marker the store can check. Decide how much of the trust model to change.
 
-2.15 P-N4 (accepted corner case): a forgotten abort re-decided commit by a delayed duplicate client prepare  [-]
-     Documented in the Transaction.commit scaladoc. Revisit only if 2.13 F6 (keeping abort state until
-     TxFinalized) is done, since that narrows it further at no extra cost.
+2.15 CLOSED 2026-11-13: P-N4's delayed duplicate client prepare is closed by the transaction horizon (1.3); the
+     accepted corner case is gone from the Transaction.commit scaladoc.
 
 
 PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
@@ -269,7 +266,7 @@ PRIORITY 5: performance and hygiene
 5.2  R-F16: start a leader driver only when the status cache has no outcome (not merely notFinalized).      [S]
 5.3  Rebuild F7: router.markOffline for a T12 rebuild on a new device, clearOffline on promotion.           [S]
 5.4  P-F12: send Accepts as soon as the new round's quorum is reached. P-F14: save the Tx when late object
-     data is adopted. P-F15: delete or wire up receiveTxPrepare and receiveStatusRequest.                   [S]
+     data is adopted. P-F15: delete or wire up receiveTxPrepare (TxStatusRequest wired up, 2026-11-13).    [S]
 5.5  Q-N5 split action: re-read before declaring a split node gone. Allocation action: make a re-run after a
      deletion idempotent (no orphan entry).                                                                 [S-M]
 5.6  CRL F16: avoid rewriting the full live set on every open, or do it off the control thread. CRL F12: replace
@@ -279,6 +276,9 @@ PRIORITY 5: performance and hygiene
 5.8  Req F10: log an invariant violation when an apply overrides a commit voter's lock.                     [S]
 5.9  Repair F12 residual: reader ranking can prefer a stale store with a higher timestamp (exact ties are
      already handled).                                                                                      [M]
+5.10 Audit the `unlessCollision` sites and `host/StoreRebuilds.scala` ~118 for idempotence when a retried
+     `TransactionOutcomeUnknown` had actually committed (`SimpleTaskExecutor.allocateTask` is known to
+     duplicate).                                                                                            [M]
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
@@ -290,6 +290,7 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
      blank-acceptor promotion test.                                                                         [S]
 6.3  G3: confirm that transfer-out and relinquish go through Store.close, so no driver or timer survives.   [S]
 6.4  G4: a host restart wiping the status cache (now late-commit evidence) combined with rolling restarts.  [M]
+     Safety half covered by the forget floor (2026-11-13); left: the liveness cost of post-load refusals.
 6.5  G8: combined HLC-skew analysis of the repair age gates and rebuild timestamps, plus a skewed-clock test.
      The acceptorSince leg is done (P-N2, Frontend.MaxStartLead, 2026-11-13).                              [M]
 6.6  G7: client caches and pointers against zombie slices and deleted objects.                             [M]

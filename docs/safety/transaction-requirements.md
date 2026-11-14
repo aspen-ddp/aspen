@@ -567,7 +567,7 @@ under reordering/crash; Low = needs an unusual precondition or a trust-model vio
 |---|---|---|---|
 | F2 | unchanged | The crash re-apply runs before any stub exists: a stub replaces the record only once it would be deleted, and a crash before that recovers the record | `Frontend.scala:668-674`; crash-recovery-log 3.6 |
 | F5 | unchanged | A stub holder applies nothing on commit, but it holds the update already (or was never a commit voter of T), and it reports its objects, so the finalizer marks it | `Tx.scala:642-648` |
-| F7 | unchanged | Stores still trust the description; prefer-abort keys on `TxPrepare.fromClient`, which a driver sets false (`TransactionDriver.scala:415,434`) and a client sets true: a forged `fromClient = true` from a store-side component would re-open P-N4's paths, within the same trust model | `Tx.scala:808-811` |
+| F7 | unchanged | Stores still trust the description; prefer-abort keys on `TxPrepare.fromClient`, which a driver sets false (`TransactionDriver.scala:415,434`) and a client sets true: a forged `fromClient = true` from a store-side component would re-open P-N4's paths, within the same trust model. *2026-11-13:* no longer for a forgotten T: the forget floor refuses any prepare, client or driver, for a transaction a store may have forgotten (paxos 10.10) | `Tx.scala:808-811` |
 | F11 | **narrowed** | A replayed allocation reaching a late or non-late commit is no longer applied at a store holding an applied stub for T. It still applies at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) and at stores that acknowledged in time on a non-late commit (paxos P-N3, P-N10) | `Tx.scala:642-648,998-1000` |
 | Q-N5 | **narrowed** (marker site) | A re-run marker's re-created UnackedCommits entries now come with a `TxFinalized` listing them, so stores write stubs for them (transaction-recovery R-N6); the ErrorTree regression is unchanged | `Frontend.scala:763-773` |
 
@@ -687,7 +687,8 @@ the shared lock is subsumed. (b) The driver uses the description's `poolIDAMap` 
 
 > **Refresh (replay pins): FIXED.** The UnackedCommits entry no longer depends on `tracelessObjects`: every
 > unacknowledged counted voter gets one (`MissedUpdateFinalizationAction.scala:98-106`). `appliedBy` still cannot prove
-> such changes, so the proof path still misses them (paxos P-N1/F2).
+> such changes, so the proof path still misses them (paxos P-N1/F2). *2026-11-13:* that no longer costs a false abort:
+> paxos F2 and P-N1 are closed by the transaction horizon (paxos-transactions.md 10.10).
 
 > **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (repair coverage).** TransactionDescription.tracelessObjects only covers RefcountUpdate and revision-less KV with deletesKeys (TransactionDescription.scala:93-98).
 > *Fix sketch:* Treat all revision-less KV updates as traceless, or write UnackedCommits for them.

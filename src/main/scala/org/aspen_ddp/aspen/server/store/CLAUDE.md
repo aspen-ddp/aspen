@@ -44,7 +44,9 @@
   resolved: a Tx that learns the outcome). An `acceptorSince` mute is checked first and keeps its muted, possibly
   proving Tx. The designated leader starts no driver for a prepare below the floor it does not hold (`Store`). A
   store therefore never rejoins a transaction it may have forgotten; for up to the horizon after a load it looks
-  offline to transactions started before the load plus `MaxStartLead`
+  offline to transactions started before the load plus `MaxStartLead`. Accepted cost: on a single host, or after most
+  of a pool's stores restart, such transactions end `TransactionOutcomeUnknown` at about 22 s and are retried. Stores
+  written by bootstrap are not exempt from the load floor. A durable high-water mark is the upgrade path
 - Expiry (`server/transaction/CLAUDE.md`): `Store.heartbeat` calls `Frontend.expiryHeartbeat`, which queries the
   peers of each Tx unfinalized past the horizon plus `expiryMargin` and decides from their `TxStatusResponse`s
   (`ExpiryTally`): adopt an outcome, keep holding, or discard (`expireTransaction`: locks and objects released, CRL

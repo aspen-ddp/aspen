@@ -13,7 +13,12 @@ orphan stub is dropped only by the second scan to find it so, and a deferred fin
 Tx) is recorded as "Refresh (final fix wave)" notes on the findings it changes (R-N7, R-N8, R-N11, P-N10, X13, X14,
 RP-N6, RP-N7) and in the rows below. The 2026-11-11 follow-ups (the finalization failure path, chunked
 UnackedCommits entries, explicit ownership of deferred finalizations, and a refresh of every line citation in
-paxos-transactions.md) are recorded as dated notes on the findings they change and in the rows below. Each has its own "Suspected flaws" section, annotated with adversarial verification verdicts:
+paxos-transactions.md) are recorded as dated notes on the findings they change and in the rows below. The
+2026-11-13 transaction horizon (`docs/superpowers/specs/2026-11-13-transaction-horizon-design.md`: past 20 s no store
+joins a transaction it does not hold, outcomes are remembered 30 s, stuck Txs expire from their peers' status, and the
+client reports `TransactionOutcomeUnknown`) has a "Re-assessment for the transaction horizon" table in
+paxos-transactions.md and transaction-recovery.md, its mechanism and safety argument in paxos-transactions.md 10.10,
+and is reflected in the rows below. Each has its own "Suspected flaws" section, annotated with adversarial verification verdicts:
 
 - **CONFIRMED**: the mechanism was traced in the code, or reproduced.
 - **PLAUSIBLE**: the mechanism is real, but the trigger is uncertain.
@@ -63,7 +68,7 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 | CRL F3 | **FIXED** 2026-11-09 (was PLAUSIBLE, reproduced by a torn-write test) | Rotation copy-forward overwrote the stream holding the only copy of live data |
 | CRL F4 | **FIXED** 2026-11-13 for the phantom (was CONFIRMED, reproduced) | A save after a delete in the same unwritten entry left a live, never-written `Tx` that pinned `oldestEntryNeeded`: after the ring wrapped, recovery threw `BrokenEntryChain` (CRL lost, every store on the device rebuilt). Residual: the skipped save is still acknowledged, which no load path reaches |
 | CRL F5 | CONFIRMED | There are no checksums on CRL entries. Bit rot or reordered sectors can become Paxos state or object data |
-| Paxos P-N4 | **NARROWED** (addendum) to the accepted corner case; PLAUSIBLE | Driver prepares are prefer-abort, so a recovered commit vote's driver can no longer re-decide a forgotten abort commit (a zombie driver already could not: Ruling 31). A delayed duplicate of the client's own prepare reaching a write threshold of each pool after the cache window still can, once the requirement that failed has cleared; documented in the `Transaction.commit` scaladoc |
+| Paxos P-N4 | **FIXED** 2026-11-13 by the transaction horizon (was NARROWED to the accepted corner case, PLAUSIBLE) | Prefer-abort closed the driver paths; the delayed duplicate of the client's own prepare is closed by the forget floor: every store that took part in the abort remembers it for longer than it would join T, and refuses T past its floor. `TransactionAborted` is final; the corner case is gone from the `Transaction.commit` scaladoc (HorizonIntegrationSuite "a delayed client prepare of a forgotten abort does not commit inside or past the horizon") |
 | Paxos P-N2 | **FIXED** 2026-11-13 (was PLAUSIBLE) | Late condition 1 assumed a rebuilt store is always muted, but the mute trusted the client's clock. Every store now mutes an unknown transaction whose start leads its host's wall clock by more than `Frontend.MaxStartLead` (2 s), so the mute depends only on host clock skew (< 8 s). Residual: larger host skew, zombie old copies |
 
 ### Tier 2: resurrection, overwritten updates, permanently stale replicas
@@ -87,8 +92,9 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 | Requirements F11 | **NARROWED** (was PLAUSIBLE; again by the addendum) | A replayed allocation can no longer commit by fresh votes (its pin fails), nor apply at a store holding an applied stub; it still applies at stubless stores where X11, X13 or P-N3 deliver the commit (X14 fixed) |
 | Repair F4 | **NARROWED** (was CONFIRMED, narrow) | TKVL deletes now carry `KeyRevision`, so the invisible no-op delete fails at apply and is marked; blind deletes unchanged |
 | Repair F1, F2, N1, N2 / Requirements F3 | CONFIRMED | Opportunistic and pre-transaction rebuilds replace KV `data` without refreshing `kvState` and skip the commit-in-flight and refcount guards |
-| Paxos F2 / Recovery F3, F8 | **NARROWED** (was CONFIRMED, narrowed) | A driver holding a proof never decides abort and resolves late; the false abort remains without a proof (refcount or overwritten pin, or the single-shot proof missed, P-N1) |
-| Paxos P-N1 | CONFIRMED (new, mechanism; **narrowed**, addendum; trigger reproduced) | The proof is sent once to `lastProposer`; any other driver may decide abort. Since prefer-abort a store first reached by a driver's prepare proves to that driver. A proof that reaches the leader's store before its driver exists is dropped (`Store.scala:206`), which Task 4 reproduced as a replay resolving abort |
+| Paxos F2 / Recovery F3, F5, F8 | **FIXED** 2026-11-13 by the transaction horizon (was CONFIRMED, narrowed) | No store joins a transaction it may have forgotten (forget floor), so no fresh instance re-decides a forgotten commit as abort: the client gets `TransactionOutcomeUnknown` past 22 s instead of a false abort, and a live commit voter left behind ends by expiry, applying T through its UnackedCommits entry if owed. The takeover margin is 30 s against 5-6 s (F5). Residual: Unknown is retried by default, so a non-idempotent retry of a T that had committed can duplicate work (Todo audit entry); post-load refusal (below) |
+| Paxos P-N1 / F10 | **CLOSED BY THE HORIZON** 2026-11-13, not fixed directly (was CONFIRMED, narrowed) | The proof is still sent once to `lastProposer`, and client retransmits still redirect it (F10), but a driver without the proof can no longer decide abort: inside the window every store that knew T answers from its `Tx` or cache, past its floor it refuses. Todo 1.3a dropped. F10's redirected `TxCommitted` still costs an extra repair mark |
+| Paxos F6 | **RE-ASSESSED** 2026-11-13: no longer a split path | An abort still drops its record at resolution, but a forgotten abort cannot be re-decided (forget floor). Residual: the floor's timing relies on each host's wall clock not stepping back by more than about 8 s |
 | Repair F5 | PLAUSIBLE | An allocation-tree record more than 60 s late is treated as a delete |
 | Requirements Q-N5 | PLAUSIBLE (new) | `replaySafe` audit: proofs and the split action hold; the allocation action's orphan entry is less rare than stated; the marker's "idempotent" blind batch can regress newer entries and re-create deleted UnackedCommits entries |
 | X6, X7, X9, C5, C6 | PLAUSIBLE | Repair coverage holes compose: marker-batch give-up, FSIF slot reuse depending on a delete entry, a non-monotone completion gate after a rebuild, untracked bootstrap-pool ErrorTree writes |
@@ -97,6 +103,7 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 
 | Id | Verdict | Finding |
 |---|---|---|
+| Paxos 10.10 (horizon cost) | accepted residual, by design | After a reload a store refuses, permanently, every T it does not hold started in `[load, load + MaxStartLead)` (and, for up to the horizon, those started before the load). On a single host, or after most of a pool's stores restart, such Ts end `TransactionOutcomeUnknown` at about 22 s and are retried. Stores written by bootstrap are not exempt (only `StoreRebuilds.createNewStore`'s are). A durable high-water mark is the upgrade path |
 | Recovery F2 / R-N2 | **FIXED** / **NARROWED** 2026-11-11 (was CONFIRMED) | Finalization has a failure path: a failed finalizer is logged and started again with backoff, never finalized without its marks. Residual (R-N2): an action failing on every attempt keeps the marks unwritten with the transaction unfinalized, a logged stall |
 | Recovery F14 / X5 | CONFIRMED | Finalization still needs the marker's write; under a metadata outage or CRL admission pressure transactions pile up unfinalized |
 | Recovery R-N3 | CONFIRMED (new) | Every recovered commit vote waits, holding its locks and with no driver, for its UnackedCommits lookup; a metadata-group outage stalls them all |
@@ -124,7 +131,9 @@ Per cross-document-review §2, no document yet covers:
 
 - mixed-version rolling upgrades;
 - drivers and timers outliving a store reload;
-- a host restart wiping the status cache (now late-commit evidence), combined with rolling restarts;
+- a host restart wiping the status cache (now late-commit evidence), combined with rolling restarts (2026-11-13: the
+  safety half is covered by the forget floor's load component, paxos 10.10; the liveness cost of rolling restarts,
+  post-load refusals ending Unknown, is stated there but not analysed across many hosts);
 - the incarnation of ErrorTree and UnackedCommits entries;
 - a combined analysis of delayed allocation-tree records;
 - client-side caches;

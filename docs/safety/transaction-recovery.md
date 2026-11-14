@@ -8,6 +8,11 @@ the source; line numbers in passages the refresh did not touch are for `c3ad5493
 Refreshed again 2026-11-10 against `c181375b` for the replay-pins addendum
 (`docs/superpowers/specs/2026-11-09-replay-pins-addendum-design.md` and its amendments): prefer-abort driver prepares,
 applied stubs and `TxFinalized.owed`; passages it changed are marked "(addendum)" and cite `c181375b`.
+Refreshed 2026-11-13 against `e9e6f3f6` for the transaction horizon
+(`docs/superpowers/specs/2026-11-13-transaction-horizon-design.md`; mechanism and safety argument in
+paxos-transactions.md 10.10): a 20 s horizon past which no store joins a transaction it does not hold (the forget
+floor), a 30 s status cache, expiry of stuck Txs from their peers' status, and `TransactionOutcomeUnknown` at the
+client. Passages it changed are marked "(horizon)"; findings in the re-assessment table at the start of section 10.
 Paths are relative to `src/main/scala/org/aspen_ddp/aspen/` unless they start with `docs/`.
 
 Sibling documents (not duplicated here): [paxos-transactions.md](paxos-transactions.md),
@@ -77,7 +82,9 @@ Defaults in production (`cmdline/Main.scala:1724-1749`): `txHeartbeatPeriod` = 1
 | Store heartbeat period | 1 s | `Host.scala:284`, `Store.heartbeat` `Store.scala:69-80` | Drives driver `TxHeartbeat`/`TxFinalized` rebroadcast, collision-wait expiry, UnackedCommits lookup retry, idle-Tx check |
 | `txHeartbeatTimeout` | 5 s (5 periods) | `Host.scala:60`, used `Store.scala:75` | Idle `Tx` (no non-client prepare, accept, resolved, finalized, heartbeat) gets a recovery driver. Observed with 1 s granularity, so actual start is 5-6 s after the last event |
 | `failedDriverDuration` | 6 s (`2 * maxDelay`) | `SimpleTransactionDriver.scala:48`, `SimpleDriverRecoveryMixin.scala:18-28` | Second, redundant trigger (500 ms poll). Because 6 s > 5 s the heartbeat path fires first; this mixin is effectively a backstop |
-| `txStatusCacheDuration` | 7 s (7 periods) | `Host.scala:66` | Lifetime of an outcome entry after the last write |
+| `txStatusCacheDuration` | 30 s (horizon) (was 7 s) | `TransactionHorizon.statusCacheDuration`, `common/transaction/TransactionHorizon.scala:27-28`; asserted by `Host.checkStatusCacheDuration`, `Host.scala:69-73` | Lifetime of an outcome entry after the last write: horizon + `MaxStartLead` + 8 heartbeats |
+| Transaction horizon (horizon) | 20 s | `TransactionHorizon.Horizon`, `TransactionHorizon.scala:11` | Past it (on `startTimestamp` against the host's wall clock) no store joins a transaction it does not hold (forget floor, `Frontend.forgetFloorMillis`); the client gives up at horizon + `MaxStartLead` (22 s) |
+| Expiry margin (horizon) | 8 s (`MaxStartLead` + `txHeartbeatTimeout` + one heartbeat) | `Frontend.expiryMargin`, `Frontend.scala:50-55` | A Tx unfinalized past horizon + margin queries its peers' status (expiry), at once then after 1, 2, 4 and every 8 heartbeats |
 | Driver rebroadcast | `maxDelay` (3 s) | `SimpleTransactionDriver.scala:113`, backoff `:116-127` | Retransmits prepare/accept/resolved; Paxos-contention backoff is randomized in `[0, backoff)` doubling to `maxDelay` |
 | `Driver.heartbeat` | every store heartbeat | `TransactionDriver.scala:184` | `TxHeartbeat` to all stores while not finalized (first tick sends none); `TxFinalized` while finalized |
 | `errorTimeout` | 2 s | `MissedUpdateFinalizationAction.scala:138` | Finalizer waits this long for `TxCommitted` before marking silent stores |
@@ -89,7 +96,10 @@ Defaults in production (`cmdline/Main.scala:1724-1749`): `txHeartbeatPeriod` = 1
 Required relationships (the code states the first three; the rest I derived):
 
 * **TR1** `txStatusCacheDuration > txHeartbeatTimeout + heartbeat granularity + message latency`. Stated in the
-  `Host.scala:62-66` comment. Actual margin with defaults: 7 s vs 5-6 s + RTT, about 1 s. See flaw F5.
+  `Host.scala:62-66` comment. Actual margin with defaults: 7 s vs 5-6 s + RTT, about 1 s. See flaw F5. (horizon) Now
+  `txStatusCacheDuration >= horizon + MaxStartLead + txHeartbeatTimeout + heartbeat`, asserted by a `require`
+  (`Host.checkStatusCacheDuration`, `Host.scala:69-73`): 30 s against a 5-6 s takeover, and missing the margin no
+  longer re-decides anything (F5 closed).
 * **TR2** (removed with the horizon). Replay safety no longer depends on any timer or clock relationship; the only
   clock left on this path is the rebuilt store's `acceptorSince` mute (paxos-transactions.md P-N2).
 * **TR3** `errorTimeout < txHeartbeatTimeout`. The comment at `MissedUpdateFinalizationAction.scala:134-137` says so.
@@ -105,6 +115,12 @@ Required relationships (the code states the first three; the rest I derived):
   claims at most two periods of silence; `maxDelay` (3 s) rebroadcasts are independent of heartbeats.
 * **TR6** Status-cache entries must survive until every store that could still be idle has taken over: this is TR1.
   An early size eviction now only loses late-commit evidence (the warning machinery was removed with the horizon).
+  (horizon) An entry must also outlast the window in which its store would join T (paxos 10.10); a size eviction
+  raises the host's eviction watermark, a forget-floor component, and is logged as an error.
+* **TR7** (horizon) `horizon < statusCacheDuration - MaxStartLead`, so that an entry written
+  when the store joined T (its clock then at least `start - MaxStartLead`) expires only once T is below the store's
+  floor: 30 - 2 = 28 s > 20 s. Holds by construction of `statusCacheDuration`; relies on the host's wall clock not
+  stepping back by more than the 8 s slack.
 
 ## 4. Driver failure and takeover (R1, R3, R4)
 
@@ -219,7 +235,10 @@ Guarantees:
   keeps the Tx (Ruling 9, `Tx.scala:997-1010`). The finalizer runs `MissedUpdateFinalizationAction` only after every
   other action completed (`RegisteredTransactionFinalizerFactory.scala:37-42`, Ruling 8), so a durable entry implies
   all other actions are done. The exceptions are a muted Tx and a prover, neither of which voted commit, and a
-  status-cache entry that expires (7 s). (addendum) A committed Tx forgotten where an UnackedCommits entry may name its
+  status-cache entry that expires (7 s; 30 s since the horizon, which outlasts the window in which a store would join
+  T, paxos 10.10). (horizon) An expiring Tx that knows a commit outcome concludes it past the horizon without a
+  `TxFinalized` (`Tx.concludeKnownOutcome`), once its peers can no longer decide T: they forgot T only after its
+  finalization. (addendum) A committed Tx forgotten where an UnackedCommits entry may name its
   store replaces its CRL record by an applied stub instead of deleting it (`Frontend.scala:654-674`); 5.4.
 
 ## 5. Feeding missed updates into repair (R6)
@@ -420,6 +439,12 @@ Hazard: store S voted commit (counted toward the write threshold), crashed befor
 after the other stores finalized and forgot. S's recovery driver prepares them; they treat it as a new transaction and
 check requirements against *current* state. (Refreshed for replay pins; the horizon defence is gone.)
 
+(horizon, 2026-11-13) Past the transaction horizon the peers that forgot T no longer answer S's driver at all: they
+refuse its prepares (forget floor, paxos 10.10). S then ends by expiry: its status query gets an outcome from a peer's
+cache (adopted; a commit through the late-commit path, so S looks its entry up), or enough "unknown" replies to discard,
+which for S's commit vote waits for a lookup that finds no entry (an entry applies T). The answering-side behaviour
+below therefore applies only to a driver whose prepares arrive inside the window.
+
 **Answering side (peers).**
 * No age test. (addendum) S's driver sends prefer-abort prepares, so the fresh `Tx` checks no requirements: it proves
   if an object shows T's update, and otherwise votes abort after `MissingDataWait` (`Tx.scala:205-208,537-542`). Before
@@ -456,7 +481,12 @@ writes a stub as the Tx is forgotten; a Tx already resolved committed looks its 
 
 ### 6.6 What happens if a forgotten commit is aborted anyway
 
-Now only when no driver holds a proof (a refcount pin, an overwritten pin, a proof lost, paxos P-N1). If peers vote
+(horizon, 2026-11-13) It no longer happens: no store that forgot T joins a driver's round for T (paxos 10.10), so no
+driver decides abort from forgotten acceptors. A commit vote whose peers forgot T ends by expiry, applying T if its
+entry exists and discarding otherwise (it was not owed). The paragraph below describes the code before the horizon;
+the ErrorTree argument still covers a store whose update was never counted.
+
+Before the horizon: only when no driver holds a proof (a refcount pin, an overwritten pin, a proof lost, paxos P-N1). If peers vote
 abort and S has no entry, the driver decides abort and S drops its update. S is safe only because S sent no
 `TxCommitted`, hence the finalizer marked it in the ErrorTree before `TxFinalized` was sent, hence repair will bring S's
 copy to the committed state. This is the key reason ErrorTree marking must precede finalization (T-M1).
@@ -544,10 +574,14 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
 * **T5 (recovered commit vote is not dropped silently)** A *recovered* `VoteCommit` `Tx` in `Unresolved` status cannot be
   aborted without an UnackedCommits lookup that began after the abort arrived and found no entry; if an entry exists it
   commits, and its driver holds a proof. Scope: recovered Txs only for aborts (F3); every commit voter for late commits.
+  (horizon) Also an expiring commit voter before it discards (`needsUnackedCheck` covers expiring Txs), and a live
+  voter's abort is now always a real one (F3 closed by the horizon).
 * **T6 (no finalization without finalizers)** `TxFinalized` is sent only by a driver whose finalizer completed, by a
   late driver (whose evidence implies some finalizer completed), or re-sent by a store that answers from a `finalized`
   status-cache entry, which was recorded only after a real `TxFinalized` or a late outcome. Therefore a finalization action's work is complete (at least once) before any store may forget the
-  transaction, except through cache expiry (7 s) or a store that was down.
+  transaction, except through cache expiry (7 s) or a store that was down. (horizon) Neither lets a store rejoin T
+  any more: cache expiry (30 s) happens only once T is below the store's floor, and a store that was down reloads with
+  a load floor; a resolved Tx whose `TxFinalized` was lost concludes past the horizon (`Tx.concludeKnownOutcome`).
 * **T7 (finalization actions are at-least-once)** See 4.4. Idempotency is the action's duty.
 * **T8 (missed-update recording precedes forgetting)** Every store that did not report an error-free commit before
   `errorTimeout` has an ErrorTree entry per non-lock-only object (and, for counted commit voters, an UnackedCommits
@@ -557,7 +591,7 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
   forgotten, pinned transaction cannot collect `t` commit votes on its pinned object; with a proof it resolves late and
   is applied only where an UnackedCommits entry says it is owed. Holds independent of clocks. Exceptions: `replaySafe`
   transactions; stores with entries left over from a late acknowledgement (R-N1); a recovering acceptor that still holds
-  the accepted commit (paxos P-N3); forgotten *aborts* (paxos P-N4). (addendum) A store holding an applied stub never
+  the accepted commit (paxos P-N3); forgotten *aborts* (paxos P-N4; closed by the horizon 2026-11-13). (addendum) A store holding an applied stub never
   applies T again (5.4), which narrows R-N1 to stores with an entry and no stub (R-N7 to R-N9); forgotten aborts are
   re-decidable only by a delayed duplicate client prepare (P-N4 narrowed). Ruling 3's delayed non-late `TxFinalized`
   (R-N8) is gone with Ruling 7.
@@ -587,7 +621,7 @@ Notation: L = designated leader store/driver; S = an arbitrary participant store
 | After prepare to a subset of stores, not to L | The stores that got it create `Tx`s; L starts no driver. After 5-6 s idle (client prepares do not count as events) the first idle store starts a recovery driver, whose data-less prepares reach L and the rest | Safe: T3. Stores that never got the client's prepare withhold promise and vote for up to 5 s then vote abort, requirements unchecked (`awaitingClientPrepare`, addendum; data-less transactions too); the transaction may abort or commit with fewer stores; a commit decided without a store's data is held there until data/TxFinalized, then repair (R6) |
 | After prepare to all stores, before result | Normal completion by L; client never learns | Safe. A later retry by a new client instance would be a new txid |
 | After result (committed), before using it | Committed | Safe. The caller's state (e.g. the pointer to an allocated object stored in another object by the same transaction) is whatever the transaction wrote (guideline in CLAUDE.md) |
-| Client survives but its TransactionFinalized/Resolved messages are lost | It retransmits prepares forever (logs "HUNG Client Transaction" every 3 retries). Stores that know the txid answer from cache/`Tx`. After the cache expires, those prepares are ignored or answered from `Frontend.receivePrepare` (finalized cache) or, unknown, checked afresh: with a proof the driver resolves late and the client gets committed; without one the client can get `TxResolved(abort)` for a committed transaction (F8, narrowed) |
+| Client survives but its TransactionFinalized/Resolved messages are lost | (horizon) It retransmits until horizon + `MaxStartLead` (22 s after the start, `SimpleClientTransactionDriver.scala:48,73`), then fails the commit with `TransactionOutcomeUnknown`. Stores that know the txid answer from cache/`Tx` (the 30 s cache covers the whole retransmit window); a store that forgot it and is past its floor refuses, so no new instance forms (F8 closed). Before the horizon: after the cache expired a no-proof driver could tell the client abort for a committed transaction | Safe; the caller retries Unknown by default, so a non-idempotent retry of a T that had committed can duplicate work (Todo audit entry) |
 
 ### 9.2 Store (participant) crashes at each step
 
@@ -626,19 +660,26 @@ Notation: L = designated leader store/driver; S = an arbitrary participant store
 
 ### 9.4 Status-cache and time (refreshed: the horizon is gone)
 
-* **Expired status cache** (>7 s since last write) at the stores that finalized: a late prepare creates a fresh `Tx`,
-  checked normally whatever its age. The pin fails; a proof leads to a late commit (nothing applied except where an
-  entry says a store is owed it); no proof leads to an abort decision (F8).
+* (horizon) **Forget floor**: a store refuses any prepare for a transaction it does not hold whose start is below the
+  latest of now - 20 s, its load + `MaxStartLead`, and the host's eviction watermark (paxos 10.10). The bullets below
+  are amended accordingly.
+* **Expired status cache** (>30 s since last write since the horizon; was >7 s) at the stores that finalized: the
+  transaction is then past every such store's floor, so a late prepare is refused and no fresh `Tx` is created (F8
+  closed). Before the horizon a late prepare was checked afresh: a proof led to a late commit, no proof to an abort.
 * **Lost TxFinalized (R3)**: the idle `Tx` starts a driver at 5-6 s; the other stores answer from their cache (written at
-  their finalization, 7 s lifetime) with `TxResolved+TxFinalized(late)`; the driver resolves late and runs no
-  finalizers. Margin about 1 s (F5). If the margin is lost, the outcome is re-decided: a proof gives a late commit, which
-  the idle store applies through its lookup; otherwise abort (F5, F8).
+  their finalization, 30 s lifetime) with `TxResolved+TxFinalized(late)`; the driver resolves late and runs no
+  finalizers. (horizon) Margin about 24 s, not 1 s (F5 closed). If even that is lost (a long stall), nothing is
+  re-decided: the peers refuse the driver, and the Tx ends by expiry, concluding its known outcome or, unresolved,
+  adopting a peer's cached outcome or discarding after a lookup that finds no entry.
 * **Clock skew**: no longer used to decide replay. It remains in the rebuilt store's `acceptorSince` mute
   (`Frontend.scala:676`; paxos P-N2) and in repair's age gate.
 * **Partition that heals after outcomes are forgotten**: a minority store S that holds a (live, not recovered) `VoteCommit`
   `Tx` and rejoins after more than 7 s: its recovery driver asks peers; with a proof it resolves late and S, holding its
   vote, looks up its entry and applies (F3 narrowed); without one S accepts the abort (no lookup since `recovered` is
-  false) and is repaired from its ErrorTree and UnackedCommits entries. This relies on repair being exact.
+  false) and is repaired from its ErrorTree and UnackedCommits entries. This relies on repair being exact. (horizon)
+  Now: inside the window the peers answer from their caches (30 s); past it they refuse S's driver, and S ends by
+  expiry, whose discard of a commit vote waits for a lookup finding no entry and whose found entry applies T (F3
+  closed). S never accepts a false abort.
 * **Finalization action that keeps failing**: the action retries itself with backoff forever (unless `StopRetrying`), the
   driver keeps heartbeating, stores keep the `Tx`, CRL entry and admission bytes; a crash of the driver's host hands the
   work to D2. (2026-11-11) If an action's future *fails* (not retries), the finalizer fails and the driver starts a
@@ -661,6 +702,18 @@ Notation: L = designated leader store/driver; S = an arbitrary participant store
 
 Confidence: H = high (the code path is directly readable), M = medium, L = low (needs a particular interleaving
 or an assumption I could not verify).
+
+### Re-assessment for the transaction horizon (2026-11-13, `e9e6f3f6`)
+
+Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding of this document is unchanged by it.
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F3 | **closed** (FIXED by the horizon) | The abort a live commit voter accepted at once was a false abort of a forgotten commit, which can no longer be decided: past the floor no store that forgot T answers a driver. Inside the window the abort it learns is the real outcome. A voter left behind past the horizon ends by expiry, and expiry's discard of a commit vote waits for an UnackedCommits lookup that finds no entry (`needsUnackedCheck` now covers expiring Txs); a found entry applies T. Item 1.3c (the traceless hold for live voters) is dropped, not implemented | `server/transaction/Tx.scala:187-189`; `server/store/Frontend.scala:648-694`; FrontendSuite "a commit voter past the horizon with no UnackedCommits entry is discarded once a later lookup finds none", "... with an UnackedCommits entry applies and resolves committed" |
+| F5 | **closed** | The takeover margin is 30 s of cache against a 5-6 s takeover (about 24 s, asserted in code), not about 1 s; a stall beyond it no longer re-decides the outcome (the peers refuse the driver) and the Tx ends by expiry, a resolved one concluding its known outcome. Residual: liveness only, a stalled store holds T until horizon + margin (28 s) plus its queries | `common/transaction/TransactionHorizon.scala:27-28`; `server/Host.scala:69-73`; StoreSuite "a committed Tx whose TxFinalized was lost concludes past the horizon, and its driver is removed" |
+| F8 | **closed** (FIXED by the horizon) | No re-decided abort exists to overwrite the cache or reach the client; the client is told `TransactionOutcomeUnknown` past horizon + `MaxStartLead`. Should an opposite outcome ever reach the cache, `updateStatus` keeps Committed and now logs it as a split decision. Residual: an Unknown is retried by default, so a non-idempotent retry of a T that had committed can still duplicate work (`SimpleTaskExecutor.allocateTask`; Todo audit entry) | `client/internal/transaction/SimpleClientTransactionDriver.scala:48,73`; `server/transaction/TransactionStatusCache.scala` `updateStatus`; HorizonIntegrationSuite "a stale retransmit of a finalized traceless commit past the horizon reports unknown, not aborted" |
+| F6 | unchanged (consequence narrowed) | Still not restored; if its own cache entry is gone the recovered `Committed` Tx's driver now finds the peers refusing it past the horizon (no false abort), and the Tx ends by expiry | `Tx.scala` constructor |
+| T9 | **changed** | Forgotten aborts are no longer an exception (paxos P-N4 closed) | paxos 10.10 |
 
 ### Re-assessment for replay pins (2026-11-09, `0d08e3c6`)
 
@@ -752,6 +805,12 @@ finalize" for missed-update marking, with the loss recorded.
 > UnackedCommits entry and applies (`Tx.scala:926-930`, `:997-1026`). Without a proof S still accepts the abort at once
 > (`needsUnackedCheck` still requires `recovered`, `Tx.scala:158-160`).
 
+> **Refresh (horizon, 2026-11-13): CLOSED.** The abort S accepted was a re-decided one from peers that forgot T; under
+> the horizon they refuse S's driver past their floor, so no such abort exists. Past the horizon S ends by expiry,
+> which for a commit vote discards only after a lookup started then finds no UnackedCommits entry, and applies T if
+> one exists (`Tx.needsUnackedCheck`, `Tx.scala:187-189`, now covering expiring Txs; `Frontend.decideExpiry`,
+> `Frontend.scala:648-681`). Todo 1.3c dropped.
+
 **F3 (M) Traceless protection applies only to `recovered` transactions, not to a live store that held a commit vote through a
 long partition or pause.** `needsUnackedCheck` requires `recovered` (`Tx.scala:128`). A store S that voted commit and
 stays up but is partitioned or paused longer than the 7 s cache window while the others commit, finalize and forget
@@ -789,6 +848,12 @@ Also applies to a UnackedCommits hit by a store that already applied (`unackedCo
 > **Refresh (replay pins): NARROWED.** Past the margin, a proof yields a late commit, applied by the idle store through
 > its lookup; abort only when no proof exists.
 
+> **Refresh (horizon, 2026-11-13): CLOSED.** The cache now lasts 30 s (horizon + `MaxStartLead` + 8 heartbeats,
+> asserted against the takeover delay by `Host.checkStatusCacheDuration`), so the margin is about 24 s, not 1 s. A
+> stall past even that re-decides nothing: the peers refuse the driver past their floors, and the Tx ends by expiry,
+> adopting a cached outcome, concluding the one it knows, or discarding (a commit vote only after its lookup finds no
+> entry). Residual: liveness, the stalled Tx holds its locks until horizon + margin plus its queries.
+
 **F5 (M) The takeover margin (cache 7 s vs. idle-driver start 5-6 s + RTT) is about 1 s and has no defense against a stall.**
 `TR1` rests on timer granularity (heartbeat check at `Store.scala:75` fires on the next 1 s tick) and on the cache being
 written at finalization time, not at the idle store's last event. A heartbeat tick delayed by GC, a slow executor (all
@@ -823,6 +888,11 @@ re-insert commit again. HLC corrections go only forward through object timestamp
 > *Fix sketch:* As paxos F2.
 
 > **Refresh (replay pins): NARROWED.** As paxos F2.
+
+> **Refresh (horizon, 2026-11-13): CLOSED.** As paxos F2: no abort is re-decided for a forgotten commit, so none
+> overwrites the cache or reaches the client; a client that cannot learn the outcome by horizon + `MaxStartLead` fails
+> with `TransactionOutcomeUnknown`. Residual: Unknown is retried by default, and a retry of a T that had committed can
+> duplicate a non-idempotent operation (the sketch's "allocate again"; Todo audit entry).
 
 **F8 (L-M) A re-decided abort can overwrite the cached finalized-commit entries and tell the client "aborted" after
 commit.** When F3, F5 or F7 produce an abort decision after a commit, the deciding driver sends `TxResolved(false)` and
@@ -1141,8 +1211,8 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 
 | Hazard | Flaws |
 |--------|-------|
-| Lose a committed update | F3, F5, F6, F13 (all on a lagging store, rescued only by repair); paxos P-N2 (late in the live window) |
-| Apply an aborted update | none found for the UnackedCommits path (entries exist only for committed transactions); paxos P-N4 (a forgotten abort re-decided commit; addendum: only by a delayed duplicate client prepare) |
+| Lose a committed update | F6, F13 (on a lagging store, rescued only by repair); F3, F5 closed by the horizon; paxos P-N2 fixed |
+| Apply an aborted update | none found for the UnackedCommits path (entries exist only for committed transactions); paxos P-N4 closed by the horizon (2026-11-13) |
 | Replay a forgotten transaction | F4 (narrowed), F10 (narrowed), R-N1 (narrowed by stubs), R-N7 (narrowed), R-N9, paxos P-N3; F7, F9 and R-N8 fixed |
 | Fail to record a missed update | F14; F13; F2 fixed, R-N2 narrowed (marks wait for a permanently failing action) |
 | Hang forever | F12; F14 (long); R-N2 (a failure repeating forever, logged); R-N3 (recovered votes without lookups); R-N10 (case-3 lookup, no locks); F1, F2 fixed |

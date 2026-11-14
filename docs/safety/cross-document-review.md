@@ -85,6 +85,11 @@ completion (or than "now minus horizon" at promotion), answering only TxUnknown/
 > constructor can no longer downgrade A's finalized late entry, so the finalized relay keeps answering late
 > (`StoreSuite` "a sibling store's delayed resolution does not downgrade a finalized late entry").
 
+> **Refresh (horizon, 2026-11-13).** The split decisions that produced opposite outcomes (paxos F2, P-N4) are closed
+> by the transaction horizon (paxos 10.10), so opposite outcomes should never reach the cache. `updateStatus` keeps
+> the merge rule below and now logs an error and counts any that does (`splitDecisions`; TransactionStatusCacheSuite
+> "an opposite outcome is logged as a split decision").
+
 > **Refresh (post-addendum): opposite outcomes.** The monotone merge ORed `finalized`/`late` across opposite statuses,
 > reachable through split decisions (paxos F2, P-N4): a stray abort over a finalized late commit became a finalized
 > abort that the relay spread, and a commit over a finalized abort became a finalized late commit whose drivers skip
@@ -123,6 +128,7 @@ the store has no trace of the transaction (needs the 'applied' record) or compar
 > **Refresh (Ruling 31): FIXED for closed stores.** `Store.close` now shuts down the store's drivers and clears its
 > map, and a `SimpleTransactionDriver` timer already firing neither sends nor reschedules, so no zombie driver outlives
 > a close, reload, rebuild or relinquish that goes through it. P-N4's delayed duplicate client prepare remains.
+> *2026-11-13:* P-N4 is closed by the transaction horizon (paxos 10.10), so nothing of this chain remains.
 >
 > **Refresh (replay pins): UNCHANGED, consequence changed.** `Store.close` still only closes the frontend
 > (`Store.scala:65`). The zombie's periodic prepares no longer meet `TooOld`: they create fresh Txs checked against
@@ -280,7 +286,7 @@ marker would have to report per-pool results instead of one all-or-nothing futur
 
 Verdict: PLAUSIBLE (mechanism CONFIRMED).  Severity: resurrection (blind writes at stores that acknowledged in time).
 D1's non-late commit `TxFinalized` waits for its handed-off write, which retries without a deadline. Once the stores'
-finalized cache entries expire (7 s, paxos P17), a replayed client prepare creates fresh Txs, and D1's message resolves
+finalized cache entries expire (7 s then; 30 s since the horizon, past which the stores refuse the replay, paxos P17 and 10.10), a replayed client prepare creates fresh Txs, and D1's message resolves
 each of them committed (`Tx.scala:945-946`), applying the replay's data where no stub exists. The cache window that
 made D1's prompt `TxFinalized` harmless before Ruling 3 no longer covers it.
 Fix sketch: as recovery R-N8: send the delayed message late but keep its `owed`, and have stores honour `owed` on late
@@ -296,7 +302,7 @@ plain `late = true`, or a bounded wait, empties `owed` and reopens X13.
 G1. Fast rebuild or lost CRL vs a long-unresolved transaction (X2): no document states how long a transaction can stay unresolved or tests promotion of a blank acceptor against it.
 G2. Mixed-version/rolling-upgrade protocol skew (message formats, finalizer types, CRL entry format, txd fields): systemic doc covers detectors only; recovery covers F1 only for jars.
 G3. Zombie drivers/timers after a non-crash store reload, device relinquish and transfer-out (X4). Only recovery F12 mentions it, with no interaction analysis.
-G4. A shared, in-memory host-wide status cache is the anchor for finalization relays and, since the refresh, late-commit evidence (condition 2); no document analyses host restart (cache wiped) combined with rolling restarts of the stores' peers (paxos F6 touches it for one restart only). The horizon and TooOld no longer depend on it.
+G4. A shared, in-memory host-wide status cache is the anchor for finalization relays and, since the refresh, late-commit evidence (condition 2); no document analyses host restart (cache wiped) combined with rolling restarts of the stores' peers (paxos F6 touches it for one restart only). The horizon and TooOld no longer depend on it. *(2026-11-13: the safety half is covered. A restart, transfer-in or size eviction raises the affected stores' forget floor (load + `MaxStartLead`, or the eviction watermark) at the moment memory is lost, so a store whose host lost its cache never rejoins a transaction it may have forgotten, however many peers restart (paxos 10.10; HorizonIntegrationSuite "a host restart does not let its stores rejoin a transaction they forgot"). Left: the liveness cost across rolling restarts, where each reload refuses the transactions it does not hold started before its load plus `MaxStartLead`, and too many refusing stores in a pool end those transactions Unknown.)*
 G5. ErrorTree/UnackedCommits entry-key incarnation (X10) and the time-line of entry production vs consumption during a T12 move are described only per-document.
 G6. Allocation-tree dependency: rebuild F10/F17, repair F5 and requirements F11 each mention an allocation recorded late or not at all, but nobody analyses the total effect (missing slice, stale deletion decision, replayed allocation) across rebuild, repair and horizon.
 G7. Client object caches/pointers (stale `ObjectPointer`, DataObject read caches) are outside all seven; resurrection by a client reading a zombie slice with a cached pointer is not discussed.
@@ -320,7 +326,7 @@ C2. repair-process 12.8 says marker inserts use `retryUntilSuccessful` and "No e
 C3. rebuild-process F14 ("Paxos acceptor amnesia is safe only within the pool's failure tolerance") contradicts paxos-transactions P8/P9 (state of a possibly chosen value must be retained) and crash-recovery-log F18 (open question). Quorum arithmetic says tolerance
     does not cover amnesia (X2). The three documents give three different answers.
 C4. transaction-recovery F10 and paxos F9 call the status-cache downgrade low impact/"hygiene" and "not unsafe"; requirements F1/F2 and X3 show a re-apply path for blind writes. *(Refresh: resolved in the documents. Since Ruling 30 the downgrade is fixed: the cache is monotone.)* The documents disagree on whether the cache is a safety mechanism (paxos P17 says assumption) or an optimization (recovery F10).
-C5. paxos F2 / recovery F3,F5 say the false-abort is "repaired through the ErrorTree/UnackedCommits entries recorded by the finalizer", but transaction-recovery F13 and requirements F8 say stores that were not counted voters, or traceless changes not covered by `tracelessObjects`, get no entry; the repair-process documents assume an entry always exists. *(Refresh: the traceless half is gone, requirements F8 fixed; the uncounted-voter half, recovery F13, stands.)*
+C5. paxos F2 / recovery F3,F5 say the false-abort is "repaired through the ErrorTree/UnackedCommits entries recorded by the finalizer", but transaction-recovery F13 and requirements F8 say stores that were not counted voters, or traceless changes not covered by `tracelessObjects`, get no entry; the repair-process documents assume an entry always exists. *(Refresh: the traceless half is gone, requirements F8 fixed; the uncounted-voter half, recovery F13, stands.)* *(2026-11-13: the false abort itself is gone, paxos F2 and recovery F3, F5 closed by the horizon; an expiring commit voter discards only when its lookup finds no entry. An uncounted voter that discards relies on its ErrorTree mark, as before, so recovery F13's gap is unchanged but no longer meets a false abort.)*
 C6. rebuild-process 8.2 says ErrorTree repair "closes the residual staleness gap"; repair-process 13.2 F1/F2/F3/F4/F13 each describe cases where repair itself leaves the store stale or declares completion early. The rebuild guarantee rests on the repair guarantee that is not established.
 C7. transaction-recovery F6 (persisted `Committed` status is not restored into the recovered Tx; relies on the cache) vs crash-recovery-log 3.1 line 149 ("No decision is saved"): the CRL doc says the resolution is not a record, but recovery F6 says it can be persisted by a re-save; both are true depending on whether a prepare/accept re-saved the Tx after resolution. Should be stated once.
 

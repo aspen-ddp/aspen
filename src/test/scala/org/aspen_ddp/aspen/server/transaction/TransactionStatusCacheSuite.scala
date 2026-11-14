@@ -146,3 +146,20 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     cache.updateStatus(txid, TransactionStatus.Committed, finalized = true)
     cache.getStatus(txid) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed, finalized = true))
   }
+
+  // Under the transaction horizon no forgotten transaction is ever decided again, so opposite outcomes should never
+  // arise: one that does is a split decision, logged as an error and counted
+  test("an opposite outcome is logged as a split decision") {
+    val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), maxEntries = 100)
+    val committed = TransactionId(new UUID(0, 1))
+    val aborted = TransactionId(new UUID(0, 2))
+    cache.updateStatus(committed, TransactionStatus.Committed, finalized = true)
+    cache.updateStatus(committed, TransactionStatus.Committed)
+    cache.updateStatus(committed, TransactionStatus.Unresolved)
+    cache.splitDecisions shouldBe 0
+    cache.updateStatus(committed, TransactionStatus.Aborted)
+    cache.splitDecisions shouldBe 1
+    cache.updateStatus(aborted, TransactionStatus.Aborted)
+    cache.updateStatus(aborted, TransactionStatus.Committed)
+    cache.splitDecisions shouldBe 2
+  }

@@ -1,7 +1,9 @@
 ### Transaction protocol
 Store-local mechanics (locks, collisions, in-flight commits, admission): `server/store/CLAUDE.md`. Client-side
 pin rule and finalizer entries: `client/internal/transaction/CLAUDE.md`. Safety arguments: `docs/safety/`.
-Designs: `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2026-11-08-traceless-commits-design.md`
+Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forget floor, expiry),
+`2026-11-09-replay-pins-design.md`, `2026-11-08-traceless-commits-design.md`. Safety argument for the horizon:
+`docs/safety/paxos-transactions.md` 10.10
 
 #### Lifecycle
 - The client builds a TransactionDescription and sends it plus object data to the stores
@@ -39,10 +41,17 @@ Designs: `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2
   requirements on one. It proves at once if it can (`appliedBy`), else withholds its whole response until the data, a
   client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes: then it votes abort
   (`NoClientPrepare`). This holds for data-less transactions too, so their late resolution may take 5 s longer. A vote
-  given stands, but later data is still used to apply a commit. Accepted corner case: a delayed duplicate client
-  prepare of an aborted transaction (see the `Transaction.commit` scaladoc)
+  given stands, but later data is still used to apply a commit. A delayed duplicate client prepare of an aborted
+  transaction cannot commit it: every store that took part remembers the abort for longer than it would join T, and
+  refuses T past its forget floor (below)
 - Muted prepares at rebuilt stores (`acceptor-since`) and for start timestamps ahead of the host's clock
   (`Frontend.MaxStartLead`): `server/store/CLAUDE.md`
+- Transaction horizon (`common.transaction.TransactionHorizon`, 20 s on `startTimestamp` against the host's wall
+  clock): a prepare for a transaction a store does not hold whose start is below its forget floor
+  (`Frontend.forgetFloorMillis`: now - horizon, its load + `MaxStartLead`, the cache's eviction watermark) is refused
+  outright, no Tx; details `server/store/CLAUDE.md`. So no driver ever counts the fresh state of an acceptor that
+  forgot T, and a commit is never re-decided as abort nor an abort as commit. Proofs and late resolution still work
+  inside the window but are no longer load-bearing
 
 #### UnackedCommits
 - Written by the finalizer for each commit voter that sent no TxCommitted (`client/internal/transaction/CLAUDE.md`);
@@ -109,8 +118,15 @@ Designs: `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2
   TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
   if the data beat the finalizer's `errorTimeout` (2 s). Stores that miss it are marked in the ErrorTree
   (`client/internal/transaction/CLAUDE.md`) and repaired (`server/repair/CLAUDE.md`)
-- A lost TxFinalized is recovered by the store itself: a Tx idle for `Host.txHeartbeatTimeout` gets a driver, which
-  learns the outcome from the stores' status caches, so `Host.txStatusCacheDuration` must outlast that timeout. At
-  high volume the cache is costly (about 175 bytes per transaction, capped at `DefaultMaxEntries`), so these stay
-  short: 5 s and 7 s with the host's 1 s heartbeat
+- A lost TxFinalized is recovered by the store itself: a Tx idle for `Host.txHeartbeatTimeout` (5 heartbeats, 5 s)
+  gets a driver, which learns the outcome from the stores' status caches. `Host.txStatusCacheDuration` is
+  `TransactionHorizon.statusCacheDuration`: horizon + `MaxStartLead` + 8 heartbeats, 30 s with the host's 1 s
+  heartbeat, asserted (`Host.checkStatusCacheDuration`) to be at least horizon + `MaxStartLead` + that timeout + one
+  heartbeat, so a Tx first created near the horizon still finds its peers' entries when its idle driver starts, and an
+  entry expires only once its transaction is below its store's floor. At high volume the cache is costly (about 175
+  bytes per transaction, capped at `DefaultMaxEntries`); a size eviction is logged as an error and raises the host's
+  eviction watermark. A driver that still learns nothing past the horizon meets refusals, and the Tx ends by expiry
+- `TransactionStatusCache.updateStatus` keeps Committed over an opposite outcome (Ruling 30). Under the horizon an
+  opposite outcome should never arise: one that does is logged as an error ("Split decision") and counted
+  (`splitDecisions`)
 - `AbortVoteReport` logs a host's abort votes by failed requirement once a second while they happen

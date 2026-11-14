@@ -23,6 +23,7 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
 
   private val watermark = new AtomicLong(0)
   private val sizeEvictionCount = new AtomicLong(0)
+  private val splitDecisionCount = new AtomicLong(0)
 
   /** Zero until a size eviction. Then the wall clock at the latest size eviction plus MaxStartLead (monotone): a
     * transaction whose startTimestamp is not past it may have had an entry evicted, so a store must not trust the
@@ -32,6 +33,9 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
 
   /** The number of size evictions so far */
   private[aspen] def sizeEvictions: Long = sizeEvictionCount.get()
+
+  /** The number of opposite outcomes recorded so far (updateStatus): split decisions, which should never arise */
+  private[aspen] def splitDecisions: Long = splitDecisionCount.get()
 
   private def recordSizeEviction(txid: TransactionId): Unit =
     val mark = wallClockMillis() + TransactionHorizon.MaxStartLead.toMillis
@@ -51,24 +55,33 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
     * entry, and a write from one that learned less (a Tx created, or a delayed non-late resolution) must not erase
     * what another recorded: the finalized relay (Store) reports from it.
     *
-    * Opposite outcomes arise only from a split decision: a forgotten transaction decided again by a later round
-    * (paxos F2, a false abort of a commit; P-N4, an abort decided again as a commit). Committed wins, because a commit is
-    * what the stores hold and nothing rolls it back. An abort never replaces a commit, and the flags describe the
-    * outcome they came with: an abort's `finalized` and `late` do not pass to a commit that replaces it. Otherwise the
-    * relay would spread the false abort as finalized, or report a commit still being finalized as late, so that its
-    * driver skipped the finalization actions
+    * Opposite outcomes should never arise (transaction horizon, 2026-11-13): no store joins a transaction it may have
+    * forgotten (Frontend.forgetFloorMillis), so a forgotten transaction is never decided again by a later round. One that
+    * does arise is a split decision (once paxos F2, a false abort of a commit; P-N4, an abort decided again as a
+    * commit): it is logged as an error and counted (splitDecisions). Committed wins, because a commit is what the
+    * stores hold and nothing rolls it back. An abort never replaces a commit, and the flags describe the outcome they
+    * came with: an abort's `finalized` and `late` do not pass to a commit that replaces it. Otherwise the relay would
+    * spread the abort as finalized, or report a commit still being finalized as late, so that its driver skipped the
+    * finalization actions
     */
   def updateStatus(txid: TransactionId, status: TransactionStatus.Value, finalized: Boolean=false, late: Boolean=false): Unit = {
+    var opposite: Option[TransactionStatus.Value] = None
     cache.underlying.asMap().compute(txid, (_, old) =>
       if old == null then
         Entry(status, finalized, late)
       else if status == TransactionStatus.Aborted && old.status == TransactionStatus.Committed then
+        opposite = Some(old.status)
         old
       else if status == TransactionStatus.Committed && old.status == TransactionStatus.Aborted then
+        opposite = Some(old.status)
         Entry(status, finalized, late)
       else
         val merged = if status == TransactionStatus.Unresolved then old.status else status
         Entry(merged, old.finalized || finalized, old.late || late))
+    opposite.foreach: recorded =>
+      splitDecisionCount.incrementAndGet()
+      logger.error(s"Split decision: transaction $txid was recorded $recorded and is now reported $status. " +
+        s"Committed is kept")
   }
 
   def getStatus(txid: TransactionId): Option[Entry] = {

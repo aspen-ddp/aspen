@@ -164,9 +164,10 @@ Recovery and every other store-side driver send prefer-abort prepares: a DataSto
 never checks the transaction's requirements on such a prepare. It proves the commit at once if an object it hosts
 already shows the transaction's update. Otherwise it waits (up to 5 seconds) for the client's own prepare, and
 votes abort if none arrives. Recovery therefore never gathers fresh commit votes, so it cannot commit a
-transaction that was already aborted and forgotten. The one accepted corner case is a delayed duplicate of the
-client's own prepare that reaches enough stores after all of them forgot an aborted transaction (after the status-cache duration, 7 s by default) while its
-requirements hold again; a client that successfully retries the transaction closes it.
+transaction that was already aborted and forgotten. Nor can a delayed duplicate of the client's own prepare: past
+the transaction horizon (20 s after the transaction started) no DataStore joins a transaction it does not already
+hold, and every DataStore remembers an outcome for longer than that, so no store ever rejoins a transaction it forgot.
+A client that cannot learn the outcome within the horizon fails the commit with `TransactionOutcomeUnknown`.
 
 One reason transactions are intended to commit/abort as fast as possible is that once a DataStore 
 votes to commit a transaction, the objects it hosts are locked to that transaction until the 

@@ -12,7 +12,13 @@ code has since been removed names the commit it was taken at (e.g. "`Frontend.sc
 dated verification and refresh notes still describes the code of its date. Every mechanism is cited as `path:line`;
 paths are relative to `src/main/scala/org/aspen_ddp/aspen/` unless they start with `docs/`. Where this document
 disagrees with `CLAUDE.md`, `Architecture.md` or `Todo.txt`, the code was taken as the truth and the disagreement is
-called out (section 2).
+called out (section 2). Refreshed 2026-11-13 against `e9e6f3f6` for the transaction horizon
+(`docs/superpowers/specs/2026-11-13-transaction-horizon-design.md`; Todo 1.3): a 20 s horizon past which no store joins
+a transaction it does not hold (the per-store forget floor), a 30 s status cache, expiry of stuck Txs from their peers'
+status, and the client error `TransactionOutcomeUnknown`. It is new mechanism, not the replay horizon removed on
+2026-11-09 (that one made stores vote `TooOld`; this one makes them refuse to take part). Its passages are marked
+"(horizon)" and cite `e9e6f3f6`; the mechanism and its safety argument are in 10.10, the findings it changes in the
+re-assessment table at the start of section 12.
 
 Related documents (siblings, not duplicated here): [crash-recovery-log.md](crash-recovery-log.md) (CRL interface and
 SimpleCRL), [transaction-requirements.md](transaction-requirements.md) (requirement checks, locks, commit-in-flight
@@ -142,8 +148,10 @@ longer matter. In code: a committed `Tx`'s CRL record (and in-memory acceptor) l
 (`Tx.scala:949-960`, `Frontend.scala:664-676`). An **aborted** `Tx`'s CRL record is deleted at *resolution*, earlier
 (`Tx.scala:746-749`, `Frontend.scala:589-591`); and after `TxFinalized` the store has no Paxos state at all. For a
 transaction whose state a store has forgotten, safety is carried by *other* mechanisms: the pin rule (P16), the host
-status cache (7 s, P17), `Tx.proveCommitted` with the late-commit rule (P15, 10.5), and the UnackedCommits tree. Since
-the refresh nothing time-based remains in the prepare path. (addendum) A forgotten *abort* is carried by prefer-abort
+status cache (30 s since the horizon, P17), `Tx.proveCommitted` with the late-commit rule (P15, 10.5), and the
+UnackedCommits tree. (horizon) Since 2026-11-13 these no longer carry it alone: the forget floor (10.10) makes a store
+refuse every prepare for a transaction it may have forgotten, so no driver ever counts the fresh state of an acceptor
+that forgot T, and the time bound is back in the prepare path in that form. (addendum) A forgotten *abort* is carried by prefer-abort
 (6.2): a store that forgot T never gives a driver a fresh commit vote. A committed T's record may be replaced by an
 applied stub instead of deleted (`Frontend.concludeTransactionState`, `Frontend.scala:684-690`); a stub carries no
 Paxos state, only "this store holds T's update" (crash-recovery-log.md 3.6).
@@ -200,11 +208,22 @@ pre-T state and do not know T, so a replay cannot collect `t` commit votes on it
 transaction-requirements.md). The rule covers committed transactions only (P-N4). There is no age test left: a
 replayed *client* prepare is checked like a new one (`Frontend.scala:812-831`). (addendum) Aborted transactions are
 covered by prefer-abort instead (6.2): a driver's prepare never gathers a fresh commit vote, so only a delayed duplicate
-of the client's own prepare can re-decide a forgotten abort (P-N4, narrowed).
+of the client's own prepare can re-decide a forgotten abort (P-N4, narrowed). (horizon) "No age test left" no longer
+holds: a prepare for a transaction the store does not hold is refused when its start is below the store's forget floor
+(`Frontend.receivePrepare`, `server/store/Frontend.scala:1003-1031`; 10.10), which covers both outcomes, so a replayed
+or delayed client prepare reaches a fresh `Tx` only inside the window in which every store that knew T still remembers
+it. The pin rule still decides replays inside that window, for stores that never saw T.
 
 **P17 Status cache (assumption).** The host-wide `TransactionStatusCache` remembers each transaction's status for
-`txStatusCacheDuration` (7 s) after its last write, bounded to 4 M entries (`server/Host.scala:66-67`,
-`server/transaction/TransactionStatusCache.scala:8-24`). A store answers prepares for transactions found there with
+`txStatusCacheDuration` after its last write, bounded to 4 M entries. (horizon) The duration is
+`TransactionHorizon.statusCacheDuration` = horizon + `MaxStartLead` + 8 heartbeats, 30 s with the 1 s host heartbeat
+(`common/transaction/TransactionHorizon.scala:27-28`), and `Host.txStatusCacheDuration` asserts it is at least horizon
++ `MaxStartLead` + `txHeartbeatTimeout` + one heartbeat (`server/Host.scala:62-72`), so an entry outlasts the window in
+which its store would still join T. Memory the cache loses early raises the forget floor instead: a size eviction
+raises the host's eviction watermark synchronously with the removal (`evictionListener`,
+`server/transaction/TransactionStatusCache.scala:32-50`), and a host restart or transfer-in builds a new Frontend whose
+load time is a floor component (10.10). The cache is no longer the only memory of an outcome: past it, the floor
+refuses. A store answers prepares for transactions found there with
 `TxResolved`/`TxFinalized` instead of running Paxos (`Store.scala:163-189`). Entries carry `late`; a finalized
 committed entry is relayed as late (`late = entry.late || entry.finalized`, `TxFinalized(..., late = committed)`,
 `Store.scala:168,180`), which is late-commit evidence (10.5). It is in memory only.
@@ -349,6 +368,12 @@ than `w - t` non-commit answers in one round, and the commit votes of that objec
 votes are fixed, stores that forgot T can only vote abort for a driver, and stores that did not answer that round held
 at most the remaining `w - n` commit votes, which the decision already counted against commit.
 
+(horizon) Path 3, a delayed duplicate of the client's own prepare, which prefer-abort cannot close, is closed by the
+forget floor (10.10): inside the window every store that took part in the abort still holds its `Tx` or its cache entry
+(an abort is finalized at once, so the entry is finalized and the Store answers the duplicate with the abort,
+`Store.scala:199-221`); past the floor it refuses the duplicate outright. HorizonIntegrationSuite "a delayed client
+prepare of a forgotten abort does not commit inside or past the horizon".
+
 Effect on healthy transactions: none for a client that stays alive, since it retransmits every 1 s
 (`cmdline/Main.scala:1268`) until it learns the outcome, and a known transaction's retransmit is admitted without a CRL
 admission check (`Frontend.admitPrepare`, `Frontend.scala:519-536`). A data transaction already voted abort without its
@@ -412,7 +437,7 @@ Properties (verified by case analysis):
   have forced a wait unless `c >= t` or `w - a < t`. So **commit implies `t` commit votes per object** (P6).
 * Once `c >= t` or `a > w - t` is true it stays true (votes are immutable and only accumulate). So different drivers
   using the same vote set agree; they can differ only through non-votes counted as aborts (F7) or through amnesia
-  (F2, F6).
+  (F2, F6; since 2026-11-13 no driver counts an acceptor that forgot T, so amnesia no longer feeds the tally, 10.10).
 * The decision is gated on *every* object's pool having `t` answers, even when abort is already certain for another
   object (F8).
 
@@ -531,7 +556,10 @@ updates are recorded by `MissedUpdateFinalizationAction` ([transaction-recovery.
 Driver `heartbeat()` sends `TxHeartbeat` (not on its first tick) or, once finalized, repeats `TxFinalized`
 (`TransactionDriver.scala:229-242`). A store that sees nothing for `txHeartbeatTimeout` drives the transaction itself
 (`Store.scala:84-88`); that is the recovery path for a lost `TxFinalized` and works only because the status cache
-(7 s) outlasts the detection (5 s + one heartbeat) (`Host.scala:59-67`).
+(7 s) outlasts the detection (5 s + one heartbeat) (`Host.scala:59-67`). (horizon) The cache is now 30 s and outlasts
+the horizon plus that detection (P17). A store whose driver still finds no outcome past the horizon (a stall, or every
+peer's entry gone) is not re-decided: its peers refuse the driver, and the Tx ends by expiry (10.10), a resolved one
+concluding its known outcome (`Tx.concludeKnownOutcome`, `server/transaction/Tx.scala:228`).
 
 ---
 
@@ -552,7 +580,11 @@ is overwritten by every prepare, including client retransmits (F10).
   creates a `Tx` with `outcomeDecided()`; it takes no locks, still votes, and learns the outcome only from `TxFinalized`
   because the driver treats the cache's reply as "this store knows" (`knownResolved`) and does not re-send
   `TxResolved` to it (`TransactionDriver.scala:406`, `SimpleTransactionDriver.scala:67`; `Frontend.scala:812-830`).
-* Tx unknown, no cache entry: a fresh `Tx`, checked normally whatever its age (the horizon is gone). A replay of a
+* (horizon) Tx unknown, no non-Unresolved cache entry, start below the store's forget floor: refused, no `Tx` at all
+  (`refusePrepare`, `Frontend.scala:1039-1046`), and the designated leader starts no driver (`Store.scala:230-232`).
+  10.10.
+* Tx unknown, no cache entry: a fresh `Tx`, checked normally (the old age test is gone; since 2026-11-13 only starts at
+  or above the forget floor get here). A replay of a
   committed pinned transaction fails its pin; a store showing its update proves it (6.3), and the driver resolves late
   (10.5). Accepted cost: a replay whose other requirements pass holds commit-vote locks until a driver resolves it.
 * Dropped under CRL backpressure: `Store.scala:153-154`; the client retransmits, and the rest of the quorum can decide
@@ -606,7 +638,8 @@ The horizon (`Host.txHorizon`, `TransactionTooOld`) was removed. In its place (d
 
 Residuals: Ruling 17 (a late-acked store with an entry re-applies a replay's writes in pools where T has no pin of its
 own; transaction-recovery R-N1 and Ruling 32: it can reach a quorum when the whole pool acked late), the design's recovering-acceptor residual (P-N3), and a proof delivered to a
-driver that never acts on it (P-N1). (addendum) Applied stubs close Ruling 17 at every store that forgot T on a
+driver that never acts on it (P-N1; closed by the horizon 2026-11-13: a driver without the proof can no longer decide
+abort for a forgotten commit, since no store that forgot T answers it, 10.10). (addendum) Applied stubs close Ruling 17 at every store that forgot T on a
 `TxFinalized` listing it, or applied T through its entry; what remains is a store with an entry and no stub
 (transaction-recovery R-N1 narrowed, R-N7 to R-N9).
 
@@ -619,7 +652,13 @@ driver that never acts on it (P-N1). (addendum) Applied stubs close Ruling 17 at
   ignore, `known`), `StoreRouter` completion queries.
 * One cache per **host**, shared by all its stores and keyed by transaction id only. Entries live 7 s after the *last
   write*. The early-eviction warning was removed with the horizon: an evicted entry only loses late-commit evidence
-  (`server/transaction/TransactionStatusCache.scala:11`).
+  (`server/transaction/TransactionStatusCache.scala:11`). (horizon) Entries now live 30 s after the last write (P17).
+  A size eviction is logged as an error, counted, and raises the host-wide eviction watermark (wall clock +
+  `MaxStartLead`), a forget-floor component, so an evicted entry's absence is never trusted (10.10). Expiry by time
+  raises nothing: an entry expires only once its transaction is below the floor anyway.
+* (horizon) An opposite outcome reaching `updateStatus` should never arise now; it is logged as an error ("Split
+  decision") and counted (`splitDecisions`), and Committed still wins (TransactionStatusCacheSuite "an opposite outcome
+  is logged as a split decision"; F11 narrowed).
 * An `Unresolved` entry counts as "no outcome" when a fresh Tx is created (`Frontend.scala:814-816`).
 * The no-Tx `TxResolved` path ignores proofs (`Frontend.scala:767-769`). `updateStatus` is monotone
   (`TransactionStatusCache.scala:34-44`), so no write site, `Tx.resolved` (`Tx.scala:787-788`) included, downgrades a
@@ -643,6 +682,128 @@ Resolved by backoff (7.3). Stale responses are filtered by proposal id (`Transac
 
 ---
 
+### 10.10 Transaction horizon, forget floor and expiry (horizon, 2026-11-13)
+
+Design: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md`. Evidence for `e9e6f3f6`.
+
+**Root cause it removes.** A store forgets T's outcome after a bounded time (an abort at resolution, a commit at
+`TxFinalized`, the host cache after its duration). Before the horizon, a prepare reaching every store after all had
+forgotten started a new Paxos instance for the same txid, which could decide the opposite outcome: a commit re-decided
+abort (F2, P-N1, F10's proof leg; recovery F3, F5, F8) or an abort re-decided commit (P-N4 path 3, F6). Better proof
+delivery could not close that, and infinite memory is not available. The fix is a time bound on *joining*.
+
+**Constants** (`common/transaction/TransactionHorizon.scala`): `Horizon` 20 s (`:11`); `MaxStartLead` 2 s (`:16`, unchanged,
+`Frontend.MaxStartLead` is it); the client gives up at horizon + `MaxStartLead` (`clientGiveUp`, `:21`); the status
+cache lasts horizon + `MaxStartLead` + 8 heartbeats, 30 s (`statusCacheDuration`, `:27-28`; asserted by
+`Host.checkStatusCacheDuration`, `server/Host.scala:69-72`). The horizon is measured on `txd.startTimestamp.wallTime`
+against the receiving host's wall clock (`Frontend.wallClockMillis`, not the JVM-wide HLC), and is injectable for tests.
+
+**The forget floor** (`Frontend.forgetFloorMillis`, `server/store/Frontend.scala:126-139`) is the latest of:
+
+* `wallClockMillis() - horizon`;
+* the store's load on this host plus `MaxStartLead` (`loadFloorMillis`, `:139`; `loadedAtMillis`, `:124`). Every
+  restart, adoption and transfer-in builds a new Frontend through `StoreLoader`, so the host's lack of a cache for the
+  store's past is covered. The lead is there because before its load the store may have joined, and forgotten, a
+  transaction started up to `MaxStartLead` ahead of its clock. Exemption: a store this process just created for a
+  pool's Initializing slot (`StoreRebuilds.createNewStore` -> `StoreLoader.newStores`,
+  `server/host/StoreLoader.scala:53-55,193,281-282,355`) records no load time, since it has never served. Rebuilt
+  stores keep `acceptorSince` (P-N2), checked first, whose muted Tx may still prove;
+* the host's eviction watermark (`TransactionStatusCache.evictionWatermarkMillis`: wall clock at the latest size
+  eviction plus `MaxStartLead`).
+
+A prepare for a transaction the store does not hold (no `Tx`, no non-Unresolved cache entry) whose start is below the
+floor is **refused**: no `Tx`, no promise, vote, reply or CRL save, its admission released, a warning with the lag for
+a client's prepare (`receivePrepare`/`refusePrepare`, `:1003-1046`). The designated leader starts no driver for it
+(`Store.scala:225-233`). A held `Tx` (recovered ones too) and a prepare whose outcome the cache knows are unaffected.
+Tests: FrontendSuite "a prepare for an unknown transaction older than the horizon creates no Tx, sends nothing and
+saves nothing", "... started before the store loaded is refused", "... started inside MaxStartLead after the store
+loaded is refused", "a prepare below the eviction watermark is refused"; StoreSuite "the designated leader starts no
+driver for a prepare below its forget floor"; HorizonIntegrationSuite "a host restart does not let its stores rejoin a
+transaction they forgot", "a store transferred to another host does not rejoin a transaction it forgot".
+
+**Why the floor timing is safe without cross-host clock agreement.** A store writes its cache entry for T after it saw
+T, and by `MaxStartLead` its own clock then read at least `start - 2 s` (it mutes any T further ahead). The entry lives
+30 s past its last write, so when it expires the store's clock reads past `start + 28 s`, beyond the 20 s horizon: the
+store already refuses T. A restart, transfer-in or size eviction loses memory at a moment that raises the floor past
+every T the store might have joined before it (hence the `+ MaxStartLead`). So a store never forgets T while it would
+still join it. Only the store's own clock is used; client and peer clocks enter only through `MaxStartLead`. Residual:
+a host wall clock stepped *backward* by more than about 8 s (30 - 20 - 2) between a store joining T and its entry
+expiring (Caffeine's expiry runs on `nanoTime`, the floor on the wall clock) reopens the window for that T.
+
+**Status query** (`TxStatusRequest`, which carries `startTimestamp`, and `TxStatusResponse.TxStatus`, which carries
+`holdsAcceptorState`: `common/network/Message.scala:337-358`; this wires up the half-built path of F15). A store with
+a `Tx` answers with its status, finalized, late and `holdsAcceptorState = !muted` (`Tx.receiveStatusRequest`,
+`server/transaction/Tx.scala:1255-1257`). A store without one answers from its cache entry if it has a non-Unresolved
+one (`holdsAcceptorState = false`); otherwise it answers `None` ("unknown") **only if T's start is below its floor**,
+which makes the answer permanent, and above the floor it stays silent, since it could still join T
+(`receiveStatusRequestWithoutTx`, `Frontend.scala:996-1001`). FrontendSuite "a store that neither holds nor remembers T
+answers unknown only below its floor".
+
+**Expiry.** A `Tx` still unfinalized (`Tx.mayExpire`, `Tx.scala:215`: unresolved, or resolved and waiting for a
+`TxFinalized` that may never come) past the horizon plus `expiryMargin` (`MaxStartLead` + `txHeartbeatTimeout` + one
+heartbeat, `Frontend.scala:50-55`) queries every other store of T at store heartbeat, at once and then after 1, 2, 4 and
+every 8 heartbeats, each round with a fresh request id (`expiryHeartbeat`, `Frontend.scala:607-640`). The pure
+`ExpiryTally.decide` (`server/transaction/ExpiryTally.scala:36-58`) applies, in order:
+
+1. any reply with an outcome is adopted (commit over abort), a commit through `TxResolved` (late if finalized or late,
+   so a commit voter looks up its UnackedCommits entry), an abort as a finalized abort;
+2. otherwise the primary pool's (`txd.primaryObjectIDA`) stores that replied "unknown" or without acceptor state are
+   non-holders, and silent stores are possible holders, never non-holders;
+3. more than `width - writeThreshold` non-holders: **discard**. A commit voter (`needsUnackedCheck`, which now covers
+   expiring Txs, `Tx.scala:187-189`) first looks up its entry: none found by a lookup started after the decision
+   discards it, one found applies T and concludes it as a late commit, and a failed lookup keeps it holding. A `Tx`
+   that already knows its outcome concludes it instead (`Tx.concludeKnownOutcome`, `Tx.scala:228`). Discarding
+   (`Frontend.expireTransaction`, `:685-694`; `Tx.expire`, `Tx.scala:274`) releases locks and objects, deletes the CRL
+   state as for a forgotten abort, forgets the `Tx`, and writes nothing in the status cache;
+4. otherwise **hold** and ask again.
+
+A driver past the horizon plus the margin that has no outcome is stopped and removed once its store holds no `Tx` for
+T (`Store.removeExpiredDrivers`, `Store.scala:110-122`). The client's `TransactionManager` forgets its driver however
+it concludes, `Unknown` included (`client/internal/transaction/TransactionManager.scala:33-48`).
+
+**Why rule 3 is safe.** An acceptor forgets T only once T is decided: an abort at resolution, a commit at `TxFinalized`
+(P9). So a committed but unfinalized T is still held by a full quorum (`t`) of the primary pool's acceptors, and more
+than `w - t` non-holders rule it out. A non-holder can never become a holder, because it answered "unknown" only below
+its floor (or holds a muted `Tx`, which accepts nothing). So T is one of: aborted; committed and finalized, in which
+case the finalizer wrote this store's UnackedCommits entry before `TxFinalized` if it was owed (the lookup found none,
+so it was not; ErrorTree marks cover a store whose update was not counted); or undecided and undecidable, since no
+quorum can ever form past the horizon. Discarding is correct in all three. Stuck holders short of a quorum report
+themselves honestly as holders and all discard (HorizonIntegrationSuite "stuck holders short of a quorum all
+discard"). Tests: FrontendSuite "an abort voter past the horizon whose peers answer unknown is discarded and releases
+its locks", "a commit voter past the horizon with no UnackedCommits entry is discarded once a later lookup finds none",
+"a commit voter past the horizon with an UnackedCommits entry applies and resolves committed", "a Tx past the horizon
+with a quorum of holders keeps holding and later learns the outcome".
+
+**Rejoin invariant.** Once a store discards or forgets T, its floor makes it refuse every later prepare for T: a
+discarded acceptor is indistinguishable from an offline one, and Paxos is safe with offline acceptors. **A store never
+rejoins a transaction it forgot.** FrontendSuite "after expiry, a later prepare for T creates no Tx".
+
+**Client.** `SimpleClientTransactionDriver` stops retransmitting once its clock is past start + horizon +
+`MaxStartLead` and completes `ClientOutcome.Unknown`, failing fast at `begin()` if already that late
+(`client/internal/transaction/SimpleClientTransactionDriver.scala:48,73`). `TransactionImpl` fails the commit with
+`TransactionOutcomeUnknown` (`client/TransactionError.scala:78`, a sibling of `TransactionAborted`) and records nothing
+in the client's status cache (`client/internal/transaction/TransactionImpl.scala:394-396`). `TransactionAborted` is now
+final without exception; `StopRetrying.unlessCollision` and the other retry sites retry Unknown as they do an abort
+(`client/StopRetrying.scala:26`). HorizonIntegrationSuite "a stale retransmit of a finalized traceless commit past the
+horizon reports unknown, not aborted".
+
+**Residual costs.**
+
+* *Post-load refusal.* After a reload a store permanently refuses every T it does not hold whose start falls in
+  `[load, load + MaxStartLead)`, and for up to the horizon every T it does not hold started before the load. Those see
+  it as offline and most commit through the other stores. On a single host, or after a restart of most of a pool's
+  stores, too few stores remain and such Ts end `TransactionOutcomeUnknown` at about 22 s, and are retried. A durable
+  per-store high-water mark of joined start times is the upgrade path.
+* *Bootstrap stores.* Stores written by bootstrap are not exempt from the load floor (only `createNewStore`'s are), so a
+  fresh system refuses for its first `MaxStartLead` the transactions started before its load.
+* *Size eviction* can raise the floor to about "now" on its host (eviction is not oldest-first), making its stores
+  refuse every not-yet-held transaction started before it. It needs about 130 k transactions/s per host sustained; it
+  fails safe and is logged as an error and counted.
+* *Slow client clocks.* A client clock more than 20 s slow has its transactions refused (logged with the lag).
+* *Retried unknowns.* An Unknown may have committed; retry-by-default sites that are not idempotent may duplicate work
+  (`SimpleTaskExecutor.allocateTask` is known to; Todo audit entry).
+* *Backward wall-clock steps* beyond about 8 s (above).
+
 ## 11. Failure scenarios
 
 Conventions: "safe" = no split decision, no loss of a decided commit, no applied update for an aborted transaction.
@@ -657,9 +818,9 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 | `TxPrepareResponse` lost | Safe, live | Driver retransmits the prepare (`SimpleTransactionDriver.scala:59-90`); the store re-answers with the same persisted vote. |
 | `TxAccept` or `TxAcceptResponse` lost | Safe, live | Retransmitted; the learner needs `t` distinct acceptors. |
 | `TxResolved` lost | Safe, live | Driver re-sends `TxResolved` to stores not in `knownResolved` until finalized; otherwise `TxFinalized` carries the outcome. |
-| `TxFinalized` lost | Safe, live if the status cache still has the entry when the idle store's driver asks (5 s idle < 7 s cache); otherwise see F2/F6 | `Store.scala:84-88`, `Host.scala:59-67`. Meanwhile the store holds its locks. |
+| `TxFinalized` lost | Safe, live: the idle store's driver asks within the status cache's life (5-6 s idle < 30 s cache, horizon); past it, its peers refuse the driver and the Tx concludes its outcome or is discarded by expiry (10.10) | `Store.scala:84-88`, `Host.scala:62-72`. Meanwhile the store holds its locks (until expiry at the latest). |
 | `TxCommitted` lost | Safe | Finalizer's missed-update logic marks the store for repair, which reconciles exactly. |
-| `TransactionResolved`/`Finalized` lost to client | Safe if the client's retransmit arrives within the cache lifetime (answered from the cache); otherwise a false abort is possible (F2) | |
+| `TransactionResolved`/`Finalized` lost to client | Safe. A retransmit inside the horizon is answered from a `Tx` or the cache; past horizon + `MaxStartLead` the client stops and fails with `TransactionOutcomeUnknown` (horizon; F2 closed) | `SimpleClientTransactionDriver.scala:48,73` |
 | Duplicates of any message | Safe | 10.1-10.3. |
 | Reordering | Safe | Proposal ids filter stale responses; `TxFinalized` before `TxResolved` is fine (5); a commit decision arriving before the prepare/data is held (9.1). A `TxResolved` arriving before any prepare is only remembered in the cache (`Frontend.scala:763-769`), so the later-created `Tx` learns it only at `TxFinalized`. |
 | Message to a store on another host after migration | Safe | `TxUnknownStore`, peer queries (`CLAUDE.md`). |
@@ -670,8 +831,8 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 |---|---|
 | Slow client: its prepare reaches a store after a driver's prepare | Promise and vote withheld up to 5 s, data or not (prefer-abort); then abort vote, requirements unchecked. Late data still adopted if the others commit (6.2). |
 | Slow client: data reaches a store after the commit decision | Commit held until data/`TxFinalized` (9.1). |
-| Client partitioned for longer than the status cache lifetime and then retransmits | Stores no longer know the Tx; fresh Txs check requirements and the pin fails. With a proof the driver resolves late and the client is told committed; without one (refcount pin, overwritten pin, lost proof) the client can still be told **aborted** (F2, narrowed). |
-| Client frozen, clock ahead, retransmit after > 7 s | No longer special: clocks play no part (F3 fixed). |
+| Client partitioned for longer than the status cache lifetime and then retransmits | (horizon) It stops retransmitting at horizon + `MaxStartLead` and reports `TransactionOutcomeUnknown`; a retransmit that still lands past a store's floor is refused, so no store re-decides T (F2 closed). Before 2026-11-13: with a proof late committed, without one a false **abort**. |
+| Client frozen, clock ahead, retransmit after > 7 s | No longer special for replay (F3 fixed). (horizon) A start more than `MaxStartLead` ahead of a store's clock is muted there until the clock catches up; one more than the horizon behind is refused. |
 | Slow store (behind) | It votes late or never; the quorum decides without it. If it missed the commit it is marked for repair by the finalizer. |
 | Leader partitioned from some stores | Driver cannot reach a quorum -> waits; recovery drivers on other stores start after 5 heartbeats; dueling resolved by Paxos. |
 | Minority of acceptors partitioned | Proceeds. A majority-or-more partition: no progress (liveness), no unsafe decision. |
@@ -688,7 +849,7 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 | Store, before the vote's save completes | No record, or an older record. Nothing was sent. | The store is as if it never saw the prepare; client/driver retransmit; a fresh vote is computed. |
 | Store, vote saved but response not sent | Record with disposition and acceptor state; locks re-taken for a commit vote | Retransmitted prepares are answered with the persisted vote (P4/P5). |
 | Store, after Accepted saved | Acceptor state recovered (`Tx.scala:76`) | Paxos state intact; P8 holds. |
-| Store, after learning commit, before applying | Recovered as Unresolved with its vote and data; commit vote re-locks | Must re-learn: a live driver, status cache, a peer's proof, or the UnackedCommits lookup (`needsUnackedCheck`), which now runs for every recovered commit vote and gates its driver. If every other store finalized and forgot: an entry makes it apply; no entry means it acknowledged (or did not count), and a late commit applies nothing. Without a proof or entry, abort votes may decide abort (F2 residual). |
+| Store, after learning commit, before applying | Recovered as Unresolved with its vote and data; commit vote re-locks | Must re-learn: a live driver, status cache, a peer's proof, or the UnackedCommits lookup (`needsUnackedCheck`), which now runs for every recovered commit vote and gates its driver. If every other store finalized and forgot: an entry makes it apply; no entry means it acknowledged (or did not count), and a late commit applies nothing. Without a proof or entry, abort votes may decide abort (F2 residual; closed by the horizon: past the floor no forgotten peer answers, and the Tx ends by expiry, applying T if its entry exists). |
 | Store, after in-memory apply, before backend commit durable | Object data still in the CRL (P13); recovered like the previous row | Same. |
 | Store, after backend commit, before CRL data drop | Recovered Unresolved; `appliedBy` shows the update | `proveCommitted` on the next prepare or `doCommit` skips as already applied (`Tx.scala:689-694`). |
 | Leader/driver, before Accept sent | Driver state lost | Recovery driver after idle timeout; values for round 1 not reused (round >= 2). Leader's own restart restarts at `(1,L)` (F5). |
@@ -716,6 +877,21 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 
 Format: ID, confidence that the described behaviour exists and is a real problem, scenario, code. "Confidence" is
 about the finding, not the likelihood of occurrence.
+
+### Re-assessment for the transaction horizon (2026-11-13, `e9e6f3f6`)
+
+Findings the horizon (10.10) touches. Every other finding of this document is unchanged by it.
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F2 | **closed** (FIXED by the horizon) | No store joins a transaction it may have forgotten: a stale retransmit past the floor is refused by every store that forgot T, so no new instance forms, and the client gives up with `TransactionOutcomeUnknown` instead of hearing a false abort. Inside the window the 30 s caches answer. A live commit voter left behind ends by expiry and applies T through its entry if owed | `Frontend.scala:126-139,1003-1046`; `Store.scala:230-232`; `SimpleClientTransactionDriver.scala:48,73`; HorizonIntegrationSuite "a stale retransmit of a finalized traceless commit past the horizon reports unknown, not aborted" |
+| F6 | **re-assessed**: no longer a split path; residual stated | An abort still deletes its CRL record at resolution, but a forgotten abort is no longer re-decidable: the store keeps its cache entry past the horizon, and a restart, transfer-in or eviction raises its floor, so it never rejoins T. What remains: the timing relies on each host's own wall clock not stepping back by more than about 8 s (10.10), and the post-load refusal cost. Todo 2.13 F6 (keep the record until `TxFinalized`) is no longer needed for safety | `Frontend.scala:126-139`; `TransactionStatusCache.scala:32-50` |
+| F10 | **closed by the horizon** (not fixed directly) | `lastProposer` still follows client prepares (`Tx.receivePrepare`), but its safety leg, a proof sent to a proposer without a driver (P-N1), no longer matters (below). The `TxCommitted` redirect to a dead leader still costs an extra ErrorTree mark and repair (harmless, unchanged) | `Tx.scala` `receivePrepare` |
+| F11 | **narrowed** | The host status cache logs an error ("Split decision") and counts every opposite outcome it is given (`splitDecisions`); `Tx.resolved`, `onResolution`, `receiveFinalized` and the client still ignore one silently | `TransactionStatusCache.updateStatus`; TransactionStatusCacheSuite "an opposite outcome is logged as a split decision" |
+| F15 | **narrowed**: `TxStatusRequest` wired up | Expiry sends it and every store answers (10.10); `receiveTxPrepare` and the other dead `Proposer` methods are unchanged | `Frontend.scala:607-640,985-1001`; `Tx.scala:1255-1257` |
+| P-N1 | **closed by the horizon** (not fixed directly) | A proof is still sent once. But a driver without it can decide abort only from a promise quorum of acceptors that forgot T, and inside the window those still answer from their `Tx` or cache entry, while past the floor they refuse. Proofs are now an optimisation inside the window, not load-bearing | 10.10; 10.5 |
+| P-N4 | **closed** (FIXED by the horizon) | A delayed duplicate of the client's own prepare finds every store that took part in the abort still remembering it (finalized abort in the cache, relayed) inside the window, and refused past the floor. The `Transaction.commit` scaladoc's accepted exception is removed; `TransactionAborted` is final | HorizonIntegrationSuite "a delayed client prepare of a forgotten abort does not commit inside or past the horizon"; `client/Transaction.scala:150-162` |
+| P-N2 | unchanged (FIXED stands) | `MaxStartLead` is now `TransactionHorizon.MaxStartLead`, the same 2 s; the floor's timing argument uses it too | `common/transaction/TransactionHorizon.scala:16` |
 
 ### Re-assessment for replay pins (2026-11-09, `0d08e3c6`)
 
@@ -767,6 +943,15 @@ Recommendation: fix the docs or implement the fast path; if implemented, P2/P6 m
 commit without a leader tally).
 
 ### F2. A stale prepare after the cache expires can produce a false abort of a committed transaction. Confidence: medium-high
+
+> **Refresh (horizon, 2026-11-13): CLOSED.** No store joins a transaction it may have forgotten (the forget floor,
+> 10.10, `Frontend.scala:126-139,1003-1046`), so the stale prepare past the cache creates no `Tx` anywhere T was
+> forgotten and no new instance can form. The client stops at horizon + `MaxStartLead` and fails the commit with
+> `TransactionOutcomeUnknown`, an honest "may have committed", instead of a false abort. Consequence (c), a live
+> commit voter dropping its update, is closed too: it ends by expiry, and applies T through its UnackedCommits entry
+> if it was owed (transaction-recovery F3). Tested end to end by HorizonIntegrationSuite "a stale retransmit of a
+> finalized traceless commit past the horizon reports unknown, not aborted". No residual of the split itself; the cost
+> moves to callers that retry an Unknown that had committed (Todo audit entry).
 
 > **Refresh (replay pins): NARROWED.** The stale prepare is now checked normally (no `TooOld`). A store showing T's
 > update proves it; the driver that receives the proof never proposes abort (`TransactionDriver.scala:361-362`), runs a
@@ -858,6 +1043,15 @@ its first Accept (it does not, because `receiveTxPrepare` is dead, 7.3).
 
 ### F6. Abort resolution forgets acceptor state before finalization; safety then rests on in-memory caches and the clock. Confidence: low-medium
 
+> **Refresh (horizon, 2026-11-13): RE-ASSESSED; no longer reachable as a split.** The record is still deleted at abort
+> resolution, but a forgotten abort can no longer be re-decided: the store's cache entry outlasts the window in which
+> it would join T, and the restart variant this finding needed (a store restart wiping the cache) now raises the
+> store's forget floor past every T it may have joined (load + `MaxStartLead`), as do a transfer-in and a size eviction
+> (10.10). So no promise quorum of memoryless acceptors can form for T. What remains is the clock the floor relies on:
+> each host's own wall clock, which must not step backward by more than about 8 s between a store joining T and its
+> entry expiring; and the floor's cost (post-load refusal). Keeping the abort record until `TxFinalized` (Todo 2.13 F6)
+> would no longer buy safety, only remove the reliance on the cache for live stores.
+
 > **Refresh (addendum): NARROWED.** The fresh votes a memoryless promise quorum would tally come only from stores that
 > saw a client prepare: a store reached by driver prepares alone never checks its requirements and votes abort
 > (`Tx.scala:205-208,537-542`, prefer-abort). The record is still deleted at abort resolution; what remains is a client
@@ -940,6 +1134,11 @@ until its idle recovery fires or the entry expires. Mostly hygiene; it also wide
 
 ### F10. `lastProposer` is overwritten by client retransmits. Confidence: medium, low impact
 
+> **Refresh (horizon, 2026-11-13): CLOSED BY THE HORIZON (not fixed directly).** The overwrite is unchanged. Its
+> safety consequence was a proof sent to a proposer with no driver (P-N1), which no longer lets any driver decide a
+> false abort (P-N1's refresh). The remaining effect is the one below: a redirected `TxCommitted` makes the finalizer
+> mark a store that did apply (extra repair, harmless).
+
 > **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (extra repair only).** Tx.receivePrepare sets lastProposer = m.from for every prepare, client prepares included (Tx.scala:806), and TxCommitted/proven TxResolved go to lastProposer (Tx.scala:733, 621-633). After resolution drivers send TxResolved, not prepares, so the redirect is not corrected.
 > *Fix sketch:* Do not update lastProposer from fromClient prepares.
 
@@ -998,6 +1197,12 @@ for adopted data.
 
 ### F15. Dead or unused protocol code. Confidence: high (informational)
 
+> **Refresh (horizon, 2026-11-13): NARROWED; `TxStatusRequest` is wired up.** Expiry sends it to every other store of
+> T, it now carries `startTimestamp`, and every store answers: with a `Tx` (`holdsAcceptorState = !muted`), from a
+> cache entry, "unknown" below its floor, or nothing (10.10; `Frontend.scala:607-640,985-1001`,
+> `Tx.scala:1255-1257`). `receiveTxPrepare`, `Proposer.receiveNack`/`maySendAccept`/`currentPrepareMessage` and the
+> commented client learner remain dead.
+
 > **Verification 2026-11-09: CONFIRMED. Severity: doc-only.** No caller of TransactionDriver.receiveTxPrepare, no constructor of TxStatusRequest outside codec/tests (grep).
 > *Fix sketch:* Delete or wire in.
 
@@ -1034,6 +1239,12 @@ Nacks (extra rounds under contention).
 > (`task-4-report.md`, concern 4). The consequence is unchanged (no store state changes; the client may be told aborted).
 > *Fix sketch (additional):* cache proofs in `prepareResponseCache` beside prepare responses, as `driveTransaction`
 > already replays the cache into a new driver.
+>
+> **Refresh (horizon, 2026-11-13): CLOSED BY THE HORIZON (not fixed directly).** The proof is still sent once, and the
+> fix sketches (Todo 1.3a) are dropped, not implemented. A driver without the proof could decide abort only from a
+> promise quorum of acceptors that forgot T. Inside the window every store that knew T still answers from its `Tx` or
+> its status-cache entry (the relay), and past its forget floor it refuses the prepare (10.10), so no such quorum
+> forms. A dropped proof now costs at most latency inside the window.
 
 #### P-N2. Late condition 1 relies on rebuilt acceptors being muted, and the mute relies on clocks. Confidence: low-medium
 
@@ -1125,6 +1336,14 @@ Nacks (extra rounds under contention).
 > pin. Documented in the `Transaction.commit` scaladoc (`client/Transaction.scala:156-161`), `Architecture.md` and
 > `UsageGuide.md`. Tested: ReplayIntegrationSuite "an aborted data-less transaction re-driven by a recovered commit vote
 > aborts again".
+>
+> **Refresh (horizon, 2026-11-13): CLOSED.** The delayed duplicate needed every store of T to have forgotten the abort.
+> Under the horizon a store remembers it (its finalized abort entry, relayed by `Store.scala:199-221`) for longer than
+> it would join T, and past its forget floor refuses the duplicate outright, so no fresh commit vote is ever gathered
+> for a forgotten abort (10.10, 6.2). Tested: HorizonIntegrationSuite "a delayed client prepare of a forgotten abort
+> does not commit inside or past the horizon" (inside 20 s, after the old 7 s cache would have expired, and past it).
+> The accepted corner case is gone from the `Transaction.commit` scaladoc (`client/Transaction.scala:150-162`),
+> `Architecture.md` and `UsageGuide.md`. Todo 2.15 closed.
 
 #### P-N5. Liveness of "never propose abort while holding a proof". Confidence: medium
 
@@ -1218,3 +1437,7 @@ Nacks (extra rounds under contention).
   by a delayed duplicate client prepare (P-N4 narrowed to the accepted corner case). Applied stubs stop a store that
   holds T's update from applying T again through any later commit (P11). New: P-N7, P-N8 (liveness, by design), P-N9
   (refuted), P-N10 (Ruling 3's delayed non-late `TxFinalized`; fixed by Ruling 7).
+* **Refresh 2026-11-13 (horizon):** past the transaction horizon no store joins a transaction it does not hold, and
+  every store remembers an outcome for longer (10.10), so a decision is never re-made by a fresh instance: F2 and P-N4
+  closed, P-N1 and F10 closed by the horizon, F6 no longer a split path. A transaction whose outcome the client cannot
+  learn in time fails with `TransactionOutcomeUnknown`; a stuck `Tx` ends by expiry from its peers' status.

@@ -17,7 +17,7 @@ import org.scalatest.matchers.should.Matchers
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.duration.*
-import scala.concurrent.{Await, ExecutionContext}
+import scala.concurrent.ExecutionContext
 
 class ClientTransactionDriverSuite extends AnyFunSuite with Matchers:
 
@@ -51,58 +51,66 @@ class ClientTransactionDriverSuite extends AnyFunSuite with Matchers:
     private[client] val objectCache: ObjectCache = ObjectCache.NoCache
     private[aspen] def getSystemAttribute(key: String): Option[String] = None
 
-  /** A transaction that started `age` ago */
-  private def mktxd(age: FiniteDuration): TransactionDescription =
+  /** A transaction that started at `startMillis` */
+  private def mktxd(startMillis: Long): TransactionDescription =
     val requirements = RefcountUpdate(pointer, ObjectRefcount(0, 1), ObjectRefcount(1, 2)) :: Nil
-    val start = HLCTimestamp((System.currentTimeMillis() - age.toMillis) << 16)
+    val start = HLCTimestamp(startMillis << 16)
     TransactionDescription(TransactionId(UUID.randomUUID()), start, pointer, 0, requirements, Nil, None, Nil, Nil, ida,
       Map(poolId -> ida))
 
+  /** The driver's clock is `now`, and its periodic task never fires (an hour's delay): tests call `tick()` */
   private class Fixture:
     val tasks = new BackgroundTaskManager(ExecutionContext.global)
     val msgr = new CountingMessenger
     val client = new TestClient(msgr, tasks)
-    def driver(txd: TransactionDescription): ClientTransactionDriver =
-      SimpleClientTransactionDriver.factory(retransmit, horizon)(client, txd, Map())
+    var now = 1_000_000L
+    def driver(age: FiniteDuration): SimpleClientTransactionDriver =
+      val txd = mktxd(now - age.toMillis)
+      SimpleClientTransactionDriver.factory(1.hour, horizon, () => now)(client, txd, Map())
+        .asInstanceOf[SimpleClientTransactionDriver]
     def done(): Unit = tasks.shutdown(Duration.Zero)
 
   test("a client gives up with Unknown once the transaction is past the horizon plus MaxStartLead"):
     val f = new Fixture
     try
-      val d = f.driver(mktxd(giveUp - 300.millis))
+      val d = f.driver(giveUp - 1.milli)
       d.begin()
-      f.msgr.prepares.get should be > 0
-      Await.result(d.result, 5.seconds) should be(ClientOutcome.Unknown)
       val sent = f.msgr.prepares.get
-      Thread.sleep(retransmit.toMillis * 5)
-      f.msgr.prepares.get should be(sent)
+      sent should be > 0
+      d.tick()
+      f.msgr.prepares.get should be > sent
+      d.result.isCompleted should be(false)
+      f.now += 2
+      d.tick()
+      d.result.value.get.get should be(ClientOutcome.Unknown)
+      val after = f.msgr.prepares.get
+      d.tick()
+      f.msgr.prepares.get should be(after)
     finally f.done()
 
   test("a client still past the horizon at begin fails fast without sending"):
     val f = new Fixture
     try
-      val d = f.driver(mktxd(giveUp + 1.second))
+      val d = f.driver(giveUp + 1.second)
       d.begin()
-      d.result.isCompleted should be(true)
-      Await.result(d.result, 1.second) should be(ClientOutcome.Unknown)
-      Thread.sleep(retransmit.toMillis * 5)
+      d.result.value.get.get should be(ClientOutcome.Unknown)
+      d.tick()
       f.msgr.prepares.get should be(0)
     finally f.done()
 
   test("a resolution before the give-up completes Committed or Aborted, and a later give-up changes nothing"):
     val f = new Fixture
     try
-      val txd = mktxd(giveUp - 300.millis)
-      val d = f.driver(txd)
+      val d = f.driver(giveUp - 1.milli)
       d.begin()
-      d.receive(TransactionResolved(client0, StoreId(poolId, 1), txd.transactionId, committed = true))
-      Await.result(d.result, 1.second) should be(ClientOutcome.Committed)
-      Thread.sleep(600) // past the give-up
-      Await.result(d.result, 1.second) should be(ClientOutcome.Committed)
+      d.receive(TransactionResolved(client0, StoreId(poolId, 1), d.txd.transactionId, committed = true))
+      d.result.value.get.get should be(ClientOutcome.Committed)
+      f.now += 1000
+      d.tick()
+      d.result.value.get.get should be(ClientOutcome.Committed)
 
-      val txd2 = mktxd(0.millis)
-      val d2 = f.driver(txd2)
+      val d2 = f.driver(0.millis)
       d2.begin()
-      d2.receive(TransactionResolved(client0, StoreId(poolId, 1), txd2.transactionId, committed = false))
-      Await.result(d2.result, 1.second) should be(ClientOutcome.Aborted)
+      d2.receive(TransactionResolved(client0, StoreId(poolId, 1), d2.txd.transactionId, committed = false))
+      d2.result.value.get.get should be(ClientOutcome.Aborted)
     finally f.done()

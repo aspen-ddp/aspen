@@ -13,12 +13,13 @@ import scala.concurrent.duration.{Duration, FiniteDuration}
 object SimpleClientTransactionDriver {
 
   def factory(retransmitDelay: Duration,
-              horizon: FiniteDuration = TransactionHorizon.Horizon): ClientTransactionDriver.Factory = {
+              horizon: FiniteDuration = TransactionHorizon.Horizon,
+              nowMillis: () => Long = () => HLCTimestamp.now.wallTime): ClientTransactionDriver.Factory = {
     def f(
            client: ReadDriverClient,
            txd: TransactionDescription,
            updateData: Map[StoreId, TransactionData]): ClientTransactionDriver =
-      new SimpleClientTransactionDriver(retransmitDelay, horizon, client, txd, updateData)
+      new SimpleClientTransactionDriver(retransmitDelay, horizon, nowMillis, client, txd, updateData)
 
     f
   }
@@ -32,6 +33,7 @@ object SimpleClientTransactionDriver {
 class SimpleClientTransactionDriver(
                                      val retransmitDelay: Duration,
                                      val horizon: FiniteDuration,
+                                     nowMillis: () => Long,
                                      client: ReadDriverClient,
                                      txd: TransactionDescription,
                                      updateData: Map[StoreId, TransactionData])
@@ -43,9 +45,10 @@ class SimpleClientTransactionDriver(
   private var complete = false
 
   private def pastGiveUp: Boolean =
-    HLCTimestamp.now.wallTime - txd.startTimestamp.wallTime > TransactionHorizon.clientGiveUp(horizon).toMillis
+    nowMillis() - txd.startTimestamp.wallTime > TransactionHorizon.clientGiveUp(horizon).toMillis
 
-  private val task = client.backgroundTaskManager.schedulePeriodic(retransmitDelay) {
+  /** One retransmit tick: gives up if past the horizon, else resends. Run by the periodic task; tests call it directly */
+  private[transaction] def tick(): Unit = {
     val send = synchronized {
       if (complete)
         false
@@ -62,6 +65,8 @@ class SimpleClientTransactionDriver(
     if (send)
       sendPrepareMessages()
   }
+
+  private val task = client.backgroundTaskManager.schedulePeriodic(retransmitDelay)(tick())
 
   private def giveUp(): Unit = {
     logger.warn(s"Client Transaction ${txd.transactionId} is past the transaction horizon: outcome unknown")

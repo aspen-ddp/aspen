@@ -52,7 +52,37 @@ Designs: `docs/superpowers/specs/2026-11-09-replay-pins-design.md` (current), `2
   while the CRL loads. A found entry proves the commit to its own driver; the Tx applies its saved update locally, logs
   it at info and stays until TxFinalized, writing no status-cache entry (a Tx holding a late commit that finds its
   entry applies and is forgotten at once). A failed or unanswered lookup holds the
-  abort and retries at heartbeat (`Frontend.UnackedLookupTimeout`, 5 s)
+  abort and retries at heartbeat (`Frontend.UnackedLookupTimeout`, 5 s). Past the horizon its peers refuse its
+  driver, so such a Tx ends by expiry (below)
+
+#### Expiry (transaction horizon design, section 2)
+- A Tx still unresolved past the horizon plus the expiry margin (`Frontend.expiryMargin`: `MaxStartLead` +
+  `Host.txHeartbeatTimeout` + one heartbeat; T's start against the host's wall clock) is `expiring`. So is a commit
+  vote that applied T from its UnackedCommits entry and waits for a TxFinalized (`provesCommitToItsDriver`). At store
+  heartbeat (`Frontend.expiryHeartbeat`) it sends `TxStatusRequest` to every other store of T, at once, then after 1,
+  2, 4 and every 8 heartbeats. Each round has a fresh `requestUUID` and counts only its own replies, plus the Tx's own
+  acceptor state (a muted Tx holds none)
+- The pure `ExpiryTally.decide` rules, in order: (1) any reply with an outcome is adopted (a commit over an abort): a
+  committed one through `TxResolved` (late if finalized or late, so a commit vote looks up its entry), an aborted one
+  as a `TxFinalized` abort; (2) otherwise the primary pool's (`txd.primaryObjectIDA`) stores that replied "unknown" or
+  without acceptor state are non-holders, and silent ones possible holders; (3) more than `width - writeThreshold`
+  non-holders: `Discard`; (4) else `Hold` and ask again
+- `Discard`: an abort voter, a Tx with no vote, a prover or a muted Tx is discarded at once. A commit voter
+  (`needsUnackedCheck`, which covers expiring Txs too) first looks up its entry: none found by a lookup started after
+  the decision discards it; one found applies T and concludes it as a late commit; a failed lookup keeps it holding and
+  is retried at heartbeat. It never discards on a failure. An entry-applied Tx concludes as finalized (applied stub).
+  Discarding releases locks and objects, deletes the CRL state as for a forgotten abort, forgets the Tx, and leaves the
+  status cache alone (no outcome is known). An expiring commit vote also holds an abort for a lookup, as a recovered
+  one does, but its store drives it meanwhile (`awaitsFirstUnackedLookup` is for recovered votes only)
+- Why discarding is safe: an acceptor forgets T only once T is decided (an abort at resolution, a commit at
+  TxFinalized), and a store answers "unknown" only below its forget floor, so a non-holder never becomes a holder.
+  More than `w - t` of them rule out a committed, unfinalized T, which a full quorum would still hold. So T aborted,
+  or committed and was finalized (its finalizer wrote this store's entry if it was owed), or can never be decided
+- A driver of a transaction past the horizon plus the margin that has no outcome is stopped and removed once its
+  store holds no Tx for it (`Store.removeExpiredDrivers`). A driver with an outcome keeps running its finalization
+- Rejoin invariant: once a store discards T, its floor makes it refuse every later prepare for T: a discarded
+  acceptor is indistinguishable from an offline one, and Paxos is safe with offline acceptors. **A store never
+  rejoins a transaction it forgot.**
 
 #### Applied stubs
 - A durable (store, txid) record in the device CRL, charged to `CrlAdmission`, meaning the store holds

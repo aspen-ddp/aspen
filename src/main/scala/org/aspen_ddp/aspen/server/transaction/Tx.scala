@@ -138,7 +138,7 @@ class Tx( trs: TransactionRecoveryState,
     * driver yet (Store.driveTransaction, Ruling 20). Found, its driver holds the proof (foundUnackedEntry); absent, it
     * is driven as usual
     */
-  def awaitsFirstUnackedLookup: Boolean = needsUnackedCheck && !unackedAnswered
+  def awaitsFirstUnackedLookup: Boolean = recovered && needsUnackedCheck && !unackedAnswered
 
   /** This Tx's outcome is a late commit: its status cache entry and status answers say so */
   private var lateOutcome = false
@@ -173,11 +173,86 @@ class Tx( trs: TransactionRecoveryState,
     * UnackedCommits entry once it has loaded, and again before accepting any abort (held until a lookup started after
     * the abort finds none). An entry means the store cast a counted commit vote and had not acknowledged applying T
     * when T was finalized, i.e. it owes T: the Tx applies its update and resolves committed, keeping its state until
-    * TxFinalized (see unackedCommitFound). See Frontend.requestUnackedLookup
+    * TxFinalized (see unackedCommitFound). See Frontend.requestUnackedLookup.
+    *
+    * An expiring live commit vote (see expiring) is in the same position: its peers may have finalized and forgotten
+    * T while its TxFinalized was lost, so it too accepts an abort, or discards itself, only once a lookup started after
+    * finds no entry. It looks the entry up only then: its store drives it meanwhile (awaitsFirstUnackedLookup is for
+    * recovered votes only), since past the horizon no store that forgot T answers a driver
     */
   def needsUnackedCheck: Boolean =
-    recovered && disposition == TransactionDisposition.VoteCommit && txStatus == TransactionStatus.Unresolved &&
-      oresolution.isEmpty
+    (recovered || expiringTx) && disposition == TransactionDisposition.VoteCommit &&
+      txStatus == TransactionStatus.Unresolved && oresolution.isEmpty
+
+  // ---- Expiry (transaction horizon design, section 2) ----
+
+  /** Unresolved past the horizon plus the expiry margin: its store queries its peers' status and decides from their
+    * replies (Frontend.expiryHeartbeat, ExpiryTally). Never cleared
+    */
+  private var expiringTx = false
+
+  /** The ExpiryTally decided Discard while this Tx held a commit vote: it is discarded once an UnackedCommits lookup
+    * started after the decision finds no entry, and applies T as a late commit if one finds it (unackedCommitFound)
+    */
+  private var expiryDiscardDecided = false
+
+  def expiring: Boolean = expiringTx
+
+  /** T started more than `horizon` plus `margin` before `nowMillis`, on the host's wall clock */
+  def pastHorizon(nowMillis: Long, horizon: FiniteDuration, margin: FiniteDuration): Boolean =
+    txd.startTimestamp.wallTime + horizon.toMillis + margin.toMillis < nowMillis
+
+  /** Whether expiry applies: the outcome is unknown, or known only from this store's UnackedCommits entry while it
+    * waits for a TxFinalized (provesCommitToItsDriver) that may never come; the objects have loaded (completeLoad ran,
+    * so a recovered Tx is no longer holding its store's messages); and no late commit waits for its lookup, which ends
+    * the Tx itself
+    */
+  def mayExpire: Boolean =
+    (oresolution.isEmpty || provesCommitToItsDriver) && ofinalized.isEmpty && loadCompleted && !lateCommitHeld &&
+      !forgetLookupHeld
+
+  /** ExpiryTally decided Discard for a Tx that applied T through its UnackedCommits entry (provesCommitToItsDriver):
+    * no quorum holds T, so no TxFinalized will come, and T committed and was finalized (its entry is durable only once
+    * every other finalization action is done). It concludes as a late commit does: finalized, an applied stub in place
+    * of its CRL state, and forgotten
+    */
+  def concludeOwedCommit(): Unit =
+    lateOutcome = true
+    logger.info(s"Tx $transactionId on store $storeId: applied from its UnackedCommits entry, and its peers can no " +
+      s"longer decide it past the transaction horizon: concluded as finalized")
+    finalized(true)
+    frontend.forget(this)
+
+  def beginExpiry(): Unit =
+    if !expiringTx then
+      expiringTx = true
+      logger.info(s"Tx $transactionId on store $storeId is unresolved past the transaction horizon: querying its " +
+        s"peers' status. ${stateSummary(System.nanoTime())}")
+
+  /** ExpiryTally decided Discard for this commit vote: returns false if it was already decided. See
+    * expiryDiscardDecided
+    */
+  def decideExpiryDiscard(): Boolean =
+    val first = !expiryDiscardDecided
+    expiryDiscardDecided = true
+    first
+
+  /** A Discard decision waits only for its UnackedCommits lookup, which has now found no entry */
+  def expiryDiscardDue: Boolean = expiryDiscardDecided && oresolution.isEmpty && ofinalized.isEmpty
+
+  /** Ends the Tx without a decision (the Frontend's discard): no outcome is known, so nothing is applied, sent or
+    * recorded. Its waits end, its locks and objects are released. The Frontend deletes its CRL state and forgets it
+    */
+  def expire(): Unit =
+    waitingOn = Set()
+    pendingCollisionPrepare = None
+    delayedPrepare = None
+    heldAborts = Nil
+    if awaitingCommits.nonEmpty then
+      frontend.stopAwaitingCommits(awaitingCommits, this)
+      awaitingCommits = Set()
+    unlock()
+    releaseObjects()
 
   /** Whether an UnackedCommits lookup answer still matters: a recovered commit vote's check (needsUnackedCheck), or a
     * late commit held for its lookup (lateCommit)
@@ -1092,7 +1167,11 @@ class Tx( trs: TransactionRecoveryState,
       // Applied through the entry: the stub replaces the CRL state when the Tx is forgotten (addendum A, case 2). A
       // stub already held means the store has the update, and doCommit applies nothing
       stubDue = true
-      val late = lateCommitHeld
+      // Found after an expiry Discard: no quorum holds T, so it committed and was finalized, and no TxFinalized will
+      // come. Applied and forgotten as a held late commit is
+      val late = lateCommitHeld || expiryDiscardDecided
+      if late then
+        lateOutcome = true
       lateCommitHeld = false
       heldAborts = Nil
       updateLastEvent()

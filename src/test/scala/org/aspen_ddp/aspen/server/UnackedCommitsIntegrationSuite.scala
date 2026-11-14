@@ -24,8 +24,9 @@ import scala.util.Try
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 
 /** A store that voted commit, crashed before learning the outcome, and is restarted after the transaction was
-  * finalized and forgotten (its status cache entry gone) still applies the committed update: from the pool's
-  * UnackedCommits tree for any change, and through proof-of-commit as well for one that leaves a trace.
+  * finalized and forgotten (its status cache entry gone) still applies the committed update, from the pool's
+  * UnackedCommits tree. Proof-of-commit cannot help here: once the status cache has forgotten the transaction, it is
+  * past every store's forget floor, so no peer creates the Tx a proof needs. Such a Tx then ends by expiry.
   *
   * The bootstrap host records its stores' CRL state, so restarting a store recovers its commit vote, and its recovery
   * drivers send. Its heartbeat is short so the status cache expires quickly. Its time (heartbeats and driver timers)
@@ -33,8 +34,9 @@ import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
   * learn the outcome from the status cache.
   *
   * A recovering store that never accepted the commit, driving the transaction with no store that did, gets no
-  * accepted value from Paxos: the other stores forgot it. Without the UnackedCommits lookup or proof-of-commit,
-  * its driver decides abort on their votes, and it drops the update.
+  * accepted value from Paxos: the other stores forgot it. Before the transaction horizon its driver decided abort on
+  * their fresh votes, dropping the update; now they refuse it, and without the UnackedCommits lookup the Tx would be
+  * discarded by expiry, which waits for that lookup to find no entry.
   */
 class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
 
@@ -204,11 +206,13 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
         (0 until 5).foreach(i => storeKeys(i, nodePtr) should contain (k))
       (tree, nodePtr)
 
-  // Ignored until expiry (transaction horizon plan, Task 5): the recovered votes' drivers prepare stores past their
-  // forget floor, which refuse them, so only expiry can now end their Txs and drivers
-  ignore("two stores recovering commit votes for a committed TKVL delete both apply it"):
+  test("two stores recovering commit votes for a committed TKVL delete both apply it"):
     // Store 2 voted commit but never accepted; store 3 accepted too. Store 2 recovers first, while store 3 is still
-    // down, so no store it hears from holds the accepted commit
+    // down, so no store it hears from holds the accepted commit. Each applies the delete from its UnackedCommits entry
+    // and would wait for a TxFinalized: past the horizon its peers refuse its driver (their forget floor), so it ends by
+    // expiry. Its peers answer its status query "unknown" (store 3, still down, is silent: a possible holder), more than
+    // width - writeThreshold of them, so no quorum can ever decide T: its update applied, it concludes as finalized
+    // with an applied stub, and its driver is stopped. Store 3 does the same once restarted (store 2 now forgot T)
     for
       (tree, nodePtr) <- treeHoldingK()
       txid <- commitHeldBy(Set(sid(2), sid(3)))(tx => tree.delete(k)(using tx))
@@ -265,8 +269,10 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite:
             List(0, 1, 3, 4).foreach(i => storeRevision(i, dataPtr) shouldBe Some(ObjectRevision(txid)))
             marked.keySet should contain (2)
       _ <- restartAfterForgotten(txid, List(2))
-      // Its recovery driver starts once the Tx is idle for Host.txHeartbeatTimeout. The other stores no longer know the
-      // transaction, and prove its commit from the revision they show
+      // Applied from store 2's own UnackedCommits entry, found as it recovers: no driver takes part. The other stores
+      // no longer know the transaction and are past their forget floor for it, so they refuse every prepare of it and
+      // prove nothing (proofs need a Tx). The test ends before the Tx, idle for Host.txHeartbeatTimeout, gets a
+      // driver; past the horizon that Tx ends by expiry (see "two stores recovering commit votes")
       _ <- eventually("store 2 applied the overwrite", clock = true):
              Future.successful(storeRevision(2, dataPtr).contains(ObjectRevision(txid)))
       _ <- settle(clock = true)

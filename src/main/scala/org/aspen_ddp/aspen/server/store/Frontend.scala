@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreReco
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitState, Completion, Read}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
-import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
+import org.aspen_ddp.aspen.server.transaction.{ExpiryTally, TransactionStatusCache, Tx}
 import scribe.Logging
 import org.aspen_ddp.aspen.client.{ReadLocks, ObjectState as ClientObjectState}
 
@@ -41,6 +41,21 @@ object Frontend {
     * clients ratchet their HLCs from can run ahead of the hosts' clocks
     */
   val MaxStartLead: FiniteDuration = TransactionHorizon.MaxStartLead
+
+  /** How long past the horizon an unresolved Tx waits before it queries its peers' status (expiryHeartbeat). It covers
+    * the start lead a store tolerates and the idle self-drive delay (the heartbeat timeout plus one heartbeat), so that
+    * every store that could still join T has refused it, and every Tx that could learn T's outcome from a status cache
+    * has had its driver try
+    */
+  def expiryMargin(txHeartbeatTimeout: FiniteDuration, heartbeatPeriod: FiniteDuration): FiniteDuration =
+    MaxStartLead + txHeartbeatTimeout + heartbeatPeriod
+
+  /** The expiry margin with the host's default 1 s heartbeat and its 5 s heartbeat timeout */
+  val DefaultExpiryMargin: FiniteDuration =
+    expiryMargin(FiniteDuration(5, SECONDS), FiniteDuration(1, SECONDS))
+
+  /** The most store heartbeats between an expiring Tx's status queries: they start one heartbeat apart and double */
+  val MaxExpiryQueryInterval: Int = 8
 
   sealed abstract class ReadKind
 
@@ -99,7 +114,9 @@ class Frontend(val storeId: StoreId,
                /** When the store was loaded on this host, in wallClockMillis milliseconds (forgetFloorMillis). None:
                  * now. Every load builds a new Frontend, restart and transfer-in included. Injected by tests
                  */
-               loadedAt: Option[Long] = None) extends Logging {
+               loadedAt: Option[Long] = None,
+               /** How long past the horizon an unresolved Tx starts its status queries (Frontend.expiryMargin) */
+               val expiryMargin: FiniteDuration = Frontend.DefaultExpiryMargin) extends Logging {
 
   import Frontend._
 
@@ -122,6 +139,12 @@ class Frontend(val storeId: StoreId,
   def belowForgetFloor(txd: TransactionDescription): Boolean = belowForgetFloor(txd.startTimestamp)
 
   def belowForgetFloor(startTimestamp: HLCTimestamp): Boolean = startTimestamp.wallTime < forgetFloorMillis
+
+  /** T started more than the horizon plus the expiry margin ago: an unresolved Tx for it expires (expiryHeartbeat),
+    * and a driver for it with no outcome is stopped once its store holds no Tx (Store.heartbeat)
+    */
+  def pastExpiry(txd: TransactionDescription): Boolean =
+    txd.startTimestamp.wallTime + horizon.toMillis + expiryMargin.toMillis < wallClockMillis()
 
   /** Written only on the store's executor. `@volatile` so that `mayHoldTransaction` may read one snapshot of it from
     * another thread (the repair scan), as Store.hasTransactions reads `transactionDrivers`
@@ -519,7 +542,12 @@ class Frontend(val storeId: StoreId,
               tx.unackedCommitFound()
             case Success(false) if requestId >= l.firstCounting =>
               unackedLookups.remove(txid)
-              tx.unackedCommitAbsent().foreach(handleTransactionMessage)
+              val held = tx.unackedCommitAbsent()
+              // A held abort is a real outcome: it is taken over an expiry discard
+              if held.isEmpty && tx.expiryDiscardDue then
+                expireTransaction(tx)
+              else
+                held.foreach(handleTransactionMessage)
             case Success(false) =>
               if isLatest then
                 startUnackedLookup(txid, l)
@@ -545,6 +573,112 @@ class Frontend(val storeId: StoreId,
           startUnackedLookup(txid, l)
         else
           unackedLookups.remove(txid)
+
+  // ---- Expiry of unresolved transactions past the horizon (transaction horizon design, section 2) ----
+
+  /** An expiring Tx's status queries. Each round has its own request id and counts only its own replies.
+    *
+    * @param replies this round's replies by store, this store's own included; a store absent from it was silent
+    * @param countdown store heartbeats left until the next round
+    * @param interval heartbeats between the next round and the one after: 1, doubling to MaxExpiryQueryInterval
+    * @param decided this round's replies decided: later ones of it are ignored
+    */
+  private final class ExpiryRound(var requestUUID: UUID, var replies: Map[StoreId, Option[TxStatusResponse.TxStatus]],
+                                  var countdown: Int, var interval: Int, var decided: Boolean)
+  private val expiryRounds = scala.collection.mutable.HashMap[TransactionId, ExpiryRound]()
+
+  /** Store heartbeat: each Tx still unresolved past the horizon plus the expiry margin queries the status of every
+    * other store of its transaction, first at the heartbeat it is found so, then after 1, 2, 4 and then every
+    * MaxExpiryQueryInterval heartbeats, until it decides from the replies (ExpiryTally): it adopts an outcome, is
+    * discarded, or keeps holding. Only the replies decide, so a Tx whose peers still hold T loses nothing by asking
+    */
+  def expiryHeartbeat(): Unit =
+    val now = wallClockMillis()
+    expiryRounds.keys.toList.foreach: txid =>
+      if !transactions.get(txid).exists(_.mayExpire) then
+        expiryRounds.remove(txid)
+    transactions.values.toList.foreach: tx =>
+      if tx.mayExpire && tx.pastHorizon(now, horizon, expiryMargin) then
+        expiryRounds.get(tx.transactionId) match
+          case None =>
+            tx.beginExpiry()
+            val round = new ExpiryRound(UUID.randomUUID(), Map(), 0, 1, false)
+            expiryRounds(tx.transactionId) = round
+            startExpiryRound(tx, round)
+          case Some(round) =>
+            round.countdown -= 1
+            if round.countdown <= 0 then
+              startExpiryRound(tx, round)
+
+  private def startExpiryRound(tx: Tx, round: ExpiryRound): Unit =
+    round.requestUUID = UUID.randomUUID()
+    round.decided = false
+    round.countdown = round.interval
+    round.interval = math.min(round.interval * 2, MaxExpiryQueryInterval)
+    // Its own acceptor state: a muted Tx holds none. Never an outcome: one known only from its UnackedCommits entry
+    // (Tx.provesCommitToItsDriver) is what its peers are asked to confirm or end
+    round.replies = Map(storeId -> Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false,
+      late = false, holdsAcceptorState = !tx.muted)))
+    val txd = tx.txd
+    // Every store of the transaction, since any outcome-bearing reply decides; only the primary pool's count otherwise
+    (txd.allDataStores - storeId).foreach: to =>
+      net.sendTransactionMessage(TxStatusRequest(to, storeId, txd.transactionId, round.requestUUID, txd.startTimestamp))
+    decideExpiry(tx, round)
+
+  private def receiveStatusResponse(m: TxStatusResponse): Unit =
+    for
+      round <- expiryRounds.get(m.transactionId) if round.requestUUID == m.requestUUID && !round.decided
+      tx <- transactions.get(m.transactionId) if tx.mayExpire
+    do
+      round.replies += (m.from -> m.status)
+      decideExpiry(tx, round)
+
+  private def decideExpiry(tx: Tx, round: ExpiryRound): Unit =
+    ExpiryTally.decide(tx.txd, round.replies) match
+      case ExpiryTally.Decision.Hold => ()
+      case ExpiryTally.Decision.Adopt(committed, finalizedOrLate) =>
+        round.decided = true
+        val from = round.replies.collectFirst:
+          case (store, Some(s)) if s.status != TransactionStatus.Unresolved => store
+        .getOrElse(storeId)
+        logger.info(s"Expiring Tx ${tx.transactionId} on store $storeId adopts the outcome reported by $from: " +
+          s"${if committed then "committed" else "aborted"}${if finalizedOrLate then ", finalized" else ""}")
+        // As the outcome's own messages would deliver it. An abort is final once resolved (a driver finalizes it at
+        // once), so it is adopted as finalized: the Tx is then forgotten
+        val adopted =
+          if !committed then
+            TxFinalized(storeId, from, tx.transactionId, committed = false, late = false, owed = Set())
+          else
+            TxResolved(storeId, from, tx.transactionId, committed = true, late = finalizedOrLate, proof = false)
+        handleTransactionMessage(adopted)
+      case ExpiryTally.Decision.Discard =>
+        round.decided = true
+        if tx.provesCommitToItsDriver then
+          expiryRounds.remove(tx.transactionId)
+          tx.concludeOwedCommit()
+        else if tx.needsUnackedCheck then
+          // A commit vote may be owed T: discarded only once a lookup started now finds no entry (unackedLookupComplete)
+          if tx.decideExpiryDiscard() then
+            logger.info(s"Expiring Tx ${tx.transactionId} on store $storeId: its peers can no longer decide it; " +
+              s"looking up its UnackedCommits entry before discarding it")
+            requestUnackedLookup(tx)
+        else
+          expireTransaction(tx)
+
+  /** Discards `tx` past the horizon, with no decision: no quorum of its primary pool can ever decide T again, and this
+    * store is owed nothing. Its locks and objects are released, its CRL state deleted as for a forgotten abort, and it
+    * is forgotten. The status cache is left alone: no outcome is known. Its floor then refuses every later prepare for
+    * T, so the store never rejoins it
+    */
+  private def expireTransaction(tx: Tx): Unit =
+    if transactions.get(tx.transactionId).exists(_ eq tx) then
+      logger.warn(s"Store $storeId discards unresolved transaction ${tx.transactionId} past the transaction horizon: " +
+        s"too few of its peers hold it to ever decide it")
+      tx.expire()
+      transactions -= tx.transactionId
+      expiryRounds.remove(tx.transactionId)
+      unackedLookups.remove(tx.transactionId)
+      if tx.muted then releaseAdmission(tx.transactionId) else deleteTransactionState(tx.transactionId)
 
   private def releaseHeldMessages(): Unit =
     if !holding then
@@ -840,6 +974,7 @@ class Frontend(val storeId: StoreId,
       transactions.get(m.transactionId) match
         case Some(tx) => tx.receiveStatusRequest(m)
         case None => receiveStatusRequestWithoutTx(m)
+    case m: TxStatusResponse => receiveStatusResponse(m)
     case _ => // Other TxMessages are not relevant
   }
 

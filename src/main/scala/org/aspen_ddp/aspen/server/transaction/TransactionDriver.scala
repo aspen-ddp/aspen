@@ -186,6 +186,9 @@ abstract class TransactionDriver(
     ds.poolId == txd.primaryObject.poolId && validAcceptorSet.contains(ds.poolIndex)
   }
 
+  /** The driver resolved or finalized the transaction: it knows the outcome, and its finalization may still be running */
+  def hasOutcome: Boolean = synchronized { resolved || finalized }
+
   /** Releases the driver's timers. Overrides must call it: it stops a pending finalizer restart */
   def shutdown(): Unit = synchronized {
     stopped = true

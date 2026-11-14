@@ -4095,4 +4095,295 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
       statusResponses(net).map(_.status.map(_.holdsAcceptorState)) shouldBe List(Some(false))
   }
+
+  // ---- Expiry: an unresolved Tx past the horizon decides from its peers' status (spec section 2) ----
+  //
+  // The store's clock is the test's: T starts 1 s before the Frontend's "now", which then moves past the horizon plus
+  // the expiry margin. Each heartbeat is a direct call. The primary pool is op1's, Replication(3, 2): more than one
+  // non-holder discards
+
+  private final class TestClock(var now: Long)
+
+  private val peer1 = StoreId(poolId, 1)
+  private val peer2 = StoreId(poolId, 2)
+
+  private def withExpiryFrontend(f: (Frontend, MapBackend, TestNet, TestCrl, ManualLookup, TestClock,
+                                     TransactionStatusCache) => Unit): Unit =
+    val clock = new TestClock(floorNow)
+    val statusCache = new TransactionStatusCache(wallClockMillis = () => clock.now)
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    populate(backend)
+    val net = new TestNet
+    val crl = new TestCrl
+    val lookup = new ManualLookup
+    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup,
+      wallClockMillis = () => clock.now, horizon = FiniteDuration(20, SECONDS), loadedAt = Some(floorNow - 60_000))
+    lookup.frontend = Some(frontend)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    f(frontend, backend, net, crl, lookup, clock, statusCache)
+
+  /** Past the horizon plus the default expiry margin, measured from T's start (1 s before floorNow) */
+  private def passHorizon(clock: TestClock): Unit =
+    clock.now = floorNow - 1_000 + 20_000 + Frontend.DefaultExpiryMargin.toMillis + 1
+
+  private def expiringTxd(reqs: List[TransactionRequirement]): TransactionDescription =
+    lockTxd(txid1, reqs).copy(startTimestamp = startedAgo(1_000))
+
+  private def statusRequests(net: TestNet): List[TxStatusRequest] = net.sentTx.collect { case r: TxStatusRequest => r }
+
+  /** Answers the latest status query round of txid1 from `from` */
+  private def reply(frontend: Frontend, net: TestNet, from: StoreId, status: Option[TxStatusResponse.TxStatus]): Unit =
+    val round = statusRequests(net).last.requestUUID
+    frontend.receiveTransactionMessage(TxStatusResponse(storeId, from, txid1, round, status))
+
+  private val holding = Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
+    holdsAcceptorState = true))
+
+  test("a Tx past the horizon queries every other store of the transaction, backing off to eight heartbeats") {
+    withExpiryFrontend: (frontend, _, net, _, _, clock, _) =>
+      val txd = expiringTxd(List(overwrite(op1), DataUpdate(otherPtr, rev0, DataUpdateOperation.Overwrite)))
+        .copy(poolIDAMap = Map(poolId -> ida, otherPoolId -> ida))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      clock.now = floorNow - 1_000 + 20_000 + Frontend.DefaultExpiryMargin.toMillis
+      frontend.expiryHeartbeat()
+      statusRequests(net) shouldBe Nil // Not yet past the horizon plus the margin
+
+      passHorizon(clock)
+      val queried = (1 to 24).filter: _ =>
+        val before = statusRequests(net).size
+        frontend.expiryHeartbeat()
+        statusRequests(net).size > before
+      queried shouldBe List(1, 2, 4, 8, 16, 24)
+
+      val rounds = statusRequests(net).groupBy(_.requestUUID)
+      rounds.size shouldBe 6 // A fresh request id each round
+      rounds.values.foreach: round =>
+        round.map(_.to).toSet shouldBe txd.allDataStores - storeId
+        round.foreach(r => (r.from, r.transactionId, r.startTimestamp) shouldBe (storeId, txid1, txd.startTimestamp))
+  }
+
+  test("an abort voter past the horizon whose peers answer unknown is discarded and releases its locks") {
+    withExpiryFrontend: (frontend, _, net, crl, lookup, clock, statusCache) =>
+      // Its required revision is not the object's: an abort vote
+      val txd = expiringTxd(List(DataUpdate(op1, ObjectRevision(txid2), DataUpdateOperation.Overwrite)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+
+      reply(frontend, net, peer1, None)
+      frontend.transactions.contains(txid1) shouldBe true // One non-holder: a quorum may remain
+      reply(frontend, net, peer2, None)
+
+      frontend.transactions.contains(txid1) shouldBe false
+      crl.deleted should contain (txid1)
+      lookup.requests shouldBe Nil // An abort vote is owed nothing
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
+      // No outcome is known: the status cache keeps what the Tx wrote
+      statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Unresolved)
+  }
+
+  test("a commit voter past the horizon with no UnackedCommits entry is discarded once a later lookup finds none") {
+    withExpiryFrontend: (frontend, backend, net, crl, lookup, clock, statusCache) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      lookup.requests shouldBe Nil
+
+      reply(frontend, net, peer1, None)
+      reply(frontend, net, peer2, None)
+      // The tally discards, but a commit voter first looks up its entry, started after the decision
+      lookup.requests shouldBe List(txid1)
+      frontend.transactions.contains(txid1) shouldBe true
+      lockedWriteTransactions(frontend, net, op1) should contain (txid1)
+      // A later round's replies make no second lookup
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, None)
+      reply(frontend, net, peer2, None)
+      lookup.requests shouldBe List(txid1)
+
+      lookup.answer(txid1, Success(false))
+      frontend.transactions.contains(txid1) shouldBe false
+      crl.deleted should contain (txid1)
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
+      backend.get(oid1).get.data.size shouldBe 0
+      statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Unresolved)
+  }
+
+  test("a commit voter past the horizon with an UnackedCommits entry applies and resolves committed") {
+    withExpiryFrontend: (frontend, backend, net, crl, lookup, clock, statusCache) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, None)
+      reply(frontend, net, peer2, None)
+
+      lookup.answer(txid1, Success(true))
+      // Owed: T committed and was finalized (its entry is durable), so it applies and is forgotten as a late commit
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+      frontend.transactions.contains(txid1) shouldBe false
+      crl.stubsSaved should contain (txid1)
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
+      statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
+        finalized = true, late = true))
+  }
+
+  test("a commit voter keeps holding while its UnackedCommits lookup fails") {
+    withExpiryFrontend: (frontend, backend, net, crl, lookup, clock, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, None)
+      reply(frontend, net, peer2, None)
+
+      lookup.answer(txid1, Failure(new Exception("metadata pool down")))
+      frontend.transactions.contains(txid1) shouldBe true
+      lockedWriteTransactions(frontend, net, op1) should contain (txid1)
+      crl.deleted should not contain txid1
+
+      frontend.retryUnackedLookups()
+      lookup.requests shouldBe List(txid1, txid1)
+      lookup.answer(txid1, Failure(new Exception("still down")))
+      frontend.transactions.contains(txid1) shouldBe true
+
+      frontend.retryUnackedLookups()
+      lookup.answer(txid1, Success(false))
+      frontend.transactions.contains(txid1) shouldBe false
+      backend.get(oid1).get.data.size shouldBe 0
+  }
+
+  test("each status query round counts only its own replies") {
+    withExpiryFrontend: (frontend, _, net, _, lookup, clock, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      val first = statusRequests(net).last.requestUUID
+      reply(frontend, net, peer1, None)
+      frontend.expiryHeartbeat() // A new round
+      statusRequests(net).last.requestUUID should not be first
+
+      // Store 2's answer to the first round, with store 1's from that round, would discard
+      frontend.receiveTransactionMessage(TxStatusResponse(storeId, peer2, txid1, first, None))
+      lookup.requests shouldBe Nil
+      frontend.transactions.contains(txid1) shouldBe true
+  }
+
+  test("a Tx past the horizon with a quorum of holders keeps holding and later learns the outcome") {
+    withExpiryFrontend: (frontend, backend, net, _, lookup, clock, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, holding)
+      reply(frontend, net, peer2, holding)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, holding) // Store 2 silent: a possible holder
+      lookup.requests shouldBe Nil
+      frontend.transactions(txid1).status shouldBe TransactionStatus.Unresolved
+      lockedWriteTransactions(frontend, net, op1) should contain (txid1)
+
+      // A later round finds store 1 resolved: the outcome is adopted
+      frontend.expiryHeartbeat()
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = false,
+        late = false, holdsAcceptorState = true)))
+      frontend.transactions(txid1).status shouldBe TransactionStatus.Committed
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+
+      frontend.receiveTransactionMessage(TxFinalized(storeId, peer1, txid1, committed = true, late = false,
+        owed = Set()))
+      frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("an expiring commit voter adopts an abort only once a later lookup finds no entry") {
+    withExpiryFrontend: (frontend, backend, net, crl, lookup, clock, statusCache) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, Some(TxStatusResponse.TxStatus(TransactionStatus.Aborted, finalized = true,
+        late = false, holdsAcceptorState = false)))
+      // As for a recovered commit vote: the abort waits for a lookup started after it
+      lookup.requests shouldBe List(txid1)
+      frontend.transactions.contains(txid1) shouldBe true
+
+      lookup.answer(txid1, Success(false))
+      frontend.transactions.contains(txid1) shouldBe false
+      crl.deleted should contain (txid1)
+      backend.get(oid1).get.data.size shouldBe 0
+      statusCache.getStatus(txid1).map(s => (s.status, s.finalized)) shouldBe Some((TransactionStatus.Aborted, true))
+  }
+
+  test("an expiring Tx adopts a finalized commit through the late-commit path") {
+    withExpiryFrontend: (frontend, backend, net, crl, lookup, clock, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = true,
+        late = false, holdsAcceptorState = false)))
+      lookup.requests shouldBe List(txid1)
+
+      lookup.answer(txid1, Success(false)) // Not owed: it applies nothing
+      frontend.transactions.contains(txid1) shouldBe false
+      backend.get(oid1).get.data.size shouldBe 0
+  }
+
+  test("after expiry, a later prepare for T creates no Tx") {
+    withExpiryFrontend: (frontend, _, net, crl, _, clock, _) =>
+      val txd = expiringTxd(List(DataUpdate(op1, ObjectRevision(txid2), DataUpdateOperation.Overwrite)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, None)
+      reply(frontend, net, peer2, None)
+      frontend.transactions.contains(txid1) shouldBe false
+      net.sentTx = Nil
+
+      // A discarded acceptor is indistinguishable from an offline one: it never rejoins T
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.receiveTransactionMessage(driverPrepare(txd))
+      frontend.transactions.contains(txid1) shouldBe false
+      net.sentTx shouldBe empty
+      // Nor does it say anything but "unknown" when asked
+      frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
+      statusResponses(net).map(_.status) shouldBe List(None)
+  }
+
+  test("a recovered commit vote applied from its entry concludes as finalized once its peers can no longer decide T") {
+    // Its TxFinalized never comes: every peer forgot T. Applied from its UnackedCommits entry, it waits for nothing else
+    val clock = new TestClock(floorNow)
+    val statusCache = new TransactionStatusCache(wallClockMillis = () => clock.now)
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    cache.insert(mkKVObjectState())
+    val update = KeyValueOperation.encode(List(new Delete(k(2))), ida)(0)
+    val trs = TransactionRecoveryState(storeId, expiringTxd(List(deleteK2)).serialize(),
+      List(ObjectUpdate(oid2, update)), TransactionDisposition.VoteCommit, TransactionStatus.Unresolved,
+      PersistentState.initial)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+    val net = new TestNet
+    val lookup = new ManualLookup
+    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup,
+      wallClockMillis = () => clock.now, horizon = FiniteDuration(20, SECONDS), loadedAt = Some(floorNow))
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    lookup.answer(txid1, Success(true))
+    kvKeys(backend) should not contain k(2)
+    frontend.transactions(txid1).provesCommitToItsDriver shouldBe true
+
+    passHorizon(clock)
+    frontend.expiryHeartbeat()
+    reply(frontend, net, peer1, holding)
+    frontend.transactions.contains(txid1) shouldBe true // Holders may yet finalize it
+    frontend.expiryHeartbeat()
+    reply(frontend, net, peer1, None)
+    reply(frontend, net, peer2, None)
+
+    frontend.transactions.contains(txid1) shouldBe false
+    crl.stubsSaved should contain (txid1)
+    lookup.requests shouldBe List(txid1) // The entry was already found
+    statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
+      finalized = true, late = true))
+  }
 }

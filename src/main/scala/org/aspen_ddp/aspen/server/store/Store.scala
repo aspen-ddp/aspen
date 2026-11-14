@@ -50,7 +50,18 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** How long after its start a transaction may be joined (Frontend.horizon) */
             horizon: FiniteDuration = TransactionHorizon.Horizon,
             /** When the store was loaded (Frontend.loadedAt). None: now. A test seam */
-            loadedAt: Option[Long] = None) extends Logging {
+            loadedAt: Option[Long] = None,
+            /** The host's heartbeat period, which calls heartbeat (Frontend.expiryMargin) */
+            heartbeatPeriod: FiniteDuration = FiniteDuration(1, SECONDS),
+            /** The host's wall clock (Frontend.wallClockMillis). A test seam */
+            wallClockMillis: () => Long = () => System.currentTimeMillis()) extends Logging {
+
+  /** How long past the horizon an unresolved Tx starts its status queries: Frontend.expiryMargin */
+  val expiryMargin: FiniteDuration = Frontend.expiryMargin(
+    txHeartbeatTimeout match
+      case d: FiniteDuration => d
+      case _ => 5 * heartbeatPeriod,
+    heartbeatPeriod)
 
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
@@ -59,8 +70,8 @@ class Store(val storageDeviceId: StorageDeviceId,
     post = postToStore match
       case None => task => task()
       case Some(postTo) => task => postTo(s => if s eq this then task()),
-    acceptorSince = acceptorSince, deferRecovery = deferRecovery, horizon = horizon,
-    loadedAt = loadedAt)
+    acceptorSince = acceptorSince, deferRecovery = deferRecovery, wallClockMillis = wallClockMillis,
+    horizon = horizon, loadedAt = loadedAt, expiryMargin = expiryMargin)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's
@@ -86,12 +97,29 @@ class Store(val storageDeviceId: StorageDeviceId,
     }
     frontend.transactions.values.foreach(_.checkCollisionWait())
     frontend.retryUnackedLookups()
+    frontend.expiryHeartbeat()
+    removeExpiredDrivers()
     frontend.transactions.values.foreach { tx =>
       tx.reportIfStuck()
       if (tx.durationSinceLastEvent > txHeartbeatTimeout && !transactionDrivers.contains(tx.transactionId))
         driveTransaction(tx.txd)
     }
   }
+
+  /** Stops and removes each driver of a transaction past the horizon plus the expiry margin that has learned no outcome
+    * and whose store holds no Tx for it: its Tx expired (Frontend.expiryHeartbeat) or never existed. Past the horizon
+    * no store that forgot the transaction answers it, and a driver holds no durable state, so dropping it is safe. A
+    * driver with an outcome is kept: its finalization must complete. Nothing is removed while the store's CRL state
+    * loads, whose transactions are not registered yet
+    */
+  private def removeExpiredDrivers(): Unit =
+    if !frontend.recoveryPending then
+      transactionDrivers.foreach: (txid, driver) =>
+        if !frontend.transactions.contains(txid) && !driver.hasOutcome && frontend.pastExpiry(driver.txd) then
+          logger.info(s"Store $storeId stops its driver of transaction $txid: past the transaction horizon with no " +
+            s"outcome, and the store holds no Tx for it")
+          transactionDrivers -= txid
+          driver.shutdown()
 
   private val prepareResponseCache = Scaffeine().expireAfterWrite(10.seconds)
     .maximumSize(1000)

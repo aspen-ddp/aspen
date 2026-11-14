@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
-import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
+import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{Delete, KeyValueObjectPointer, KeyValueOperation, ObjectId}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -38,13 +38,14 @@ class StoreSuite extends AnyFunSuite with Matchers:
                       backendOverride: Option[MapBackend] = None,
                       backgroundTasks: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager,
                       driverFactory: TransactionDriver.Factory = TransactionDriver.noErrorRecoveryFactory,
-                      loadedAt: Option[Long] = FrontendSuite.longLoaded) =
+                      loadedAt: Option[Long] = FrontendSuite.longLoaded,
+                      wallClockMillis: () => Long = () => System.currentTimeMillis()) =
     val backend = backendOverride.getOrElse(new MapBackend(id))
     val net = new TestNet
     val crl = new TestCrl
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.global, backend,
       new HostObjectCache(1024 * 1024).forStore(id), net, backgroundTasks, crl, statusCache,
-      null, driverFactory, heartbeatTimeout, None, loadedAt = loadedAt)
+      null, driverFactory, heartbeatTimeout, None, loadedAt = loadedAt, wallClockMillis = wallClockMillis)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     val os = mkObjectState(oid1)
     backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
@@ -142,6 +143,27 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.frontend.transactions.contains(txid1) shouldBe false
     net.sentTx shouldBe Nil
     crl.txSaved shouldBe false
+  }
+
+  test("a driver past the horizon is removed once its store's Tx expired") {
+    var now = System.currentTimeMillis()
+    val (store, net, _) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS),
+      wallClockMillis = () => now)
+    // A client's prepare without the data: an abort vote at once
+    store.receiveTransactionMessage(prepare(leader, leader).copy(fromClient = true))
+    store.hasTransactions shouldBe true
+    val start = store.frontend.transactions(txid1).txd.startTimestamp.wallTime
+
+    now = start + 20_000 + store.expiryMargin.toMillis + 1
+    store.heartbeat()
+    store.hasTransactions shouldBe true // Its Tx still holds T: no peer has answered
+    val round = net.sentTx.collect { case r: TxStatusRequest => r }
+    round.map(_.to).toSet shouldBe Set(storeId, peer)
+
+    round.foreach(r => store.receiveTransactionMessage(TxStatusResponse(leader, r.to, txid1, r.requestUUID, None)))
+    store.frontend.transactions.contains(txid1) shouldBe false
+    store.heartbeat()
+    store.hasTransactions shouldBe false
   }
 
   // Ruling 31: a closed store's drivers would otherwise keep re-preparing its transactions from their timers

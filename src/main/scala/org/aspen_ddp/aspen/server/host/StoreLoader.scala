@@ -15,6 +15,7 @@ import scribe.Logging
 
 import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.duration.{FiniteDuration, MILLISECONDS}
 import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
 
@@ -339,7 +340,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 // their objects once it is installed (awaitCrlLoad)
                 deferRecovery = true,
                 missingDataWait = ctx.missingDataWait,
-                horizon = ctx.transactionHorizon)
+                horizon = ctx.transactionHorizon,
+                heartbeatPeriod = FiniteDuration(ctx.heartbeatPeriod.toMillis, MILLISECONDS))
               madeStore = Some(store)
               val entry = new StoreRouter.Entry(store, executor)
               // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any

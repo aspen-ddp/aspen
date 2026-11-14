@@ -324,9 +324,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
       yAfter.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))
 
-  // Ignored until expiry (transaction horizon plan, Task 5): the recovered vote's driver prepares stores past their
-  // forget floor, which refuse it, so only expiry can now end its Tx and driver
-  ignore(reDrivenAbortTest):
+  test(reDrivenAbortTest):
     val voter = 1
     val blocked = Set(3, 4).map(sid)
     // Whether `m` is an outcome of `txid` (TxResolved or TxFinalized) sent to one of `to`
@@ -382,7 +380,10 @@ class ReplayIntegrationSuite extends IntegrationTestSuite:
       _ = (0 until 5).filter(_ != voter).foreach: i =>
             net.smgr.control.router.loaded.get(sid(i)).exists(_.frontend.transactions.contains(tx.id)) shouldBe false
       // Store 1 restarts crash-only and recovers its commit vote. Its recovery driver re-prepares T to stores that
-      // forgot it, and whose requirement on x now holds again
+      // forgot it, and whose requirement on x now holds again: they are past their forget floor for T, so they refuse
+      // it, and T cannot commit. Store 1's Tx ends by expiry: its peers answer its status query "unknown", more than
+      // width - writeThreshold of the pool; its UnackedCommits lookup finds no entry (T aborted), so it is discarded and
+      // its driver stopped. Before the horizon, prefer-abort made the re-driven T abort again; the outcome is the same
       _ = net.dropTxMessage = _ => false
       _ <- pump(net.restartStore(net.stores(voter)), clock = true)
       _ <- forgottenByStores(tx.id)

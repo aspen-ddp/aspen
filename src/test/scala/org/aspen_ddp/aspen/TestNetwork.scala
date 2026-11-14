@@ -16,7 +16,7 @@ import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientRespon
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionHorizon, TransactionId}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
@@ -30,7 +30,7 @@ import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache as S
 import org.aspen_ddp.aspen.server.transaction.{SimpleTransactionDriver, TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.common.ida.IDA
 
-import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
+import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS, SECONDS}
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.language.implicitConversions
 
@@ -139,7 +139,8 @@ object TestNetwork {
                                recordCrl: Boolean = false,
                                recoveryDrivers: Boolean = false,
                                wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None,
-                               missingDataWait: Duration = Frontend.MissingDataWait)
+                               missingDataWait: Duration = Frontend.MissingDataWait,
+                               transactionHorizon: FiniteDuration = TransactionHorizon.Horizon)
 
   /** Opens a fresh no-op CRL for each device, creating the crl directory a real one would, so discovery does not
     * take the device's stores to have lost theirs */
@@ -451,7 +452,8 @@ class TestNetwork(executionContext: ExecutionContext,
     Duration(60, SECONDS),
     // Its stores are loaded directly (below), onto a device it never loads
     seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
-      missingDataWait = hostOptions.missingDataWait))
+      missingDataWait = hostOptions.missingDataWait),
+    transactionHorizon = hostOptions.transactionHorizon)
 
   // Stands in for each store's StoreConfig.effectiveMaxSliceSize, which Host reads from the store config file
   private val storesLoaded = (stores ++ metadataStores).map(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))

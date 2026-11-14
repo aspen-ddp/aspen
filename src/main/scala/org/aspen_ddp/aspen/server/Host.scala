@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDevi
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
@@ -59,12 +59,19 @@ object Host:
   /** How long a store's Tx may sit idle before the store drives it itself. This is how a lost TxFinalized is recovered */
   def txHeartbeatTimeout(heartbeatPeriod: Duration): Duration = heartbeatPeriod * 5
 
-  /** Outlasts an idle Tx being noticed, one heartbeat after its timeout, so that the driver then started learns the
-    * outcome from the stores' status caches. Without those the stores would treat its prepare as a new transaction
-    * and report a committed one as aborted.
+  /** How long the host remembers a transaction's outcome: TransactionHorizon.statusCacheDuration. It must outlast the
+    * horizon, the start lead and an idle Tx being noticed (its timeout plus one heartbeat), so that the driver then
+    * started learns the outcome from the stores' status caches. Without those the stores would treat its prepare as a
+    * new transaction and report a committed one as aborted.
     */
-  def txStatusCacheDuration(heartbeatPeriod: Duration): FiniteDuration =
-    FiniteDuration((heartbeatPeriod * 7).toNanos, NANOSECONDS)
+  def txStatusCacheDuration(heartbeatPeriod: Duration, horizon: FiniteDuration): FiniteDuration =
+    checkStatusCacheDuration(TransactionHorizon.statusCacheDuration(horizon, heartbeatPeriod), heartbeatPeriod, horizon)
+
+  private[server] def checkStatusCacheDuration(duration: FiniteDuration, heartbeatPeriod: Duration,
+                                               horizon: FiniteDuration): FiniteDuration =
+    val bound = horizon + TransactionHorizon.MaxStartLead + txHeartbeatTimeout(heartbeatPeriod) + heartbeatPeriod
+    require(duration >= bound, s"status cache duration $duration is below the bound $bound")
+    duration
 
   /** Each tick is a transaction per running system task, so it is not tied to the transaction heartbeat */
   val SystemTaskHeartbeatPeriod: Duration = Duration(5, SECONDS)
@@ -183,10 +190,12 @@ class Host(val client: AspenClient,
                     *  device's stores anyway. See awaitShutdownWork. */
                    val shutdownWorkTimeout: Duration = Duration(60, SECONDS),
                    /** What tests replace. See Host.Seams. */
-                   seams: Host.Seams = Host.Seams.default) extends Logging with RepairTarget {
+                   seams: Host.Seams = Host.Seams.default,
+                   /** See TransactionHorizon. Sizes the status cache */
+                   val transactionHorizon: FiniteDuration = TransactionHorizon.Horizon) extends Logging with RepairTarget {
   import Host._
 
-  private val txStatusCache = new TransactionStatusCache(Host.txStatusCacheDuration(heartbeatPeriod))
+  private val txStatusCache = new TransactionStatusCache(Host.txStatusCacheDuration(heartbeatPeriod, transactionHorizon))
 
   private val localDevices = new LocalDevices()
 

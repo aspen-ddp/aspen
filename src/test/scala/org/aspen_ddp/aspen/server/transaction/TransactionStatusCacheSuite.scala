@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.transaction
 
+import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.common.transaction.{TransactionId, TransactionStatus}
 import org.scalatest.concurrent.Eventually
 import org.scalatest.funsuite.AnyFunSuite
@@ -17,6 +18,58 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     eventually(timeout(org.scalatest.time.Span(10, org.scalatest.time.Seconds)),
                interval(org.scalatest.time.Span(1, org.scalatest.time.Millis))):
       cache.size should be <= 100L
+  }
+
+  test("a size eviction raises the eviction watermark to the eviction time plus MaxStartLead") {
+    val clock = 1_000_000L
+    val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), maxEntries = 1, wallClockMillis = () => clock)
+    cache.evictionWatermarkMillis shouldBe 0
+    cache.updateStatus(TransactionId(new UUID(0, 1)), TransactionStatus.Committed)
+    cache.updateStatus(TransactionId(new UUID(0, 2)), TransactionStatus.Committed)
+    cache.cleanUpForTest()
+    cache.evictionWatermarkMillis shouldBe clock + 2000
+    cache.sizeEvictions shouldBe 1
+  }
+
+  test("an expiry by time does not raise the watermark") {
+    var nanos = 0L
+    val ticker = new com.github.benmanes.caffeine.cache.Ticker:
+      def read(): Long = nanos
+    val cache = new TransactionStatusCache(FiniteDuration(10, SECONDS), wallClockMillis = () => 5L, ticker = ticker)
+    val txid = TransactionId(new UUID(0, 1))
+    cache.updateStatus(txid, TransactionStatus.Committed)
+    nanos = FiniteDuration(11, SECONDS).toNanos
+    cache.cleanUpForTest()
+    cache.getStatus(txid) shouldBe None
+    cache.evictionWatermarkMillis shouldBe 0
+    cache.sizeEvictions shouldBe 0
+  }
+
+  test("evictForTest raises the watermark as a size eviction does") {
+    val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), wallClockMillis = () => 7L)
+    val txid = TransactionId(new UUID(0, 1))
+    cache.updateStatus(txid, TransactionStatus.Committed)
+    cache.evictForTest(txid)
+    cache.getStatus(txid) shouldBe None
+    cache.evictionWatermarkMillis shouldBe 2007
+    cache.sizeEvictions shouldBe 1
+  }
+
+  test("the watermark never decreases") {
+    var clock = 100L
+    val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), wallClockMillis = () => clock)
+    val txid = TransactionId(new UUID(0, 1))
+    cache.updateStatus(txid, TransactionStatus.Committed)
+    cache.evictForTest(txid)
+    clock = 50L
+    cache.evictForTest(txid)
+    cache.evictionWatermarkMillis shouldBe 2100
+  }
+
+  test("the host status cache outlasts horizon, MaxStartLead and the idle self-drive") {
+    Host.txStatusCacheDuration(1.second, 20.seconds) shouldBe 30.seconds
+    Host.checkStatusCacheDuration(28.seconds, 1.second, 20.seconds) shouldBe 28.seconds
+    an [IllegalArgumentException] should be thrownBy Host.checkStatusCacheDuration(27.seconds, 1.second, 20.seconds)
   }
 
   test("an entry within the cap is remembered") {

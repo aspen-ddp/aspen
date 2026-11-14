@@ -50,7 +50,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
   test("the status cache outlasts an idle transaction being noticed") {
     val period = Duration(1, SECONDS)
-    Host.txStatusCacheDuration(period) should be > (Host.txHeartbeatTimeout(period) + period)
+    Host.txStatusCacheDuration(period, 20.seconds) should be > (Host.txHeartbeatTimeout(period) + period)
   }
 
   test("a store that finalized a transaction tells a recovery driver the transaction committed") {

@@ -1,8 +1,11 @@
 package org.aspen_ddp.aspen.server.transaction
 
 import com.github.blemale.scaffeine.{Cache, Scaffeine}
-import org.aspen_ddp.aspen.common.transaction.{TransactionId, TransactionStatus}
+import com.github.benmanes.caffeine.cache.{RemovalCause, Ticker}
+import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId, TransactionStatus}
+import scribe.Logging
 
+import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
 import scala.concurrent.duration.{FiniteDuration, SECONDS}
 
 object TransactionStatusCache {
@@ -13,11 +16,35 @@ object TransactionStatusCache {
 }
 
 class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, SECONDS),
-                             maxEntries: Long = TransactionStatusCache.DefaultMaxEntries) {
+                             maxEntries: Long = TransactionStatusCache.DefaultMaxEntries,
+                             wallClockMillis: () => Long = () => System.currentTimeMillis(),
+                             ticker: Ticker = Ticker.systemTicker()) extends Logging {
   import TransactionStatusCache._
 
+  private val watermark = new AtomicLong(0)
+  private val sizeEvictionCount = new AtomicLong(0)
+
+  /** Zero until a size eviction. Then the wall clock at the latest size eviction plus MaxStartLead (monotone): a
+    * transaction whose startTimestamp is not past it may have had an entry evicted, so a store must not trust the
+    * absence of an entry for it. Expiry by time does not raise it: entries outlast the horizon (Host).
+    */
+  def evictionWatermarkMillis: Long = watermark.get()
+
+  /** The number of size evictions so far */
+  private[aspen] def sizeEvictions: Long = sizeEvictionCount.get()
+
+  private def recordSizeEviction(txid: TransactionId): Unit =
+    val mark = wallClockMillis() + TransactionHorizon.MaxStartLead.toMillis
+    watermark.accumulateAndGet(mark, math.max)
+    sizeEvictionCount.incrementAndGet()
+    logger.error(s"Transaction status cache is full: evicted the entry of $txid before it expired. Lower the transaction rate or raise the cache size")
+
+  // The listener runs synchronously with the removal, so a reader that finds the entry gone sees the raised watermark
   private val cache: Cache[TransactionId,Entry] =
-    Scaffeine().expireAfterWrite(cacheDuration).maximumSize(maxEntries).build[TransactionId, Entry]()
+    Scaffeine().expireAfterWrite(cacheDuration).maximumSize(maxEntries).ticker(ticker)
+      .evictionListener((txid: TransactionId, _: Entry, cause: RemovalCause) =>
+        if cause == RemovalCause.SIZE then recordSizeEviction(txid))
+      .build[TransactionId, Entry]()
 
   /** Records what is known of `txid`. Monotone, atomically (Ruling 30): `finalized` and `late` are sticky, and a
     * resolved status (Committed or Aborted) never reverts to Unresolved. Several stores of a host write the same
@@ -51,7 +78,9 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
   private[aspen] def cleanUpForTest(): Unit = cache.cleanUp()
 
   /** Drops `txid`'s entry, as a size eviction would */
-  private[aspen] def evictForTest(txid: TransactionId): Unit = cache.invalidate(txid)
+  private[aspen] def evictForTest(txid: TransactionId): Unit =
+    cache.invalidate(txid)
+    recordSizeEviction(txid)
 
   private[aspen] def size: Long = {
     cache.cleanUp()

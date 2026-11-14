@@ -3256,11 +3256,37 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val done = Promise[ReconcileResult]()
     frontend.reconcileForRepair(snapshot.future.value.get.get, read, done)
 
-    done.future.value.get.get shouldBe ReconcileResult(Set(k(1)), false, false)
+    done.future.value.get.get shouldBe ReconcileResult(Set(k(1)), false, false, changed = true)
     val stored = backend.m(oid2).kvState.get.content
     stored.keySet shouldBe Set(k(1), k(2), k(4))
     stored(k(1)).revision shouldBe rev0
     stored(k(4)).revision shouldBe ObjectRevision(txid2)
+  }
+
+  def kvRead(keys: Range): org.aspen_ddp.aspen.client.KeyValueObjectState =
+    def vs(n: Int) = org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState(Value(Array[Byte](n.toByte)), rev0,
+      HLCTimestamp(n.toLong))
+    new org.aspen_ddp.aspen.client.KeyValueObjectState(kvPtr, rev0, ObjectRefcount(1, 1),
+      HLCTimestamp(1), HLCTimestamp(1), ida, Some(k(0)), None, None, None, keys.map(n => k(n) -> vs(n)).toMap)
+
+  test("reconciling a store that matches the read reports changed = false") {
+    val (frontend, backend, _) = lockFixture()
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr), kvRead(1 to 3), done)
+    val result = done.future.value.get.get
+    result.complete shouldBe true
+    result.changed shouldBe false
+    backend.m(oid2).kvState.get.content.keySet shouldBe (1 to 3).map(k).toSet
+  }
+
+  test("reconciling a store missing a key reports changed = true") {
+    val (frontend, backend, _) = lockFixture()
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr), kvRead(1 to 4), done)
+    val result = done.future.value.get.get
+    result.complete shouldBe true
+    result.changed shouldBe true
+    backend.m(oid2).kvState.get.content.keySet shouldBe (1 to 4).map(k).toSet
   }
 
   /** A read of op1 newer than anything the fixtures commit, at revision txid2 */

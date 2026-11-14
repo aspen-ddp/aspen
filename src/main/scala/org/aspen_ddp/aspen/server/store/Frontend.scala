@@ -1385,7 +1385,7 @@ class Frontend(val storeId: StoreId,
       val done = Promise[Unit]()
       done.future.onComplete { result =>
         post(() => repairWriteComplete(os, result.isSuccess))
-        p.complete(result.map(_ => plan.result))
+        p.complete(result.map(_ => plan.result.copy(changed = true)))
       }(using scala.concurrent.ExecutionContext.parasitic)
       backend.repair(CommitState(read.pointer, os.metadata, os.objectType, os.data), done)
 

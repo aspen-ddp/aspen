@@ -58,9 +58,11 @@ object KVObjectLevel:
 
 /** What a reconciliation left undone. Keys and object-level parts reported locked are deferred; `stale` means
   * something the repair would have changed differed from the snapshot (it was left for a later pass), or the read
-  * could not be used. Only a complete result lets the repair drop its entry
+  * could not be used. Only a complete result lets the repair drop its entry. `changed` is true when the store
+  * installed anything
   */
-final case class ReconcileResult(deferredKeys: Set[Key], objectLevelDeferred: Boolean, stale: Boolean):
+final case class ReconcileResult(deferredKeys: Set[Key], objectLevelDeferred: Boolean, stale: Boolean,
+                                   changed: Boolean = false):
   def complete: Boolean = deferredKeys.isEmpty && !objectLevelDeferred && !stale
 
 /** What to change on the store. Every value is in the store's form: key values, left and right are its IDA slices,

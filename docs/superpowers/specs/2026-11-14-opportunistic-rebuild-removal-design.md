@@ -81,7 +81,11 @@ Remove, with their tests:
   `TransactionBuilder.buildTranaction`'s manager parameter and pre-tx rebuild collection, `BaseReadDriver`'s
   `sendOpportunisticRebuild` and `markRepairNeeded` call, and the `disableOpportunisticRebuild` parameter threaded
   through `ReadManager`/`ReadDriver`/`SimpleReadDriver` and every caller.
-- `ObjectState.getRebuildDataForStore` (and anything it alone uses) if nothing else needs it.
+- The client object cache: `client.ObjectCache` (trait and `NoCache`), `client.internal.SimpleObjectCache`, the
+  `objectCache` member of `ReadDriverClient`/`BaseAspenClient` and its construction in `SimpleAspenClient`, and the
+  `put` in `BaseReadDriver`. Its only reader is `SimpleOpportunisticRebuildManager` (verified 2026-11-14); reads
+  never consult it. The server-side `server.store.cache.ObjectCache` is unrelated and stays.
+- Keep `ObjectState.getRebuildDataForStore`: `server.rebuild.RebuildingStore` uses it.
 - `ReadManager.pruneStaleReadsTask` holds completed reads for `slowReadReplyDuration` (5 s) only so late responses
   can trigger opportunistic rebuild (its scaladoc says so). Release a read when it completes instead. Builder to
   confirm that a response for an unknown read is dropped harmlessly and that nothing else (slow-read reporting,

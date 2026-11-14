@@ -553,8 +553,7 @@ class TestNetwork(executionContext: ExecutionContext,
     * started within MaxStartLead after it loaded, since it may have joined and forgotten one before
     */
   def loadFloorPassed(storeId: StoreId): Boolean =
-    hostFor(storeId).control.router.loaded.get(storeId).exists: s =>
-      System.currentTimeMillis() >= s.frontend.loadedAtMillis + Frontend.MaxStartLead.toMillis
+    hostFor(storeId).control.router.loaded.get(storeId).exists(_.frontend.loadFloorPassed)
 
   private var hostsBuilt = 0
 

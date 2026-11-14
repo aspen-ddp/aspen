@@ -11,7 +11,6 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.server.Host
-import org.aspen_ddp.aspen.server.store.Frontend
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -111,13 +110,10 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
   private def awaitLoadFloors(host: Host): Unit =
     val bootstrapStores = (0 until 3).map(i => StoreId(PoolId.BootstrapPoolId, i.toByte))
     val deadline = System.nanoTime() + Timeout.toNanos
-    def floor: Option[Long] =
+    def passed: Boolean =
       val loaded = bootstrapStores.flatMap(host.control.router.loaded.get)
-      if loaded.size == bootstrapStores.size then
-        Some(loaded.map(_.frontend.loadedAtMillis).max + Frontend.MaxStartLead.toMillis)
-      else
-        None
-    while !floor.exists(System.currentTimeMillis() >= _) do
+      loaded.size == bootstrapStores.size && loaded.forall(_.frontend.loadFloorPassed)
+    while !passed do
       if System.nanoTime() > deadline then
         fail("the bootstrap pool's stores never passed their load floors")
       Thread.sleep(10)

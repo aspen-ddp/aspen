@@ -133,8 +133,15 @@ class Frontend(val storeId: StoreId,
     * watermark (an entry dropped for size, which adds the lead the same way)
     */
   def forgetFloorMillis: Long =
-    math.max(math.max(wallClockMillis() - horizon.toMillis, loadedAtMillis + MaxStartLead.toMillis),
-      statusCache.evictionWatermarkMillis)
+    math.max(math.max(wallClockMillis() - horizon.toMillis, loadFloorMillis), statusCache.evictionWatermarkMillis)
+
+  /** The load's part of the forget floor: the load plus MaxStartLead */
+  val loadFloorMillis: Long = loadedAtMillis + MaxStartLead.toMillis
+
+  /** Whether a transaction started now on this host's clock is at or above the load's part of the floor, so the store
+    * may join it: past MaxStartLead after the store's load. Tests wait for it after a reload
+    */
+  def loadFloorPassed: Boolean = wallClockMillis() >= loadFloorMillis
 
   /** The transaction started below the forget floor: a prepare for it, unless the store holds it or the status cache
     * knows its outcome, is refused (receivePrepare), and its designated leader does not drive it (Store)

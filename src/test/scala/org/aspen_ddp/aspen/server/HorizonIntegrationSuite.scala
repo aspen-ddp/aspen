@@ -11,6 +11,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.store.Frontend
 
+import org.scalatest.Assertion
+
 import scala.concurrent.Future
 import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS, SECONDS}
 import scala.util.{Failure, Success, Try}
@@ -151,6 +153,24 @@ class HorizonIntegrationSuite extends IntegrationTestSuite:
       net.recordTxMessage = _ => false
       (tx.id, recordedClientPrepares(tx.id))
 
+  /** Runs `attempt` until it is not spoiled, at most `attempts` times. An attempt yields None when a scheduling stall
+    * pushed a step meant to happen inside T's horizon past it, which the attempt checks after the step (the clock read
+    * afterwards is past start + horizon): its outcome then shows nothing, and a fresh attempt, on a fresh object and
+    * transaction, runs instead. Only that explanation retries; any other unexpected outcome fails the attempt
+    */
+  private def retrySpoiled(what: String, attempts: Int = SpoiledAttempts, n: Int = 0)
+                          (attempt: Int => Future[Option[Assertion]]): Future[Assertion] =
+    attempt(n).flatMap:
+      case Some(result) => Future.successful(result)
+      case None if n + 1 < attempts => retrySpoiled(what, attempts, n + 1)(attempt)
+      case None => Future.failed(new AssertionError(s"every attempt was spoiled by scheduling stalls: $what"))
+
+  /** How many attempts retrySpoiled makes: each is spoiled only by a stall of over a second at one step */
+  private val SpoiledAttempts = 5
+
+  /** Whether T, started at `start`, was already past the horizon when this was called */
+  private def pastHorizon(start: Long): Boolean = wallMillis() - horizon.toMillis > start
+
   /** Waits until the hosts' wall clock is past `millis` */
   private def clockPast(millis: Long): Future[Unit] =
     eventually(s"the clock passed $millis", clock = false)(wallMillis() > millis)
@@ -196,6 +216,10 @@ class HorizonIntegrationSuite extends IntegrationTestSuite:
       xAfter.refcount shouldBe xBefore.refcount.increment()
 
   test("a delayed client prepare of a forgotten abort does not commit inside or past the horizon"):
+    retrySpoiled("the replay inside the horizon")(_ => forgottenAbortReplay())
+
+  /** One attempt of the test above: None if its replay meant for inside the horizon came after it */
+  private def forgottenAbortReplay(): Future[Option[Assertion]] =
     val blocked = Set(3, 4).map(sid)
     def outcomeTo(txid: TransactionId)(m: TxMessage): Boolean = isOutcome(txid)(m) && blocked.contains(m.to)
     for
@@ -224,6 +248,7 @@ class HorizonIntegrationSuite extends IntegrationTestSuite:
       aborted <- outcome(tx.commit(), clock = false)
       _ <- settle(clock = false)
       prepares = recordedClientPrepares(tx.id)
+      start = prepares.head.txd.startTimestamp.wallTime
       _ = withClue("T aborted: "):
             aborted should matchPattern { case Failure(_: TransactionAborted) => }
             prepares.size shouldBe 5
@@ -240,42 +265,65 @@ class HorizonIntegrationSuite extends IntegrationTestSuite:
       // T's client prepares reaches every store. Stores that forgot the abort voted commit afresh, and T committed (P-N4
       // path 3). Now the cache outlasts the horizon: the stores still know T aborted
       _ <- clockPast(forgottenAt + 8 * testHostOptions.heartbeatPeriod.toMillis)
-      _ = withClue("the host still knows T aborted: ")(cachedStatus(tx.id) shouldBe Some(TransactionStatus.Aborted))
+      known = cachedStatus(tx.id)
       _ = net.recordTxMessage = isOutcome(tx.id)
       _ = leaderLast(prepares).foreach(net.deliverTransactionMessage)
+      // Read after the replay: if T was not past the horizon then, the replay reached every store inside it
+      spoiled = pastHorizon(start)
       _ <- settle(clock = true)
       _ <- eventually("every store forgot T again", clock = true)(holders(tx.id).isEmpty)
       inside = net.takeRecordedTxMessages()
-      _ = withClue("inside the horizon the replay learns the abort, and nothing commits: "):
-            inside.collect { case m: TxResolved if m.committed => m } shouldBe Nil
-            inside.collect { case m: TxFinalized if m.committed => m } shouldBe Nil
-            (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(xBefore.revision))
+      _ = net.recordTxMessage = _ => false
+      result <- if spoiled then Future.successful(None) else pastHorizonReplay(x, xBefore.revision, tx.id, prepares,
+                  known, inside).map(Some(_))
+    yield result
+
+  /** The rest of an attempt whose replay was inside the horizon: its checks, then the replay past the horizon */
+  private def pastHorizonReplay(x: DataObjectPointer, revision: ObjectRevision, txid: TransactionId,
+                                prepares: List[TxPrepare], known: Option[TransactionStatus.Value],
+                                inside: List[TxMessage]): Future[Assertion] =
+    withClue("the host still knew T aborted at the replay: ")(known shouldBe Some(TransactionStatus.Aborted))
+    withClue("inside the horizon the replay learns the abort, and nothing commits: "):
+      inside.collect { case m: TxResolved if !m.committed => m } should not be empty
+      inside.collect { case m: TxResolved if m.committed => m } shouldBe Nil
+      inside.collect { case m: TxFinalized if m.committed => m } shouldBe Nil
+      (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(revision))
+    for
       // Past the horizon, once the cache forgot T, the same duplicate is refused everywhere
-      _ <- eventually("the status cache forgot T", clock = true)(cachedStatus(tx.id).isEmpty)
-      _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id && !isClientPrepare(tx.id)(m)
+      _ <- eventually("the status cache forgot T", clock = true)(cachedStatus(txid).isEmpty)
+      _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == txid && !isClientPrepare(txid)(m)
       _ = leaderLast(prepares).foreach(net.deliverTransactionMessage)
-      _ = withClue("past the horizon no store joins T: ")(holders(tx.id) shouldBe Set())
+      _ = withClue("past the horizon no store joins T: ")(holders(txid) shouldBe Set())
       _ <- settle(clock = true)
       past = net.takeRecordedTxMessages()
       xAfter <- client.read(x)
     yield
       net.recordTxMessage = _ => false
       withClue("no store sent anything for the replay past the horizon: ")(past shouldBe Nil)
-      crlStores(tx.id) shouldBe Set()
-      (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(xBefore.revision))
-      xAfter.revision shouldBe xBefore.revision
+      crlStores(txid) shouldBe Set()
+      (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(revision))
+      xAfter.revision shouldBe revision
       xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](1)
 
   test(nearHorizonTest):
     val late = 4
+    val other = net.newHost()
     for
-      x <- allocateX()
-      xBefore <- client.read(x)
+      // An object for each attempt, every store holding it. Allocated first, with the store on the bootstrap host, like
+      // every transaction the suite's setup started
+      xs <- (0 until SpoiledAttempts).foldLeft(Future.successful(Vector.empty[DataObjectPointer])): (f, _) =>
+              f.flatMap(acc => allocateX().map(acc :+ _))
       // The late store on a host of its own, so its status cache knows nothing of T. T starts once the store's load
       // plus MaxStartLead has passed, so T is above its forget floor until the horizon
-      other = net.newHost()
       _ <- pump(net.moveStore(net.stores(late), other, closeFirst = true), clock = false)
       _ <- eventually("the late store passed its load floor", clock = false)(net.loadFloorPassed(sid(late)))
+      result <- retrySpoiled("the late store's prepare inside the horizon")(n => lateStoreLearns(late, other, xs(n)))
+    yield result
+
+  /** One attempt of the test above, on `x`: None if the late store's prepare came after the horizon */
+  private def lateStoreLearns(late: Int, other: Host, x: DataObjectPointer): Future[Option[Assertion]] =
+    for
+      xBefore <- client.read(x)
       // T: a pinned overwrite of x, which commits and is finalized without the late store ever hearing of it. It is
       // reported offline meanwhile, so it does not lead
       tx = client.newTransaction()
@@ -298,20 +346,31 @@ class HorizonIntegrationSuite extends IntegrationTestSuite:
       // learns no outcome until its idle driver asks the other stores, after the horizon
       _ <- clockPast(start + horizon.toMillis - nearHorizonLead.toMillis)
       _ = net.deliverTransactionMessage(prepare.head)
-      _ = withClue("the late store, above its floor, joins T: ")(holds(late, tx.id) shouldBe true)
+      joined = holds(late, tx.id)
+      // Read after the delivery: a refusal is explained only if T was past the horizon by then
+      spoiled = !joined && pastHorizon(start)
+      _ = if !spoiled then withClue("the late store, above its floor, joins T: ")(joined shouldBe true)
+      result <- if spoiled then Future.successful(None) else learnsFromCaches(late, other, tx.id, prepare.head, start)
+                  .map(Some(_))
+    yield result
+
+  /** The rest of an attempt in which the late store joined T inside the horizon */
+  private def learnsFromCaches(late: Int, other: Host, txid: TransactionId, prepare: TxPrepare,
+                               start: Long): Future[Assertion] =
+    for
       _ <- eventually("the late store learned T's outcome", clock = true):
-             other.control.txStatusCache.getStatus(tx.id).exists(_.status != TransactionStatus.Unresolved)
+             other.control.txStatusCache.getStatus(txid).exists(_.status != TransactionStatus.Unresolved)
       learnedAt = wallMillis()
-      _ <- eventually("the late store forgot T", clock = true)(!holds(late, tx.id))
+      _ <- eventually("the late store forgot T", clock = true)(!holds(late, txid))
       _ <- settle(clock = true)
     yield
       // The other stores were past the horizon when its driver asked, so only their status caches could answer it,
       // which they outlast (horizon + MaxStartLead + 8 heartbeats from their last write)
       withClue("the late store learned the outcome only after the horizon: ")(learnedAt should be > start + horizon.toMillis)
-      (0 until 4).foreach(i => frontend(i).exists(_.belowForgetFloor(prepare.head.txd)) shouldBe true)
+      (0 until 4).foreach(i => frontend(i).exists(_.belowForgetFloor(prepare.txd)) shouldBe true)
       withClue("it learned the commit: "):
-        other.control.txStatusCache.getStatus(tx.id).map(_.status) shouldBe Some(TransactionStatus.Committed)
-      crlStores(tx.id) shouldBe Set()
+        other.control.txStatusCache.getStatus(txid).map(_.status) shouldBe Some(TransactionStatus.Committed)
+      crlStores(txid) shouldBe Set()
 
   test("stuck holders short of a quorum all discard"):
     val absent = Set(3, 4).map(sid)

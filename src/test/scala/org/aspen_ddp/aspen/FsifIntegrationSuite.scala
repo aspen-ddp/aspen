@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{Host, StoreConfig}
 import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
-import org.aspen_ddp.aspen.server.store.{Frontend, ReconcileResult, RepairSnapshot}
+import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler, FsifConfig}
 import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifRecovery}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -130,8 +130,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
     * store the host created joins at once; one it loaded again, after a restart or a rebuild, only then
     */
   private def joinsNewTransactions(storeId: StoreId): Boolean =
-    host.control.router.loaded.get(storeId).exists: s =>
-      System.currentTimeMillis() >= s.frontend.loadedAtMillis + Frontend.MaxStartLead.toMillis
+    host.control.router.loaded.get(storeId).exists(_.frontend.loadFloorPassed)
 
   /** Every store of the pool is Active on the device and served by the current host */
   private def awaitStoresServed(): Future[Unit] =

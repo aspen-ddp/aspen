@@ -25,6 +25,12 @@
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
   install and after close the backend and directory belong to the control side, which otherwise reads only
   `storeId`, `path`, `crlSaveFile` and the thread-safe `hasFailed`/`isWriteFrozen`. `release` frees the slot
+- Load time and the forget floor (`server/store/CLAUDE.md`): every Store `StoreLoader` builds records its load
+  (`Frontend.loadedAt`), so after a restart, adoption or transfer in it refuses, for good, each transaction it does
+  not hold that started before the load plus `MaxStartLead`. The exception is a store this process just created
+  (`StoreLoader.newStores`: a `startOpen` with `create`, made only by `StoreRebuilds.createNewStore` for a new pool's
+  store with no directory yet). It has never served, so it records no load and joins at once. Tests set load times
+  through `Host.Seams.storeLoadedAt`
 - A loading store asks for its CRL state with the non-blocking `readStoreState` from its executor
   (`StoreRouter.readAndRecover`), holding its messages until it recovers, so no store thread blocks on a CRL
 - Device management (the classes `DeviceControl` wires) runs on one control thread, `aspen-host-control`,

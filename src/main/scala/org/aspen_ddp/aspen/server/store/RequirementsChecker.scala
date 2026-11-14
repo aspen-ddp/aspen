@@ -23,6 +23,9 @@ object RequirementsChecker extends Logging {
     *                 transaction's can no longer commit, so enforcing its lock would only turn this store's part of
     *                 a committed update into a missed update.
     * @param nanoTime Clock for the exclusive preference window
+    * @param allocatedOver Objects the transaction allocates whose load found an existing state (in memory or in the
+    *                 backend) rather than a fresh one. A replayed allocation must never overwrite a live object
+    *                 (transaction-requirements F11), so every requirement on them fails with ObjectExists
     * @return Tuple of object specific errors and a list of non-object errors
     */
   def check(transactionId: TransactionId,
@@ -32,7 +35,8 @@ object RequirementsChecker extends Logging {
             objectUpdates: Map[ObjectId, DataBuffer],
             maxSliceSize: Option[Long] = None,
             applying: Boolean = false,
-            nanoTime: () => Long = () => System.nanoTime()):
+            nanoTime: () => Long = () => System.nanoTime(),
+            allocatedOver: Set[ObjectId] = Set()):
   (Map[ObjectId, RequirementError], List[RequirementError]) = {
 
     def collide(oid: ObjectId, holders: Iterable[TransactionId]): Unit =
@@ -55,6 +59,7 @@ object RequirementsChecker extends Logging {
     def loaded(oid: ObjectId): ObjectState =
       objects.get(oid) match
         case None => throw ObjectErr(oid, MissingObject())
+        case Some(_) if allocatedOver.contains(oid) => throw ObjectErr(oid, ObjectExists())
         case Some(os) if os.metadata.refcount.count == 0 => throw ObjectErr(oid, MissingObject())
         case Some(os) =>
           if os.reloadRequired then
@@ -191,6 +196,12 @@ object RequirementsChecker extends Logging {
                 s"$transactionId. Failing the requirement.", e)
               nonObjectErrors = RequirementCheckFailure() :: nonObjectErrors
       }
+    }
+
+    // Also over errors a requirement found before loading the state (an unflagged delete, say)
+    allocatedOver.foreach { oid =>
+      if objects.contains(oid) then
+        objectErrors += (oid -> ObjectExists())
     }
 
     (objectErrors, nonObjectErrors)

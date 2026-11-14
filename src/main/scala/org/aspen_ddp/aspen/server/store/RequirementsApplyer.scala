@@ -46,14 +46,16 @@ object RequirementsApplyer extends Logging {
     * shows it when its revision is the transaction's, for an update that moves the revision (DataUpdate, VersionBump,
     * KeyValueUpdate with a required revision), or when a key carries it, for a KeyValueUpdate without one. A
     * RefcountUpdate, a KeyValueUpdate that only deletes, or one whose Inserts later writes superseded
-    * (`KVObjectState.insertWins`), leaves no trace.
+    * (`KVObjectState.insertWins`), leaves no trace. An object the transaction allocates (`allocatedOver`, see
+    * RequirementsChecker.check) shows it at the transaction's revision too.
     */
   def appliedBy(transactionId: TransactionId,
                 requirements: List[TransactionRequirement],
-                objects: Map[ObjectId, ObjectState]): Set[ObjectId] =
+                objects: Map[ObjectId, ObjectState],
+                allocatedOver: Set[ObjectId] = Set()): Set[ObjectId] =
     val rev = ObjectRevision(transactionId)
     def atRevision(oid: ObjectId): Option[ObjectState] = objects.get(oid).filter(_.metadata.revision == rev)
-    requirements.iterator.flatMap { (r: TransactionRequirement) =>
+    val byUpdate = requirements.iterator.flatMap { (r: TransactionRequirement) =>
       r match
         case r: DataUpdate => atRevision(r.objectPointer.id)
         case r: VersionBump => atRevision(r.objectPointer.id)
@@ -62,17 +64,19 @@ object RequirementsApplyer extends Logging {
           objects.get(r.objectPointer.id).filter(_.kvState.exists(_.content.valuesIterator.exists(_.revision == rev)))
         case _ => None
     }.map(_.objectId).toSet
+    byUpdate ++ allocatedOver.filter(oid => atRevision(oid).nonEmpty)
 
   def apply(transactionId: TransactionId,
             timestamp: HLCTimestamp,
             requirements: List[TransactionRequirement],
             objects: Map[ObjectId, ObjectState],
             objectUpdates: Map[ObjectId, DataBuffer],
-            maxSliceSize: Option[Long] = None): Result = {
+            maxSliceSize: Option[Long] = None,
+            allocatedOver: Set[ObjectId] = Set()): Result = {
 
     // Get a list of all objects that are unfit for accepting the changes in this transaction
     val skippedReasons = RequirementsChecker.check(transactionId, timestamp, requirements, objects, objectUpdates,
-      maxSliceSize, applying = true)._1
+      maxSliceSize, applying = true, allocatedOver = allocatedOver)._1
 
     var failedObjects: Set[ObjectId] = Set()
 

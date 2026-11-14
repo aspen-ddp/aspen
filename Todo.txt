@@ -36,12 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.3  Allocating writes must not overwrite an existing object: Req F11, X11 (narrows R-N1, P-N3, X12, X13)   [S-M]
-     An Allocating ObjectState is built without consulting the backend, so a replayed allocation delivered by a
-     late or non-late commit at a stubless store overwrites a live or deleted object with its initial content.
-     Fix: the store (or backend) fails the allocating write when the object or its tombstone exists, and marks
-     the store.
-
 2.4  Monotone missed-update marker: Repair F10, Q-N5 (marker), R-N6 (marker part)                           [S]
      MissedUpdateMarker's blind, replaySafe upsert can lower a newer missedTimestamp (weakening the completion
      gate) and re-create deleted UnackedCommits entries. Fix: upsert with max(missedTimestamp), and do not
@@ -83,9 +77,11 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
      R-N1, R-N6, R-N7 (X13, G13), R-N9, RP-N4, P-N3 (X12). A store holding an UnackedCommits entry and no applied
      stub re-applies T on a replay's commit. That covers blind writes, ABA DoesNotExist inserts and allocations,
      and for R-N7 possibly a whole pool. R-N7 and R-N9 were accepted by ruling. 2.2 landed (blind Inserts are
-     last-writer-wins, blind deletes refused). Once 2.3-2.4 land too, most write classes become harmless. Re-derive
-     what remains, including an Insert replayed after a later delete of its key (blind or DoesNotExist ABA: decide on
-     a per-key generation), and either close it or re-confirm the acceptance in writing.
+     last-writer-wins, blind deletes refused). 2.3 landed (an allocation over an object the store holds is refused,
+     ObjectExists). Once 2.4 lands too, most write classes become harmless. Re-derive what remains, including an
+     Insert replayed after a later delete of its key (blind or DoesNotExist ABA: decide on a per-key generation) and
+     an allocation replayed after its object's deletion persisted (no tombstones: an orphan slice), and either close
+     it or re-confirm the acceptance in writing.
      Candidate fixes: treat an adopted accepted commit from a quorum that contains memoryless acceptors as late
      when a proof exists (P-N3); D1 writes no entries for stores that D0 listed or that acknowledged (R-N7). Add
      the missing test that kills D1's host between hand-off and TxFinalized (G13).

@@ -1,8 +1,8 @@
 package org.aspen_ddp.aspen.server.transaction
 
-import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
-import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ObjectRevision, ReadError}
+import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
@@ -314,7 +314,8 @@ class Tx( trs: TransactionRecoveryState,
   /** The loaded objects that already show this transaction's update, proving that it committed. See
     * RequirementsApplyer.appliedBy
     */
-  private def appliedHere: Set[ObjectId] = RequirementsApplyer.appliedBy(transactionId, requirements, objects)
+  private def appliedHere: Set[ObjectId] =
+    RequirementsApplyer.appliedBy(transactionId, requirements, objects, allocatedOver)
 
   /** This store found the transaction's update already applied to an object it hosts, without knowing the
     * transaction: the other stores finalized and forgot it, and a recovery driver prepares it again for a store that
@@ -520,11 +521,36 @@ class Tx( trs: TransactionRecoveryState,
 
   private def trsObjectUpdates: List[ObjectUpdate] = if (saveObjectUpdates) objectUpdates else Nil
 
-  def objectLoaded(os: ObjectState): Unit = {
-    objects += (os.objectId -> os)
+  /** Objects this transaction allocates whose load found the store's existing state rather than a fresh one: a
+    * replayed allocation. Every requirement on them fails (RequirementsChecker.check, ObjectExists), so the replay
+    * never overwrites the live object (transaction-requirements F11)
+    */
+  private var allocatedOver: Set[ObjectId] = Set()
 
+  /** The store's state of `os.objectId`, from its cache or backend. For an object this transaction allocates, the
+    * object already exists here. See allocatedOver
+    */
+  def objectLoaded(os: ObjectState): Unit =
+    if txd.allocatingObjects.contains(os.objectId) then
+      logger.warn(s"Tx $transactionId allocates object ${os.objectId}, which store $storeId already holds " +
+        s"(revision ${os.metadata.revision.lastUpdateTxUUID}): a replayed allocation, refused")
+      allocatedOver += os.objectId
     // Ensures every transaction uses this state, and keeps it in memory, while this transaction is in progress
-    frontend.retain(os, shared = !txd.allocatingObjects.contains(os.objectId))
+    frontend.retain(os, shared = true)
+    loadedObject(os)
+
+  /** The store does not hold `objectId`, which this transaction allocates: it gets a fresh, empty state. Only this
+    * transaction knows it, so it is not shared with others
+    */
+  def allocationLoaded(objectId: ObjectId): Unit =
+    logger.trace(s"Allocating new object: $objectId in Tx: $transactionId.")
+    val os = new ObjectState(objectId, Metadata(ObjectRevision.Allocating, ObjectRefcount.Allocating,
+      txd.startTimestamp), pointerOf(objectId).objectType, DataBuffer.Empty)
+    frontend.retain(os, shared = false)
+    loadedObject(os)
+
+  private def loadedObject(os: ObjectState): Unit = {
+    objects += (os.objectId -> os)
 
     pendingObjectLoads -= 1
 
@@ -659,7 +685,7 @@ class Tx( trs: TransactionRecoveryState,
       val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
       val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
-        frontend.maxSliceSize)
+        frontend.maxSliceSize, allocatedOver = allocatedOver)
 
       awaitableHolders(m, l) match
         case Some(holders) =>
@@ -779,7 +805,7 @@ class Tx( trs: TransactionRecoveryState,
     }
 
     val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, requirements,
-      objects -- failedHere, ou, frontend.maxSliceSize)
+      objects -- failedHere, ou, frontend.maxSliceSize, allocatedOver)
 
     // Objects that threw partway through their update hold partially-applied, potentially
     // corrupt state. Drop them from the cache so the next access reloads the last durable
@@ -792,7 +818,7 @@ class Tx( trs: TransactionRecoveryState,
     // Skipped because they already show this transaction's update (see proveCommitted): applied, though not by this
     // commit. Only skipped objects are looked at, so a commit applied normally pays nothing for this
     val alreadyApplied = RequirementsApplyer.appliedBy(transactionId, requirements,
-      objects.filter((oid, _) => result.skipped.contains(oid) && !failedHere.contains(oid)))
+      objects.filter((oid, _) => result.skipped.contains(oid) && !failedHere.contains(oid)), allocatedOver)
     if alreadyApplied.nonEmpty then
       logger.info(s"Tx $transactionId. Store $storeId already holds the committed update of objects $alreadyApplied")
 

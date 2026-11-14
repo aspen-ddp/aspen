@@ -408,7 +408,9 @@ that built on the deleting one waits for the in-flight deletion (R9) then fails 
 `deleting` set, so the object keeps answering `ObjectNotFound` while the store is loaded.
 A stale `DataUpdate`/`KeyValueUpdate` with an old required revision on a store that missed the deletion is an
 ordinary stale-state vote (section 10.3): fewer than `T` such stores exist.
-Object ids are UUIDs and are never reallocated by design; an allocation transaction has no existence check, see F11.
+Object ids are UUIDs and are never reallocated by design. An allocation reads the store first: it refuses an object
+the store holds, or is deleting (`ObjectExists`, `MissingObject`). It cannot see one whose deletion has persisted,
+since no backend keeps tombstones (F11).
 
 ## 10. Failure scenarios
 
@@ -488,7 +490,8 @@ committed state (no revert). A failed *deletion* leaves the object answering `Ob
 ### 10.7 Deleted object followed by a transaction on the same id
 
 See 9.4. Outcome: abort (`MissingObject` or `StaleObjectState`). The ordering is by R9: a Tx touching a deleting object
-waits for the deletion to persist. An allocation transaction for the same id would create a fresh state: F11.
+waits for the deletion to persist. An allocation transaction for the same id votes abort while the deletion is in
+flight. Once it has persisted, the allocation creates a fresh state (F11 residual).
 
 ### 10.8 Key deleted, then a stale insert
 
@@ -559,6 +562,7 @@ under reordering/crash; Low = needs an unusual precondition or a trust-model vio
 | F11 | **narrowed** | A replayed allocation can no longer commit through fresh votes: its transaction's pin fails. It still applies where a late commit finds a leftover entry (transaction-recovery R-N1) or where a recovering acceptor gives a non-late commit (paxos P-N3) | `Pins.scala:18-33`; `Tx.scala:926-930` |
 | F12 | unchanged | `awaitingCommits` still has no timer | `Tx.scala:511-517` |
 | F13 | unchanged | Not in the diff | |
+| F11 (2026-11-14) | **FIXED** for live objects | An allocation reads the cache and backend. An existing state fails every requirement on the object with `ObjectExists`, at vote and at the apply re-check. Residual: an id whose deletion has persisted | `Frontend.readObjectForTransaction`; `RequirementsChecker.check(allocatedOver)` |
 | N1, N2 | unchanged | Not in the diff | |
 
 ### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
@@ -778,6 +782,24 @@ violation into a silent overwrite instead of a detected conflict, since the lose
 Open question: should an apply that overrides a held lock of a *commit* voter be logged as an invariant violation?
 
 ### F11. An allocating object has no existence check, so a replayed allocation can overwrite a live or deleted object. Confidence: Low.
+
+> **Status 2026-11-14: FIXED for live objects; residual for deleted ones.** `Frontend.readObjectForTransaction` treats
+> an allocating object like any other. It takes the in-memory state, answers `ObjectNotFound` while a deletion is in
+> flight, and otherwise reads the backend. Only a backend miss gives the fresh `Allocating` state
+> (`Tx.allocationLoaded`). An existing state goes into `Tx.allocatedOver`, and every requirement on that object fails
+> with `ObjectExists` (`RequirementsChecker.check`). This holds at the vote and at the apply re-check, so the replay
+> votes abort. A commit that still reaches the store (late or non-late, X11 step 3, P-N3) applies nothing there. A
+> non-late commit reports the object in `TxCommitted`, and the finalizer marks the store. A late one leaves the
+> existing entry for the scan. The requirements alone could not catch this: a KV allocation is a `KeyValueUpdate`
+> with no required revision and `RefcountUpdate(Allocating -> (0,1))`, so it passes on a KV object that only blind
+> updates touched since. `RequirementsApplyer.appliedBy` counts an allocated object at T's own revision as already
+> applied, which covers a recovered commit vote whose backend commit persisted before the crash.
+> *Residuals:* (1) No backend keeps tombstones. A replay of an allocation whose object was deleted, and whose deletion
+> has persisted, still creates it again at a stubless store: an unreferenced orphan slice (a leak, not an overwrite;
+> Todo 2.9). (2) An empty KV allocation leaves no revision or key trace. A recovered one that already persisted is
+> reported as missed, and repair reconciles it with no effect. (3) Every allocation now costs one backend read per
+> store. That is a point lookup on a miss in RocksDB, and an in-memory index check in FSIF.
+> Tests: `FrontendSuite` "Replayed allocations"; `RequirementsCheckerSuite`.
 
 > **Refresh (replay pins): NARROWED.** The horizon is gone, but allocations are never pins, so an allocating transaction
 > carries another pin, which a replay fails (`Pins.scala:18-33`). The fresh `Allocating` state still passes, so the

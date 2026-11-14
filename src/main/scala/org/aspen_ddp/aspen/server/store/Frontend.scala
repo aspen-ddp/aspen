@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
-import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
+import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
@@ -432,7 +432,7 @@ class Frontend(val storeId: StoreId,
     */
   private def recoverTransactions(states: List[TransactionRecoveryState]): Unit =
     // Every recovered transaction is registered before any of their reads starts: one that loads synchronously (its
-    // objects cached, or all allocated) must not find the others missing and release the held messages early
+    // objects cached) must not find the others missing and release the held messages early
     val recovered = states.flatMap { trs =>
       val txd = TransactionDescription.deserialize(trs.serializedTxd)
       if transactions.contains(txd.transactionId) then
@@ -1265,38 +1265,28 @@ class Frontend(val storeId: StoreId,
 
     logger.trace(s"Loading object for Tx: ${transaction.transactionId}. Object: $objectId")
 
-    if transaction.txd.allocatingObjects.contains(pointer.id) then
-      logger.trace(s"Allocating new object: $objectId in Tx: ${transaction.transactionId}.")
+    // An object the transaction allocates is read like any other: the store may already hold it (a replayed
+    // allocation, transaction-requirements F11), and the transaction must then see that state and refuse to overwrite
+    // it. Only a backend miss gives the fresh state (readCompleted)
+    stateForTransaction(objectId) match
+      case Some(os) =>
+        logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: $objectId")
+        transaction.objectLoaded(os)
 
-      val metadata = Metadata(
-        ObjectRevision.Allocating,
-        ObjectRefcount.Allocating,
-        transaction.txd.startTimestamp
-      )
+      case None if deleting.contains(objectId) =>
+        transaction.objectLoadFailed(objectId, ReadError.ObjectNotFound)
 
-      val os = new ObjectState(objectId, metadata, pointer.objectType, DataBuffer.Empty)
+      case None =>
+        val tr = TransactionRead(transaction.transactionId)
 
-      transaction.objectLoaded(os)
-    else
-      stateForTransaction(objectId) match
-        case Some(os) =>
-          logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: $objectId")
-          transaction.objectLoaded(os)
+        pendingReads.get(objectId) match
+          case Some(lst) =>
+            pendingReads += (objectId -> (tr :: lst))
 
-        case None if deleting.contains(objectId) =>
-          transaction.objectLoadFailed(objectId, ReadError.ObjectNotFound)
-
-        case None =>
-          val tr = TransactionRead(transaction.transactionId)
-
-          pendingReads.get(objectId) match
-            case Some(lst) =>
-              pendingReads += (objectId -> (tr :: lst))
-
-            case None =>
-              pendingReads += (objectId -> (tr :: Nil))
-              logger.trace(s"Loading object from Backend for Tx: ${transaction.transactionId}. Object: $objectId")
-              backend.read(pointer)
+          case None =>
+            pendingReads += (objectId -> (tr :: Nil))
+            logger.trace(s"Loading object from Backend for Tx: ${transaction.transactionId}. Object: $objectId")
+            backend.read(pointer)
 
   /** Applies Reconcile.plan to `loaded`, the store's copy (None when it holds none), and hands the result to the
     * backend. Keys and object-level parts this store holds locked are deferred along with those the read reports: a
@@ -1459,7 +1449,14 @@ class Frontend(val storeId: StoreId,
               val rr = ReadResponse(netRead.clientId, storeId, netRead.requestUUID, HLCTimestamp.now, Left(err) )
               net.sendClientResponse(rr)
 
-            case tr: TransactionRead => transactions.get(tr.transactionId).foreach { tx => tx.objectLoadFailed(objectId, err) }
+            case tr: TransactionRead => transactions.get(tr.transactionId).foreach { tx =>
+              // A miss is what lets a transaction allocate the object here; a deletion in flight is no miss
+              if err == ReadError.ObjectNotFound && !deleting.contains(objectId) &&
+                tx.txd.allocatingObjects.contains(objectId) then
+                tx.allocationLoaded(objectId)
+              else
+                tx.objectLoadFailed(objectId, err)
+            }
 
             case SnapshotRead(_, p) => p.success(RepairSnapshot.missing(objectId))
 

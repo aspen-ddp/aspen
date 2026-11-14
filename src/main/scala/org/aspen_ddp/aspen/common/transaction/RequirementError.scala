@@ -33,6 +33,11 @@ case class StaleObjectState() extends RequirementError
   */
 case class BackendCommitFailed() extends RequirementError
 
+/** A transaction allocates an object this store already holds (in memory or in its backend): a replayed allocation,
+  * which must not overwrite the live object (transaction-requirements F11). Purely local, like RequirementCheckFailure.
+  */
+case class ObjectExists() extends RequirementError
+
 /** A transaction prepared on this store only by store-side drivers (TxPrepare.fromClient = false) got no client
   * prepare within Frontend.missingDataWait. A driver's prepare never gathers a fresh commit vote (prefer-abort), so
   * the store votes abort without checking the requirements. Purely local, like RequirementCheckFailure.

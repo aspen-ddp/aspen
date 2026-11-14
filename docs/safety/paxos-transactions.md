@@ -1321,7 +1321,8 @@ Nacks (extra rounds under contention).
 > or the other acceptors answers first decides between late and normal. Fresh Txs made by a concurrently replayed client
 > prepare (which carries data) then apply on a non-late commit (`Tx.scala:916-919`), re-checked only by their own
 > requirements: per-write checked writes are skipped, pin-only blind writes, `DoesNotExist` inserts after a later delete
-> and allocations (whose `Allocating` state is built without a backend read, transaction-requirements F11) are applied.
+> and allocations of an id whose deletion has persisted are applied. An allocation over a live object is refused
+> since 2026-11-14 (`ObjectExists`, transaction-requirements F11).
 > Fresh Txs made by the recovering store's own data-less prepares cannot apply data and only report errors, which marks
 > every store again (extra repair). Needs an acceptor offline past the cache window holding T's accepted commit, and a
 > replayed client prepare during its recovery.

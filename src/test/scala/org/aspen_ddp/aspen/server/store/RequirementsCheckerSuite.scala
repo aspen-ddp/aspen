@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, SetMax, SetRight, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, KeyTimestampError, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, MissingObject, RequirementCheckFailure, RequirementError, ExclusiveRevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, AppendMismatch, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, KeyTimestampError, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, ObjectExists, RefcountMismatch, RefcountUpdate, MissingObject, RequirementCheckFailure, RequirementError, ExclusiveRevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, AppendMismatch, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -1364,5 +1364,35 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     blindInsertAbsent(tx1).lock(objects)
     blindInsertAbsent(tx2).unlock(objects)
     objects(oid1).lockedWriteTransactions shouldBe Set(tx1)
+  }
+
+  test("every requirement on an allocated object the store already holds fails with ObjectExists (Req F11)") {
+    val (o1, o2) = mkobjs()
+    // Refcount and revision as a never-revised allocation leaves them: the requirements alone would pass
+    o1.metadata = Metadata(ObjectRevision.Allocating, ObjectRefcount.Allocating, ts1)
+    val reqs = List(
+      RefcountUpdate(p1, ObjectRefcount.Allocating, ObjectRefcount.Default),
+      DataUpdate(p1, ObjectRevision.Allocating, DataUpdateOperation.Overwrite),
+      DataUpdate(p2, rev2, DataUpdateOperation.Overwrite))
+    val objects = HashMap(oid1 -> o1, oid2 -> o2)
+    val updates = HashMap(oid1 -> DataBuffer(Array[Byte](1)), oid2 -> DataBuffer(Array[Byte](2)))
+    RequirementsChecker.check(tx1, HLCTimestamp.now, reqs, objects, updates)._1 shouldBe empty
+    RequirementsChecker.check(tx1, HLCTimestamp.now, reqs, objects, updates, allocatedOver = Set(oid1))._1 shouldBe
+      Map(oid1 -> ObjectExists())
+
+    val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, reqs, objects, updates, allocatedOver = Set(oid1))
+    result.uncommittable shouldBe Set(oid1)
+    o1.metadata.revision shouldBe ObjectRevision.Allocating
+    o2.metadata.revision shouldBe ObjectRevision(tx1)
+  }
+
+  test("an allocated object the store holds at the transaction's own revision counts as already applied") {
+    val (o1, _) = mkobjs()
+    o1.metadata = Metadata(ObjectRevision(tx1), ObjectRefcount.Default, ts1)
+    val reqs = List(RefcountUpdate(kp1, ObjectRefcount.Allocating, ObjectRefcount.Allocating))
+    RequirementsApplyer.appliedBy(tx1, reqs, HashMap(oid1 -> o1)) shouldBe empty
+    RequirementsApplyer.appliedBy(tx1, reqs, HashMap(oid1 -> o1), allocatedOver = Set(oid1)) shouldBe Set(oid1)
+    o1.metadata = Metadata(rev1, ObjectRefcount.Default, ts1)
+    RequirementsApplyer.appliedBy(tx1, reqs, HashMap(oid1 -> o1), allocatedOver = Set(oid1)) shouldBe empty
   }
 }

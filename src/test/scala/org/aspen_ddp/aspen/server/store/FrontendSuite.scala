@@ -1870,7 +1870,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     * or answers with `readError`. Records its fail-stops
     */
   def recoveredVote(stored: ObjectState, readError: Option[ReadError.Value] = None,
-                    frozen: Boolean = false): (Frontend, TestNet, () => List[Throwable]) =
+                    frozen: Boolean = false,
+                    txd: TransactionDescription = lockTxd(txid1, List(overwrite(op1))))
+      : (Frontend, TestNet, () => List[Throwable]) =
     val backend = new MapBackend(storeId):
       private var failNext = readError
       private var handler: Option[CompletionHandler] = None
@@ -1885,7 +1887,6 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         case None => super.read(pointer)
     backend.bootstrapAllocate(stored.objectId, stored.objectType, stored.metadata, stored.data)
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
-    val txd = lockTxd(txid1, List(overwrite(op1)))
     val trs = TransactionRecoveryState(storeId, txd.serialize(), List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))),
       TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial)
     val crl = new TestCrl:
@@ -3192,6 +3193,104 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     cache.get(newPtr.id) shouldBe None
     cache.sizeInBytes shouldBe 0
+  }
+
+  // ---- Replayed allocations (transaction-requirements F11, cross-document X11) ----
+
+  /** txid's allocation of the data object `ptr`, as TransactionBuilder makes it */
+  def allocateData(txid: TransactionId, ptr: DataObjectPointer): TransactionDescription =
+    lockTxd(txid, List(
+      RefcountUpdate(ptr, ObjectRefcount.Allocating, ObjectRefcount.Default),
+      DataUpdate(ptr, ObjectRevision.Allocating, DataUpdateOperation.Overwrite))).copy(
+      allocatingObjects = Set(ptr.id))
+
+  test("an allocation of an object the store does not hold votes commit and applies") {
+    val (frontend, backend, net) = lockFixture()
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 31)), poolId, Array[Byte]())
+    prepare(frontend, net, allocateData(txid1, newPtr)).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    val stored = backend.get(newPtr.id).get
+    stored.metadata.revision shouldBe ObjectRevision(txid1)
+    stored.metadata.refcount shouldBe ObjectRefcount.Default
+    stored.data.getByteArray shouldBe Array[Byte](1)
+  }
+
+  test("a replayed allocation over a live object in the backend votes abort, and its commit leaves the object alone") {
+    val (frontend, backend, net, stops) = failStopFixture()
+    prepare(frontend, net, allocateData(txid1, op1)).disposition shouldBe TransactionDisposition.VoteAbort
+    // Committed by stores that still voted on a fresh state: this store applies nothing, and reports the object
+    resolve(frontend, net, txid1, committed = true)
+    val stored = backend.get(oid1).get
+    stored.metadata.revision shouldBe rev0
+    stored.metadata.refcount shouldBe ObjectRefcount(1, 1)
+    stored.data.size shouldBe 0
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
+    stops() shouldBe Nil
+    // The live object is still usable
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("a replayed allocation over a cached live object votes abort") {
+    val (frontend, backend, net) = lockFixture()
+    frontend.readObjectForNetwork(clientId, new UUID(1, 31), op1, FullObject())
+    net.clientMessage().isDefined shouldBe true
+    prepare(frontend, net, allocateData(txid1, op1)).disposition shouldBe TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid1, committed = true)
+    backend.get(oid1).get.metadata.revision shouldBe rev0
+  }
+
+  test("a replayed KV allocation over a never-revised live KV object votes abort, which its requirements alone allow") {
+    // A KV allocation is a KeyValueUpdate with no required revision and a RefcountUpdate from Allocating to the
+    // default initial refcount, (0,1), which is Allocating too. A KV object that only blind updates touched since its
+    // allocation keeps revision Allocating and refcount (0,1): every requirement of the replay holds on it
+    val (frontend, backend, net) = lockFixture()
+    val live = mkKVObjectState()
+    backend.bootstrapAllocate(oid2, live.objectType,
+      Metadata(ObjectRevision.Allocating, ObjectRefcount.Allocating, HLCTimestamp(1)), live.data)
+    val txd = lockTxd(txid1, List(
+      KeyValueUpdate(kvPtr, None, None, Nil),
+      RefcountUpdate(kvPtr, ObjectRefcount.Allocating, ObjectRefcount.Allocating))).copy(
+      allocatingObjects = Set(oid2))
+    val initial = KeyValueOperation.encode(List(new Insert(k(9), Array[Byte](9))), ida)(0)
+    prepare(frontend, net, txd, initial).disposition shouldBe TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid1, committed = true)
+    kvKeys(backend) shouldBe Set(k(1), k(2), k(3))
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid2))
+  }
+
+  test("an allocation over an object whose deletion is in flight votes abort") {
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
+    val delete = RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 0))
+    prepare(frontend, net, lockTxd(txid1, List(delete))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+    frontend.receiveTransactionMessage(mkPrepare(allocateData(txid2, op1), fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
+    backend.deliverCommits()
+    votes(net).filter(_.transactionId == txid2).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+    resolve(frontend, net, txid2, committed = true)
+    backend.get(oid1) shouldBe None
+  }
+
+  test("a replayed allocation reaching a late commit at a store holding its entry applies nothing (X11 step 3)") {
+    val (frontend, backend, net, _, lookup) = lateFixture()
+    frontend.receiveTransactionMessage(clientPrepare(allocateData(txid1, op1)))
+    expectVote(net, TransactionDisposition.VoteAbort)
+    lateCommit(frontend, finalized = true)
+    // An abort voter applies no late commit: it makes no lookup, and its entry stays for the repair scan
+    lookup.requests shouldBe Nil
+    frontend.transactions.contains(txid1) shouldBe false
+    backend.get(oid1).get.metadata.revision shouldBe rev0
+    backend.get(oid1).get.data.size shouldBe 0
+  }
+
+  test("a recovered allocating commit vote whose update the backend already holds neither reports nor fail-stops") {
+    val applied = mkObjectState(oid1)
+    applied.metadata = Metadata(ObjectRevision(txid1), ObjectRefcount.Default, HLCTimestamp(1))
+    val (frontend, net, stops) = recoveredVote(applied, txd = allocateData(txid1, op1))
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+    stops() shouldBe Nil
   }
 
   test("a pinned state counts toward the store's bytes") {

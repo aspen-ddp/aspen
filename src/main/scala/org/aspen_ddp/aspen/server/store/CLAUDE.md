@@ -17,6 +17,12 @@
   is the max of its value and the transaction's. No tombstones, so `TransactionBuilder` refuses blind key deletes
   and blind object-level ops (`BlindKeyValueWrite`). Residual: a late or replayed Insert after a later delete of its
   key resurrects it, like a `DoesNotExist` ABA (Todo 2.9)
+- Allocations (transaction-requirements F11): an object in `txd.allocatingObjects` is loaded like any other (cache,
+  `deleting`, backend read). Only a backend miss gives the fresh `Allocating` state (`Tx.allocationLoaded`). An
+  existing state goes into `Tx.allocatedOver`, and every requirement on it fails with `ObjectExists`, at vote and at
+  the apply re-check, so a replayed allocation never overwrites a live object. `appliedBy` counts such an object at
+  T's own revision as applied. Residual: no tombstones, so an id whose deletion has persisted can be allocated again
+  (an orphan slice, Todo 2.9)
 - A prepare that reaches a store after its transaction was finalized is not applied there: the store relies on
   missed-update repair. A collision is an ordinary abort vote, even with an already-completed transaction, except
   one with a lock holder the transaction is built on (it requires the revision the holder writes): the store then

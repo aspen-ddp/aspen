@@ -258,6 +258,10 @@ Fix sketch: as R-N1; and have an allocating update fail at apply when the backen
 > reconciled from the majority. The end-to-end form of steps 1-3 (with a `DoesNotExist` insert instead of an
 > allocation) is ReplayIntegrationSuite's headline test, which now passes. The `Allocating` state is unchanged, so the
 > overwrite remains wherever a commit does reach a stubless store.
+> **Refresh 2026-11-14 (Todo 2.3): the allocation leg is CLOSED for live objects.** An allocation reads the store
+> first and refuses an object the store holds (`ObjectExists`, requirements F11), so step 3 applies nothing for an
+> allocation. What remains of X11 is T's other unpinned writes (blind or `replaySafe` writes, ABA-prone
+> `DoesNotExist` inserts) and an allocation whose object was deleted, which comes back as an orphan slice (Todo 2.9).
 
 ### X12. Recovering acceptor x replay x finalization re-run (paxos P-N3 x recovery R-N6 x requirements Q-N5)
 Verdict: PLAUSIBLE.  Severity: resurrection (blind writes), stale-replica (orphan allocation entries, regressed marks).

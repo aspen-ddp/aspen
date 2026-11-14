@@ -1015,7 +1015,9 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > entry (`Tx.scala:926-930`), finds it and applies T's write again (`:1003-1004`). With entries at a write threshold of
 > a blind-written object's stores, a newer committed value of that key is overwritten at a quorum; the entries'
 > reconcile then reads the regressed state and deletes them. For an allocation the re-apply overwrites the live object
-> (transaction-requirements F11, cross-document X11). Needs a quorum of late acknowledgements, a pin-only blind write
+> (transaction-requirements F11, cross-document X11; *2026-11-14:* no longer, since an allocation over an object the
+> store holds votes abort and applies nothing (`ObjectExists`); an allocation whose object was deleted still comes
+> back as an orphan slice). Needs a quorum of late acknowledgements, a pin-only blind write
 > (TKVL writes are checked), and a replay before the scans.
 > *Ruling 32 (documentation corrected, no closure implemented; the user chooses):* the exposed write classes are exactly
 > T's writes in a pool where T has no pin of its own: blind or `replaySafe` writes, ABA-prone `DoesNotExist` inserts

@@ -6,12 +6,15 @@ import org.aspen_ddp.aspen.common.network.{TransactionFinalized, TransactionReso
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContext, Future}
 
 class TransactionManager(val client: AspenClient,
                          defaultDriverFactory: ClientTransactionDriver.Factory) {
 
   private var transactions = Map[TransactionId, ClientTransactionDriver]()
+
+  /** The transactions whose drivers have not concluded */
+  private[transaction] def pending: Set[TransactionId] = synchronized { transactions.keySet }
 
   def shutdown(): Unit = synchronized {
     transactions.values.foreach(_.shutdown())
@@ -27,9 +30,18 @@ class TransactionManager(val client: AspenClient,
       transactions += (txd.transactionId -> td)
     }
 
+    // Forgotten however the driver concludes: an outcome it hears (receive), or one it reaches itself, as Unknown once
+    // past the horizon, which no message would ever remove
+    td.result.onComplete(_ => forget(txd.transactionId, td))(using ExecutionContext.parasitic)
+
     td.begin()
 
     td.result
+  }
+
+  private def forget(txid: TransactionId, td: ClientTransactionDriver): Unit = synchronized {
+    if (transactions.get(txid).exists(_ eq td))
+      transactions -= txid
   }
 
   def receive(resolved: TransactionResolved): Unit = {

@@ -476,6 +476,20 @@ class TestNetwork(executionContext: ExecutionContext,
           else
             recovery.create(ec, storeId, messenger, driverTimers, txd, finalizerFactory)
 
+  /** The stores any host of this network has loaded */
+  private var everLoaded: Set[StoreId] = Set()
+
+  /** A store's first load is of a new store, which has never served, so there is nothing it could have forgotten: it
+    * records no load time (Frontend.loadedAt) and joins transactions at once, as a store a host creates does
+    * (StoreLoader). Every later load of it (restartStore, moveStore) records its load, as a real reload does
+    */
+  private def storeLoadedAt(storeId: StoreId): Option[Long] = synchronized:
+    if everLoaded.contains(storeId) then
+      None
+    else
+      everLoaded += storeId
+      Some(0L)
+
   val smgr = new Host(
     client,
     HostId.BootstrapHostId,
@@ -493,7 +507,7 @@ class TestNetwork(executionContext: ExecutionContext,
     Duration(60, SECONDS),
     // Its stores are loaded directly (below), onto a device it never loads
     seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
-      missingDataWait = hostOptions.missingDataWait),
+      missingDataWait = hostOptions.missingDataWait, storeLoadedAt = storeLoadedAt),
     transactionHorizon = hostOptions.transactionHorizon)
 
   // Stands in for each store's StoreConfig.effectiveMaxSliceSize, which Host reads from the store config file
@@ -534,6 +548,14 @@ class TestNetwork(executionContext: ExecutionContext,
       clientDrivers = live ++ clientDrivers
     handleEvents()
 
+  /** Whether a transaction started now is at or above the load floor of store `storeId` (Frontend.forgetFloorMillis:
+    * its load plus MaxStartLead), so the store joins it: a store refuses every transaction it does not hold that
+    * started within MaxStartLead after it loaded, since it may have joined and forgotten one before
+    */
+  def loadFloorPassed(storeId: StoreId): Boolean =
+    hostFor(storeId).control.router.loaded.get(storeId).exists: s =>
+      System.currentTimeMillis() >= s.frontend.loadedAtMillis + Frontend.MaxStartLead.toMillis
+
   private var hostsBuilt = 0
 
   /** Another lockstep host like the bootstrap one (the same HostOptions and CRL), serving no store yet: moveStore. Its
@@ -545,7 +567,7 @@ class TestNetwork(executionContext: ExecutionContext,
       new LockstepThreading(executionContext), objectCacheFactory, this, BackgroundTaskManager.NoBackgroundTaskManager,
       TestCRL, FinalizerFactory, txDriverFactory, hostOptions.heartbeatPeriod, Duration(60, SECONDS),
       seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
-        missingDataWait = hostOptions.missingDataWait),
+        missingDataWait = hostOptions.missingDataWait, storeLoadedAt = storeLoadedAt),
       transactionHorizon = hostOptions.transactionHorizon)
 
   /** Serves store `backend` on `to` from now on: a new Store there recovers its transactions from `crl`, as a store

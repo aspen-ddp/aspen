@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{Host, StoreConfig}
 import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
-import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
+import org.aspen_ddp.aspen.server.store.{Frontend, ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler, FsifConfig}
 import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifRecovery}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -125,13 +125,21 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
   private def deviceEntries: Future[Map[StoreId, StorageDeviceState.StoreEntry]] =
     client.getStorageDeviceState(deviceId).map(_.stores.filter((s, _) => s.poolId == poolId))
 
+  /** Whether `storeId`, served by the current host, joins transactions started from now on: a store refuses every
+    * transaction it does not hold that started before its load plus MaxStartLead (Frontend.forgetFloorMillis). A
+    * store the host created joins at once; one it loaded again, after a restart or a rebuild, only then
+    */
+  private def joinsNewTransactions(storeId: StoreId): Boolean =
+    host.control.router.loaded.get(storeId).exists: s =>
+      System.currentTimeMillis() >= s.frontend.loadedAtMillis + Frontend.MaxStartLead.toMillis
+
   /** Every store of the pool is Active on the device and served by the current host */
   private def awaitStoresServed(): Future[Unit] =
     awaitCondition("every FSIF store to be Active and served"):
       deviceEntries.map: entries =>
         entries.size == ida.width &&
           entries.values.forall(_.status == StorageDeviceState.StoreStatus.Active) &&
-          storeIds.forall(host.containsStore)
+          storeIds.forall(host.containsStore) && storeIds.forall(joinsNewTransactions)
 
   /** Waits until `storeId` is Active and served again, and returns whether its entry was seen Rebuilding on the
     * way: the reconcile flips a lost store's entry to Rebuilding before its rebuild starts.
@@ -143,7 +151,8 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
         val status = entries.get(storeId).map(_.status)
         if status.contains(StorageDeviceState.StoreStatus.Rebuilding) then
           sawRebuilding = true
-        status.contains(StorageDeviceState.StoreStatus.Active) && host.containsStore(storeId)
+        status.contains(StorageDeviceState.StoreStatus.Active) && host.containsStore(storeId) &&
+          joinsNewTransactions(storeId)
     .map(_ => sawRebuilding)
 
   // ---- Setup ------------------------------------------------------------------------------------------------

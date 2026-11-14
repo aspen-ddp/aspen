@@ -271,10 +271,11 @@ class HorizonIntegrationSuite extends IntegrationTestSuite:
     for
       x <- allocateX()
       xBefore <- client.read(x)
-      // The late store on a host of its own, so its status cache knows nothing of T. It is loaded before T starts, so
-      // T is above its forget floor until the horizon
+      // The late store on a host of its own, so its status cache knows nothing of T. T starts once the store's load
+      // plus MaxStartLead has passed, so T is above its forget floor until the horizon
       other = net.newHost()
       _ <- pump(net.moveStore(net.stores(late), other, closeFirst = true), clock = false)
+      _ <- eventually("the late store passed its load floor", clock = false)(net.loadFloorPassed(sid(late)))
       // T: a pinned overwrite of x, which commits and is finalized without the late store ever hearing of it. It is
       // reported offline meanwhile, so it does not lead
       tx = client.newTransaction()
@@ -376,6 +377,8 @@ class HorizonIntegrationSuite extends IntegrationTestSuite:
       xBefore <- client.read(x)
       first = net.newHost()
       _ <- pump(net.moveStore(net.stores(moved), first, closeFirst = true), clock = false)
+      // T starts once store 4 joins new transactions there
+      _ <- eventually("store 4 passed its load floor", clock = false)(net.loadFloorPassed(sid(moved)))
       (t, prepares) <- commitRecorded(x, xBefore.revision)
       prepare = prepares.filter(_.to == sid(moved))
       _ = withClue("store 4 committed T and forgot it; its host remembers the outcome: "):

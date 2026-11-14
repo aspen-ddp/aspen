@@ -434,6 +434,15 @@ class StoreRepairerSuite extends IntegrationTestSuite:
 
   private def deadline(): Long = System.nanoTime() + Duration(30, SECONDS).toNanos
 
+  /** Completes once store `i` joins transactions started from now on (TestNetwork.loadFloorPassed), draining events */
+  private def untilLoadFloorPassed(i: Int, until: Long = deadline()): Future[Unit] =
+    if net.loadFloorPassed(net.stores(i).storeId) then
+      Future.unit
+    else if System.nanoTime() > until then
+      Future.failed(new AssertionError(s"store $i never passed its load floor"))
+    else
+      Future { Thread.sleep(1); net.handleEvents() }.flatMap(_ => untilLoadFloorPassed(i, until))
+
   /** Completes once no host has transactions, draining the host's events meanwhile. Finalization actions, the
     * errorTree marks among them, need events drained after their last message
     */
@@ -943,6 +952,8 @@ class StoreRepairerSuite extends IntegrationTestSuite:
             id -> new org.aspen_ddp.aspen.server.store.ObjectState(id, os.metadata, os.objectType, os.data)
       _ <- pump(net.restartStore(net.stores(2)), deadline())
       _ <- settle()
+      // The repair pass's transactions start once the restarted store joins new ones
+      _ <- untilLoadFloorPassed(2)
       rebuilt = Map(kvPtr.id -> stored(2, kvPtr.id).map(_.metadata), dataPtr.id -> stored(2, dataPtr.id).map(_.metadata))
       result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
       remaining <- unackedEntries(2)

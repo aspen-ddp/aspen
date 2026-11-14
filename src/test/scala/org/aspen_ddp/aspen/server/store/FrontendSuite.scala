@@ -1012,10 +1012,11 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
     val crl = new TestCrl
-    // Loaded when its acceptor started, as a store is once its rebuild finishes
+    // Loaded MaxStartLead before its acceptor started, so the load's floor (the load plus MaxStartLead) is the
+    // acceptor's start: older transactions meet the acceptor's mute, newer ones neither
     val since = ago(FiniteDuration(2, SECONDS))
     val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache,
-      acceptorSince = Some(since), loadedAt = Some(since.wallTime))
+      acceptorSince = Some(since), loadedAt = Some(since.wallTime - Frontend.MaxStartLead.toMillis))
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
     f(frontend, backend, net, crl)
@@ -1172,7 +1173,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("a store votes on a transaction started ahead of its clock by less than MaxStartLead") {
-    withPlainFrontend(): (frontend, _, net) =>
+    // Loaded long ago: a store loaded within MaxStartLead before the start refuses it (forgetFloorMillis)
+    withPlainFrontend(loadedAt = FrontendSuite.longLoaded): (frontend, _, net) =>
       val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ahead(FiniteDuration(1, SECONDS)))
       frontend.receiveTransactionMessage(clientPrepare(txd))
 
@@ -1209,7 +1211,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   // ---- The forget floor (Frontend.forgetFloorMillis) ----
   //
   // A store refuses a prepare for a transaction it does not hold, and whose outcome the status cache does not know,
-  // that started below its floor: the horizon before now, the store's load, or the status cache's eviction watermark.
+  // that started below its floor: the horizon before now, the store's load plus MaxStartLead, or the status cache's
+  // eviction watermark.
   // No Tx, no promise, no vote, no reply. A fixed injected clock keeps these deterministic
 
   private val floorNow = 1_000_000_000_000L
@@ -1264,6 +1267,36 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.transactions.contains(txid1) shouldBe false
       net.sentTx shouldBe empty
       crl.txSaved shouldBe false
+  }
+
+  // Before its load the store may have joined, and forgotten, a transaction started up to MaxStartLead ahead of its
+  // clock: the load raises the floor to the load plus the lead
+  private val lead: Long = Frontend.MaxStartLead.toMillis
+
+  test("a prepare for an unknown transaction started inside MaxStartLead after the store loaded is refused") {
+    val loaded = floorNow - 500
+    for start <- List(loaded + 1, loaded + lead / 2, loaded + lead - 1) do
+      withFloorFrontend(loadedAt = loaded): (frontend, _, net, crl) =>
+        val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp(start << 16))
+        frontend.forgetFloorMillis shouldBe loaded + lead
+        frontend.receiveTransactionMessage(clientPrepare(txd))
+
+        withClue(s"started ${start - loaded} ms after the load: "):
+          frontend.transactions.contains(txid1) shouldBe false
+          net.sentTx shouldBe empty
+          crl.txSaved shouldBe false
+  }
+
+  test("a prepare for an unknown transaction started MaxStartLead or more after the store loaded is answered") {
+    val loaded = floorNow - lead - 500
+    for start <- List(loaded + lead, loaded + lead + 1) do
+      withFloorFrontend(loadedAt = loaded): (frontend, _, net, crl) =>
+        val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp(start << 16))
+        frontend.receiveTransactionMessage(clientPrepare(txd))
+
+        withClue(s"started ${start - loaded} ms after the load: "):
+          votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+          crl.txSaved shouldBe true
   }
 
   test("a prepare below the eviction watermark is refused") {

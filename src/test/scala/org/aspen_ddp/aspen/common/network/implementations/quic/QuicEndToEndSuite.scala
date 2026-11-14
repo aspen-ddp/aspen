@@ -7,7 +7,11 @@ import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.network.NetworkPlugin
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key}
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
+import org.aspen_ddp.aspen.server.Host
+import org.aspen_ddp.aspen.server.store.Frontend
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -91,6 +95,7 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
           network shouldBe a [QuicNet]
           network.asInstanceOf[QuicNet].eventLoopsForTests.size shouldBe 1 // a client command's single loop
           network.startIoThread(client)
+          awaitLoadFloors(host.host)
           fn(client)
         finally
           stopClient(client, network)
@@ -98,6 +103,24 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
         host.stop()
     finally
       os.remove.all(tmp)
+
+  /** Waits until the bootstrap pool's stores are loaded and join transactions started from now on. A store refuses
+    * every transaction it does not hold that started before its load plus MaxStartLead (Frontend.forgetFloorMillis),
+    * and on this single host every store of the pool would refuse it: the client would give up only past the horizon
+    */
+  private def awaitLoadFloors(host: Host): Unit =
+    val bootstrapStores = (0 until 3).map(i => StoreId(PoolId.BootstrapPoolId, i.toByte))
+    val deadline = System.nanoTime() + Timeout.toNanos
+    def floor: Option[Long] =
+      val loaded = bootstrapStores.flatMap(host.control.router.loaded.get)
+      if loaded.size == bootstrapStores.size then
+        Some(loaded.map(_.frontend.loadedAtMillis).max + Frontend.MaxStartLead.toMillis)
+      else
+        None
+    while !floor.exists(System.currentTimeMillis() >= _) do
+      if System.nanoTime() > deadline then
+        fail("the bootstrap pool's stores never passed their load floors")
+      Thread.sleep(10)
 
   private def stopClient(client: AspenClient, network: NetworkPlugin): Unit =
     network.shutdown(Duration.Zero)

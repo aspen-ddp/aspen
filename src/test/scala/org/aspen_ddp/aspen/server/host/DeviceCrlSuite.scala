@@ -22,6 +22,7 @@ import org.aspen_ddp.aspen.server.crl.simple.{Recovery, SimpleCRL}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome,
   TransferOutcome}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.store.Frontend
 import org.aspen_ddp.aspen.server.store.backend.{Backend, DefaultBackendOpener, RocksDBConfig}
 import org.aspen_ddp.aspen.server.RecordingRebuildFactory
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
@@ -227,10 +228,10 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
   private def overwriteTxd(id: TransactionId, leader: Byte, pool: PoolId = poolId): TransactionDescription =
     val p = DataObjectPointer(oid, pool, Array[Byte]())
-    // A few ms ahead of now, so it starts after the stores this host loaded before it was built, even within their
-    // load millisecond (Frontend.loadedAt: a store refuses a transaction started before its load). Well inside
-    // MaxStartLead
-    val start = HLCTimestamp(HLCTimestamp.now.asLong + (5L << 16))
+    // MaxStartLead ahead of the host's clock now: no earlier than the forget floor of the stores this host loaded
+    // before it was built (Frontend.forgetFloorMillis: a store refuses a transaction started before its load plus
+    // MaxStartLead), and never further ahead of the host's clock than MaxStartLead, so not muted
+    val start = HLCTimestamp((System.currentTimeMillis() + Frontend.MaxStartLead.toMillis) << 16)
     TransactionDescription(id, start, p, leader,
       List(DataUpdate(p, rev0, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida, Map(pool -> ida))
 

@@ -81,7 +81,11 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           /** How long the stores' Txs wait for a client's prepare (Frontend.missingDataWait) */
                           val missingDataWait: Duration = Frontend.MissingDataWait,
                           /** How long after its start the stores join a transaction (Frontend.horizon) */
-                          val transactionHorizon: FiniteDuration = TransactionHorizon.Horizon):
+                          val transactionHorizon: FiniteDuration = TransactionHorizon.Horizon,
+                          /** The load time a store being loaded records (Frontend.loadedAt), by store. None: now. A
+                            * test seam (Host.Seams.storeLoadedAt)
+                            */
+                          val storeLoadedAt: StoreId => Option[Long] = _ => None):
   given ExecutionContext = threading.control
 
   lazy val router: StoreRouter = new StoreRouter(this)

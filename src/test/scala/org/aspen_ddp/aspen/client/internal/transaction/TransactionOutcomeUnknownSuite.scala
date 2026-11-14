@@ -30,6 +30,10 @@ class TransactionOutcomeUnknownSuite extends IntegrationTestSuite:
   /** Commits one refcount-pin transaction whose driver concludes with `outcome`, returning the failure and the
     * transactions the client's status cache heard of */
   private def commitWith(outcome: ClientOutcome): Future[(Throwable, List[TransactionId])] =
+    commitWithManager(outcome).map((err, recorded, _) => (err, recorded))(using executionContext)
+
+  /** As commitWith, with the TransactionManager that ran the transaction */
+  private def commitWithManager(outcome: ClientOutcome): Future[(Throwable, List[TransactionId], TransactionManager)] =
     given ExecutionContext = executionContext
     val cache = new RecordingCache
     val pools = net.client
@@ -49,12 +53,17 @@ class TransactionOutcomeUnknownSuite extends IntegrationTestSuite:
       _ = tx.setRefcount(radicle, before.refcount, before.refcount.increment())
       err <- tx.commit().failed
     yield
-      (err, cache.recorded)
+      (err, cache.recorded, txm)
 
   atest("an Unknown outcome fails commit with TransactionOutcomeUnknown and records nothing in the client status cache"):
     commitWith(ClientOutcome.Unknown).map: (err, recorded) =>
       err shouldBe a[TransactionOutcomeUnknown]
       recorded should be(Nil)
+
+  atest("a driver that concludes Unknown is forgotten by its TransactionManager"):
+    commitWithManager(ClientOutcome.Unknown).map: (err, _, txm) =>
+      err shouldBe a[TransactionOutcomeUnknown]
+      txm.pending should be(Set())
 
   atest("an Aborted outcome still fails commit with TransactionAborted and is recorded"):
     commitWith(ClientOutcome.Aborted).map: (err, recorded) =>

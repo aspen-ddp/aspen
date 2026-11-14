@@ -16,7 +16,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.server.store.Store
+import org.aspen_ddp.aspen.server.store.{Frontend, Store}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 
@@ -55,9 +55,12 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
 
   private val ida = Replication(3, 2)
 
-  /** Started now: a prepare made after the store loads is inside its forget floor (Frontend.forgetFloorMillis) */
+  /** Started MaxStartLead ahead of the host's clock now: a prepare made after the store loads is at or above its
+    * forget floor (Frontend.forgetFloorMillis: the load plus MaxStartLead), and not muted as too far ahead
+    */
   private def overwriteTxd(id: TransactionId, leader: Byte): TransactionDescription =
-    TransactionDescription(id, HLCTimestamp(System.currentTimeMillis() << 16), ptr, leader,
+    TransactionDescription(id, HLCTimestamp((System.currentTimeMillis() + Frontend.MaxStartLead.toMillis) << 16), ptr,
+      leader,
       List(DataUpdate(ptr, rev0, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida, Map(poolId -> ida))
 
   /** The store's backend holding the object, with no crl_save.log */

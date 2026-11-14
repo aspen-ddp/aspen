@@ -148,7 +148,10 @@ object Host:
                          wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None,
                          /** How long the stores' Txs wait for a client's prepare (Frontend.missingDataWait), for
                           *  tests that would otherwise wait the full default in real time */
-                         missingDataWait: Duration = Frontend.MissingDataWait)
+                         missingDataWait: Duration = Frontend.MissingDataWait,
+                         /** The load time each store loaded records (Frontend.loadedAt), for tests whose stores are
+                          *  new, with nothing they could have forgotten: None, now */
+                         storeLoadedAt: StoreId => Option[Long] = _ => None)
 
   object Seams:
     val default: Seams = Seams()
@@ -261,6 +264,7 @@ class Host(val client: AspenClient,
     writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker),
     unackedLookup = seams.wrapUnackedLookup.fold(unackedLookup)(wrap => wrap(unackedLookup)),
     missingDataWait = seams.missingDataWait,
+    storeLoadedAt = seams.storeLoadedAt,
     transactionHorizon = transactionHorizon)
 
   private val shutdownPromise: Promise[Unit] = Promise()

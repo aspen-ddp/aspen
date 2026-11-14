@@ -48,6 +48,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // says whether the store was opened at any point in between, even if closed again since
   private var openCounts: Map[StoreId, Long] = Map()
 
+  // Stores whose backend this process created (startOpen with `create`: a new pool's store, StoreRebuilds.createNewStore),
+  // from their open until their Store is built. Such a store has never served, so it cannot have joined and forgotten a
+  // transaction: it records no load time (Frontend.loadedAt), and joins transactions started at once. Every other load
+  // (a restart, an adoption, a transfer in) records its load, which raises its forget floor
+  private var newStores: Set[StoreId] = Set()
+
   /** SpaceRetryCap in device scans, at least 1 */
   private val spaceRetryCapScans: Int =
     val period = ctx.deviceScanPeriod
@@ -183,6 +189,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         backend.close()
         created.foreach(_.tryFailure(new IllegalStateException(s"store $storeId was opened but not served")))
       case Success(backend) =>
+        if create then
+          newStores += storeId
         val served = serveOpened(sds, storeCfg, storePath, backend)
         created.foreach(_.completeWith(served))
         servedCallback = onServed
@@ -269,6 +277,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   def handleLoad(e: LoadStore): Unit =
     val LoadStore(storageDeviceId, backend, maxSliceSize, p) = e
+    // Taken whatever this load's outcome: a later load of the store is not its first
+    val isNew = newStores.contains(backend.storeId)
+    newStores -= backend.storeId
     // The save file is read before the Store exists: a store whose CRL state cannot be
     // recovered must never serve, not even briefly.
     val failed = backend.hasFailed
@@ -341,6 +352,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 deferRecovery = true,
                 missingDataWait = ctx.missingDataWait,
                 horizon = ctx.transactionHorizon,
+                loadedAt = if isNew then Some(0L) else ctx.storeLoadedAt(storeId),
                 heartbeatPeriod = FiniteDuration(ctx.heartbeatPeriod.toMillis, MILLISECONDS))
               madeStore = Some(store)
               val entry = new StoreRouter.Entry(store, executor)

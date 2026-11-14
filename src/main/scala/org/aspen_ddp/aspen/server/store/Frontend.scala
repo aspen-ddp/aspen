@@ -128,10 +128,13 @@ class Frontend(val storeId: StoreId,
     * holds a Tx for it, and the host's status cache may have dropped its entry. Joining afresh could then decide it
     * again, against its outcome. The floor is the latest of: the horizon before now (the status cache outlasts it, so
     * an entry expires only once its transaction is below it); the store's load on this host (a restart, or a transfer
-    * from a host whose cache this one lacks); and the status cache's eviction watermark (an entry dropped for size)
+    * from a host whose cache this one lacks) plus MaxStartLead, since before its load the store may have joined, and
+    * forgotten, a transaction started up to MaxStartLead ahead of its host's clock; and the status cache's eviction
+    * watermark (an entry dropped for size, which adds the lead the same way)
     */
   def forgetFloorMillis: Long =
-    math.max(math.max(wallClockMillis() - horizon.toMillis, loadedAtMillis), statusCache.evictionWatermarkMillis)
+    math.max(math.max(wallClockMillis() - horizon.toMillis, loadedAtMillis + MaxStartLead.toMillis),
+      statusCache.evictionWatermarkMillis)
 
   /** The transaction started below the forget floor: a prepare for it, unless the store holds it or the status cache
     * knows its outcome, is refused (receivePrepare), and its designated leader does not drive it (Store)

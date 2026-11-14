@@ -1335,6 +1335,35 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       results.foreach(_.incomplete should be >= 1)
       nodeKeys(2, holder.id) should not contain key
 
+  test("a sweep after a lock deferral reconciles the whole node, not only the deferred key"):
+    // Sweep 1 defers the locked key; store 2 then misses an untracked write of another key of the same node. No
+    // entry records that miss, so sweep 2 must reconcile the whole node
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target)
+    val deferral = DeferralState()
+    val locked = buildErrorKey(1.toByte, ObjectId(new UUID(13, 1)))
+    val later = buildErrorKey(1.toByte, ObjectId(new UUID(13, 2)))
+    for
+      _ <- settle()
+      _ <- seedErrorEntry(ObjectId(new UUID(13, 0)), Array[Byte](1))
+      _ <- untrackedErrorTreeWrite(2, locked, buildErrorValue(HLCTimestamp.now, Array[Byte](1)))
+      tree <- errorTree
+      nodes <- treeNodes(tree)
+      holder = nodes.collect { case (0, ptr) if nodeKeys(0, ptr.id).contains(locked) => ptr }.head
+      _ = target.lockedKeys += holder.id -> Set(locked)
+      first <- sweep(2, repairer, deferral)
+      _ <- untrackedErrorTreeWrite(2, later, buildErrorValue(HLCTimestamp.now, Array[Byte](2)))
+      missedLater = !nodeKeys(2, holder.id).contains(later)
+      laterInHolder = nodeKeys(0, holder.id).contains(later)
+      second <- sweep(2, repairer, deferral)
+    yield
+      first.incomplete should be >= 1
+      withClue("store 2 missed the later write to the same node: "):
+        laterInHolder shouldBe true
+        missedLater shouldBe true
+      nodeKeys(2, holder.id) should contain (later)
+      second.reconciled should be >= 1
+
   test("sweeping a store of another pool is rejected"):
     val repairer = StoreRepairer(client, net.smgr)
     recoverToSucceededIf[IllegalArgumentException]:

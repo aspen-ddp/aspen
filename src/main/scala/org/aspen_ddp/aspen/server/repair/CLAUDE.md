@@ -19,7 +19,8 @@
 - `StoreRepairer.sweepBootstrapTrees` reconciles one bootstrap store's copy of every node (all tiers,
   `TieredKeyValueList.foreachNode`) of the bootstrap pool's own errorTree and unackedCommitsTree, whose writes run
   untracked so a miss leaves no entry. Each node goes through `repairUpdate` with no minimum timestamp and no proofs
-  (they would collide with marker traffic), keyed `sweepDeferralKey` (prefix 2, kept by `DeferralState.retain`;
+  (they would collide with marker traffic), always over the whole node (never only the keys a lock deferred: a later
+  missed untracked write records nothing), keyed `sweepDeferralKey` (prefix 2, kept by `DeferralState.retain`;
   pruned by `retainSweep` after a complete walk). It creates and deletes no entries; an unreadable node counts as
   incomplete. `SweepResult.needsAnotherPass` is true when anything was reconciled or left incomplete, or a walk
   missed nodes

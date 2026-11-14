@@ -409,7 +409,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * stale result, so `complete` says exactly whether the entry may be dropped. The result is recorded in `deferral`
     * under `entryKey`: a later pass reconciles only the keys deferred before, and once parts have been deferred by a
     * lock for `policy.proofAfterDeferrals` passes they are proven (RepairProofs) and, where proven, reconciled from
-    * the same read. Without `allowProof` (the bootstrap sweep) deferred parts are only retried on later passes.
+    * the same read. Without `allowProof` (the bootstrap sweep) nothing is proven and every pass
+    * reconciles the whole object.
     */
   private def repairUpdate(storeId: StoreId, ptr: ObjectPointer, minTimestamp: HLCTimestamp, entryKey: Key,
                            policy: RepairPolicy, deferral: DeferralState,
@@ -425,7 +426,9 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
 
     for
       taken <- snapshot.future
-      snap = taken.copy(only = deferral.deferredKeys(entryKey))
+      // Narrowing to the deferred keys serves proofs. Without them (the sweep) every pass reconciles the whole object:
+      // a later untracked write the store missed records nothing, so `complete` must mean the whole copy matches
+      snap = taken.copy(only = if allowProof then deferral.deferredKeys(entryKey) else None)
       // A full read: only full reads report the stores' locks
       os <- ptr match
         case kp: KeyValueObjectPointer => client.read(kp)

@@ -1,6 +1,5 @@
 package org.aspen_ddp.aspen.client
 
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
@@ -23,11 +22,7 @@ trait ReadDriverClient:
 
   def backgroundTaskManager: BackgroundTaskManager
 
-  private[client] def opportunisticRebuildManager: OpportunisticRebuildManager
-
   private[client] val messenger: Messenger
-
-  private[client] val objectCache: ObjectCache
 
   /** Not a read concern. It is here so that BaseReadDriver.noErrorRecoveryReadDriver can
    *  name the running test in its hung-read logs without threading a label through
@@ -37,8 +32,8 @@ trait ReadDriverClient:
 
 object ReadDriverClient:
 
-  /** No-op implementation for tests. Follows the convention set by Messenger.None,
-   *  ObjectCache.NoCache, and friends: every member is the existing no-op singleton
+  /** No-op implementation for tests. Follows the convention set by Messenger.None
+   *  and friends: every member is the existing no-op singleton
    *  for its type, so a test that does not care about a dependency need not name it.
    */
   class NoOp(val clientId: ClientId) extends ReadDriverClient:
@@ -49,10 +44,6 @@ object ReadDriverClient:
 
     def backgroundTaskManager: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager
 
-    private[client] def opportunisticRebuildManager: OpportunisticRebuildManager = OpportunisticRebuildManager.None
-
     private[client] val messenger: Messenger = Messenger.None
-
-    private[client] val objectCache: ObjectCache = ObjectCache.NoCache
 
     private[aspen] def getSystemAttribute(key: String): Option[String] = None

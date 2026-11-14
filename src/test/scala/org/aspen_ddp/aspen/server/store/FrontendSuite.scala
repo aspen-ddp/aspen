@@ -248,7 +248,7 @@ object FrontendSuite {
 
   def mkPrepare(txd: TransactionDescription, fromClient: Boolean): TxPrepare =
     TxPrepare(storeId, StoreId(poolId, txd.designatedLeaderUID), txd,
-      ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient)
+      ProposalId.initialProposal(txd.designatedLeaderUID), Nil, fromClient)
 
   /** Started now on the wall clock: after the Frontends built before it loaded, inside the forget floor */
   def mktxd(): TransactionDescription =

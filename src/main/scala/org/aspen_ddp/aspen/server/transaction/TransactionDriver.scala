@@ -516,7 +516,7 @@ abstract class TransactionDriver(
     val messages = ofinal match {
       case Some(result) => txd.allDataStores.map(TxResolved(_, storeId, txd.transactionId, result, isLate, proof = false))
       case None => txd.allDataStores.filter(!alreadyPrepared.contains(_)).map(to =>
-        TxPrepare(to, storeId, txd, proposalId, Nil, Nil, fromClient = false))
+        TxPrepare(to, storeId, txd, proposalId, Nil, fromClient = false))
     }
 
 //    if (messages.nonEmpty)
@@ -535,7 +535,7 @@ abstract class TransactionDriver(
 
       case None =>
         //logger.trace(s"Sending TxPrepare(${txd.transactionId}) to $toStoreId")
-        messenger.sendTransactionMessage(TxPrepare(toStoreId, storeId, txd, proposalId, Nil, Nil, fromClient = false))
+        messenger.sendTransactionMessage(TxPrepare(toStoreId, storeId, txd, proposalId, Nil, fromClient = false))
     }
   }
 

@@ -185,9 +185,6 @@ abstract class BaseReadDriver(
                 case mos: MetadataObjectState => HLCTimestamp.update(mos.timestamp)
               }
 
-              if !isPartial then
-                client.objectCache.put(objectPointer, os)
-
               Right(os)
           }
 

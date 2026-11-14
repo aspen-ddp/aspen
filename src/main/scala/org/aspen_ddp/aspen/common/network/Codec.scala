@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, FinalizationActionId, KeyValueUpdate, LocalTimeRequirement, ObjectUpdate, PreTransactionOpportunisticRebuild, RefcountUpdate, ExclusiveRevisionLock, SerializedFinalizationAction, SharedRevisionLock, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus, VersionBump}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, FinalizationActionId, KeyValueUpdate, LocalTimeRequirement, ObjectUpdate, RefcountUpdate, ExclusiveRevisionLock, SerializedFinalizationAction, SharedRevisionLock, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus, VersionBump}
 import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, FsifConfig, RocksDBConfig}
 
@@ -476,10 +476,9 @@ object Codec extends Logging:
     )
 
   def decode(m: codec.TxPrepare,
-             objectUpdates: List[ObjectUpdate],
-             preTxRebuilds: List[PreTransactionOpportunisticRebuild]): TxPrepare =
+             objectUpdates: List[ObjectUpdate]): TxPrepare =
     TxPrepare(decode(m.to.get), decode(m.from.get), decode(m.txd.get), decode(m.proposalId.get),
-      objectUpdates, preTxRebuilds, m.fromClient)
+      objectUpdates, m.fromClient)
 
 
   def encode(o: TxPrepareResponse): codec.TxPrepareResponse =

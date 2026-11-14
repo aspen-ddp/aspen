@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.{UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject}
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, IDA, ReedSolomon}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, VersionBump}
@@ -35,7 +34,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   private val appended = Array.tabulate[Byte](50)(i => (i * 7 + 1).toByte)
 
   private def build(bldr: TransactionBuilder, ida: IDA) =
-    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(p1.poolId -> ida), Map(p1.poolId -> None), Map())
+    bldr.buildTranaction(Map(p1.poolId -> ida), Map(p1.poolId -> None), Map())
 
   private val kvp = KeyValueObjectPointer(ObjectId(new UUID(0, 9)), PoolId(new UUID(0, 0)), Array[Byte]())
 
@@ -43,7 +42,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
     val bldr = mkBuilder()
     bldr.replaySafe("test")
     bldr.update(kvp, None, None, Nil, ops)
-    val (txd, _, _) = bldr.buildTranaction(OpportunisticRebuildManager.None, Map(kvp.poolId -> Replication(3, 2)),
+    val (txd, _, _) = bldr.buildTranaction(Map(kvp.poolId -> Replication(3, 2)),
       Map(kvp.poolId -> None), Map())
     txd.requirements.collectFirst { case r: KeyValueUpdate => r.deletesKeys }.get
 
@@ -125,7 +124,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   private def withPins[T](f: => T): T = f
 
   private def buildPin(bldr: TransactionBuilder) =
-    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(p1.poolId -> Replication(3, 2)),
+    bldr.buildTranaction(Map(p1.poolId -> Replication(3, 2)),
       Map(p1.poolId -> None), Map())
 
   private val k1 = Key(Array[Byte](1))

@@ -443,7 +443,7 @@ class Frontend(val storeId: StoreId,
       else
         val pointers = txd.allHostedObjects(storeId)
         admitRecovered(txd.transactionId, trs)
-        val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, pointers, recovered = true)
+        val tx = new Tx(trs, txd, this, net, crl, statusCache, pointers, recovered = true)
         transactions += (txd.transactionId -> tx)
         // A transaction with no objects here never loads any
         if pointers.nonEmpty then
@@ -1112,7 +1112,7 @@ class Frontend(val storeId: StoreId,
                   s"or this host's runs slow")
     val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates, takeSerializedTxd(m.txd.transactionId))
     val pointers = m.txd.allHostedObjects(m.to)
-    val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers,
+    val tx = new Tx(trs, m.txd, this, net, crl, statusCache, pointers,
       muted = muted)
     transactions += (m.txd.transactionId -> tx)
     tx.receivePrepare(m)

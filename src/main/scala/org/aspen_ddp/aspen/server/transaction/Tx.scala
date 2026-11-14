@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -39,7 +39,6 @@ class Tx( trs: TransactionRecoveryState,
           private val net: Messenger,
           private val crl: CrashRecoveryLog,
           private val statusCache: TransactionStatusCache,
-          private val preTxRebuilds: List[PreTransactionOpportunisticRebuild],
           private val objectPointers: List[ObjectPointer],
           /** Recreated from persisted recovery state. See onAllObjectsLoaded */
           val recovered: Boolean = false,
@@ -572,20 +571,6 @@ class Tx( trs: TransactionRecoveryState,
   def completeLoad(): Unit = {
     loadCompleted = true
     logger.trace(s"AllObjectsLoaded for tx ${transactionId}. Have delayedPrepare: ${delayedPrepare.nonEmpty}")
-
-    // Apply pre-transaction rebuilds
-    preTxRebuilds.foreach { r =>
-      objects.get(r.objectId).foreach { os =>
-        if (os.metadata.revision == r.requiredMetadata.revision && !os.reloadRequired) {
-          os.metadata = r.requiredMetadata
-          os.data = r.data
-          val cs = CommitState(pointerOf(os.objectId), os.metadata, os.objectType, os.data)
-          val txid = TransactionId(r.requiredMetadata.revision.lastUpdateTxUUID)
-          // No need to wait for this to complete
-          frontend.commit(os, cs, txid)
-        }
-      }
-    }
 
     // A recovered transaction keeps the vote it persisted: the vote may already have been counted, and recomputing it
     // against state that changed since could contradict it. A recovered commit vote takes its locks again; a recovered

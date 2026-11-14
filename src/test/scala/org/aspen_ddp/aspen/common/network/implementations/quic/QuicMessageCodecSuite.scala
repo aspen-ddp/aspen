@@ -42,8 +42,8 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     List(DataUpdate(dataPtr(4), rev(5), DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida,
     Map(dataPtr(2).poolId -> ida))
 
-  private def prepare(updates: List[ObjectUpdate], rebuilds: List[PreTransactionOpportunisticRebuild]) =
-    TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), updates, rebuilds, fromClient = false)
+  private def prepare(updates: List[ObjectUpdate]) =
+    TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), updates, fromClient = false)
 
   private def readResponse(data: Option[DataBuffer]) =
     ReadResponse(ClientId(uuid(1)), storeId(2), uuid(3), HLCTimestamp(1000L),
@@ -52,7 +52,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
 
   /** A single-section message (the payload is its only out-of-band data section) */
   private def rebuildMsg(data: DataBuffer): TxPrepare =
-    prepare(List(ObjectUpdate(ObjectId(uuid(7)), data)), Nil)
+    prepare(List(ObjectUpdate(ObjectId(uuid(7)), data)))
 
   private def fixtures: List[Message] = List(
     HostHeartbeat(HostId(uuid(1))),
@@ -64,9 +64,9 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     TransactionCompletionResponse(ClientId(uuid(1)), storeId(2), uuid(3), isComplete = true),
     TransactionResolved(ClientId(uuid(1)), storeId(2), TransactionId(uuid(3)), committed = true),
     TransactionFinalized(ClientId(uuid(1)), storeId(2), TransactionId(uuid(3)), committed = false),
-    prepare(Nil, Nil),
-    prepare(List(ObjectUpdate(ObjectId(uuid(7)), DataBuffer(bytes(30)))),
-      List(PreTransactionOpportunisticRebuild(ObjectId(uuid(8)), meta(8), DataBuffer(bytes(40))))),
+    prepare(Nil),
+    prepare(List(ObjectUpdate(ObjectId(uuid(7)), DataBuffer(bytes(30))),
+      ObjectUpdate(ObjectId(uuid(8)), DataBuffer(bytes(40))))),
     TxPrepareResponse(storeId(1), storeId(2), TransactionId(uuid(3)),
       Right(TxPrepareResponse.Promise(Some((ProposalId(4, 1.toByte), true)))),
       ProposalId(3, 1.toByte), TransactionDisposition.VoteCommit, Nil),
@@ -132,16 +132,13 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
       prefix.refCnt() shouldBe 0
       assertSame(result.toOption.getOrElse(fail(s"$m: $result")).msg, m)
 
-  test("TxPrepare with 3 updates and 2 rebuilds keeps order and metadata"):
-    val updates = (1 to 3).toList.map(i => ObjectUpdate(ObjectId(uuid(i)), DataBuffer(bytes(10 * i, i))))
-    val rebuilds = (4 to 5).toList.map(i =>
-      PreTransactionOpportunisticRebuild(ObjectId(uuid(i)), meta(i), DataBuffer(bytes(10 * i, i))))
-    val m = prepare(updates, rebuilds)
+  test("TxPrepare with 5 updates keeps order"):
+    val updates = (1 to 5).toList.map(i => ObjectUpdate(ObjectId(uuid(i)), DataBuffer(bytes(10 * i, i))))
+    val m = prepare(updates)
     val enc = QuicMessageCodec.encode(m, alloc)
     val decoded = streamRoundTrip(enc).toOption.get.msg.asInstanceOf[TxPrepare]
     decoded shouldBe m
     decoded.objectUpdates.map(_.objectId) shouldBe updates.map(_.objectId)
-    decoded.preTxRebuilds.map(_.requiredMetadata) shouldBe rebuilds.map(_.requiredMetadata)
 
   test("payload slices with non-zero position encode only their visible bytes"):
     val arr = bytes(40)
@@ -203,7 +200,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
 
   test("empty payloads round-trip"):
     val msgs: List[Message] = List(
-      prepare(List(ObjectUpdate(ObjectId(uuid(1)), DataBuffer.Empty)), Nil),
+      prepare(List(ObjectUpdate(ObjectId(uuid(1)), DataBuffer.Empty))),
       readResponse(None),
       rebuildMsg(DataBuffer.Empty))
     msgs.foreach: m =>
@@ -339,7 +336,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     parse(good ++ Array[Byte](0)).isLeft shouldBe true
 
     // TxPrepare whose aux disagrees with the section count
-    val prep = prepare(List(ObjectUpdate(ObjectId(uuid(1)), DataBuffer(bytes(4)))), Nil)
+    val prep = prepare(List(ObjectUpdate(ObjectId(uuid(1)), DataBuffer(bytes(4)))))
     val enc = QuicMessageCodec.encode(prep, alloc)
     val p = QuicMessageCodec.parsePrefix(enc.prefix).toOption.get
     p.sectionSizes.length shouldBe 1
@@ -374,7 +371,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
 
   test("toHost round-trips in stream frames"):
     val msgs = List[Message](
-      prepare(List(ObjectUpdate(ObjectId(uuid(7)), DataBuffer(bytes(30)))), Nil),
+      prepare(List(ObjectUpdate(ObjectId(uuid(7)), DataBuffer(bytes(30))))),
       Read(storeId(10), ClientId(uuid(20)), uuid(30), dataPtr(1), FullObject()))
     msgs.foreach: m =>
       val f = frameOf(m, Some(toHostId)).toOption.get

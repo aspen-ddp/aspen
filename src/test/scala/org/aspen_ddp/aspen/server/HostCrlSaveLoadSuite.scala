@@ -206,7 +206,7 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       _ <- yieldUntil(reading)
       // Sent once the store is built, so the transaction starts after the store's load (Frontend.forgetFloorMillis)
       _ = host.receiveTransactionMessage(TxPrepare(crlStoreId, net.storeId0, overwriteTxd(other, 1),
-            ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), Nil, true))
+            ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), true))
       _ = host.testingOnlyHandleEvents()
       waiting = storeOf(host).map(_.frontend.transactions.keySet)
       _ = crl.answer.success(())
@@ -295,7 +295,7 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       // Sent once the store is built, so the transaction starts after the store's load (Frontend.forgetFloorMillis),
       // and while the crl_save.log loads
       _ = host.receiveTransactionMessage(TxPrepare(crlStoreId, net.storeId0, overwriteTxd(other, 1),
-            ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), Nil, true))
+            ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), true))
       _ = host.testingOnlyHandleEvents()
       _ = withClue("the prepare is held while the crl_save.log loads: "):
             storeOf(host).exists(_.frontend.transactions.contains(other)) should be (false)

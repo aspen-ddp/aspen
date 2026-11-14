@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, DataObjectState, ObjectSizeLimitExceeded, RangedWrite, RangedWriteState}
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.ClientId
@@ -33,10 +32,10 @@ class TransactionMaxSizeSuite extends AnyFunSuite with Matchers {
     b
 
   private def build(bldr: TransactionBuilder, ida: IDA, max: Option[Int]) =
-    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(pool -> ida), Map(pool -> max), Map())
+    bldr.buildTranaction(Map(pool -> ida), Map(pool -> max), Map())
 
   private def buildKV(bldr: TransactionBuilder, ida: IDA, sliceLimit: Option[Int]) =
-    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(pool -> ida),
+    bldr.buildTranaction(Map(pool -> ida),
       Map(pool -> sliceLimit.map(ida.maxObjectSize(_))), Map(pool -> sliceLimit))
 
   private def state(ida: IDA, length: Int): RangedWriteState =

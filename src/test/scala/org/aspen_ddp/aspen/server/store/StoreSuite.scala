@@ -32,7 +32,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     requirements = List(DataUpdate(op1, rev0, DataUpdateOperation.Overwrite)))
 
   private def prepare(to: StoreId, from: StoreId) =
-    TxPrepare(to, from, txd, ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient = false)
+    TxPrepare(to, from, txd, ProposalId.initialProposal(txd.designatedLeaderUID), Nil, fromClient = false)
 
   private def mkStore(id: StoreId, statusCache: TransactionStatusCache, heartbeatTimeout: Duration,
                       backendOverride: Option[MapBackend] = None,
@@ -120,7 +120,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     val (store, net, _) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS))
     val ahead = HLCTimestamp((System.currentTimeMillis() + 3600000) << 16)
     val early = TxPrepare(leader, leader, txd.copy(startTimestamp = ahead),
-      ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient = true)
+      ProposalId.initialProposal(txd.designatedLeaderUID), Nil, fromClient = true)
     store.receiveTransactionMessage(early)
 
     store.hasTransactions shouldBe false
@@ -138,7 +138,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     val (store, net, crl) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS),
       loadedAt = Some(System.currentTimeMillis()))
     val old = TxPrepare(leader, leader, txd.copy(startTimestamp = start),
-      ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient = true)
+      ProposalId.initialProposal(txd.designatedLeaderUID), Nil, fromClient = true)
     store.receiveTransactionMessage(old)
 
     store.hasTransactions shouldBe false
@@ -156,7 +156,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     val (store, net, _) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS),
       wallClockMillis = () => now)
     // A client's prepare without the data: an abort vote at once
-    store.receiveTransactionMessage(TxPrepare(leader, leader, fixedTxd, ProposalId.initialProposal(1.toByte), Nil, Nil,
+    store.receiveTransactionMessage(TxPrepare(leader, leader, fixedTxd, ProposalId.initialProposal(1.toByte), Nil,
       fromClient = true))
     store.hasTransactions shouldBe true
     val start = fixedStart
@@ -179,7 +179,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     val (store, net, crl) = mkStore(storeId, new TransactionStatusCache(), Duration.Zero,
       wallClockMillis = () => now, unackedLookup = lookup)
     store.receiveTransactionMessage(TxPrepare(storeId, leader, fixedTxd, ProposalId.initialProposal(1.toByte),
-      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), Nil, fromClient = true))
+      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), fromClient = true))
     store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true, late = false, proof = false))
     // Its TxFinalized is lost: idle, it gets a driver, which its peers (past their floor) never answer
     store.heartbeat()
@@ -379,7 +379,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.hasTransactions shouldBe false
     // Nor does a prepare reaching its designated leader start one
     store.receiveTransactionMessage(TxPrepare(storeId, StoreId(poolId, 1), store.frontend.transactions(foundTxid).txd,
-      ProposalId(5, 1), Nil, Nil, fromClient = false))
+      ProposalId(5, 1), Nil, fromClient = false))
     store.hasTransactions shouldBe false
 
     lookup.answer(foundTxid, scala.util.Failure(new Exception("metadata pool down")))

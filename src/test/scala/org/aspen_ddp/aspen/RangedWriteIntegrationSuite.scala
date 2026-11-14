@@ -3,7 +3,6 @@ package org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.TestTransactions
 
 import org.aspen_ddp.aspen.client.{DataObjectState, RangeReadNotSupported, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState, Transaction}
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.transaction.TransactionBuilder
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
@@ -508,7 +507,7 @@ class RangedWritePayloadSuite extends AnyFunSuite with Matchers:
       HLCTimestamp.now, HLCTimestamp.now, ida, 0, DataBuffer(content)))
     val bldr = new TransactionBuilder(TransactionId(new UUID(0, 2)), (_, _) => 0.toByte, ClientId(new UUID(0, 4)))
     bldr.rangedWrites(state, writes, false)
-    val (_, updates, _) = bldr.buildTranaction(OpportunisticRebuildManager.None, Map(pointer.poolId -> ida),
+    val (_, updates, _) = bldr.buildTranaction(Map(pointer.poolId -> ida),
                                                Map(pointer.poolId -> None), Map())
     updates.size should be (ida.width)
     (0 until ida.width).toList.map: i =>

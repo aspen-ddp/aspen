@@ -1,9 +1,9 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.internal.{BaseAspenClient, OpportunisticRebuildManager}
+import org.aspen_ddp.aspen.client.internal.BaseAspenClient
 import org.aspen_ddp.aspen.client.internal.transaction.TransactionBuilder.TransactionData
-import org.aspen_ddp.aspen.client.{ObjectCache, ReadDriverClient, StoragePool, Transaction, TransactionAborted, TransactionOutcomeUnknown, TransactionStatusCache}
+import org.aspen_ddp.aspen.client.{ReadDriverClient, StoragePool, Transaction, TransactionAborted, TransactionOutcomeUnknown, TransactionStatusCache}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.{KeyValueObjectPointer, ObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -38,9 +38,8 @@ class TransactionOutcomeUnknownSuite extends IntegrationTestSuite:
     val cache = new RecordingCache
     val pools = net.client
     val recClient = new BaseAspenClient(executionContext, radicle, org.aspen_ddp.aspen.common.network.ClientId(new java.util.UUID(0, 2)),
-      net.cliMessenger, cache, ObjectCache.NoCache, BaseReadDriver.noErrorRecoveryReadDriver,
+      net.cliMessenger, cache, BaseReadDriver.noErrorRecoveryReadDriver,
       ClientTransactionDriver.noErrorRecoveryFactory, Nil):
-      override def opportunisticRebuildManager: OpportunisticRebuildManager = OpportunisticRebuildManager.None
       // The network answers reads only for its own client
       override def getStoragePool(poolId: PoolId): Future[StoragePool] = pools.getStoragePool(poolId)
       override protected def resolveIda(pointer: ObjectPointer): Future[IDA] = Future.successful(net.ida)

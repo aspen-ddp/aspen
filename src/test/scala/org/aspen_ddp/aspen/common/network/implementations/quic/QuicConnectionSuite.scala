@@ -485,7 +485,7 @@ object QuicConnectionSuite:
       List(DataUpdate(ptr, revision, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida,
       Map(ptr.poolId -> ida))
     TxPrepare(toStore, StoreId(PoolId.BootstrapPoolId, 1), txd, ProposalId(1, 1.toByte),
-      List(ObjectUpdate(ptr.id, data)), Nil, fromClient = true)
+      List(ObjectUpdate(ptr.id, data)), fromClient = true)
 
   /** A one-update TxPrepare carrying `seq` (as its object id) whose encoded size is exactly `total` bytes */
   def sized(seq: Long, total: Int): TxPrepare =

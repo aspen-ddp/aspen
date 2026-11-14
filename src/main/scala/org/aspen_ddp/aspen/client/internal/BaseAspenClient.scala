@@ -41,8 +41,8 @@ private object Namespaces:
   * Everything that SimpleAspenClient and TestNetwork.TClient have in common lives here.
   * The differences between a full production client and a minimal test client are confined
   * to a small set of "dials":
-  *   - constructor parameters that can be built without `this` (caches, driver factories)
-  *   - the abstract members below (`opportunisticRebuildManager`, `resolveIda`, `runCreate`)
+  *   - constructor parameters that can be built without `this` (driver factories)
+  *   - the abstract members below (`resolveIda`, `runCreate`)
   */
 abstract class BaseAspenClient(
     val executionContext: ExecutionContext,
@@ -50,7 +50,6 @@ abstract class BaseAspenClient(
     override val clientId: ClientId,
     private[client] val messenger: ClientMessenger,
     override val txStatusCache: TransactionStatusCache,
-    private[client] val objectCache: ObjectCache,
     readDriverFactory: ReadDriver.Factory,
     txDriverFactory: ClientTransactionDriver.Factory,
     userTypeFactories: List[RegisteredTypeFactory]) extends AspenClient:
@@ -98,9 +97,6 @@ abstract class BaseAspenClient(
   /** Runs a create-style transaction. Production retries with recovery; the test client runs
     * a single attempt so failures surface instead of being retried away. */
   protected def runCreate[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T]): Future[T]
-
-  // `opportunisticRebuildManager` remains abstract (declared on the ReadDriverClient trait) and
-  // is overridden by each subclass.
 
   // ---- Reads ----
 

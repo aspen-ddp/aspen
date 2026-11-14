@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 
 sealed abstract class Message
 
@@ -244,7 +244,6 @@ final case class TxPrepare(
                             txd: TransactionDescription,
                             proposalId: ProposalId,
                             objectUpdates: List[ObjectUpdate],
-                            preTxRebuilds: List[PreTransactionOpportunisticRebuild],
                             // True for the originating client's prepares. The client sends them on
                             // the designated leader's behalf, so `from` names the leader either way.
                             fromClient: Boolean) extends TxMessage:

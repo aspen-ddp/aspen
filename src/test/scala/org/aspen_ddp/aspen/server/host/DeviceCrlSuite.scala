@@ -258,7 +258,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
   private def prepareInFlight(host: Host, crl: RecordedCrl, sid: StoreId, id: TransactionId): Future[Unit] =
     given ExecutionContext = executionContext
     host.receiveTransactionMessage(TxPrepare(sid, net.storeId0, overwriteTxd(id, 1, sid.poolId),
-      ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), Nil, true))
+      ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), true))
     pumpUntil(host, crl.firstSave.isCompleted).map(_ => crl.firstSave.isCompleted should be(true))
 
   /** Whether `host` serves `sid` with transaction `id` recovered and holding its lock on the object */
@@ -512,7 +512,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
       _ = host.control.router.loaded.contains(storeId) should be(true)
       _ = host.receiveTransactionMessage(TxPrepare(storeId, net.storeId0, overwriteTxd(txid, 1),
-        ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), Nil, true))
+        ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), true))
       _ <- pumpUntil(host, first.opened.head.firstSave.isCompleted)
       _ = first.opened.head.firstSave.isCompleted should be(true)
       // Crash-only: the store is not closed, so its state stays in the device's CRL
@@ -1269,7 +1269,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     // Led by a third store, so neither starts a driver
     def prepare(sid: StoreId, id: TransactionId) =
       TxPrepare(sid, net.storeId0, overwriteTxd(id, 2), ProposalId.initialProposal(2),
-        List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), Nil, true)
+        List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), true)
     for
       _ <- writeRocksStore(dirA, sidA)
       _ <- writeRocksStore(dirB, sidB)
@@ -1310,7 +1310,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     // Led by a third store, so neither starts a driver
     def prepare(sid: StoreId) =
       TxPrepare(sid, net.storeId0, overwriteTxd(txid, 2), ProposalId.initialProposal(2),
-        List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), Nil, true)
+        List(ObjectUpdate(oid, DataBuffer(Array[Byte](1)))), true)
     for
       _ <- writeRocksStore(dirA, sid0)
       _ <- writeRocksStore(dirA, sid1)

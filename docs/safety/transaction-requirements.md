@@ -624,6 +624,8 @@ is the normal state of a just-committed transaction.
 
 ### F3. The pre-transaction opportunistic rebuild bypasses the checks that the live opportunistic rebuild has. Confidence: Low-Medium.
 
+> **FIXED 2026-11-14 (path deleted).** The opportunistic rebuild (read-triggered message and pre-transaction piggyback) and the client object cache were removed; repair is the ErrorTree path only. See docs/superpowers/specs/2026-11-14-opportunistic-rebuild-removal-design.md.
+
 > **Verification 2026-11-09: CONFIRMED (mechanism). Severity: stale-replica.** Tx.completeLoad assigns os.metadata = r.requiredMetadata and os.data = r.data when only revision equals and !reloadRequired (Tx.scala:380-392): no commitInFlight guard, no refcount-serial max, no lock check, `frontend.commit(os, cs, txid)` not ordered. KeyValue objects do reach it (KeyValueObjectState.getRebuildDataForStore exists, client ObjectState.scala:~295). The client cache can lag blind KV writes/refcount changes (neither moves the revision), so the store's newer content/serial/timestamp is overwritten and persisted. Gated only by the client's 10 s repairCache (SimpleOpportunisticRebuildManager.scala:14-16) and by the object being flagged knownBehind (revision-based).
 > *Fix sketch:* Route both rebuild paths through one guarded implementation (commitInFlight, refcount max, content compare) or through Reconcile.
 
@@ -915,5 +917,5 @@ Evidence:
 
 ### New findings from the adversarial verification (2026-11-09)
 
-* **N1.** An opportunistic rebuild that survives its revision check can replace a KeyValue object's content with an older snapshot and leaves `kvState` unchanged; see repair-process.md F1, F2 and N1. This enlarges F3 here: the pre-transaction path is the same bug without the `commitInFlight` guard.
+* **N1. FIXED 2026-11-14 (path deleted).** An opportunistic rebuild that survives its revision check can replace a KeyValue object's content with an older snapshot and leaves `kvState` unchanged; see repair-process.md F1, F2 and N1. This enlarges F3 here: the pre-transaction path is the same bug without the `commitInFlight` guard.
 * **N2.** A replayed (already applied) `RefcountUpdate` or `DataUpdate` after a crash is skipped by its revision or refcount check and then reported in `TxCommitted.objectCommitErrors`, producing a spurious but harmless ErrorTree mark (see transaction-recovery.md F4).

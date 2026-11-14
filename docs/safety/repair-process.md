@@ -904,6 +904,8 @@ head first".
 > *Fix sketch:* After replacing os.data for a KeyValue object rebuild kvState from it (or route through Reconcile and delete the opportunistic path).
 
 **F1. Opportunistic rebuild leaves `kvState` stale** (`server/store/Frontend.scala:867-881`; `server/store/ObjectState.scala:
+
+> **FIXED 2026-11-14 (path deleted).** The opportunistic rebuild (read-triggered message and pre-transaction piggyback) and the client object cache were removed; repair is the ErrorTree path only. See docs/superpowers/specs/2026-11-14-opportunistic-rebuild-removal-design.md.
 34-37`; `server/transaction/Tx.scala:381-390`).
 `opportunisticRebuild` and the pre-transaction path assign `os.metadata` and `os.data` and commit. `ObjectState.kvState`
 (the structure requirement checks, locks and the next apply use) is a `var` initialised once from `data` at
@@ -920,7 +922,7 @@ medium-high; the fix is to rebuild `kvState` from the new data, or to route thro
 > **Verification 2026-11-09: CONFIRMED (mechanism, race trigger). Severity: stale-replica (durable regression of one replica until next write).** Guard is only revision equality (+ !commitInFlight on the message path): os.data = op.data replaces the whole KV content with the read's snapshot and os.metadata.timestamp goes back to op.timestamp (Frontend.scala:867-881). Blind writes applied after the read do not change the revision (RequirementsApplyer.scala:105-112), so they are dropped from data (and persisted that way: crash reloads the regression), although the stale kvState still holds them and re-encodes them on the next write (interplay with F1). Pre-transaction path additionally has no commitInFlight guard and no refcount max (Tx.scala:380-392, requirements F3).
 > *Fix sketch:* Do not replace content on equal revision for KeyValue objects; use Reconcile with snapshot compare.
 
-**F2. Whole-content overwrite when revisions are equal** (`Frontend.scala:867-881`; `Tx.scala:381-390`;
+**F2. Whole-content overwrite when revisions are equal. FIXED 2026-11-14 (path deleted).** (`Frontend.scala:867-881`; `Tx.scala:381-390`;
 `SimpleOpportunisticRebuildManager.scala:24-39`).
 The only guard is `os.metadata.revision == op.revision` (plus `!commitInFlight` for the message path). For KeyValue
 objects, blind writes do not change the revision (Q9), so equality says nothing about keys. `op.data` is the whole
@@ -1109,8 +1111,8 @@ dependency is real but sound. Confidence: low.
 
 ### 13.4 New findings from the adversarial verification (2026-11-09)
 
-* **N1 (stale-replica, doc correction for F1/F2).** The opportunistic rebuild is nearly dead code for the store it targets: the client flags a store `knownBehind` only when its revision differs from the chosen revision (`BaseObjectReader.scala` getStoreStates, `KeyValueObjectReader.scala:122`), while `Frontend.opportunisticRebuild` applies only when the store's revision EQUALS the read's (`Frontend.scala:869`). It fires only when the store caught up between the read and the message arriving, and then it replaces content with the read's older snapshot (F2) leaving `kvState` stale (F1). Real repair of a revision-lagging or same-revision-lagging store is left entirely to the ErrorTree path. Fix: delete the path or turn it into a Reconcile call.
-* **N2 (stale-replica).** The client-side read that feeds repair (`repairUpdate`'s `client.read`) is an ordinary read and may itself send `OpportunisticRebuild` to the store under repair (open question 7): with F1/F2 this can overwrite the very install the repair just made. `disableOpportunisticRebuild` exists on the read manager (`ReadManager.scala:113`) but `repairUpdate` does not set it.
+* **N1 (stale-replica, doc correction for F1/F2). FIXED 2026-11-14 (path deleted).** The opportunistic rebuild is nearly dead code for the store it targets: the client flags a store `knownBehind` only when its revision differs from the chosen revision (`BaseObjectReader.scala` getStoreStates, `KeyValueObjectReader.scala:122`), while `Frontend.opportunisticRebuild` applies only when the store's revision EQUALS the read's (`Frontend.scala:869`). It fires only when the store caught up between the read and the message arriving, and then it replaces content with the read's older snapshot (F2) leaving `kvState` stale (F1). Real repair of a revision-lagging or same-revision-lagging store is left entirely to the ErrorTree path. Fix: delete the path or turn it into a Reconcile call.
+* **N2 (stale-replica). FIXED 2026-11-14 (path deleted).** The client-side read that feeds repair (`repairUpdate`'s `client.read`) is an ordinary read and may itself send `OpportunisticRebuild` to the store under repair (open question 7): with F1/F2 this can overwrite the very install the repair just made. `disableOpportunisticRebuild` exists on the read manager (`ReadManager.scala:113`) but `repairUpdate` does not set it.
 
 ### 13.5 New findings from the replay-pins refresh (2026-11-09)
 

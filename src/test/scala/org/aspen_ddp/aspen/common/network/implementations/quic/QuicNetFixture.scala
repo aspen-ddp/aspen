@@ -123,7 +123,7 @@ object QuicNetFixture:
       List(DataUpdate(ptr, ObjectRevision(TransactionId(UUID.randomUUID())), DataUpdateOperation.Overwrite)),
       Nil, None, Nil, Nil, ida, Map(ptr.poolId -> ida))
     TxPrepare(to, StoreId(PoolId.BootstrapPoolId, 1), txd, ProposalId(1, 1.toByte),
-      List(ObjectUpdate(ptr.id, DataBuffer(payload))), Nil, fromClient = true)
+      List(ObjectUpdate(ptr.id, DataBuffer(payload))), fromClient = true)
 
   /** The payload of a message built by `dataMsg` */
   def payloadOf(m: TxPrepare): DataBuffer = m.objectUpdates.head.data

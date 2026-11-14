@@ -80,10 +80,10 @@ class ClientTransactionDriver(
 
       txd.allDataStores.foreach { toStore =>
 
-        val transactionData = updateData.getOrElse(toStore, TransactionData(Nil, Nil))
+        val transactionData = updateData.getOrElse(toStore, TransactionData(Nil))
 
         val initialPrepare = TxPrepare(toStore, fromStore, txd, ProposalId.initialProposal(txd.designatedLeaderUID),
-          transactionData.localUpdates, transactionData.preTransactionRebuilds, fromClient = true)
+          transactionData.localUpdates, fromClient = true)
 
         client.messenger.sendTransactionMessage(initialPrepare)
       }

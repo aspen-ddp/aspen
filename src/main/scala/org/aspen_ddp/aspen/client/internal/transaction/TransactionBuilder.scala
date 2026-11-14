@@ -1,6 +1,5 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.DeletionFinalizationAction
 import org.aspen_ddp.aspen.client.{UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
 import org.aspen_ddp.aspen.common.network.ClientId
@@ -31,8 +30,7 @@ object TransactionBuilder {
   /** Ranged writes to one object. `edits` carry the old bytes taken from the state when they were added */
   case class RangedUpdate(currentLength: Int, edits: List[RangeEdit], zeroFill: Boolean)
 
-  case class TransactionData(localUpdates: List[ObjectUpdate],
-                             preTransactionRebuilds: List[PreTransactionOpportunisticRebuild])
+  case class TransactionData(localUpdates: List[ObjectUpdate])
 }
 
 class TransactionBuilder(
@@ -87,8 +85,7 @@ class TransactionBuilder(
     *
     * A pool missing from either map is treated as unlimited by that map.
     */
-  def buildTranaction(opportunisticRebuildManager: OpportunisticRebuildManager,
-                      poolIDAMap: Map[PoolId, IDA],
+  def buildTranaction(poolIDAMap: Map[PoolId, IDA],
                       poolMaxObjectSizeMap: Map[PoolId, Option[Int]],
                       poolMaxSliceSizeMap: Map[PoolId, Option[Int]]): (TransactionDescription,
     Map[StoreId, TransactionData], HLCTimestamp) = synchronized {
@@ -143,30 +140,18 @@ class TransactionBuilder(
     var updates = Map[StoreId, TransactionData]()
 
     def addUpdate(pointer: ObjectPointer, encoded: Array[DataBuffer]): Unit = {
-      val mpr = opportunisticRebuildManager.getPreTransactionOpportunisticRebuild(pointer)
       val objIDA = poolIDAMap(pointer.poolId)
 
       (0 until objIDA.width).foreach { poolIndex =>
         val storeId = StoreId(pointer.poolId, poolIndex.toByte)
         val lu = ObjectUpdate(pointer.id, encoded(poolIndex))
 
-        val opr = mpr.get(poolIndex.toByte)
-
         updates.get(storeId) match {
           case None =>
-            val lpr = opr match {
-              case None => List()
-              case Some(pr) => pr :: Nil
-            }
-            updates += (storeId -> TransactionData(List(lu), lpr))
+            updates += (storeId -> TransactionData(List(lu)))
 
           case Some(td) =>
-            val newLu = lu :: td.localUpdates
-            val newLp = opr match {
-              case None => td.preTransactionRebuilds
-              case Some(pr) => pr :: td.preTransactionRebuilds
-            }
-            updates += (storeId -> TransactionData(newLu, newLp))
+            updates += (storeId -> TransactionData(lu :: td.localUpdates))
         }
       }
     }

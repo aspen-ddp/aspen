@@ -1,8 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
-import org.aspen_ddp.aspen.client.{ObjectCache, ReadDriverClient, TransactionStatusCache}
+import org.aspen_ddp.aspen.client.{ReadDriverClient, TransactionStatusCache}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, HostMessage, TransactionResolved, TxMessage, TxPrepare}
@@ -46,9 +45,7 @@ class ClientTransactionDriverSuite extends AnyFunSuite with Matchers:
     val txStatusCache: TransactionStatusCache = TransactionStatusCache.NoCache
     def clientContext: ExecutionContext = ExecutionContext.global
     def backgroundTaskManager: BackgroundTaskManager = tasks
-    private[client] def opportunisticRebuildManager: OpportunisticRebuildManager = OpportunisticRebuildManager.None
     private[client] val messenger: ClientMessenger = msgr
-    private[client] val objectCache: ObjectCache = ObjectCache.NoCache
     private[aspen] def getSystemAttribute(key: String): Option[String] = None
 
   /** A transaction that started at `startMillis` */

@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.{AppendPosition, ConflictingRequirements, DataObjectState, MultipleDataUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, IDA, RangeEdit, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation}
@@ -35,7 +34,7 @@ class TransactionRangedWriteSuite extends AnyFunSuite with Matchers {
       ars, 0, DataBuffer(bytes)))
 
   private def build(bldr: TransactionBuilder, ida: IDA, maxObjectSize: Option[Int] = None) =
-    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(p1.poolId -> ida), Map(p1.poolId -> maxObjectSize), Map())
+    bldr.buildTranaction(Map(p1.poolId -> ida), Map(p1.poolId -> maxObjectSize), Map())
 
   private def bytes(s: String): Array[Byte] = s.getBytes("UTF-8")
 

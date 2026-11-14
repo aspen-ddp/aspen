@@ -309,7 +309,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     val txid = TransactionId(new UUID(15, 7))
     withRouter(emptyCrl): fx =>
       fx.ctx.router.deliverTx(TxPrepare(unknown, peer, overwriteTxd(txid), ProposalId.initialProposal(0),
-        Nil, Nil, true))
+        Nil, true))
       fx.net.tx.asScala.toList should be(List((TxUnknownStore(peer, unknown, txid), Thread.currentThread.getName)))
 
   test("tasks queued ahead of a close run against the open store"):
@@ -343,7 +343,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     val peer = StoreId(poolId, 1)
     val txid = TransactionId(new UUID(15, 8))
     withRouter(emptyCrl, ready = false): fx =>
-      def prepare = TxPrepare(unknown, peer, overwriteTxd(txid), ProposalId.initialProposal(0), Nil, Nil, true)
+      def prepare = TxPrepare(unknown, peer, overwriteTxd(txid), ProposalId.initialProposal(0), Nil, true)
       fx.ctx.router.deliverTx(prepare)
       fx.net.tx.asScala.toList should be(empty)
       fx.ctx.router.markReady()
@@ -355,7 +355,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     val peer = StoreId(poolId, 1)
     val txid = TransactionId(new UUID(15, 9))
     withRouter(emptyCrl): fx =>
-      def prepare = TxPrepare(unknown, peer, overwriteTxd(txid), ProposalId.initialProposal(0), Nil, Nil, true)
+      def prepare = TxPrepare(unknown, peer, overwriteTxd(txid), ProposalId.initialProposal(0), Nil, true)
       val router = fx.ctx.router
       router.markLoading(unknown)
       router.markAwaitingDevice(unknown)

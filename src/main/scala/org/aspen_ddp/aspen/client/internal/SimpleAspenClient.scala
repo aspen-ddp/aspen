@@ -30,14 +30,9 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     clientId,
     msngr,
     new TransactionStatusCache(txStatusCacheDuration),
-    new SimpleObjectCache,
     new SimpleReadDriver.Factory(initialReadDelay, maxReadDelay).apply,
     SimpleClientTransactionDriver.factory(txRetransmitDelay, TransactionHorizon.Horizon),
     userTypeFactories):
-
-  // Created exactly once, with thread-safe (lazy val) initialization.
-  override lazy val opportunisticRebuildManager: OpportunisticRebuildManager =
-    new SimpleOpportunisticRebuildManager(this)
 
   // The storage-pools tree lives in the bootstrap pool, so resolving that pool's IDA by reading
   // its pool object would recurse forever: read -> resolveIda -> getStoragePool -> read. The

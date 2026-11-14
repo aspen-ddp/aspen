@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId}
-import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild}
+import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate}
 
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -129,16 +129,12 @@ object QuicMessageCodec:
   /** Returns (message used for the header, aux bytes, sections) */
   private def split(msg: Message): (Message, ByteBuffer, Array[DataBuffer]) = msg match
     case m: TxPrepare =>
-      val auxSize = 4 + 16 * m.objectUpdates.size + 4 + (16 + Metadata.EncodedSize) * m.preTxRebuilds.size
+      val auxSize = 4 + 16 * m.objectUpdates.size
       val aux = ByteBuffer.allocate(auxSize)
       aux.putInt(m.objectUpdates.size)
       m.objectUpdates.foreach(u => writeUUID(aux, u.objectId.uuid))
-      aux.putInt(m.preTxRebuilds.size)
-      m.preTxRebuilds.foreach: r =>
-        writeUUID(aux, r.objectId.uuid)
-        r.requiredMetadata.encodeInto(aux)
       aux.flip()
-      (m, aux, (m.objectUpdates.map(_.data) ++ m.preTxRebuilds.map(_.data)).toArray)
+      (m, aux, m.objectUpdates.map(_.data).toArray)
 
     case m @ ReadResponse(_, _, _, _, Right(cs)) if cs.objectData.exists(!_.isEmpty) =>
       (m.copy(result = Right(cs.copy(objectData = None))), ByteBuffer.allocate(0), Array(cs.objectData.get))
@@ -287,19 +283,14 @@ object QuicMessageCodec:
       Left("TxPrepare aux too short")
     else
       val nUpdates = aux.getInt()
-      if nUpdates < 0 || nUpdates.toLong * 16 + 4 > aux.remaining() then
+      if nUpdates < 0 || nUpdates.toLong * 16 > aux.remaining() then
         Left(s"Invalid TxPrepare update count $nUpdates")
       else
         val updateIds = Array.fill(nUpdates)(ObjectId(new UUID(aux.getLong(), aux.getLong())))
-        val nRebuilds = aux.getInt()
-        if nRebuilds < 0 || nRebuilds.toLong * (16 + Metadata.EncodedSize) != aux.remaining().toLong then
-          Left(s"Invalid TxPrepare rebuild count $nRebuilds")
-        else if nUpdates.toLong + nRebuilds != sections.length then
-          Left(s"TxPrepare expects ${nUpdates.toLong + nRebuilds} sections, got ${sections.length}")
+        if aux.remaining() != 0 then
+          Left(s"Invalid TxPrepare aux: ${aux.remaining()} trailing bytes")
+        else if nUpdates != sections.length then
+          Left(s"TxPrepare expects $nUpdates sections, got ${sections.length}")
         else
           val updates = updateIds.indices.map(i => ObjectUpdate(updateIds(i), sections(i))).toList
-          val rebuilds = (0 until nRebuilds).map: i =>
-            val id = ObjectId(new UUID(aux.getLong(), aux.getLong()))
-            PreTransactionOpportunisticRebuild(id, Metadata(aux), sections(nUpdates + i))
-          .toList
-          Right(Codec.decode(p, updates, rebuilds))
+          Right(Codec.decode(p, updates))

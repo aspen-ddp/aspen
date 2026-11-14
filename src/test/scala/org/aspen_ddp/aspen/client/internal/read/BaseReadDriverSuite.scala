@@ -5,13 +5,11 @@ import org.aspen_ddp.aspen.client.{CorruptedObject, DataObjectState, InvalidObje
 import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.client.{KeyValueObjectState, MetadataObjectState, ObjectCache, ObjectState, TransactionStatusCache}
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
+import org.aspen_ddp.aspen.client.{KeyValueObjectState, MetadataObjectState, ObjectState, TransactionStatusCache}
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, Read, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{ByteRanges, DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError, ReadType, Value}
 import org.aspen_ddp.aspen.server.store.{KVObjectState, ValueState => StoreValueState}
-import org.aspen_ddp.aspen.common.transaction.PreTransactionOpportunisticRebuild
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
@@ -192,16 +190,9 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
   }
 
 
-  /** Records the cache puts, client requests, and repair marks a read driver makes */
+  /** Records the client requests a read driver makes */
   class RecordingClient extends ReadDriverClient.NoOp(client):
-    var puts: List[ObjectState] = Nil
     var requests: List[ClientRequest] = Nil
-    var repairMarks: List[Set[Byte]] = Nil
-
-    override private[client] val objectCache: ObjectCache = new ObjectCache:
-      def get(pointer: DataObjectPointer): Option[DataObjectState] = None
-      def get(pointer: KeyValueObjectPointer): Option[KeyValueObjectState] = None
-      private[client] def put(pointer: ObjectPointer, os: ObjectState): Unit = puts = os :: puts
 
     override private[client] val messenger: Messenger = new Messenger:
       def sendClientRequest(msg: ClientRequest): Unit = requests = msg :: requests
@@ -209,12 +200,6 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
       def sendTransactionMessages(msg: List[TxMessage]): Unit = ()
       def sendHostMessage(msg: HostMessage): Unit = ()
       def dropCacheForStore(storeId: StoreId): Unit = ()
-
-    override private[client] def opportunisticRebuildManager: OpportunisticRebuildManager = new OpportunisticRebuildManager:
-      def markRepairNeeded(os: ObjectState, repairNeeded: Set[Byte]): Unit =
-        repairMarks = repairNeeded :: repairMarks
-      def getPreTransactionOpportunisticRebuild(pointer: ObjectPointer): Map[Byte, PreTransactionOpportunisticRebuild] = Map()
-      def slowReadReplyDuration: Duration = Duration.Zero
 
   val kvKey = Key(Array[Byte](5))
 
@@ -250,26 +235,23 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     val (m, result) = runStaleStoreReadOf(readType, kvptr)
     (m, Await.result(result, awaitDuration).asInstanceOf[KeyValueObjectState])
 
-  test("full KV read caches and sends no rebuild to a stale store") {
+  test("full KV read sends no rebuild to a stale store") {
     val (m, kvos) = runStaleStoreRead(FullObject())
     kvos.partial should be (false)
-    m.puts.size should be (1)
     m.requests should be (Nil)
   }
 
-  test("partial KV read is not cached") {
+  test("partial KV read completes with partial state") {
     val (m, kvos) = runStaleStoreRead(KeySet(List(kvKey)))
     kvos.partial should be (true)
     kvos.contents.contains(kvKey) should be (true)
     kvos.getRebuildDataForStore(ds1) should be (None)
-    m.puts should be (Nil)
   }
 
-  test("partial Data ByteRanges read is not cached") {
+  test("partial Data ByteRanges read completes") {
     val (m, result) = runStaleStoreReadOf(ByteRanges(List((0, 4)), 0), ptr)
     val dos = Await.result(result, awaitDuration)
     dos.getRebuildDataForStore(ds1) should be (None)
-    m.puts should be (Nil)
   }
 
   test("partial KV read sends its read type") {
@@ -289,13 +271,12 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
         mos.revision should be (ObjectRevision(TransactionId(new UUID(0,2))))
         mos.refcount should be (ref)
       case other => fail(s"Expected a MetadataObjectState, got $other")
-    m.puts should be (Nil)
 
-  test("metadata-only KV read is not cached") {
+  test("metadata-only KV read returns metadata") {
     checkMetadataOnlyRead(kvptr)
   }
 
-  test("metadata-only Data read is not cached") {
+  test("metadata-only Data read returns metadata") {
     checkMetadataOnlyRead(ptr)
   }
 

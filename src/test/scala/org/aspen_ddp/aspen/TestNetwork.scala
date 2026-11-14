@@ -2,8 +2,8 @@ package org.aspen_ddp.aspen
 
 import java.util.UUID
 import org.aspen_ddp.aspen
-import org.aspen_ddp.aspen.client.internal.{BaseAspenClient, OpportunisticRebuildManager}
-import org.aspen_ddp.aspen.client.{AspenClient, ObjectCache, RegisteredTypeFactory, Transaction, TransactionStatusCache}
+import org.aspen_ddp.aspen.client.internal.BaseAspenClient
+import org.aspen_ddp.aspen.client.{AspenClient, RegisteredTypeFactory, Transaction, TransactionStatusCache}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.read.BaseReadDriver
@@ -167,13 +167,9 @@ object TestNetwork {
       ClientId(new UUID(0, 1)),
       msngr,
       TransactionStatusCache.NoCache,
-      ObjectCache.NoCache,
       BaseReadDriver.noErrorRecoveryReadDriver,
       txDriverFactory,
       userTypeFactories):
-
-    override def opportunisticRebuildManager: OpportunisticRebuildManager =
-      OpportunisticRebuildManager.None
 
     // Fixed IDA for the bootstrap pool: resolving it per-read would recurse, since the pool states live in it.
     // Other pools are resolved from their state (read through the bootstrap pool), so objects in pools of another

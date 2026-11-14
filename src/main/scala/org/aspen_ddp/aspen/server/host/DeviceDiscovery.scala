@@ -620,6 +620,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             val crl = openDeviceCrl(storageDevicePath, sdCfg, storeFiles)
             val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl,
               new CrlAdmission(crl.admissionLimitBytes))
+            // Everything the CRL holds is counted, retained for its store, before any store loads: a store that loads
+            // counts its own afresh, and the entries of one that does not are copied forward all the same (F8)
+            crl.recoveredBytesByStore.foreach((storeId, bytes) => sds.admission.chargeRetained(storeId, bytes))
+            // On the control context. Ignored unless sds is still the device loaded (DeviceShutdown.crlFailed)
+            crl.failed.foreach(t => ctx.shutdown.crlFailed(sds, t))
             logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
             try
               storeFiles.foreach: potentialStoreFile =>

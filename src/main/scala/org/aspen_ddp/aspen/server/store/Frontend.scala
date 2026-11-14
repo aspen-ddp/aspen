@@ -779,10 +779,10 @@ class Frontend(val storeId: StoreId,
     admitted.get(txid) match
       case Some(a) => chargeData(a, trs.objectUpdates)
       case None =>
-        val a = new Admitted(CrlAdmission.TxOverheadBytes + trs.serializedTxd.size, Set(), None)
+        // As the device's open counted it (CrashRecoveryLog.recoveredBytesByStore), which this replaces
+        val a = new Admitted(CrlAdmission.recoveredBytes(trs), trs.objectUpdates.iterator.map(_.objectId).toSet, None)
         admission.charge(a.bytes)
         admitted(txid) = a
-        chargeData(a, trs.objectUpdates)
 
   /** The description `admitPrepare` serialized for `txid`, if not taken yet */
   private def takeSerializedTxd(txid: TransactionId): Option[DataBuffer] =

@@ -33,18 +33,17 @@ class StreamWriter(val maxSizeInBytes: Long,
                    onThreadDeath: Throwable => Unit = _ => ()) extends Logging:
   
   private val queue = new LinkedBlockingQueue[WriterThread.Command]()
+  // The files exist, preallocated at their full size (SimpleCRL.createStreams): a write never allocates, so it cannot
+  // fail with ENOSPC (crash-recovery-log F7)
   private val streams = files.map(t =>
     // FileChannel rather than os-lib: os-lib cannot open with DSYNC
     val channel = FileChannel.open(t._2.toNIO,
-      StandardOpenOption.CREATE,
       StandardOpenOption.DSYNC,
       StandardOpenOption.WRITE)
-
-    if channel.size() < maxSizeInBytes then
-      channel.position(maxSizeInBytes-1)
-      channel.write(ByteBuffer.allocate(1))
-      channel.position(0)
-
+    if channel.size() != maxSizeInBytes then
+      val size = channel.size()
+      channel.close()
+      throw new IllegalStateException(s"CRL stream ${t._2} is $size bytes, not $maxSizeInBytes")
     t._1 -> channel
   ).toMap
   private var exitLoop = false

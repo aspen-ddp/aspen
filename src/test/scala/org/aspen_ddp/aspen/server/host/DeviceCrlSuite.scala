@@ -8,16 +8,17 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, 
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, TxPrepare}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Metadata, ObjectId, ObjectRefcount,
   ObjectRevision, ObjectType}
-import org.aspen_ddp.aspen.common.paxos.ProposalId
+import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription,
-  TransactionId}
+  TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig,
   StorageDeviceManager, StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlCorrupt, StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlCorrupt,
+  StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, SimpleCRL}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome,
   TransferOutcome}
@@ -76,6 +77,8 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   override def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
     inner.deleteTransactions(storeId, txids)
   override def storesWithEntries(): Future[Set[StoreId]] = inner.storesWithEntries()
+  override def recoveredBytesByStore: Map[StoreId, Long] = inner.recoveredBytesByStore
+  override def failed: Future[Throwable] = inner.failed
 
   /** Completed when dropStore is first called */
   val dropCalled: Promise[Unit] = Promise()
@@ -525,6 +528,69 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     yield
       recovered should be(Set(txid))
       lockHolder should be(Some(txid))
+
+  /** A state for `sid` of a transaction overwriting the suite's object with `data` */
+  private def recoveryState(sid: StoreId, id: TransactionId, data: Array[Byte]): TransactionRecoveryState =
+    TransactionRecoveryState(sid, overwriteTxd(id, 1, sid.poolId).serialize(), List(ObjectUpdate(oid, DataBuffer(data))),
+      TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState(None, None))
+
+  atest("a device's admission counts, from its open, what its CRL holds for every store, loaded or not"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val unloaded = StoreId(poolId, 7.toByte) // No directory: never loads
+    val loadedTrs = recoveryState(storeId, txid, Array[Byte](1, 2, 3))
+    val unloadedTrs = recoveryState(unloaded, TransactionId(new UUID(9, 5)), new Array[Byte](1000))
+    val first = newFactory()
+    val crl = first.openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
+      deviceDir / StorageDeviceConfig.configFilename))
+    val saved = Promise[Unit]()
+    crl.save(txid, loadedTrs, () => ())
+    crl.save(unloadedTrs.txd.transactionId, unloadedTrs, () => saved.trySuccess(()))
+    val loadedBytes = CrlAdmission.recoveredBytes(loadedTrs)
+    val unloadedBytes = CrlAdmission.recoveredBytes(unloadedTrs)
+    for
+      _ <- saved.future
+      _ = first.shutdownAll()
+      _ <- writeRocksStore(deviceDir, storeId)
+      host = newCrlHost(hostRoot, newFactory())
+      admission = host.control.devices.devices(deviceA).admission
+      // Counted at the open, before any store loads
+      atOpen = (admission.admittedBytes, admission.retainedBytes(storeId), admission.retainedBytes(unloaded))
+      _ <- pumpUntil(host, host.control.router.loaded.get(storeId).exists(_.frontend.transactions.contains(txid)))
+      afterLoad = (admission.admittedBytes, admission.retainedBytes(storeId), admission.retainedBytes(unloaded))
+      _ <- host.control.router.loaded(storeId).backend.close()
+    yield
+      atOpen should be((loadedBytes + unloadedBytes, loadedBytes, unloadedBytes))
+      // The loaded store counts its own afresh, in place of what the open retained for it: counted once
+      afterLoad._2 should be(0L)
+      afterLoad._1 should be(loadedBytes + afterLoad._3)
+
+  atest("a device whose CRL fails is unloaded and not loaded again, and its stores are taken offline"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    createCrl(deviceDir)
+    val factory = newFactory()
+    for
+      _ <- writeRocksStore(deviceDir, storeId)
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = factory.opened.head
+      // An entry larger than a whole 1 MB stream: Stream.writeEntry's require kills the CRL thread
+      _ = crl.inner.save(TransactionId(new UUID(9, 6)),
+            recoveryState(storeId, TransactionId(new UUID(9, 6)), new Array[Byte](2 * 1024 * 1024)), () => ())
+      _ <- crl.failed
+      _ <- pumpUntil(host, !host.control.devices.devices.contains(deviceA) && crl.shutdownCalls.get > 0)
+      rescanned = host.control.discovery.checkForNewDevices()
+    yield
+      host.control.devices.devices.contains(deviceA) should be(false)
+      crl.shutdownCalls.get should be >= 1
+      host.control.router.loaded.contains(storeId) should be(false)
+      host.control.router.isOffline(storeId) should be(true)
+      host.control.discovery.disownedDeviceDirs should contain(deviceDir)
+      rescanned should be(Nil)
+      factory.opened.size should be(1)
 
   atest("unloading a device shuts its CRL down"):
     given ExecutionContext = executionContext

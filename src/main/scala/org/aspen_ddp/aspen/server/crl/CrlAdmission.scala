@@ -60,6 +60,13 @@ final class CrlAdmission(val limitBytes: Long):
     if bytes != null then
       total.addAndGet(-bytes)
 
+  /** Charges `bytes`, which `storeId`'s entries hold in the CRL, without a check and retained for it: the device's
+    * CRL is opened holding them, whether or not the store loads (crash-recovery-log F8) */
+  def chargeRetained(storeId: StoreId, bytes: Long): Unit =
+    if bytes > 0 then
+      charge(bytes)
+      retain(storeId, bytes)
+
   /** What `storeId` is retained for */
   def retainedBytes(storeId: StoreId): Long = Option(retained.get(storeId)).map(_.longValue).getOrElse(0L)
 
@@ -80,6 +87,14 @@ object CrlAdmission:
 
   /** What an object update's data costs the CRL */
   def objectUpdateBytes(dataSize: Long): Long = dataSize + ObjectUpdateOverheadBytes
+
+  /** What a transaction state the CRL holds is counted for: its record, description and object data */
+  def recoveredBytes(trs: TransactionRecoveryState): Long =
+    TxOverheadBytes + trs.serializedTxd.size + trs.objectUpdates.iterator.map(ou => objectUpdateBytes(ou.data.size)).sum
+
+  /** What a store's state in the CRL is counted for: its transaction states and its applied stubs */
+  def recoveredBytes(state: StoreRecoveryState): Long =
+    state.transactions.iterator.map(recoveredBytes).sum + state.appliedStubs.size * AppliedStubBytes
 
   /** Admits everything: for tests and stores with no device */
   def Unlimited: CrlAdmission = new CrlAdmission(Long.MaxValue)

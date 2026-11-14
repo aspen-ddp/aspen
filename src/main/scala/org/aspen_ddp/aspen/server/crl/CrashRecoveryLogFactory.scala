@@ -17,6 +17,10 @@ trait CrashRecoveryLogFactory {
 class CrlLocked(crlDir: os.Path)
   extends Exception(s"The CRL in $crlDir is already open, by this process or another. Refusing a second writer")
 
+/** The failure of every Future a CRL returns once it has failed (CrashRecoveryLog.failed): its thread or its writer
+ *  died of `cause`, and nothing more is written. The files hold what was written before, so a restart recovers it */
+class CrlFailed(val cause: Throwable) extends Exception(s"The CRL has failed: $cause", cause)
+
 /** Thrown by openCRL when the CRL's files hold other than what was written: an entry recovery needs fails its checksums,
  *  or an intact entry newer than the last one recovery found exists. The CRL cannot be recovered, as with any other
  *  failure to recover it, but the cause is named apart so corruption can be counted (Todo 3.1) */

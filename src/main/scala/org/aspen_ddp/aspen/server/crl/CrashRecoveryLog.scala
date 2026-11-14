@@ -197,4 +197,14 @@ trait CrashRecoveryLog {
 
   /** How many bytes of live state the CRL admits */
   def admissionLimitBytes: Long = Long.MaxValue
+
+  /** What the CRL held for each store when it was opened, as CrlAdmission counts it (`CrlAdmission.recoveredBytes`).
+    * The device's admission is charged for all of it at open, retained for each store until the store loads (and
+    * counts its own afresh) or its entries leave the CRL: the records of stores that do not load are copied forward
+    * like any other (crash-recovery-log F8). The default holds none, for CRLs that keep nothing on disk. */
+  def recoveredBytesByStore: Map[StoreId, Long] = Map()
+
+  /** Completes, with the cause, if the CRL fails: its thread or its writer died. Nothing is written from then on, and
+    * every Future it returned or returns fails with CrlFailed. The default never completes */
+  def failed: Future[Throwable] = Future.never
 }

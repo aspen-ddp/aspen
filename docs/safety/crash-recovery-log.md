@@ -606,18 +606,18 @@ no wrong state is recovered, assuming A1-A6.
 | 10.3 | Power loss with write caching | See below | Yes if A1; no if the drive lies |
 | 10.4 | A full stream | See below | Yes (F3 fixed) |
 | 10.5 | A slow fsync | See below | Safe; liveness only |
-| 10.6 | A dead CRL thread | See below | Safe for state; F9 for operations |
+| 10.6 | A dead CRL thread | See below | Safe; the device is unloaded until restart (F9 fixed) |
 | 10.7 | The device is pulled | See below | Safe |
 | 10.8 | Adoption by another host | See below | Safe under A3 |
 | 10.9 | Crash during transfer-out, before `crl_save.log` durable | See below | Safe |
 | 10.10 | Crash during transfer-out, after `crl_save.log` durable | See below | Safe |
 | 10.11 | Crash between `dropStore` and directory removal | See below | Safe |
-| 10.12 | Stores sharing a CRL, one rebuilt | See below | Safe except F8 and F12 |
+| 10.12 | Stores sharing a CRL, one rebuilt | See below | Safe except F12 (F8 fixed) |
 | 10.13 | Crash during recovery's re-save | See below | Safe (F3 fixed) |
 | 10.14 | CRL files unrecoverable at open | See below | Safe for the CRL; transient errors retried (F6) |
 | 10.15 | Sizing mismatch | See below | Safe for state, destructive (F6) |
 | 10.16 | A completion handler throws | See below | State safe; device stops |
-| 10.17 | Device full | See below | Not safe for liveness (F7) |
+| 10.17 | Device full | See below | Safe except on copy-on-write file systems (F7 fixed) |
 
 **10.1 Crash mid-write.** An appended entry is written after the last valid one in the active stream. A crash leaves
 either nothing, a prefix of the new bytes, or (without ordering guarantees from the disk) an arbitrary subset of its
@@ -653,7 +653,8 @@ requirement (A1), not a software property.
 **10.4 A full stream.** `canWriteEntry` fails, the next stream is recycled, live content with data in it is re-emitted
 into the same file from offset 0 (5.4, 5.7). If the entry still does not fit (live set larger than a stream because of
 F8 or a large pending entry), `Stream.writeEntry`'s `require` throws on the CRL thread: the CRL thread dies, the device
-stops (10.6). The files are unchanged by the failed attempt (the recycle is in memory), so a restart recovers. The
+stops (10.6). *2026-11-14:* F8 is fixed, so only an entry larger than half a stream gets here, and the device is then
+unloaded until restart (10.6). The files are unchanged by the failed attempt (the recycle is in memory), so a restart recovers. The
 overwrite itself is not crash-safe (F3).
 
 **10.5 A slow fsync.** Entries are strictly serial, so every vote on the device waits. The pending entry grows with the
@@ -662,12 +663,14 @@ at half a stream, so clients retransmit and the cluster slows. Long waits push t
 `Tx.CollisionWait`/heartbeat timeouts, so other stores drive them or abort. No state is lost. A `DSYNC` that never
 returns blocks the writer thread and the device indefinitely; there is no timeout or detection (Backlog.txt).
 
-**10.6 A dead CRL thread.** `onThreadDeath` logs. `save` calls are queued and never answered, so no vote, accept or
+**10.6 A dead CRL thread.** *Revised 2026-11-14 (F9 fixed):* every pending and later Future fails with `CrlFailed`,
+and the host unloads the device until it restarts. No safety loss. *Was:* `onThreadDeath` logs. `save` calls are queued and never answered, so no vote, accept or
 promise is sent: **no safety loss**. But also `readStoreState`, `deleteTransactions`, `dropStore` and
 `storesWithEntries` are served by the same thread and never complete: store loads, transfers, rebuilds and reconciles
 that wait on them hang. The stores stay installed and keep serving reads while they cannot vote (F9).
 
-**10.7 The device is pulled.** Writes fail with an I/O error: the writer thread dies (10.6). Whatever was acknowledged
+**10.7 The device is pulled.** Writes fail with an I/O error: the writer thread dies, and the host unloads the device
+(10.6). Whatever was acknowledged
 before is on the device. The host's device handling then takes over (not CRL logic). The pulled drive contains a
 consistent post-crash CRL, which is what makes adoption possible.
 
@@ -726,11 +729,13 @@ file is read, and refuses the device: it stays unloaded with its files and store
 each scan retries; 10.14 does not follow. A crash after the sizing file and before or during the stream files' creation
 opens as a new CRL at the recorded sizing. *Was:* the handling in 10.14 followed and every store was rebuilt.
 
-**10.16 A completion handler throws.** `runCompletionHandlers` is called inside the writer loop
+**10.16 A completion handler throws.** *2026-11-14:* handled as any writer death (10.6, F9 fixed).
+`runCompletionHandlers` is called inside the writer loop
 (`StreamWriter.scala:74-75`, `Stream.scala:35-38`): the exception escapes the loop, the writer thread dies, remaining
 handlers of that entry never run, and the device stops (10.6). No state is lost.
 
-**10.17 Device full.** The stream files are sparse: block allocation happens on first write to each region. On a full
+**10.17 Device full.** *Revised 2026-11-14 (F7 fixed):* the stream files are preallocated, so a CRL write never
+allocates and a full device cannot fail it, except on copy-on-write file systems. *Was:* The stream files are sparse: block allocation happens on first write to each region. On a full
 device (or a copy-on-write file system, where an overwrite also allocates) a CRL write can fail with `ENOSPC`; the
 writer dies. Since freeing space requires transactions (deletes, refcount changes), the device can be unable to
 recover without operator action (F7). FSIF freezes its own writes and keeps serving; the CRL has no equivalent.
@@ -999,6 +1004,18 @@ more than one device at a time.
 
 ### F7. Sparse stream files: a full device kills the CRL, and the CRL is needed to free space (medium confidence)
 
+> **FIXED (2026-11-14, Todo 1.8) except on copy-on-write file systems.** A new CRL's stream files are created
+> preallocated at their full size (`SimpleCRL.createStreamsIfNew`, `server.FilePreallocation`): on Linux with
+> `fallocate(2)` mode 0 through FFM (O(extents), nothing written; ext4 reserves clusters for the first-write
+> conversion of the unwritten extents), elsewhere or on `EOPNOTSUPP` by writing zeros. Each is written as
+> `<n>.crl.tmp`, renamed, and the directory forced before the writer starts, so a `.tmp` left at open marks a
+> creation that wrote nothing and is restarted. `StreamWriter` opens existing files only and refuses one of the wrong
+> size. A CRL write therefore never allocates a block, so a full device cannot fail it with ENOSPC, and freezing the
+> CRL's writes is not needed. Residual: btrfs and ZFS allocate on every overwrite; the open warns, and the CRL needs a
+> file system that overwrites in place (or `chattr +C`). A write that fails all the same kills the CRL, which is then
+> handled as in F9. Tests: `FilePreallocationSuite`; `SimpleCRLSuite` "A new CRL's stream files are fully allocated,
+> and an interrupted creation starts over".
+
 **Verification: PLAUSIBLE, severity liveness.** Confirmed by reading `StreamWriter.scala:40-47`: files are extended by a one-byte write at the end, giving sparse files; ENOSPC on a first write to a hole kills the writer thread (F9 then applies). Not executed. Fix sketch: `fallocate`-style preallocation (write zeros or `FileChannel.truncate` plus a real allocation) at creation.
 
 `StreamWriter` extends the files by writing the last byte (`StreamWriter.scala:43-47`) and never reserves blocks. The
@@ -1007,6 +1024,15 @@ The writer thread dies (`StreamWriter.scala:55-65`) and the device cannot proces
 the usual remedy, is itself a transaction. No `fallocate`, no free-space check at open.
 
 ### F8. Admission undercounts live CRL bytes, so C11 can fail and kill the CRL (medium confidence)
+
+> **FIXED (2026-11-14, Todo 1.8).** When the device loads, its admission is charged for everything the CRL holds,
+> store by store (`CrashRecoveryLog.recoveredBytesByStore`, by the formula `CrlAdmission.recoveredBytes` that
+> `Frontend.admitRecovered` also uses), each store's share retained for it (`CrlAdmission.chargeRetained`) before any
+> store loads. The paths that already release retained bytes then settle it: a store that loads replaces the share
+> with its own count (`StoreLoader`), and a drop, extraction or leftover drop releases it. Records of stores that do
+> not load are counted while they are copied forward. `Stream.writeEntry`'s `require` stays as the backstop, and a
+> failure there is handled as in F9. Test: `DeviceCrlSuite` "a device's admission counts, from its open, what its CRL
+> holds for every store, loaded or not".
 
 **Verification: PLAUSIBLE, severity liveness.** `new CrlAdmission(...)` starts at zero (`DeviceDiscovery.scala:566-567`); recovered records of stores that do not load are not admitted, yet the open-time re-save and every rotation copy them. If live bytes exceed the stream, `require(canWriteEntry)` (`Stream.scala:28`) throws on the CRL thread and the CRL dies (F9). Trigger needs a large live set held for non-loading stores. Fix sketch: at open, charge admission for every recovered record whatever its store, release on drop/transfer.
 
@@ -1021,6 +1047,19 @@ without a check. If live bytes exceed the stream during a rotation, `require(can
 once more).
 
 ### F9. Thread death is silent for the stores, and several callers hang (medium-high confidence)
+
+> **FIXED (2026-11-14, Todo 1.8).** A CRL has one death path: a writer death is queued to the CRL thread, which dies
+> of it. On death, every Future the CRL returned and has not answered (`readStoreState`, `deleteTransactions`,
+> `storesWithEntries`, `dropStore`, and `loadStore`, now overridden so each of its saves is tracked) fails with
+> `CrlFailed`, and so does every later call. `CrashRecoveryLog.failed` completes, and `onThreadDeath` runs once.
+> Handler-style save completions never run, as before, so no vote follows. The host
+> (`DeviceShutdown.crlFailed`, through `failed`) disowns the device directory, closes its stores, gossips them offline
+> and unloads the device. Nothing is written, so a restart recovers the files as after a crash. Deliberately not done:
+> no reload before the restart (a reopen loop would reach `CrlOpenAttempts` and declare the CRL lost) and no Failed
+> mark in the tree (that would rebuild every store, Todo 3.1). Rebuilds and transfers on the device are not
+> cancelled: their CRL calls and loads fail, and a restart resumes them. Tests: `SimpleCRLSuite` "A CRL whose writer
+> thread died fails every call ..." and "A CRL whose own thread died ..."; `DeviceCrlSuite` "a device whose CRL fails
+> is unloaded ...".
 
 **Verification: CONFIRMED, severity liveness.** `Main.scala:1702` only logs. After death nothing drains `ioQueue` (`SimpleCRL.scala:145-155`), so `save` completions never fire (stores never vote) and `readStoreState`/`dropStore`/`deleteTransactions`/`storesWithEntries` futures never complete. Nothing in the host detects the dead CRL or takes the device out of service. Fix sketch: on thread death mark the device failed (unload stores, stop answering as acceptors, raise an operator alarm) rather than leaving zombie stores.
 
@@ -1056,6 +1095,9 @@ and offsets: interleaved or overwritten entries, lost acknowledged state. The un
 declines fencing; this is the record of what that decision depends on.
 
 ### F11. Stream file creation and the `crl/` directory entries are not made durable (low confidence of harm)
+
+> **FIXED (2026-11-14, Todo 1.8)** with F7: the stream files are renamed into place and `crl/` is forced before the
+> writer starts.
 
 **Verification: PLAUSIBLE-low, severity liveness (spurious F6).** Not executed; on journaling filesystems the DSYNC write of the size-extension byte normally persists the new directory entry, but POSIX does not require it. Fix sketch: `DurableFiles.syncDirectory(crlDir)` after creating the files.
 
@@ -1186,11 +1228,11 @@ not executed). Fix sketch: close the writer in a constructor failure path.
 
 | CLAUDE.md claim | Code |
 |-----------------|------|
-| "a dead CRL thread stalls that device ... reads keep working" (`S/crl/CLAUDE.md`) | `readStoreState`, `dropStore`, `deleteTransactions` and `storesWithEntries` all need the CRL thread; they hang. Object reads of the stores continue. |
+| "a dead CRL thread stalls that device ... reads keep working" (`S/crl/CLAUDE.md`) | `readStoreState`, `dropStore`, `deleteTransactions` and `storesWithEntries` all need the CRL thread; they hang. Object reads of the stores continue. *Corrected 2026-11-14:* they fail with `CrlFailed`, and the host unloads the device (F9). |
 | "The sizing is fixed ... the CRL is treated as lost" | True, and it happens for any configuration edit, not only a disk fault (F6). |
 | Stream recycling "the oldest live data is copied to the head of the buffer whenever it is about to overwrite that live data" | The copy was written *over* the stream being recycled (F3). Fixed: the copy is now one stream ahead; crl/CLAUDE.md updated. |
 | "Only read at application startup" | Also read by `readStoreState` for every store load, transfer and drop. |
-| Admission "so a recycled stream's live copy-forward always fits" | Only for the bytes admission counts (F8). |
+| Admission "so a recycled stream's live copy-forward always fits" | Only for the bytes admission counts (F8). *Fixed 2026-11-14:* admission now counts every record at open. |
 
 ### 11.2 Reproducing the experiments
 

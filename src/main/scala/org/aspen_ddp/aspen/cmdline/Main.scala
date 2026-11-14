@@ -1693,8 +1693,8 @@ object Main {
       atomicWrite(bsCfgFile, yaml)
       scribe.info(s"Updated bootstrap config written to $bsCfgFile")
 
-    // One CRL per storage device. A dead CRL thread stalls only its own device's transactions, so it is logged
-    // rather than halting the host. The CRL last opened on each device is remembered so RunningHost.stop can shut
+    // One CRL per storage device. A dead CRL thread fails only its own device, which the host unloads until it
+    // restarts (DeviceShutdown.crlFailed), so it does not halt the host. The CRL last opened on each device is remembered so RunningHost.stop can shut
     // down its threads. One per path: a device is loaded again only once its previous CRL has shut down
     // (LocalDevices.closingCrls), so the new one replaces it. Shutdown is idempotent, so one already shut down at an
     // unload is harmless here.
@@ -1703,7 +1703,7 @@ object Main {
       def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
         val crl = SimpleCRL.DeviceFactory(t =>
           scribe.error(s"The CRL thread of storage device ${config.storageDeviceId} at $devicePath died. " +
-                       s"No transaction on its stores can complete until the host restarts", t)
+                       s"The device is unloaded until the host restarts", t)
         ).openCRL(devicePath, config)
         openedCrls.updateAndGet(_ + (devicePath -> crl))
         crl

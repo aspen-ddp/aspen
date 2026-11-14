@@ -2,9 +2,9 @@ package org.aspen_ddp.aspen.server.crl.simple
 
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.server.{DurableFiles, StorageDeviceConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlLocked, CrlSizingMismatch,
-  StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlFailed, CrlLocked,
+  CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
 import scribe.Logging
 
 import java.util.UUID
@@ -35,7 +35,7 @@ object SimpleCRL extends Logging:
 
   case class WriteComplete(serialNumber: Long) extends ActionRequest
 
-  /** Queued when the writer thread dies, so the open-time re-save does not wait forever for its write */
+  /** Queued when the writer thread dies: the open-time re-save fails with it, and the CRL thread dies of it */
   case class WriterDied(cause: Throwable) extends ActionRequest
 
   case class Shutdown(completionHandler: () => Unit) extends ActionRequest
@@ -102,6 +102,7 @@ object SimpleCRL extends Logging:
         (StreamId(i), streamsDir / s"$i.crl")
       ).toList
 
+      createStreamsIfNew(streamsDir, files.map(_._2), sizing.maxSizeInBytes)
       checkSizing(streamsDir, files.map(_._2).toSet, sizing.maxSizeInBytes)
 
       val r = Recovery.recover(files)
@@ -143,8 +144,30 @@ object SimpleCRL extends Logging:
       DurableFiles.write(file, requested.encode)
       requested
 
+  private val warnedCopyOnWrite = new AtomicBoolean(false)
+
+  /** Creates the stream files of a new CRL, preallocated at their full size (FilePreallocation), so no CRL write ever
+    * allocates a block and a full device cannot fail one with ENOSPC (crash-recovery-log F7). Each is written as
+    * `<name>.tmp` and renamed into place, and the directory is forced once all are: only then does the writer start.
+    * So a `.tmp` file left at open means a creation that never finished and wrote no entry, and it starts over.
+    * A copy-on-write file system allocates on every overwrite, which no preallocation prevents: warned once. */
+  private def createStreamsIfNew(streamsDir: os.Path, streams: List[os.Path], maxSizeInBytes: Long): Unit =
+    def tmpOf(f: os.Path): os.Path = f / os.up / s"${f.last}.tmp"
+    val leftoverTmps = os.list(streamsDir).filter(_.last.endsWith(".crl.tmp"))
+    if leftoverTmps.nonEmpty then
+      logger.warn(s"The creation of the CRL in $streamsDir did not finish. Creating its stream files again")
+      (leftoverTmps ++ streamFiles(streamsDir)).foreach(os.remove(_))
+    if streamFiles(streamsDir).isEmpty then
+      if FilePreallocation.isCopyOnWrite(streamsDir) && warnedCopyOnWrite.compareAndSet(false, true) then
+        logger.warn(s"The CRL in $streamsDir is on a copy-on-write file system: its writes allocate, so a full " +
+                    s"device can stop it. Use a file system that overwrites in place, or disable copy-on-write " +
+                    s"for the directory (chattr +C)")
+      streams.foreach(f => FilePreallocation.preallocate(tmpOf(f), maxSizeInBytes))
+      streams.foreach(f => os.move(tmpOf(f), f, atomicMove = true))
+      DurableFiles.syncDirectory(streamsDir)
+
   /** A directory with no stream files is a new CRL. Otherwise its files must be exactly `expected`, each
-    * `maxSizeInBytes` long (StreamWriter creates them at that size) */
+    * `maxSizeInBytes` long (createStreamsIfNew creates them at that size) */
   private def checkSizing(streamsDir: os.Path, expected: Set[os.Path], maxSizeInBytes: Long): Unit =
     val present = streamFiles(streamsDir)
     if present.nonEmpty then
@@ -172,9 +195,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   private val ioQueue = new LinkedBlockingQueue[ActionRequest]()
 
-  private val writer = StreamWriter(maxSizeInBytes, files, t =>
-    ioQueue.put(WriterDied(t))
-    onThreadDeath(t))
+  // Reported through the CRL thread, which dies of it: the CRL has one death path
+  private val writer = StreamWriter(maxSizeInBytes, files, t => ioQueue.put(WriterDied(t)))
   private var currentStream: Int = r.activeStreamId.number
   private var currentLogEntry: LogEntry = new LogEntry(r.initialPreviousEntryLocation,
     r.initialNextEntrySerialNumber, r.initialOldestEntryNeeded)
@@ -223,19 +245,53 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   initializing = false
 
+  override val recoveredBytesByStore: Map[StoreId, Long] =
+    val byStore = transactions.valuesIterator.map(tx => tx.id.storeId -> CrlAdmission.recoveredBytes(tx.state)) ++
+      stubs.keysIterator.map(id => id.storeId -> CrlAdmission.AppliedStubBytes)
+    byStore.toList.groupMapReduce(_._1)(_._2)(_ + _)
+
   // Before the thread starts: its catch counts shutdownComplete down
   private val shutdownRequested = new AtomicBoolean(false)
   private val shutdownComplete = new CountDownLatch(1)
+
+  // The CRL has failed: its thread is dead (of its own error or the writer's), and nothing it is asked from now on is
+  // answered. `cause` is set before `dead`
+  @volatile private var cause: Throwable = null
+  @volatile private var dead = false
+  private val death = Promise[Throwable]()
+
+  // The promises of the Future-returning calls not answered yet. A death fails them, so no caller waits on a dead CRL
+  // (crash-recovery-log F9). Handler-style completions (save, saveAppliedStub) are never run after a death: nothing
+  // that waits on one, a vote above all, may proceed without the write
+  private val pending = java.util.concurrent.ConcurrentHashMap.newKeySet[Promise[?]]()
+
+  private def failPending(): Unit =
+    pending.forEach(p => p.tryFailure(CrlFailed(cause)))
+
+  /** Queues `request(p)` and returns `p`'s future, failed with CrlFailed if the CRL is or becomes dead first. Added
+    * before `dead` is checked: either the dying thread's failPending finds `p`, or this check sees the death */
+  private def tracked[T](request: Promise[T] => ActionRequest): Future[T] =
+    val p = Promise[T]()
+    pending.add(p)
+    p.future.onComplete(_ => pending.remove(p))(using scala.concurrent.ExecutionContext.parasitic)
+    ioQueue.put(request(p))
+    if dead then
+      p.tryFailure(CrlFailed(cause))
+    p.future
 
   private val ioThread = new Thread {
     override def run(): Unit =
       try crlThread()
       catch case t: Throwable =>
         logger.error("CRL thread died", t)
+        cause = t
+        dead = true
+        failPending()
         // Nothing takes the Shutdown that shutdown() queues now, so the shutdown is completed here: the files are
         // closed and the latch counted down once the writer finishes what it holds. Without it the device could not
         // be loaded again (its path stays in closingCrls) and the host's stop would wait forever.
         shutdownWriter(() => shutdownComplete.countDown())
+        death.trySuccess(t)
         onThreadDeath(t)
   }
   ioThread.start()
@@ -317,7 +373,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
         case DeleteAppliedStub(storeId, transactionId) => onDeleteAppliedStub(storeId, transactionId)
 
-        case WriterDied(_) => () // Reported through onThreadDeath
+        case WriterDied(t) => throw t // Nothing more can be written: the CRL dies with its writer
 
         case WriteComplete(serialNumber) =>
           logger.trace(s"CRL write complete for entry serial number: ${serialNumber}")
@@ -445,9 +501,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   def getAppliedStubs(storeId: StoreId): Set[TransactionId] = blockingRead(storeId).appliedStubs
 
   private def blockingRead(storeId: StoreId): StoreRecoveryState =
-    val blockingQueue = new LinkedBlockingQueue[StoreRecoveryState]()
-    ioQueue.put(GetRecoveryState(storeId, state => blockingQueue.put(state)))
-    blockingQueue.take()
+    scala.concurrent.Await.result(readStoreState(storeId), scala.concurrent.duration.Duration.Inf)
 
   def save(transactionId: TransactionId,
            state: TransactionRecoveryState,
@@ -467,19 +521,26 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     ioQueue.put(DeleteAppliedStub(storeId, txid))
 
   override def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
-    val p = Promise[Unit]()
-    ioQueue.put(DeleteTransactions(storeId, txids, () => p.trySuccess(())))
-    p.future
+    tracked(p => DeleteTransactions(storeId, txids, () => p.trySuccess(())))
 
   override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
-    val p = Promise[StoreRecoveryState]()
-    ioQueue.put(GetRecoveryState(storeId, state => p.success(state)))
-    p.future
+    tracked(p => GetRecoveryState(storeId, state => p.trySuccess(state)))
 
   override def storesWithEntries(): Future[Set[StoreId]] =
-    val p = Promise[Set[StoreId]]()
-    ioQueue.put(GetStoresWithEntries(stores => p.success(stores)))
-    p.future
+    tracked(p => GetStoresWithEntries(stores => p.trySuccess(stores)))
+
+  /** As the default, with every save tracked, so a death fails the load rather than leaving it waiting */
+  override def loadStore(storeId: StoreId, state: StoreRecoveryState): Future[Unit] =
+    given scala.concurrent.ExecutionContext = scala.concurrent.ExecutionContext.parasitic
+    // Stubs first: a stub's save replaces a transaction's state of the same id, which a later save then keeps
+    Future.sequence(state.appliedStubs.toList.map: txid =>
+      tracked[Unit](p => SaveAppliedStub(storeId, txid, () => p.trySuccess(())))
+    ).flatMap: _ =>
+      Future.sequence(state.transactions.map: trs =>
+        tracked[Unit](p => SaveTransaction(trs.txd.transactionId, trs, () => p.trySuccess(())))
+      ).map(_ => ())
+
+  override def failed: Future[Throwable] = death.future
 
   /** Idempotent: a later call waits for the first one's shutdown, as a second Shutdown would find no thread */
   override def shutdown(): Unit =

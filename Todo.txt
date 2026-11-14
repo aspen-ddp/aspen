@@ -28,18 +28,7 @@ RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-re
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.8  CRL writer death: F9 (+ F7, F8, 11.1 table)                                                            [M]
-     F9: the CRL thread's death only logs (cmdline/Main.scala:1704). readStoreState, dropStore,
-     deleteTransactions and storesWithEntries then hang, and zombie stores keep serving reads but cannot vote.
-     Fix: fail pending futures, mark the device failed (unload its stores), and alarm.
-     Remove the realistic killers too:
-       F8: admission starts at zero, and recovered records of non-loading stores (Offline, rebuild-required,
-           awaiting-drop, transferring-out) are never charged, so `require(canWriteEntry)` can throw on the CRL
-           thread. Charge every recovered record at open, and release it on drop or transfer.
-       F7: stream files are sparse (a one-byte write at the end), so ENOSPC on a hole kills the writer.
-           Preallocate real blocks. ENOSPC on the CRL must freeze the device's writes, not mark the device failed
-           (Backlog "Full storage devices").
-     Correct server/crl/CLAUDE.md: "reads keep working" holds only for object reads.
+(no open items)
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence

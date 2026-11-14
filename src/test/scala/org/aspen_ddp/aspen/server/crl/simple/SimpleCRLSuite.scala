@@ -9,7 +9,9 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation, Tx}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlCorrupt, CrlLocked, CrlSizingMismatch, StoreRecoveryState,
+import org.aspen_ddp.aspen.server.FilePreallocationSuite
+import org.aspen_ddp.aspen.server.FilePreallocation
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlFailed, CrlLocked, CrlSizingMismatch, StoreRecoveryState,
   TransactionRecoveryState}
 
 import java.nio.ByteBuffer
@@ -88,6 +90,12 @@ class SimpleCRLSuite extends FileBasedTests {
     for i <- 0 until numStreams do
       lst = (StreamId(i), tdir / f"$i.log") :: lst
     lst.reverse
+
+  /** A writer over `numStreams` stream files, preallocated as SimpleCRL creates them */
+  def newWriter(maxSizeInBytes: Long, numStreams: Int): StreamWriter =
+    val files = streams(numStreams)
+    files.foreach((_, f) => FilePreallocation.preallocate(f, maxSizeInBytes))
+    new StreamWriter(maxSizeInBytes, files)
 
   private def saveAndWait(crl: CrashRecoveryLog, txid: TransactionId, trs: TransactionRecoveryState): Unit =
     val q = new LinkedBlockingQueue[String]()
@@ -440,7 +448,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     def completionHandler(): Unit = queue.put("")
 
-    val streamWriter = new StreamWriter(4096 * 1000, streams(1))
+    val streamWriter = newWriter(4096 * 1000, 1)
 
     val tx = Tx(txid, trs, None, None)
 
@@ -477,7 +485,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val streamWriter = new StreamWriter(4096*1000, streams(1))
+    val streamWriter = newWriter(4096*1000, 1)
 
     val tx = Tx(txid, trs, None, None)
     val le = LogEntry(StreamLocation.Null, 0, 0)
@@ -719,16 +727,96 @@ class SimpleCRLSuite extends FileBasedTests {
     SimpleCRL(tdir, 3, 8192).crl.shutdown()
   }
 
-  test("A CRL whose writer thread died keeps its lock until its shutdown") {
+  /** Every Future-returning call of a failed CRL fails with CrlFailed, whether queued before the death or after */
+  private def assertFailsFast(crl: CrashRecoveryLog): Unit =
+    def failsFast(f: => scala.concurrent.Future[?]): Unit =
+      val result = Await.ready(f, 10.seconds).value.get
+      assert(result.failed.toOption.exists(_.isInstanceOf[CrlFailed]), s"expected CrlFailed, got $result")
+    failsFast(crl.readStoreState(storeId))
+    failsFast(crl.deleteTransactions(storeId, List(transactionId)))
+    failsFast(crl.storesWithEntries())
+    failsFast(crl.dropStore(storeId))
+    failsFast(crl.loadStore(storeId2, StoreRecoveryState(List(trsValidTxd2), Set(transactionId2))))
+    assertThrows[CrlFailed](crl.getFullRecoveryState(storeId))
+
+  test("A CRL whose writer thread died fails every call, reports the death once and recovers on reopen") {
     val died = new LinkedBlockingQueue[Throwable]()
     val i = SimpleCRL(tdir, 3, 1024 * 1024, t => died.put(t))
-    i.crl.save(transactionId, trsValidTxd, () => throw new RuntimeException("completion handler failed"))
-    assert(died.poll(10, TimeUnit.SECONDS) != null)
+    val err = new RuntimeException("completion handler failed")
+    i.crl.save(transactionId, trsValidTxd, () => throw err)
+    // Queued behind the save: answered before the death or failed by it, never left waiting
+    val pendingRead = i.crl.readStoreState(storeId)
 
-    // The CRL thread still runs, so the CRL is still open
-    assertThrows[CrlLocked](SimpleCRL(tdir, 3, 1024 * 1024))
+    assert(Await.result(i.crl.failed, 10.seconds) eq err)
+    Await.ready(pendingRead, 10.seconds)
+    assertFailsFast(i.crl)
+    assert(died.poll(10, TimeUnit.SECONDS) eq err)
+    assert(died.poll(100, TimeUnit.MILLISECONDS) == null, "the death was reported twice")
+
+    assertShutdownReturns(i.crl)
+    // The entry was written before its handler threw
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i2.trsList.map(_.storeId) == List(storeId))
+    i2.crl.shutdown()
+  }
+
+  test("A CRL whose own thread died fails every call, including those queued behind the fatal one") {
+    val i = SimpleCRL(tdir, 3, 8192)
+    val tooBig = ObjectUpdate(ou1.objectId, DataBuffer(new Array[Byte](8192)))
+    i.crl.save(transactionId, trsValidTxd.copy(objectUpdates = List(tooBig)), () => ())
+    val queuedBehind = i.crl.storesWithEntries()
+
+    assert(Await.result(i.crl.failed, 10.seconds).isInstanceOf[IllegalArgumentException])
+    val r = Await.ready(queuedBehind, 10.seconds).value.get
+    assert(r.failed.toOption.exists(_.isInstanceOf[CrlFailed]))
+    assertFailsFast(i.crl)
+    assertShutdownReturns(i.crl)
+  }
+
+  test("A live CRL has not failed") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    assert(!i.crl.failed.isCompleted)
     i.crl.shutdown()
-    SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
+  }
+
+  test("A new CRL's stream files are fully allocated, and an interrupted creation starts over") {
+    val size = 1024 * 1024L
+    SimpleCRL(tdir, 3, size).crl.shutdown()
+    val files = (0 until 3).map(n => tdir / s"$n.crl")
+    files.foreach: f =>
+      assert(os.size(f) == size)
+      assert(FilePreallocationSuite.allocatedBytes(f) >= size, s"$f is sparse")
+    assert(os.list(tdir).forall(!_.last.endsWith(".tmp")))
+
+    // As a crash between the renames leaves it: one file still under its temporary name
+    os.move(files(1), tdir / "1.crl.tmp")
+    val i = SimpleCRL(tdir, 3, size)
+    assert(i.trsList.isEmpty)
+    assert(files.forall(os.exists(_)) && !os.exists(tdir / "1.crl.tmp"))
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    i.crl.shutdown()
+    val i2 = SimpleCRL(tdir, 3, size)
+    assert(i2.trsList.map(_.storeId) == List(storeId))
+    i2.crl.shutdown()
+  }
+
+  test("A reopened CRL reports what it holds for each store, as admission counts it") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i.crl.recoveredBytesByStore.isEmpty)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    saveAndWait(i.crl, transactionId2, trsValidTxd2)
+    val q = new LinkedBlockingQueue[String]()
+    i.crl.saveAppliedStub(storeId3, transactionId3, () => q.put(""))
+    q.take()
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i2.crl.recoveredBytesByStore == Map(
+      storeId -> CrlAdmission.recoveredBytes(trsValidTxd),
+      trsValidTxd2.storeId -> CrlAdmission.recoveredBytes(trsValidTxd2),
+      storeId3 -> CrlAdmission.AppliedStubBytes))
+    i2.crl.shutdown()
   }
 
   test("A dead CRL thread is reported") {
@@ -1268,7 +1356,7 @@ class SimpleCRLSuite extends FileBasedTests {
   test("Delete in same log entry as save") {
     val queue = new LinkedBlockingQueue[String]()
 
-    val streamWriter = new StreamWriter(4096 * 1000, streams(1))
+    val streamWriter = newWriter(4096 * 1000, 1)
     val stream = new Stream(stream0, streamWriter, UUID.randomUUID(), 0)
 
     val tx1 = Tx(txid, trs, None, None)
@@ -1462,7 +1550,7 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("StreamWriter writes every buffer of a write with more buffers than IOV_MAX") {
-    val sw = StreamWriter(1024 * 1024, streams(1))
+    val sw = newWriter(1024 * 1024, 1)
     val buffers = (0 until 3000).map(i => ByteBuffer.wrap(Array[Byte]((i % 127).toByte, 1))).toArray
     val done = new CountDownLatch(1)
     sw.write(stream0, 10, buffers, () => done.countDown())

@@ -284,9 +284,40 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
             logger.warn(s"Failed to unload storage device $deviceId, $unloadedAs. The next " +
                         s"check of the device will try again. Error: $t")
 
+  /** Takes a loaded device whose CRL has failed (CrashRecoveryLog.failed: its thread or its writer died) out of
+   *  service: none of its stores can vote again, and every call on the CRL fails (crash-recovery-log F9). The directory
+   *  is disowned so no scan loads it again, its stores are closed and gossiped offline, and the device and its CRL are
+   *  unloaded. Nothing is written: the files hold what the CRL wrote before it failed, so the host's restart
+   *  recovers them as after a crash. Not reloaded before that: a CRL failing again would loop, and repeated open
+   *  failures end in a lost CRL (DeviceDiscovery.CrlOpenAttempts). Nor is the device declared Failed in the tree,
+   *  which would rebuild every store it holds (safety SL, Todo 3.1).
+   *
+   *  Rebuilds and transfers on the device are not cancelled: their CRL calls and store loads now fail, and a restart
+   *  resumes them from what they left on disk, as after a crash. */
+  def crlFailed(local: LocalStorageDeviceState, cause: Throwable): Unit =
+    val deviceId = local.storageDeviceId
+    if ctx.devices.devices.get(deviceId).exists(_ eq local) && !relinquishingDevices.contains(deviceId) then
+      relinquishingDevices += deviceId
+      logger.error(s"The CRL of storage device $deviceId at ${local.devicePath} has failed. None of its stores can " +
+                   s"vote: unloading the device until the host restarts", cause)
+      ctx.discovery.disown(local.devicePath)
+      val closed =
+        try
+          closeStoresToRelinquish(local, (storeId: StoreId) =>
+            ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now)))
+        catch case t: Throwable => Future.failed(t)
+      closed.onComplete: result =>
+        relinquishingDevices -= deviceId
+        result.failed.foreach(t => logger.error(s"Failed to close the stores of storage device $deviceId, whose CRL " +
+                                                s"has failed. Unloading it anyway: $t"))
+        if ctx.devices.devices.get(deviceId).exists(_ eq local) then
+          unloadDevice(deviceId)
+          logger.info(s"Storage device $deviceId, whose CRL has failed, is unloaded")
+
   /** Closes every store open on a relinquished device, one at a time, until none is left: one loaded meanwhile is
-   *  closed by another round. */
-  private def closeStoresToRelinquish(local: LocalStorageDeviceState): Future[Unit] =
+   *  closed by another round. `onClosed` runs for each once it is offline. */
+  private def closeStoresToRelinquish(local: LocalStorageDeviceState,
+                                      onClosed: StoreId => Unit = _ => ()): Future[Unit] =
     val open = storesToClose(local)
     if open.isEmpty then
       Future.unit
@@ -295,7 +326,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         ctx.closeStoreForShutdown(storeId).transform(_ => Success(())).map: _ =>
           ctx.router.markOffline(storeId)
           local.offlineStores += storeId
-      .flatMap(_ => closeStoresToRelinquish(local))
+          onClosed(storeId)
+      .flatMap(_ => closeStoresToRelinquish(local, onClosed))
 
   /** The stores closeStoresForShutdown picks: those loaded on the device and not offline. A crash
    *  mid-shutdown reloads the device, ShuttingDown, with its stores served, and they are closed again. */

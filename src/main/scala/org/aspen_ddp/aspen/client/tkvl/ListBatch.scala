@@ -27,7 +27,7 @@ private[tkvl] object ListBatch:
 
   /** Scans right from `start` and hands each of `ops`, ascending, to the node whose range holds it. Returns the nodes
     * holding ops, left to right, and every node read, `start` included. Fails with `BelowMinimumError` if the first
-    * op is below `start`'s range.
+    * op is below `start`'s range. A conditional put its node declines (`BatchOp.Put.appliesTo`) is dropped here.
     */
   def assign(reader: ObjectReader, start: ListNode, ops: List[BatchOp]): Future[(List[Assigned], List[ListNode])] =
     given ExecutionContext = reader.client.clientContext
@@ -37,9 +37,12 @@ private[tkvl] object ListBatch:
              ops: List[BatchOp],
              assigned: List[Assigned],
              read: List[ListNode]): Future[(List[Assigned], List[ListNode])] =
-      val (here, rest) = node.link match
+      val (inRange, rest) = node.link match
         case None => (ops, Nil)
         case Some(l) => ops.span(op => ordering.compare(op.key, l.minimum) < 0)
+      val here = inRange.filter:
+        case p: BatchOp.Put => p.appliesTo(node)
+        case _ => true
       val nowAssigned = if here.isEmpty then assigned else Assigned(node, here) :: assigned
       val nowRead = node :: read
 

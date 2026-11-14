@@ -1088,6 +1088,13 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > not bounded by R-N9's `w - t` argument (no Tx does not imply "never saw T"); only message loss leaves it exposed, and
 > the driver resends `TxFinalized` only until its own store receives it. The ErrorTree regression and the orphan
 > allocation entry are unchanged.
+>
+> **Fix 2026-11-14 (Todo 2.4): marker part FIXED.** A re-run marker no longer regresses ErrorTree marks (a mark
+> replaces a held one only for a later miss) and never rewrites a held UnackedCommits entry (repair-process F10). It
+> can still re-create an entry the scan already deleted (no tombstone), and that is harmless under the transaction
+> horizon: the scan deletes an entry only while the store holds no Tx for T, the store never rejoins T (finalized
+> cache entry, then the forget floor), and a late commit applies only at a Tx holding its own commit vote, so the lost
+> `TxFinalized` no longer matters for these entries. Remaining: the orphan allocation entry (Todo 5.5).
 
 ### 10.0a New findings from the addendum refresh (2026-11-10, `c181375b`)
 

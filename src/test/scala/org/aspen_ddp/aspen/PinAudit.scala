@@ -35,7 +35,7 @@ class PinAudit(client: AspenClient):
     built.filter(b => b.replaySafe && b.description.notes.contains(s"replay-safe: $reason"))
 
 object PinAudit:
-  def isMark(b: Built): Boolean = b.description.notes.contains("replay-safe: missed-update marks are idempotent")
+  def isMark(b: Built): Boolean = b.description.notes.contains("replay-safe: missed-update marks only move forward")
 
   def touches(b: Built, ptr: ObjectPointer): Boolean =
     b.description.requirements.exists:

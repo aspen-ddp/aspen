@@ -159,7 +159,7 @@ read), absent means "deleted, or its allocation has not been recorded yet" (sect
 4. `MissedUpdateMarker.mark` (`MissedUpdateMarker.scala:302-309`) queues entries per pool. Per pool at most one write
    is outstanding. Entries arriving meanwhile wait; the queue is a `LinkedHashMap` keyed by (poolIndex, objectId) for
    updates and (poolIndex, txid) for UnackedCommits entries, so a store missing one object repeatedly produces one write of
-   the newest miss (`:316-327`, higher `missedTimestamp` wins *within the queue only*). Batches hold at most 256 entries
+   the newest miss (`:316-327`, higher `missedTimestamp` wins; since 2026-11-14 also against the tree, see step 5). Batches hold at most 256 entries
    of both kinds with a half-and-half guarantee (`:335-353`).
 5. `writeBatch` (`:369-397`) is one transaction on the pool's ErrorTree and UnackedCommits trees, retried until
    success except `UnknownStoragePool`/`TransactionCreationError` (`StopRetrying`, `:377-386`). If the transaction
@@ -168,8 +168,8 @@ read), absent means "deleted, or its allocation has not been recorded yet" (sect
    after the batch commits; the transaction cannot be forgotten before that (`:101-106`).
 
 Important properties used later: entries are written *after* the transaction committed and *at least 2 s later*;
-the entry value's timestamp is the miss's start timestamp, not its commit time; an entry write can overwrite an
-existing entry with an older `missedTimestamp` (flaw F10).
+the entry value's timestamp is the miss's start timestamp, not its commit time; an entry write never replaces an
+existing entry with an older `missedTimestamp` (flaw F10, fixed 2026-11-14: conditional checked puts).
 
 ---
 
@@ -746,8 +746,8 @@ I (blind insert of the same key):
   I was written (I follows the finalizer by >= 2 s) and so it is covered by E1 for any read started after C2 committed.
   A read started before C2 committed cannot make D's precondition `complete` with respect to C2's entry since C2's
   entry is independent. So the interleavings are safe.
-- **Exception:** the unguarded delete `deleteEntry` after `repairDelete` (`StoreRepairer.scala:191`) and the
-  marker's `missedTimestamp` regression on overwrite (F10), see section 13.
+- **Exception:** the unguarded delete `deleteEntry` after `repairDelete` (`StoreRepairer.scala:191`), see section 13.
+  The marker's `missedTimestamp` regression on overwrite (F10) is fixed (2026-11-14).
 
 ### 12.5 Entry for an object that has since been deleted
 
@@ -891,7 +891,7 @@ head first".
 | F7 | Repair's entry-deletion transaction has tracking disabled unconditionally, so a store missing it is never marked | low | medium |
 | F8 | `stale` outcomes never escalate: a hot or perpetually busy object is retried forever | medium (resource), low-medium | medium |
 | F9 | `ScanTimedOut` throws away deferral counts and doubles the interval while a backlog exists | low-medium | medium |
-| F10 | Marker overwrite can replace a newer `missedTimestamp` with an older one | low | medium |
+| F10 | **FIXED** 2026-11-14. Marker overwrite can replace a newer `missedTimestamp` with an older one | low | medium |
 | F11 | Object-level proof is a `ExclusiveRevisionLock`; blind SetMin/SetMax/SetLeft/SetRight do not move the revision | low | low |
 | F12 | Reader ranks revisions by timestamp before count; timestamp bumps from refcount updates can make a stale revision win the ranking and stall reads | low (availability) | low |
 | F13 | DataObject `read.timestamp < current.timestamp` is a silent skip that counts as complete | low | low |
@@ -1040,6 +1040,19 @@ Confidence: medium (depends on backlog size and latency).
 > **Refresh (replay pins): UNCHANGED, reach widened.** The batch is now `replaySafe` (`MissedUpdateMarker.scala:165`): a
 > replay of an old batch, or the marker re-run by a driver adopting an old accepted commit (Ruling 13), regresses entries
 > the same way and re-creates UnackedCommits entries already deleted (transaction-recovery R-N6).
+
+> **Fix 2026-11-14 (Todo 2.4): FIXED.** `MissedUpdateMarker.writeBatch` writes conditional checked puts
+> (`TKVLInsert.replaces`, dropped in `ListBatch.assign` when declined): an ErrorTree mark replaces a held one only for a
+> later `missedTimestamp` (else no write, no requirement), and its overwrite carries the key's `KeyRevision`, so a
+> concurrent mark aborts one batch and the retry decides again. An UnackedCommits entry is written only where none is
+> held. A replayed or re-run batch therefore writes a key only where none is held: a mark for an already repaired
+> object costs one more pass, and an UnackedCommits entry re-created after the scan deleted it is reconciled as a
+> no-op and deleted again (the scan deletes one only while the store holds no Tx for T, and a store never rejoins a
+> transaction it forgot: `Frontend.receivePrepare` ignores a finalized one and refuses one below the floor).
+> Tests: MissedUpdateFinalizationActionSuite "an older miss marked after a newer one leaves the newer mark", "an
+> UnackedCommits entry written again is kept as it was"; StoreRepairerSuite "a UnackedCommits entry written again after
+> the scan deleted it changes nothing and is deleted again"; TKVLBatchSuite "conditional insert" tests. Cost: two
+> clients marking one key at once now abort one batch.
 
 **F10. Marker overwrite can regress `missedTimestamp`** (`MissedUpdateMarker.scala:316-327,369-376`).
 Within a pool queue the newest `missedTimestamp` wins, but across batches a late-arriving older miss overwrites the

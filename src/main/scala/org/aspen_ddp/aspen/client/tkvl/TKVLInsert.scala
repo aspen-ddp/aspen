@@ -14,14 +14,21 @@ import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
   *
   * With `requiredRevision`, the key must be held at that revision (`PutRequirement.AtRevision`, KeyValue-object trees
   * only).
+  *
+  * With `replaces`, the insert is conditional and checked: given the value the node read holds for `key`, the
+  * predicate says whether this insert replaces it. If not, the insert is dropped from the batch: no write and no
+  * requirement. An absent key is always inserted. Either way a competing write of the key aborts the transaction,
+  * and the retry reads and decides again, so writers that all use the same predicate never move the value backward
+  * (`MissedUpdateMarker`). It takes none of the other options.
   */
 final case class TKVLInsert(key: Key,
                             value: Value,
                             requireDoesNotExist: Boolean = false,
                             blind: Boolean = false,
-                            requiredRevision: Option[ObjectRevision] = None):
-  require(List(requireDoesNotExist, blind, requiredRevision.isDefined).count(identity) <= 1,
-    "A TKVLInsert takes at most one of requireDoesNotExist, blind and requiredRevision")
+                            requiredRevision: Option[ObjectRevision] = None,
+                            replaces: Option[Value => Boolean] = None):
+  require(List(requireDoesNotExist, blind, requiredRevision.isDefined, replaces.isDefined).count(identity) <= 1,
+    "A TKVLInsert takes at most one of requireDoesNotExist, blind, requiredRevision and replaces")
 
   def requirement: PutRequirement =
     if requireDoesNotExist then PutRequirement.MustNotExist

@@ -169,8 +169,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       pool <- client.getStoragePool(Radicle.poolId)
       entry <- pool.errorTree.get(buildErrorKey(net.storeId0, ptr.id))
     yield
-      // errorTree.set is an unconditional last-write-wins replace and storePointer is a stable
-      // property of the pointer, so the re-mark writes identical bytes over the first entry.
+      // The re-mark is for the same miss, not a later one, so the first entry is kept.
       entry.isDefined shouldBe true
       decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
 
@@ -631,29 +630,80 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
         Future.failed(new org.aspen_ddp.aspen.client.tkvl.NodeSizeExceeded)
     marker.mark(List(missed(net.storeId0))).failed.map(_ shouldBe a [org.aspen_ddp.aspen.client.tkvl.NodeSizeExceeded])
 
-  atest("a mark batch is blind and marked replay-safe"):
+  atest("a mark batch is checked and marked replay-safe"):
     val marker = new ObservedMarker
     val txid = TransactionId(UUID.randomUUID())
     val entry = UnackedCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
     val update = missed(net.storeId0)
     val errorKey = buildErrorKey(update.store, update.objectId)
+    val unackedKey = UnackedCommitEntry.key(net.storeId0, txid)
     for
       _ <- marker.mark(List(update))
       audit = new PinAudit(client)
-      // A rewrite of a held key: blind, so it carries no KeyRevision a concurrent mark could fail
-      _ <- marker.mark(List(update.copy(missedTimestamp = HLCTimestamp(2000L))),
+      // A rewrite of a held key carries its KeyRevision, so a concurrent mark of it aborts one of the two; a new key
+      // carries DoesNotExist
+      _ <- marker.mark(List(update.copy(missedTimestamp = HLCTimestamp(2000L << 16))),
                        List(MissedUnackedCommit(net.storeId0, txid, entry)))
       _ = audit.stop()
     yield
       audit.unpinned shouldBe empty
-      audit.replaySafeWith("missed-update marks are idempotent") should not be empty
+      audit.replaySafeWith("missed-update marks only move forward") should not be empty
       val keyReqs = audit.built.flatMap(_.description.requirements).collect:
         case kvu: KeyValueUpdate => kvu.requirements
-      keyReqs.flatten.exists:
+      .flatten
+      keyReqs.exists:
         case KeyValueUpdate.KeyRevision(k, _) => k == errorKey
-        case KeyValueUpdate.DoesNotExist(k) => k == errorKey
         case _ => false
-      .shouldBe(false)
+      .shouldBe(true)
+      keyReqs.exists:
+        case KeyValueUpdate.DoesNotExist(k) => k == unackedKey
+        case _ => false
+      .shouldBe(true)
+
+  // Monotone entries (repair F10): writes by separate markers, as by two clients, a re-run finalizer or a replay
+
+  atest("an older miss marked after a newer one leaves the newer mark"):
+    val objectId = ObjectId(UUID.randomUUID())
+    val older = HLCTimestamp(1000L << 16)
+    val newer = HLCTimestamp(2000L << 16)
+    val second = new ObservedMarker
+    for
+      _ <- new MissedUpdateMarker(client).mark(List(missed(net.storeId0, objectId, newer, Array[Byte](7))))
+      pool <- client.getStoragePool(Radicle.poolId)
+      before <- pool.errorTree.get(buildErrorKey(net.storeId0, objectId))
+      _ <- second.mark(List(missed(net.storeId0, objectId, older)))
+      after <- pool.errorTree.get(buildErrorKey(net.storeId0, objectId))
+    yield
+      decodeErrorValue(after.get.value) shouldBe ((newer, Seq[Byte](7)))
+      after.get.revision shouldBe before.get.revision
+      // Nothing left to write: no transaction is committed
+      second.commits shouldBe 0
+
+  atest("a newer miss marked after an older one replaces the older mark"):
+    val objectId = ObjectId(UUID.randomUUID())
+    val older = HLCTimestamp(1000L << 16)
+    val newer = HLCTimestamp(2000L << 16)
+    for
+      _ <- new MissedUpdateMarker(client).mark(List(missed(net.storeId0, objectId, older)))
+      _ <- new MissedUpdateMarker(client).mark(List(missed(net.storeId0, objectId, newer, Array[Byte](7))))
+      pool <- client.getStoragePool(Radicle.poolId)
+      entry <- pool.errorTree.get(buildErrorKey(net.storeId0, objectId))
+    yield
+      decodeErrorValue(entry.get.value) shouldBe ((newer, Seq[Byte](7)))
+
+  atest("an UnackedCommits entry written again is kept as it was"):
+    val txid = TransactionId(UUID.randomUUID())
+    val entry = UnackedCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
+    val key = UnackedCommitEntry.key(net.storeId0, txid)
+    for
+      _ <- new MissedUpdateMarker(client).mark(Nil, List(MissedUnackedCommit(net.storeId0, txid, entry)))
+      pool <- client.getStoragePool(Radicle.poolId)
+      before <- pool.unackedCommitsTree.get(key)
+      _ <- new MissedUpdateMarker(client).mark(Nil, List(MissedUnackedCommit(net.storeId0, txid, entry)))
+      after <- pool.unackedCommitsTree.get(key)
+    yield
+      before.isDefined shouldBe true
+      after.get.revision shouldBe before.get.revision
 
   // Cancellation (a late resolution, or TxFinalized from another driver): nothing is written once cancelled
 

@@ -24,6 +24,13 @@
   transaction changes (a lock changes nothing, so there is nothing to repair and the object's timestamp would not
   catch up). A client's `MissedUpdateMarker` writes one batch per pool at a time and merges waiting entries by key,
   so a slow spell makes batches larger rather than adding colliding writes. Repair: `server/repair/CLAUDE.md`
+- Marker entries only move forward (repair F10): its puts are conditional checked inserts (`TKVLInsert.replaces`). An
+  ErrorTree mark replaces a held one only for a later `missedTimestamp`; an UnackedCommits entry is written only
+  where none is held, so a re-write never moves its revision under the scan's delete. Two clients marking one key at
+  once abort one batch, which retries; a batch with nothing newer to write commits nothing. Still `replaySafe`
+  ("missed-update marks only move forward"): a replay writes a key only where none is held, which costs one more
+  repair pass. An UnackedCommits entry re-created after the scan deleted it is harmless: the scan deletes one only
+  while its store holds no Tx for T, and a store never rejoins a transaction it forgot
 - An UnackedCommits entry larger than half a leaf node of its tree (`UnackedCommitEntry.maxEncodedSize`) is written as
   chunks, each a complete entry for some of the objects: chunk 0 under `UnackedCommitEntry.key(store, txid)`, chunk `i`
   under that plus `i` as 2 bytes. Lookups name the head only

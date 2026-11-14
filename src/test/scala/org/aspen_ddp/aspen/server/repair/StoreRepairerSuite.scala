@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.TestTransactions
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, ReadLocks, Transaction}
-import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
+import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateMarker, UnackedCommitEntry}
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedUnackedCommit
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{TKVLInsert, TieredKeyValueList}
@@ -908,6 +908,33 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       remaining shouldBe empty
       storeKeys(2, kvPtr) should not contain k1
       storeKeys(2, kvPtr) shouldBe Set(k0)
+
+  // A re-run finalizer, or a replay of its marker batch, can write an entry again after the scan deleted it (the
+  // marker keeps no tombstone). The store held no Tx for the transaction when it was deleted and never rejoins one it
+  // forgot, so the entry only costs a reconcile that changes nothing
+  test("a UnackedCommits entry written again after the scan deleted it changes nothing and is deleted again"):
+    val repairer = StoreRepairer(client, SeamTarget())
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
+      txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
+      _ <- dropErrorEntries(2)
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      key = UnackedCommitEntry.key(sid(2), txid)
+      entry <- pool.unackedCommitsTree.get(key).map(vs => UnackedCommitEntry.decode(vs.get.value.bytes))
+      _ <- scanUntilQuiet(2, repairer)
+      deleted <- unackedEntries(2)
+      repaired = stored(2, kvPtr.id).map(_.metadata)
+      _ <- pump(new MissedUpdateMarker(client).mark(Nil, List(MissedUnackedCommit(sid(2), txid, entry))), deadline())
+      recreated <- unackedEntries(2)
+      _ <- scanUntilQuiet(2, repairer)
+      remaining <- unackedEntries(2)
+    yield
+      deleted shouldBe empty
+      recreated shouldBe List(key)
+      remaining shouldBe empty
+      stored(2, kvPtr.id).map(_.metadata) shouldBe repaired
+      storeKeys(2, kvPtr) shouldBe Set(k0)
+      hasStub(2, txid) shouldBe false
 
   test("a UnackedCommits entry for a deleted object deletes it from the store"):
     for

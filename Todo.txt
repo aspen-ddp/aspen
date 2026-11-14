@@ -36,12 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.4  Monotone missed-update marker: Repair F10, Q-N5 (marker), R-N6 (marker part)                           [S]
-     MissedUpdateMarker's blind, replaySafe upsert can lower a newer missedTimestamp (weakening the completion
-     gate) and re-create deleted UnackedCommits entries. Fix: upsert with max(missedTimestamp), and do not
-     re-create an UnackedCommits entry that a scan already deleted (or shadow it with the stub check). Re-check
-     whether the replaySafe justification in TransactionBuilder still holds afterwards.
-
 2.5  Repair scan correctness: Repair F13, F4, F11, F6                                                       [S each]
      F13: Reconcile treats `read.timestamp < current.timestamp` as caught up. A store that missed data write D
           but applied a later refcount update R2, which the read quorum has not applied yet, drops its entry
@@ -73,15 +67,16 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
            several documents assume an entry always exists (C5). Decide which stores get entries, together
            with R-N4's growth (4.7), then make the documents agree (C5, C7).
 
-2.9  Replays through entries with no stub (accepted residuals; re-assess after 2.3-2.4)                     [L]
+2.9  Replays through entries with no stub (accepted residuals; re-assess now 2.2-2.4 landed)                [L]
      R-N1, R-N6, R-N7 (X13, G13), R-N9, RP-N4, P-N3 (X12). A store holding an UnackedCommits entry and no applied
      stub re-applies T on a replay's commit. That covers blind writes, ABA DoesNotExist inserts and allocations,
      and for R-N7 possibly a whole pool. R-N7 and R-N9 were accepted by ruling. 2.2 landed (blind Inserts are
      last-writer-wins, blind deletes refused). 2.3 landed (an allocation over an object the store holds is refused,
-     ObjectExists). Once 2.4 lands too, most write classes become harmless. Re-derive what remains, including an
-     Insert replayed after a later delete of its key (blind or DoesNotExist ABA: decide on a per-key generation) and
-     an allocation replayed after its object's deletion persisted (no tombstones: an orphan slice), and either close
-     it or re-confirm the acceptance in writing.
+     ObjectExists). 2.4 landed (marker entries only move forward; a re-created UnackedCommits entry changes
+     nothing, since its store never rejoins T). Most write classes are now harmless. Re-derive what remains,
+     including an Insert replayed after a later delete of its key (blind or DoesNotExist ABA: decide on a per-key
+     generation) and an allocation replayed after its object's deletion persisted (no tombstones: an orphan slice),
+     and either close it or re-confirm the acceptance in writing.
      Candidate fixes: treat an adopted accepted commit from a quorum that contains memoryless acceptors as late
      when a proof exists (P-N3); D1 writes no entries for stores that D0 listed or that acknowledged (R-N7). Add
      the missing test that kills D1's host between hand-off and TxFinalized (G13).

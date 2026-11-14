@@ -275,6 +275,10 @@ they let one long outage plus one delayed duplicate leave three different kinds 
 > them, so every store with no Tx writes a stub (recovery R-N6); stores holding a stub apply nothing on the non-late
 > commit and are marked (paxos P-N3). Blind writes at stores that acknowledged in time, the regressed marks and the
 > orphan allocation entry remain.
+> **2026-11-14 (Todo 2.4): NARROWED.** The marker leg is closed: a re-run marker never regresses a mark or rewrites a
+> held UnackedCommits entry, and an entry it re-creates after the scan deleted it changes nothing (repair-process F10,
+> recovery R-N6). Blind writes at stores that acknowledged in time and the orphan allocation entry remain (Todo 2.9,
+> 5.5).
 
 ### X13. Second driver's entries x marker give-up x late commit (recovery R-N7 x X6 x R-N1; addendum)
 

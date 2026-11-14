@@ -265,6 +265,59 @@ class TKVLBatchRequirementSuite extends TKVLBatchSuiteSupport:
         assert(attempts == 2)
         assert(stored == Some(value(52).bytes.toList))
 
+    /** True if `v`'s last byte is below `b`, as a conditional insert's predicate */
+    def below(b: Int)(v: Value): Boolean = v.bytes.last < b
+
+    atest(s"$kind: a conditional insert replaces a held value only where its predicate accepts it"):
+      for
+        (tree, _) <- newTree(kind)
+        _ <- batch(tree, inserts(keys(1 to 3)), Nil)
+        _ <- batch(tree, List(TKVLInsert(Key(1), value(11), replaces = Some(below(11))),
+                              TKVLInsert(Key(2), value(0), replaces = Some(below(0))),
+                              TKVLInsert(Key(5), value(5), replaces = Some(_ => false))), Nil)
+        entries <- tree.entries()
+      yield
+        assert(entries == List(Key(1) -> value(11).bytes.toList, Key(2) -> value(2).bytes.toList,
+                               Key(3) -> value(3).bytes.toList, Key(5) -> value(5).bytes.toList))
+
+    atest(s"$kind: a batch whose conditional inserts all decline stages nothing"):
+      for
+        (tree, _) <- newTree(kind)
+        _ <- batch(tree, inserts(keys(1 to 3)), Nil)
+        tx = client.newTransaction()
+        _ <- tree.prepareUpdates(List(TKVLInsert(Key(2), value(9), replaces = Some(_ => false))), Nil)(using tx)
+      yield
+        assert(tx.isEmpty)
+
+    atest(s"$kind: a conditional insert that loses a race to another writer of the key aborts, and its retry decides again"):
+      var attempts = 0
+      var firstFailed = false
+      for
+        (tree, _) <- newTree(kind)
+        _ <- batch(tree, inserts(keys(1 to 3)), Nil)
+        _ <- client.retryStrategy.retryUntilSuccessful:
+          attempts += 1
+          val tx = TestTransactions.replaySafe(client.newTransaction())
+          for
+            _ <- tree.prepareUpdates(List(TKVLInsert(Key(2), value(30), replaces = Some(below(30)))), Nil)(using tx)
+            _ <- if attempts == 1 then inTransaction(rtx => tree.set(Key(2), value(40))(using rtx)) else Future.unit
+            _ <- if tx.isEmpty then Future.unit
+                 else tx.commit().map(_ => ()).recoverWith:
+                   case e =>
+                     firstFailed = attempts == 1
+                     Future.failed(e)
+          yield ()
+        stored <- tree.get(Key(2))
+      yield
+        assert(firstFailed)
+        assert(attempts == 2)
+        assert(stored == Some(value(40).bytes.toList))
+
+  test("a conditional insert takes no other requirement"):
+    assertThrows[IllegalArgumentException](TKVLInsert(Key(1), value(1), blind = true, replaces = Some(_ => true)))
+    assertThrows[IllegalArgumentException](
+      TKVLInsert(Key(1), value(1), requireDoesNotExist = true, replaces = Some(_ => true)))
+
   atest("KeyValueObjects: a delete at a revision deletes only the key as read, else aborts with KeyNotAtRevision"):
     for
       (_, rm) <- newTree(TreeKind.KeyValueObjects)

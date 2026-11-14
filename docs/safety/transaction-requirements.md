@@ -889,6 +889,16 @@ can starve shared lockers. Documented behaviour.
 >
 >   **Refresh (addendum):** the re-armed R-N1 half is closed where the re-run's `TxFinalized`, which lists the re-created
 >   entries in `owed`, reaches the store (it writes a stub, transaction-recovery R-N6); the regression half stands.
+>
+>   **Fix 2026-11-14 (Todo 2.4): FIXED for regression; re-creation harmless.** The batch's puts are conditional
+>   checked inserts (`TKVLInsert.replaces`): a mark replaces a held one only for a later `missedTimestamp` and carries
+>   its `KeyRevision` (a pin for that key), and an UnackedCommits entry is written only where none is held. The batch
+>   stays `replaySafe` ("missed-update marks only move forward"): a new key carries only `DoesNotExist`, so a replay
+>   writes a key only where none is held. A re-created UnackedCommits entry changes nothing: the scan deletes one only
+>   while the store holds no Tx for T, and a store never rejoins a transaction it forgot (finalized cache entry
+>   inside the window, forget floor past it), so a late commit finds no commit vote to apply through it. A store that
+>   never held T joining through a replayed client prepare inside the window is the same exposure the original entry
+>   gave (P-N3, R-N9; Todo 2.9). Evidence as repair-process F10.
 
 #### Q-N6. Liveness costs of the converted sites. Confidence: medium
 

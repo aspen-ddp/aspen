@@ -8,8 +8,15 @@ private[tkvl] sealed abstract class BatchOp:
 
 private[tkvl] object BatchOp:
 
-  /** Sets `key` to `value`. `requirement` is as for `NodeEncoding.insert` */
-  final case class Put(key: Key, value: Value, requirement: PutRequirement) extends BatchOp
+  /** Sets `key` to `value`. `requirement` is as for `NodeEncoding.insert`. With `replaces` (`TKVLInsert.replaces`)
+    * the put is dropped where the node holding the key declines to be replaced (`ListBatch.assign`)
+    */
+  final case class Put(key: Key,
+                       value: Value,
+                       requirement: PutRequirement,
+                       replaces: Option[Value => Boolean] = None) extends BatchOp:
+    /** False if the put is conditional and `node`, which holds its key's range, holds a value it does not replace */
+    def appliesTo(node: ListNode): Boolean = replaces.forall(r => node.get(key).forall(r))
 
   /** Deletes `key`. Nothing is done for a key that is not in the tree, unless `requiredRevision` is given: the key
     * must then be held at that revision, else the batch fails with `KeyNotAtRevision`
@@ -33,7 +40,7 @@ private[tkvl] object BatchOp:
     if (deletes ++ atRevisionKeys).exists(distinctInserts.contains) then
       throw new IllegalArgumentException("A batch update may not both insert and delete a key")
 
-    val puts = inserts.map(i => Put(i.key, i.value, i.requirement))
+    val puts = inserts.map(i => Put(i.key, i.value, i.requirement, i.replaces))
     puts ++ deletes.distinct.map(Remove(_)) ++ atRevision.map((k, rev) => Remove(k, Some(rev)))
 
   /** `ops` ascending by `ordering` */

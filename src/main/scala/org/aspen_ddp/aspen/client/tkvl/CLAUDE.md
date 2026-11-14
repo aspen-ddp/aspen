@@ -73,6 +73,11 @@
   containing node, `KeyNotAtRevision` at once if a node read differs. It is no pin, so a transaction made only of it
   needs `replaySafe` (harmless: it writes nothing). Used for decisions that change nothing, such as amoebafs rename
   between two links of one file.
+- Conditional insert, both kinds: `TKVLInsert(replaces = Some(held => ...))` is a `Checked` put that `ListBatch.assign`
+  drops (no write, no requirement) when the node holding the key holds a value the predicate declines; an absent key
+  is always inserted. A competing write aborts it and the retry decides again, so writers sharing a predicate never
+  move a value backward. A batch whose puts all decline stages nothing (`tx.isEmpty`): don't commit it. Used by
+  `MissedUpdateMarker` (newest miss wins; put-if-absent with `_ => false`)
 - `TKVLInsert.requireDoesNotExist` (`MustNotExist`) works on both kinds: KV via `DoesNotExist`, DataObject via the
   node's revision guard (the key's range changes only through an update of its node). Only it fails with
   `KeyAlreadyExists`, when the node read holds the key. On DataObject trees `Checked` and `Blind` add nothing (every

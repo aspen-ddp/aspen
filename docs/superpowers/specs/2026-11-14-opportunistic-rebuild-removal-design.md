@@ -120,8 +120,8 @@ marker and deletion writes to those nodes are not, so treat every node of both t
 
 The sweep reconciles one B store's copy of every node of both trees:
 
-- **Where:** in `StoreRepairer.scan`, for a store of the bootstrap pool, after the ErrorTree and UnackedCommits
-  walks and orphan-stub handling. It therefore runs only where scans run: on the host the pool entry names, for a
+- **Where:** `StoreRepairer.sweepBootstrapTrees`, run by `RepairService.scanOne` for a store of the bootstrap
+  pool right after that store's entry scan (`StoreRepairer.scan`, unchanged) settles. It therefore runs only where scans run: on the host the pool entry names, for a
   repairable store (not offline, rebuilding or transferring out), under the scan deadline.
 - **When:** every scan of a B store. A store becomes repairable on load and on rebuild promotion, so its first
   scan after either sweeps it; that closes Rebuild F8 within one scan interval of promotion. Periodic scans

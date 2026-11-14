@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.client.internal
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.read.SimpleReadDriver
 import org.aspen_ddp.aspen.client.internal.transaction.SimpleClientTransactionDriver
+import org.aspen_ddp.aspen.common.transaction.TransactionHorizon
 import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.ClientId
@@ -31,7 +32,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     new TransactionStatusCache(txStatusCacheDuration),
     new SimpleObjectCache,
     new SimpleReadDriver.Factory(initialReadDelay, maxReadDelay).apply,
-    SimpleClientTransactionDriver.factory(txRetransmitDelay),
+    SimpleClientTransactionDriver.factory(txRetransmitDelay, TransactionHorizon.Horizon),
     userTypeFactories):
 
   // Created exactly once, with thread-safe (lazy val) initialization.

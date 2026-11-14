@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.compute.impl
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, StopRetrying, Transaction, TransactionAborted}
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, StopRetrying, Transaction, TransactionAborted, TransactionOutcomeUnknown}
 import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, DurableTaskFactory, TaskExecutor}
@@ -85,7 +85,9 @@ class SimpleTaskExecutor(val client: AspenClient,
     // Only a collision is retried, after refreshing the executor's revision. Anything else -- an
     // unreadable executor object, an executor object grown past its size limit -- is permanent.
     def onFail(err: Throwable): Future[Unit] = err match
-      case _: TransactionAborted =>
+      // An unknown outcome is treated like an abort. If the attempt did commit, it leaves a duplicate task, as a false
+      // abort did
+      case _: TransactionAborted | _: TransactionOutcomeUnknown =>
         client.read(executorObject).map: kvos =>
           synchronized:
             executorRevision = kvos.revision

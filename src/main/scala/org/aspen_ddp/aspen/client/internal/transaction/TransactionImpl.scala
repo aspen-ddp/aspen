@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AbortAfterCommit, AppendPosition, AspenClient, PostCommitTransactionModification, RangedWrite, RangedWriteState, StoragePool, Transaction, TransactionAborted}
+import org.aspen_ddp.aspen.client.{AbortAfterCommit, AppendPosition, AspenClient, PostCommitTransactionModification, RangedWrite, RangedWriteState, StoragePool, Transaction, TransactionAborted, TransactionOutcomeUnknown}
 import org.aspen_ddp.aspen.common.objects._
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
@@ -383,17 +383,17 @@ class TransactionImpl(val client: AspenClient,
                 case Failure(cause) =>
                   client.txStatusCache.transactionAborted(txd.transactionId)
                   promise.failure(cause)
-                case Success(committed) =>
-
-                  if (committed) {
-                    val ts = txd.startTimestamp
-                    HLCTimestamp.update(ts)
-                    client.txStatusCache.transactionCommitted(txd.transactionId)
-                    promise.success(ts)
-                  } else {
-                    client.txStatusCache.transactionAborted(txd.transactionId)
-                    promise.failure(TransactionAborted(txd))
-                  }
+                case Success(ClientOutcome.Committed) =>
+                  val ts = txd.startTimestamp
+                  HLCTimestamp.update(ts)
+                  client.txStatusCache.transactionCommitted(txd.transactionId)
+                  promise.success(ts)
+                case Success(ClientOutcome.Aborted) =>
+                  client.txStatusCache.transactionAborted(txd.transactionId)
+                  promise.failure(TransactionAborted(txd))
+                case Success(ClientOutcome.Unknown) =>
+                  // Neither outcome is known, so nothing definite is recorded
+                  promise.failure(TransactionOutcomeUnknown(txd))
               }
           catch
             case e: Throwable => promise.tryFailure(e)

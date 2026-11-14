@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
-import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitState, Completion, Read}
@@ -40,7 +40,7 @@ object Frontend {
     * clocks stays under RebuildingStore.AcceptorSinceMargin (paxos P-N2). It also bounds how far timestamps that
     * clients ratchet their HLCs from can run ahead of the hosts' clocks
     */
-  val MaxStartLead: FiniteDuration = FiniteDuration(2, SECONDS)
+  val MaxStartLead: FiniteDuration = TransactionHorizon.MaxStartLead
 
   sealed abstract class ReadKind
 

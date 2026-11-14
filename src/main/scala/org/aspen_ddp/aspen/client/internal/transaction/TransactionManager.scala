@@ -20,7 +20,7 @@ class TransactionManager(val client: AspenClient,
   def runTransaction(
                       txd: TransactionDescription,
                       updateData: Map[StoreId, TransactionData],
-                      driverFactory: Option[ClientTransactionDriver.Factory]): Future[Boolean] = {
+                      driverFactory: Option[ClientTransactionDriver.Factory]): Future[ClientOutcome] = {
     val td = driverFactory.getOrElse(defaultDriverFactory)(client, txd, updateData)
 
     synchronized {

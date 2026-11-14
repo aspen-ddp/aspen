@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.vdisk
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, TransactionAborted, ObjectAllocator, ObjectAllocatorId, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, TransactionAborted, TransactionOutcomeUnknown, ObjectAllocator, ObjectAllocatorId, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, NodeAllocator, Root, SinglePoolNodeAllocator, TieredKeyValueList,
   TreeKind}
@@ -241,7 +241,7 @@ object DiskCatalog:
             // too: an older delete that has not yet noticed it was fenced is still walking the same nodes. Starting
             // over takes ownership again, which fences it, and every step is safe to repeat. Anything else is a real
             // failure.
-            case _: TransactionAborted => Future.failed(Fenced)
+            case _: TransactionAborted | _: TransactionOutcomeUnknown => Future.failed(Fenced)
         _ <- deleteConfigAndFence(info)
       yield
         ()

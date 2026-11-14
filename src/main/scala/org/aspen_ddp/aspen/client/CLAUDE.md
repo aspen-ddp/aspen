@@ -18,3 +18,12 @@
 - Replication supports all of them too. Classic ReedSolomon does not: those operations fail with
   `RangeReadNotSupported` / `AppendNotSupported` / `RangeWriteNotSupported`
 - Store side of the deltas (`EncodedAppendDelta`): see `server/store/CLAUDE.md`
+
+### Transaction outcomes
+- A commit fails with `TransactionAborted` (final: it did not and will not commit) or, past the transaction horizon
+  (`common.transaction.TransactionHorizon`, 20 s from `startTimestamp`), `TransactionOutcomeUnknown`: it may have
+  committed or aborted and the client can no longer find out. The two are siblings, not subtypes. Unknown records
+  nothing in the client's status cache
+- Retry is the default for both: `StopRetrying.unlessCollision` retries aborted and unknown, and
+  `SimpleTaskExecutor.allocateTask` treats unknown like an abort (a committed-but-unknown attempt leaves a duplicate
+  task, as a false abort did). `DiskCatalog.deleteContents` maps unknown to `Fenced`

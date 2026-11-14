@@ -153,12 +153,12 @@ trait Transaction {
     *
     *  The future successfully completes if the transaction commits. Otherwise it will fail with a TransactionError subclass.
     *
-    *  A TransactionAborted failure is final, with one accepted exception. A transaction the client was told aborted
-    *  can still commit later if a delayed duplicate of the client's own prepare reaches enough stores after every
-    *  store has forgotten the transaction (more than the status-cache duration (7 s by default) later), and the transaction's requirements
-    *  hold again at that time. Recovery and other store-side drivers can never commit an aborted transaction: their
-    *  prepares are prefer-abort. A client that retries an aborted transaction successfully closes the case, because
-    *  the retry consumes the same pin and the old requirements then fail.
+    *  A TransactionAborted failure is final: the transaction did not and will not commit.
+    *
+    *  A TransactionOutcomeUnknown failure means the transaction was not resolved within the transaction horizon
+    *  (20 s after it started). It may have committed or aborted. No new instance can change that, because stores no
+    *  longer join a transaction past the horizon, but an instance already in progress at stores may still resolve.
+    *  The retry helpers retry it as they do an abort.
     */
   def commit(): Future[HLCTimestamp]
 

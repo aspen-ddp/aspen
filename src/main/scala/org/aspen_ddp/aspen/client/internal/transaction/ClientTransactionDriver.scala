@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
-import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.client.ReadDriverClient
 import org.aspen_ddp.aspen.client.internal.transaction.TransactionBuilder.TransactionData
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.{TransactionFinalized, TransactionResolved, TxPrepare}
@@ -11,34 +11,42 @@ import scribe.Logging
 
 import scala.concurrent.{Future, Promise}
 
+/** How a client transaction driver concluded. Unknown: the transaction is past the horizon without a resolution, so it
+  * may have committed or aborted and the client can no longer find out */
+enum ClientOutcome:
+  case Committed, Aborted, Unknown
+
+object ClientOutcome:
+  def apply(committed: Boolean): ClientOutcome = if committed then Committed else Aborted
+
 object ClientTransactionDriver {
-  type Factory = (AspenClient, TransactionDescription, Map[StoreId, TransactionData]) => ClientTransactionDriver
+  type Factory = (ReadDriverClient, TransactionDescription, Map[StoreId, TransactionData]) => ClientTransactionDriver
 
   def noErrorRecoveryFactory(
-                              client: AspenClient,
+                              client: ReadDriverClient,
                               txd: TransactionDescription,
                               updateData: Map[StoreId, TransactionData]): ClientTransactionDriver = new ClientTransactionDriver(client, txd, updateData)
 }
 
 class ClientTransactionDriver(
-                               val client: AspenClient,
+                               val client: ReadDriverClient,
                                val txd: TransactionDescription,
                                val updateData: Map[StoreId, TransactionData]) extends Logging {
 
   //protected val learner = new Learner(txd.primaryObject.ida.width, txd.primaryObject.ida.writeThreshold)
-  protected val promise: Promise[Boolean] = Promise()
+  protected val promise: Promise[ClientOutcome] = Promise()
 
-  def result: Future[Boolean] = promise.future
+  def result: Future[ClientOutcome] = promise.future
 
   def begin(): Unit = sendPrepareMessages()
 
   def shutdown(): Unit = {}
 
-  protected def complete(committed: Boolean): Unit = synchronized {
+  protected def complete(outcome: ClientOutcome): Unit = synchronized {
     if (!promise.isCompleted) {
       logger.trace(s"Client Transaction Completed: ${txd.transactionId}")
       HLCTimestamp.update(txd.startTimestamp)
-      promise.success(committed)
+      promise.success(outcome)
     }
   }
 
@@ -58,9 +66,9 @@ class ClientTransactionDriver(
   }
   */
 
-  def receive(finalized: TransactionFinalized): Unit = complete(finalized.committed)
+  def receive(finalized: TransactionFinalized): Unit = complete(ClientOutcome(finalized.committed))
 
-  def receive(resolved: TransactionResolved): Unit = complete(resolved.committed)
+  def receive(resolved: TransactionResolved): Unit = complete(ClientOutcome(resolved.committed))
 
   protected def sendPrepareMessages(): Unit = {
     val isCompleted = synchronized { promise.isCompleted }

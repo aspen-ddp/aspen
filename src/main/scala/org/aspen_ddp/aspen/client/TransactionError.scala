@@ -70,3 +70,10 @@ abstract class TransactionProcessingError extends TransactionError {
 
 final case class TransactionAborted(txd: TransactionDescription) extends TransactionProcessingError
 
+/** The transaction may have committed or aborted and the client can no longer find out: it was not resolved within the
+  * transaction horizon, so no store will join it again. A new instance of the transaction can never change the
+  * outcome, but an instance already in progress at stores may still resolve it. Not a subtype of `TransactionAborted`,
+  * which is final; retry helpers retry both.
+  */
+final case class TransactionOutcomeUnknown(txd: TransactionDescription) extends TransactionProcessingError
+

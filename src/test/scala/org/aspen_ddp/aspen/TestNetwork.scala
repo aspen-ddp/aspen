@@ -375,7 +375,7 @@ class TestNetwork(executionContext: ExecutionContext,
       val counts = stop()
       result.map(t => (t, counts))
 
-  private val cliMessenger = new ClientMessenger {
+  val cliMessenger = new ClientMessenger {
 
     def sendClientRequest(msg: ClientRequest): Unit = {
       msg match

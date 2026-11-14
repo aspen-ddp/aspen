@@ -10,8 +10,9 @@ object StopRetrying:
   /** An `onCommitFailure` handler for `transactUntilSuccessfulWithRecovery` that retries only a
    *  collision and stops on everything else.
    *
-   *  A commit fails transiently only with `TransactionAborted`: the transaction manager never
-   *  fails a transaction, it reports it committed or aborted. Every other error -- an
+   *  A commit fails transiently only with `TransactionAborted` or `TransactionOutcomeUnknown`: the
+   *  transaction manager never fails a transaction, it reports it committed, aborted or, past the
+   *  transaction horizon, unknown. Every other error -- an
    *  `InvalidObject` from a deleted object, a `CorruptedObject`, a `TransactionCreationError`, a
    *  failed lookup -- fails the same way on every attempt, so retrying it never completes the
    *  future. An unmatched error in a hand-written handler is no better: the `MatchError` it throws
@@ -22,4 +23,5 @@ object StopRetrying:
    */
   def unlessCollision(err: Throwable): Future[Unit] = err match
     case _: TransactionAborted => Future.unit
+    case _: TransactionOutcomeUnknown => Future.unit
     case e => throw StopRetrying(e)

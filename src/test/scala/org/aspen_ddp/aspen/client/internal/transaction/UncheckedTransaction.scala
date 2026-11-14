@@ -23,4 +23,4 @@ object UncheckedTransaction:
     pools.flatMap: ps =>
       val (txd, data, _) = bldr.buildTranaction(client.opportunisticRebuildManager,
         ps.map((id, pool) => id -> pool.ida).toMap, Map(), Map())
-      client.txManager.runTransaction(txd, data, None)
+      client.txManager.runTransaction(txd, data, None).map(_ == ClientOutcome.Committed)

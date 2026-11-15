@@ -1,4 +1,5 @@
 ### Store and Frontend
+- `Frontend.incarnation` (a `StoreIncarnation`; default `StoreIncarnation.default(storeId)`, overridden through `Store`'s and `Frontend`'s `incarnationOverride`) is carried by every prepare reply (`TxPrepareResponse.incarnation`)
 - The transaction protocol the Frontend takes part in (votes, proofs, late resolution, UnackedCommits, applied
   stubs, status cache): `server/transaction/CLAUDE.md`. Read both when changing `Frontend` or `Tx`
 - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus

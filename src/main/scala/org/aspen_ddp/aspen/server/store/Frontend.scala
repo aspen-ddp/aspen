@@ -4,7 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, CurrentAllocationsReply, CurrentAllocationsRequest, PendingAllocation, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectType, ReadError, ReadType}
-import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
+import org.aspen_ddp.aspen.common.store.{ReadState, StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
@@ -135,7 +135,14 @@ class Frontend(val storeId: StoreId,
                /** Called once, on the store's executor, when the store fail-stops (failStop): its host takes it
                  * offline and rebuilds it. The default only logs, for tests
                  */
-               onFailStop: Throwable => Unit = _ => ()) extends Logging {
+               onFailStop: Throwable => Unit = _ => (),
+               /** Which life of the store's data this is. None: StoreIncarnation.default(storeId). A default cannot
+                 * name storeId in the same parameter list
+                 */
+               incarnationOverride: Option[StoreIncarnation] = None) extends Logging {
+
+  /** Which life of the store's data this is: prepare replies carry it (TxPrepareResponse.incarnation) */
+  val incarnation: StoreIncarnation = incarnationOverride.getOrElse(StoreIncarnation.default(storeId))
 
   import Frontend._
 

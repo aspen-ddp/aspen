@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import com.github.blemale.scaffeine.Scaffeine
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionHorizon, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission}
@@ -60,7 +60,9 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** Called on the store's executor when the store fail-stops (Frontend.failStop): its host takes it
               * offline and rebuilds it (Host.StoreFailStopped)
               */
-            onFailStop: (Store, Throwable) => Unit = (_, _) => ()) extends Logging {
+            onFailStop: (Store, Throwable) => Unit = (_, _) => (),
+            /** Which life of the store's data this is (Frontend.incarnation). None: StoreIncarnation.default(storeId) */
+            incarnationOverride: Option[StoreIncarnation] = None) extends Logging {
 
   /** How long past the horizon an unresolved Tx starts its status queries: Frontend.expiryMargin */
   val expiryMargin: FiniteDuration = Frontend.expiryMargin(
@@ -78,7 +80,7 @@ class Store(val storageDeviceId: StorageDeviceId,
       case Some(postTo) => task => postTo(s => if s eq this then task()),
     acceptorSince = acceptorSince, deferRecovery = deferRecovery, wallClockMillis = wallClockMillis,
     horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, expiryMargin = expiryMargin,
-    onFailStop = err => onFailStop(this, err))
+    onFailStop = err => onFailStop(this, err), incarnationOverride = incarnationOverride)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's

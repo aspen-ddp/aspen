@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, IDAPol
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRanges, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, KeySet, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, FinalizationActionId, KeyValueUpdate, LocalTimeRequirement, ObjectUpdate, RefcountUpdate, ExclusiveRevisionLock, SerializedFinalizationAction, SharedRevisionLock, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus, VersionBump}
 import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
@@ -512,7 +512,8 @@ object Codec extends Logging:
       lastAcceptedId = lastAcceptedId,
       lastAcceptedValue = lastAcceptedValue,
       disposition = encodeTransactionDisposition(o.disposition),
-      transactionCollisions = ByteString.copyFrom(arr)
+      transactionCollisions = ByteString.copyFrom(arr),
+      incarnation = o.incarnation.map(i => encodeUUID(i.uuid))
     )
 
   def decode(m: codec.TxPrepareResponse): TxPrepareResponse =
@@ -539,7 +540,11 @@ object Codec extends Logging:
       collisions = TransactionId(new UUID(msb, lsb)) :: collisions
     }
 
-    TxPrepareResponse(to, from, txid, response, proposalId, disposition, collisions)
+    val incarnation = m.incarnation.map(decodeUUID)
+      .filter(u => u.getMostSignificantBits != 0L || u.getLeastSignificantBits != 0L)
+      .map(StoreIncarnation(_))
+
+    TxPrepareResponse(to, from, txid, response, proposalId, disposition, collisions, incarnation)
 
 
   def encode(o: TxAccept): codec.TxAccept =

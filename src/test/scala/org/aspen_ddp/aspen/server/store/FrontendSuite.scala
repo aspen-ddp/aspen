@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadRespons
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, FullObject, Insert, Key, KeySet, KeyValueOperation, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
+import org.aspen_ddp.aspen.common.store.{ReadState, StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.paxos.PersistentState
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.TempDirManager
@@ -475,13 +475,15 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   private def dataUpdateTxd = mktxd().copy(requirements = List(DataUpdate(op1, rev0, DataUpdateOperation.Overwrite)))
 
-  private def withDataless(missingDataWait: Duration = Frontend.MissingDataWait)
+  private def withDataless(missingDataWait: Duration = Frontend.MissingDataWait,
+                           incarnation: Option[StoreIncarnation] = None)
                           (f: (Frontend, MapBackend, TestNet, TestCrl) => Unit): Unit =
     val backend = new MapBackend(storeId)
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val net = new TestNet
     val crl = new TestCrl
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), None, missingDataWait, loadedAt = FrontendSuite.longLoaded)
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), None, missingDataWait, loadedAt = FrontendSuite.longLoaded,
+      incarnationOverride = incarnation)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     val os = mkObjectState(oid1)
     backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
@@ -493,6 +495,12 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   private def expectVote(net: TestNet, vote: TransactionDisposition.Value): Unit = net.txMessage() match
     case Some(r: TxPrepareResponse) => r.disposition shouldBe vote
     case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
+
+  test("a prepare reply carries the store's incarnation") {
+    withDataless(incarnation = Some(StoreIncarnation(new UUID(7, 7)))): (frontend, backend, net, crl) =>
+      frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+      votes(net).map(_.incarnation) shouldBe List(Some(StoreIncarnation(new UUID(7, 7))))
+  }
 
   test("a driver's prepare that overtakes the client's data gets no vote until the data arrives") {
     withDataless(): (frontend, backend, net, crl) =>

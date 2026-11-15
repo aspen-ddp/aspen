@@ -1025,7 +1025,8 @@ class Tx( trs: TransactionRecoveryState,
       case Left(n) => Left(TxPrepareResponse.Nack(n.promisedProposalId))
     }
 
-    val txr = TxPrepareResponse(m.from, storeId, transactionId, result, m.proposalId, disposition, collisions)
+    val txr = TxPrepareResponse(m.from, storeId, transactionId, result, m.proposalId, disposition, collisions,
+      Some(frontend.incarnation))
     logger.trace(s"*** PrepareResponse: ${m.transactionId}, Disposition:$disposition. All Objects Loaded: $allObjectsLoaded")
 
     if allObjectsLoaded then

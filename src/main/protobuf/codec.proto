@@ -229,6 +229,7 @@ message TxPrepareResponse {
   bool last_accepted_value = 8;    // Valid for Promise responses
   TransactionDisposition disposition = 9;
   bytes transaction_collisions = 10; // sequence of 16-byte transaction UUIDs
+  UUID incarnation = 11;             // The replying store's incarnation. Absent or zero: none
 }
 
 message TxAccept {

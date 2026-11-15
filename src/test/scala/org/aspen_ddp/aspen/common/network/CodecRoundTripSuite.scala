@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, IDAPol
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.*
 import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 import org.aspen_ddp.aspen.server.store.backend.{FsifConfig, RocksDBConfig}
@@ -318,6 +318,17 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     )
     val decodedNoLast = Codec.decode(Codec.encode(promiseNoLast))
     decodedNoLast.response.toOption.get.lastAccepted shouldBe None
+
+  test("TxPrepareResponse round-trips its incarnation, and none decodes as none"):
+    val base = TxPrepareResponse(
+      storeId(1), storeId(2), TransactionId(uuid(3)),
+      Right(TxPrepareResponse.Promise(None)),
+      ProposalId(3, 1.toByte), TransactionDisposition.VoteCommit, Nil
+    )
+    val inc = StoreIncarnation(uuid(42))
+    Codec.decode(Codec.encode(base.copy(incarnation = Some(inc)))).incarnation shouldBe Some(inc)
+    Codec.decode(Codec.encode(base)).incarnation shouldBe None
+    Codec.decode(Codec.encode(base.copy(incarnation = Some(StoreIncarnation(new UUID(0, 0)))))).incarnation shouldBe None
 
   test("TxAccept round-trip"):
     val original = TxAccept(storeId(1), storeId(2), TransactionId(uuid(3)), ProposalId(4, 1.toByte), true)

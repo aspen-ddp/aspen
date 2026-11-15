@@ -6,7 +6,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 
 sealed abstract class Message
@@ -280,7 +280,9 @@ final case class TxPrepareResponse(
                                     response: Either[TxPrepareResponse.Nack, TxPrepareResponse.Promise],
                                     proposalId: ProposalId,
                                     disposition: TransactionDisposition.Value,
-                                    collisions: List[TransactionId]) extends TxMessage:
+                                    collisions: List[TransactionId],
+                                    /** The replying store's incarnation (Frontend.incarnation) */
+                                    incarnation: Option[StoreIncarnation] = None) extends TxMessage:
   override def toString: String = f"TxPrepareResponse to $to from $from tx $transactionId proposalId $proposalId disposition $disposition response $response"
 
 object TxPrepareResponse {

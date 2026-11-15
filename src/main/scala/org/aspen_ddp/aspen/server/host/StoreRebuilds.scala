@@ -180,7 +180,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   def startRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     if !rebuildingStores.contains(storeId) &&
        rebuildingStores.size + droppingCrlState.size < ctx.maxConcurrentRebuilds &&
-       ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && discardLostStore(local, storeId) then
+       ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId) &&
+       discardLostStore(local, storeId) then
       val sr = ctx.storeRebuildFactory.createRebuild(
         ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends)
 
@@ -244,7 +245,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           ctx.metadata.markRebuiltStoreActive(local.storageDeviceId, storeId, ctx.gossipStoreOnline).onComplete:
             case Success(RebuildOutcome.Adopt) =>
               try
-                ctx.loadStoreById(local.storageDeviceId, storeId)
+                // Loaded only once the marker is gone, or tryLoadStore leaves it offline; a failed removal is
+                // retried by the reconcile, which finds the entry Active
+                if clearRebuildCompleteMarker(local.devicePath / storeId.directoryName) then
+                  ctx.loadStoreById(local.storageDeviceId, storeId)
               finally
                 release()
                 recheckAll()
@@ -336,12 +340,59 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile, "")
       if ! os.exists(Backend.crlSaveFile(storePath)) then
         CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(storePath))
+      // After the pair: the transfer-out marker now keeps it offline, and its reinstatement loads it
+      DurableFiles.remove(storePath / RebuildingStore.RebuildCompleteMarkerFile)
     catch
       case t: Throwable =>
         // Offline for the life of this process either way. A restart cancelling the shutdown
         // loses the abandoned-transfer-out pass's reinstatement without the marker, so the store
         // waits for this host's next start to load; an adopter refuses the device.
         logger.error(s"Failed to mark rebuilt store $storeId offline at $storePath: $t")
+
+  /** Removes the rebuild-complete marker of a rebuilt store whose entry has left Rebuilding, durably, so it can be
+   *  loaded. Returns whether it is gone; a failure is logged and leaves the store offline for a later reconcile. */
+  def clearRebuildCompleteMarker(storePath: os.Path): Boolean =
+    try
+      DurableFiles.remove(storePath / RebuildingStore.RebuildCompleteMarkerFile)
+      true
+    catch
+      case t: Throwable =>
+        logger.error(s"Failed to remove the rebuild-complete marker of the rebuilt store at $storePath. It stays " +
+                     s"offline until a later check of its device. Error: $t")
+        false
+
+  /** Rebuild F3. A directory at the path of a store being rebuilt here that carries neither the rebuild-complete
+   *  marker (a finished rebuild awaiting its flip) nor rebuild-required (a lost copy discardLostStore clears) was not
+   *  produced by a rebuild: a leftover of an earlier tenancy of the store on this device (a transferred-away copy
+   *  whose delete failed and whose marker was lost), or a copy put there by hand. Nothing ties it to the store's
+   *  current state, so it is retired as a lost copy: marked rebuild-required, and then kept in pending-delete by
+   *  discardLostStore like any other. A served one is first taken out of service as a failed backend is, and its
+   *  rebuild waits for a later check. Returns whether the rebuild may go on now. */
+  private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
+    val storePath = local.devicePath / storeId.directoryName
+    if !os.exists(storePath) ||
+       os.exists(storePath / RebuildingStore.RebuildCompleteMarkerFile) ||
+       os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+      true
+    else if ctx.loader.isOpening(storeId) then
+      false
+    else
+      val err = new IllegalStateException(s"$storePath holds a copy of store $storeId that no rebuild produced, " +
+                                          "while the store is Rebuilding on this device")
+      ctx.router.entry(storeId) match
+        case Some(entry) if entry.store.backend.path == storePath =>
+          backendFailed(storeId, Some(entry.store.backend), err, "is served from a copy no rebuild produced")
+          false
+        case _ =>
+          logger.error(s"Retiring a store directory before rebuilding: ${err.getMessage}. It is kept in " +
+                       s"pending-delete until the store is Active again")
+          try
+            markRebuildRequired(storePath)
+            true
+          catch
+            case t: Throwable =>
+              logger.error(s"Failed to mark store $storeId for rebuild at $storePath. Not rebuilding it yet: $t")
+              false
 
   /** Writes the marker that keeps the store at `storePath` from ever being loaded again: its CRL
    *  save file is unusable and was the only copy of its transaction state. */
@@ -493,8 +544,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             logger.warn(s"Failed to mark store $storeId on device $storageDeviceId for rebuild. " +
                         s"Will retry on a later check. Error: $t")
 
-  /** Clears the path of a store whose CRL state was lost, before its rebuild starts: a rebuild that
-   *  finds a directory at the store's path takes it for a store already in place. Returns whether
+  /** Clears the path of a store whose CRL state was lost, before its rebuild starts: a rebuild refuses to start
+   *  over a directory at the store's path that is not a finished rebuild (RebuildingStore.start). Returns whether
    *  the path is clear now, so the rebuild may start.
    *
    *  Nothing is destroyed: the copy is kept under RebuildingStore.PendingDeleteDirectory until the store is Active

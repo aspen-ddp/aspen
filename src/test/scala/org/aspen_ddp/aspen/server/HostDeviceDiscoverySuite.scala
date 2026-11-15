@@ -1791,6 +1791,67 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       // Nothing was opened in the copy's directory.
       os.list(storeDir).length should be(2)
 
+  atest("a rebuilt store carrying the rebuild-complete marker is not loaded at startup"):
+    // Rebuild F4: a crash between the rebuild's move into place and its flip. The tree still says Rebuilding, so
+    // the copy must not serve; the rebuild's completion loads it once the flip commits.
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
+    val storeDir = deviceDir / storeId.directoryName
+    os.makeDir.all(storeDir)
+    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
+    os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, Array.emptyByteArray)
+
+    val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
+      net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
+      net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
+      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2)
+
+    Future.successful:
+      host.control.router.offlineStores should contain(storeId)
+      host.getStoreIds should not contain storeId
+      os.list(storeDir).length should be(2)
+
+  atest("an Active store still carrying the rebuild-complete marker is loaded; a Rebuilding one is not"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new StoreRebuildFactory:
+      def createRebuild(client: org.aspen_ddp.aspen.client.AspenClient, sid: StoreId, deviceId: StorageDeviceId,
+                        devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener) =
+        new org.aspen_ddp.aspen.server.rebuild.StoreRebuild:
+          val storeId: StoreId = sid
+          def complete: Future[Unit] = scala.concurrent.Promise[Unit]().future
+          def cancel(): Unit = ()
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+
+    // As tryLoadStore leaves them: marked offline by hand, since the recording tryLoadStore honours no marker.
+    // storeId: the flip committed and the host crashed before removing the marker. storeIdB: the flip has not
+    // committed; its rebuild (held here) is what flips and loads it.
+    val List(activeDir, rebuildingDir) = List(storeId, storeIdB).map: sid =>
+      val dir = deviceDir / sid.directoryName
+      os.makeDir.all(dir)
+      os.write.over(dir / RebuildingStore.RebuildCompleteMarkerFile, Array.emptyByteArray)
+      dir
+    val local = loadedDevices(host)(deviceA)
+    local.offlineStores = local.offlineStores ++ Set(storeId, storeIdB)
+    val before = recorded(host).storeLoadAttempts.size
+
+    val armed = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    armed.success(deviceState(
+      deviceA,
+      Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
+          storeIdB -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None))))
+
+    yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).map: _ =>
+      host.control.reconciler.activeDeviceChecks should not contain deviceA
+      os.exists(activeDir / RebuildingStore.RebuildCompleteMarkerFile) should be(false)
+      os.exists(rebuildingDir / RebuildingStore.RebuildCompleteMarkerFile) should be(true)
+      recorded(host).storeLoadAttempts.toList.drop(before) should be(List((deviceA, activeDir)))
+      // The Rebuilding one's rebuild started over its finished copy, not over a retired one
+      host.control.rebuilds.rebuildingStoreIds should contain(storeIdB)
+      os.exists(rebuildingDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+
   atest("an Active store still carrying the transferred-in marker is loaded; a TransferringIn one is not"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)

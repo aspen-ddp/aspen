@@ -97,6 +97,14 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                       s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
           router.markOffline(storeCfg.storeId)
           sds.offlineStores += storeCfg.storeId
+        else if os.exists(potentialStoreFile / RebuildingStore.RebuildCompleteMarkerFile) then
+          // A finished rebuild whose flip may not have committed (a crash between the move and the flip, Rebuild F4).
+          // The rebuild's completion removes the marker and loads it once the flip commits; for an entry already
+          // Active, the reconcile does (DeviceReconciler)
+          logger.info("Skipping load of rebuilt store awaiting its device entry's flip out of Rebuilding. " +
+                      s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
+          router.markOffline(storeCfg.storeId)
+          sds.offlineStores += storeCfg.storeId
         else if opening.contains(storeCfg.storeId) || router.get(storeCfg.storeId).isDefined then
           logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")
         else

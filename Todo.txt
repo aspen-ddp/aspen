@@ -36,12 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.7  Rebuild completion identity: Rebuild F3, F4                                                            [S]
-     start() treats any directory at the final path as a finished rebuild (F3). A crash between the staging move
-     and the flip leaves a loadable store that serves as a blank acceptor (F4). Fix: write a rebuild-complete
-     marker in staging before the move, and require it. Load a store whose tree entry is still Rebuilding as
-     offline until the flip commits.
-
 2.8  Recovered Tx resolution and entry coverage: R-F6, R-F13, R-F15, C5, C7 (decide with R-N4 in 4.7)       [S + M]
      R-F6: oresolution is not restored from the persisted status, so a recovered Committed Tx skips locking and
            the traceless check. Restore it (S).

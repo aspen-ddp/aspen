@@ -104,6 +104,8 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // The staging directory and its checkpoint are gone once the store is whole.
       os.exists(dev / RebuildingStore.RebuildDirectory / storeId.directoryName) should be(false)
       os.exists(finalPath / RebuildState.stateFilename) should be(false)
+      // Moved in carrying the marker that keeps it offline until its flip commits (Rebuild F4)
+      os.exists(finalPath / RebuildingStore.RebuildCompleteMarkerFile) should be(true)
       // A StoreConfig is written up front, so the moved directory is loadable.
       StoreConfig.loadStoreConfig(finalPath / StoreConfig.configFilename).storeId should
         be(storeId)
@@ -141,12 +143,32 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       unreadable.isDefined should be(true)
       (unreadable.get - before) should be >= RebuildingStore.AcceptorSinceMargin.asInstanceOf[scala.concurrent.duration.Duration]
 
+  atest("a final directory no rebuild finished fails the rebuild and is left in place"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    // Rebuild F3: a leftover of an earlier tenancy, no rebuild-complete marker. StoreRebuilds retires such a
+    // directory before starting a rebuild; the rebuild itself must not take it for a finished one.
+    val leftover = dev / storeId.directoryName
+    os.makeDir.all(leftover)
+    os.write.over(leftover / "data", "stale")
+    for
+      _ <- populate(3)
+      _ <- net.waitForTransactionsToComplete()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                    testingOnlyTrackRestoredKeys = true)
+      outcome <- outcomeOrStalled(rebuild)
+    yield
+      outcome.map(_.isFailure) should be(Some(true))
+      rebuild.testingOnlyRestoredKeys should be(Nil)
+      os.list(leftover).map(_.last) should be(Seq("data"))
+
   atest("a pre-existing final directory skips straight to completion"):
     given ExecutionContext = executionContext
     val dev = deviceDir()
-    // A crash between the move and the flip leaves the store in place. The rebuild must not
+    // A crash between the move and the flip leaves the store in place, with its marker. The rebuild must not
     // start over, and must not fail.
     os.makeDir.all(dev / storeId.directoryName)
+    os.write.over(dev / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile, "")
     // Staged as a crash just before the move would have left it: the move is not atomic with
     // the flip, so a staging directory carrying a checkpoint can outlive the final directory
     // appearing. Pre-created so that asserting on its removal is an assertion about

@@ -428,7 +428,8 @@ the design document predates the ErrorTree.
 | torn checkpoint | `.tmp` or unreadable yaml | `load` returns None: full re-walk, safe (`RebuildState.scala:107-122`) |
 | inside `finish` after checkpoint removal, before move | staging, no checkpoint | full re-walk (wasteful, safe) |
 | after move, before dir sync | staging or final (rename may revert) | either re-walk or "final exists" path |
-| after move+sync, before tree flip | final path present, entry Rebuilding, no markers | **the device load serves the store** (`tryLoadStore` has no check against the tree, `StoreLoader.scala:67-97`); `start()` later sees final exists and flips (F4) |
+| after move+sync, before tree flip | final path present with `rebuild-complete`, entry Rebuilding | the device load leaves it offline (marker); `start()` sees the marked final path and flips (F4, fixed 2026-11-14) |
+| after flip committed, before the marker's removal | final path with `rebuild-complete`, entry Active | loaded offline; the reconcile's Completed Rebuilds pass removes the marker and loads it |
 | after flip committed, before `loadStoreById` | final path, entry Active | normal load at restart |
 | flip transaction fails permanently | final path, entry Rebuilding | logged; `release()` and re-check of all devices including this one (`StoreRebuilds.scala:263-276`) re-enter `start()` which flips again (spin bounded only by the device lookup, F11) |
 | device shutdown mid-walk | staging + checkpoint, entry Rebuilding | `cancelFor` latches `RebuildCancelled` (`StoreRebuilds.scala:53`), pass fails, resumes after restart or adoption |
@@ -441,8 +442,9 @@ the design document predates the ErrorTree.
 Each is a property the code is intended to maintain and is checked by reading; "holds" / "does not hold" is my finding.
 
 * **B1 No serving while rebuilding.** The staging backend is never reachable by the network, the router or a `Store`.
-  Holds (`RebuildingStore.scala:19-22`; `DeviceDiscovery.scala:255-259`). The final directory becomes loadable the
-  moment `os.move` completes, before the tree decision, which weakens B1 across a crash (F4).
+  Holds (`RebuildingStore.scala:19-22`; `DeviceDiscovery.scala:255-259`). Since 2026-11-14 the final directory carries
+  `rebuild-complete` from the moment `os.move` completes, and a load leaves it offline until the flip commits, so a
+  crash between the two no longer weakens B1 (F4 fixed).
 * **B2 Marker before destruction.** A store directory is cleared only after its `rebuild-required` marker is durable
   and its device-CRL entries have been durably dropped. Holds (`StoreRebuilds.scala:493-521,544`;
   `DurableFiles.write`).
@@ -456,7 +458,7 @@ Each is a property the code is intended to maintain and is checked by reading; "
   latch is re-checked and the checkpoint removed. Holds modulo the crash windows in section 10.
 * **B8 Load follows the metadata decision.** In the normal (no-crash) flow the store is loaded only after
   `markRebuiltStoreActive` returned `Adopt`. Holds in-process (`StoreRebuilds.scala:224-236`); the crash window in B1
-  is the exception.
+  was the exception, closed 2026-11-14 by the `rebuild-complete` marker (F4).
 * **B9 Metadata flips are guarded.** Every tree-entry change in this subsystem is a transaction carrying a
   `KeyRevision` on the device state key. Holds (`StoreRebuilds.scala:464-467`, `DeviceMetadata.scala:408`,
   `FailedStorageDeviceDurableTask.scala`).
@@ -572,7 +574,8 @@ tree entry plus the `KeyRevision` flip. Safe, under the assumption in (b) that t
 need not).
 
 **FS13 Promotion crash.** See section 10 rows. The one row that changes behaviour is "after move, before the flip": the
-store is loaded and served while the tree says Rebuilding (F4).
+store was loaded and served while the tree said Rebuilding (F4, fixed 2026-11-14: the `rebuild-complete` marker keeps
+it offline).
 
 **FS14 Destination device runs out of space.** `isOutOfSpace` latches an abort, the pass fails, staging and checkpoint
 stay, the entry stays Rebuilding "until capacity is added" (`RebuildingStore.scala:288-294`). There is no
@@ -666,6 +669,18 @@ companion document) and gate the discard on a pool-health read.
 
 **Verification: CONFIRMED, severity data-loss (only in a correlated-loss situation, but that is exactly what systemic-loss-protection.md is about).** `startRebuild` (`StoreRebuilds.scala:167-169`) calls `discardLostStore` (`:499-520`) which does `crl.dropStore` and then `removeLostStoreDirectory` (rename to `discarded/`, then `os.remove.all`, `:522-540`) with no read of the pool state. Because `rebuildingStores` is filled only after `discardLostStore` returns true, a reconcile pass starts the discard of every marked store on a device regardless of `maxConcurrentRebuilds`. No retention of the old bytes. Fix sketch: keep the discarded directory (and CRL entries or a copy) until the rebuilt store has been promoted, or gate the discard on a pool-health read.
 
+> **F3 FIXED (2026-11-14)** with F4 (Todo 2.7): `finish` writes a durable `rebuild-complete` marker in staging
+> before the move, and `start()` takes a directory at the final path for a finished rebuild only when it carries the
+> marker (one without it fails the pass, as a defence). Before a rebuild starts, `StoreRebuilds.retireForeignCopy`
+> marks a directory at the store's path that carries neither `rebuild-complete` nor `rebuild-required` as
+> rebuild-required, so `discardLostStore` keeps it in `pending-delete/` and the store is rebuilt from the pool; a
+> served one is first taken out of service as a failed backend is (`backendFailed`), and its rebuild waits for the
+> next check. Tests: RebuildingStoreSuite "a final directory no rebuild finished fails the rebuild and is left in
+> place", StoreRebuildTriggerSuite "a directory no rebuild produced at a Rebuilding store's path is retired before the
+> rebuild starts". Residual: such a leftover is still loaded by a device load before the first reconcile reaches its
+> Rebuilding entry (tryLoadStore does not read the tree), so it can serve as an old incarnation until then; the
+> served-copy branch is not covered by a test.
+
 **F3 (Medium-Low) `RebuildingStore.start` treats any directory at the final path as a finished rebuild.**
 Scenario: the failed-device drain places store S on D3, where an earlier tenancy of S left a directory (a transferred-away
 copy whose delete failed and whose `transferring-out` marker was lost, or an operator copy). `start()` sees the path,
@@ -674,6 +689,15 @@ stale store that no ErrorTree entry will ever repair. `discardLostStore` only cl
 (`StoreRebuilds.scala:501-502`). No identity or freshness check on the directory.
 
 **Verification: PLAUSIBLE, severity stale-replica.** `RebuildingStore.start` (`:134-139`) does treat any existing `finalPath` as complete. Whether the drain can place a store on a device that still has a directory for it depends on leftover directories (`DeviceReconciler` deletes transferred-away directories and retries on failure), so the trigger is a failed cleanup plus a later placement on that device. Fix sketch: the rebuild writes a `rebuild-complete` marker inside the staging dir before the move and `start()` requires it.
+
+> **F4 FIXED (2026-11-14)** with F3: the `rebuild-complete` marker is at the final path from the moment the move
+> lands, and `StoreLoader.tryLoadStore` leaves a store carrying it offline. The rebuild's completion removes it
+> (durably) once the flip commits, before `loadStoreById` (`Adopt`), or after writing the transfer-out pair
+> (`AdoptOffline`). A crash between the flip and the removal leaves an Active entry over a marked copy: the reconcile's
+> Completed Rebuilds pass removes the marker and loads it (`DeviceReconciler`). Tests: HostDeviceDiscoverySuite "a
+> rebuilt store carrying the rebuild-complete marker is not loaded at startup" and "an Active store still carrying the
+> rebuild-complete marker is loaded; a Rebuilding one is not", StoreRebuildTriggerSuite "a successfully flipped
+> rebuild is loaded, marked Active, and gossips StoreMoved" (marker removed).
 
 **F4 (Medium) A rebuilt store can serve while the tree still says Rebuilding.**
 Scenario: crash after `os.move(staging, final)` (`RebuildingStore.scala:467-470`) and before `markRebuiltStoreActive`.

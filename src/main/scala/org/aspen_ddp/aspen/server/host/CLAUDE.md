@@ -108,6 +108,8 @@
   (`readStoreState`, leaving them live) into `crl_save.log` (loaded or not, `StoreTransfers.closeForTransferOut`)
   and deletes them from the device CRL (`deleteTransactions`) only once that file is durable: a crash or failed save
   before that leaves the device CRL holding them
+- A rebuilt store's directory carries `rebuild-complete` from its move into place until its entry leaves
+  Rebuilding; `tryLoadStore` leaves such a store offline (`server/rebuild/CLAUDE.md`)
 - Nothing of a lost store is destroyed before its rebuild succeeds: its `pending-delete/` copy (data plus saved CRL
   entries) is deleted by the device's reconcile only once the store is Active again, on this device by its own
   entry, elsewhere by the pool's entry and that device's state; a failed read keeps it. A fail-stopped backend's CRL

@@ -249,6 +249,24 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
           ctx.tryLoadStore(local, storePath, None)
 
       //----------------------
+      // Completed Rebuilds
+      //
+      // A crash between a rebuild's flip committing and the removal of its rebuild-complete marker leaves an Active
+      // entry over a copy that tryLoadStore skips; the rebuild's completion, which would remove the marker, is gone.
+      // Active is the tree's word that the flip committed, so the copy is ours to load. A rebuild still running here
+      // removes its own marker once its flip commits.
+      local.offlineStores.filter(storeId =>
+        !ctx.rebuilds.rebuildingStoreIds.contains(storeId) &&
+        remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
+        os.exists(local.devicePath / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile)
+      ).foreach: storeId =>
+        val storePath = local.devicePath / storeId.directoryName
+        logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still carries its " +
+                    s"rebuild-complete marker. Completing the rebuild and loading the store")
+        if ctx.rebuilds.clearRebuildCompleteMarker(storePath) then
+          ctx.tryLoadStore(local, storePath, None)
+
+      //----------------------
       // New Stores
       //
       remote.stores.filter((storeId, entry) =>

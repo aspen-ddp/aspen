@@ -2,6 +2,13 @@
 - A rebuilt store lost its Paxos acceptor state. `RebuildingStore.finish` writes `acceptor-since` (finish time plus
   `AcceptorSinceMargin`, 10 s) into its directory; how the Frontend enforces it: `server/store/CLAUDE.md`. The
   margin covers `Frontend.MaxStartLead` (2 s) plus host-to-host clock skew; client clocks do not enter into it
+- Completion identity (Rebuild F3, F4): `finish` writes a durable `rebuild-complete` marker in staging just before
+  the move. A store directory carrying it is a finished rebuild awaiting its flip: `start()` takes the final path
+  for done only with the marker, `StoreLoader.tryLoadStore` leaves it offline, and `StoreRebuilds` removes it once
+  the flip commits (before the load, or after the transfer-out pair for `AdoptOffline`); the reconcile's Completed
+  Rebuilds pass removes it for an Active entry after a crash. A directory at a Rebuilding store's path with neither
+  this marker nor `rebuild-required` is retired as a lost copy (`StoreRebuilds.retireForeignCopy`: marked, kept in
+  `pending-delete/`, rebuilt)
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
   `StoreRebuildFactory.createRebuild`)
 - A promoted bootstrap-pool store may hold stale copies of the bootstrap pool's own ErrorTree/UnackedCommits nodes

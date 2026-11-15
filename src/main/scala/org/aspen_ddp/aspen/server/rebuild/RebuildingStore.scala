@@ -34,6 +34,16 @@ object RebuildingStore:
    *  Host.tryLoadStore for the same reason as RebuildDirectory. */
   val PendingDeleteDirectory = "pending-delete"
 
+  /** In a store directory a rebuild produced, from just before its move into place until its tree entry leaves
+   *  Rebuilding. Written durably by finish in staging, so it is at the store's path the moment the directory is.
+   *  It says two things. The directory is this rebuild's output: start() takes a directory at the store's path for
+   *  a finished rebuild only when it carries the marker (any other one is retired as a lost copy by
+   *  StoreRebuilds.startRebuild, Rebuild F3). And the store is not in service yet: StoreLoader.tryLoadStore leaves
+   *  it offline, so a crash between the move and the flip cannot have a restart serve it as a blank acceptor while
+   *  the tree still says Rebuilding (Rebuild F4). Removed once the flip commits (StoreRebuilds), or by the
+   *  reconcile for an Active entry after a crash between the flip and the removal (DeviceReconciler) */
+  val RebuildCompleteMarkerFile = "rebuild-complete"
+
   /** In a store directory being discarded: the store's device-CRL entries, saved by CrashRecoveryLog.saveStoreState
    *  before they are dropped from the device CRL, which a rebuild onto the same device would otherwise recover */
   val LostCrlStateFile = "lost-crl-state.log"
@@ -165,12 +175,17 @@ class RebuildingStore(client: AspenClient,
   private def start(): Unit =
     val f =
       try
-        if os.exists(finalPath) then
+        if os.exists(finalPath / RebuildCompleteMarkerFile) then
           // A crash between the move and the flip. The store is already whole; there is nothing to
           // rebuild, only the flip left, and that is Host's job on completion.
           logger.info(s"Rebuild of $storeId: store already in place at $finalPath")
           cleanupStaging()
           Future.unit
+        else if os.exists(finalPath) then
+          // Not this rebuild's output. StoreRebuilds.startRebuild retires such a directory before it starts a
+          // rebuild, so this is only a defence: the directory is left alone and the rebuild fails
+          Future.failed(new IllegalStateException(
+            s"Rebuild of $storeId: $finalPath holds a store directory that no rebuild finished"))
         else
           runPass()
       catch
@@ -499,6 +514,8 @@ class RebuildingStore(client: AspenClient,
       RebuildState.removeAll(stagingPath)
       // The rebuilt store has no Paxos state: it takes no part in transactions started before now (plus the margin)
       writeAcceptorSince(stagingPath)
+      // Last before the move: the directory is a finished rebuild, kept out of service until its flip commits
+      DurableFiles.write(stagingPath / RebuildCompleteMarkerFile, "")
 
       os.move(stagingPath, finalPath)
       // Durable before the store is reported in place: a device shut down and moved after this

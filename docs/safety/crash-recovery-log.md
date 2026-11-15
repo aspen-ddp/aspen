@@ -156,8 +156,11 @@ Consequences:
   vote, and both are in the state saved at `Tx.scala:742` before it is sent. This is what makes the 1-RTT commit safe
   across a crash. The Paxos side is described in [paxos-transactions.md](paxos-transactions.md).
 - **Nacks are saved too.** The state is saved before a Nack is sent (no state change, but the same path).
-- **No decision is saved.** The commit/abort resolution is not a CRL record. After a crash a transaction is `Unresolved`
-  and is re-resolved by Paxos/status caches ([transaction-recovery.md](transaction-recovery.md)).
+- **No decision record.** No save is made because a transaction resolved. But every save writes the Tx's current
+  status, so a prepare or accept handled after the resolution persists `Committed` or `Aborted`, and recovery restores
+  it (`Tx.oresolution`, transaction-recovery F6, fixed 2026-11-14): the commit is applied, or the abort's state deleted,
+  once the objects load. Any other recovered transaction is `Unresolved` and is resolved again by Paxos and the status
+  caches ([transaction-recovery.md](transaction-recovery.md)).
 - **No vote is sent for a transaction the CRL has not accepted.** A dead CRL thread therefore stops every vote of every
   store on the device while the stores otherwise keep running (F9).
 

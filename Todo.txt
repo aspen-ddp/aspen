@@ -36,13 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.8  Recovered Tx resolution and entry coverage: R-F6, R-F13, R-F15, C5, C7 (decide with R-N4 in 4.7)       [S + M]
-     R-F6: oresolution is not restored from the persisted status, so a recovered Committed Tx skips locking and
-           the traceless check. Restore it (S).
-     R-F13/F15: late-uncounted voters and non-voters get no UnackedCommits entry, only an ErrorTree mark, yet
-           several documents assume an entry always exists (C5). Decide which stores get entries, together
-           with R-N4's growth (4.7), then make the documents agree (C5, C7).
-
 2.9  Replays through entries with no stub (accepted residuals; re-assess now 2.2-2.4 landed)                [L]
      R-N1, R-N6, R-N7 (X13, G13), R-N9, RP-N4, P-N3 (X12). A store holding an UnackedCommits entry and no applied
      stub re-applies T on a replay's commit. That covers blind writes, ABA DoesNotExist inserts and allocations,
@@ -150,10 +143,11 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
      A stalled scan lets stubs grow against device admission (~4.5 M per device). Cap stubs per store and fall
      back to the case-3 lookup.
 
-4.7  UnackedCommits growth: R-N4, RP-N3 (decide with 2.8)                                                   [M]
+4.7  UnackedCommits growth: R-N4, RP-N3                                                                     [M]
      There is one entry per (store, transaction) for every silent voter, never merged, and each is reconciled in
-     addition to the ErrorTree entry. Write entries only where they are needed (traceless), or merge per store.
-     Skip in phase B objects already repaired in phase A.
+     addition to the ErrorTree entry. Merge entries per store, and skip in phase B objects already repaired in
+     phase A. The baseline from 2.8 (transaction-recovery F13/F15, closed by design) still holds: every
+     unacknowledged counted voter must remain covered by an entry, merged or not.
 
 4.8  Rebuild liveness: Rebuild F5 residual, F11, F12, F15                                                   [S-M]
      F5: pass failures other than join races wait the hourly device check. Add a backoff self-recheck.

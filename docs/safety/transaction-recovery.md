@@ -761,6 +761,31 @@ Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding 
 | R-N2 | **narrowed** | A failed action no longer loses the marks for good: the fresh finalizer runs the marker once its other actions complete. The marker still waits for them (Ruling 8: a durable entry implies every other action is done, which the late-commit argument uses), so an action failing on every attempt (a deterministic bug, or a type no host can load) keeps the marks unwritten along with the transaction unfinalized. That is a logged stall, not a finalization with missing marks. Running the marker after a failed action would buy repair of the missed stores during such a stall at the cost of Ruling 8; not done | `RegisteredTransactionFinalizerFactory.scala` `Finalizer` |
 | F14 | unchanged | A marker that keeps failing now restarts the whole finalizer rather than hanging, but finalization still needs the write | as F2 |
 
+### Re-assessment for recovered resolutions and entry coverage (2026-11-14, Todo 2.8)
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F6 | **fixed** | A recovered `Tx` restores `oresolution` from its saved status (`Committed` or `Aborted`, saved by a prepare or accept after the resolution). Once its objects load, `completeLoad` applies the commit with the recovered re-check rules or deletes the abort's state. It no longer waits for its driver to learn the outcome again, and it is not lost when the status-cache entry is gone. An update that persisted before the crash (its object data dropped) or that was superseded is skipped without a fail-stop. Residual: the constructor still seeds the status cache with the saved status, so a Tx that resolved from its UnackedCommits entry (which records nothing in the cache) and was saved again writes a cached `Committed` after recovery. Under the horizon a replay is refused below the floor, so this is not load-bearing | `Tx.scala` `oresolution`, `completeLoad`; FrontendSuite "a commit vote recovered with a persisted Committed status applies its update on load (R-F6)", "... recovered Committed after its update persisted applies nothing again ...", "... recovered with a persisted Aborted status deletes its state on load ..." |
+| F13 | **closed** (by design, argument below) | Entries stay limited to counted voters. Uncounted stores are not needed for durability | `MissedUpdateFinalizationAction.scala` `writeMissedUpdates` |
+| F15 | **closed** (by design, argument below) | As F13: a non-voter holds no vote to recover, and its ErrorTree mark repairs it | as F13 |
+
+Entry coverage (decided with R-N4). The finalizer writes an UnackedCommits entry for each counted commit voter that
+sent no `TxCommitted`, and for every silent store when the voters are unknown. Nothing is written for other stores.
+That is sufficient:
+- For each changed object, the counted voters reach the object's write threshold. Each one either sent `TxCommitted`
+  (its backend commits persisted) or has an entry. A recovered voter with an entry applies T, and repair leaves the
+  entry alone while the store holds T live (repair E11/M11). So at least a write threshold of stores holds T.
+- An uncounted voter or a non-voter that sent no `TxCommitted` gets an ErrorTree mark, because the marker marks every
+  store without `TxCommitted`. Repair keeps that mark until the store's copy reaches T's timestamp (repair E8), and it
+  reads from the stores above.
+- F13's objection relied on two things, and neither remains. One was a read quorum missing a traceless change, which
+  is now covered: entries name every changed object (requirements F8, fixed). The other was a false abort, which
+  the horizon closed.
+- A recovered uncounted voter either learns the commit from its peers' caches and applies it, or is discarded past
+  the horizon and relies on its mark. While it waits it holds its locks: that is liveness (R-N3).
+- R-N4 (Todo 4.7) may narrow entries further, but it must keep one entry per unacknowledged counted voter, because
+  this argument depends on it.
+
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness.** RegisteredTransactionFinalizerFactory.create does getType(...).get (server/RegisteredTransactionFinalizerFactory.scala, create); it runs inside TransactionDriver.onResolution after `resolved = true` and before `finalizer =` and before queueTxMessages (TransactionDriver.scala:471-520), the exception escapes the handler; periodic TxResolved (SimpleTransactionDriver.scala:42-47) still tells stores, but no finalizer ever exists. Needs a host lacking a registered type (version skew, partial --load-jars).
 > *Fix sketch:* Catch creation failure, leave resolved=false so the driver retries, and surface an error; or refuse to drive txds with unknown types.
 
@@ -878,6 +903,10 @@ store's own `Store.handleTransactionMessage` (`Store.scala:131-158`). If the cac
 start) the driver may re-decide through peers' `TooOld` votes and the store drops an update it knew was committed.
 Fix direction: restore `oresolution` from `trs.status` on recovery.
 
+> **Fixed 2026-11-14.** `oresolution` is restored from the saved status. A recovered `Committed` Tx applies its update
+> on load and an `Aborted` one deletes its state (re-assessment for recovered resolutions, above). Also fixed: a commit
+> whose backend completed synchronously inside `issueCommits` was concluded twice (a duplicate `TxCommitted`).
+
 > **Verification 2026-11-09: CONFIRMED (mechanism). Severity: resurrection (see paxos F3).** Same as paxos F3 (Frontend.scala:655; no server-side HLC update).
 > *Fix sketch:* As paxos F3.
 
@@ -958,6 +987,11 @@ that missed T" and relies on its ErrorTree mark and exact reconciliation. That a
 repair read quorum can include stores that have not applied the traceless change (the 5-wide, write-4 example in the design doc
 with two such stores).
 
+> **Closed 2026-11-14 (by design).** Entries stay limited to counted voters. A write threshold of counted voters holds
+> T or owes it through an entry, and an uncounted voter is repaired by its ErrorTree mark. The traceless objection is
+> covered by requirements F8 (fixed), and the false abort was closed by the horizon. See the re-assessment for
+> recovered resolutions and entry coverage, above.
+
 > **Verification 2026-11-09: CONFIRMED (by design). Severity: liveness.** Finalization needs the marker write (see F2).
 > *Fix sketch:* As F2.
 
@@ -974,6 +1008,9 @@ prepares across the board is outside this scope.
 **F15 (L) Stores that never held a `Tx` for a committed transaction are not recoverable by lookup at all.** The traceless
 design deliberately excludes non-voters (their `ErrorTree` marks suffice). This is only sound if repair always reaches
 the correct quorum state; see repair-process.md.
+
+> **Closed 2026-11-14 (by design).** As F13: repair reaches the state of the write-threshold holders, which are
+> counted voters that acknowledged T or hold an entry for it.
 
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness (wasted work).** Store.scala:156 `notFinalized` is true for a cached non-finalized Aborted/Committed entry, so the leader starts a driver for a resolved transaction.
 > *Fix sketch:* Drive only when the cache has no outcome.
@@ -1225,8 +1262,8 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 
 | Hazard | Flaws |
 |--------|-------|
-| Lose a committed update | F6, F13 (on a lagging store, rescued only by repair); F3, F5 closed by the horizon; paxos P-N2 fixed |
+| Lose a committed update | none open: F6 fixed and F13 closed by design (2026-11-14); F3, F5 closed by the horizon; paxos P-N2 fixed |
 | Apply an aborted update | none found for the UnackedCommits path (entries exist only for committed transactions); paxos P-N4 closed by the horizon (2026-11-13) |
 | Replay a forgotten transaction | F4 (narrowed), F10 (narrowed), R-N1 (narrowed by stubs), R-N7 (narrowed), R-N9, paxos P-N3; F7, F9 and R-N8 fixed |
-| Fail to record a missed update | F14; F13; F2 fixed, R-N2 narrowed (marks wait for a permanently failing action) |
+| Fail to record a missed update | F14; F13 closed (2026-11-14); F2 fixed, R-N2 narrowed (marks wait for a permanently failing action) |
 | Hang forever | F12; F14 (long); R-N2 (a failure repeating forever, logged); R-N3 (recovered votes without lookups); R-N10 (case-3 lookup, no locks); F1, F2 fixed |

@@ -1884,7 +1884,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     */
   def recoveredVote(stored: ObjectState, readError: Option[ReadError.Value] = None,
                     frozen: Boolean = false,
-                    txd: TransactionDescription = lockTxd(txid1, List(overwrite(op1))))
+                    txd: TransactionDescription = lockTxd(txid1, List(overwrite(op1))),
+                    status: TransactionStatus.Value = TransactionStatus.Unresolved,
+                    updates: List[ObjectUpdate] = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))),
+                    crl: TestCrl = new TestCrl)
       : (Frontend, TestNet, () => List[Throwable]) =
     val backend = new MapBackend(storeId):
       private var failNext = readError
@@ -1900,10 +1903,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         case None => super.read(pointer)
     backend.bootstrapAllocate(stored.objectId, stored.objectType, stored.metadata, stored.data)
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
-    val trs = TransactionRecoveryState(storeId, txd.serialize(), List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))),
-      TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial)
-    val crl = new TestCrl:
-      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+    val trs = TransactionRecoveryState(storeId, txd.serialize(), updates, TransactionDisposition.VoteCommit, status,
+      PersistentState.initial)
     val net = new TestNet
     var stops = List[Throwable]()
     val lookup = new ManualLookup
@@ -1947,6 +1948,39 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
     committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
     stops() shouldBe Nil
+  }
+
+  test("a commit vote recovered with a persisted Committed status applies its update on load (R-F6)") {
+    val crl = new TestCrl
+    val (frontend, net, stops) = recoveredVote(mkObjectState(oid1), status = TransactionStatus.Committed, crl = crl)
+    // No outcome message: the resolution it saved is restored, so it applies at once
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+    crl.dropped shouldBe List(txid1)
+    stops() shouldBe Nil
+    // Resolved, so it holds no locks
+    prepare(frontend, net, lockTxd(txid2, List(overwriteAfter(txid1)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
+    crl.deleted shouldBe List(txid1)
+    frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("a commit vote recovered Committed after its update persisted applies nothing again and does not fail-stop") {
+    val applied = mkObjectState(oid1)
+    applied.metadata = applied.metadata.copy(revision = ObjectRevision(txid1))
+    // Its object data was dropped once the commit persisted
+    val (_, net, stops) = recoveredVote(applied, status = TransactionStatus.Committed, updates = Nil)
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+    stops() shouldBe Nil
+  }
+
+  test("a commit vote recovered with a persisted Aborted status deletes its state on load and holds no locks") {
+    val crl = new TestCrl
+    val (frontend, net, stops) = recoveredVote(mkObjectState(oid1), status = TransactionStatus.Aborted, crl = crl)
+    crl.deleted shouldBe List(txid1)
+    committedMessages(net) shouldBe Nil
+    stops() shouldBe Nil
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
   }
 
   test("a prepare arriving after its transaction was finalized starts no transaction and takes no locks") {

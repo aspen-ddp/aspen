@@ -63,6 +63,12 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   entry applies and is forgotten at once). A failed or unanswered lookup holds the
   abort and retries at heartbeat (`Frontend.UnackedLookupTimeout`, 5 s). Past the horizon its peers refuse its
   driver, so such a Tx ends by expiry (below)
+- A recovered Tx whose saved status is resolved (re-saved by a prepare or accept after the resolution) restores it
+  into `oresolution`. It takes no locks and needs no lookup: once its objects load it applies the commit with the
+  recovered re-check rules, or deletes the abort's state, then waits for TxFinalized as a live resolved Tx does
+- Coverage: entries exist only for unacknowledged counted voters (every silent store when the voters are unknown).
+  These reach the write threshold, so uncounted voters and non-voters are repaired by their ErrorTree marks alone
+  (transaction-recovery F13/F15). Any narrowing of entries must keep this rule
 
 #### Expiry (transaction horizon design, section 2)
 - A Tx still unfinalized past the horizon plus the expiry margin (`Frontend.expiryMargin`: `MaxStartLead` +

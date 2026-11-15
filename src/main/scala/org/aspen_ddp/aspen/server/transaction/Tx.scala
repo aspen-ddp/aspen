@@ -71,7 +71,15 @@ class Tx( trs: TransactionRecoveryState,
   private var disposition = trs.disposition
   private var collisions: List[TransactionId] = Nil
   private var txStatus = trs.status
-  private var oresolution: Option[Boolean] = None
+  /** A recovered Tx restores the resolution its saved status records: a prepare or accept after the resolution saves
+    * the Tx again with it (transaction-recovery R-F6). Its commit is then applied, or its abort's state deleted, as soon
+    * as its objects load (completeLoad), rather than waiting for its driver to learn the outcome again. A live Tx
+    * always starts unresolved
+    */
+  private var oresolution: Option[Boolean] = trs.status match
+    case TransactionStatus.Committed => Some(true)
+    case TransactionStatus.Aborted => Some(false)
+    case _ => None
   private var ofinalized: Option[Boolean] = None
   private var objects: Map[ObjectId, ObjectState] = Map()
   private var pendingObjectLoads: Int = objectPointers.size
@@ -418,7 +426,7 @@ class Tx( trs: TransactionRecoveryState,
 
   /** Holds the requirement locks from a commit vote until the transaction resolves, so that this store votes abort
     * on conflicting transactions in the meantime. Locks have no purpose once the outcome is known, including the
-    * resolved status of a Tx recovered from the CRL.
+    * resolution a Tx recovered from the CRL restores from its saved status.
     */
   private def lock(): Unit =
     if !locked && !outcomeKnown && txStatus == TransactionStatus.Unresolved &&
@@ -787,8 +795,9 @@ class Tx( trs: TransactionRecoveryState,
       frontend.transactionFinalized(transactionId, writeStub = stubDue, by = Some(this))
 
     // Nothing was committed, so no commit completions will arrive to trigger the notification.
-    // Without this the proposer never learns this store's outcome.
-    if pendingObjectCommits == 0 then
+    // Without this the proposer never learns this store's outcome. A synchronous backend may already have completed
+    // every commit inside issueCommits (committed), which must not conclude them twice
+    if pendingObjectCommits == 0 && !committed then
       allObjectCommitsComplete()
   }
 

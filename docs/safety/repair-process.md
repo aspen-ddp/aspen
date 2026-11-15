@@ -544,8 +544,10 @@ positive refcount.
 
 ### 9.2 How a missed delete is repaired
 
-1. The finalizer records the miss: an ErrorTree entry (store never replied, or replied with an error) or a
-   UnackedCommits entry (replied, but no `TxCommitted`), both carrying the `storePointer`.
+1. The finalizer records the miss. Every store that sent no `TxCommitted`, or reported the object in its
+   `TxCommitted` errors, gets an ErrorTree entry. A counted commit voter that sent no `TxCommitted` (any silent store,
+   when the voters are unknown) also gets a UnackedCommits entry. Both carry the `storePointer`. Uncounted voters and
+   non-voters get only the ErrorTree entry (transaction-recovery F13/F15, closed by design 2026-11-14).
 2. Scan: the entry is found. `allocationTree.get(objectId)`:
    - **present** (DeletionFinalizationAction not yet run): `client.read` fails with `InvalidObject` (refcount 0,
      Q7). The callback fails and logs, the entry stays. The next pass retries.

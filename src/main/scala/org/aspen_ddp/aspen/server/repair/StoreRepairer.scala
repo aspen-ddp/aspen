@@ -330,7 +330,13 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
             counts.deferred.incrementAndGet()
             Future.unit
 
-        for
+        if target.mayJoinTransaction(storeId, errorEntry.missedTimestamp) then
+          // As for UnackedCommits entries: a replay may still create a Tx for the missed transaction here and apply
+          // it after this entry's reconcile, and the entry would be gone (transaction-recovery R-N9)
+          logger.debug(s"Deferring error entry of $objectId on $storeId: the store may still join its transaction")
+          counts.deferred.incrementAndGet()
+          Future.unit
+        else for
           oAllocation <- pool.allocationTree.get(Key(objectId.toBytes))
           _ <- oAllocation match
             case Some(allocation) =>
@@ -361,7 +367,9 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
   /** A UnackedCommits entry: the store cast a commit vote on transaction T and had not acknowledged applying it when
     * T was finalized, so it may be owed T. The entry names every object of the store that T changes, traced or
     * traceless; it may also be left over after the store applied T late, and reconciling such objects is a no-op.
-    * Skipped while the store holds T live: its Tx applies T (recovery). Otherwise each
+    * Skipped while the store holds T live: its Tx applies T (recovery). Also skipped while T's start is at or above
+    * the store's forget floor (RepairTarget.mayJoinTransaction): a replay may still create a Tx for T there and apply
+    * it late through this entry, after a reconcile, so the entry must outlive that window. Otherwise each
     * object is reconciled, or, when the allocation tree does not list it, handled by repairAbsent. As for errorTree
     * entries, that needs the entry to be older than `policy.minErrorEntryAgeForDeletion`: an allocation's
     * RefcountUpdate is traceless, so a store that missed it gets an entry before AllocationFinalizationAction records
@@ -384,39 +392,53 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           Future.unit
         else
           val entry = UnackedCommitEntry.decode(value.value.bytes)
-          val entryKeys = entry.objects.map(ptr => ptr -> unackedDeferralKey(key, ptr.id))
-          counts.touch(entryKeys.map(_._2))
+          if target.mayJoinTransaction(storeId, entry.timestamp) then
+            // A replay may still create a Tx for T here, after the holdsTransaction check above, and apply T late
+            // through this entry once its reconcile is done: deleting the entry then would leave that apply
+            // unrepaired (transaction-recovery R-N9). Below the store's forget floor no new Tx for T can appear
+            logger.debug(s"Deferring UnackedCommits entry of $txid on $storeId: the store may still join it")
+            counts.deferred.incrementAndGet()
+            Future.unit
+          else
+            repairUnackedObjects(pool, storeId, policy, deferral, counts, key, value, txid, entry)
 
-          // One object at a time, as errorTree entries are
-          val completed = entryKeys.foldLeft(Future.successful(true)): (f, objectEntry) =>
-            val (ptr, entryKey) = objectEntry
-            f.flatMap: allComplete =>
-              pool.allocationTree.get(Key(ptr.id.toBytes)).flatMap:
-                case None if errorEntryMayBeDeleted(value.timestamp, HLCTimestamp.now,
-                                                    policy.minErrorEntryAgeForDeletion) =>
-                  repairAbsent(storeId, ptr, entry.timestamp, entryKey, policy, deferral)
-                    .map(complete => allComplete && complete)
-                case None =>
-                  logger.debug(s"Deferring repair of ${ptr.id} on $storeId: absent from the allocation tree but its " +
-                               s"UnackedCommits entry is too recent to treat as a deletion")
-                  Future.successful(false)
-                case Some(_) =>
-                  repairUpdate(storeId, ptr, entry.timestamp, entryKey, policy, deferral, allowProof = true)
-                    .map(result => allComplete && result.complete)
+  /** The objects of a UnackedCommits entry the scan may act on (repairUnackedEntry), then the entry itself */
+  private def repairUnackedObjects(pool: StoragePool, storeId: StoreId, policy: RepairPolicy, deferral: DeferralState,
+                                   counts: Counts, key: Key, value: ValueState, txid: TransactionId,
+                                   entry: UnackedCommitEntry): Future[Unit] =
+      val entryKeys = entry.objects.map(ptr => ptr -> unackedDeferralKey(key, ptr.id))
+      counts.touch(entryKeys.map(_._2))
 
-          completed.flatMap: allComplete =>
-            if allComplete then
-              entryKeys.foreach((_, entryKey) => deferral.clear(entryKey))
-              deleteEntryIfUnchanged(storeId.poolId, pool.unackedCommitsTree, value.revision, key).map: _ =>
-                // Only the head's deletion drops the stub: the lookups that decide whether the store applies a
-                // late commit name the head (UnackedCommitEntry.key), so the stub must outlive it, not the other
-                // chunks, which only carry more objects to repair
-                if UnackedCommitEntry.isHeadKey(key) then target.dropAppliedStub(storeId, txid)
-                logger.info(s"Repair complete for UnackedCommits entry of $txid on store $storeId")
-                counts.repaired.incrementAndGet()
-            else
-              counts.deferred.incrementAndGet()
-              Future.unit
+      // One object at a time, as errorTree entries are
+      val completed = entryKeys.foldLeft(Future.successful(true)): (f, objectEntry) =>
+        val (ptr, entryKey) = objectEntry
+        f.flatMap: allComplete =>
+          pool.allocationTree.get(Key(ptr.id.toBytes)).flatMap:
+            case None if errorEntryMayBeDeleted(value.timestamp, HLCTimestamp.now,
+                                                policy.minErrorEntryAgeForDeletion) =>
+              repairAbsent(storeId, ptr, entry.timestamp, entryKey, policy, deferral)
+                .map(complete => allComplete && complete)
+            case None =>
+              logger.debug(s"Deferring repair of ${ptr.id} on $storeId: absent from the allocation tree but its " +
+                           s"UnackedCommits entry is too recent to treat as a deletion")
+              Future.successful(false)
+            case Some(_) =>
+              repairUpdate(storeId, ptr, entry.timestamp, entryKey, policy, deferral, allowProof = true)
+                .map(result => allComplete && result.complete)
+
+      completed.flatMap: allComplete =>
+        if allComplete then
+          entryKeys.foreach((_, entryKey) => deferral.clear(entryKey))
+          deleteEntryIfUnchanged(storeId.poolId, pool.unackedCommitsTree, value.revision, key).map: _ =>
+            // Only the head's deletion drops the stub: the lookups that decide whether the store applies a
+            // late commit name the head (UnackedCommitEntry.key), so the stub must outlive it, not the other
+            // chunks, which only carry more objects to repair
+            if UnackedCommitEntry.isHeadKey(key) then target.dropAppliedStub(storeId, txid)
+            logger.info(s"Repair complete for UnackedCommits entry of $txid on store $storeId")
+            counts.repaired.incrementAndGet()
+        else
+          counts.deferred.incrementAndGet()
+          Future.unit
 
   /** Repairs an object of an entry old enough (errorEntryMayBeDeleted) that the allocation tree does not list.
     * Absence alone does not prove a deletion: the allocating transaction's AllocationFinalizationAction may simply be

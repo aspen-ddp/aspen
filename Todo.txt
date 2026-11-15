@@ -36,20 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.9  Replays through entries with no stub (accepted residuals; re-assess now 2.2-2.4 landed)                [L]
-     R-N1, R-N6, R-N7 (X13, G13), R-N9, RP-N4, P-N3 (X12). A store holding an UnackedCommits entry and no applied
-     stub re-applies T on a replay's commit. That covers blind writes, ABA DoesNotExist inserts and allocations,
-     and for R-N7 possibly a whole pool. R-N7 and R-N9 were accepted by ruling. 2.2 landed (blind Inserts are
-     last-writer-wins, blind deletes refused). 2.3 landed (an allocation over an object the store holds is refused,
-     ObjectExists). 2.4 landed (marker entries only move forward; a re-created UnackedCommits entry changes
-     nothing, since its store never rejoins T). Most write classes are now harmless. Re-derive what remains,
-     including an Insert replayed after a later delete of its key (blind or DoesNotExist ABA: decide on a per-key
-     generation) and an allocation replayed after its object's deletion persisted (no tombstones: an orphan slice),
-     and either close it or re-confirm the acceptance in writing.
-     Candidate fixes: treat an adopted accepted commit from a quorum that contains memoryless acceptors as late
-     when a proof exists (P-N3); D1 writes no entries for stores that D0 listed or that acknowledged (R-N7). Add
-     the missing test that kills D1's host between hand-off and TxFinalized (G13).
-
 2.11 Allocation-tree coverage for rebuilds: Rebuild F10, F17, G6                                            [M]
      Audit every allocation path (FSIF index bitmap, pool creation, tasks) for an allocation-tree entry, and add a
      test asserting that every allocated object is present. An allocation whose tree entry lands after the walk
@@ -69,6 +55,8 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
        F6: aborts drop acceptor state at resolution. The transaction horizon makes a forgotten abort
            non-re-decidable, so this matters only if a host wall clock steps back by more than ~8 s (paxos F6).
            Fix if that residual matters: keep the Paxos record until TxFinalized, as commits do. Low priority.
+           The same clock step also weakens the forget floor's time leg, letting a store that forgot T rejoin
+           it, which would reopen the replay residuals 2.9 closed (transaction-recovery Todo 2.9 re-assessment).
        F7: count Undetermined as no reply, not as an abort vote.
        F11: Tx, driver and client accept a conflicting resolution silently. Log an error and count it, as split-
             decision detection, the way the host status cache already does (TransactionStatusCache.splitDecisions).

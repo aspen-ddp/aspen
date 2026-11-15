@@ -274,6 +274,10 @@ Fix sketch: as R-N1; and have an allocating update fail at apply when the backen
 > first and refuses an object the store holds (`ObjectExists`, requirements F11), so step 3 applies nothing for an
 > allocation. What remains of X11 is T's other unpinned writes (blind or `replaySafe` writes, ABA-prone
 > `DoesNotExist` inserts) and an allocation whose object was deleted, which comes back as an orphan slice (Todo 2.9).
+> **2026-11-14 (Todo 2.9): CLOSED at a quorum by the transaction horizon.** Step 2 needs a fresh Tx at a P store that
+> applied and forgot T; such a store never rejoins T (finalized cache entry, then the forget floor). Only stores that
+> never saw T (below a quorum) can apply it late, and their entry's reconcile heals them, now always after the apply
+> (transaction-recovery, re-assessment "replays through entries with no stub", 2026-11-14, Todo 2.9).
 
 ### X12. Recovering acceptor x replay x finalization re-run (paxos P-N3 x recovery R-N6 x requirements Q-N5)
 Verdict: PLAUSIBLE.  Severity: resurrection (blind writes), stale-replica (orphan allocation entries, regressed marks).
@@ -291,6 +295,9 @@ they let one long outage plus one delayed duplicate leave three different kinds 
 > held UnackedCommits entry, and an entry it re-creates after the scan deleted it changes nothing (repair-process F10,
 > recovery R-N6). Blind writes at stores that acknowledged in time and the orphan allocation entry remain (Todo 2.9,
 > 5.5).
+> **2026-11-14 (Todo 2.9): NARROWED to the orphan allocation entry (Todo 5.5).** Stores that acknowledged in time saw
+> T and forgot it, so they hold no replay Tx for the non-late commit to resolve. A re-adoption is possible only inside
+> the horizon, and then T applies only at stores that never saw T (transaction-recovery, re-assessment "replays through entries with no stub", 2026-11-14, Todo 2.9).
 
 ### X13. Second driver's entries x marker give-up x late commit (recovery R-N7 x X6 x R-N1; addendum)
 
@@ -314,6 +321,9 @@ marker would have to report per-pool results instead of one all-or-nothing futur
 > message lost at a store. A stub can now precede its entry, so the scan drops an orphan stub only after two
 > consecutive successful scans found no entry (Ruling 8, `StoreRepairer.scala:95-104,187-200`); a D1 batch still in
 > flight across two whole successful scans of a store would leave that store an entry without a stub (residual).
+> **2026-11-14 (Todo 2.9): CLOSED by the transaction horizon.** Every store D1's entries name forgot T on D0's
+> message and never rejoins T, so no replay Tx exists there to apply through an entry. The crash leg and the two-scan
+> leg no longer matter (transaction-recovery, re-assessment "replays through entries with no stub", 2026-11-14, Todo 2.9).
 
 ### X14. Ruling 3's delayed `TxFinalized` x status-cache expiry x replay (recovery R-N8 x paxos P-N3 x P17; addendum)
 
@@ -347,7 +357,10 @@ G9. Marker-batch size/limit: `TransactionCreationError` is treated as permanent 
 G10. Capacity interaction: ErrorTree growth during long outages (repair 13.3-6) x CRL admission (X5) x rebuild in-progress counts as failure budget (rebuild 6.3): no combined capacity argument.
 
 G11. Replay ordering: the replay integration tests deliver the leader's copy of the replayed client prepare last (the TestNetwork leader driver does not retransmit), so the ordering where a driver's data-less prepare reaches stores before the replayed client prepare is not exercised end to end. *(Addendum: the headline stub test delivers the pool-B leader's copy before pool A's, because the default order dropped the provers' proofs at a leader with no driver yet (paxos P-N1). Prefer-abort makes a driver-first store withhold everything until the client's prepare arrives, then check it normally, or prove at once (`Tx.awaitingClientPrepare`, `Tx.scala:205-208`); FrontendSuite covers both at unit level, end to end is still untested.)*
-G13. (addendum) No document or test covers a second driver's handed-off entries across its host's crash (X13), nor a `TxFinalized` delivered after the stores' cache entries expired (X14). *(Final fix wave: X14's delayed `TxFinalized` no longer exists; the unit suites cover D1's prompt finalization with the planned set, its silence afterwards, and the two-scan stub drop. The crash leg of X13 is still untested.)*
+G13. (addendum) No document or test covers a second driver's handed-off entries across its host's crash (X13), nor a `TxFinalized` delivered after the stores' cache entries expired (X14). *(Final fix wave: X14's delayed `TxFinalized` no longer exists; the unit suites cover D1's prompt finalization with the planned set, its silence afterwards, and the two-scan stub drop. The crash leg of X13 is still untested.)* *(2026-11-14, Todo 2.9: closed. X13 is closed by the horizon, and the state
+the crash leaves, every store with an entry and no stub after forgetting T, is tested end to end: ReplayIntegrationSuite
+"a replay at a pool whose stores hold entries and no stubs applies nothing, inside and past the caches". The
+single-host TestNetwork cannot run the second driver on another host, and the outcome does not depend on it.)*
 G12. amoebafs pre-existing bugs found during the refactor (cross-node rename whose delete joins into the target node updates it twice; stale `iptr` in `prepareMove`; `prepareDelete` able to end unpinned) are outside these documents' scope and are recorded in Todo.txt. **Fixed (2026-11-11), the cross-node rename:** `SimpleDirectory.prepareRename` stages both keys as one `TieredKeyValueList.prepareUpdates` batch, so the joined node is updated once; the old key is deleted at the revision it was read (`deletesAtRevision`, else `KeyNotAtRevision` aborts) and the new key written under `MustNotExist` or `AtRevision` of the entry it replaces. **Fixed (2026-11-11), the stale `iptr`:** `Directory.prepareMove` no longer takes the pointer from its caller; `prepareMoveOut` reads the source entry inside the attempt and deletes it under that read's `KeyRevision`, returning the pointer it held, which is what is moved (and, for a directory, whose inode's parent pointer is rewritten at its freshly read revision). `Directory.move` holds the retry loop that `AmoebaNFS.move` now calls. **Fixed (2026-11-09, `29e94080`), the unpinned `prepareDelete`:** the delete goes through `TieredKeyValueList.deleteIfPresent`, and when the node it plans against no longer holds the entry (nothing staged, so no pin) it fails with `DirectoryEntryDoesNotExist` as if the entry had been absent from the start (DirectorySuite "a delete whose entry a concurrent unlink removed after it was read fails as an absent entry"). `prepareMoveOut` shares the path. All three G12 items are now fixed.
 
 ## 3. Inter-document contradictions

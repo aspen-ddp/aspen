@@ -628,7 +628,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     yield txid
 
   /** Scans store `i` through the live host until its errorTree and UnackedCommits ranges are empty */
-  private def scanUntilQuiet(i: Int, repairer: StoreRepairer = StoreRepairer(client, net.smgr),
+  private def scanUntilQuiet(i: Int, repairer: StoreRepairer = StoreRepairer(client, SeamTarget()),
                              passes: Int = 20): Future[Unit] =
     for
       _ <- settle()
@@ -766,7 +766,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     // the install: only the snapshot check keeps the install from deleting it
     @volatile var target: Option[KeyValueObjectPointer] = None
     @volatile var paused = false
-    val repairer = StoreRepairer(client, net.smgr, testingOnlyBeforeReconcile = (s, ptr) =>
+    val repairer = StoreRepairer(client, SeamTarget(), testingOnlyBeforeReconcile = (s, ptr) =>
       if !paused && s == sid(2) && target.exists(_.id == ptr.id) then
         paused = true
         missedBy(0)(kvUpdate(target.get, List(Insert(k3, Array[Byte](3)))))
@@ -794,10 +794,14 @@ class StoreRepairerSuite extends IntegrationTestSuite:
 
   /** The live host, with test seams: `live` stands in for transactions a store still holds live, `lockedKeys` and
     * `objectLocked` for locks every read of an object reports. Only a proof transaction gets past those locks: the
-    * reconciliation that follows a committed proof ignores what the read reported on the proven parts
+    * reconciliation that follows a committed proof ignores what the read reported on the proven parts. `mayJoin`
+    * stands in for the store's forget floor: by default every transaction is below it, as the host's would be once its
+    * horizon passed, so these scenarios need not wait the horizon out (the host's own answer: HostRepairTargetSuite)
     */
   private class SeamTarget extends RepairTarget:
     @volatile var live: Set[(StoreId, TransactionId)] = Set()
+    @volatile var mayJoin: (StoreId, HLCTimestamp) => Boolean = (_, _) => false
+    override def mayJoinTransaction(storeId: StoreId, start: HLCTimestamp): Boolean = mayJoin(storeId, start)
     @volatile var lockedKeys: Map[ObjectId, Set[Key]] = Map()
     @volatile var objectLocked: Set[ObjectId] = Set()
 
@@ -1019,6 +1023,56 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       storeKeys(2, kvPtr) should not contain k1
       storeKeys(2, kvPtr) shouldBe Set(k0)
 
+  // A replay may create a Tx for T at a store whose floor T is still above, after the scan's holdsTransaction check,
+  // and apply T late through the entry once its reconcile is done. Deleting the entry then would leave that apply
+  // unrepaired (transaction-recovery R-N9), so the entry waits until no new Tx for T can appear
+  test("a UnackedCommits entry whose transaction the store may still join is left for a later pass"):
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
+      txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
+      _ <- dropErrorEntries(2)
+      before <- unackedEntries(2)
+      _ = target.mayJoin = (s, _) => s == sid(2)
+      result <- pass(2, repairer, DeferralState())
+      held <- unackedEntries(2)
+      keysWhileJoinable = storeKeys(2, kvPtr)
+      _ = target.mayJoin = (_, _) => false
+      _ <- scanUntilQuiet(2, repairer)
+      remaining <- unackedEntries(2)
+    yield
+      before shouldBe List(UnackedCommitEntry.key(sid(2), txid))
+      withClue("while the store may join T the entry is neither reconciled nor deleted: "):
+        held shouldBe before
+        result.deferred shouldBe 1
+        keysWhileJoinable shouldBe Set(k0, k1)
+      remaining shouldBe empty
+      storeKeys(2, kvPtr) shouldBe Set(k0)
+
+  test("an errorTree entry whose transaction the store may still join is left for a later pass"):
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
+      before <- errorEntries(2)
+      _ = target.mayJoin = (s, _) => s == sid(2)
+      result <- pass(2, repairer, DeferralState())
+      held <- errorEntries(2)
+      keysWhileJoinable = storeKeys(2, kvPtr)
+      _ = target.mayJoin = (_, _) => false
+      _ <- scanUntilQuiet(2, repairer)
+      remaining <- errorEntries(2)
+    yield
+      before should not be empty
+      withClue("while the store may join the missed transaction its entry is neither reconciled nor deleted: "):
+        held shouldBe before
+        result.deferred shouldBe before.size
+        keysWhileJoinable shouldBe Set(k0)
+      remaining shouldBe empty
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1)
+
   // A re-run finalizer, or a replay of its marker batch, can write an entry again after the scan deleted it (the
   // marker keeps no tombstone). The store held no Tx for the transaction when it was deleted and never rejoins one it
   // forgot, so the entry only costs a reconcile that changes nothing
@@ -1056,7 +1110,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
             storeHasObject(2, dataPtr.id) shouldBe true
             storeHasObject(0, dataPtr.id) shouldBe false
       marked <- unackedEntries(2)
-      _ <- pass(2, StoreRepairer(client, net.smgr), DeferralState(), noDeletionAge)
+      _ <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState(), noDeletionAge)
       remaining <- unackedEntries(2)
     yield
       marked should not be empty
@@ -1067,7 +1121,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   // Repair F5: an object absent from the allocation tree may be live, its AllocationFinalizationAction late. Before
   // Todo 2.6 an aged entry then dropped the store's live slice; now a read decides, and it is repaired instead
   test("an aged errorTree entry for a live object the allocation tree does not list repairs it, not deletes it"):
-    val repairer = StoreRepairer(client, net.smgr)
+    val repairer = StoreRepairer(client, SeamTarget())
     for
       kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
       _ <- missedBy(2)(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
@@ -1088,7 +1142,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- dropErrorEntries(2)
       marked <- unackedEntries(2)
       _ <- forgetAllocation(kvPtr.id)
-      _ <- pass(2, StoreRepairer(client, net.smgr), DeferralState(), noDeletionAge)
+      _ <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState(), noDeletionAge)
       remaining <- unackedEntries(2)
     yield
       marked should not be empty
@@ -1114,7 +1168,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- pool.unackedCommitsTree.set(UnackedCommitEntry.key(sid(2), txid),
              Value(UnackedCommitEntry(HLCTimestamp.now, List(ptr)).encode))(using tx)
       _ <- pump(tx.commit(), deadline())
-      result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
+      result <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState())
       remaining <- unackedEntries(2)
     yield
       storeHasObject(2, oid) shouldBe true
@@ -1132,7 +1186,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- missedByCrashedVoter(2, dataPtr)(_.setRefcount(dataPtr, before.refcount, expected))
       _ <- dropErrorEntries(2)
       marked <- unackedEntries(2)
-      result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
+      result <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState())
       remaining <- unackedEntries(2)
     yield
       marked.size shouldBe 2
@@ -1162,7 +1216,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       // The repair pass's transactions start once the restarted store joins new ones
       _ <- untilLoadFloorPassed(2)
       rebuilt = Map(kvPtr.id -> stored(2, kvPtr.id).map(_.metadata), dataPtr.id -> stored(2, dataPtr.id).map(_.metadata))
-      result <- pass(2, StoreRepairer(client, net.smgr), DeferralState())
+      result <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState())
       remaining <- unackedEntries(2)
     yield
       withClue("the rebuilt store holds the transactions' changes: "):
@@ -1434,7 +1488,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       heldBefore = tier0.exists(ptr => nodeKeys(2, ptr.id).contains(key))
       heldElsewhere = tier0.exists(ptr => nodeKeys(0, ptr.id).contains(key))
       entries <- errorEntries(2)
-      result <- sweep(2, StoreRepairer(client, net.smgr), DeferralState())
+      result <- sweep(2, StoreRepairer(client, SeamTarget()), DeferralState())
     yield
       heldElsewhere shouldBe true
       withClue("store 2 missed the write, with no entry: "):
@@ -1450,7 +1504,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     def seed(ns: Range): Future[Unit] =
       ns.foldLeft(Future.unit): (f, n) =>
         f.flatMap(_ => untrackedErrorTreeWrite(2, entryKey(n), buildErrorValue(HLCTimestamp.Zero, bigPointer)))
-    val repairer = StoreRepairer(client, net.smgr)
+    val repairer = StoreRepairer(client, SeamTarget())
     val deferral = DeferralState()
     def sweepUntilConverged(passes: Int): Future[Int] =
       sweep(2, repairer, deferral).flatMap: result =>
@@ -1479,7 +1533,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       succeed
 
   test("a sweep of a converged store changes nothing and needs no further pass"):
-    val repairer = StoreRepairer(client, net.smgr)
+    val repairer = StoreRepairer(client, SeamTarget())
     val deferral = DeferralState()
     for
       _ <- scanAllUntilQuiet()
@@ -1559,7 +1613,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       second.reconciled should be >= 1
 
   test("sweeping a store of another pool is rejected"):
-    val repairer = StoreRepairer(client, net.smgr)
+    val repairer = StoreRepairer(client, SeamTarget())
     recoverToSucceededIf[IllegalArgumentException]:
       repairer.sweepBootstrapTrees(StoreId(PoolId(UUID.randomUUID()), 0.toByte), RepairPolicy.Default,
                                    DeferralState())

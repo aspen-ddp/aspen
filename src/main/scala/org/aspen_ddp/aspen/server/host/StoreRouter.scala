@@ -285,6 +285,12 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   def holdsTransaction(storeId: StoreId, txid: TransactionId): Boolean =
     Option(stores.get(storeId)).exists(_.store.holdsTransaction(txid))
 
+  /** Callable from any thread (the repair scan): the forget floor reads a val, the wall clock and an atomic watermark.
+    * False for a store not loaded here
+    */
+  def mayJoinTransaction(storeId: StoreId, start: HLCTimestamp): Boolean =
+    Option(stores.get(storeId)).exists(s => !s.store.frontend.belowForgetFloor(start))
+
   /** Callable from any thread (TestNetwork's checker thread): Store.hasTransactions reads a volatile snapshot. */
   def hasTransactions: Boolean = stores.values.asScala.exists(_.store.hasTransactions)
 

@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -23,6 +24,19 @@ class HostRepairTargetSuite extends IntegrationTestSuite:
       val ids = net.smgr.repairableStoreIds
       ids should contain (StoreId(PoolId.BootstrapPoolId, 0.toByte))
       ids should not contain unhostedStore
+
+  // The repair scan leaves an entry alone while its store may still join the entry's transaction (StoreRepairer)
+  test("mayJoinTransaction follows the store's forget floor"):
+    client.read(radicle, "warm up").map: _ =>
+      val store0 = StoreId(PoolId.BootstrapPoolId, 0.toByte)
+      def at(offsetMillis: Long) = HLCTimestamp((System.currentTimeMillis() + offsetMillis) << 16)
+      // The floor is at most the store's load plus MaxStartLead, or now less the horizon: never above now + 2 s
+      withClue("a transaction starting after the floor may be joined: "):
+        net.smgr.mayJoinTransaction(store0, at(5000)) shouldBe true
+      withClue("one started more than the horizon ago may not: "):
+        net.smgr.mayJoinTransaction(store0, at(-60000)) shouldBe false
+      withClue("an unhosted store joins nothing: "):
+        net.smgr.mayJoinTransaction(unhostedStore, at(5000)) shouldBe false
 
   test("a repair snapshot for an unhosted store fails rather than hanging"):
     val p = Promise[RepairSnapshot]()

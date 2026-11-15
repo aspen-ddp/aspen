@@ -857,7 +857,7 @@ opportunistic rebuild, deletion and the completion gate are unchanged.
 
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
-| RP-N4 | **narrowed** | The entry still outlives the store's own late application of T until the scan, but a store that forgot T on a `TxFinalized` listing it, or applied T through the entry, holds an applied stub and applies nothing on a replay's commit. The window stays open only at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) | `Tx.scala:642-648,998-1000`; `StoreRepairer.scala:322` |
+| RP-N4 | **closed** 2026-11-14 (Todo 2.9; was narrowed: the horizon leaves only never-saw stores, and the forget-floor gate makes their reconcile follow the late apply) | The entry still outlives the store's own late application of T until the scan, but a store that forgot T on a `TxFinalized` listing it, or applied T through the entry, holds an applied stub and applies nothing on a replay's commit. The window stays open only at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) | `Tx.scala:642-648,998-1000`; `StoreRepairer.scala:322` |
 | RP-N3 | unchanged (cost added) | Each such entry also keeps a stub in the device CRL until the scan (RP-N6) | `Frontend.scala:395-409` |
 | RP-N5 | unchanged (REFUTED stands) | The scan still skips an entry while the store holds T live; the skipped entry now also counts as seen, so its stub is kept | `StoreRepairer.scala:273-278` |
 | F7 | unchanged | Entry deletion is still untracked; the stub drop that follows it is a store-local CRL write | `StoreRepairer.scala:322` |
@@ -1181,6 +1181,11 @@ dependency is real but sound. Confidence: low.
   *Refresh (addendum): NARROWED.* Applied stubs close it at every store that forgot T on a `TxFinalized` listing it in
   `owed`, or that applied T through the entry (`Tx.scala:642-648,998-1000`); the stub is dropped with the entry. What
   remains is a store holding an entry and no stub (transaction-recovery R-N7 to R-N9).
+  *2026-11-14 (Todo 2.9): CLOSED.* Under the horizon only a store that never saw T can hold a replay's Tx, and its
+  late apply is what it is owed. The scan now leaves an UnackedCommits entry or ErrorTree mark while the store may
+  still join its transaction (`RepairTarget.mayJoinTransaction`, T's start at or above the store's forget floor), so
+  the entry's reconcile always follows such an apply, and the entry no longer outlives it unrepaired
+  (transaction-recovery, re-assessment "replays through entries with no stub", 2026-11-14, Todo 2.9).
 * **RP-N5 (REFUTED).** Deleting an entry while a recovered vote still needs it: the scan skips while
   `mayHoldTransaction` (`awaitingCrl || transactions.contains`, `Frontend.scala:96`), and a found entry's Tx stays live
   until `TxFinalized` (Ruling 9), so a recovered vote has looked its entry up before the scan can delete it.

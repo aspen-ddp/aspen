@@ -952,7 +952,7 @@ Findings the addendum touches. Every other finding of this document is unchanged
 | F7 | unchanged | Undetermined answers still count as aborts | `TransactionDriver.scala:332-337` |
 | F14 | unchanged | Adopted data still not re-saved; the commit's own data wait is unchanged | `Tx.scala:239,798-802` |
 | P-N1 | **narrowed** | A store reached first by a driver's prepare now proves to *that* driver as soon as its objects load (no abort vote goes out beside the proof), so a recovery driver whose prepare creates a store's Tx holds the proof. A second driver, or a proof that reaches a store with no driver yet, is still lost; the latter is now reproduced (Task 4) | `Tx.scala:806,208,584-586,630`; `Store.scala:208` |
-| P-N3 | **narrowed** | A store holding an applied stub applies nothing on the non-late commit and reports its objects, so the finalizer re-marks it; stores without a stub (they acknowledged in time) still apply a concurrently replayed client prepare's blind writes. Ruling 3 added a second source of non-late commits for a forgotten T (P-N10); Ruling 7 removed it | `Tx.scala:642-648` |
+| P-N3 | **narrowed** (2026-11-14, Todo 2.9: the blind writes at in-time ackers are closed by the horizon; left is a re-adoption inside the horizon, whose cost is the orphan allocation entry, Todo 5.5) | A store holding an applied stub applies nothing on the non-late commit and reports its objects, so the finalizer re-marks it; stores without a stub (they acknowledged in time) still apply a concurrently replayed client prepare's blind writes. Ruling 3 added a second source of non-late commits for a forgotten T (P-N10); Ruling 7 removed it | `Tx.scala:642-648` |
 | P-N4 | **narrowed** to path 3 | Recovery and other store-side drivers can no longer re-decide a forgotten abort commit (prefer-abort, 6.2; tested by ReplayIntegrationSuite "an aborted data-less transaction re-driven by a recovered commit vote aborts again"). A delayed duplicate of the client's own prepare still can: the accepted corner case, documented in the `Transaction.commit` scaladoc | `Tx.scala:205-208,537-542`; `client/Transaction.scala:156-161` |
 | P-N5, P-N6 | unchanged (REFUTED stands) | | |
 
@@ -1337,6 +1337,13 @@ Nacks (extra rounds under contention).
 > `TxFinalized` is lost. Prefer-abort can tilt the race the verdict describes toward the non-late outcome: memoryless
 > acceptors reached only by driver prepares withhold their promises for up to 5 s, while the recovering acceptor answers
 > at once (P-N7).
+>
+> **2026-11-14 (Todo 2.9): NARROWED to inside the horizon.** Stores that acknowledged in time saw T and forgot it, so
+> they never hold a replay's Tx (rejoin invariant, 10.10): the blind-write leg is closed. Past the horizon every peer
+> refuses the recovering acceptor's driver and its Tx ends by expiry. Inside the window it can still join stores that
+> never saw T in a post-proof quorum and adopt commit non-late. The finalization actions then re-run (the marker is
+> harmless, Todo 2.4; the allocation action's orphan entry is Todo 5.5), and T applies only at never-saw stores,
+> which are owed it (transaction-recovery R-N9). The sketched fix is not needed (transaction-recovery, re-assessment "replays through entries with no stub", 2026-11-14, Todo 2.9).
 
 #### P-N4. A forgotten abort can be re-decided commit: pins protect committed transactions only. Confidence: medium
 

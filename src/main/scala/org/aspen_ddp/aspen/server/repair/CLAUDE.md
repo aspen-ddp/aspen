@@ -8,7 +8,11 @@
   object-level parts a read reports locked (`ReadLocks`) are deferred; nothing is written while the object has a
   commit in flight
 - One `StoreRepairer` scan walks the store's ErrorTree range, then its UnackedCommits range (skipping transactions
-  the store holds live). Each chunk of a chunked UnackedCommits entry is repaired as an entry of its own. It drops an
+  the store holds live). Each chunk of a chunked UnackedCommits entry is repaired as an entry of its own. Both kinds
+  of entry are left for a later pass while the store may still join the entry's transaction
+  (`RepairTarget.mayJoinTransaction`: T's start, which both carry, at or above the store's forget floor). Otherwise a
+  replay's Tx created after the `holdsTransaction` check could apply T after the reconcile, and the entry would be
+  deleted under it (transaction-recovery R-N9). The delay is at most the horizon plus `MaxStartLead` (about 22 s). It drops an
   applied stub with its entry (for a chunked one, with its head, the chunk the lookups name), and an orphan stub only
   once two consecutive scans found it so (`server/transaction/CLAUDE.md`)
 - An entry is deleted through its tree (`TieredKeyValueList.deleteIfPresent`, under the entry's `KeyRevision`), not

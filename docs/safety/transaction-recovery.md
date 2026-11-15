@@ -742,10 +742,10 @@ Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding 
 
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
-| R-N1 | **narrowed** | A store that forgot T on a `TxFinalized` listing it in `owed`, applied T through its entry, or found its entry through the case-3 lookup holds an applied stub and applies nothing on a replay's commit, late or not. The R-N1 quorum scenario is tested end to end (ReplayIntegrationSuite "a replay at a pool whose stores all acknowledged late leaves every store unchanged"). Remaining: stores with an entry and no stub: the self-healing minority that never saw T (R-N9), a second driver's entries (R-N7, narrowed by Ruling 7), and a lost `TxFinalized` after a re-run finalizer (R-N6) | `Tx.scala:642-648,935-936,984-1007,1078-1092`; `Frontend.scala:768-778` |
+| R-N1 | **closed** 2026-11-14 (was narrowed) | Todo 2.9: under the horizon only a store that never saw T can hold a replay's Tx, so of the residual below only R-N9 remains. Before: a store that forgot T on a `TxFinalized` listing it in `owed`, applied T through its entry, or found its entry through the case-3 lookup holds an applied stub and applies nothing on a replay's commit, late or not. The R-N1 quorum scenario is tested end to end (ReplayIntegrationSuite "a replay at a pool whose stores all acknowledged late leaves every store unchanged"). Remaining: stores with an entry and no stub: the self-healing minority that never saw T (R-N9), a second driver's entries (R-N7, narrowed by Ruling 7), and a lost `TxFinalized` after a re-run finalizer (R-N6) | `Tx.scala:642-648,935-936,984-1007,1078-1092`; `Frontend.scala:768-778` |
 | R-N3 | unchanged (widened slightly) | The case-3 lookup also depends on the metadata group, but holds no locks: a committed, applied Tx stays in memory (status cache not yet finalized) until the lookup answers or a non-late `TxFinalized` arrives (R-N10) | `Tx.scala:990-997`; `Frontend.scala:484-494` |
 | R-N4 | unchanged (cost added) | Each entry for a store that forgets T on a listing `TxFinalized` now also costs one stub in the device CRL until the scan drops it (repair-process RP-N6) | `Frontend.scala:395-409` |
-| R-N6 | **narrowed** | The re-run marker's entries come with a non-late `TxFinalized` listing them; stores with no Tx write stubs (`Frontend.scala:763-773`), so the re-created entries no longer re-arm R-N1 unless that `TxFinalized` is lost at a store. The ErrorTree regression and the orphan allocation entry are unchanged | as cited |
+| R-N6 | **narrowed** (2026-11-14: to the orphan allocation entry, Todo 5.5; the marker part is FIXED, R-N1's re-arming is closed by the horizon) | The re-run marker's entries come with a non-late `TxFinalized` listing them; stores with no Tx write stubs (`Frontend.scala:763-773`), so the re-created entries no longer re-arm R-N1 unless that `TxFinalized` is lost at a store. The ErrorTree regression and the orphan allocation entry are unchanged | as cited |
 | F2 / R-N2 | unchanged | Still no failure path: a write that gives up never completes the action, so a driver relying on its own finalizer never finalizes (`MissedUpdateFinalizationAction.scala:140-146`). A second driver finalized by another's `TxFinalized` lists its planned set whatever its write's outcome (Ruling 7; R-N7 variant 2 closed) | `TransactionDriver.scala:411-430` |
 | F3 | unchanged | A live commit voter still accepts an abort at once; the late-commit half is now covered by stubs too | `Tx.scala:176-178` |
 | F4 | unchanged | A crash between the backend commit and the stub's (or deletion's) durability still recovers the Tx and can re-apply a blind write through `unackedCommitFound`: the stub in memory is lost with the crash, and the record it would have replaced is still there | `Frontend.scala:395-409`; `Tx.scala:1089-1100` |
@@ -1040,6 +1040,83 @@ transaction messages, yet `Store.handleTransactionMessage` lets drivers on this 
 only produce messages to peers and the `Tx` holds its own responses until loaded, I did not find a violation, but the
 combination (recovery driver for a transaction whose local `Tx` is still loading) is untested here.
 
+### Re-assessment of replays through entries with no stub (2026-11-14, Todo 2.9)
+
+The findings below (R-N1, R-N6, R-N7, R-N9; paxos P-N3; repair RP-N4; cross-document X11 to X13, G13) were written
+before the transaction horizon. They all depend on one step, and the horizon removes that step for every store that
+saw T.
+
+**The step.** For T to be applied again at a store S that holds an entry and no stub, a replay must create a fresh Tx
+for T at S. That Tx must hold a commit vote and meet T's commit: a late commit applies through the entry lookup, and
+a non-late commit applies through `doCommit`.
+
+**The rejoin invariant.** A store never rejoins a transaction it forgot (`Frontend.receivePrepare`; paxos-transactions
+10.10). A store with no Tx for T ignores a prepare while the host's status cache holds T finalized. Below its forget
+floor it refuses the prepare. The floor is the latest of three times:
+- now less the horizon;
+- the store's load or arrival, plus a lead;
+- the cache's eviction watermark.
+
+Every way a store forgets T writes a finalized cache entry, or happens only past the horizon (expiry), or raises the
+floor (restart, transfer, size eviction): TxFinalized, a late commit, `applyNothing` and `concludeKnownOutcome` all
+write one. The entry expires only once T is below the store's floor (`TransactionHorizon.statusCacheDuration`).
+Therefore **a fresh Tx for T exists only at a store that never saw T on its current load.**
+
+Applied to each finding:
+- **R-N7 / X13 / G13: CLOSED by the horizon.** D1's entries name stores that forgot T on D0's `TxFinalized`, so none
+  of them can create a fresh Tx for T. Losing D1's `TxFinalized`, whether to its host's crash or to message loss, no
+  longer matters, and neither does a D1 batch in flight across two scans. The same holds for an entry with no stub
+  from any other source at a store that saw T.
+
+  Test: ReplayIntegrationSuite "a replay at a pool whose stores hold entries and no stubs applies nothing, inside and
+  past the caches". The single-host TestNetwork cannot run D1 on another host, so the test builds the state D1's crash
+  leaves behind: every store applied and forgot T and holds an entry with no stub. That state decides the outcome. The
+  test fails with the two rejoin guards of `receivePrepare` disabled.
+- **R-N1 / RP-N4: CLOSED.** Stubs already covered the late ackers. The other stores R-N1 listed are R-N7's (closed
+  above), R-N6's (stores that forgot T, so closed) and R-N9's (below).
+- **P-N3 / X12, blind writes at stores that acknowledged in time: CLOSED.** Those stores saw T and forgot it, so they
+  hold no replay Tx for the non-late commit to resolve.
+
+  What remains of P-N3 lies inside the horizon only. A recovering acceptor A that restarts while T is still above its
+  peers' floors can join stores that never saw T in a post-proof quorum and adopt commit non-late. Past the horizon
+  every peer refuses A's driver, and A's Tx ends by expiry. The re-run costs two things:
+  - the finalization actions run again: the marker is harmless (2.4), and the allocation action can leave an orphan
+    entry (Todo 5.5);
+  - T applies at never-saw stores, which is R-N9's class.
+
+  The candidate fixes in the Todo (treat the adoption as late when a proof exists; D1 writes no entries) are not needed.
+- **R-N6: narrowed to the orphan allocation entry (Todo 5.5).**
+- **R-N9: NARROWED, and the residual is re-confirmed as accepted.** A store that never saw T (at most `w - t` of each
+  pool T writes, because the write threshold of its stores voted) applies T late. It is owed T, so this is the repair
+  it needs. It diverges only where T's write was superseded inside the window, and every write class except two
+  already handles that:
+  - per-write checked writes and the pin fail;
+  - a blind Insert over a newer value is a no-op (2.2);
+  - blind and `Exists`-guarded deletes are refused (2.5);
+  - an allocation over an existing object votes abort with `ObjectExists` (2.3).
+
+  The two that remain both leave S with an entry, and the entry's reconcile heals S from the majority:
+  - **An Insert after a later delete of its key.** S never had the key, so it refused the delete. Reconcile installs KV
+    objects key by key, so S's copy of the key is removed. No per-key generation is needed.
+  - **An allocation after its object's deletion persisted.** This leaves an orphan slice. `repairAbsent` proves the
+    deletion and drops the slice (repair 2.6).
+
+  The one gap was the lookup race in R-N9's caveat, **FIXED**: `repairUnackedEntry` checked `holdsTransaction` once,
+  reconciled asynchronously, then deleted the entry. Two things could follow:
+  - a replay's Tx created after that check could apply T after the last install;
+  - the scan then deleted the entry, which left S diverged with no record.
+
+  The scan now leaves an entry, ErrorTree marks included (they carry T's start too), while the store may still join T
+  (`RepairTarget.mayJoinTransaction`: T's start at or above the store's forget floor). Below the floor no new Tx for
+  T can appear, and one that already exists is caught by `holdsTransaction`. The cost is at most about 22 s of delay
+  on a fresh entry. Tests: StoreRepairerSuite "a UnackedCommits entry whose transaction the store may still join is
+  left for a later pass", "an errorTree entry whose transaction ...", and HostRepairTargetSuite "mayJoinTransaction
+  follows the store's forget floor". Both repairer tests fail without the gate.
+
+**Shared residual (not new).** The floor's time leg is measured on the host's wall clock. A clock step back of more
+than the cache's margin over the horizon (about 8 s) can let a store that forgot T rejoin it, which reopens all of the
+above for that store. This is the residual of paxos F6 (Todo 2.13), and it is cited there.
+
 ### 10.0 New findings from the replay-pins refresh (2026-11-09)
 
 > **R-N1. Verdict: PLAUSIBLE. Severity: resurrection (pin-only blind writes and allocations, possibly at a quorum).**
@@ -1073,6 +1150,9 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > ReplayIntegrationSuite headline test, which failed before the change ("no pool-B store applied T again"). What
 > remains is any store holding an entry for T and no stub: R-N7 (a second driver's entries; narrowed by Ruling 7, can
 > still reach a quorum), R-N9 (never saw T, at most `w - t`, self-healing) and R-N6's lost `TxFinalized`.
+>
+> **2026-11-14 (Todo 2.9): CLOSED by the transaction horizon.** A store that saw T never rejoins it, so only a store
+> that never saw T can hold a replay's Tx: R-N7's and R-N6's stores are closed and R-N9 remains (re-assessment "replays through entries with no stub", 2026-11-14, Todo 2.9).
 
 > **R-N2. Verdict: CONFIRMED. Severity: stale-replica (lost marks) plus F2's hang.** Ruling 8 runs the marker only when
 > `Future.sequence(first.map(_.complete))` succeeds (`RegisteredTransactionFinalizerFactory.scala:39-42`). A failed
@@ -1132,6 +1212,9 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > horizon: the scan deletes an entry only while the store holds no Tx for T, the store never rejoins T (finalized
 > cache entry, then the forget floor), and a late commit applies only at a Tx holding its own commit vote, so the lost
 > `TxFinalized` no longer matters for these entries. Remaining: the orphan allocation entry (Todo 5.5).
+>
+> **2026-11-14 (Todo 2.9):** re-confirmed. The re-run's non-late commit can reach a replay's Tx only at stores that
+> never saw T, R-N9's class (re-assessment "replays through entries with no stub", 2026-11-14, Todo 2.9). The residual is the orphan allocation entry (Todo 5.5).
 
 ### 10.0a New findings from the addendum refresh (2026-11-10, `c181375b`)
 
@@ -1167,6 +1250,12 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > consecutive successful scans found it with no entry (Ruling 8); a new residual is a D1 batch still in flight across
 > two whole successful scans of the same store, which leaves its entry without a stub. The liveness note is gone:
 > D1 is finalized, so its store drops it at once (`Store.scala:216-218`).
+>
+> **2026-11-14 (Todo 2.9): CLOSED by the transaction horizon.** Every store D1's entries name forgot T on D0's
+> `TxFinalized`, so a replay's prepare there is ignored (finalized cache entry) or refused (forget floor), and no Tx
+> exists to look the entry up. D1's crash, a lost message and the two-scan batch leg no longer matter. Tested with the
+> state D1's crash leaves: ReplayIntegrationSuite "a replay at a pool whose stores hold entries and no stubs applies
+> nothing, inside and past the caches" (re-assessment "replays through entries with no stub", 2026-11-14, Todo 2.9).
 
 > **R-N8. Verdict: PLAUSIBLE (mechanism CONFIRMED). Severity: resurrection (blind writes at stores that acknowledged in
 > time).** Ruling 3 lets a non-late commit `TxFinalized` arrive long after the transaction was finalized and forgotten:
@@ -1209,6 +1298,13 @@ combination (recovery driver for a transaction whose local `Tx` is still loading
 > every store has already forgotten T (R-N6's re-run, R-N7), and the heal fails if the late commit's lookup read the
 > entry before a concurrent scan deleted it and its answer is handled after the scan's reconcile (a lookup race that
 > predates the addendum; a stub holder is immune because it never looks up, `Tx.scala:998-1000`).
+>
+> **2026-11-14 (Todo 2.9): NARROWED; the residual is re-confirmed as accepted.** Under the horizon the first caveat
+> is gone: only a store that never saw T can hold a replay's Tx, so the `w - t` bound holds for every source of
+> entries. The lookup race is FIXED: the repair scan leaves an entry, or an ErrorTree mark, while the store may still
+> join T (`RepairTarget.mayJoinTransaction`), so the entry's reconcile always follows any late apply. Of the write
+> classes, only an Insert after a later delete of its key and an allocation after its object's deletion can make the
+> late apply diverge. Reconcile key by key and `repairAbsent` heal both, so no per-key generation is needed (re-assessment "replays through entries with no stub", 2026-11-14, Todo 2.9).
 
 > **R-N10. Verdict: CONFIRMED (liveness, by design). Severity: liveness (memory, status-cache lag).** The case-3
 > fallback holds a committed, applied Tx until its UnackedCommits lookup answers (`forgetLookupHeld`,

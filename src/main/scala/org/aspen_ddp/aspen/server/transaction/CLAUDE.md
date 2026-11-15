@@ -112,8 +112,11 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   and finalizes at once, listing the received `owed` plus the stores its mark had handed off (`handedOffStores`), so
   a stub may precede its entry. A commit at a store with a stub applies nothing; a non-late one reports its objects in
   `objectCommitErrors`. The repair scan drops a stub with its entry (a chunked entry's head), and an orphan stub (pre-walk snapshot, no entry)
-  only once two consecutive scans found it so. Residuals: a store that never saw T and missed its TxFinalized (below a
-  quorum, self-heals), and a second driver's host crashing after its hand-off but before its TxFinalized arrives
+  only once two consecutive scans found it so. An entry with no stub is harmless at a store that saw T: it never
+  rejoins T, so no replay Tx exists there to apply through it (a second driver's lost TxFinalized included). Residual:
+  a store that never saw T (below a quorum) applies T late through its entry. That is what it is owed, and the
+  entry's reconcile heals any write superseded meanwhile, since repair leaves the entry until the store can no
+  longer join T (`server/repair/CLAUDE.md`; transaction-recovery Todo 2.9 re-assessment)
 - A Tx finalized while its commit is held for its turn defers concluding its state (`Frontend.finalizationDeferred`).
   Every deferring Tx of the txid (a replay's too) is listed, and the state is deleted or stubbed only by the call that
   empties the list; a stub owed meanwhile passes to every listed Tx

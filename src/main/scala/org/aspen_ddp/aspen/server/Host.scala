@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectState as ClientObjectState}
 import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
@@ -399,6 +400,10 @@ class Host(val client: AspenClient,
   /** Called from the repair scan's thread: reads the router's concurrent map and the store's volatile snapshots */
   def holdsTransaction(storeId: StoreId, txid: TransactionId): Boolean =
     deviceControl.router.holdsTransaction(storeId, txid)
+
+  /** Called from the repair scan's thread: see StoreRouter.mayJoinTransaction */
+  override def mayJoinTransaction(storeId: StoreId, start: HLCTimestamp): Boolean =
+    deviceControl.router.mayJoinTransaction(storeId, start)
 
   def snapshot(storeId: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
     deviceControl.router.snapshotForRepair(storeId, pointer, p)

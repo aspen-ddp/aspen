@@ -501,3 +501,95 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
         (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe None)
       yAfterReplay.contents.keySet should not contain k
       entries.forall(i => bFrontend(i).exists(_.hasAppliedStub(t))) shouldBe true
+
+  // Transaction-recovery R-N7 (cross-document X13, G13): a second driver's host crashing after its marker handed
+  // entries off and before its TxFinalized reached the stores leaves entries with no stub, possibly at a whole pool.
+  // The single-host TestNetwork cannot run that driver on another host; this builds the state its crash leaves (every
+  // store applied and forgot T, holds an entry and no stub), which is what decides the outcome. Under the forget floor
+  // no store that forgot T rejoins it: inside its status cache's memory a replayed prepare is ignored, and past it
+  // refused, so no fresh Tx can look its entry up and apply T again
+  test("a replay at a pool whose stores hold entries and no stubs applies nothing, inside and past the caches"):
+    val poolB = PoolId.InitialMetadataPoolId
+    val bStores = net.metadataStores
+    def bKeyRevision(i: Int, ptr: KeyValueObjectPointer): Option[ObjectRevision] =
+      bStores(i).m.get(ptr.id).flatMap(_.kvState).flatMap(_.content.get(k)).map(_.revision)
+    def bFrontend(i: Int) = net.smgr.control.router.loaded.get(bStores(i).storeId).map(_.frontend)
+    def bTxCreated(t: TransactionId): Boolean = (0 until 5).exists(i => bFrontend(i).exists(_.transactions.contains(t)))
+    for
+      poolA <- client.getStoragePool(Radicle.poolId)
+      pb <- client.getStoragePool(poolB)
+      (x, y) <- client.transactUntilSuccessful: tx =>
+                  given Transaction = tx
+                  tx.replaySafe("test")
+                  for
+                    x <- poolA.allocator.allocateDataObject(DataBuffer(Array[Byte](1)))
+                    y <- pb.allocator.allocateKeyValueObject(Map())
+                  yield (x, y)
+      _ <- settle(clock = false)
+      xBefore <- client.read(x)
+      t <- {
+        val tx = client.newTransaction()
+        net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id && m.isInstanceOf[TxPrepare]
+        // Never acknowledged in time, so the finalizer writes each pool-B store an entry
+        net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id && m.isInstanceOf[TxCommitted] &&
+          m.from.poolId == poolB
+        tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+        tx.update(y, None, None, List(KeyValueUpdate.DoesNotExist(k)), List(Insert(k, Array[Byte](2))))
+        for
+          _ <- pump(tx.commit(), clock = false)
+          _ <- settle(clock = false)
+        yield
+          net.recordTxMessage = _ => false
+          net.dropTxMessage = _ => false
+          tx.id
+      }
+      entries <- pb.unackedCommitsTree.foldLeft(Set[Int]()): (acc, contents) =>
+                   acc ++ contents.keysIterator.filter(key => UnackedCommitEntry.decodeTransactionId(key) == t)
+                     .map(_.bytes(0).toInt)
+      _ = withClue("every pool-B store applied T, and a write threshold of them has an entry: "):
+            entries.size should be >= 4
+            (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe Some(ObjectRevision(t)))
+      // The second driver's lost TxFinalized: the stores hold their entries and no stub
+      _ = (0 until 5).foreach(i => net.smgr.control.router.post(bStores(i).storeId)(_.frontend.dropAppliedStub(t)))
+      _ <- settle(clock = false)
+      _ = withClue("no pool-B store holds a stub for T: "):
+            (0 until 5).foreach(i => bFrontend(i).exists(_.hasAppliedStub(t)) shouldBe false)
+      // T2: k is deleted, at T's revision of it
+      _ <- client.transactUntilSuccessful: tx =>
+             tx.update(y, None, None, List(KeyValueUpdate.KeyRevision(k, ObjectRevision(t))), List(Delete(k)))
+             Future.successful(tx.id)
+      _ <- settle(clock = false)
+      _ = (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe None)
+      // Replay 1, while the host's status cache still holds T finalized: every store ignores the prepare
+      _ = withClue("the host still remembers T as finalized: "):
+            net.smgr.control.txStatusCache.getStatus(t).exists(_.finalized) shouldBe true
+      prepares = net.takeRecordedTxMessages().collect { case m: TxPrepare if m.fromClient && m.transactionId == t => m }
+      _ = withClue("T's client prepares were recorded: ")(prepares should not be empty)
+      _ = {
+        val (b, a) = prepares.partition(_.to.poolId == poolB)
+        val (leader, others) = b.partition(isLeader)
+        (others ++ leader ++ a).foreach(net.deliverTransactionMessage)
+        net.handleEvents()
+      }
+      createdInsideCache = bTxCreated(t)
+      _ <- settle(clock = true)
+      _ = withClue("inside the caches' memory no pool-B store created a Tx or applied T again: "):
+            createdInsideCache shouldBe false
+            (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe None)
+      // Replay 2, once the cache forgot T: past every store's forget floor, refused
+      _ <- eventually("the status cache forgot the transaction", clock = false):
+             Future.successful(net.smgr.control.txStatusCache.getStatus(t).isEmpty)
+      _ = {
+        val (b, a) = prepares.partition(_.to.poolId == poolB)
+        val (leader, others) = b.partition(isLeader)
+        (others ++ leader ++ a).foreach(net.deliverTransactionMessage)
+        net.handleEvents()
+      }
+      createdPastCache = bTxCreated(t)
+      _ <- settle(clock = true)
+      yAfter <- client.read(y)
+    yield
+      withClue("past the caches no pool-B store created a Tx either: ")(createdPastCache shouldBe false)
+      withClue("no pool-B store applied T again: "):
+        (0 until 5).foreach(i => bKeyRevision(i, y) shouldBe None)
+      yAfter.contents.keySet should not contain k

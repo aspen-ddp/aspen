@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -39,6 +40,15 @@ trait RepairTarget:
     * from any thread: it reads `@volatile` snapshots, as `Host.hasTransactions` does
     */
   def holdsTransaction(storeId: StoreId, txid: TransactionId): Boolean
+
+  /** Whether the store may still join a transaction started at `start`: it is at or above the store's forget floor
+    * (Frontend.forgetFloorMillis), so a replayed prepare may yet create a Tx for it there. A UnackedCommits entry for
+    * such a transaction is left for a later pass: a Tx created after the scan's `holdsTransaction` check could apply
+    * the entry's transaction late after its reconcile, and the scan would then delete the entry (transaction-recovery
+    * R-N9). Below the floor no new Tx for it can appear. Callable from any thread. False for a store not hosted here,
+    * whose repair fails with StoreNotHosted anyway, and by default (test targets)
+    */
+  def mayJoinTransaction(storeId: StoreId, start: HLCTimestamp): Boolean = false
 
   /** Records the store's copy of the object, the first step of a repair (`Reconcile`). Completes `p` with
     * Failure(StoreNotHosted) if the store has left this host.

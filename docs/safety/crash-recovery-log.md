@@ -763,7 +763,7 @@ described. Only findings whose *consequence* runs through the transaction layer 
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
 | F1-F12, F14-F17, F19-F21 | unchanged (earlier FIXED marks stand) | CRL code not in the diff | `server/crl/` |
-| F13 | **narrowed** | The re-apply after a crash now meets per-write checks for TKVL writes and is skipped; blind writes, `DoesNotExist` inserts after a later delete, and a recovered acceptor's non-late commit remain. *2026-11-14:* a re-applied blind Insert over a newer write is a no-op, `Exists`-guarded deletes are refused, refcount ABA refuted; remaining: inserts after a later delete | `KeyValueListNode.scala:501-518`; `KVObjectState.insertWins`; paxos P-N3 |
+| F13 | **narrowed** | The re-apply after a crash now meets per-write checks for TKVL writes and is skipped; blind writes, `DoesNotExist` inserts after a later delete, and a recovered acceptor's non-late commit remain. *2026-11-14:* a re-applied blind Insert over a newer write is a no-op, `Exists`-guarded deletes are refused, refcount ABA refuted; remaining: inserts after a later delete. *2026-11-14 (Todo 2.9):* only at stores that never saw T (fewer than a quorum), and healed by their entry's reconcile | `KeyValueListNode.scala:501-518`; `KVObjectState.insertWins`; paxos P-N3 |
 | F18 | unchanged (still RESOLVED by the X2 mute) | Its reasoning no longer rests on `TransactionTooOld`; the late-commit rule now also relies on the mute (paxos P-N2) | `Frontend.scala:676` |
 
 New, CRL-facing: every recovered unresolved commit vote now waits for its UnackedCommits lookup before its store drives

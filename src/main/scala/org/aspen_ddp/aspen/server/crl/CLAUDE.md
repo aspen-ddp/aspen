@@ -37,7 +37,9 @@
   `onThreadDeath` runs once. Save completions never run, so no vote follows. The host unloads the device until it
   restarts (`DeviceShutdown.crlFailed`, `server/host/CLAUDE.md`), and the restart recovers the files as after a crash
 - `admissionLimitBytes` (SimpleCRL: half a stream, so a recycled stream's live copy-forward always fits) sizes the
-  device's `CrlAdmission`, which drops prepares for unseen transactions past it. `Stream.writeEntry`'s `require` stays
+  device's `CrlAdmission`, which drops prepares for unseen transactions past it. Lanes (`AdmissionTier`, the store's
+  pool's, persisted in its StoreConfig): data stores admit below 3/4 of it, metadata stores below 7/8, bootstrap
+  stores up to it, so the marker batches each tier's finalization needs keep headroom (safety X5, G10). `Stream.writeEntry`'s `require` stays
   the fail-stop backstop. The admission counts everything the CRL holds from the device's open
   (`recoveredBytesByStore`, `CrlAdmission.recoveredBytes`), retained per store until the store loads and counts its
   own, or its entries leave the CRL: records of stores that do not load are copied forward too (safety F8)

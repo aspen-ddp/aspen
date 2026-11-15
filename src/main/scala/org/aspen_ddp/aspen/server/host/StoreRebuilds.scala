@@ -109,8 +109,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             logger.info(s"Not creating store $storeId: device $deviceId is being shut down")
             Future.successful(false)
           else
-            val backendCfg = StoreConfig.storageBackendFor(pstate.backendConfig)
-            val storeConfig = StoreConfig(storeId, backendCfg, pstate.maxSliceSize, pstate.ida)
+            val storeConfig = StoreConfig.forPool(storeId, pstate)
 
             os.makeDir.all(storePath)
             os.write.over(storePath / StoreConfig.configFilename, storeConfig.yamlConfig)

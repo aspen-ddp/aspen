@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionHorizon, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission}
+import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrlAdmission}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -67,7 +67,9 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** Which life of the store's data this is (Frontend.incarnation). None: StoreIncarnation.default(storeId) */
             incarnationOverride: Option[StoreIncarnation] = None,
             /** The IDA of the store's pool (Frontend.poolIDA). None: unchecked, tests only */
-            poolIDA: Option[IDA] = None) extends Logging {
+            poolIDA: Option[IDA] = None,
+            /** The store's CRL admission lane (Frontend.admissionTier) */
+            admissionTier: AdmissionTier = AdmissionTier.Data) extends Logging {
 
   /** How long past the horizon an unresolved Tx starts its status queries: Frontend.expiryMargin */
   val expiryMargin: FiniteDuration = Frontend.expiryMargin(
@@ -86,7 +88,8 @@ class Store(val storageDeviceId: StorageDeviceId,
       case Some(postTo) => task => postTo(s => if s eq this then task()),
     acceptorSince = acceptorSince, deferRecovery = deferRecovery, wallClockMillis = wallClockMillis,
     horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, expiryMargin = expiryMargin,
-    onFailStop = err => onFailStop(this, err), incarnationOverride = incarnationOverride, poolIDA = poolIDA)
+    onFailStop = err => onFailStop(this, err), incarnationOverride = incarnationOverride, poolIDA = poolIDA,
+    admissionTier = admissionTier)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's
@@ -210,8 +213,8 @@ class Store(val storageDeviceId: StorageDeviceId,
   def receiveTransactionMessage(msg: TxMessage): Unit = msg match {
     case _ if frontend.failStopped =>
       logger.trace(s"Store $storeId dropped $msg: fail-stopped")
-    // Backpressure: while the device's CRL is filling, a prepare for a transaction this store has not seen is dropped
-    // without a reply. The client retransmits; other stores may commit it without this one, which repair catches up
+    // Backpressure: while the device's CRL is filling past this store's lane (CrlAdmission), a prepare for a
+    // transaction this store has not seen is dropped without a reply. The client retransmits; other stores may commit it without this one, which repair catches up
     case m: TxPrepare if !frontend.admitPrepare(m) =>
       logger.trace(s"Store $storeId dropped the prepare of unseen Tx ${m.txd.transactionId}: its device's CRL is filling")
     case _ => handleTransactionMessage(msg)

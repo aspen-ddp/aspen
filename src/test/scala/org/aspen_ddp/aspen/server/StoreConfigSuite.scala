@@ -128,6 +128,37 @@ ida:
       val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(None), None, i)
       roundTrip(cfg) should be(cfg)
 
+  test("yaml round trip of each admission tier, Data being the default and left out"):
+    import org.aspen_ddp.aspen.server.crl.AdmissionTier
+    StoreConfig(storeId0, StoreConfig.RocksDB(None), None, ida).yamlConfig should not include "admission-tier"
+    AdmissionTier.values.foreach: t =>
+      val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), Some(4096), ida, t)
+      roundTrip(cfg) should be(cfg)
+    StoreConfig(storeId0, StoreConfig.RocksDB(None), None, ida, AdmissionTier.Metadata).yamlConfig should include(
+      "admission-tier: metadata")
+
+  test("forPool copies the pool's settings and derives its admission tier"):
+    import org.aspen_ddp.aspen.common.metadata.{StorageDeviceSetId, StoragePoolState, fixed_ids}
+    import org.aspen_ddp.aspen.server.crl.AdmissionTier
+    import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
+    def pool(id: PoolId, meta: Boolean) = StoragePoolState(id, "p", ida, Some(4096), Array.empty,
+      RocksDBConfig(Some(2048)), StorageDeviceSetId(UUID.randomUUID()), isMetadataPool = meta)
+    val data = PoolId(UUID.randomUUID())
+    StoreConfig.forPool(StoreId(data, 0), pool(data, meta = false)) shouldBe
+      StoreConfig(StoreId(data, 0), StoreConfig.RocksDB(Some(2048)), Some(4096), ida, AdmissionTier.Data)
+    StoreConfig.forPool(StoreId(data, 0), pool(data, meta = true)).admissionTier shouldBe AdmissionTier.Metadata
+    val boot = fixed_ids.BootstrapPoolId
+    StoreConfig.forPool(StoreId(boot, 0), pool(boot, meta = true)).admissionTier shouldBe AdmissionTier.Bootstrap
+
+  test("an unknown admission tier is a FormatError"):
+    val f = os.temp(prefix = "aspen-store-tier", suffix = ".yaml")
+    try
+      os.write.over(f, "store-id: 00000000-0000-0000-0000-000000000000:0\nbackend:\n  storage-engine: rocksdb\n" +
+        "admission-tier: fast\n" + idaYaml)
+      a[YamlFormat.FormatError] should be thrownBy StoreConfig.loadStoreConfig(f)
+    finally
+      os.remove(f)
+
   test("a config without an ida is a FormatError"):
     val f = os.temp(prefix = "aspen-store-noida", suffix = ".yaml")
     try

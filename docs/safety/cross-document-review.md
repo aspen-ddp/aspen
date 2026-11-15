@@ -145,6 +145,27 @@ Fix sketch: `Store.close` must `shutdown()` all drivers; a driver should stop wh
 
 ### X5. Admission back-pressure x finalization needing ErrorTree writes x shared device CRL (CRL F15 x recovery F14 x paxos F8 x repair)
 
+> **2026-11-15 (Todo 4.3): FIXED for the admission leg.** Admission has lanes by the receiving store's pool
+> (`AdmissionTier`, `CrlAdmission.ceiling`): data-pool stores admit a new transaction only while the device's total is
+> below 3/4 of the limit, metadata-pool stores below 7/8, bootstrap-pool stores up to the limit. The tier is copied
+> into the store's `aspen-store-config.yaml` from its pool when the store is created (`StoreConfig.forPool`), so no
+> claim in the description is trusted. Finalization only depends upward: a data transaction's marker batch writes
+> trees in a metadata pool, a metadata transaction's in the bootstrap pool, and a bootstrap transaction's marker about
+> the bootstrap pool tracks no missed updates (`MissedUpdateFinalizationAction.limitTracking`). Data load on a shared
+> device therefore cannot take the room the marker batches it waits for need. `TxFinalized` is a message, never
+> gated. The capacity argument is G10.
+> Residual: (a) finalizers in the same tier as their transaction (TKVL split, join and tail removal) can still stall
+> if that tier's own traffic fills its lane on every device of the pool; lower-tier load can no longer cause it.
+> (b) Finalization still needs the marker write to be *available*: a metadata quorum that is unreachable still holds
+> transactions unfinalized (recovery F14, Todo 4.9). (c) Data-only devices give up 1/4 of their admission headroom
+> (Backlog.txt).
+> Tests: CrlAdmissionSuite "each tier is admitted below its own ceiling"; FrontendSuite "past the data lane a data
+> store drops a new prepare while a metadata store on the device admits one", "past the metadata lane only a
+> bootstrap store admits a new prepare"; StoreConfigSuite "forPool copies the pool's settings and derives its
+> admission tier"; MainSuite (the CLI's bootstrap and initial metadata stores). Not reproduced end to end: the
+> single-host TestNetwork runs with unlimited admission, and the loop's only mechanism, which lane a store's
+> admission checks, is exercised directly at the Store.
+
 > **Refresh (replay pins): UNCHANGED, amplified.** Every marker batch now also carries one UnackedCommits entry per
 > silent counted voter per transaction (transaction-recovery R-N4), so the batches the loop waits on are larger.
 Verdict: PLAUSIBLE.  Severity: liveness (system-wide stall, positive feedback).
@@ -431,6 +452,21 @@ G8. Clock: HLC skew no longer affects replay (the horizon is gone, paxos F3 fixe
     host's wall clock plus 2 s. Still open: the repair age gate and rebuild timestamps under host skew.
 G9. Marker-batch size/limit: `TransactionCreationError` is treated as permanent (StopRetrying) and wedges finalization (recovery F2); no document asks which creation errors an oversized batch (256 entries x many objects) can hit. *(2026-11-11: no longer a wedge. The give-up fails the actions and their drivers re-run the finalizers with backoff, so a transient creation error heals; one that repeats forever is a logged stall. An oversized UnackedCommits entry surfaced as TKVL `NodeSizeExceeded`, retried in place forever: about 90 objects on one store with 4096-byte FSIF metadata segments. Fixed: such entries are written in chunks of at most half a leaf node (repair-process 13.0b), and a `NodeSizeExceeded` left over is permanent, taking the finalizer failure path. ErrorTree entries are fixed-size and small.)*
 G10. Capacity interaction: ErrorTree growth during long outages (repair 13.3-6) x CRL admission (X5) x rebuild in-progress counts as failure budget (rebuild 6.3): no combined capacity argument.
+    *2026-11-15 (Todo 4.3), the CRL admission leg:* ErrorTree and UnackedCommits growth costs backend space in the
+    metadata pools, not CRL bytes: an entry occupies a device's CRL admission only while the marker batch writing it is
+    in flight, and batching (`MissedUpdateMarker`) bounds those batches per pool. Every committed but unfinalized
+    transaction holds its admitted bytes until its finalization actions complete. Lanes keep them from starving each
+    other: tier t admits while the device total is below c(t), c(Data) = 3/4 L < c(Metadata) = 7/8 L < c(Bootstrap)
+    = L (L = half a CRL stream). A transaction's marker batch is one tier up (the bootstrap tier's own markers track
+    nothing). Lower tiers stop being admitted at their ceiling, so each higher tier keeps about L/8 of headroom on every
+    device. The exceptions are charges made without a check: one transaction crossing its ceiling, object data
+    arriving after admission, records recovered at load, and applied stubs. The first three are bounded by the
+    transactions already admitted. Stubs are not bounded while repair scans stall (CRL F22, Todo 4.6). A
+    transaction of tier t then finalizes once a write threshold of the next tier's stores can admit one batch, which
+    lower-tier load cannot prevent. What can still fill a lane is the tier's own traffic, including same-tier
+    finalizers (TKVL split, join, tail removal): that is ordinary back-pressure, and it clears as the tier's own
+    transactions finalize upward. Still open: the rebuild leg (in-progress rebuilds counted against the failure
+    budget, rebuild 6.3) and UnackedCommits growth (Todo 4.7).
 
 G11. Replay ordering: the replay integration tests deliver the leader's copy of the replayed client prepare last (the TestNetwork leader driver does not retransmit), so the ordering where a driver's data-less prepare reaches stores before the replayed client prepare is not exercised end to end. *(Addendum: the headline stub test delivers the pool-B leader's copy before pool A's, because the default order dropped the provers' proofs at a leader with no driver yet (paxos P-N1). Prefer-abort makes a driver-first store withhold everything until the client's prepare arrives, then check it normally, or prove at once (`Tx.awaitingClientPrepare`, `Tx.scala:205-208`); FrontendSuite covers both at unit level, end to end is still untested.)*
 G13. (addendum) No document or test covers a second driver's handed-off entries across its host's crash (X13), nor a `TxFinalized` delivered after the stores' cache entries expired (X14). *(Final fix wave: X14's delayed `TxFinalized` no longer exists; the unit suites cover D1's prompt finalization with the planned set, its silence afterwards, and the two-scan stub drop. The crash leg of X13 is still untested.)* *(2026-11-14, Todo 2.9: closed. X13 is closed by the horizon, and the state

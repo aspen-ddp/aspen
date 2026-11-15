@@ -7,7 +7,8 @@ import org.aspen_ddp.aspen.common.network.{ClientId, CurrentAllocationsReply, Cu
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrlAdmission, StoreRecoveryState,
+  TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitState, Completion, Read}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -149,7 +150,9 @@ class Frontend(val storeId: StoreId,
                /** The IDA of the store's pool (StoreConfig.ida), which a description must name for it
                  * (DescriptionValidator). None skips that check: tests only
                  */
-               val poolIDA: Option[IDA] = None) extends Logging {
+               val poolIDA: Option[IDA] = None,
+               /** The lane of `admission` this store's new transactions use: its pool's (StoreConfig.admissionTier) */
+               val admissionTier: AdmissionTier = AdmissionTier.Data) extends Logging {
 
   /** Which life of the store's data this is: prepare replies carry it (TxPrepareResponse.incarnation) */
   val incarnation: StoreIncarnation = incarnationOverride.getOrElse(StoreIncarnation.default(storeId))
@@ -898,7 +901,8 @@ class Frontend(val storeId: StoreId,
     * and could strand it. Object data it brings that is not yet counted is charged without a limit check. A known
     * transaction always is too, as is one finalized in the status cache, which is answered from the cache and never
     * reaches the CRL. Any other is counted for its description, object data and CRL record, and admitted only while
-    * the device's admission has room. The status cache is host-wide, so a transaction merely started on another
+    * the device's admission is below this store's tier's ceiling (CrlAdmission lanes: a metadata or bootstrap store
+    * keeps room for the marker batches data transactions finalize with). The status cache is host-wide, so a transaction merely started on another
     * store is not known here.
     */
   def admitPrepare(m: TxPrepare): Boolean =
@@ -909,12 +913,12 @@ class Frontend(val storeId: StoreId,
         true
       case None if transactions.contains(txid) || statusCache.getStatus(txid).exists(_.finalized) => true
       // Checked before serializing: a prepare that will be dropped costs nothing more
-      case None if admission.full => false
+      case None if admission.full(admissionTier) => false
       case None =>
         val stxd = m.txd.serialize()
         val bytes = CrlAdmission.TxOverheadBytes + stxd.size +
           m.objectUpdates.iterator.map(ou => CrlAdmission.objectUpdateBytes(ou.data.size)).sum
-        if admission.tryAdmit(bytes) then
+        if admission.tryAdmit(bytes, admissionTier) then
           admitted(txid) = new Admitted(bytes, m.objectUpdates.iterator.map(_.objectId).toSet, Some(stxd))
           true
         else

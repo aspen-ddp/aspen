@@ -332,3 +332,11 @@ Traceless commits follow-ups (minor, from the 2026-11-08 reviews):
 - No repair proof compares a KV object's min/max/left/right (the object-level proof is a RevisionLock), and a
   SetMin/DeleteMin/... without a required revision is a traceless change that `deletesKeys` does not flag. Check
   whether such updates occur and, if so, how a store that misses one is repaired.
+
+CRL admission lanes waste headroom on data-only devices (from Todo 4.3, 2026-11-15):
+- `AdmissionTier` reserves the top 1/4 of a device's CRL admission limit for metadata- and bootstrap-pool stores
+  (data stores are admitted only below 3/4, metadata below 7/8, bootstrap up to the limit). The reservation applies
+  on every device, so a device that hosts only data-pool stores never uses that 1/4 of its admission headroom.
+  Cleanup: size the data ceiling per device by whether any metadata or bootstrap store is placed on it (the
+  reserve is needed only where such a store can load, including by transfer, rebuild or adoption), or otherwise
+  reclaim the unused reserve without weakening the X5 / G10 capacity argument.

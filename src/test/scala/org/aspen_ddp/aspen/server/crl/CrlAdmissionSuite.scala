@@ -8,6 +8,36 @@ import java.util.concurrent.atomic.AtomicLong
 
 class CrlAdmissionSuite extends AnyFunSuite with Matchers:
 
+  test("each tier is admitted below its own ceiling"):
+    val a = new CrlAdmission(800)
+    a.ceiling(AdmissionTier.Data) shouldBe 600
+    a.ceiling(AdmissionTier.Metadata) shouldBe 700
+    a.ceiling(AdmissionTier.Bootstrap) shouldBe 800
+    a.tryAdmit(600, AdmissionTier.Data) shouldBe true
+    a.full(AdmissionTier.Data) shouldBe true
+    a.tryAdmit(1, AdmissionTier.Data) shouldBe false
+    a.tryAdmit(100, AdmissionTier.Metadata) shouldBe true
+    a.full(AdmissionTier.Metadata) shouldBe true
+    a.tryAdmit(1, AdmissionTier.Metadata) shouldBe false
+    a.full(AdmissionTier.Bootstrap) shouldBe false
+    a.tryAdmit(100, AdmissionTier.Bootstrap) shouldBe true
+    a.tryAdmit(1, AdmissionTier.Bootstrap) shouldBe false
+    a.release(250)
+    a.tryAdmit(1, AdmissionTier.Data) shouldBe true
+
+  test("an unlimited admission admits every tier"):
+    val a = CrlAdmission.Unlimited
+    AdmissionTier.values.foreach: t =>
+      a.ceiling(t) should be > Long.MaxValue / 2
+      a.tryAdmit(1L << 40, t) shouldBe true
+
+  test("a pool's tier"):
+    import org.aspen_ddp.aspen.common.metadata.fixed_ids
+    import org.aspen_ddp.aspen.common.pool.PoolId
+    AdmissionTier.forPool(fixed_ids.BootstrapPoolId, isMetadataPool = true) shouldBe AdmissionTier.Bootstrap
+    AdmissionTier.forPool(fixed_ids.InitialMetadataPoolId, isMetadataPool = true) shouldBe AdmissionTier.Metadata
+    AdmissionTier.forPool(PoolId(java.util.UUID.randomUUID()), isMetadataPool = false) shouldBe AdmissionTier.Data
+
   test("admits below the limit and refuses at it"):
     val a = new CrlAdmission(100)
     a.tryAdmit(60) shouldBe true

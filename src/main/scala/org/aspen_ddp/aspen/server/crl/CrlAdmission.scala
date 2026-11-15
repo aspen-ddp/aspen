@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server.crl
 
+import org.aspen_ddp.aspen.common.metadata.fixed_ids
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 
 import java.util.concurrent.ConcurrentHashMap
@@ -23,26 +25,38 @@ import scala.annotation.tailrec
   * limit check (the CRL already holds them), so repeated restarts under load cannot stack uncounted live bytes. An
   * accepted gap: a retransmitted prepare arriving past the mark while the store awaits its crl_save.log state is
   * dropped until recovery recreates the transaction.
+  *
+  * Lanes (cross-document-review X5, G10): a new transaction is admitted only below its receiving store's tier's
+  * ceiling (`AdmissionTier`): 3/4 of the limit for data pools, 7/8 for metadata pools, the whole limit for the bootstrap
+  * pool. Finalization depends only upward: a data transaction's marker batch writes trees in a metadata pool, a
+  * metadata transaction's in the bootstrap pool, and a bootstrap transaction's marker about the bootstrap pool tracks
+  * no missed updates (MissedUpdateFinalizationAction.limitTracking). So lower-tier load on a shared device never
+  * takes the headroom a higher tier's finalization needs. The tier is the receiving store's own pool's, so nothing in
+  * the description is trusted for it. Residual: finalizers in the same tier (TKVL split, join, tail removal) can still
+  * stall if that tier's own traffic fills its lane on every device of the pool.
   */
 final class CrlAdmission(val limitBytes: Long):
   private val total = new AtomicLong(0)
 
-  /** Admits `bytes` if the total admitted is below the limit */
+  /** The total below which a new transaction of `tier` is admitted */
+  def ceiling(tier: AdmissionTier): Long = limitBytes - tier.reserveParts * (limitBytes / tier.reserveDivisor)
+
+  /** Admits `bytes` if the total admitted is below the ceiling of `tier` */
   @tailrec
-  def tryAdmit(bytes: Long): Boolean =
+  def tryAdmit(bytes: Long, tier: AdmissionTier = AdmissionTier.Bootstrap): Boolean =
     val current = total.get
-    if current >= limitBytes then
+    if current >= ceiling(tier) then
       false
     else if total.compareAndSet(current, current + bytes) then
       true
     else
-      tryAdmit(bytes)
+      tryAdmit(bytes, tier)
 
   /** Adds `bytes` whatever the total: for a transaction already admitted, which must not be dropped */
   def charge(bytes: Long): Unit = total.addAndGet(bytes)
 
-  /** Whether the total is at or past the limit, so no new transaction is admitted */
-  def full: Boolean = total.get >= limitBytes
+  /** Whether the total is at or past the ceiling of `tier`, so no new transaction of that tier is admitted */
+  def full(tier: AdmissionTier = AdmissionTier.Bootstrap): Boolean = total.get >= ceiling(tier)
 
   def release(bytes: Long): Unit = total.addAndGet(-bytes)
 
@@ -71,6 +85,26 @@ final class CrlAdmission(val limitBytes: Long):
   def retainedBytes(storeId: StoreId): Long = Option(retained.get(storeId)).map(_.longValue).getOrElse(0L)
 
   def admittedBytes: Long = total.get
+
+/** Which admission lane a store's new transactions use, by the store's pool (CrlAdmission). The ceiling is
+  * `limit - reserveParts * (limit / reserveDivisor)`, computed without overflow for any limit */
+enum AdmissionTier(val reserveParts: Long, val reserveDivisor: Long):
+  /** Ordinary pools: 3/4 of the limit */
+  case Data extends AdmissionTier(1, 4)
+  /** Metadata pools (their trees hold data pools' ErrorTree, UnackedCommits and AllocationTree): 7/8 */
+  case Metadata extends AdmissionTier(1, 8)
+  /** The bootstrap pool: the whole limit */
+  case Bootstrap extends AdmissionTier(0, 1)
+
+object AdmissionTier:
+  /** The tier of a pool's stores */
+  def forPool(poolId: PoolId, isMetadataPool: Boolean): AdmissionTier =
+    if poolId == fixed_ids.BootstrapPoolId then
+      Bootstrap
+    else if isMetadataPool then
+      Metadata
+    else
+      Data
 
 object CrlAdmission:
   /** SimpleCRL's static record of a saved transaction (LogContent.staticDataSize): TxId 33, txd location 14,

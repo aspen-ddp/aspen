@@ -16,6 +16,7 @@ import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.util.YamlFormat
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
+import org.aspen_ddp.aspen.server.crl.AdmissionTier
 import org.aspen_ddp.aspen.server.{BootstrapHttpServer, HostConfig, StorageDeviceManager, StoreConfig, UserJarLoader}
 import org.aspen_ddp.aspen.server.store.backend.{FsifConfig, RocksDBConfig}
 import org.yaml.snakeyaml.parser.ParserException
@@ -523,7 +524,13 @@ class MainSuite extends AnyFunSuite with Matchers:
       val devDir = hostDir / StorageDeviceManager.StorageDevicesDirName / "bootstrap-device"
       for i <- 0 until 3 do
         val storeId = StoreId(PoolId.InitialMetadataPoolId, i.toByte)
-        StoreConfig.loadStoreConfig(devDir / storeId.toString / StoreConfig.configFilename).storeId shouldBe storeId
+        val cfg = StoreConfig.loadStoreConfig(devDir / storeId.toString / StoreConfig.configFilename)
+        cfg.storeId shouldBe storeId
+        // Its admission lane reserves room for its marker batches above data traffic (CrlAdmission, X5)
+        cfg.admissionTier shouldBe AdmissionTier.Metadata
+        val bootstrapId = StoreId(PoolId.BootstrapPoolId, i.toByte)
+        StoreConfig.loadStoreConfig(devDir / bootstrapId.toString / StoreConfig.configFilename)
+          .admissionTier shouldBe AdmissionTier.Bootstrap
 
   test("bootstrap writes an owner-only client config caching the bootstrap host"):
     withTempDir("aspen-bootstrap"): tmp =>

@@ -126,9 +126,12 @@
 #### Backpressure (`CrlAdmission`, one per device, shared by its stores)
 - A store admits a prepare for a transaction it has not seen (not admitted or recovered by its Frontend, nor
   finalized in the host-wide status cache) for its description, object data and CRL record, and drops it silently
-  while the device's admitted bytes are at or past half a CRL stream (`SimpleCRL.admissionLimitBytes`). Object data
-  arriving later is charged once per object without a check. Everything else (known transactions' prepares, accepts,
-  resolutions, finalizations, heartbeats, status requests) is handled. Nothing is exempt. Bytes are released when
+  while the device's admitted bytes are at or past its lane's ceiling (`Frontend.admissionTier`, from
+  `StoreConfig.admissionTier`): 3/4 of the limit (half a CRL stream, `SimpleCRL.admissionLimitBytes`) for data pools,
+  7/8 for metadata pools, the whole limit for the bootstrap pool. Marker batches are always a tier above what they
+  finalize, so lower-tier load never blocks them (safety X5, G10). Object data arriving later is charged once per
+  object without a check. Everything else (known transactions' prepares, accepts, resolutions, finalizations,
+  heartbeats, status requests) is handled. Bytes are released when
   the entry is deleted, a Tx is forgotten without one, or the store closes; a Tx waiting on an in-flight commit keeps
   its admission. Recovered transactions are counted too, without a check. Accepted gap: a retransmit past the mark
   while a store awaits its crl_save.log is dropped

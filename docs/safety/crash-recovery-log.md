@@ -1160,6 +1160,13 @@ Committed/Aborted status in a transfer's `crl_save.log` but loses it after a cra
 
 **Verification: PLAUSIBLE (design-level), severity liveness.** Admission rule re-read (`CrlAdmission`, `Frontend.admitPrepare`); no exemption exists. Not demonstrated. Fix sketch: exempt finalization-action transactions or reserve a share of the mark for them.
 
+> **2026-11-15 (Todo 4.3): FIXED (narrowed).** Admission has lanes by the store's pool (`AdmissionTier`): data
+> pools admit below 3/4 of the limit, metadata pools below 7/8, the bootstrap pool up to the limit. The marker
+> batches that finalization waits for are always one tier above the transaction they finalize, so lower-tier load no
+> longer blocks them (cross-document-review X5 for the details and tests, G10 for the capacity argument).
+> Residual: finalizers in the transaction's own tier (TKVL split, join, tail removal) still compete with that tier's
+> traffic.
+
 The record of a committed transaction stays live until its finalization actions (further transactions) complete. Those
 transactions are new to every store that must vote on them and are dropped when the store's device CRL is above the
 mark. If every device in the relevant pools is above the mark because of records waiting for finalization, nothing

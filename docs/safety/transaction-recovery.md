@@ -1022,6 +1022,11 @@ with two such stores).
 > **Verification 2026-11-09: CONFIRMED (by design). Severity: liveness.** Finalization needs the marker write (see F2).
 > *Fix sketch:* As F2.
 
+> **2026-11-15 (Todo 4.3): narrowed.** CRL admission no longer throttles the marker write: metadata- and
+> bootstrap-pool stores admit in lanes above data traffic (`AdmissionTier`, cross-document-review X5). Residual:
+> finalization still depends on the marker write being available, so a metadata quorum that is unreachable still
+> holds transactions unfinalized with their CRL state (Todo 4.9).
+
 **F14 (M) Finalization (and therefore forgetting) depends on the availability of the ErrorTree write; no escape hatch.**
 Any transaction in which one store is silent for `errorTimeout` needs a successful marker transaction, whose own
 commit may be slowed by the same overload that made the store silent (the `MissedUpdateMarker` batching mitigates it but

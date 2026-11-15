@@ -126,7 +126,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     sds.offlineStores -= backend.storeId
     router.clearOffline(backend.storeId)
     logger.info(s"Loading store ${storeCfg.storeId}: $storePath")
-    ctx.loadStore(sds.storageDeviceId, backend, storeCfg.effectiveMaxSliceSize.map(_.toLong), Some(storeCfg.ida))
+    ctx.loadStore(sds.storageDeviceId, backend, storeCfg.effectiveMaxSliceSize.map(_.toLong), Some(storeCfg.ida),
+      storeCfg.admissionTier)
 
   /** Opens (or, with `create`, creates) a store's backend through the BackendOpener, which decides where the open
    *  runs. An open that has completed by the time the opener returns (one run in the caller) is handled here and
@@ -285,7 +286,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     p.future
 
   def handleLoad(e: LoadStore): Unit =
-    val LoadStore(storageDeviceId, backend, maxSliceSize, p, poolIDA) = e
+    val LoadStore(storageDeviceId, backend, maxSliceSize, p, poolIDA, admissionTier) = e
     // Taken whatever this load's outcome: a later load of the store is not its first
     val isNew = newStores.contains(backend.storeId)
     newStores -= backend.storeId
@@ -358,6 +359,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 RebuildingStore.readAcceptorSince(backend.path),
                 incarnationOverride = Some(StoreIncarnationFile.loadOrCreate(backend.path, storeId)),
                 poolIDA = poolIDA,
+                admissionTier = admissionTier,
                 // Its backend's completion handler is set below, after the Store is built: recovered transactions read
                 // their objects once it is installed (awaitCrlLoad)
                 deferRecovery = true,

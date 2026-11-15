@@ -119,7 +119,7 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 | Recovery F2 / R-N2 | **FIXED** / **NARROWED** 2026-11-11 (was CONFIRMED) | Finalization has a failure path: a failed finalizer is logged and started again with backoff, never finalized without its marks. Residual (R-N2): an action failing on every attempt keeps the marks unwritten with the transaction unfinalized, a logged stall |
 | Recovery F6 / C7 | **FIXED** 2026-11-14 (was CONFIRMED) | A recovered Tx restores the resolution its re-saved status records, and applies the commit (or deletes the abort's state) once its objects load instead of waiting for a driver and a status cache. Residual: the saved status seeds the status cache, including for an entry-resolved Tx (not load-bearing under the horizon) |
 | Recovery F13, F15 / C5 | **CLOSED** 2026-11-14 by design (was CONFIRMED / PLAUSIBLE) | UnackedCommits entries stay limited to unacknowledged counted voters. A write threshold of those holds T or owes it through an entry, so uncounted voters and non-voters are repaired by their ErrorTree marks. R-N4 may narrow entries but must keep this rule |
-| Recovery F14 / X5 | CONFIRMED | Finalization still needs the marker's write; under a metadata outage or CRL admission pressure transactions pile up unfinalized |
+| Recovery F14 / X5 / CRL F15 | X5, CRL F15 **FIXED** 2026-11-15; F14 narrowed (was CONFIRMED / PLAUSIBLE) | Admission has lanes by the store's pool (data below 3/4 of the limit, metadata below 7/8, bootstrap to the limit), and a marker batch is always a tier above the transaction it finalizes, so data load on a shared device no longer blocks it. Residual: finalization still needs the marker's write, so a metadata outage piles transactions up unfinalized (F14, Todo 4.9); same-tier finalizers (TKVL split/join) still compete with their tier's traffic |
 | Recovery R-N3 | CONFIRMED (new) | Every recovered commit vote waits, holding its locks and with no driver, for its UnackedCommits lookup; a metadata-group outage stalls them all |
 | Recovery R-N4 / Repair RP-N3 | CONFIRMED (new) | UnackedCommits entries are one per (store, transaction), never merge, and are now written for every transaction with a silent voter: tree growth, larger marker batches, double reconciles |
 | Cross G9 | **FIXED** 2026-11-11 (was a coverage gap) | An UnackedCommits entry naming more objects than half a metadata-tree node (about 90 with 4 KiB FSIF segments) failed its insert with `NodeSizeExceeded`, retried forever; the marker now writes it as chunks under consecutive keys (repair-process 13.0b), and a node too small for one object gives up into the finalizer failure path |
@@ -154,7 +154,8 @@ Per cross-document-review §2, no document yet covers:
 - client-side caches;
 - clock skew across `acceptorSince`, repair age gates and rebuild timestamps (no longer the horizon);
 - the size limits of marker batches;
-- a combined capacity argument covering the ErrorTree, UnackedCommits growth, CRL admission and rebuilds;
+- a combined capacity argument covering the ErrorTree, UnackedCommits growth, CRL admission and rebuilds (the CRL
+  admission leg stated 2026-11-15, cross-document G10; UnackedCommits growth and rebuilds still open);
 - replay where a driver's data-less prepare precedes the replayed client prepare (untested end to end; since the
   addendum the store waits for the client's prepare or proves, covered at unit level only);
 - (closed 2026-11-14, Todo 2.9) a second driver's handed-off entries across its host's crash (cross-document G13;

@@ -2,8 +2,10 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.metadata.StoragePoolState
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
+import org.aspen_ddp.aspen.server.crl.AdmissionTier
 import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, FsifConfig, RocksDBConfig}
 
 import java.util.UUID
@@ -14,6 +16,7 @@ backend:
   storage-engine: rocksdb
   max-slice-size: 2048      # optional, backend limit
 pool-max-slice-size: 4096   # optional, pool limit
+admission-tier: metadata    # optional: data (the default), metadata or bootstrap (AdmissionTier)
 ida:                        # required, the pool's IDA (BootstrapConfig.IDAOptions)
   type: replication
   write-threshold: 2
@@ -30,11 +33,14 @@ backend:
   * @param ida              The pool's IDA, copied from the StoragePoolState when the store was created (a pool's IDA
   *                         never changes). Stores refuse a transaction description that names another IDA for their
   *                         pool (Frontend.poolIDA, DescriptionValidator)
+  * @param admissionTier    The CRL admission lane of the store's new transactions (CrlAdmission), from the pool:
+  *                         `AdmissionTier.forPool`, fixed when the pool is created
   */
 case class StoreConfig(storeId: StoreId,
                        backend: StoreConfig.StorageBackend,
                        poolMaxSliceSize: Option[Int],
-                       ida: IDA):
+                       ida: IDA,
+                       admissionTier: AdmissionTier = AdmissionTier.Data):
 
   /** The limit the store enforces: the smaller of the pool limit and the backend limit when both are present, the
     * only one present otherwise, or None when the store is unlimited.
@@ -51,9 +57,15 @@ case class StoreConfig(storeId: StoreId,
       case b: StoreConfig.Fsif =>
         s"\n  segment-payload-size: ${b.segmentPayloadSize}\n  segment-count: ${b.segmentCount}"
     val poolLimit = poolMaxSliceSize.map(v => s"\npool-max-slice-size: $v").getOrElse("")
+    // The default, Data, is left out
+    val tier =
+      if admissionTier == AdmissionTier.Data then
+        ""
+      else
+        s"\nadmission-tier: ${StoreConfig.tierName(admissionTier)}"
     s"""store-id: $storeId
        |backend:
-       |  storage-engine: ${backend.name}$backendAttrs$poolLimit
+       |  storage-engine: ${backend.name}$backendAttrs$poolLimit$tier
        |ida:
        |${BootstrapConfig.idaYaml(ida)}""".stripMargin
 
@@ -100,6 +112,11 @@ object StoreConfig extends YObject[StoreConfig]:
            positive("segment-count", segmentCount.get(o)))
 
 
+  /** A new store's config, from its pool's state */
+  def forPool(storeId: StoreId, pstate: StoragePoolState): StoreConfig =
+    StoreConfig(storeId, storageBackendFor(pstate.backendConfig), pstate.maxSliceSize, pstate.ida,
+      AdmissionTier.forPool(pstate.poolId, pstate.isMetadataPool))
+
   /** The store backend a pool's BackendConfig names */
   def storageBackendFor(cfg: BackendConfig): StorageBackend = cfg match
     case c: RocksDBConfig => RocksDB(c.maxSliceSize)
@@ -116,11 +133,22 @@ object StoreConfig extends YObject[StoreConfig]:
 
   val ida: Required[IDA] = Required("ida", Choice("type", BootstrapConfig.IDAOptions))
 
-  val attrs: List[Attr] = storeId :: backend :: poolMaxSliceSize :: ida :: Nil
+  val admissionTier: Optional[String] = Optional("admission-tier", YString)
+
+  val attrs: List[Attr] = storeId :: backend :: poolMaxSliceSize :: ida :: admissionTier :: Nil
+
+  private val tierNames: Map[String, AdmissionTier] = Map("data" -> AdmissionTier.Data,
+    "metadata" -> AdmissionTier.Metadata, "bootstrap" -> AdmissionTier.Bootstrap)
+
+  def tierName(tier: AdmissionTier): String = tierNames.collectFirst { case (n, t) if t == tier => n }.get
 
   def create(o: Object): StoreConfig =
+    val tier = admissionTier.get(o) match
+      case None => AdmissionTier.Data
+      case Some(n) => tierNames.getOrElse(n, throw new FormatError(s"admission-tier must be one of " +
+        s"${tierNames.keys.mkString(", ")}, got $n"))
     StoreConfig(storeId.get(o), backend.get(o), positiveLimit("pool-max-slice-size", poolMaxSliceSize.get(o)),
-      ida.get(o))
+      ida.get(o), tier)
 
   /** `limit` unchanged, or a FormatError if it is present but not positive: a slice limit of zero or less admits
     * nothing, so such a file is corrupt rather than a deliberate setting

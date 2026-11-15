@@ -253,8 +253,7 @@ class RebuildingStore(client: AspenClient,
 
     for
       pstate <- client.getStoragePoolState(storeId.poolId)
-      stagingCfg = StoreConfig(storeId, StoreConfig.storageBackendFor(pstate.backendConfig), pstate.maxSliceSize,
-        pstate.ida)
+      stagingCfg = StoreConfig.forPool(storeId, pstate)
       _ = if !os.exists(stagingPath / StoreConfig.configFilename) then
             // Written up front so the directory is loadable the instant it is moved into place.
             os.write.over(stagingPath / StoreConfig.configFilename, stagingCfg.yamlConfig)

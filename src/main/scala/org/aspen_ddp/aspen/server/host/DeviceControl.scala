@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.transaction.TransactionHorizon
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
+import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.store.{Frontend, QuarantineVerifier, UnackedCommitLookup}
@@ -61,7 +61,7 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val deviceScanPeriod: Duration,
                           val storeRebuildFactory: StoreRebuildFactory,
                           val maxConcurrentRebuilds: Int,
-                          val loadStore: (StorageDeviceId, Backend, Option[Long], Option[IDA]) => Future[Unit],
+                          val loadStore: (StorageDeviceId, Backend, Option[Long], Option[IDA], AdmissionTier) => Future[Unit],
                           val tryLoadStore: (LocalStorageDeviceState, os.Path, Option[() => Unit]) => Unit,
                           val loadStoreById: (StorageDeviceId, StoreId) => Unit,
                           val warn: (os.Path, String) => Unit,

@@ -12,7 +12,8 @@ import org.aspen_ddp.aspen.common.store.{ReadState, StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.paxos.PersistentState
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.TempDirManager
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrlAdmission, StoreRecoveryState,
+  TransactionRecoveryState}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, LogRateLimit}
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
@@ -4350,14 +4351,15 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   /** A Store over a DeferredCommitBackend whose device admits through `admission`. Its transactions are led by
     * another store, so it starts no driver
     */
-  def admissionStore(admission: CrlAdmission, crl: TestCrl = new TestCrl): (Store, DeferredCommitBackend, TestNet) =
+  def admissionStore(admission: CrlAdmission, crl: TestCrl = new TestCrl,
+                     tier: AdmissionTier = AdmissionTier.Data): (Store, DeferredCommitBackend, TestNet) =
     val backend = new DeferredCommitBackend
     populate(backend)
     val net = new TestNet
     val store = new Store(StorageDeviceId(new UUID(0, 99)), scala.concurrent.ExecutionContext.parasitic, backend,
       new HostObjectCache(1024 * 1024).forStore(storeId), net, BackgroundTaskManager.NoBackgroundTaskManager, crl,
       new TransactionStatusCache(), null, TransactionDriver.noErrorRecoveryFactory, Duration(60, SECONDS), None,
-      admission, loadedAt = FrontendSuite.longLoaded)
+      admission, loadedAt = FrontendSuite.longLoaded, admissionTier = tier)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     (store, backend, net)
 
@@ -4389,10 +4391,46 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     admission.admittedBytes shouldBe 100
   }
 
+  // Cross-document-review X5: data transactions filling a shared device must not block the marker batches, on the
+  // device's metadata-pool stores, that those transactions finalize with
+  test("past the data lane a data store drops a new prepare while a metadata store on the device admits one") {
+    val admission = new CrlAdmission(800)
+    admission.tryAdmit(admission.ceiling(AdmissionTier.Data)) shouldBe true
+    val dataCrl = new TestCrl
+    val (dataStore, _, _) = admissionStore(admission, dataCrl)
+    val metaCrl = new TestCrl
+    val (metaStore, _, _) = admissionStore(admission, metaCrl, AdmissionTier.Metadata)
+
+    dataStore.receiveTransactionMessage(dataPrepare(ledTxd(txid1, List(overwrite(op1)))))
+    dataStore.frontend.transactions shouldBe empty
+    dataCrl.txSaved shouldBe false
+
+    val m = dataPrepare(ledTxd(txid2, List(overwrite(op1))))
+    metaStore.receiveTransactionMessage(m)
+    metaStore.frontend.transactions.keySet shouldBe Set(txid2)
+    metaCrl.txSaved shouldBe true
+    admission.admittedBytes shouldBe 600 + admissionBytes(m)
+  }
+
+  test("past the metadata lane only a bootstrap store admits a new prepare") {
+    val admission = new CrlAdmission(800)
+    admission.tryAdmit(admission.ceiling(AdmissionTier.Metadata)) shouldBe true
+    val (metaStore, _, _) = admissionStore(admission, tier = AdmissionTier.Metadata)
+    val bootCrl = new TestCrl
+    val (bootStore, _, _) = admissionStore(admission, bootCrl, AdmissionTier.Bootstrap)
+
+    metaStore.receiveTransactionMessage(dataPrepare(ledTxd(txid1, List(overwrite(op1)))))
+    metaStore.frontend.transactions shouldBe empty
+
+    bootStore.receiveTransactionMessage(dataPrepare(ledTxd(txid2, List(overwrite(op1)))))
+    bootStore.frontend.transactions.keySet shouldBe Set(txid2)
+    bootCrl.txSaved shouldBe true
+  }
+
   test("a stub write is not subject to CrlAdmission backpressure") {
     val admission = new CrlAdmission(100)
     admission.tryAdmit(100) shouldBe true
-    admission.full shouldBe true
+    admission.full() shouldBe true
     val crl = new TestCrl
     val (store, _, _) = admissionStore(admission, crl)
 

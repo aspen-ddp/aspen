@@ -8,10 +8,11 @@
   So a forgotten transaction replayed by a delayed prepare cannot gather a write threshold of commit votes, and there
   is no time horizon. A refcount-0 object is `MissingObject` for every requirement. Design:
   `docs/superpowers/specs/2026-11-09-replay-pins-design.md`
-- Blind writes (`TransactionBuilder.refuseBlindWrites`, transaction-requirements F1): an update with neither a required
-  revision nor a content lock may not delete a key without that key's `KeyRevision` (`Exists` is not enough), or
-  change min/max/left/right, except in an allocated object's initial content. It fails with `BlindKeyValueWrite`,
-  even when replay-safe. Blind Inserts are allowed: stores apply them last-writer-wins, but keep nothing to order
+- Blind writes (`TransactionBuilder.refuseBlindWrites`, transaction-requirements F1), except in an allocated object's
+  initial content: a key Delete needs that key's `KeyRevision` (`Exists` is not enough), a required revision or a
+  content lock; a min/max/left/right change needs a required revision (a content lock does not move the revision a
+  repair proof locks, repair F11). It fails with `BlindKeyValueWrite`, even when replay-safe, and stores refuse the
+  same writes (`BlindWrite`). Blind Inserts are allowed: stores apply them last-writer-wins, but keep nothing to order
   a delete or an object-level change by
 - UnackedCommits (`StoragePoolState.UnackedCommitsTreeKey`, `UnackedCommitEntry.key(store, txid)`): for every
   committed transaction, the finalizer writes `UnackedCommitEntry(timestamp, objects)` for each counted commit voter

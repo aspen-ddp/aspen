@@ -49,6 +49,12 @@ case class NoClientPrepare() extends RequirementError
   */
 case class UnflaggedDelete() extends RequirementError
 
+/** A KeyValueUpdate with no required revision, no content lock and no allocation of its object deletes a key it holds
+  * no KeyRevision on, or changes the object's minimum, maximum, left or right. TransactionBuilder refuses such an
+  * update (BlindKeyValueWrite); the store refuses it too (repair F4, F11). Purely local, like RequirementCheckFailure.
+  */
+case class BlindWrite() extends RequirementError
+
 /** An Append delta does not apply to the store's current slice.
   *
   * Either the payload could not be decoded or its expected slice length or trailer differs from

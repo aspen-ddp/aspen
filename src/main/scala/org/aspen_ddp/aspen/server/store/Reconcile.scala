@@ -149,11 +149,14 @@ object Reconcile:
       // Deferred under an object-level lock, as KeyValue object-level parts are. HLC timestamps are per
       // transaction, so a read no older than the store's copy reflects every transaction the store applied. A
       // refcount change advances the timestamp without the revision, so equal timestamps with differing revisions
-      // mean the store missed a data write: the revision, not the timestamp, decides
+      // mean the store missed a data write: the revision, not the timestamp, decides. A read older than the store
+      // with a differing revision is not proof the store caught up: the store may have missed a data write and
+      // applied a later refcount update the read's responders have yet to apply (repair F13). It is left for a later
+      // pass, which reads once they have
       val (data, dataStale) =
-        if locks.objectLevel || read.revision == current.revision || read.timestamp < current.timestamp then
+        if locks.objectLevel || read.revision == current.revision then
           (None, false)
-        else if current.revision != snapshot.revision then
+        else if read.timestamp < current.timestamp || current.revision != snapshot.revision then
           (None, true)
         else
           (Some(read.ida.encode(read.data)(storeId.poolIndex)), false)

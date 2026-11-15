@@ -172,6 +172,19 @@ object FrontendSuite {
       heldRepairs = Nil
       held.foreach((state, complete) => super.repair(state, complete))
 
+    /** With `deferRepairDeletes`, repair deletions are held until deliverRepairDeletes */
+    var deferRepairDeletes: Boolean = false
+    private var heldRepairDeletes: List[(ObjectId, Array[Byte], Promise[Unit])] = Nil
+
+    override def repairDelete(objectId: ObjectId, storePointer: Array[Byte], complete: Promise[Unit]): Unit =
+      if deferRepairDeletes then heldRepairDeletes = heldRepairDeletes :+ (objectId, storePointer, complete)
+      else super.repairDelete(objectId, storePointer, complete)
+
+    def deliverRepairDeletes(): Unit =
+      val held = heldRepairDeletes
+      heldRepairDeletes = Nil
+      held.foreach((oid, sp, complete) => super.repairDelete(oid, sp, complete))
+
     /** The transactions of the commits received, in the order received */
     var issued: List[TransactionId] = Nil
     /** The most commits held at once */
@@ -2412,7 +2425,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   private val unackedDriver = StoreId(poolId, 2)
 
   /** T's update: a KV Delete of key 2 on kvPtr */
-  private val deleteK2: KeyValueUpdate = KeyValueUpdate(kvPtr, None, None, Nil, deletesKeys = true)
+  private val deleteK2: KeyValueUpdate =
+    KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(2), rev0)), deletesKeys = true)
 
   /** A Frontend recovering T, a commit vote of `reqs` deleting key 2 of kvPtr, with its lookups made through `lookup` */
   private def unackedFixture(reqs: List[TransactionRequirement] = List(deleteK2),
@@ -3423,6 +3437,66 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.reconcileForRepair(repairSnapshot(frontend, op1), newerRepairState(), done)
     done.future.value.get.get.stale shouldBe true
     backend.repairs shouldBe 0
+  }
+
+  // Repair F6: a missed deletion's repair must not race a read, a commit or a transaction on the object
+  def refusedRepairDelete(frontend: Frontend, oid: ObjectId): Boolean =
+    val completion = Promise[Unit]()
+    frontend.deleteObjectForRepair(oid, ObjectPointer.EmptyArray, completion)
+    completion.future.value match
+      case Some(scala.util.Failure(_: Frontend.RepairDeleteDeferred)) => true
+      case other => throw new AssertionError(s"Expected a refusal, got $other")
+
+  test("a repair deletion is refused while a backend read of the object is pending") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    backend.deferReads = true
+    frontend.readObjectForNetwork(clientId, new UUID(1, 1), op1, FullObject())
+    refusedRepairDelete(frontend, oid1) shouldBe true
+    backend.deliverReads()
+    net.clientMessage() match
+      case Some(rr: ReadResponse) => rr.result.isRight shouldBe true
+      case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
+    backend.m.contains(oid1) shouldBe true
+  }
+
+  test("a repair deletion is refused while a commit of the object is in flight, or a transaction holds it") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    // Locked by the commit vote
+    refusedRepairDelete(frontend, oid1) shouldBe true
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+    refusedRepairDelete(frontend, oid1) shouldBe true
+    backend.m.contains(oid1) shouldBe true
+  }
+
+  test("a repair write in flight refuses a repair deletion of the object") {
+    val (frontend, backend, _, _) = commitWindowFixture()
+    backend.deferRepairs = true
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, op1), newerRepairState(), done)
+    backend.repairs shouldBe 1
+    refusedRepairDelete(frontend, oid1) shouldBe true
+  }
+
+  test("while a repair deletion is outstanding the object reads as not found, and is not cached") {
+    val (frontend, backend, cache, net) = commitWindowFixture()
+    backend.deferRepairDeletes = true
+    val completion = Promise[Unit]()
+    frontend.deleteObjectForRepair(oid1, ObjectPointer.EmptyArray, completion)
+    completion.isCompleted shouldBe false
+    backend.m.contains(oid1) shouldBe true
+
+    readData(frontend, net, op1) shouldBe Left(ReadError.ObjectNotFound)
+    repairSnapshot(frontend, op1).isMissing shouldBe true
+    cache.get(oid1) shouldBe None
+    // A second repair deletion waits for the first
+    refusedRepairDelete(frontend, oid1) shouldBe true
+
+    backend.deliverRepairDeletes()
+    completion.future.value shouldBe Some(scala.util.Success(()))
+    backend.m.contains(oid1) shouldBe false
+    readData(frontend, net, op1) shouldBe Left(ReadError.ObjectNotFound)
   }
 
   test("a prepare arriving while a repair write is pending withholds its vote until the write completes") {

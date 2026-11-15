@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.ida.EncodedAppendDelta
-import org.aspen_ddp.aspen.common.objects.{Delete, KeyValueOperation, ObjectId, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{Delete, Insert, KeyValueOperation, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -26,6 +26,8 @@ object RequirementsChecker extends Logging {
     * @param allocatedOver Objects the transaction allocates whose load found an existing state (in memory or in the
     *                 backend) rather than a fresh one. A replayed allocation must never overwrite a live object
     *                 (transaction-requirements F11), so every requirement on them fails with ObjectExists
+    * @param allocating The objects the transaction allocates (TransactionDescription.allocatingObjects). Their initial
+    *                 content is the one KeyValue update that may be blind (see BlindWrite)
     * @return Tuple of object specific errors and a list of non-object errors
     */
   def check(transactionId: TransactionId,
@@ -36,7 +38,8 @@ object RequirementsChecker extends Logging {
             maxSliceSize: Option[Long] = None,
             applying: Boolean = false,
             nanoTime: () => Long = () => System.nanoTime(),
-            allocatedOver: Set[ObjectId] = Set()):
+            allocatedOver: Set[ObjectId] = Set(),
+            allocating: Set[ObjectId] = Set()):
   (Map[ObjectId, RequirementError], List[RequirementError]) = {
 
     def collide(oid: ObjectId, holders: Iterable[TransactionId]): Unit =
@@ -45,6 +48,25 @@ object RequirementsChecker extends Logging {
       }
 
     /** Object-level locks: lockedToTransaction and a KV object's content lock. Every requirement collides with them */
+    /** The store's copy of TransactionBuilder.refuseBlindWrites. Unless the transaction allocates the object (its
+      * initial content), a key Delete needs a KeyRevision on its key, a required revision or a content lock, and a
+      * change of min, max, left or right needs a required revision. A blind Delete leaves no tombstone and
+      * object-level parts carry no timestamp, so neither can be ordered against other writes, and repair cannot see
+      * them: a no-op blind Delete leaves no trace for its snapshot (repair F4), and an object-level change that does
+      * not move the revision escapes a repair proof's ExclusiveRevisionLock (repair F11). Enforced here too so a
+      * client that bypasses the builder cannot issue one
+      */
+    def refuseBlindWrites(r: KeyValueUpdate, ops: List[KeyValueOperation]): Unit =
+      val oid = r.objectPointer.id
+      if r.requiredRevision.isEmpty && !allocating.contains(oid) then
+        val revisionChecked = r.requirements.iterator.collect { case kr: KeyValueUpdate.KeyRevision => kr.key }.toSet
+        ops.foreach {
+          case _: Insert =>
+          case d: Delete =>
+            if r.contentLock.isEmpty && !revisionChecked.contains(d.key) then throw ObjectErr(oid, BlindWrite())
+          case _ => throw ObjectErr(oid, BlindWrite())
+        }
+
     def checkObjectLocks(oid: ObjectId, os: ObjectState): Unit =
       collide(oid, os.lockedToTransaction)
       os.kvState.foreach(kvs => collide(oid, kvs.contentLocked))
@@ -135,6 +157,7 @@ object RequirementsChecker extends Logging {
             }
             if ops.exists(_.exists(_.isInstanceOf[Delete])) && !r.deletesKeys then
               throw ObjectErr(r.objectPointer.id, UnflaggedDelete())
+            refuseBlindWrites(r, ops.getOrElse(Nil))
             val writes = ops.map(KVWrites.of)
 
             // Requirements and operations that lock the whole object, rather than only the keys they name

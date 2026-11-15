@@ -125,7 +125,7 @@ class TransactionMaxSizeSuite extends AnyFunSuite with Matchers {
           val os = new ObjectState(kp.id, Metadata(ObjectRevision.Allocating, ObjectRefcount.Allocating,
             txd.startTimestamp), ObjectType.KeyValue, DataBuffer.Empty)
           val (oerrs, _) = RequirementsChecker.check(txd.transactionId, txd.startTimestamp, reqs,
-            Map(kp.id -> os), Map(kp.id -> payload), Some(sliceLimit.toLong))
+            Map(kp.id -> os), Map(kp.id -> payload), Some(sliceLimit.toLong), allocating = txd.allocatingObjects)
           oerrs.get(kp.id)
 
       buildKV(allocate(atLimit), ida, Some(sliceLimit))

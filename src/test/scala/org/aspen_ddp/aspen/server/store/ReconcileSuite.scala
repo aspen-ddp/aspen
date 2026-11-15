@@ -184,10 +184,12 @@ class ReconcileSuite extends AnyFunSuite with Matchers:
     equal.timestamp shouldBe None
     equal.result.complete shouldBe true
 
-    // A read older than the store's copy changes nothing
+    // A read older than the store's copy with a differing revision changes nothing and is stale (repair F13): the
+    // store may have missed the data write and applied a later refcount update the read's responders have not
     val older = plan(store, store, read(rev(2), ts(10)))
     older.changesNothing shouldBe true
-    older.result.complete shouldBe true
+    older.result.stale shouldBe true
+    older.result.complete shouldBe false
 
     // The same revision changes nothing, whatever the timestamps
     plan(store, store, read(rev(1), ts(30))).data shouldBe None

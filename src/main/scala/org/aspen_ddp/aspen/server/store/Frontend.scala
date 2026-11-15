@@ -23,6 +23,11 @@ import scala.util.{Failure, Success, Try}
 
 object Frontend {
 
+  /** A repair's deletion of an object was refused because the object is in use on the store (a read, a commit or a
+    * deletion in flight, or a transaction holding it): the repair keeps its entry and tries again on a later pass
+    */
+  final class RepairDeleteDeferred(message: String) extends Exception(message)
+
   /** How long a store withholds its vote from drivers' prepares while waiting for a client's object data.
     * Several client retransmissions long, since the only cost of a late abort is a client retry.
     */
@@ -1246,19 +1251,34 @@ class Frontend(val storeId: StoreId,
 
   /** Repairs a missed deletion by dropping the object from this store.
     *
-    * There is nothing to read first: the object is gone everywhere else, so there is no state
-    * to compare against. We evict the cache for the same reason `commit` does when a refcount
-    * reaches zero, then hand the removal to the backend.
+    * There is nothing to read first: the object is gone everywhere else, so there is no state to compare against.
+    * Refused (RepairDeleteDeferred) while the object is in use here, as reconcile refuses: a backend read in flight
+    * could otherwise answer, and cache, the state being deleted, and a commit or transaction on it would race the
+    * deletion (repair F6). While the backend removal is outstanding the object counts as deleting, as for a
+    * transaction's deletion, so reads, snapshots and transactions get the answer the backend will give. The cache is
+    * evicted for the same reason `commit` evicts it when a refcount reaches zero.
     */
   def deleteObjectForRepair(objectId: ObjectId,
                             storePointer: Array[Byte],
                             completion: Promise[Unit]): Unit =
     if stopped then
       completion.failure(new IllegalStateException(s"Store $storeId fail-stopped"))
+    else if holding || pendingReads.contains(objectId) || commitInFlight(objectId) || committing.contains(objectId) ||
+      deleting.contains(objectId) || referenced.contains(objectId) then
+      completion.failure(new Frontend.RepairDeleteDeferred(
+        s"Store $storeId: object $objectId is in use; its missed deletion is repaired on a later pass"))
     else
       logger.trace(s"Repairing missed deletion of object $objectId")
       discard(objectId)
-      backend.repairDelete(objectId, storePointer, completion)
+      deleting(objectId) = deleting.getOrElse(objectId, 0) + 1
+      val done = Promise[Unit]()
+      done.future.onComplete { result =>
+        post(() =>
+          val n = deleting.getOrElse(objectId, 1) - 1
+          if n == 0 then deleting.remove(objectId) else deleting(objectId) = n)
+        completion.complete(result)
+      }(using scala.concurrent.ExecutionContext.parasitic)
+      backend.repairDelete(objectId, storePointer, done)
 
   private def readObjectForTransaction(transaction: Tx, pointer: ObjectPointer): Unit =
     val objectId = pointer.id

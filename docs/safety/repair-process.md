@@ -421,15 +421,15 @@ never installs a refcount whose serial is not strictly higher unless the store h
 ```
 if current.isMissing && locks.objectLevel: defer object level (cannot create the copy without its refcount)
 refcount = if locks.objectLevel: none else planRefcount
-data = if locks.objectLevel || read.revision == current.revision || read.timestamp < current.timestamp:  none, NOT stale
-       elif current.revision != snapshot.revision:  none, STALE
+data = if locks.objectLevel || read.revision == current.revision:  none, NOT stale
+       elif read.timestamp < current.timestamp || current.revision != snapshot.revision:  none, STALE
        else: Some(read.ida.encode(read.data)(poolIndex))     -- install data, revision, and timestamp = max
 result = ReconcileResult(deferredKeys = {}, objectLevelDeferred = locks.objectLevel, stale = refcountStale || dataStale)
 ```
 
-The silent "read.timestamp < current.timestamp" skip is justified only by a timestamp argument: the read reflects every
-transaction the store applied if it is "no older" than the store (`Reconcile.scala:147-150`). Section 13 (F3, F13)
-examines that assumption.
+A read older than the store with a differing revision is stale, not a silent skip (F13, fixed 2026-11-14): the store
+may have missed a data write and applied a later refcount update the read's responders have not applied yet. Section
+13 (F3) examines the remaining timestamp assumption of the completion gate.
 
 **KeyValueObject** (`planKeyValue`, `:165-216`):
 
@@ -659,7 +659,7 @@ Numbered for review; the code that enforces each is in section 7. "Holds" means 
 | E3 | Repair never installs a part of an object that differs from the snapshot taken before the read. | Holds, with the exception of changes that leave no trace in the compared fields (F4) |
 | E4 | Repair never installs a part the read or the store reports locked. | Holds (M6, `Reconcile.scala:179`) |
 | E5 | Repair never lowers a refcount's `updateSerial`; it never installs a refcount while an object-level lock is reported. | Holds (M7) |
-| E6 | Repair never installs an older DataObject revision over a newer one the store has applied: data requires `current.revision == snapshot.revision`, `read.revision != current.revision`, `read.timestamp >= current.timestamp`. | Holds if object timestamps order revisions: true for DataObjects, which check `timestamp > txTimestamp` on every revision-bearing update (Q8) |
+| E6 | Repair never installs an older DataObject revision over a newer one the store has applied: data requires `current.revision == snapshot.revision`, `read.revision != current.revision`, `read.timestamp >= current.timestamp`. | Holds if object timestamps order revisions: true for DataObjects, which check `timestamp > txTimestamp` on every revision-bearing update (Q8). An older read with a differing revision is now reported stale (F13), so the entry is never dropped on it |
 | E7 | Repair never creates a copy of an object without installing its refcount, never while the object-level part is locked, never if the store deleted it after the snapshot. | Holds (M9) |
 | E8 | An ErrorTree/UnackedCommits entry is removed only if (a) the object was reconciled completely (`complete`), or (b) the object was absent from the AllocationTree for an entry at least `minErrorEntryAgeForDeletion` old and `repairDelete` succeeded. | Holds in the code; (b) is a heuristic (F5) |
 | E9 | An entry is removed only if it has not been rewritten since the scan read it (ErrorTree/UnackedCommits via `deleteEntryIfUnchanged`). | Holds except branch (b) of E8, which uses unguarded `deleteEntry` (F5) |
@@ -841,11 +841,11 @@ completion gate are unchanged.
 | F3 | **narrowed** 2026-11-14 | Applies take the max object timestamp (requirements F4); the gate still relies on copied timestamps (X7) | `RequirementsApplyer.apply` |
 | F4 | **narrowed** | TKVL deletes now carry `KeyRevision(k, rev)`, so a delete of k at a store where k is absent fails at apply, is reported and marked instead of applying as an invisible no-op; blind deletes unchanged. *2026-11-14:* `TransactionBuilder` refuses blind deletes (`BlindKeyValueWrite`), so the invisible no-op needs a client that bypasses the builder | `KeyValueListNode.scala:505-506`; `RequirementsChecker.scala:141` |
 | F5 | unchanged | Absence heuristic unchanged; the allocation action never skips an entry now (Ruling 28), which does not shorten its delay | `StoreRepairer.scala:249-256` |
-| F6 | unchanged | `deleteObjectForRepair` untouched | |
+| F6 | unchanged (**FIXED** 2026-11-14, see 13.2) | `deleteObjectForRepair` untouched | |
 | F7 | unchanged | Entry deletions still untracked; `deleteEntry` now pins on `KeyRevision` of the value read | `StoreRepairer.scala` |
 | F8, F9 | unchanged (load larger) | More entries per store (R-N4 in transaction-recovery) | |
 | F10 | unchanged (reach widened) | Blind upsert kept (`PutRequirement.Blind`), and the batch is `replaySafe`, so a replayed or re-run batch also regresses entries (transaction-requirements Q-N5) | `MissedUpdateMarker.scala:145-148,165` |
-| F11-F15 | unchanged | Not in the diff | |
+| F11-F15 | unchanged (F11, F13 **FIXED** 2026-11-14, see 13.2) | Not in the diff | |
 | N1, N2 | unchanged | Not in the diff | |
 
 ### 13.0a Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
@@ -885,16 +885,16 @@ head first".
 | F1 | Opportunistic rebuild replaces `os.data` of a KeyValue object but not `os.kvState` | high if real | medium-high |
 | F2 | Opportunistic and pre-transaction rebuild overwrite whole KeyValue content when revisions are equal, regressing blind writes applied since the read | high if real | medium |
 | F3 | Completion gate `read.timestamp >= missedTimestamp` assumes monotone timestamps; blind KV writes and refcount updates break that | medium (livelock of one entry) | medium |
-| F4 | A blind key delete applied as a no-op at the store between snapshot and install is invisible to the snapshot check, so repair re-creates the deleted key at that store | medium | medium |
+| F4 | **FIXED** 2026-11-14 (stores refuse blind writes). A blind key delete applied as a no-op at the store between snapshot and install is invisible to the snapshot check, so repair re-creates the deleted key at that store | medium | medium |
 | F5 | `repairDelete` on allocation absence: object live but not yet in the AllocationTree for over 60 s loses the store's slice and the entry (unguarded delete) | medium impact, low probability | low-medium |
-| F6 | `repairDelete` has no in-flight/pending-read guard | low | low |
+| F6 | **FIXED** 2026-11-14. `repairDelete` has no in-flight/pending-read guard | low | low |
 | F7 | Repair's entry-deletion transaction has tracking disabled unconditionally, so a store missing it is never marked | low | medium |
 | F8 | `stale` outcomes never escalate: a hot or perpetually busy object is retried forever | medium (resource), low-medium | medium |
 | F9 | `ScanTimedOut` throws away deferral counts and doubles the interval while a backlog exists | low-medium | medium |
 | F10 | **FIXED** 2026-11-14. Marker overwrite can replace a newer `missedTimestamp` with an older one | low | medium |
-| F11 | Object-level proof is a `ExclusiveRevisionLock`; blind SetMin/SetMax/SetLeft/SetRight do not move the revision | low | low |
+| F11 | **FIXED** 2026-11-14 (stores refuse blind writes). Object-level proof is a `ExclusiveRevisionLock`; blind SetMin/SetMax/SetLeft/SetRight do not move the revision | low | low |
 | F12 | Reader ranks revisions by timestamp before count; timestamp bumps from refcount updates can make a stale revision win the ranking and stall reads | low (availability) | low |
-| F13 | DataObject `read.timestamp < current.timestamp` is a silent skip that counts as complete | low | low |
+| F13 | **FIXED** 2026-11-14. DataObject `read.timestamp < current.timestamp` is a silent skip that counts as complete | low | low |
 | F14 | A zombie slice installed from a pre-deletion read is cleaned only if the delete's own marker is written | low | low |
 | F15 | Entry callbacks that fail repeatedly (InvalidObject read of a deleted object whose allocation entry is slow to disappear) log at error each pass | cosmetic | high |
 
@@ -962,6 +962,8 @@ the store's post-install equality with the read (all unlocked parts equal), not 
 > (`KeyValueListNode.scala:505-506`); at S, where k is absent, the delete fails its check at apply, is reported in
 > `TxCommitted` and marked, so the next scan repairs S. Unchanged for blind deletes.
 
+> **Fixed 2026-11-14 (Todo 2.5).** Stores refuse blind writes as `TransactionBuilder` does: `RequirementsChecker.refuseBlindWrites` fails a `KeyValueUpdate` with no required revision, no content lock and no allocation of its object that deletes a key it holds no `KeyRevision` on, and any update with no required revision that changes min, max, left or right (`BlindWrite`, at the vote and at the apply re-check; an allocation's initial content is exempt). No current code issued such writes (the builder is the only producer of descriptions). A key Delete now always carries a `KeyRevision` on its key, a required revision or a content lock, each of which fails at a store lacking the key, so the delete is marked there instead of applying as an invisible no-op. A key or object-level change now always moves something the snapshot or the proof compares. Tests: RequirementsCheckerSuite "a key Delete with no KeyRevision on its key, and no required revision or content lock, is refused", "an object-level operation with no required revision or content lock is refused", "deletes and object-level operations pass with a required revision, a content lock, or an allocation".
+
 **F4. No-op blind delete is invisible to the snapshot check** (`Reconcile.scala:179-189`; `RequirementsApplyer.scala:~126`).
 The snapshot compares key revisions. A blind `Delete(k)` applied at S where k is absent changes S's timestamp only.
 Scenario: key k absent at S (S missed insert I). Snapshot at t0. Read at t1 from B, C returns k@I with no locks. A
@@ -992,6 +994,8 @@ object but also for "never allocated")?
 
 > **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (low).** Frontend.deleteObjectForRepair has no commitInFlight/pendingReads guard (Frontend.scala:822-828).
 > *Fix sketch:* Refuse while reads/commits are pending.
+
+> **Fixed 2026-11-14 (Todo 2.5).** `Frontend.deleteObjectForRepair` refuses (`RepairDeleteDeferred`) while the store holds for recovered transactions, or while the object has a pending backend read, a commit, a repair write or a deletion in flight, or a transaction holding it. `StoreRepairer` counts the refusal as deferred and keeps the entry. While the backend removal is outstanding, the object counts in `deleting`, so reads, snapshots and transactions get `ObjectNotFound` and nothing re-caches the old state. Tests: FrontendSuite "a repair deletion is refused while a backend read of the object is pending", "... while a commit of the object is in flight, or a transaction holds it", "a repair write in flight refuses a repair deletion of the object", "while a repair deletion is outstanding the object reads as not found, and is not cached"; StoreRepairerSuite "a deletion the store defers while the object is in use keeps the entry for a later pass".
 
 **F6. `repairDelete` has no in-flight guard** (`Frontend.scala:822-828`).
 `discard(objectId)` then `backend.repairDelete`. It does not check `commitInFlight`, `committing`, or pending reads
@@ -1065,6 +1069,8 @@ medium that it happens; low impact. Also affects which `storePointer` bytes are 
 > **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica (low).** Blind object-level KV ops do not move the revision (RequirementsApplyer.scala:105-112); proof is a ExclusiveRevisionLock.
 > *Fix sketch:* Include a timestamp in the proof's requirements.
 
+> **Fixed 2026-11-14 (Todo 2.5).** An object-level change (min, max, left, right) now needs a required revision, at the store as in `TransactionBuilder` (see F4); a content lock alone no longer suffices, since it does not move the revision. A required revision moves the revision, so every object-level change since the read makes the proof's `ExclusiveRevisionLock(readRevision)` fail. The only exception is an allocation's initial content, which no proof can precede. Test: RequirementsCheckerSuite "an object-level operation with no required revision is refused, even under a content lock".
+
 **F11. Object-level proof compares revision only** (`RepairProofs.scala:261-268`; `RequirementsApplyer.scala:105-111`).
 A blind `SetMin`/`SetMax`/`SetLeft`/`SetRight` (no required revision) changes the object-level parts but not the
 revision. If the read saw the object-level part locked (reason for the deferral) and the lock holder committed between
@@ -1085,6 +1091,8 @@ which is then ignored by the revision check). Availability only. Confidence: low
 
 > **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica (narrow).** Reconcile.planData treats read.timestamp < current.timestamp as complete with no change (Reconcile.scala:151-153). A store that missed data write D but applied a later refcount update R2 that the read quorum has not yet applied has a higher timestamp than the read, so the miss is treated as caught up and the entry is dropped. Needs R2 committed but unapplied at the read quorum.
 > *Fix sketch:* Mark stale when the revision differs but timestamp is newer, and retry.
+
+> **Fixed 2026-11-14 (Todo 2.5).** `Reconcile.planData` reports a read older than the store with a differing revision as `stale`. The entry stays, and a later pass reads once the read quorum has applied the later refcount update. If the quorum still holds that update's locks, the read reports the object locked and it is deferred. Same revision still changes nothing. Test: ReconcileSuite "a DataObject's data is installed when its revision differs and the read is not older". A stale result that persists is Todo 4.5 (F8).
 
 **F13. DataObject silent skip** (`Reconcile.scala:151-153`).
 `read.timestamp < current.timestamp` skips the data without marking stale, so the result is `complete` and the entry is

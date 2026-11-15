@@ -36,17 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.5  Repair scan correctness: Repair F13, F4, F11, F6                                                       [S each]
-     F13: Reconcile treats `read.timestamp < current.timestamp` as caught up. A store that missed data write D
-          but applied a later refcount update R2, which the read quorum has not applied yet, drops its entry
-          while still stale. Return stale, not complete, when revisions differ.
-     F4:  a blind key delete applied as a no-op between snapshot and install is invisible, because the snapshot
-          compares key revisions only. Add the store's timestamp or a change counter to RepairSnapshot.
-     F11: the object-level proof compares the revision only, and blind SetMin/Max/Left/Right do not move it.
-          Include the change counter there too.
-     F6:  deleteObjectForRepair has no pendingReads/commitInFlight guard, so a read can re-insert a stale cache
-          entry. Refuse and retry next pass.
-
 2.6  Absence from the AllocationTree treated as deletion: Repair F5, X6 residual, Rebuild F18               [M]
      An allocation-tree record more than 60 s late makes repair delete a live slice and its entry, which only a
      full rebuild restores. FSIF updateExt returns ObjectMismatch forever over a foreign occupant, so a missed
@@ -108,6 +97,8 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
      The pin rule, thresholds, primary object and one-update-per-object are enforced by the client only. Validate
      at the store: thresholds against the pool IDA (and audit `2T > width` outside IDA construction), at most one
      update per object, and a pin marker the store can check. Decide how much of the trust model to change.
+     Done 2026-11-14 (2.5): stores refuse blind key deletes and object-level changes without a required revision
+     (BlindWrite).
 
 2.16 Recovered commit vote whose apply re-check fails (residual of Req F5)                                    [S-M]
      A live commit voter that cannot apply its committed update fail-stops the store (Tx.issueCommits). A

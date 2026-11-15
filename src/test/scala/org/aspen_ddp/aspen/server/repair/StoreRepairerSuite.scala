@@ -320,6 +320,42 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     yield
       stillThere shouldBe true
 
+  test("a deletion the store defers while the object is in use keeps the entry for a later pass"):
+    // Repair F6: Frontend.deleteObjectForRepair refuses while a read, commit or transaction is on the object
+    val objectId = ObjectId(new UUID(11, 12))
+    var refuse = true
+    var deletes = 0
+    val busy = new RepairTarget:
+      def repairableStoreIds: List[StoreId] = List(storeId)
+      def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
+      def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
+      def appliedStubs(sid: StoreId): Future[Set[TransactionId]] = Future.successful(Set())
+      def dropAppliedStub(sid: StoreId, txid: TransactionId): Unit = ()
+      def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+        p.failure(StoreNotHosted(sid))
+      def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
+                    p: Promise[ReconcileResult]): Unit =
+        p.failure(StoreNotHosted(sid))
+      def repairDelete(sid: StoreId, oid: ObjectId,
+                       sp: Array[Byte], completion: Promise[Unit]): Unit =
+        if refuse then completion.failure(new org.aspen_ddp.aspen.server.store.Frontend.RepairDeleteDeferred("busy"))
+        else
+          deletes += 1
+          completion.success(())
+    val repairer = StoreRepairer(client, busy)
+    val policy = RepairPolicy.Default.copy(minErrorEntryAgeForDeletion = Duration(0, SECONDS))
+    for
+      _ <- seedErrorEntry(objectId, Array[Byte](1))
+      _ <- repairer.scan(storeId, policy)
+      deferred <- errorEntryExists(objectId)
+      _ = refuse = false
+      _ <- repairer.scan(storeId, policy)
+      gone <- errorEntryExists(objectId)
+    yield
+      deferred shouldBe true
+      deletes shouldBe 1
+      gone shouldBe false
+
   test("a failed update leaves the error tree entry in place"):
     val failing = new RepairTarget:
       def repairableStoreIds: List[StoreId] = List(storeId)

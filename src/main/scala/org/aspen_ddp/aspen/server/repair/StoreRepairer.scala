@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjec
                                            ObjectId, ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
+import org.aspen_ddp.aspen.server.store.{Frontend, ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import scribe.Logging
@@ -343,11 +343,13 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                 // The entry value holds the storePointer bytes captured when the update was
                 // missed -- the only surviving copy, since deletion removed the allocation tree
                 // entry. Empty means "delete by ObjectId alone".
-                for
-                  _ <- repairDeletion(storeId, objectId, storePointer)
-                  _ <- deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key)
-                yield
-                  counts.repaired.incrementAndGet()
+                repairDeletion(storeId, objectId, storePointer).flatMap: deleted =>
+                  if deleted then
+                    deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key)
+                      .map(_ => counts.repaired.incrementAndGet())
+                  else
+                    counts.deferred.incrementAndGet()
+                    Future.unit
               else
                 logger.debug(s"Deferring repair of $objectId on $storeId: absent from the " +
                              s"allocation tree but its error entry is too recent to treat as a " +
@@ -392,7 +394,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
               pool.allocationTree.get(Key(ptr.id.toBytes)).flatMap:
                 case None if errorEntryMayBeDeleted(value.timestamp, HLCTimestamp.now,
                                                     policy.minErrorEntryAgeForDeletion) =>
-                  repairDeletion(storeId, ptr.id, ptr.storePointer).map(_ => allComplete)
+                  repairDeletion(storeId, ptr.id, ptr.storePointer).map(deleted => allComplete && deleted)
                 case None =>
                   logger.debug(s"Deferring repair of ${ptr.id} on $storeId: absent from the allocation tree but its " +
                                s"UnackedCommits entry is too recent to treat as a deletion")
@@ -502,11 +504,20 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     yield
       ReadLocks(keys, objectLevel)
 
-  private def repairDeletion(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte]): Future[Unit] =
+  /** Drops the object from the store. False when the store refused because the object is in use there
+    * (Frontend.RepairDeleteDeferred): the entry stays for a later pass
+    */
+  private def repairDeletion(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte]): Future[Boolean] =
     val completion = Promise[Unit]()
     target.repairDelete(storeId, objectId, storePointer, completion)
-    completion.future.map: _ =>
-      logger.info(s"Repair complete (deletion) for object $objectId on store $storeId")
+    completion.future
+      .map: _ =>
+        logger.info(s"Repair complete (deletion) for object $objectId on store $storeId")
+        true
+      .recover:
+        case e: Frontend.RepairDeleteDeferred =>
+          logger.debug(e.getMessage)
+          false
 
   /** Deletes `key` from `tree` if its value is still at `entryRevision`. Through the tree rather than the node the walk
     * handed over: a delete that empties its node joins it with its right neighbor or leaves it empty, and the tree's

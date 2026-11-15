@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, DeleteLeft, DeleteMax, DeleteMin, DeleteRight, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectId, ObjectRevision, SetLeft, SetMax, SetMin, SetRight}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, Exists, KeyRevision}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, Exists, FullContentLock, KeyRevision}
 import org.aspen_ddp.aspen.common.objects.ObjectRefcount
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -208,6 +208,12 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
                    DeleteMin(), DeleteMax(), DeleteLeft(), DeleteRight()) do
       val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, Nil, List(op))
       intercept[BlindKeyValueWrite](buildPin(b))
+  }
+  test("an object-level operation under only a content lock is refused; a Delete under one is not blind") {
+    val lock = Some(FullContentLock(List(KeyRevision(k1, rev1))))
+    val b = mkBuilder(); b.update(kvp, None, lock, Nil, List(SetMax(Key(Array[Byte](1)))))
+    intercept[BlindKeyValueWrite](buildPin(b))
+    val d = mkBuilder(); d.replaySafe("test"); d.update(kvp, None, lock, Nil, List(Delete(k1))); buildPin(d)
   }
   test("an object-level operation under a required object revision is not blind") {
     val b = mkBuilder(); b.update(kvp, Some(rev1), None, Nil, List(SetMin(Key(Array[Byte](1))))); buildPin(b)

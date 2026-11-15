@@ -726,6 +726,11 @@ unresolved lifetime.
 > **Verification 2026-11-09: CONFIRMED. Severity: doc-only (trust model).** Invariants enforced only in TransactionBuilder; stores take thresholds from the description (TransactionDriver.scala:88-90, 259-262).
 > *Fix sketch:* Validate txd against pool state at the store.
 
+> **Narrowed 2026-11-14 (Todo 2.5, repair F4/F11).** Stores now enforce the builder's blind-write rule
+> (`RequirementsChecker.refuseBlindWrites`, `BlindWrite`): a key Delete without a `KeyRevision` on its key, a required
+> revision or a content lock, and an object-level change without a required revision, fail at every store unless the
+> transaction allocates the object. The rest of (a)-(c), and the pin rule (Q-N4), remain client-side (Todo 2.14).
+
 
 (a) The "one update per object" and "lock xor update" rules are enforced only in `TransactionBuilder`; a hand-built
 description with two `KeyValueUpdate`s on one object has `KVWrites.from` keep only the last (`toMap`,

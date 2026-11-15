@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, SetMax, SetRight, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, KeyTimestampError, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, ObjectExists, RefcountMismatch, RefcountUpdate, MissingObject, RequirementCheckFailure, RequirementError, ExclusiveRevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, AppendMismatch, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, KeyTimestampError, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, ObjectExists, RefcountMismatch, RefcountUpdate, MissingObject, RequirementCheckFailure, RequirementError, ExclusiveRevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, UnflaggedDelete, BlindWrite, AppendMismatch, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -1318,24 +1318,61 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   test("a flagged key Delete passes") {
     val (objErrors, _) = RequirementsChecker.check(tx1, HLCTimestamp.now,
-      List(KeyValueUpdate(kp1, None, None, Nil, deletesKeys = true)), kvObjectWithKey(),
+      List(KeyValueUpdate(kp1, None, None, List(KeyRevision(kk1, rev1)), deletesKeys = true)), kvObjectWithKey(),
       Map(oid1 -> kvData(List(Delete(kk1)))))
     objErrors shouldBe empty
   }
 
-  test("a blind delete collides with a lock on its key") {
-    val delete = KVTx(tx2, Nil, List(Delete(kk1)))
+  test("a key Delete collides with a lock on its key") {
+    val delete = KVTx(tx2, List(KeyRevision(kk1, rev1)), List(Delete(kk1)))
     lockThenCheckKV(kvObjectWithKey(), KVTx(tx1, List(KeyValueUpdate.Exists(kk1)), Nil), delete) shouldBe
       Map(oid1 -> TransactionCollision(tx1))
   }
 
-  test("an object-level operation without a required revision locks the whole object") {
-    val relink = (t: TransactionId) => KVTx(t, Nil, List(SetRight(Array[Byte](1))))
+  test("an object-level operation locks the whole object") {
+    val relink = (t: TransactionId) => KVTx(t, Nil, List(SetRight(Array[Byte](1))), requiredRevision = Some(rev1))
     val withinRange = (t: TransactionId) => KVTx(t, List(KeyValueUpdate.WithinRange(kk9, ByteArrayKeyOrdering)), Nil)
-    val split = (t: TransactionId) => KVTx(t, Nil, List(SetMax(kk9)), requiredRevision = Some(rev1))
-    for other <- List(withinRange, blindInsertAbsent, blindInsertPresent, split) do
+    for other <- List(withinRange, blindInsertAbsent, blindInsertPresent) do
       lockThenCheckKV(kvObjectWithKey(), relink(tx1), other(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
       lockThenCheckKV(kvObjectWithKey(), other(tx1), relink(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
+  }
+
+  // Repair F4 and F11: a blind Delete leaves no trace for a repair snapshot, and a blind object-level change does not
+  // move the revision a repair proof locks. The store refuses them, as TransactionBuilder does
+  test("a key Delete with no KeyRevision on its key, and no required revision or content lock, is refused") {
+    KVTx(tx1, Nil, List(Delete(kk1))).check(kvObjectWithKey()) shouldBe Map(oid1 -> BlindWrite())
+    // A KeyRevision on another key does not cover it
+    KVTx(tx1, List(KeyRevision(kk9, rev1)), List(Delete(kk1))).check(kvObjectWithKey()) shouldBe
+      Map(oid1 -> BlindWrite())
+    // Refused at the apply re-check too
+    KVTx(tx1, Nil, List(Delete(kk1))).check(kvObjectWithKey(), applying = true) shouldBe Map(oid1 -> BlindWrite())
+  }
+
+  test("an object-level operation with no required revision is refused, even under a content lock") {
+    KVTx(tx1, Nil, List(SetRight(Array[Byte](1)))).check(kvObjectWithKey()) shouldBe Map(oid1 -> BlindWrite())
+    KVTx(tx1, Nil, List(SetMax(kk9))).check(kvObjectWithKey()) shouldBe Map(oid1 -> BlindWrite())
+    // A content lock does not move the revision a repair proof locks (repair F11)
+    val locked = KeyValueUpdate(kp1, None, Some(KeyValueUpdate.FullContentLock(List(KeyRevision(kk1, rev1)))), Nil)
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(locked), kvObjectWithKey(),
+      Map(oid1 -> kvData(List(SetMax(kk9)))), nanoTime = () => 0L)._1 shouldBe Map(oid1 -> BlindWrite())
+  }
+
+  test("deletes and object-level operations pass with a required revision or an allocation, and deletes under a " +
+       "content lock") {
+    val ops = List(Delete(kk1), SetMax(kk9), SetRight(Array[Byte](1)))
+    KVTx(tx1, Nil, ops, requiredRevision = Some(rev1)).check(kvObjectWithKey()) shouldBe Map()
+
+    val locked = KeyValueUpdate(kp1, None, Some(KeyValueUpdate.FullContentLock(List(KeyRevision(kk1, rev1)))), Nil,
+      deletesKeys = true)
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(locked), kvObjectWithKey(),
+      Map(oid1 -> kvData(List(Delete(kk1)))), nanoTime = () => 0L)._1 shouldBe Map()
+
+    // The initial content of an object the transaction allocates
+    val initial = KeyValueUpdate(kp1, None, None, Nil, deletesKeys = true)
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(initial), kvObjectWithKey(), Map(oid1 -> kvData(ops)),
+      nanoTime = () => 0L, allocating = Set(oid1))._1 shouldBe Map()
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(initial), kvObjectWithKey(), Map(oid1 -> kvData(ops)),
+      nanoTime = () => 0L)._1 shouldBe Map(oid1 -> BlindWrite())
   }
 
   test("applying a committed transaction ignores other transactions' write locks") {
@@ -1348,7 +1385,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   test("unlock releases write locks after the commit inserted or deleted the key") {
     val objects = kvObjectWithKey()
-    val tx = KVTx(tx1, List(KeyValueUpdate.MayExist(kk9)), List(Delete(kk1), insert(kk9)))
+    val tx = KVTx(tx1, List(KeyValueUpdate.MayExist(kk9), KeyRevision(kk1, rev1)), List(Delete(kk1), insert(kk9)))
     tx.check(objects) shouldBe Map()
     tx.lock(objects)
     objects(oid1).lockedWriteTransactions shouldBe Set(tx1)

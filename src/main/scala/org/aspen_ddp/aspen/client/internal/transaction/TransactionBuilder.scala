@@ -298,19 +298,19 @@ class TransactionBuilder(
 
   /** Stores apply a blind key Insert last-writer-wins on (timestamp, revision), so a lagging store or a crash
     * re-apply cannot regress a later write of the key (KVObjectState.insertWins). A Delete leaves no tombstone and
-    * object-level parts carry no timestamp, so the same cannot be done for them: an update with neither a required
-    * revision nor a content lock must not delete a key it holds no KeyRevision on, or change an object-level part,
-    * unless it is the initial content of an object this transaction allocates (transaction-requirements F1).
+    * object-level parts carry no timestamp, so the same cannot be done for them. Unless it is the initial content of
+    * an object this transaction allocates (transaction-requirements F1), an update must not delete a key without a
+    * KeyRevision on it, a required revision or a content lock, and must not change an object-level part without a
+    * required revision: only that moves the revision a repair proof locks (repair F11). Stores refuse the same
+    * writes (RequirementsChecker, BlindWrite).
     */
   private def refuseBlindWrites(kvu: KVUpdate): Unit =
-    val pinned = kvu.requiredRevision.nonEmpty || kvu.contentLock.nonEmpty ||
-      allocatingObjects.exists(_.id == kvu.pointer.id)
-    if !pinned then
+    if kvu.requiredRevision.isEmpty && !allocatingObjects.exists(_.id == kvu.pointer.id) then
       val revisionChecked = kvu.requirements.collect { case r: KeyValueUpdate.KeyRevision => r.key }.toSet
       kvu.operations.foreach:
         case _: Insert =>
         case d: Delete =>
-          if !revisionChecked.contains(d.key) then
+          if kvu.contentLock.isEmpty && !revisionChecked.contains(d.key) then
             throw BlindKeyValueWrite(kvu.pointer, "Delete of a key with no KeyRevision")
         case op =>
           throw BlindKeyValueWrite(kvu.pointer, s"${op.getClass.getSimpleName} with no required revision")

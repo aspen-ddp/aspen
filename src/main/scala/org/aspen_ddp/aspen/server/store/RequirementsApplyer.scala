@@ -72,11 +72,12 @@ object RequirementsApplyer extends Logging {
             objects: Map[ObjectId, ObjectState],
             objectUpdates: Map[ObjectId, DataBuffer],
             maxSliceSize: Option[Long] = None,
-            allocatedOver: Set[ObjectId] = Set()): Result = {
+            allocatedOver: Set[ObjectId] = Set(),
+            allocating: Set[ObjectId] = Set()): Result = {
 
     // Get a list of all objects that are unfit for accepting the changes in this transaction
     val skippedReasons = RequirementsChecker.check(transactionId, timestamp, requirements, objects, objectUpdates,
-      maxSliceSize, applying = true, allocatedOver = allocatedOver)._1
+      maxSliceSize, applying = true, allocatedOver = allocatedOver, allocating = allocating)._1
 
     var failedObjects: Set[ObjectId] = Set()
 

@@ -291,7 +291,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     cache.insert(mkKVObjectState()) // So the recovered transaction loads during construction
     val txd = mktxd().copy(transactionId = foundTxid,
-      requirements = List(KeyValueUpdate(kvPointer, None, None, Nil, deletesKeys = true)))
+      requirements = List(KeyValueUpdate(kvPointer, None, None, List(KeyValueUpdate.KeyRevision(k(2), rev0)),
+        deletesKeys = true)))
     val update = KeyValueOperation.encode(List(new Delete(k(2))), ida)(0)
     val trs = TransactionRecoveryState(storeId, txd.serialize(), List(ObjectUpdate(oid2, update)),
       TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial)

@@ -15,8 +15,11 @@
   Insert is last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`; `encodedSizeAfter`
   uses the same rule). A superseded Insert is a no-op, not a skip: no report and no fail-stop. The object timestamp
   is the max of its value and the transaction's. No tombstones, so `TransactionBuilder` refuses blind key deletes
-  and blind object-level ops (`BlindKeyValueWrite`). Residual: a late or replayed Insert after a later delete of its
-  key resurrects it, like a `DoesNotExist` ABA (Todo 2.9)
+  and blind object-level ops (`BlindKeyValueWrite`), and stores refuse them too (`RequirementsChecker.refuseBlindWrites`,
+  `BlindWrite`, at vote and apply re-check): unless the transaction allocates the object, a key Delete needs a
+  `KeyRevision` on its key, a required revision or a content lock, and a min/max/left/right change a required revision
+  (a content lock does not move the revision a repair proof locks; repair F4, F11). Residual: a late or replayed
+  Insert after a later delete of its key resurrects it, like a `DoesNotExist` ABA (Todo 2.9)
 - Allocations (transaction-requirements F11): an object in `txd.allocatingObjects` is loaded like any other (cache,
   `deleting`, backend read). Only a backend miss gives the fresh `Allocating` state (`Tx.allocationLoaded`). An
   existing state goes into `Tx.allocatedOver`, and every requirement on it fails with `ObjectExists`, at vote and at
@@ -117,3 +120,7 @@
   `server/host/CLAUDE.md`
 - `Reconcile` (exact repair install): `server/repair/CLAUDE.md`; `ReconcileResult.changed` is true only when the
   install was applied (every deferred, stale or no-op path reports false)
+- `deleteObjectForRepair` refuses (`Frontend.RepairDeleteDeferred`) while the store holds for recovered transactions or
+  the object has a pending backend read, a commit, repair write or deletion in flight, or a transaction referencing
+  it (repair F6); while its backend removal is outstanding the object counts in `deleting`, so reads, snapshots and
+  transactions get `ObjectNotFound`

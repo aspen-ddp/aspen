@@ -105,5 +105,7 @@ final class DeviceControl(val metadata: DeviceMetadata,
   /** Rebuilds the snapshot from the router's maps, the loaded devices, the rebuilds running and the stores
    *  transferring out, and publishes it. Called on the control thread after every change to any of them. */
   private[server] def publishView(): Unit =
-    view = HostStoreView.of(router.loaded.keySet, router.offlineStores, rebuilds.rebuildingStoreIds,
-      storeTransferService.transferringOutStores, devices.devices.map((id, sds) => id -> sds.devicePath))
+    val loaded = router.loaded
+    view = HostStoreView.of(loaded.keySet, router.offlineStores, rebuilds.rebuildingStoreIds,
+      storeTransferService.transferringOutStores, devices.devices.map((id, sds) => id -> sds.devicePath),
+      loaded.map((id, s) => id -> s.storageDeviceId))

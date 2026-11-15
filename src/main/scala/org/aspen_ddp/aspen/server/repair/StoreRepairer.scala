@@ -20,7 +20,7 @@ import scribe.Logging
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration.{Duration, DurationInt, FiniteDuration}
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
 /** What one store's scan found. `seen` and `unackedSeen` drive pacing: any entry at all, repaired, deferred or
@@ -141,9 +141,13 @@ object DeferralState:
   */
 class StoreRepairer(client: AspenClient, target: RepairTarget,
                     /** The host the scans run on. When given, a store is scanned only while its pool's entry names
-                     *  this host: a copy left on a device declared failed, or otherwise superseded, must not consume
-                     *  the entries the store's current copy needs. None (tests driving one network) skips the check */
+                     *  this host and the device the store is loaded from here (`RepairTarget.localDevice`), and each
+                     *  entry delete re-checks that: a copy left on a device declared failed, or otherwise superseded,
+                     *  must not consume the entries the store's current copy needs. None (tests driving one network)
+                     *  skips the check */
                     hostId: Option[HostId] = None,
+                    /** How old a scan's ownership check may be when an entry delete relies on it */
+                    ownershipRecheck: FiniteDuration = StoreRepairer.OwnershipRecheck,
                     /** Test seam: runs between a repair's read and its install */
                     testingOnlyBeforeReconcile: (StoreId, ObjectPointer) => Future[Unit] = (_, _) => Future.unit,
                     /** Test seam: told the parts each proof run proved */
@@ -154,7 +158,38 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
 
   import StoreRepairer.*
 
-  private final class Counts:
+  /** One scan's fence: whether the pool's entry for the store still names this host and device. An entry delete
+    * awaits it first (`deleteIfStillOwned`). The read is shared by every delete within `ownershipRecheck` of it, and
+    * redone after that. Once a check finds the store owned elsewhere the scan is abandoned: `lost` stays true for the
+    * rest of it. Safe to call from any thread: the scan's entry callbacks may run concurrently
+    */
+  private final class OwnershipFence(storeId: StoreId):
+    private var checked: Option[(Long, Future[Boolean])] = None
+    @volatile private var isLost = false
+    @volatile private var wasOwned = false
+
+    def lost: Boolean = isLost
+
+    def stillOwned(): Future[Boolean] =
+      val check = synchronized:
+        val now = System.nanoTime()
+        checked match
+          case Some((at, f)) if now - at < ownershipRecheck.toNanos => f
+          case _ =>
+            val f = ownedHere(storeId)
+            checked = Some((now, f))
+            f
+      check.map: owned =>
+        if owned then
+          wasOwned = true
+        else if !isLost then
+          isLost = true
+          // The scan's first check warns on its own
+          if wasOwned then
+            logger.warn(s"Abandoning repair scan of $storeId: its pool no longer records it on this host and device")
+        owned
+
+  private final class Counts(val fence: OwnershipFence):
     val seen = AtomicInteger(0)
     val repaired = AtomicInteger(0)
     val deferred = AtomicInteger(0)
@@ -171,16 +206,17 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     def result: ScanResult = ScanResult(seen.get, repaired.get, deferred.get, unackedSeen.get)
 
   def scan(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState = DeferralState()): Future[ScanResult] =
-    val counts = Counts()
+    val fence = OwnershipFence(storeId)
+    val counts = Counts(fence)
 
     // Both trees' keys start with the poolIndex, so one store's entries are the half-open range [poolIndex,
     // poolIndex+1).
     val min = Key(Array[Byte](storeId.poolIndex))
     val max = Key(Array[Byte]((storeId.poolIndex + 1).toByte))
 
-    ownedHere(storeId).flatMap: owned =>
+    fence.stillOwned().flatMap: owned =>
       if !owned then
-        logger.warn(s"Not repairing store $storeId: its pool records it on another host")
+        logger.warn(s"Not repairing store $storeId: its pool records it on another host or device")
         Future.successful(counts.result)
       else
         for
@@ -236,7 +272,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       ownedHere(storeId).flatMap: owned =>
         if !owned then
           // The entry scan of the same pass has already warned
-          logger.debug(s"Not sweeping store $storeId: its pool records it on another host")
+          logger.debug(s"Not sweeping store $storeId: its pool records it on another host or device")
           Future.successful(SweepResult.Empty)
         else
           for
@@ -273,7 +309,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
   private def dropOrphanStubs(pool: StoragePool, storeId: StoreId, before: Set[TransactionId],
                               deferral: DeferralState, counts: Counts): Future[Unit] =
     val candidates = before -- counts.unackedTxidsSeen
-    if abandoned(storeId) then
+    if abandoned(storeId, counts) then
       Future.unit
     else
       val found = candidates.foldLeft(Future.successful(Set[TransactionId]())): (f, txid) =>
@@ -285,12 +321,37 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           logger.info(s"Dropping the applied stub of $txid on $storeId: two scans found no UnackedCommits entry for it")
           target.dropAppliedStub(storeId, txid)
 
-  /** Whether the pool's entry for the store names this host, read fresh for each scan */
+  /** Whether the pool's entry for the store names this host and the device the store is loaded from here, read
+    * fresh. A store with no device here is not owned
+    */
   private def ownedHere(storeId: StoreId): Future[Boolean] = hostId match
     case None => Future.successful(true)
     case Some(h) =>
       client.getStoragePoolState(storeId.poolId).map: pool =>
-        storeId.poolIndex < pool.stores.length && pool.stores(storeId.poolIndex).hostId == h
+        if storeId.poolIndex >= pool.stores.length || pool.stores(storeId.poolIndex).hostId != h then
+          false
+        else
+          val entry = pool.stores(storeId.poolIndex)
+          target.localDevice(storeId) match
+            case None =>
+              logger.warn(s"Store $storeId has no device on this host: its pool records it on device " +
+                          s"${entry.storageDeviceId}")
+              false
+            case Some(device) => device == entry.storageDeviceId
+
+  /** Deletes a repaired entry, after the scan's fence confirms the store is still owned here. False, leaving the
+    * entry for the store's current copy, when it is not
+    */
+  private def deleteIfStillOwned(storeId: StoreId, counts: Counts, tree: TieredKeyValueList,
+                                 revision: ObjectRevision, key: Key): Future[Boolean] =
+    counts.fence.stillOwned().flatMap: owned =>
+      if owned then
+        deleteEntryIfUnchanged(storeId.poolId, tree, revision, key).map(_ => true)
+      else
+        Future.successful(false)
+
+  /** As `abandoned`, or the scan's fence found the store owned elsewhere */
+  private def abandoned(storeId: StoreId, counts: Counts): Boolean = counts.fence.lost || abandoned(storeId)
 
   /** The store left this host mid-scan. foreachInRange has no early exit so the remaining tree-node reads still
     * happen, but those are cheap next to the per-object read and transactions each remaining entry would otherwise
@@ -306,7 +367,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
   private def repairErrorEntry(pool: StoragePool, storeId: StoreId, policy: RepairPolicy, deferral: DeferralState,
                                counts: Counts)
                               (node: KeyValueListNode, key: Key, value: ValueState): Future[Unit] =
-    if abandoned(storeId) then
+    if abandoned(storeId, counts) then
       Future.unit
     else
       // Wrap synchronous portion to convert throws into failed Futures. decodeObjectId,
@@ -324,8 +385,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
         def completed(complete: Boolean): Future[Unit] =
           if complete then
             deferral.clear(entryKey)
-            deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key)
-              .map(_ => counts.repaired.incrementAndGet())
+            deleteIfStillOwned(storeId, counts, pool.errorTree, value.revision, key).map: deleted =>
+              if deleted then counts.repaired.incrementAndGet() else counts.deferred.incrementAndGet()
           else
             counts.deferred.incrementAndGet()
             Future.unit
@@ -379,7 +440,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
   private def repairUnackedEntry(pool: StoragePool, storeId: StoreId, policy: RepairPolicy,
                                    deferral: DeferralState, counts: Counts)
                                   (node: KeyValueListNode, key: Key, value: ValueState): Future[Unit] =
-    if abandoned(storeId) then
+    if abandoned(storeId, counts) then
       Future.unit
     else
       Future.unit.flatMap: _ =>
@@ -429,13 +490,16 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       completed.flatMap: allComplete =>
         if allComplete then
           entryKeys.foreach((_, entryKey) => deferral.clear(entryKey))
-          deleteEntryIfUnchanged(storeId.poolId, pool.unackedCommitsTree, value.revision, key).map: _ =>
-            // Only the head's deletion drops the stub: the lookups that decide whether the store applies a
-            // late commit name the head (UnackedCommitEntry.key), so the stub must outlive it, not the other
-            // chunks, which only carry more objects to repair
-            if UnackedCommitEntry.isHeadKey(key) then target.dropAppliedStub(storeId, txid)
-            logger.info(s"Repair complete for UnackedCommits entry of $txid on store $storeId")
-            counts.repaired.incrementAndGet()
+          deleteIfStillOwned(storeId, counts, pool.unackedCommitsTree, value.revision, key).map: deleted =>
+            if deleted then
+              // Only the head's deletion drops the stub: the lookups that decide whether the store applies a
+              // late commit name the head (UnackedCommitEntry.key), so the stub must outlive it, not the other
+              // chunks, which only carry more objects to repair
+              if UnackedCommitEntry.isHeadKey(key) then target.dropAppliedStub(storeId, txid)
+              logger.info(s"Repair complete for UnackedCommits entry of $txid on store $storeId")
+              counts.repaired.incrementAndGet()
+            else
+              counts.deferred.incrementAndGet()
         else
           counts.deferred.incrementAndGet()
           Future.unit
@@ -627,6 +691,9 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
         Future.failed(new IllegalStateException(s"Repair entry $key is gone"))
 
 object StoreRepairer:
+
+  /** How long a scan may rely on one read of the pool's entry for its store before an entry delete reads it again */
+  val OwnershipRecheck: FiniteDuration = 1.second
 
   /** The DeferralState key of an errorTree entry: the entry's key and value revision. A store that misses another
     * update rewrites the entry, and the rewritten entry starts over with its whole object

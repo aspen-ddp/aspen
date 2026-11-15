@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -24,6 +25,13 @@ class HostRepairTargetSuite extends IntegrationTestSuite:
       val ids = net.smgr.repairableStoreIds
       ids should contain (StoreId(PoolId.BootstrapPoolId, 0.toByte))
       ids should not contain unhostedStore
+
+  // The repair fence: a scan runs only while the pool's entry names this host and the device the store is loaded from
+  test("localDevice names the device a loaded store is on, and nothing for an unknown store"):
+    client.read(radicle, "warm up").map: _ =>
+      net.smgr.localDevice(StoreId(PoolId.BootstrapPoolId, 0.toByte)) shouldBe
+        Some(StorageDeviceId.BootstrapStorageDeviceId)
+      net.smgr.localDevice(unhostedStore) shouldBe None
 
   // The repair scan leaves an entry alone while its store may still join the entry's transaction (StoreRepairer)
   test("mayJoinTransaction follows the store's forget floor"):

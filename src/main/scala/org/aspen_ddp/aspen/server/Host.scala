@@ -374,6 +374,10 @@ class Host(val client: AspenClient,
     */
   def isRepairable(storeId: StoreId): Boolean = deviceControl.currentView.repairable.contains(storeId)
 
+  /** The device the store is loaded from here, from the published HostStoreView (the repair fence) */
+  override def localDevice(storeId: StoreId): Option[StorageDeviceId] =
+    deviceControl.currentView.storeDevices.get(storeId)
+
   /** Called from TestNetwork's checker thread: reads the router's concurrent map. */
   def hasTransactions: Boolean = deviceControl.router.hasTransactions
 

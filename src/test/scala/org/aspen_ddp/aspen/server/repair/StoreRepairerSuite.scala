@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Ke
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.server.store.backend.RepairSlotOccupied
-import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StoragePoolState}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 
@@ -62,6 +62,10 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     val departed = new AtomicBoolean(false)
     @volatile var repairs: List[ObjectId] = Nil
     @volatile var deletions: List[(ObjectId, Seq[Byte])] = Nil
+    /** The device each hosted store is on here: by default the one the bootstrap pool's entries name */
+    @volatile var device: Option[StorageDeviceId] = Some(StorageDeviceId.BootstrapStorageDeviceId)
+
+    override def localDevice(sid: StoreId): Option[StorageDeviceId] = if hosted.contains(sid) then device else None
 
     def repairableStoreIds: List[StoreId] = if departed.get then Nil else hosted
 
@@ -205,6 +209,74 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       keptForOwner shouldBe true
       owned.repaired shouldBe 1
       stillThere shouldBe false
+
+  /** Rewrites the pool's entry for the store to name `hostId` and `deviceId`, as a transfer would */
+  private def movePoolEntry(sid: StoreId, hostId: HostId, deviceId: StorageDeviceId): Future[Unit] =
+    client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStoragePoolPointer(sid.poolId)
+        kvos <- client.read(ptr)
+      yield
+        val cfg = StoragePoolState(kvos)
+        cfg.stores(sid.poolIndex) = StoragePoolState.StoreEntry(hostId, deviceId)
+        tx.update(ptr, None, None,
+          List(KeyValueUpdate.KeyRevision(StoragePoolState.ConfigKey, kvos.contents(StoragePoolState.ConfigKey).revision)),
+          List(Insert(StoragePoolState.ConfigKey, cfg.encode())))
+
+  test("a store whose pool records it on this host but another device is not scanned"):
+    val target = RecordingTarget(List(storeId))
+    target.device = Some(StorageDeviceId(new UUID(6, 6)))
+    for
+      ptr <- allocateObjectPointer()
+      os <- client.read(ptr)
+      _ <- seedErrorEntry(ptr.id, Array[Byte](1, 2, 3), os.timestamp)
+      result <- StoreRepairer(client, target, Some(HostId.BootstrapHostId)).scan(storeId, RepairPolicy.Default)
+      stillThere <- errorEntryExists(ptr.id)
+    yield
+      result.seen shouldBe 0
+      target.repairs shouldBe Nil
+      stillThere shouldBe true
+
+  test("a store with no device in the host's view is not scanned"):
+    val target = RecordingTarget(List(storeId))
+    target.device = None
+    for
+      ptr <- allocateObjectPointer()
+      os <- client.read(ptr)
+      _ <- seedErrorEntry(ptr.id, Array[Byte](1, 2, 3), os.timestamp)
+      result <- StoreRepairer(client, target, Some(HostId.BootstrapHostId)).scan(storeId, RepairPolicy.Default)
+      stillThere <- errorEntryExists(ptr.id)
+    yield
+      result.seen shouldBe 0
+      target.repairs shouldBe Nil
+      stillThere shouldBe true
+
+  test("a scan stops deleting entries once the pool moves the store elsewhere"):
+    val target = RecordingTarget(List(storeId))
+    // The objects in the order the walk reaches them: the pool moves the store before the second's install
+    @volatile var reconciled = List[ObjectId]()
+    val repairer = StoreRepairer(client, target, Some(HostId.BootstrapHostId), ownershipRecheck = Duration.Zero,
+      testingOnlyBeforeReconcile = (_, ptr) =>
+        reconciled = reconciled :+ ptr.id
+        if reconciled.size == 2 then
+          movePoolEntry(storeId, HostId(new UUID(5, 5)), StorageDeviceId.BootstrapStorageDeviceId)
+        else
+          Future.unit)
+    for
+      a <- allocateObjectPointer()
+      b <- allocateObjectPointer()
+      osA <- client.read(a)
+      osB <- client.read(b)
+      _ <- seedErrorEntry(a.id, Array[Byte](1), osA.timestamp)
+      _ <- seedErrorEntry(b.id, Array[Byte](1), osB.timestamp)
+      result <- repairer.scan(storeId, RepairPolicy.Default)
+      firstThere <- errorEntryExists(reconciled.head)
+      secondThere <- errorEntryExists(reconciled(1))
+    yield
+      reconciled.toSet shouldBe Set(a.id, b.id)
+      result.repaired shouldBe 1
+      firstThere shouldBe false
+      secondThere shouldBe true
 
   test("an entry is removed when its object was updated again after the miss"):
     val target = RecordingTarget(List(storeId))

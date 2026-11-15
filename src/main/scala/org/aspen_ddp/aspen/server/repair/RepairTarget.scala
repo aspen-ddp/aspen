@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -49,6 +50,13 @@ trait RepairTarget:
     * whose repair fails with StoreNotHosted anyway, and by default (test targets)
     */
   def mayJoinTransaction(storeId: StoreId, start: HLCTimestamp): Boolean = false
+
+  /** The storage device the store is loaded from on this host, None when it is not loaded here (and by default, for
+    * test targets). The repair fence: a scan runs only while the pool's entry names both this host and this device,
+    * so a copy left on another device of the same host never consumes the current copy's entries. Callable from any
+    * thread
+    */
+  def localDevice(storeId: StoreId): Option[StorageDeviceId] = None
 
   /** Records the store's copy of the object, the first step of a repair (`Reconcile`). Completes `p` with
     * Failure(StoreNotHosted) if the store has left this host.

@@ -55,5 +55,9 @@
   installs the object. A listed occupant is logged as an error and left (cross-document-review X6)
 - A deletion the store refuses because the object is in use (`Frontend.RepairDeleteDeferred`) counts as deferred: the
   entry stays for a later pass
-- A repair scan runs only while the store's pool entry names this host, so a superseded copy never consumes the
-  current copy's ErrorTree entries
+- Repair fence: a repair scan runs only while the store's pool entry names both this host and the device the store
+  is loaded from here (`RepairTarget.localDevice`, from `HostStoreView.storeDevices`; a store with no device here is
+  not owned), so a superseded copy, even one on another device of the same host, never consumes the current copy's
+  entries. Each entry delete re-checks it first: one cached ownership read per scan, redone when older than
+  `StoreRepairer.OwnershipRecheck` (1 s, constructor seam `ownershipRecheck`). A check that fails leaves that entry and
+  abandons the rest of the scan. The bootstrap sweep checks only at its start (it deletes nothing)

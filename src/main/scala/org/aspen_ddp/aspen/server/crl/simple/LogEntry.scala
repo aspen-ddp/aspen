@@ -2,6 +2,8 @@ package org.aspen_ddp.aspen.server.crl.simple
 
 import scribe.Logging
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
+
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.zip.CRC32C
@@ -32,7 +34,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
   def staticDataSize: Long =
     txs.valuesIterator.foldLeft(0L)((s, tx) => s + tx.staticDataSize)
     + TxId.StaticSize * txDeletions.length
-    + TxId.StaticSize * stubs.size
+    + Stub.StaticSize * stubs.size
     + TxId.StaticSize * stubDeletions.size
     + 16 // Trailing file UUID. Must match header UUID during load process or corrupted entry
 
@@ -209,7 +211,8 @@ object LogEntry:
   ///
   /// Recovery takes nothing from an entry whose checksums fail (Recovery, crash-recovery-log F5)
   ///
-  /// Static data: transactions, applied stubs (TxId each), transaction deletions, applied stub deletions, stream UUID
+  /// Static data: transactions, applied stubs (TxId and start timestamp each), transaction deletions, applied stub
+  /// deletions (TxId each), stream UUID
   case class EntryHeader(streamUUID: UUID,
                          entrySerialNumber: Long,
                          oldestEntryNeeded: Long,
@@ -231,7 +234,7 @@ object LogEntry:
 
   class RecoveringState(var txs: HashMap[TxId, Tx.LoadingTx],
                         var txDeletions: Set[TxId],
-                        var stubs: Set[TxId] = Set(),
+                        var stubs: HashMap[TxId, HLCTimestamp] = new HashMap(),
                         var stubDeletions: Set[TxId] = Set())
 
 
@@ -261,7 +264,7 @@ object LogEntry:
     // after a delete of the same id within one entry) and to saves in older entries. It must
     // not remove a save from a newer entry: that is a re-save of a previously deleted id.
     val loaded = List.fill(header.numTransactions)(Tx.loadTx(bb))
-    val stubsHere = List.fill(header.numAppliedStubs)(Tx.getTxId(bb))
+    val stubsHere = List.fill(header.numAppliedStubs)(Stub.load(bb))
     val deletedHere = List.fill(header.numDeletedTransactions)(Tx.getTxId(bb)).toSet
     val stubsDeletedHere = List.fill(header.numDeletedAppliedStubs)(Tx.getTxId(bb)).toSet
 
@@ -273,9 +276,9 @@ object LogEntry:
 
     // Applied stubs are separate entries, with the same rule. An entry never holds a stub and its deletion
     // (LogEntry.addStub), so only newer deletions can remove one
-    stubsHere.foreach: id =>
-      if !rstate.stubDeletions.contains(id) && !stubsDeletedHere.contains(id) then
-        rstate.stubs += id
+    stubsHere.foreach: (id, start) =>
+      if !rstate.stubDeletions.contains(id) && !stubsDeletedHere.contains(id) && !rstate.stubs.contains(id) then
+        rstate.stubs += (id -> start)
 
     rstate.stubDeletions ++= stubsDeletedHere
 

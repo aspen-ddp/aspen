@@ -72,12 +72,13 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   never at the apply re-check
 - Muted prepares at rebuilt stores (`acceptor-since`) and for start timestamps ahead of the host's clock
   (`Frontend.MaxStartLead`): `server/store/CLAUDE.md`
-- Transaction horizon (`common.transaction.TransactionHorizon`, 20 s on `startTimestamp` against the host's wall
-  clock): a prepare for a transaction a store does not hold whose start is below its forget floor
-  (`Frontend.forgetFloorMillis`: now - horizon, its load + `MaxStartLead`, the cache's eviction watermark) is refused
-  outright, no Tx; details `server/store/CLAUDE.md`. So no driver ever counts the fresh state of an acceptor that
-  forgot T, and a commit is never re-decided as abort nor an abort as commit. Proofs and late resolution still work
-  inside the window but are no longer load-bearing
+- Transaction horizon (`common.transaction.TransactionHorizon`, 20 s on `startTimestamp` against the host's wall clock):
+  a prepare for a transaction a store does not hold whose start is below its forget floor (`Frontend.forgetFloorMillis`:
+  now - horizon, its load + `MaxStartLead`, the cache's eviction watermark) is refused outright, no Tx, even when the
+  host's status cache holds T resolved but unfinalized (another store's Tx may have written it after this store forgot
+  T; a finalized entry has the prepare ignored); details `server/store/CLAUDE.md`. So no driver ever counts the fresh
+  state of an acceptor that forgot T, and a commit is never re-decided as abort nor an abort as commit. Proofs and late
+  resolution still work inside the window but are no longer load-bearing
 
 #### UnackedCommits
 - Written by the finalizer for each commit voter that sent no TxCommitted (`client/internal/transaction/CLAUDE.md`);
@@ -150,13 +151,17 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 
 #### Applied stubs
 - A durable (store, txid) record in the device CRL, charged to `CrlAdmission`, meaning the store holds
-  that transaction's update. Written where the Tx's CRL state would be deleted, after its commits persist: on an
+  that transaction's update. It carries T's start timestamp (from the Tx's txd, or `TxFinalized.startTimestamp` when
+  the store holds no Tx). Written where the Tx's CRL state would be deleted, after its commits persist: on an
   owed-listing `TxFinalized` (`owed`), on applying through an UnackedCommits entry, and by a lookup when the Tx is
   forgotten without a listing one. A driver reached by another's non-late commit `TxFinalized` cancels its finalizer
   and finalizes at once, listing the received `owed` plus the stores its mark had handed off (`handedOffStores`), so
   a stub may precede its entry. A commit at a store with a stub applies nothing; a non-late one reports its objects in
-  `objectCommitErrors`. The repair scan drops a stub with its entry (a chunked entry's head), and an orphan stub (pre-walk snapshot, no entry)
-  only once two consecutive scans found it so. An entry with no stub is harmless at a store that saw T: it never
+  `objectCommitErrors`. The store drops a stub itself (`Frontend.expireStubs`, at heartbeat) once T is past the
+  horizon plus the expiry margin and it holds no Tx for T (live, deferred, awaiting backend commits or a quarantine):
+  below the floor no prepare creates a Tx for T, so the stub can suppress nothing (Todo 4.6, CRL F22). Stubs are so
+  bounded by their rate times ~30 s whatever the repair scans do; the scan neither reads nor drops them. An entry with
+  no stub is harmless at a store that saw T: it never
   rejoins T, so no replay Tx exists there to apply through it (a second driver's lost TxFinalized included). Residual:
   a store that never saw T (below a quorum) gets T from reconcile: its entry can exist only through the unknown-voters
   case, which names no incarnation, so a late commit there applies nothing through it, and the entry's reconcile

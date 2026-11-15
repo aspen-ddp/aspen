@@ -121,8 +121,8 @@ object StoreRouterSuite:
     def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = synchronized:
       states += storeId -> (states.getOrElse(storeId, Map()) - txid)
 
-    def getAppliedStubs(storeId: StoreId): Set[TransactionId] = Set()
-    def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
+    def getAppliedStubs(storeId: StoreId): Map[TransactionId, HLCTimestamp] = Map()
+    def saveAppliedStub(storeId: StoreId, txid: TransactionId, start: HLCTimestamp, completionHandler: () => Unit): Unit =
       completionHandler()
     def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = ()
 

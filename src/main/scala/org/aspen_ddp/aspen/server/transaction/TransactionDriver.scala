@@ -309,7 +309,8 @@ abstract class TransactionDriver(
       (finalized, resolvedValue, late, d, owed)
     }
     if (isFinalized)
-      messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed, isLate, owedNow)))
+      messenger.sendTransactionMessages(allDataStores.map(toStoreId =>
+        TxFinalized(toStoreId, storeId, txd.transactionId, committed, isLate, owedNow, txd.startTimestamp)))
     else if (due)
       messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxHeartbeat(toStoreId, storeId, txd.transactionId)))
   }
@@ -563,7 +564,8 @@ abstract class TransactionDriver(
           clientFinalized = Some(TransactionFinalized(client, storeId, txd.transactionId, committed))
         })
 
-        val messages = allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, committed, late, owed))
+        val messages = allDataStores.map(toStoreId =>
+          TxFinalized(toStoreId, storeId, txd.transactionId, committed, late, owed, txd.startTimestamp))
 
         logger.trace(s"Sending TxFinalized(${txd.transactionId}) to ${messages.head.to.poolId}:(${messages.map(_.to.poolIndex)})")
 

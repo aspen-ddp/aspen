@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
@@ -28,7 +29,7 @@ object SimpleCRL extends Logging:
   case class DeleteTransactions(storeId: StoreId, transactionIds: List[TransactionId],
                                 completionHandler: () => Unit) extends ActionRequest
 
-  case class SaveAppliedStub(storeId: StoreId, transactionId: TransactionId,
+  case class SaveAppliedStub(storeId: StoreId, transactionId: TransactionId, start: HLCTimestamp,
                              completionHandler: () => Unit) extends ActionRequest
 
   case class DeleteAppliedStub(storeId: StoreId, transactionId: TransactionId) extends ActionRequest
@@ -49,7 +50,7 @@ object SimpleCRL extends Logging:
 
   case class InitialCRLState(crl: SimpleCRL,
                              trsList: List[TransactionRecoveryState],
-                             appliedStubs: Set[TxId])
+                             appliedStubs: Map[TxId, HLCTimestamp])
 
   /** Opens each device's SimpleCRL in `CrashRecoveryLog.deviceCrlDir`, creating the directory if absent. A new CRL is
    *  sized by the device's config; an existing one keeps the sizing it recorded (SizingFile). `onThreadDeath` is
@@ -229,7 +230,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   // A failed open shuts its writer down: the caller may open the same files again
   try
     // Stubs first: a stub's save replaces a transaction's state of the same id, and both may be live
-    r.appliedStubs.foreach(id => onSaveAppliedStub(id.storeId, id.transactionId, () => ()))
+    r.appliedStubs.foreach((id, start) => onSaveAppliedStub(id.storeId, id.transactionId, start, () => ()))
     r.trsList.foreach(trs => onSaveTransaction(trs.txd.transactionId, trs, () => ()))
 
     if !currentLogEntry.isEmpty then
@@ -368,8 +369,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
             currentLogEntry.addCompletionHandler(completionHandler)
             startWrite()
 
-        case SaveAppliedStub(storeId, transactionId, completionHandler) =>
-          onSaveAppliedStub(storeId, transactionId, completionHandler)
+        case SaveAppliedStub(storeId, transactionId, start, completionHandler) =>
+          onSaveAppliedStub(storeId, transactionId, start, completionHandler)
 
         case DeleteAppliedStub(storeId, transactionId) => onDeleteAppliedStub(storeId, transactionId)
 
@@ -426,11 +427,12 @@ class SimpleCRL private (val maxSizeInBytes: Long,
                                 ): Unit =
     completion(StoreRecoveryState(
       transactions.valuesIterator.filter(_.id.storeId == storeId).map(_.state).toList,
-      stubs.keysIterator.filter(_.storeId == storeId).map(_.transactionId).toSet))
+      stubs.valuesIterator.filter(_.id.storeId == storeId).map(s => s.id.transactionId -> s.start).toMap))
 
   /** Replaces the transaction state held for the id, if any, in the same entry: its deletion and the stub are durable
     * together */
-  private def onSaveAppliedStub(storeId: StoreId, transactionId: TransactionId, completionHandler: () => Unit): Unit =
+  private def onSaveAppliedStub(storeId: StoreId, transactionId: TransactionId, start: HLCTimestamp,
+                                completionHandler: () => Unit): Unit =
     val txid = TxId(storeId, transactionId)
     transactions.get(txid).foreach: tx =>
       removeFromQueue(tx)
@@ -439,7 +441,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     val stub = stubs.get(txid) match
       case Some(stub) => stub
       case None =>
-        val stub = new Stub(txid)
+        val stub = new Stub(txid, start)
         addToQueueHead(stub)
         stubs += (txid -> stub)
         stub
@@ -498,7 +500,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = blockingRead(storeId).transactions
 
-  def getAppliedStubs(storeId: StoreId): Set[TransactionId] = blockingRead(storeId).appliedStubs
+  def getAppliedStubs(storeId: StoreId): Map[TransactionId, HLCTimestamp] = blockingRead(storeId).appliedStubs
 
   private def blockingRead(storeId: StoreId): StoreRecoveryState =
     scala.concurrent.Await.result(readStoreState(storeId), scala.concurrent.duration.Duration.Inf)
@@ -514,8 +516,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   def dropTransactionObjectData(storeId: StoreId, transactionid: TransactionId): Unit =
     ioQueue.put(DropTransactionData(storeId, transactionid))
 
-  def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
-    ioQueue.put(SaveAppliedStub(storeId, txid, completionHandler))
+  def saveAppliedStub(storeId: StoreId, txid: TransactionId, start: HLCTimestamp, completionHandler: () => Unit): Unit =
+    ioQueue.put(SaveAppliedStub(storeId, txid, start, completionHandler))
 
   def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit =
     ioQueue.put(DeleteAppliedStub(storeId, txid))
@@ -533,8 +535,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   override def loadStore(storeId: StoreId, state: StoreRecoveryState): Future[Unit] =
     given scala.concurrent.ExecutionContext = scala.concurrent.ExecutionContext.parasitic
     // Stubs first: a stub's save replaces a transaction's state of the same id, which a later save then keeps
-    Future.sequence(state.appliedStubs.toList.map: txid =>
-      tracked[Unit](p => SaveAppliedStub(storeId, txid, () => p.trySuccess(())))
+    Future.sequence(state.appliedStubs.toList.map: (txid, start) =>
+      tracked[Unit](p => SaveAppliedStub(storeId, txid, start, () => p.trySuccess(())))
     ).flatMap: _ =>
       Future.sequence(state.transactions.map: trs =>
         tracked[Unit](p => SaveTransaction(trs.txd.transactionId, trs, () => p.trySuccess(())))

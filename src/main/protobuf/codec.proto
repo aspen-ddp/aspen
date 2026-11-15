@@ -275,6 +275,7 @@ message TxFinalized {
   bool committed = 4;
   bool late = 5;
   repeated StoreId owed = 6;
+  uint64 start_timestamp = 7;
 }
 
 message TxHeartbeat {
@@ -579,9 +580,14 @@ message TransactionRecoveryState {
 }
 
 // One entry of a crl_save.log: a transaction's state, or an applied stub (the transaction id)
+message AppliedStub {
+  UUID transaction_uuid = 1;
+  uint64 start_timestamp = 2;
+}
+
 message StoreCRLEntry {
   TransactionRecoveryState trs = 1;
-  UUID applied_stub = 2;
+  AppliedStub applied_stub = 2;
 }
 
 message PoolStoreEntry {

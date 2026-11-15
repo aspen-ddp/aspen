@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server.transaction
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
+
 import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxPrepare, TxPrepareResponse, TxResolved}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -93,7 +95,8 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
   test("a finalized driver stops retransmitting TxResolved") {
     val (driver, messenger, tasks) = resolvedDriver()
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, driver.txd.transactionId, committed = true, late = false, owed = Set()))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, driver.txd.transactionId, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     messenger.clear()
 
     tasks.fireAll()
@@ -105,7 +108,8 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
   test("a driver whose mark was handed off sends no TxResolved after another driver's TxFinalized") {
     val (driver, messenger, tasks) = resolvedDriver(handedOff = Set(ds2))
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, driver.txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, driver.txd.transactionId, committed = true, late = false, owed = Set(ds1),
+      startTimestamp = HLCTimestamp.now))
     val finals = messenger.messages.collect { case f: TxFinalized => (f.owed, f.late) }.toSet
     finals shouldBe Set((Set(ds1, ds2), false))
     messenger.clear()

@@ -250,7 +250,8 @@ class Store(val storageDeviceId: StorageDeviceId,
           r.foreach(resolved => net.sendTransactionMessage(resolved))
 
           if (entry.finalized) {
-            net.sendTransactionMessage(TxFinalized(msg.from, msg.to, m.txd.transactionId, committed, late = committed, owed = Set()))
+            net.sendTransactionMessage(TxFinalized(msg.from, msg.to, m.txd.transactionId, committed, late = committed,
+              owed = Set(), m.txd.startTimestamp))
 
             m.txd.originatingClient.foreach { client =>
               net.sendClientResponse(TransactionFinalized(client, msg.to, m.txd.transactionId, committed))
@@ -265,7 +266,7 @@ class Store(val storageDeviceId: StorageDeviceId,
         // (Frontend.MaxStartLead): a driver would only run data-less rounds, and could abort it for want of the
         // client's prepare once the clocks catch up. The client's retransmission starts the driver then. Nor is one
         // started below the store's forget floor for a transaction it does not hold: the Frontend refuses the prepare
-        // (or, with an outcome cached, needs no driver to learn it), and a driver could only run rounds with stores
+        // (or ignores it, its finalized outcome cached), and a driver could only run rounds with stores
         // that may have forgotten the transaction
         val refused = frontend.belowForgetFloor(m.txd) && !frontend.transactions.contains(m.txd.transactionId)
         if (notFinalized && m.txd.primaryObject.poolId == storeId.poolId && m.txd.designatedLeaderUID == storeId.poolIndex

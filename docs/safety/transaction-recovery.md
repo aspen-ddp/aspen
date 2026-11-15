@@ -344,7 +344,9 @@ naming S for T is stale" (`StoreRecoveryState`, crash-recovery-log.md 3.6). The 
   (`Tx.scala:642-648`); a late commit reaching an undecided commit vote with a stub, or a held late commit whose stub
   arrived during its lookup, applies nothing (`:998-1000`, `:1087-1088`). A recovered non-late commit vote with a stub
   resolves committed through `doCommit` and stays until `TxFinalized` (Ruling 5).
-* **Cleanup.** The repair scan drops S's stub for T when it deletes entry (S, T) (`StoreRepairer.scala:322`); for an
+* **Cleanup.** *2026-11-15 (Todo 4.6):* the store drops its own stub once T is past the horizon plus the expiry
+  margin and it holds no Tx for T (`Frontend.expireStubs`; the stub carries T's start, crash-recovery-log.md F22); the
+  repair scan no longer touches stubs. Before: the repair scan dropped S's stub for T when it deleted entry (S, T) (`StoreRepairer.scala:322`); for an
   entry written in chunks (2026-11-11, repair-process.md 2.3), when it deletes the head, the chunk the lookups name. It
   drops an orphan stub only after two consecutive successful scans found it orphaned: read before the walk, no entry
   in the walk, and none at a point lookup (Rulings 6 and 8, `:95-104,161-165,187-200`; repair-process.md 5.5).
@@ -769,7 +771,7 @@ Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding 
 |---|---|---|---|
 | R-N1 | **closed** 2026-11-14 (was narrowed) | Todo 2.9: under the horizon only a store that never saw T can hold a replay's Tx, so of the residual below only R-N9 remains. Before: a store that forgot T on a `TxFinalized` listing it in `owed`, applied T through its entry, or found its entry through the case-3 lookup holds an applied stub and applies nothing on a replay's commit, late or not. The R-N1 quorum scenario is tested end to end (ReplayIntegrationSuite "a replay at a pool whose stores all acknowledged late leaves every store unchanged"). Remaining: stores with an entry and no stub: the self-healing minority that never saw T (R-N9), a second driver's entries (R-N7, narrowed by Ruling 7), and a lost `TxFinalized` after a re-run finalizer (R-N6) | `Tx.scala:642-648,935-936,984-1007,1078-1092`; `Frontend.scala:768-778` |
 | R-N3 | **narrowed** 2026-11-15 (Todo 4.4; was unchanged, widened slightly). R-N10 **fixed** the same day | The case-3 lookup also depends on the metadata group, but holds no locks: a committed, applied Tx stays in memory (status cache not yet finalized) until the lookup answers or a non-late `TxFinalized` arrives (R-N10) | `Tx.scala:990-997`; `Frontend.scala:484-494` |
-| R-N4 | unchanged (cost added) | Each entry for a store that forgets T on a listing `TxFinalized` now also costs one stub in the device CRL until the scan drops it (repair-process RP-N6) | `Frontend.scala:395-409` |
+| R-N4 | unchanged (cost added) | Each entry for a store that forgets T on a listing `TxFinalized` now also costs one stub in the device CRL, until T is past the horizon plus the expiry margin (2026-11-15, Todo 4.6; was until the scan dropped it, repair-process RP-N6) | `Frontend.scala:395-409` |
 | R-N6 | **narrowed** (2026-11-14: to the orphan allocation entry, Todo 5.5; the marker part is FIXED, R-N1's re-arming is closed by the horizon) | The re-run marker's entries come with a non-late `TxFinalized` listing them; stores with no Tx write stubs (`Frontend.scala:763-773`), so the re-created entries no longer re-arm R-N1 unless that `TxFinalized` is lost at a store. The ErrorTree regression and the orphan allocation entry are unchanged | as cited |
 | F2 / R-N2 | unchanged | Still no failure path: a write that gives up never completes the action, so a driver relying on its own finalizer never finalizes (`MissedUpdateFinalizationAction.scala:140-146`). A second driver finalized by another's `TxFinalized` lists its planned set whatever its write's outcome (Ruling 7; R-N7 variant 2 closed) | `TransactionDriver.scala:411-430` |
 | F3 | unchanged | A live commit voter still accepts an abort at once; the late-commit half is now covered by stubs too | `Tx.scala:176-178` |
@@ -1374,6 +1376,12 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 > drops its lookup. The entry is left for the repair scan; an entry with no stub is harmless at a store that saw T.
 > Test: FrontendSuite "a late commit of an applied Tx whose lookup never answers is forgotten without a stub once past
 > expiry".
+>
+> **2026-11-15 (Todo 4.6): gap closed.** The argument missed one path: below the floor a prepare still created a Tx
+> when the host's shared status cache held T resolved but unfinalized (another store's Tx could write such an entry
+> after this store's finalized one expired), and that Tx could apply T again. `receivePrepare` now refuses it; only a
+> finalized entry exempts a prepare, which is then ignored. The same argument now expires every applied stub
+> (crash-recovery-log.md F22).
 
 > **R-N11. Verdict: PLAUSIBLE (very narrow). Severity: stale-replica at one store, self-healing.**
 > `deferredFinalizations` is keyed by txid and `transactionFinalized` removes the key whatever Tx calls it

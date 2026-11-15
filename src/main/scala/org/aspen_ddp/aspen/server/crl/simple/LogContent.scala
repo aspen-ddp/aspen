@@ -108,24 +108,36 @@ sealed abstract class Record(val id: TxId):
   def closeStream(id: StreamId): Boolean
 
 
-/** An applied stub (StoreRecoveryState): its static record is only its TxId. `anchor` is a zero-length location in
-  * the entry that wrote it, so a rotation recycling that stream copies it forward as it does a transaction's data */
-final class Stub(id: TxId) extends Record(id):
+/** An applied stub (StoreRecoveryState): its static record is its TxId and its transaction's start timestamp (by which
+  * its store expires it). `anchor` is a zero-length location in the entry that wrote it, so a rotation recycling that
+  * stream copies it forward as it does a transaction's data */
+final class Stub(id: TxId, val start: HLCTimestamp) extends Record(id):
   var anchor: Option[StreamLocation] = None
 
   def clearDynamicData(): Unit = anchor = None
 
   def dynamicDataSize: Long = 0
 
-  def staticDataSize: Long = TxId.StaticSize
+  def staticDataSize: Long = Stub.StaticSize
 
-  def writeStaticEntry(bb: ByteBuffer): Unit = Tx.putTxId(bb, id)
+  def writeStaticEntry(bb: ByteBuffer): Unit =
+    Tx.putTxId(bb, id)
+    bb.putLong(start.asLong)
 
   def closeStream(streamId: StreamId): Boolean = anchor match
     case Some(loc) if loc.streamId == streamId =>
       anchor = None
       true
     case _ => false
+
+
+object Stub:
+  /** TxId and start timestamp */
+  val StaticSize: Long = TxId.StaticSize + 8
+
+  def load(bb: ByteBuffer): (TxId, HLCTimestamp) =
+    val id = Tx.getTxId(bb)
+    (id, HLCTimestamp(bb.getLong()))
 
 
 final class Tx(id: TxId,

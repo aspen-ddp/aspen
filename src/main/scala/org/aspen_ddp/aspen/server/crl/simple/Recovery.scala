@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
-import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrlCorrupt, TransactionRecoveryState}
 import scribe.Logging
@@ -23,7 +23,7 @@ object Recovery extends Logging:
                     initialPreviousEntryLocation: StreamLocation,
                     trsList: List[TransactionRecoveryState],
                     /** Applied stubs: not transactions, recovered apart from them */
-                    appliedStubs: Set[TxId] = Set())
+                    appliedStubs: Map[TxId, HLCTimestamp] = Map())
 
   def recover(files: List[(StreamId, os.Path)]): Result =
     val readers = files.sortBy(_._1.number).map(t => StreamReader(t._1, t._2)).toArray

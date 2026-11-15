@@ -112,9 +112,10 @@ object CrlAdmission:
     */
   val TxOverheadBytes: Long = 63
 
-  /** SimpleCRL's record of an applied stub (Stub.staticDataSize): its TxId. Charged without a check, so stubs are
-    * never dropped or held back, but count toward the copy-forward budget new prepares are admitted against */
-  val AppliedStubBytes: Long = 33
+  /** SimpleCRL's record of an applied stub (Stub.staticDataSize): its TxId 33 and start timestamp 8. Charged without
+    * a check, so stubs are never dropped or held back, but count toward the copy-forward budget new prepares are
+    * admitted against */
+  val AppliedStubBytes: Long = 41
 
   /** Per object update in that record: object UUID 16 + data location 14 */
   val ObjectUpdateOverheadBytes: Long = 30

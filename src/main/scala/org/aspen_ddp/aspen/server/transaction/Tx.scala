@@ -30,7 +30,10 @@ object Tx {
 
   /** `txd` started more than `horizon` plus `margin` before `nowMillis`, on the host's wall clock (expiry) */
   def pastHorizon(txd: TransactionDescription, nowMillis: Long, horizon: FiniteDuration, margin: FiniteDuration): Boolean =
-    txd.startTimestamp.wallTime + horizon.toMillis + margin.toMillis < nowMillis
+    pastHorizon(txd.startTimestamp, nowMillis, horizon, margin)
+
+  def pastHorizon(start: HLCTimestamp, nowMillis: Long, horizon: FiniteDuration, margin: FiniteDuration): Boolean =
+    start.wallTime + horizon.toMillis + margin.toMillis < nowMillis
 }
 
 class Tx( trs: TransactionRecoveryState,
@@ -840,7 +843,7 @@ class Tx( trs: TransactionRecoveryState,
       frontend.heldCommitIssued(changedHere, this)
     if finalizeDeferred then
       finalizeDeferred = false
-      frontend.transactionFinalized(transactionId, writeStub = stubDue, by = Some(this))
+      frontend.transactionFinalized(transactionId, stub = Option.when(stubDue)(txd.startTimestamp), by = Some(this))
 
     // Nothing was committed, so no commit completions will arrive to trigger the notification.
     // Without this the proposer never learns this store's outcome. A synchronous backend may already have completed
@@ -1197,7 +1200,7 @@ class Tx( trs: TransactionRecoveryState,
       finalizeDeferred = true
       frontend.finalizationDeferred(this)
     else
-      frontend.transactionFinalized(transactionId, writeStub = stubDue, by = Some(this))
+      frontend.transactionFinalized(transactionId, stub = Option.when(stubDue)(txd.startTimestamp), by = Some(this))
     statusCache.updateStatus(transactionId, txStatus, finalized = true, late = lateOutcome)
 
   /** A late commit: the driver learned the commit only after the transaction was finalized and forgotten
@@ -1270,7 +1273,8 @@ class Tx( trs: TransactionRecoveryState,
     ofinalized = Some(committed)
     lateOutcome = late
     // Nothing was committed here, so nothing waits for backend commits
-    frontend.transactionFinalized(transactionId, writeStub = committed && stubDue, by = Some(this))
+    frontend.transactionFinalized(transactionId, stub = Option.when(committed && stubDue)(txd.startTimestamp),
+      by = Some(this))
     unlock()
     releaseObjects()
     statusCache.updateStatus(transactionId,

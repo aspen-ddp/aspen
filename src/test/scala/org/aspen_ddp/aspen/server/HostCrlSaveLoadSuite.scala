@@ -133,7 +133,7 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     val stubbed = TransactionId(new UUID(7, 9))
     val backend = storeWithSaveFile()
     val (_, saved) = CrashRecoveryLog.loadStoreState(backend.crlSaveFile)
-    CrashRecoveryLog.saveStoreState(crlStoreId, saved.copy(appliedStubs = Set(stubbed)), backend.crlSaveFile)
+    CrashRecoveryLog.saveStoreState(crlStoreId, saved.copy(appliedStubs = Map(stubbed -> HLCTimestamp.now)), backend.crlSaveFile)
     val crl = new TestNetwork.RecordingCRL
     val host = newCrlHost(crl)
     val loaded = host.loadStore(deviceId, backend, None)
@@ -147,16 +147,16 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       _ <- loaded
     yield
       val store = storeOf(host).get
-      store.frontend.appliedStubs should be (Set(stubbed))
+      store.frontend.appliedStubs.keySet should be (Set(stubbed))
       store.frontend.transactions.keySet should be (Set(txid))
-      crl.getAppliedStubs(crlStoreId) should be (Set(stubbed))
+      crl.getAppliedStubs(crlStoreId).keySet should be (Set(stubbed))
 
   atest("a store loaded with applied stubs in its device CRL recovers them"):
     given ExecutionContext = executionContext
     val stubbed = TransactionId(new UUID(7, 9))
     val crl = new TestNetwork.RecordingCRL
     crl.save(txid, commitVote(), () => ())
-    crl.saveAppliedStub(crlStoreId, stubbed, () => ())
+    crl.saveAppliedStub(crlStoreId, stubbed, HLCTimestamp.now, () => ())
     val backend = storeWithObject()
     val host = newCrlHost(crl)
     val loaded = host.loadStore(deviceId, backend, None)
@@ -169,7 +169,7 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       _ <- yieldUntil(recovered)
       _ <- loaded
     yield
-      storeOf(host).get.frontend.appliedStubs should be (Set(stubbed))
+      storeOf(host).get.frontend.appliedStubs.keySet should be (Set(stubbed))
 
   /** A RecordingCRL whose readStoreState answers only when the test completes `answer`, as a busy CRL thread would,
    *  and which records any blocking getFullRecoveryState call */

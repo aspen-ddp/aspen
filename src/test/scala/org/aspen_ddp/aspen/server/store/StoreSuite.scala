@@ -291,7 +291,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.receiveTransactionMessage(TxResolved(leader, leader, txid1, committed = false, late = false, proof = false))
     // An expiring commit vote looks up its UnackedCommits entry before it lets go of an abort
     lookup.answer(txid1, lookup.absent)
-    store.receiveTransactionMessage(TxFinalized(leader, leader, txid1, committed = false, late = false, owed = Set()))
+    store.receiveTransactionMessage(TxFinalized(leader, leader, txid1, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     store.frontend.transactions.contains(txid1) shouldBe false
     crl.deleted should contain (txid1)
   }
@@ -324,7 +325,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.heartbeat()
     store.hasTransactions shouldBe true
 
-    store.receiveTransactionMessage(TxFinalized(storeId, peer, txid1, committed = true, late = false, owed = Set()))
+    store.receiveTransactionMessage(TxFinalized(storeId, peer, txid1, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     store.frontend.transactions.contains(txid1) shouldBe false
     store.hasTransactions shouldBe false
     crl.txDel shouldBe true
@@ -337,7 +339,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.receiveTransactionMessage(prepare(storeId, leader).copy(fromClient = true,
       objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
     store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true, late = false, proof = false))
-    store.receiveTransactionMessage(TxFinalized(storeId, leader, txid1, committed = true, late = false, owed = Set()))
+    store.receiveTransactionMessage(TxFinalized(storeId, leader, txid1, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     backend.heldCommits shouldBe 1
     crl.deleted shouldBe Nil
 
@@ -432,7 +435,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     net.sentTx.collect { case f: TxFinalized => (f.committed, f.late) }.distinct shouldBe List((true, true))
     finalizer.created shouldBe 0
 
-    store.receiveTransactionMessage(TxFinalized(storeId, storeId, foundTxid, committed = true, late = true, owed = Set()))
+    store.receiveTransactionMessage(TxFinalized(storeId, storeId, foundTxid, committed = true, late = true, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     store.frontend.transactions.contains(foundTxid) shouldBe false
   }
 
@@ -466,7 +470,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     finalizer.created shouldBe 1
     net.sentTx = Nil
 
-    store.receiveTransactionMessage(TxFinalized(storeId, peer, foundTxid, committed = true, late = false, owed = Set(peer)))
+    store.receiveTransactionMessage(TxFinalized(storeId, peer, foundTxid, committed = true, late = false, owed = Set(peer),
+      startTimestamp = HLCTimestamp.now))
     net.sentTx.collect { case f: TxFinalized => (f.owed, f.late) }.distinct shouldBe List((Set(peer, leader), false))
     store.hasTransactions shouldBe false
   }

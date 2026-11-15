@@ -73,8 +73,6 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
 
     def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
-    def appliedStubs(sid: StoreId): Future[Set[TransactionId]] = Future.successful(Set())
-    def dropAppliedStub(sid: StoreId, txid: TransactionId): Unit = ()
 
     def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
       p.success(RepairSnapshot.missing(pointer.id))
@@ -471,8 +469,6 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       def repairableStoreIds: List[StoreId] = List(storeId)
       def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
       def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
-      def appliedStubs(sid: StoreId): Future[Set[TransactionId]] = Future.successful(Set())
-      def dropAppliedStub(sid: StoreId, txid: TransactionId): Unit = ()
       def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
         p.failure(StoreNotHosted(sid))
       def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
@@ -499,8 +495,6 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       def repairableStoreIds: List[StoreId] = List(storeId)
       def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
       def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
-      def appliedStubs(sid: StoreId): Future[Set[TransactionId]] = Future.successful(Set())
-      def dropAppliedStub(sid: StoreId, txid: TransactionId): Unit = ()
       def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
         p.failure(StoreNotHosted(sid))
       def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
@@ -531,8 +525,6 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       def repairableStoreIds: List[StoreId] = List(storeId)
       def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
       def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
-      def appliedStubs(sid: StoreId): Future[Set[TransactionId]] = Future.successful(Set())
-      def dropAppliedStub(sid: StoreId, txid: TransactionId): Unit = ()
       def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
         p.failure(StoreNotHosted(sid))
       def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
@@ -1008,8 +1000,6 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       net.smgr.reconcile(storeId, snapshot, read, p)
     def repairDelete(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte], completion: Promise[Unit]): Unit =
       net.smgr.repairDelete(storeId, objectId, storePointer, completion)
-    def appliedStubs(storeId: StoreId): Future[Set[TransactionId]] = net.smgr.appliedStubs(storeId)
-    def dropAppliedStub(storeId: StoreId, txid: TransactionId): Unit = net.smgr.dropAppliedStub(storeId, txid)
 
   /** One scan of store `i`, then settle */
   private def pass(i: Int, repairer: StoreRepairer, deferral: DeferralState,
@@ -1102,13 +1092,14 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   /** Gives store `i` an applied stub for `txid`, durable */
   private def writeStub(i: Int, txid: TransactionId): Future[Unit] =
     for
-      _ <- pump(net.smgr.control.router.onStore(sid(i))(_.frontend.recordAppliedStub(txid)(())), deadline())
+      _ <- pump(net.smgr.control.router.onStore(sid(i))(_.frontend.recordAppliedStub(txid, HLCTimestamp.now)(())), deadline())
       _ <- settle()
     yield ()
 
   private def hasStub(i: Int, txid: TransactionId): Boolean = storeFrontend(i).hasAppliedStub(txid)
 
-  test("deleting an UnackedCommits entry drops the store's stub for it"):
+  // A store expires its stubs itself (Frontend.expireStubs, Todo 4.6): the scan reads and drops none
+  test("deleting an UnackedCommits entry leaves the store's stub for it"):
     val repairer = StoreRepairer(client, SeamTarget())
     for
       kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
@@ -1116,12 +1107,14 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- dropErrorEntries(2)
       _ <- writeStub(2, txid)
       _ <- scanUntilQuiet(2, repairer)
+      remaining <- unackedEntries(2)
     yield
-      hasStub(2, txid) shouldBe false
+      remaining shouldBe empty
+      hasStub(2, txid) shouldBe true
 
-  test("a UnackedCommits entry whose delete the ownership fence refuses keeps the entry and the store's stub"):
+  test("a UnackedCommits entry whose delete the ownership fence refuses keeps the entry"):
     // The pool moves store 2 to another host after the scan's first check, before the entry's delete, which re-checks
-    // (ownershipRecheck = Duration.Zero): the entry and its stub stay for the store's current copy
+    // (ownershipRecheck = Duration.Zero): the entry stays for the store's current copy
     val target = new SeamTarget:
       override def localDevice(storeId: StoreId): Option[StorageDeviceId] = net.smgr.localDevice(storeId)
     val moved = new AtomicBoolean(false)
@@ -1129,7 +1122,6 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
       txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
       _ <- dropErrorEntries(2)
-      _ <- writeStub(2, txid)
       poolState <- client.getStoragePoolState(sid(2).poolId)
       owner = poolState.stores(sid(2).poolIndex)
       repairer = StoreRepairer(client, target, Some(owner.hostId), ownershipRecheck = Duration.Zero,
@@ -1146,39 +1138,6 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       storeKeys(2, kvPtr) shouldBe Set(k0)
       result.repaired shouldBe 0
       remaining shouldBe List(UnackedCommitEntry.key(sid(2), txid))
-      hasStub(2, txid) shouldBe true
-
-  // Ruling 8: a stub may be written before its entry is durable (Ruling 7), so one scan finding no entry is not enough
-  test("an orphan stub survives one scan and is dropped by the second"):
-    val repairer = StoreRepairer(client, SeamTarget())
-    val deferral = DeferralState()
-    val orphan = TransactionId(new UUID(77, 1))
-    for
-      _ <- writeStub(2, orphan)
-      _ <- pass(2, repairer, deferral)
-      afterFirst = hasStub(2, orphan)
-      _ <- pass(2, repairer, deferral)
-    yield
-      afterFirst shouldBe true
-      hasStub(2, orphan) shouldBe false
-
-  test("a cancelled scan's orphan pass counts toward no drop (repair F9)"):
-    val repairer = StoreRepairer(client, SeamTarget())
-    val deferral = DeferralState()
-    val orphan = TransactionId(new UUID(77, 2))
-    val cancelled = ScanControl()
-    cancelled.cancel()
-    for
-      _ <- writeStub(2, orphan)
-      _ <- pass(2, repairer, deferral)
-      _ <- settle()
-      _ <- pump(repairer.scan(sid(2), RepairPolicy.Default, deferral, cancelled), deadline())
-      afterCancelled = hasStub(2, orphan)
-      _ <- pass(2, repairer, deferral)
-    yield
-      withClue("the cancelled scan neither dropped the stub nor reset the suspicion: "):
-        afterCancelled shouldBe true
-      hasStub(2, orphan) shouldBe false
 
   test("a scan cancelled part way starts no further entry and keeps the store's deferral state (repair F9)"):
     // Two objects, each with an entry. The first reconcile cancels the scan: the second entry is left untouched, and
@@ -1210,108 +1169,6 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       control.sawEntries shouldBe true
       after.size shouldBe 1
       deferral.deferredKeys(unrelated) shouldBe Some(Set(k0))
-
-  test("a stub whose entry lands between two scans is kept"):
-    val target = SeamTarget()
-    val repairer = StoreRepairer(client, target)
-    val deferral = DeferralState()
-    val txid = TransactionId(new UUID(77, 3))
-    for
-      _ <- writeStub(2, txid)
-      _ <- pass(2, repairer, deferral) // No entry yet: the stub is suspected
-      // The planned entry lands. The store holds the transaction live, so the scan leaves the entry alone
-      _ <- pump(client.missedUpdateMarker.mark(Nil,
-             List(MissedUnackedCommit(sid(2), txid, UnackedCommitEntry(HLCTimestamp.now, None, Nil)))), deadline())
-      _ <- settle()
-      _ = target.live += (sid(2) -> txid)
-      _ <- pass(2, repairer, deferral)
-      afterSecond = hasStub(2, txid)
-      // The entry gone again: the suspicion restarts, so one more scan keeps the stub
-      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
-      tx = TestTransactions.replaySafe(client.newRepairTransaction())
-      _ <- pool.unackedCommitsTree.delete(UnackedCommitEntry.key(sid(2), txid))(using tx)
-      _ <- pump(tx.commit(), deadline())
-      _ = target.live = Set()
-      _ <- pass(2, repairer, deferral)
-    yield
-      afterSecond shouldBe true
-      hasStub(2, txid) shouldBe true
-
-  test("a stub whose entry is still present is kept"):
-    val target = SeamTarget()
-    val repairer = StoreRepairer(client, target)
-    for
-      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
-      txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
-      _ <- dropErrorEntries(2)
-      _ <- writeStub(2, txid)
-      _ = target.live += (sid(2) -> txid)
-      _ <- pass(2, repairer, DeferralState())
-      entries <- unackedEntries(2)
-    yield
-      entries should not be empty
-      hasStub(2, txid) shouldBe true
-
-  test("a stub written during the walk is kept, and dropped two scans later"):
-    val late = TransactionId(new UUID(77, 2))
-    var written: Future[Unit] = Future.unit
-    // The hook runs inside the walk, when the scan asks whether the store holds the walked entry's transaction
-    val target = new SeamTarget:
-      override def holdsTransaction(storeId: StoreId, txid: TransactionId): Boolean =
-        written = writeStub(2, late)
-        super.holdsTransaction(storeId, txid)
-    val repairer = StoreRepairer(client, target)
-    for
-      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
-      txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
-      _ <- dropErrorEntries(2)
-      _ = target.live += (sid(2) -> txid)
-      _ <- pass(2, repairer, DeferralState())
-      _ <- written
-      keptDuringScan = hasStub(2, late)
-      _ = target.live = Set()
-      next = StoreRepairer(client, SeamTarget())
-      deferral = DeferralState()
-      _ <- pass(2, next, deferral) // First scan to see the stub: suspected only (Ruling 8)
-      keptByNext = hasStub(2, late)
-      _ <- pass(2, next, deferral)
-    yield
-      keptDuringScan shouldBe true
-      keptByNext shouldBe true
-      hasStub(2, late) shouldBe false
-
-  /** Writes UnackedCommits entry chunks for store `i` and `txid`, each naming `objects`, under the given chunk indexes */
-  private def writeChunks(i: Int, txid: TransactionId, objects: List[ObjectPointer], chunks: Int*): Future[Unit] =
-    // Older than the objects, so a read of them is not stale against it
-    val entry = Value(UnackedCommitEntry(HLCTimestamp(1000L), None, objects).encode)
-    for
-      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
-      tx = TestTransactions.replaySafe(client.newRepairTransaction())
-      _ <- pool.unackedCommitsTree.prepareUpdates(
-             chunks.toList.map(c => TKVLInsert(UnackedCommitEntry.key(sid(i), txid, c), entry, blind = true)), Nil)(using tx)
-      _ <- pump(tx.commit(), deadline())
-      _ <- settle()
-    yield ()
-
-  // A chunked entry (UnackedCommitEntry.chunks): the lookups that decide a late commit's apply name the head, so the
-  // stub outlives the head, not the later chunks
-  test("deleting a later chunk of an UnackedCommits entry keeps the stub; the head's deletion drops it"):
-    val repairer = StoreRepairer(client, SeamTarget())
-    val deferral = DeferralState()
-    val onlyLater = TransactionId(new UUID(78, 1))
-    val both = TransactionId(new UUID(78, 2))
-    for
-      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
-      _ <- writeChunks(2, onlyLater, List(kvPtr), 1)
-      _ <- writeChunks(2, both, List(kvPtr), 0, 1)
-      _ <- writeStub(2, onlyLater)
-      _ <- writeStub(2, both)
-      _ <- pass(2, repairer, deferral)
-      remaining <- unackedEntries(2)
-    yield
-      remaining shouldBe empty
-      hasStub(2, onlyLater) shouldBe true
-      hasStub(2, both) shouldBe false
 
   test("a UnackedCommits entry is reconciled and deleted once the store no longer holds it"):
     val target = SeamTarget()

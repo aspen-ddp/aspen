@@ -51,9 +51,9 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   /** While set, the next read of a store's state completes only once it completes: a host stopped there crashes in
    *  the window between the read and the save file's write. Later reads (a store's recovery) are not gated */
   @volatile var readGate: Option[Future[Unit]] = None
-  def getAppliedStubs(storeId: StoreId): Set[TransactionId] = inner.getAppliedStubs(storeId)
-  def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
-    inner.saveAppliedStub(storeId, txid, completionHandler)
+  def getAppliedStubs(storeId: StoreId): Map[TransactionId, HLCTimestamp] = inner.getAppliedStubs(storeId)
+  def saveAppliedStub(storeId: StoreId, txid: TransactionId, start: HLCTimestamp, completionHandler: () => Unit): Unit =
+    inner.saveAppliedStub(storeId, txid, HLCTimestamp.now, completionHandler)
   def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = inner.deleteAppliedStub(storeId, txid)
   override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
     val read = inner.readStoreState(storeId)
@@ -1096,7 +1096,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       crl = factory.opened.head
       _ <- prepareInFlight(host, crl, storeId, txid)
       stubDurable = Promise[Unit]()
-      _ = crl.saveAppliedStub(storeId, stubbed, () => stubDurable.trySuccess(()))
+      _ = crl.saveAppliedStub(storeId, stubbed, HLCTimestamp.now, () => stubDurable.trySuccess(()))
       _ <- stubDurable.future
       _ <-
         if loaded then
@@ -1108,7 +1108,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(host, extracting.isCompleted)
       _ <- extracting
       saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
-      heldAfter = crl.getAppliedStubs(storeId)
+      heldAfter = crl.getAppliedStubs(storeId).keySet
       _ = factory.shutdownAll()
       onDisk = heldStubsOnDisk(deviceDir, storeId)
     yield (saved, heldAfter, onDisk)
@@ -1116,13 +1116,13 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
   private def heldStubsOnDisk(deviceDir: os.Path, sid: StoreId): Set[TransactionId] =
     val crl = newFactory().openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
       deviceDir / StorageDeviceConfig.configFilename))
-    try crl.getAppliedStubs(sid)
+    try crl.getAppliedStubs(sid).keySet
     finally crl.shutdown()
 
   atest("a network transfer out of an open store ships its applied stubs in its crl_save.log"):
     given ExecutionContext = executionContext
     extractionWithStub(loaded = true).map: (saved, heldAfter, onDisk) =>
-      saved.map(_.appliedStubs) should be(Right(Set(TransactionId(new UUID(9, 41)))))
+      saved.map(_.appliedStubs.keySet) should be(Right(Set(TransactionId(new UUID(9, 41)))))
       saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(txid)))
       heldAfter should be(Set())
       onDisk should be(Set())
@@ -1130,7 +1130,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
   atest("a network transfer out of an unloaded store ships its applied stubs in its crl_save.log"):
     given ExecutionContext = executionContext
     extractionWithStub(loaded = false).map: (saved, heldAfter, onDisk) =>
-      saved.map(_.appliedStubs) should be(Right(Set(TransactionId(new UUID(9, 41)))))
+      saved.map(_.appliedStubs.keySet) should be(Right(Set(TransactionId(new UUID(9, 41)))))
       saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(txid)))
       heldAfter should be(Set())
       onDisk should be(Set())

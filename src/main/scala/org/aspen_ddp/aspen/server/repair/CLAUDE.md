@@ -12,9 +12,8 @@
   of entry are left for a later pass while the store may still join the entry's transaction
   (`RepairTarget.mayJoinTransaction`: T's start, which both carry, at or above the store's forget floor). Otherwise a
   replay's Tx created after the `holdsTransaction` check could apply T after the reconcile, and the entry would be
-  deleted under it (transaction-recovery R-N9). The delay is at most the horizon plus `MaxStartLead` (about 22 s). It drops an
-  applied stub with its entry (for a chunked one, with its head, the chunk the lookups name), and an orphan stub only
-  once two consecutive scans found it so (`server/transaction/CLAUDE.md`)
+  deleted under it (transaction-recovery R-N9). The delay is at most the horizon plus `MaxStartLead` (about 22 s).
+  Applied stubs are not repair's: each store expires its own (`server/transaction/CLAUDE.md`, Todo 4.6)
 - An entry is deleted through its tree (`TieredKeyValueList.deleteIfPresent`, under the entry's `KeyRevision`), not
   through the node the walk handed over, so a delete that empties a node registers the join/tail-removal finalization
   actions and the trees shrink as repair drains them. Those actions run in ordinary (tracked) transactions, as the

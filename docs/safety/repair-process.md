@@ -313,6 +313,13 @@ stub (`StoreRepairer.scala:322`).
 
 ### 5.5 Applied stub cleanup (addendum)
 
+> **2026-11-15 (Todo 4.6): superseded.** The scan no longer reads or drops applied stubs, and Rulings 6 and 8 no longer
+> apply to it. Each store expires its own stubs at heartbeat once T is past the horizon plus the expiry margin and no
+> Tx for T is held (`Frontend.expireStubs`; crash-recovery-log.md F22). The scan deletes an entry only once the store
+> can no longer join T (`mayJoinTransaction`), no earlier than expiry, so dropping a stub with its entry never removed
+> it sooner than expiry now does. Ruling 8's residual (an entry landing with no stub) is unchanged in kind: an entry
+> with no stub is harmless at a store that saw T. The description below is the code before the change.
+
 A stub (S, T) is usually written after entry (S, T) is durable: a single driver's `owed` lists entries its marker
 wrote before `TxFinalized` was sent (Ruling 2), and the case-3 fallback writes one only after its lookup found the
 entry (transaction-recovery.md 5.4). Since Ruling 7 a second driver, finalized at once by another driver's
@@ -862,7 +869,7 @@ opportunistic rebuild, deletion and the completion gate are unchanged.
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
 | RP-N4 | **closed** 2026-11-14 (Todo 2.9; was narrowed: the horizon leaves only never-saw stores, and the forget-floor gate makes their reconcile follow the late apply) | The entry still outlives the store's own late application of T until the scan, but a store that forgot T on a `TxFinalized` listing it, or applied T through the entry, holds an applied stub and applies nothing on a replay's commit. The window stays open only at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) | `Tx.scala:642-648,998-1000`; `StoreRepairer.scala:322` |
-| RP-N3 | unchanged (cost added) | Each such entry also keeps a stub in the device CRL until the scan (RP-N6) | `Frontend.scala:395-409` |
+| RP-N3 | unchanged (cost added) | Each such entry also keeps a stub in the device CRL until the scan (RP-N6; since 2026-11-15, until T is past the horizon plus the expiry margin) | `Frontend.scala:395-409` |
 | RP-N5 | unchanged (REFUTED stands) | The scan still skips an entry while the store holds T live; the skipped entry now also counts as seen, so its stub is kept | `StoreRepairer.scala:273-278` |
 | F7 | unchanged | Entry deletion is still untracked; the stub drop that follows it is a store-local CRL write | `StoreRepairer.scala:322` |
 | F8, F9 | unchanged (load larger) | One point lookup per orphan candidate per scan (RP-N7); a timed-out scan's background walk still runs its orphan pass against the DeferralState it started with, which `RepairService` has replaced, so it drops only stubs that state already suspected: two successful scans' evidence either way (each drop also checked by a lookup) | `StoreRepairer.scala:187-200`; `RepairService.scala:195-199` |
@@ -1243,15 +1250,16 @@ dependency is real but sound. Confidence: low.
 
 ### 13.6 New findings from the addendum refresh (2026-11-10, `c181375b`)
 
-* **RP-N6 (capacity; PLAUSIBLE).** Stubs live as long as their entries plus two scans (5.5, Ruling 8), so a stalled scan (metadata
+* **RP-N6 (capacity; FIXED 2026-11-15, Todo 4.6).** Stubs live as long as their entries plus two scans (5.5, Ruling 8), so a stalled scan (metadata
   group unreadable, scans timing out, the store not repairable) lets them accumulate one per entry, in the device CRL
   and charged to its admission (crash-recovery-log.md F22). Liveness only; bounded by the same entry growth as RP-N3 and
-  transaction-recovery R-N4.
-* **RP-N7 (performance; CONFIRMED).** Each orphan candidate gets its own point lookup of the UnackedCommits tree, run
+  transaction-recovery R-N4. *Fixed:* each store now expires its stubs once T is past the horizon plus the expiry
+  margin, independent of the scans (crash-recovery-log.md F22).
+* **RP-N7 (performance; CLOSED 2026-11-15, Todo 4.6 and 5.1: the scan no longer handles stubs).** Each orphan candidate gets its own point lookup of the UnackedCommits tree, run
   one after another (`StoreRepairer.scala:192-196`), so a scan after a stall that deleted many entries some other way
   pays one tree read per stub, and since Ruling 8 each orphan pays it on two scans (deferred Task 5 minor).
   Correctness is unaffected: a failed lookup fails the scan before any drop or change of suspicion.
-* **RP-N8 (REFUTED for stub holders).** A scan deleting entry (S, T) and then dropping S's stub, racing a replay's late
+* **RP-N8 (REFUTED for stub holders; moot since 2026-11-15, the scan drops no stub).** A scan deleting entry (S, T) and then dropping S's stub, racing a replay's late
   commit at S: while the stub is held, `lateCommit` applies nothing without a lookup (`Tx.scala:998-1000`), and the
   stub is dropped only after the deletion committed, so a lookup started after the drop finds nothing. A held late
   commit whose stub appears during its lookup also applies nothing (`:1087-1088`). For a store with an entry and no

@@ -204,8 +204,9 @@ class Frontend(val storeId: StoreId,
     */
   def loadFloorPassed: Boolean = wallClockMillis() >= loadFloorMillis
 
-  /** The transaction started below the forget floor: a prepare for it, unless the store holds it or the status cache
-    * knows its outcome, is refused (receivePrepare), and its designated leader does not drive it (Store)
+  /** The transaction started below the forget floor: a prepare for it, unless the store holds it (or the status cache
+    * knows it finalized, when the prepare is ignored), is refused (receivePrepare), and its designated leader does not
+    * drive it (Store). So no Tx for it can arise here any more: what applied stubs rely on to expire (expireStubs)
     */
   def belowForgetFloor(txd: TransactionDescription): Boolean = belowForgetFloor(txd.startTimestamp)
 
@@ -326,10 +327,10 @@ class Frontend(val storeId: StoreId,
                                  var countdown: Int, var interval: Int, var failures: Int)
   private val quarantined = scala.collection.mutable.HashMap[ObjectId, Quarantine]()
 
-  /** Finalized transactions whose CRL state a quarantine keeps (concludeTransactionState), and whether an applied stub
-    * is owed: concluded once no quarantine names them
+  /** Finalized transactions whose CRL state a quarantine keeps (concludeTransactionState), and the start timestamp of
+    * an applied stub owed, if any: concluded once no quarantine names them
     */
-  private val quarantinedConclusions = scala.collection.mutable.HashMap[TransactionId, Boolean]()
+  private val quarantinedConclusions = scala.collection.mutable.HashMap[TransactionId, Option[HLCTimestamp]]()
 
   /** The object is quarantined: every transaction on it votes abort (ObjectQuarantined) and a committed one applies
     * nothing to it, until repair verifies the store's copy
@@ -391,8 +392,8 @@ class Frontend(val storeId: StoreId,
           quarantined.remove(oid)
           q.txids.foreach: txid =>
             if !quarantined.valuesIterator.exists(_.txids.contains(txid)) then
-              quarantinedConclusions.remove(txid).foreach: writeStub =>
-                concludeTransactionState(txid, writeStub, keepAdmission = transactions.contains(txid))
+              quarantinedConclusions.remove(txid).foreach: stub =>
+                concludeTransactionState(txid, stub, keepAdmission = transactions.contains(txid))
         case other =>
           q.failures += 1
           q.countdown = q.interval
@@ -499,10 +500,11 @@ class Frontend(val storeId: StoreId,
     * @param outstanding commits not yet reported complete by the backend
     * @param failed some commit failed
     * @param finalized TxFinalized arrived while commits were outstanding: the CRL deletion waits for them
-    * @param writeStub the CRL state is replaced by an applied stub rather than deleted (see transactionFinalized)
+    * @param stub the CRL state is replaced by an applied stub with this start rather than deleted (see
+    *             transactionFinalized)
     */
   private final class TxCommits(var outstanding: Int, var failed: Boolean, var finalized: Boolean,
-                                var writeStub: Boolean = false)
+                                var stub: Option[HLCTimestamp] = None)
   private val txCommits = scala.collection.mutable.HashMap[TransactionId, TxCommits]()
 
   /** Finalized transactions whose commit is held for its turn (Tx.finalized, finalizeDeferred): forgotten, but their
@@ -577,9 +579,10 @@ class Frontend(val storeId: StoreId,
   private val unackedLookups = scala.collection.mutable.HashMap[TransactionId, UnackedLookup]()
   private var nextUnackedRequest: Long = 0L
 
-  /** The transactions this store holds an applied stub for (StoreRecoveryState): it holds their updates. Loaded at
-    * recovery. Written only on the store's executor; `@volatile` so appliedStubs may be read from any thread */
-  @volatile private var stubs: Set[TransactionId] = Set()
+  /** The transactions this store holds an applied stub for (StoreRecoveryState), with their start timestamps: it holds
+    * their updates. Loaded at recovery, dropped by expireStubs. Written only on the store's executor; `@volatile` so
+    * tests may read hasAppliedStub from their own thread */
+  @volatile private var stubs: Map[TransactionId, HLCTimestamp] = Map()
 
   /** What the stubs are charged to the device's admission (CrlAdmission.AppliedStubBytes each), until released */
   private var stubBytesCharged: Long = 0L
@@ -602,8 +605,8 @@ class Frontend(val storeId: StoreId,
 
   private def recoverState(state: StoreRecoveryState): Unit =
     // Counted without a check, as recovered transactions are: the CRL already holds them
-    chargeStubs((state.appliedStubs -- stubs).size)
-    stubs ++= state.appliedStubs
+    chargeStubs((state.appliedStubs.keySet -- stubs.keySet).size)
+    stubs = state.appliedStubs ++ stubs
     recoverTransactions(state.transactions)
 
   /** Recreates the transactions in `states`, which the CRL holds for this store, that are not already known.
@@ -669,8 +672,8 @@ class Frontend(val storeId: StoreId,
   /** Whether the store holds an applied stub for `txid`: it already holds the transaction's update */
   def hasAppliedStub(txid: TransactionId): Boolean = stubs.contains(txid)
 
-  /** The store's applied stubs. Callable from any thread */
-  def appliedStubs: Set[TransactionId] = stubs
+  /** The store's applied stubs, with their transactions' starts. Tests only */
+  def appliedStubs: Map[TransactionId, HLCTimestamp] = stubs
 
   /** Records that the store holds `txid`'s update: an applied stub, saved in the CRL in place of the transaction's
     * state, for a transaction the store is forgetting. `onDurable` runs on the store's executor once the stub is
@@ -681,34 +684,56 @@ class Frontend(val storeId: StoreId,
     * afresh, never through the record of the state being replaced.
     *
     * The stub is charged to the device's admission without a check (CrlAdmission.AppliedStubBytes), so it is never
-    * dropped or held back, while new prepares feel its bytes: the CRL's copy-forward carries stubs too. Released by
-    * dropAppliedStub, or retained at close until the store's entries leave the CRL.
+    * dropped or held back, while new prepares feel its bytes: the CRL's copy-forward carries stubs too. It carries the
+    * transaction's start (`start`), by which expireStubs drops it, releasing the charge; retained at close until the
+    * store's entries leave the CRL.
     *
     * It must not replace the state of a transaction whose backend commits here are outstanding or failed: that state
     * (object data included) is what a reloaded store recovers the transaction from. Stubs are written only where
     * deleteTransactionState would run.
     */
-  def recordAppliedStub(txid: TransactionId, keepAdmission: Boolean = false)(onDurable: => Unit): Unit =
+  def recordAppliedStub(txid: TransactionId, start: HLCTimestamp, keepAdmission: Boolean = false)
+                       (onDurable: => Unit): Unit =
     require(!txCommits.contains(txid),
       s"Store $storeId: an applied stub cannot replace transaction $txid's CRL state while its backend commits are " +
       s"outstanding or failed")
     if !stubs.contains(txid) then
       chargeStubs(1)
-      stubs += txid
+      stubs += (txid -> start)
     if !keepAdmission then
       admitted.remove(txid).foreach: a =>
         stubReplacedAdmissions(txid) = stubReplacedAdmissions.getOrElse(txid, 0L) + a.bytes
-    crl.saveAppliedStub(storeId, txid, () => post { () =>
+    crl.saveAppliedStub(storeId, txid, stubs(txid), () => post { () =>
       stubReplacedAdmissions.remove(txid).foreach(admission.release)
       onDurable
     })
 
-  /** Drops the applied stub for `txid`, if the store holds one, deletes it from the CRL and releases its charge */
-  def dropAppliedStub(txid: TransactionId): Unit =
+  /** Drops the applied stub for `txid`, if the store holds one, deletes it from the CRL and releases its charge. Only
+    * expireStubs drops one; visible for tests */
+  private[server] def dropAppliedStub(txid: TransactionId): Unit =
     if stubs.contains(txid) then
       stubs -= txid
       releaseStub()
       crl.deleteAppliedStub(storeId, txid)
+
+  /** Drops every applied stub whose transaction is past the horizon plus the expiry margin (Tx.pastHorizon) and for
+    * which the store holds no Tx, whether live, waiting on a held commit (deferredFinalizations), on its backend
+    * commits (txCommits) or on a quarantine (quarantinedConclusions). Called at heartbeat (expiryHeartbeat).
+    *
+    * A stub only ever keeps a Tx for its transaction at this store from applying the update again. Past the margin T is
+    * below the forget floor, so a prepare for it creates no Tx (receivePrepare: refused, or ignored when the host's
+    * status cache knows T finalized), and with none held no Tx for T can arise here again: the stub can suppress
+    * nothing. This bounds the stubs by their rate times the horizon plus the margin, whether or not repair scans run
+    * (crash-recovery-log F22, repair RP-N6, Todo 4.6). An UnackedCommits entry left without its stub is harmless: no
+    * Tx is left to apply through it, and the scan's reconcile is exact
+    */
+  private def expireStubs(now: Long): Unit =
+    if stubs.nonEmpty then
+      stubs.foreach: (txid, start) =>
+        if Tx.pastHorizon(start, now, horizon, expiryMargin) && !transactions.contains(txid) &&
+           !deferredFinalizations.contains(txid) && !txCommits.contains(txid) &&
+           !quarantinedConclusions.contains(txid) then
+          dropAppliedStub(txid)
 
   // ---- UnackedCommits lookups of recovered commit votes and held late commits (Tx.awaitsUnackedLookup) ----
 
@@ -829,6 +854,7 @@ class Frontend(val storeId: StoreId,
     */
   def expiryHeartbeat(): Unit =
     val now = wallClockMillis()
+    expireStubs(now)
     expiryRounds.keys.toList.foreach: txid =>
       if !transactions.get(txid).exists(_.mayExpire) then
         expiryRounds.remove(txid)
@@ -885,7 +911,8 @@ class Frontend(val storeId: StoreId,
         // once), so it is adopted as finalized: the Tx is then forgotten
         val adopted =
           if !committed then
-            TxFinalized(storeId, from, tx.transactionId, committed = false, late = false, owed = Set())
+            TxFinalized(storeId, from, tx.transactionId, committed = false, late = false, owed = Set(),
+              tx.txd.startTimestamp)
           else
             TxResolved(storeId, from, tx.transactionId, committed = true, late = finalizedOrLate, proof = false)
         handleTransactionMessage(adopted)
@@ -1069,10 +1096,11 @@ class Frontend(val storeId: StoreId,
     * issued for that transaction has succeeded (see TxCommits). A reloaded store recovers the rest from the CRL, and its
     * transaction driver concludes them. Aborted transactions, and those that committed nothing here, are deleted at once.
     *
-    * With `writeStub` the state is replaced by an applied stub instead (recordAppliedStub), at the same point: the
-    * store holds the committed transaction's update and an UnackedCommits entry naming it may exist (replay-pins
-    * addendum A), so it must never apply the transaction again through that entry. A failed backend commit keeps the
-    * CRL state while the store is loaded, so no stub replaces it; a reloaded store recovers the transaction from it.
+    * With `stub` (the transaction's start) the state is replaced by an applied stub instead (recordAppliedStub), at
+    * the same point: the store holds the committed transaction's update and an UnackedCommits entry naming it may
+    * exist (replay-pins addendum A), so it must never apply the transaction again through that entry. A failed backend
+    * commit keeps the CRL state while the store is loaded, so no stub replaces it; a reloaded store recovers the
+    * transaction from it.
     * Called by the Tx as it is forgotten (`by`), and by a TxFinalized for a transaction the store holds no Tx for.
     * While any Tx of the transaction has a deferred finalization (finalizationDeferred) the state is left alone: a
     * listed Tx's commit is not issued yet and still needs it. A listed Tx is removed from the list by its own call; the
@@ -1080,18 +1108,18 @@ class Frontend(val storeId: StoreId,
     * waits), or by a TxFinalized with no Tx, changes nothing else. A stub the caller owes passes to every Tx still
     * listed, so whichever concludes the state writes it
     */
-  def transactionFinalized(txid: TransactionId, writeStub: Boolean = false, by: Option[Tx] = None): Unit =
+  def transactionFinalized(txid: TransactionId, stub: Option[HLCTimestamp] = None, by: Option[Tx] = None): Unit =
     val waiting = deferredFinalizations.getOrElse(txid, Nil).filterNot(tx => by.exists(_ eq tx))
     if waiting.isEmpty then
       deferredFinalizations.remove(txid)
       txCommits.get(txid) match
         case Some(r) =>
           r.finalized = true
-          r.writeStub ||= writeStub
-        case None => concludeTransactionState(txid, writeStub, keepAdmission = false)
+          r.stub = r.stub.orElse(stub)
+        case None => concludeTransactionState(txid, stub, keepAdmission = false)
     else
       deferredFinalizations(txid) = waiting
-      if writeStub then
+      if stub.nonEmpty then
         waiting.foreach(_.stubOwed())
 
   /** Deletes the CRL state of a finalized transaction, or replaces it by an applied stub. A stub already held
@@ -1100,12 +1128,12 @@ class Frontend(val storeId: StoreId,
     * @param keepAdmission a newer Tx for the transaction (a replay's) is live and shares its admission record: it
     *                      keeps it, and releases it when it is forgotten
     */
-  private def concludeTransactionState(txid: TransactionId, writeStub: Boolean, keepAdmission: Boolean): Unit =
+  private def concludeTransactionState(txid: TransactionId, stub: Option[HLCTimestamp], keepAdmission: Boolean): Unit =
     if quarantineKeeps(txid) then
       // Kept until the quarantine clears (verificationComplete): a reloaded store recovers it and quarantines again
-      quarantinedConclusions(txid) = quarantinedConclusions.getOrElse(txid, false) || writeStub
-    else if writeStub && !stubs.contains(txid) then
-      recordAppliedStub(txid, keepAdmission)(())
+      quarantinedConclusions(txid) = quarantinedConclusions.get(txid).flatten.orElse(stub)
+    else if stub.nonEmpty && !stubs.contains(txid) then
+      recordAppliedStub(txid, stub.get, keepAdmission)(())
     else
       crl.deleteTransaction(storeId, txid)
       if !keepAdmission then
@@ -1120,7 +1148,7 @@ class Frontend(val storeId: StoreId,
         txCommits.remove(txid)
         if r.finalized then
           // The Tx that finalized it was forgotten then: a live one is a later Tx for the same transaction
-          concludeTransactionState(txid, r.writeStub, keepAdmission = transactions.contains(txid))
+          concludeTransactionState(txid, r.stub, keepAdmission = transactions.contains(txid))
     }
 
   /** Called when a transaction takes `os` for one of its objects, and by commit for the commit's duration. A state that
@@ -1231,7 +1259,7 @@ class Frontend(val storeId: StoreId,
           if m.committed && !m.late && m.owed.contains(storeId) && !stubs.contains(m.transactionId) then
             // While a commit is held for its turn the state is not deletable yet, nor the update applied: the listed
             // Txs take the stub
-            transactionFinalized(m.transactionId, writeStub = true)
+            transactionFinalized(m.transactionId, stub = Some(m.startTimestamp))
     case m: TxHeartbeat => transactions.get(m.transactionId).foreach(tx => tx.receiveHeartbeat(m))
     case m: TxStatusRequest =>
       transactions.get(m.transactionId) match
@@ -1276,8 +1304,11 @@ class Frontend(val storeId: StoreId,
       val known = cached.filter(_.status != TransactionStatus.Unresolved)
       // An Unresolved entry counts as none: another store's Tx on this host wrote it, which says nothing of the outcome
       val beforeAcceptor = acceptorSince.exists(m.txd.startTimestamp < _)
-      // The rebuilt store's mute (acceptorSince) keeps its semantics: its muted Tx may still prove the commit
-      if known.isEmpty && !beforeAcceptor && belowForgetFloor(m.txd) then
+      // The rebuilt store's mute (acceptorSince) keeps its semantics: its muted Tx may still prove the commit.
+      // Below the floor a resolved, unfinalized cache entry creates no Tx either (a finalized one was ignored above):
+      // the host's cache is shared, so another store's Tx may have written it after this store forgot T, and a Tx
+      // created here could then apply T again once this store's applied stub has expired (Todo 4.6)
+      if !beforeAcceptor && belowForgetFloor(m.txd) then
         refusePrepare(m)
       else
         createTx(m, known, beforeAcceptor)

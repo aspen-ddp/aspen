@@ -48,10 +48,6 @@ PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.6  Stub accumulation: CRL F22, RP-N6                                                                      [S-M]
-     A stalled scan lets stubs grow against device admission (~4.5 M per device). Cap stubs per store and fall
-     back to the case-3 lookup.
-
 4.7  UnackedCommits growth: R-N4, RP-N3                                                                     [M]
      There is one entry per (store, transaction) for every silent voter, never merged, and each is reconciled in
      addition to the ErrorTree entry. Merge entries per store, and skip in phase B objects already repaired in
@@ -82,7 +78,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.1  RP-N7: batch the orphan-stub point lookups.                                                            [S]
 5.2  R-F16: start a leader driver only when the status cache has no outcome (not merely notFinalized).      [S]
 5.3  Rebuild F7: router.markOffline for a T12 rebuild on a new device, clearOffline on promotion.           [S]
 5.4  P-F12: send Accepts as soon as the new round's quorum is reached. P-F14: save the Tx when late object

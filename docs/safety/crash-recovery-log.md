@@ -801,6 +801,20 @@ writes that many in about 8 minutes of stalled scans. Before the limit is reache
 are durable and the admission limit keeps C11. *Fix sketch:* none needed beyond R-N4's; or cap stubs per store and fall
 back to the case-3 lookup.
 
+> **2026-11-15 (Todo 4.6): FIXED.** A cap was rejected: a stub skipped at the cap lets a replay apply T again at that
+> store, and a non-late commit has no lookup to fall back on. Instead a stub carries T's start timestamp (`Stub`, TxId
+> plus 8 B: `AppliedStubBytes` 41; `TxFinalized.startTimestamp` for the no-Tx owed path; `crl_save.log` carries it),
+> and its store drops it at heartbeat (`Frontend.expireStubs`) once T is past the horizon plus the expiry margin and the
+> store holds no Tx for T (live, deferred behind a held commit, awaiting backend commits, or kept by a quarantine). Past
+> that point T is below the forget floor, and `receivePrepare` now refuses such a prepare even when the host's status
+> cache holds T resolved but unfinalized (it may have been written by another store's Tx after this store forgot T); a
+> finalized entry has it ignored. So no Tx for T can arise, and the stub can suppress nothing: the R-N10 argument,
+> made to hold for every stub. Stubs are bounded by their write rate times about 30 s, whatever the repair scans do;
+> the scan no longer touches them (repair RP-N6, RP-N7). Tests: FrontendSuite "an applied stub is dropped once its
+> transaction is past the horizon plus the expiry margin", "an applied stub is kept past expiry while the store holds
+> a Tx for its transaction", "a prepare below the floor with a resolved, unfinalized status-cache entry is refused";
+> SimpleCRLSuite's stub tests compare the recovered start timestamps across rotation and reopen.
+
 #### F23 (new). Stub durability across rotation, transfer, adoption and rebuild (REFUTED except rebuild)
 
 **Verdict: REFUTED for rotation, transfer and adoption; see rebuild-process.md N3 for rebuild.** Rotation: copy-forward

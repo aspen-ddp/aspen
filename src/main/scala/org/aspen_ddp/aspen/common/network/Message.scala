@@ -336,7 +336,9 @@ final case class TxFinalized(
                               committed: Boolean,
                               late: Boolean,
                               // Stores for which the finalizer wrote UnackedCommits entries. Empty for aborts and late commits
-                              owed: Set[StoreId]) extends TxMessage:
+                              owed: Set[StoreId],
+                              // The transaction's start: a store with no Tx stamps the applied stub it writes with it
+                              startTimestamp: HLCTimestamp) extends TxMessage:
   override def toString: String = f"TxFinalized to $to from $from tx $transactionId committed $committed late $late owed $owed"
 
 final case class TxHeartbeat(

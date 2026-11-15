@@ -142,9 +142,9 @@ object FrontendSuite {
     var holdStubSaves = false
     var heldStubSaves: List[() => Unit] = Nil
 
-    override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = Set()
+    override def getAppliedStubs(storeId: StoreId): Map[TransactionId, HLCTimestamp] = Map()
 
-    override def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
+    override def saveAppliedStub(storeId: StoreId, txid: TransactionId, start: HLCTimestamp, completionHandler: () => Unit): Unit =
       stubsSaved = stubsSaved :+ txid
       if holdStubSaves then heldStubSaves = heldStubSaves :+ completionHandler else completionHandler()
 
@@ -297,6 +297,9 @@ object FrontendSuite {
 
 class FrontendSuite extends AnyFunSuite with Matchers {
   import FrontendSuite._
+
+  /** The start a stub written directly here carries: now, so no heartbeat of a test expires it (expireStubs) */
+  private def stubStart: HLCTimestamp = HLCTimestamp.now
 
   def checkPartialRead(preCache: Boolean): Unit =
     val (frontend, backend, cache, net) = mkFrontendWithNet()
@@ -699,7 +702,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
       committedMessages(net) shouldBe Nil
 
-      frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
+      frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(),
+        startTimestamp = HLCTimestamp.now))
       committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
       frontend.transactions.contains(txid1) shouldBe false
 
@@ -719,7 +723,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       crl.txSaved shouldBe true
       crl.txDel shouldBe false
 
-      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = false, late = false, owed = Set()))
+      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = false, late = false, owed = Set(),
+        startTimestamp = HLCTimestamp.now))
       crl.txDel shouldBe true
       frontend.transactions.contains(txid1) shouldBe false
   }
@@ -732,7 +737,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       crl.txDel = false
       frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
 
-      frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false, late = false, owed = Set()))
+      frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false, late = false, owed = Set(),
+        startTimestamp = HLCTimestamp.now))
       crl.txDel shouldBe true
   }
 
@@ -876,7 +882,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     crl.txDel shouldBe false
     statusCache.getStatus(txid1).map(_.status).forall(_ == TransactionStatus.Unresolved) shouldBe true
 
-    frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid1) shouldBe false
     committedMessages(net) shouldBe Nil
     crl.txDel shouldBe true
@@ -949,7 +956,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a proven commit is not applied again and sends no TxCommitted when finalized") {
     withApplied(): (frontend, backend, net, crl) =>
       frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd))
-      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = true, late = false, owed = Set()))
+      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = true, late = false, owed = Set(),
+        startTimestamp = HLCTimestamp.now))
 
       committedMessages(net) shouldBe Nil
       backend.get(oid1).get.data.getByteArray shouldBe appliedData
@@ -960,7 +968,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a late client prepare with data for an applied transaction does not apply the data again") {
     withApplied(): (frontend, backend, net, _) =>
       frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
-      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = true, late = true, owed = Set()))
+      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = true, late = true, owed = Set(),
+        startTimestamp = HLCTimestamp.now))
 
       resolvedMessages(net).map(r => (r.committed, r.proof)) shouldBe List((true, true))
       // Answered after its objects loaded: the held response goes out as a memoryless abort vote
@@ -978,7 +987,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         ObjectUpdate(oid1, DataBuffer(Array[Byte](7))), ObjectUpdate(fenceOid, DataBuffer(Array[Byte](8))))))
       resolvedMessages(net).map(_.proof) shouldBe List(true)
 
-      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = true, late = false, owed = Set()))
+      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = true, late = false, owed = Set(),
+        startTimestamp = HLCTimestamp.now))
 
       backend.get(fenceOid).get.metadata.revision shouldBe rev0
       backend.get(fenceOid).get.data.size shouldBe 0
@@ -1186,7 +1196,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("an unknown prepare for a transaction cached as resolved uses the cached outcome") {
     val statusCache = new TransactionStatusCache()
     statusCache.updateStatus(txid1, TransactionStatus.Committed)
-    withPlainFrontend(statusCache): (frontend, _, net) =>
+    // Loaded long before T: below the floor a resolved entry no longer creates a Tx
+    withPlainFrontend(statusCache, loadedAt = Some(0L)): (frontend, _, net) =>
       val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(6500, MILLISECONDS)))
       frontend.receiveTransactionMessage(clientPrepare(txd))
 
@@ -1463,15 +1474,33 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         List((TransactionDisposition.VoteAbort, Right(TxPrepareResponse.Promise(None))))
   }
 
-  test("a prepare below the floor with a resolved status-cache entry still learns the outcome") {
+  test("a prepare below the floor with a resolved, unfinalized status-cache entry is refused") {
+    // The host's cache is shared: another store's Tx may have written the entry after this store forgot T. A Tx
+    // created here could apply T again once this store's applied stub had expired (Todo 4.6)
+    val statusCache = new TransactionStatusCache(wallClockMillis = () => floorNow)
+    statusCache.updateStatus(txid1, TransactionStatus.Committed)
+    val admission = new CrlAdmission(1024 * 1024)
+    withFloorFrontend(statusCache = statusCache, admission = admission): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = startedAgo(25_000))
+      frontend.belowForgetFloor(txd) shouldBe true
+      admitAndReceive(frontend, clientPrepare(txd))
+
+      frontend.transactions.contains(txid1) shouldBe false
+      net.sentTx shouldBe empty
+      crl.txSaved shouldBe false
+      admission.admittedBytes shouldBe 0
+      statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
+  }
+
+  test("a prepare inside the floor with a resolved status-cache entry still learns the outcome") {
     val statusCache = new TransactionStatusCache(wallClockMillis = () => floorNow)
     statusCache.updateStatus(txid1, TransactionStatus.Committed)
     withFloorFrontend(statusCache = statusCache): (frontend, _, net, _) =>
-      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = startedAgo(25_000))
-      frontend.belowForgetFloor(txd) shouldBe true
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = startedAgo(15_000))
+      frontend.belowForgetFloor(txd) shouldBe false
       frontend.receiveTransactionMessage(clientPrepare(txd))
 
-      // As inside the horizon: checked, the outcome known, no locks, the cached status kept
+      // Checked, the outcome known, no locks, the cached status kept
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
       frontend.transactions(txid1).holdsLocks shouldBe false
       statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
@@ -2048,7 +2077,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       deferRecovery = true, onFailStop = err => stops = stops :+ err)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
-    frontend.recover(StoreRecoveryState(List(trs), Set()))
+    frontend.recover(StoreRecoveryState(List(trs), Map()))
     (frontend, net, () => stops)
 
   test("a recovered commit vote whose object fails to load fail-stops the store (Req F6)") {
@@ -2108,7 +2137,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("a quarantine clears once repair verifies the object, and the CRL state it kept is then concluded") {
     val (frontend, net, crl, verifier, stops) = quarantinedVote()
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid1) shouldBe false
     // Kept: the quarantine lives in memory only, and the CRL state is what quarantines again after a crash
     crl.deleted shouldBe Nil
@@ -2152,7 +2182,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     // Resolved, so it holds no locks
     prepare(frontend, net, lockTxd(txid2, List(overwriteAfter(txid1)))).disposition shouldBe
       TransactionDisposition.VoteCommit
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     crl.deleted shouldBe List(txid1)
     frontend.transactions.contains(txid1) shouldBe false
   }
@@ -2181,7 +2212,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     // Aborted by the other stores and finalized before this store saw its prepare
     prepare(frontend, net, txd).disposition shouldBe TransactionDisposition.VoteCommit
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid1) shouldBe false
 
     // A retransmitted prepare
@@ -2196,7 +2228,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, _, net) = lockFixture()
     val txd = lockTxd(txid1, List(overwrite(op1)))
 
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
       objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
     frontend.transactions.contains(txid1) shouldBe false
@@ -2401,7 +2434,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     populate(backend)
     // Recovered at construction, read from the CRL
     val crl = new TestCrl:
-      override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = Set(txid1)
+      override def getAppliedStubs(storeId: StoreId): Map[TransactionId, HLCTimestamp] = Map(txid1 -> stubStart)
     val f = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet, crl,
       new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     f.hasAppliedStub(txid1) shouldBe true
@@ -2412,9 +2445,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val deferred = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
       new TestCrl, new TransactionStatusCache(), deferRecovery = true, loadedAt = FrontendSuite.longLoaded)
     deferred.hasAppliedStub(txid2) shouldBe false
-    deferred.recover(StoreRecoveryState(Nil, Set(txid2)))
+    deferred.recover(StoreRecoveryState(Nil, Map(txid2 -> stubStart)))
     deferred.hasAppliedStub(txid2) shouldBe true
-    deferred.appliedStubs shouldBe Set(txid2)
+    deferred.appliedStubs.keySet shouldBe Set(txid2)
     // A stub is not a transaction
     deferred.transactions shouldBe empty
   }
@@ -2427,7 +2460,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val f = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet, crl,
       new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     var durable = false
-    f.recordAppliedStub(txid1) { durable = true }
+    f.recordAppliedStub(txid1, stubStart) { durable = true }
     f.hasAppliedStub(txid1) shouldBe true
     crl.stubsSaved shouldBe List(txid1)
     durable shouldBe false
@@ -2671,7 +2704,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       PersistentState.initial)
     val crl = new TestCrl:
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
-      override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = stubs
+      override def getAppliedStubs(storeId: StoreId): Map[TransactionId, HLCTimestamp] =
+        stubs.iterator.map(_ -> stubStart).toMap
     val net = new TestNet
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup,
@@ -2719,7 +2753,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     crl.deleted should not contain (unackedTxid)
     statusCache.getStatus(unackedTxid).map(_.status).forall(_ == TransactionStatus.Unresolved) shouldBe true
 
-    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(unackedTxid) shouldBe false
     crl.stubsSaved should contain (unackedTxid) // An applied stub replaces its state (replay-pins addendum A)
     log.exists((level, text) => level == scribe.Level.Info &&
@@ -2753,7 +2788,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](9)
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
     frontend.receiveTransactionMessage(TxFinalized(storeId, StoreId(poolId, 2), unackedTxid, committed = true,
-      late = false, owed = Set()))
+      late = false, owed = Set(), startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(unackedTxid) shouldBe false
     crl.stubsSaved should contain (unackedTxid) // An applied stub replaces its state (replay-pins addendum A)
   }
@@ -2762,7 +2797,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, backend, _, crl, lookup) = unackedFixture()
     lookup.answer(unackedTxid, lookup.absent)
 
-    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     // The abort waits for a lookup started after it arrived
     lookup.requests.count(_ == unackedTxid) shouldBe 2
     frontend.transactions.contains(unackedTxid) shouldBe true
@@ -2815,7 +2851,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lockedWriteTransactions(frontend, net, kvPtr) should not contain (unackedTxid)
 
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false,
-      owed = Set()))
+      owed = Set(), startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(unackedTxid) shouldBe false
     kvKeys(backend) should contain (k(2))
     crl.stubsSaved shouldBe Nil
@@ -2828,7 +2864,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, _, _, _, lookup) = unackedFixture()
     lookup.answer(unackedTxid, lookup.absent)
 
-    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false, late = false, proof = false))
     lookup.answer(unackedTxid, lookup.absent)
 
@@ -2866,7 +2903,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a failing UnackedCommits lookup holds the abort and is retried at heartbeat") {
     val (frontend, _, net, _, lookup) = unackedFixture()
     lookup.answer(unackedTxid, Failure(new Exception("metadata pool down")))
-    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     lookup.requests.count(_ == unackedTxid) shouldBe 2
 
     // Only failed lookups are retried
@@ -2892,7 +2930,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
     kvKeys(backend) should contain (k(2))
     frontend.isQuarantined(oid2) shouldBe true
-    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(unackedTxid) shouldBe false
     // The store may not hold T's update: its state, not a stub, stays until repair verifies the object
     crl.stubsSaved shouldBe Nil
@@ -2926,7 +2965,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("a UnackedCommits lookup answering after the Tx resolved committed is ignored") {
     val (frontend, backend, _, _, lookup) = unackedFixture()
-    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     kvKeys(backend) should not contain k(2)
     frontend.transactions.contains(unackedTxid) shouldBe false
 
@@ -2944,7 +2984,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false, late = false,
       proof = false))
     frontend.transactions.contains(unackedTxid) shouldBe true // TxFinalized forgets it
-    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
 
     frontend.transactions.contains(unackedTxid) shouldBe false
     kvKeys(backend) should not contain k(2)
@@ -2958,7 +2999,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lookup.answer(unackedTxid, lookup.own)
     val committedBefore = committedMessages(net).size
 
-    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = true, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = true, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
 
     frontend.transactions.contains(unackedTxid) shouldBe false
     kvKeys(backend) should not contain k(2)
@@ -2980,7 +3022,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     populate(backend)
     val net = new TestNet
     val crl = new TestCrl:
-      override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = stubs
+      override def getAppliedStubs(storeId: StoreId): Map[TransactionId, HLCTimestamp] =
+        stubs.iterator.map(_ -> stubStart).toMap
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
       statusCache, unackedLookup = lookup, acceptorSince = acceptorSince, loadedAt = FrontendSuite.longLoaded,
@@ -2991,7 +3034,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   private def lateCommit(frontend: Frontend, finalized: Boolean): Unit =
     if finalized then
-      frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, txid1, committed = true, late = true, owed = Set()))
+      frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, txid1, committed = true, late = true, owed = Set(),
+        startTimestamp = HLCTimestamp.now))
     else
       frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, txid1, committed = true, late = true,
         proof = false))
@@ -3088,7 +3132,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lateCommit(frontend, finalized = true)
     lookup.requests shouldBe List(txid1)
     // Recorded while the lookup is in flight
-    frontend.recordAppliedStub(txid1)(())
+    frontend.recordAppliedStub(txid1, stubStart)(())
     crl.stubsSaved shouldBe List(txid1)
 
     lookup.answer(txid1, Success(UnackedLookupResult.Found(Some(incarnationA))))
@@ -3194,6 +3238,47 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       crl.stubsSaved shouldBe Nil
   }
 
+  // ---- Applied stub expiry (Frontend.expireStubs, Todo 4.6) ----
+  //
+  // Past the horizon plus the expiry margin no prepare for T creates a Tx here, so a stub held for T, with no Tx for T
+  // held, can suppress nothing: the store drops it at heartbeat, whether or not a repair scan ever runs
+
+  test("an applied stub is dropped once its transaction is past the horizon plus the expiry margin") {
+    val admission = new CrlAdmission(1024 * 1024)
+    withExpiryFrontendAdmitting(admission): (frontend, _, _, crl, _, clock, _) =>
+      val start = startedAgo(1_000)
+      // Named in `owed` with no Tx here: the stub carries the start TxFinalized names
+      frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, txid1, committed = true, late = false,
+        owed = Set(storeId), startTimestamp = start))
+      frontend.appliedStubs shouldBe Map(txid1 -> start)
+      crl.stubsSaved shouldBe List(txid1)
+      admission.admittedBytes shouldBe CrlAdmission.AppliedStubBytes
+
+      frontend.expiryHeartbeat()
+      frontend.hasAppliedStub(txid1) shouldBe true // Not yet past expiry
+
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      frontend.hasAppliedStub(txid1) shouldBe false
+      crl.stubsDeleted shouldBe List(txid1)
+      admission.admittedBytes shouldBe 0
+  }
+
+  test("an applied stub is kept past expiry while the store holds a Tx for its transaction") {
+    withExpiryFrontend: (frontend, _, net, crl, _, clock, _) =>
+      val txd = expiringTxd(List(overwrite(op1)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      expectVote(net, TransactionDisposition.VoteCommit)
+      // A replay's Tx beside a stub for its transaction: the stub is what keeps it from applying T again
+      frontend.recordAppliedStub(txid1, txd.startTimestamp)(())
+
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      frontend.transactions.contains(txid1) shouldBe true
+      frontend.hasAppliedStub(txid1) shouldBe true
+      crl.stubsDeleted shouldBe Nil
+  }
+
   test("a late TxFinalized for an unknown transaction is cached as finalized, committed and late") {
     val statusCache = new TransactionStatusCache()
     val (frontend, _, _, _, _) = lateFixture(statusCache)
@@ -3215,7 +3300,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   /** A non-late committed TxFinalized of `txid` listing `owed` */
   private def owedFinalized(txid: TransactionId, owed: Set[StoreId] = Set(storeId)): TxFinalized =
-    TxFinalized(storeId, unackedDriver, txid, committed = true, late = false, owed = owed)
+    TxFinalized(storeId, unackedDriver, txid, committed = true, late = false, owed = owed,
+      startTimestamp = HLCTimestamp.now)
 
   test("a TxFinalized naming this store in owed writes a stub before deleting the transaction's state") {
     val (frontend, backend, net, crl, _) = lateFixture()
@@ -3265,9 +3351,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, _, _, crl, _) = lateFixture()
     frontend.receiveTransactionMessage(owedFinalized(txid1, owed = Set(StoreId(poolId, 1))))
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, txid1, committed = true, late = true,
-      owed = Set()))
+      owed = Set(), startTimestamp = HLCTimestamp.now))
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, txid3, committed = false, late = false,
-      owed = Set(storeId)))
+      owed = Set(storeId), startTimestamp = HLCTimestamp.now))
     crl.stubsSaved shouldBe Nil
 
     frontend.receiveTransactionMessage(owedFinalized(txid2))
@@ -3297,7 +3383,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     kvKeys(backend) should not contain k(2)
     crl.stubsSaved shouldBe Nil
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false,
-      owed = Set()))
+      owed = Set(), startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(unackedTxid) shouldBe false
     crl.stubsSaved shouldBe List(unackedTxid)
     crl.deleted should not contain (unackedTxid)
@@ -3368,7 +3454,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     expectVote(inFlightNet, TransactionDisposition.VoteCommit)
     lateCommit(inFlight, finalized = true)
     inFlightLookup.requests shouldBe List(txid1)
-    inFlight.recordAppliedStub(txid1)(())
+    inFlight.recordAppliedStub(txid1, stubStart)(())
     inFlightLookup.answer(txid1, inFlightLookup.own)
     inFlightBackend.get(oid1).get.data.size shouldBe 0
     committedMessages(inFlightNet) shouldBe Nil
@@ -3388,7 +3474,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions(unackedTxid).provesCommitToItsDriver shouldBe true
     lockedWriteTransactions(frontend, net, kvPtr) should not contain (unackedTxid)
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false,
-      owed = Set()))
+      owed = Set(), startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(unackedTxid) shouldBe false
     kvKeys(backend) should contain (k(2))
     crl.deleted should contain (unackedTxid)
@@ -3396,7 +3482,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     // A late commit reaching it applies nothing either
     val (late, lateBackend, _, _, lateLookup) = unackedFixture(stubs = Set(unackedTxid))
     late.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = true,
-      owed = Set()))
+      owed = Set(), startTimestamp = HLCTimestamp.now))
     lateLookup.answer(unackedTxid, lateLookup.own)
     kvKeys(lateBackend) should contain (k(2))
     late.transactions.contains(unackedTxid) shouldBe false
@@ -3457,7 +3543,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     resolve(frontend, net, txid1, committed = true)
     backend.heldCommits shouldBe 1
     // The retention does not depend on the transaction
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid1) shouldBe false
 
     evictionPressure(frontend, net)
@@ -4049,7 +4136,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   def replayableStatusCache(): TransactionStatusCache = new TransactionStatusCache(wallClockMillis = () => 0L)
 
   def finalizeTx1(frontend: Frontend): Unit =
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
 
   test("finalization before the backend commit completes defers the CRL deletion") {
     val crl = new TestCrl
@@ -4098,9 +4186,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
       crl.getFullRecoveryState(storeId)
     override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] = crl.readStoreState(storeId)
-    override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = crl.getAppliedStubs(storeId)
-    override def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit =
-      crl.saveAppliedStub(storeId, txid, completionHandler)
+    override def getAppliedStubs(storeId: StoreId): Map[TransactionId, HLCTimestamp] = crl.getAppliedStubs(storeId)
+    override def saveAppliedStub(storeId: StoreId, txid: TransactionId, start: HLCTimestamp, completionHandler: () => Unit): Unit =
+      crl.saveAppliedStub(storeId, txid, stubStart, completionHandler)
     override def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = crl.deleteAppliedStub(storeId, txid)
     override def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
       val done = new LinkedBlockingQueue[java.lang.Boolean]()
@@ -4273,7 +4361,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, backend, net) = heldCommit(crl)
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     resolve(frontend, net, txid2, committed = true)
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid2) shouldBe false
     crl.deleted should not contain txid2
 
@@ -4290,11 +4379,12 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, backend, net) = heldCommit(crl)
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     resolve(frontend, net, txid2, committed = true)
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid2) shouldBe false
     // Another driver's TxFinalized (Ruling 3), or a retransmit, lists this store: the Tx holding the commit is forgotten
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false,
-      owed = Set(storeId)))
+      owed = Set(storeId), startTimestamp = HLCTimestamp.now))
     crl.stubsSaved shouldBe Nil
 
     backend.deliverOne()
@@ -4312,19 +4402,21 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, backend, net) = heldCommit(crl, replayableStatusCache())
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     resolve(frontend, net, txid2, committed = true)
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid2) shouldBe false
     // The status entry is evicted for size, so a replayed prepare starts a fresh Tx, which is forgotten in turn
     frontend.statusCache.evictForTest(txid2)
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     frontend.transactions.contains(txid2) shouldBe true
     // A late outcome reaches it: with no UnackedCommits entry it applies nothing and is forgotten at once
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = true, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = true, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid2) shouldBe false
     frontend.statusCache.evictForTest(txid2)
 
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false,
-      owed = Set(storeId)))
+      owed = Set(storeId), startTimestamp = HLCTimestamp.now))
     // The held Tx takes the stub, written once its commit persists, not before; its state is kept until then
     crl.stubsSaved shouldBe Nil
     crl.deleted should not contain txid2
@@ -4339,7 +4431,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, backend, net) = heldCommit(crl, replayableStatusCache())
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     resolve(frontend, net, txid2, committed = true)
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid2) shouldBe false
     // The status entry is evicted for size, so a replayed driver prepare, which carries no data, starts a fresh Tx
     frontend.statusCache.evictForTest(txid2)
@@ -4348,7 +4441,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     // A TxFinalized listing this store reaches the replay's Tx. With no data it holds no commit of its own, so it is
     // forgotten at once, owing the stub
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false,
-      owed = Set(storeId)))
+      owed = Set(storeId), startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid2) shouldBe false
     crl.stubsSaved shouldBe Nil
     crl.deleted should not contain txid2
@@ -4364,16 +4457,18 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, backend, net) = heldCommit(crl, replayableStatusCache())
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     resolve(frontend, net, txid2, committed = true)
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid2) shouldBe false
     // A TxFinalized listing this store reaches the store with no Tx: the held Tx owes the stub
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false,
-      owed = Set(storeId)))
+      owed = Set(storeId), startTimestamp = HLCTimestamp.now))
     // The status entry is evicted for size, so a replayed prepare starts a fresh Tx, finalized behind the held commit
     frontend.statusCache.evictForTest(txid2)
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     frontend.transactions.contains(txid2) shouldBe true
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid2) shouldBe false
     crl.stubsSaved shouldBe Nil
 
@@ -4386,7 +4481,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (frontend, backend, net) = heldCommit(new TestCrl)
     sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
     resolve(frontend, net, txid2, committed = false)
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = false, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
 
     backend.deliverOne()
     prepareResponses(net, txid2) shouldBe empty
@@ -4536,13 +4632,13 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     // Written past the mark, and charged without a check
     var durable = false
-    store.frontend.recordAppliedStub(txid1) { durable = true }
+    store.frontend.recordAppliedStub(txid1, stubStart) { durable = true }
     durable shouldBe true
     crl.stubsSaved shouldBe List(txid1)
     store.frontend.hasAppliedStub(txid1) shouldBe true
     admission.admittedBytes shouldBe 100 + CrlAdmission.AppliedStubBytes
     // Saved again, it is charged once
-    store.frontend.recordAppliedStub(txid1)(())
+    store.frontend.recordAppliedStub(txid1, stubStart)(())
     crl.stubsSaved shouldBe List(txid1, txid1)
     admission.admittedBytes shouldBe 100 + CrlAdmission.AppliedStubBytes
   }
@@ -4551,8 +4647,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val admission = new CrlAdmission(Long.MaxValue)
     val crl = new TestCrl
     val (store, _, _) = admissionStore(admission, crl)
-    store.frontend.recordAppliedStub(txid1)(())
-    store.frontend.recordAppliedStub(txid2)(())
+    store.frontend.recordAppliedStub(txid1, stubStart)(())
+    store.frontend.recordAppliedStub(txid2, stubStart)(())
     admission.admittedBytes shouldBe 2 * CrlAdmission.AppliedStubBytes
 
     store.frontend.dropAppliedStub(txid2)
@@ -4575,7 +4671,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     populate(backend)
     val recovering = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
       new TestCrl, new TransactionStatusCache(), admission = full, deferRecovery = true, loadedAt = FrontendSuite.longLoaded)
-    recovering.recover(StoreRecoveryState(Nil, Set(txid1, txid2)))
+    recovering.recover(StoreRecoveryState(Nil, Map(txid1 -> stubStart, txid2 -> stubStart)))
     full.admittedBytes shouldBe 1 + 2 * CrlAdmission.AppliedStubBytes
     recovering.releaseAllAdmissions()
     full.admittedBytes shouldBe 1
@@ -4592,7 +4688,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     store.frontend.transactions.contains(txid1) shouldBe false
     admission.admittedBytes shouldBe admissionBytes(p1)
 
-    store.frontend.recordAppliedStub(txid1)(())
+    store.frontend.recordAppliedStub(txid1, stubStart)(())
     admission.admittedBytes shouldBe admissionBytes(p1) + CrlAdmission.AppliedStubBytes
     crl.heldStubSaves.foreach(_())
     admission.admittedBytes shouldBe CrlAdmission.AppliedStubBytes
@@ -4600,9 +4696,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("an applied stub cannot replace a transaction whose backend commits are outstanding or failed") {
     val (frontend, backend, _) = heldCommit(new TestCrl)
-    an[IllegalArgumentException] should be thrownBy frontend.recordAppliedStub(txid1)(())
+    an[IllegalArgumentException] should be thrownBy frontend.recordAppliedStub(txid1, stubStart)(())
     backend.deliverCommits(Right(CommitError.IOFailure))
-    an[IllegalArgumentException] should be thrownBy frontend.recordAppliedStub(txid1)(())
+    an[IllegalArgumentException] should be thrownBy frontend.recordAppliedStub(txid1, stubStart)(())
     frontend.hasAppliedStub(txid1) shouldBe false
   }
 
@@ -4628,7 +4724,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     store.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
     backend.deliverCommits()
     committedMessages(net).map(_.transactionId) shouldBe List(txid1)
-    store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
+    store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     store.frontend.transactions.contains(txid1) shouldBe false
     crl.deleted shouldBe List(txid1)
     admission.admittedBytes shouldBe 0
@@ -4644,13 +4741,15 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     store.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed, late = false, proof = false))
     if finalizeBeforePersisted then
-      store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed, late = false, owed = Set()))
+      store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed, late = false, owed = Set(),
+        startTimestamp = HLCTimestamp.now))
       // A committed transaction's CRL entry, and so its admission, outlives the Tx until its commit persists
       admission.admittedBytes shouldBe (if committed then admissionBytes(p1) else 0L)
       backend.deliverCommits()
     else
       backend.deliverCommits()
-      store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed, late = false, owed = Set()))
+      store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed, late = false, owed = Set(),
+        startTimestamp = HLCTimestamp.now))
     store.frontend.transactions.contains(txid1) shouldBe false
     crl.deleted should contain (txid1)
     admission.admittedBytes shouldBe 0
@@ -4676,7 +4775,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
       store.receiveTransactionMessage(p1)
       store.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
-      val owed = TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(storeId))
+      val owed = TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(storeId),
+        startTimestamp = HLCTimestamp.now)
       if finalizeBeforePersisted then
         store.receiveTransactionMessage(owed)
         backend.deliverCommits()
@@ -4697,7 +4797,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (store, _, _) = admissionStore(admission, crl)
     val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
     store.frontend.admitPrepare(p1) shouldBe true
-    store.frontend.recordAppliedStub(txid1)(())
+    store.frontend.recordAppliedStub(txid1, stubStart)(())
     // A replayed prepare: charged for itself, while the replaced state stays counted until the stub is durable
     store.frontend.admitPrepare(p1) shouldBe true
     admission.admittedBytes shouldBe 2 * admissionBytes(p1) + CrlAdmission.AppliedStubBytes
@@ -4709,7 +4809,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     // Closed before the stub is durable, the replaced state stays counted, retained for the store
     crl.heldStubSaves = Nil
     store.frontend.admitPrepare(p1) shouldBe true
-    store.frontend.recordAppliedStub(txid1)(())
+    store.frontend.recordAppliedStub(txid1, stubStart)(())
     store.frontend.close()
     admission.retainedBytes(storeId) shouldBe admissionBytes(p1) + CrlAdmission.AppliedStubBytes
     crl.heldStubSaves.foreach(_())
@@ -4734,7 +4834,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     store.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
     backend.deliverCommits()
-    store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
+    store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     admission.admittedBytes shouldBe 0
   }
 
@@ -4762,7 +4863,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
     store.receiveTransactionMessage(p1)
     store.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
-    store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
+    store.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     backend.heldCommits shouldBe 1
 
     val p2 = dataPrepare(ledTxd(txid2, List(overwriteAfter(txid1))))
@@ -4835,7 +4937,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     admission.admittedBytes shouldBe bytes
 
     frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false, late = false, proof = false))
-    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false, late = false, owed = Set()))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     // Neither the recovery's UnackedCommits lookup nor the one started after the aborts finds an entry
     lookup.answer(txid1, lookup.absent)
     lookup.answer(txid1, lookup.absent)
@@ -4971,6 +5074,11 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   private def withExpiryFrontend(f: (Frontend, MapBackend, TestNet, TestCrl, ManualLookup, TestClock,
                                      TransactionStatusCache) => Unit): Unit =
+    withExpiryFrontendAdmitting(CrlAdmission.Unlimited)(f)
+
+  private def withExpiryFrontendAdmitting(admission: CrlAdmission)
+                                         (f: (Frontend, MapBackend, TestNet, TestCrl, ManualLookup, TestClock,
+                                              TransactionStatusCache) => Unit): Unit =
     val clock = new TestClock(floorNow)
     val statusCache = new TransactionStatusCache(wallClockMillis = () => clock.now)
     val backend = new MapBackend(storeId)
@@ -4980,7 +5088,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val crl = new TestCrl
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup,
-      wallClockMillis = () => clock.now, horizon = FiniteDuration(20, SECONDS), loadedAt = Some(floorNow - 60_000))
+      wallClockMillis = () => clock.now, horizon = FiniteDuration(20, SECONDS), loadedAt = Some(floorNow - 60_000),
+      admission = admission)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     f(frontend, backend, net, crl, lookup, clock, statusCache)
@@ -5179,7 +5288,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
 
       frontend.receiveTransactionMessage(TxFinalized(storeId, peer1, txid1, committed = true, late = false,
-        owed = Set()))
+        owed = Set(), startTimestamp = HLCTimestamp.now))
       frontend.transactions.contains(txid1) shouldBe false
   }
 

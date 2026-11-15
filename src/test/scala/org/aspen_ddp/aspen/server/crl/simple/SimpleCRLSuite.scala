@@ -85,6 +85,9 @@ object SimpleCRLSuite:
 class SimpleCRLSuite extends FileBasedTests {
   import SimpleCRLSuite._
 
+  /** The start timestamp the stubs here carry: a fixed one, so recovered states compare equal */
+  private val stubStart = HLCTimestamp(0x5eed0000L)
+
   def streams(numStreams: Int): List[(StreamId, os.Path)] =
     var lst: List[(StreamId, os.Path)] = Nil
     for i <- 0 until numStreams do
@@ -736,7 +739,7 @@ class SimpleCRLSuite extends FileBasedTests {
     failsFast(crl.deleteTransactions(storeId, List(transactionId)))
     failsFast(crl.storesWithEntries())
     failsFast(crl.dropStore(storeId))
-    failsFast(crl.loadStore(storeId2, StoreRecoveryState(List(trsValidTxd2), Set(transactionId2))))
+    failsFast(crl.loadStore(storeId2, StoreRecoveryState(List(trsValidTxd2), Map(transactionId2 -> stubStart))))
     assertThrows[CrlFailed](crl.getFullRecoveryState(storeId))
 
   test("A CRL whose writer thread died fails every call, reports the death once and recovers on reopen") {
@@ -807,7 +810,7 @@ class SimpleCRLSuite extends FileBasedTests {
     saveAndWait(i.crl, transactionId, trsValidTxd)
     saveAndWait(i.crl, transactionId2, trsValidTxd2)
     val q = new LinkedBlockingQueue[String]()
-    i.crl.saveAppliedStub(storeId3, transactionId3, () => q.put(""))
+    i.crl.saveAppliedStub(storeId3, transactionId3, stubStart, () => q.put(""))
     q.take()
     i.crl.shutdown()
 
@@ -1688,7 +1691,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
   private def stubAndWait(crl: CrashRecoveryLog, sid: StoreId, tid: TransactionId): Unit =
     val q = new LinkedBlockingQueue[String]()
-    crl.saveAppliedStub(sid, tid, () => q.put(""))
+    crl.saveAppliedStub(sid, tid, stubStart, () => q.put(""))
     q.take()
 
   private def readState(crl: CrashRecoveryLog, sid: StoreId): StoreRecoveryState =
@@ -1699,19 +1702,19 @@ class SimpleCRLSuite extends FileBasedTests {
     saveAndWait(i.crl, transactionId, trsValidTxd)
     stubAndWait(i.crl, storeId, transactionId)
 
-    readState(i.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    readState(i.crl, storeId) shouldBe StoreRecoveryState(Nil, Map(transactionId -> stubStart))
     i.crl.getFullRecoveryState(storeId) shouldBe Nil
     // A transaction deletion leaves the stub
     i.crl.deleteTransaction(storeId, transactionId)
     saveAndWait(i.crl, transactionId2, trsValidTxd2)
-    i.crl.getAppliedStubs(storeId) shouldBe Set(transactionId)
+    i.crl.getAppliedStubs(storeId) shouldBe Map(transactionId -> stubStart)
     Await.result(i.crl.storesWithEntries(), Duration(5000, MILLISECONDS)) shouldBe Set(storeId, storeId2)
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
     i2.trsList.map(_.storeId) shouldBe List(storeId2)
-    i2.appliedStubs shouldBe Set(TxId(storeId, transactionId))
-    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    i2.appliedStubs shouldBe Map(TxId(storeId, transactionId) -> stubStart)
+    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Map(transactionId -> stubStart))
     i2.crl.shutdown()
   }
 
@@ -1724,7 +1727,7 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
-    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Map(transactionId -> stubStart))
     i2.crl.shutdown()
   }
 
@@ -1743,13 +1746,13 @@ class SimpleCRLSuite extends FileBasedTests {
     saveAndWait(i.crl, transactionId, trsValidTxd)
     val gate = holdWriter(i.crl)
     i.crl.deleteTransaction(storeId, transactionId)
-    i.crl.saveAppliedStub(storeId, transactionId, () => q.put("stub"))
+    i.crl.saveAppliedStub(storeId, transactionId, stubStart, () => q.put("stub"))
     gate.countDown()
     q.poll(5, TimeUnit.SECONDS) shouldBe "stub"
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
-    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Map(transactionId -> stubStart))
     i2.crl.shutdown()
   }
 
@@ -1759,16 +1762,16 @@ class SimpleCRLSuite extends FileBasedTests {
     val gate = holdWriter(i.crl)
     // All in one entry: the stub's replacement of the state does not make the later save's deletion final
     i.crl.save(transactionId, trsUndetermined, () => q.put("first save"))
-    i.crl.saveAppliedStub(storeId, transactionId, () => q.put("stub"))
+    i.crl.saveAppliedStub(storeId, transactionId, stubStart, () => q.put("stub"))
     i.crl.save(transactionId, trsValidTxd, () => q.put("save"))
     gate.countDown()
     Set(q.poll(5, TimeUnit.SECONDS), q.poll(5, TimeUnit.SECONDS), q.poll(5, TimeUnit.SECONDS)) shouldBe
       Set("first save", "stub", "save")
-    readState(i.crl, storeId) shouldBe StoreRecoveryState(List(trsValidTxd), Set(transactionId))
+    readState(i.crl, storeId) shouldBe StoreRecoveryState(List(trsValidTxd), Map(transactionId -> stubStart))
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
-    readState(i2.crl, storeId) shouldBe StoreRecoveryState(List(trsValidTxd), Set(transactionId))
+    readState(i2.crl, storeId) shouldBe StoreRecoveryState(List(trsValidTxd), Map(transactionId -> stubStart))
     i2.crl.shutdown()
   }
 
@@ -1777,7 +1780,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val i = SimpleCRL(tdir, 3, 1024 * 1024)
     val gate = holdWriter(i.crl)
     i.crl.save(transactionId, trsUndetermined, () => q.put("first save"))
-    i.crl.saveAppliedStub(storeId, transactionId, () => q.put("stub"))
+    i.crl.saveAppliedStub(storeId, transactionId, stubStart, () => q.put("stub"))
     i.crl.save(transactionId, trsValidTxd, () => q.put("save"))
     i.crl.deleteTransaction(storeId, transactionId)
     i.crl.save(transactionId, trsValidTxd, () => q.put("late save"))
@@ -1786,7 +1789,7 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
-    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    readState(i2.crl, storeId) shouldBe StoreRecoveryState(Nil, Map(transactionId -> stubStart))
     i2.crl.shutdown()
   }
 
@@ -1806,15 +1809,15 @@ class SimpleCRLSuite extends FileBasedTests {
         stream = i.crl.currentStreamNumber
     saveAndWait(i.crl, transactionId2, trsValidTxd2)
     assert(rotations > 6)
-    readState(i.crl, storeId) shouldBe StoreRecoveryState(Nil, Set(transactionId))
+    readState(i.crl, storeId) shouldBe StoreRecoveryState(Nil, Map(transactionId -> stubStart))
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, size)
-    i2.appliedStubs shouldBe Set(TxId(storeId, transactionId))
+    i2.appliedStubs shouldBe Map(TxId(storeId, transactionId) -> stubStart)
     i2.crl.shutdown()
     // And again: the open's re-save carries it on
     val i3 = SimpleCRL(tdir, 3, size)
-    i3.appliedStubs shouldBe Set(TxId(storeId, transactionId))
+    i3.appliedStubs shouldBe Map(TxId(storeId, transactionId) -> stubStart)
     i3.crl.shutdown()
   }
 
@@ -1825,11 +1828,11 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.deleteAppliedStub(storeId, transactionId3)
     // Requests are handled in order: a save completing after the deletion proves it durable
     saveAndWait(i.crl, transactionId2, trsValidTxd2)
-    readState(i.crl, storeId).appliedStubs shouldBe Set()
+    readState(i.crl, storeId).appliedStubs shouldBe Map()
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
-    i2.appliedStubs shouldBe Set()
+    i2.appliedStubs shouldBe Map()
     // Only the stub: the store's transaction stays
     readState(i2.crl, storeId).transactions shouldBe List(trsValidTxd)
     i2.crl.shutdown()
@@ -1845,7 +1848,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     // Extraction: read, saved to the file, then deleted from the CRL
     val extracted = readState(i.crl, storeId)
-    extracted shouldBe StoreRecoveryState(List(trsValidTxd), Set(transactionId3, transactionId4))
+    extracted shouldBe StoreRecoveryState(List(trsValidTxd), Map(transactionId3 -> stubStart, transactionId4 -> stubStart))
     CrashRecoveryLog.saveStoreState(storeId, extracted, savePath)
     CrashRecoveryLog.loadValidStoreState(savePath, storeId) shouldBe Right(extracted)
 
@@ -1858,17 +1861,17 @@ class SimpleCRLSuite extends FileBasedTests {
     target.crl.shutdown()
     SimpleCRL(targetDir, 3, 1024 * 1024) match
       case reopened =>
-        reopened.appliedStubs shouldBe Set(TxId(storeId, transactionId3), TxId(storeId, transactionId4))
+        reopened.appliedStubs shouldBe Map(TxId(storeId, transactionId3) -> stubStart, TxId(storeId, transactionId4) -> stubStart)
         reopened.crl.shutdown()
 
     // A store with only stubs still has entries; dropStore takes them with its transactions
     i.crl.deleteTransaction(storeId, transactionId)
     Await.result(i.crl.storesWithEntries(), Duration(5000, MILLISECONDS)) shouldBe Set(storeId, storeId2)
     Await.result(i.crl.dropStore(storeId), Duration(5000, MILLISECONDS))
-    readState(i.crl, storeId) shouldBe StoreRecoveryState(Nil, Set())
+    readState(i.crl, storeId) shouldBe StoreRecoveryState(Nil, Map())
     i.crl.shutdown()
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
-    i2.appliedStubs shouldBe Set()
+    i2.appliedStubs shouldBe Map()
     readState(i2.crl, storeId2).transactions.size shouldBe 1
     i2.crl.shutdown()
   }

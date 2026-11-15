@@ -76,12 +76,3 @@ trait RepairTarget:
   def repairDelete(storeId: StoreId, objectId: ObjectId,
                    storePointer: Array[Byte], completion: Promise[Unit]): Unit
 
-  /** The txids of the store's applied stubs (Frontend.appliedStubs), read on the store's executor. An unhosted store
-    * has none to report: the Future completes empty, so nothing is dropped
-    */
-  def appliedStubs(storeId: StoreId): Future[Set[TransactionId]]
-
-  /** Drops the store's applied stub for `txid`, if it holds one, on the store's executor. Does nothing for an unhosted
-    * store
-    */
-  def dropAppliedStub(storeId: StoreId, txid: TransactionId): Unit

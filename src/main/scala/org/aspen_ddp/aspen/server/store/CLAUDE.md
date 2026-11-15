@@ -65,25 +65,27 @@
   replies `status = None` ("unknown") only when the start is below its forget floor (`belowForgetFloor(HLCTimestamp)`),
   which makes the answer permanent; above the floor it stays silent, as it could still join the transaction
 - Forget floor (`Frontend.forgetFloorMillis`, transaction horizon design section 1): a prepare for a transaction the
-  store does not hold (no Tx, no non-Unresolved status-cache entry) whose start is below the floor is refused: no Tx,
-  no promise, vote, reply or CRL save, its admission released, a warning with the lag for a client's prepare (at most
-  once per `RefusalLogPeriod`, 10 s, with the count held back). The floor
-  is the latest of `wallClockMillis() - horizon` (`TransactionHorizon.Horizon`, 20 s, threaded Host → DeviceControl →
-  StoreLoader → Store → Frontend), the store's load on this host plus `MaxStartLead` (`loadedAtMillis`, taken when
-  the Frontend is built: every restart, adoption and transfer-in builds a new Store through `StoreLoader`; the lead
-  because before its load the store may have joined, and forgotten, a transaction started up to `MaxStartLead` ahead
-  of its clock; a new pool's store the host just created, `StoreRebuilds.createNewStore`, has never served and records
-  no load; a load less than `RebuildingStore.AcceptorSinceMargin` after the store's arrival from another host, recorded
-  durably in `StoreLoader.ArrivedAtFile` by a transfer in or an adoption and passed as `arrivedAt`, adds that 10 s
-  margin instead, since it joined there by a clock that may lead this host's by up to the P-N2 skew), and the status
-  cache's `evictionWatermarkMillis` (which adds the lead too). A Tx the store holds
-  (recovered ones included) is unaffected, as is a prepare whose outcome the cache knows (finalized: the relay;
-  resolved: a Tx that learns the outcome). An `acceptorSince` mute is checked first and keeps its muted, possibly
-  proving Tx. The designated leader starts no driver for a prepare below the floor it does not hold (`Store`). A
-  store therefore never rejoins a transaction it may have forgotten; for up to the horizon after a load it looks
-  offline to transactions started before the load plus `MaxStartLead`. Accepted cost: on a single host, or after most
-  of a pool's stores restart, such transactions end `TransactionOutcomeUnknown` at about 22 s and are retried. Stores
-  written by bootstrap are not exempt from the load floor. A durable high-water mark is the upgrade path
+  store does not hold (no Tx; a finalized status-cache entry has it ignored instead) whose start is below the floor is
+  refused, a resolved but unfinalized cache entry included (Todo 4.6: the host's cache is shared, so another store's Tx
+  may have written it after this store forgot T, whose applied stub may have expired): no Tx, no promise, vote, reply or
+  CRL save, its admission released, a warning with the lag for a client's prepare (at most once per `RefusalLogPeriod`,
+  10 s, with the count held back). The floor is the latest of `wallClockMillis() - horizon`
+  (`TransactionHorizon.Horizon`, 20 s, threaded Host → DeviceControl → StoreLoader → Store → Frontend), the store's load
+  on this host plus `MaxStartLead` (`loadedAtMillis`, taken when the Frontend is built: every restart, adoption and
+  transfer-in builds a new Store through `StoreLoader`; the lead because before its load the store may have joined, and
+  forgotten, a transaction started up to `MaxStartLead` ahead of its clock; a new pool's store the host just created,
+  `StoreRebuilds.createNewStore`, has never served and records no load; a load less than
+  `RebuildingStore.AcceptorSinceMargin` after the store's arrival from another host, recorded durably in
+  `StoreLoader.ArrivedAtFile` by a transfer in or an adoption and passed as `arrivedAt`, adds that 10 s margin instead,
+  since it joined there by a clock that may lead this host's by up to the P-N2 skew), and the status cache's
+  `evictionWatermarkMillis` (which adds the lead too). A Tx the store holds (recovered ones included) is unaffected; a
+  prepare whose outcome the cache knows creates a Tx that learns it only above the floor (resolved), and is ignored when
+  finalized (the relay). An `acceptorSince` mute is checked first and keeps its muted, possibly proving Tx. The
+  designated leader starts no driver for a prepare below the floor it does not hold (`Store`). A store therefore never
+  rejoins a transaction it may have forgotten; for up to the horizon after a load it looks offline to transactions
+  started before the load plus `MaxStartLead`. Accepted cost: on a single host, or after most of a pool's stores
+  restart, such transactions end `TransactionOutcomeUnknown` at about 22 s and are retried. Stores written by bootstrap
+  are not exempt from the load floor. A durable high-water mark is the upgrade path
 - Expiry (`server/transaction/CLAUDE.md`): `Store.heartbeat` calls `Frontend.expiryHeartbeat`, which queries the
   peers of each Tx unfinalized past the horizon plus `expiryMargin` and decides from their `TxStatusResponse`s
   (`ExpiryTally`): adopt an outcome, keep holding, or discard (`expireTransaction`: locks and objects released, CRL

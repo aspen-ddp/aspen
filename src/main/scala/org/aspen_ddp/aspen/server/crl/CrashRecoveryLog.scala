@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.crl
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.codec
@@ -47,7 +48,9 @@ object CrashRecoveryLog:
         fos.write(msg)
 
       state.transactions.foreach(trs => write(codec.StoreCRLEntry(trs = Some(Codec.encode(trs)))))
-      state.appliedStubs.foreach(txid => write(codec.StoreCRLEntry(appliedStub = Some(Codec.encodeUUID(txid.uuid)))))
+      state.appliedStubs.foreach: (txid, start) =>
+        val stub = codec.AppliedStub(Some(Codec.encodeUUID(txid.uuid)), start.asLong)
+        write(codec.StoreCRLEntry(appliedStub = Some(stub)))
 
   /** Thrown by loadStoreState for a file that is shorter than its own framing says: a write
    *  that never finished, or a file truncated by a crash. */
@@ -59,7 +62,7 @@ object CrashRecoveryLog:
    *  caller deciding whether a store's state is intact can rely on it. */
   def loadStoreState(saveFilePath: os.Path): (StoreId, StoreRecoveryState) =
     var trsList: List[TransactionRecoveryState] = Nil
-    var stubs: Set[TransactionId] = Set()
+    var stubs: Map[TransactionId, HLCTimestamp] = Map()
     val fc = os.read.channel(saveFilePath)
     try
       def readFully(buf: ByteBuffer, what: String): Unit =
@@ -91,7 +94,8 @@ object CrashRecoveryLog:
         val m = codec.StoreCRLEntry.parseFrom(entryBytes)
         (m.trs, m.appliedStub) match
           case (Some(trs), None) => trsList = Codec.decode(trs) :: trsList
-          case (None, Some(uuid)) => stubs += TransactionId(Codec.decodeUUID(uuid))
+          case (None, Some(codec.AppliedStub(Some(uuid), start, _))) =>
+            stubs += (TransactionId(Codec.decodeUUID(uuid)) -> HLCTimestamp(start))
           case _ => throw InvalidSaveFile(saveFilePath, "an entry is neither a transaction nor an applied stub")
 
       (storeId, StoreRecoveryState(trsList.reverse, stubs))
@@ -123,7 +127,7 @@ trait CrashRecoveryLog {
 
   /** The applied stubs held for `storeId` (StoreRecoveryState). May block on the CRL's own thread, as
     * getFullRecoveryState does */
-  def getAppliedStubs(storeId: StoreId): Set[TransactionId]
+  def getAppliedStubs(storeId: StoreId): Map[TransactionId, HLCTimestamp]
 
   /** Everything held for `storeId`, its transactions and its applied stubs, which stay in the CRL: removed only by
     * deleteTransactions, which records the deletion. A transfer out writes them to its save file first, so a crash or
@@ -145,9 +149,9 @@ trait CrashRecoveryLog {
       save(trs.txd.transactionId, trs, c)
       p.future
 
-    def saveStub(txid: TransactionId): Future[Unit] =
+    def saveStub(txid: TransactionId, start: HLCTimestamp): Future[Unit] =
       val p = Promise[Unit]()
-      saveAppliedStub(storeId, txid, () => p.success(()))
+      saveAppliedStub(storeId, txid, start, () => p.success(()))
       p.future
 
     // Stubs first: a stub's save replaces a transaction's state of the same id, which a later save then keeps
@@ -162,9 +166,10 @@ trait CrashRecoveryLog {
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit
 
   /** Saves an applied stub for `txid` of `storeId`, in place of any transaction state the store holds for it, in one
-    * write. `completionHandler` runs, on the CRL's thread, once it is durable. Never subject to CrlAdmission: a stub is
-    * a few dozen bytes, and the stores that write one are concluding a transaction (StoreRecoveryState) */
-  def saveAppliedStub(storeId: StoreId, txid: TransactionId, completionHandler: () => Unit): Unit
+    * write. `start` is the transaction's start timestamp, by which the store expires the stub. `completionHandler`
+    * runs, on the CRL's thread, once it is durable. Never subject to CrlAdmission: a stub is a few dozen bytes, and
+    * the stores that write one are concluding a transaction (StoreRecoveryState) */
+  def saveAppliedStub(storeId: StoreId, txid: TransactionId, start: HLCTimestamp, completionHandler: () => Unit): Unit
 
   /** Deletes the applied stub held for `txid` of `storeId`, if any. Its transaction state, if any, stays */
   def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit

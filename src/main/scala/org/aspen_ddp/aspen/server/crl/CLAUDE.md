@@ -48,9 +48,11 @@
   would pin `oldestEntryNeeded` until recovery broke on the wrap. The exception is a deletion a stub's save made,
   which a later save cancels
 - Applied stubs (`StoreRecoveryState`, `saveAppliedStub`/`deleteAppliedStub`): a (store, txid) entry meaning the store
-  holds that transaction's update. A namespace apart from transaction state (own header counts and deletion list in
-  each `LogEntry`), copied forward like a transaction (`Stub.anchor`); a stub's save replaces the transaction's state
-  in the same entry. `readStoreState`, `crl_save.log`, `loadStore`, `deleteTransactions` and `dropStore` carry both.
-  Charged to CrlAdmission without a check (`AppliedStubBytes`), by the Frontend: never dropped, but counted
+  holds that transaction's update, with the transaction's start timestamp (`Stub.StaticSize`: TxId + 8 B), by which the
+  store expires it (`Frontend.expireStubs`). A namespace apart from transaction state (own header counts and deletion
+  list in each `LogEntry`), copied forward like a transaction (`Stub.anchor`); a stub's save replaces the transaction's
+  state in the same entry. `readStoreState`, `crl_save.log`, `loadStore`, `deleteTransactions` and `dropStore` carry
+  both. Charged to CrlAdmission without a check (`AppliedStubBytes`, 41), by the Frontend: never refused, but counted,
+  and released when the store expires the stub
 - The device's CRL is shared by all its stores; sizing comes from the device config. A loading store reads its state
   with the non-blocking `readStoreState` from its executor (`server/host/CLAUDE.md`)

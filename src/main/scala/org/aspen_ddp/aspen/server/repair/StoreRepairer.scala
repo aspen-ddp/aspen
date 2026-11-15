@@ -57,8 +57,8 @@ object SweepResult:
 
 /** One scan's (or sweep's) cancellation and progress, shared with whoever runs it (RepairService). A scan cut off by
   * its deadline keeps running in the background, since a hung read cannot be interrupted: `cancel` makes it stop at
-  * the next entry or node, and skip the work that only a scan that ran to its end may do (pruning DeferralState,
-  * confirming orphan stubs). So the store's DeferralState can be kept for its next scan (repair F9). `sawEntries` is
+  * the next entry or node, and skip the work that only a scan that ran to its end may do (pruning DeferralState).
+  * So the store's DeferralState can be kept for its next scan (repair F9). `sawEntries` is
   * whether the scan had reached any entry by then: a scan cut off while working through a backlog is not quiet.
   * Safe to use from any thread.
   */
@@ -73,9 +73,8 @@ final class ScanControl:
   def sawEntries: Boolean = entries.get > 0
   private[repair] def sawEntry(): Unit = entries.incrementAndGet()
 
-/** Lock deferrals of one store's repair entries, and its suspected orphan stubs (`confirmOrphans`), kept in memory
-  * across its scans by RepairService. A host restart forgets them: the next pass then reconciles each whole object
-  * again and restarts the count, and an orphan stub needs two more scans to be dropped.
+/** Lock deferrals of one store's repair entries, kept in memory across its scans by RepairService. A host restart
+  * forgets them: the next pass then reconciles each whole object again and restarts the count.
   *
   * Keyed per entry and object (StoreRepairer.errorDeferralKey, unackedDeferralKey). Only parts deferred by a lock
   * count: `deferredKeys` and `objectLevelDeferred`, the latter including a refcount deferred under an object lock. A
@@ -158,18 +157,6 @@ final class DeferralState:
 
   private[repair] def size: Int = synchronized(entries.size)
 
-  /** The store's applied stubs the last successful scan found with no UnackedCommits entry (Ruling 8) */
-  private var orphanSuspects = Set[TransactionId]()
-
-  /** Records the stubs a successful scan found with no entry, and returns those to drop: the ones the previous
-    * successful scan found with no entry too. The rest are suspected until the next scan; a stub no longer found
-    * orphaned (its entry landed, or it is gone) is no longer suspected
-    */
-  private[repair] def confirmOrphans(found: Set[TransactionId]): Set[TransactionId] = synchronized:
-    val confirmed = found.intersect(orphanSuspects)
-    orphanSuspects = found -- confirmed
-    confirmed
-
 object DeferralState:
   private final case class Deferral(count: Int, only: Option[Set[Key]])
 
@@ -236,11 +223,6 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     val deferred = AtomicInteger(0)
     val unackedSeen = AtomicInteger(0)
     private var touched = Set[Key]()
-    private var unackedTxids = Set[TransactionId]()
-
-    /** Notes a UnackedCommits entry of the walk, whatever became of it */
-    def sawUnacked(txid: TransactionId): Unit = synchronized { unackedTxids += txid }
-    def unackedTxidsSeen: Set[TransactionId] = synchronized(unackedTxids)
 
     def touch(keys: Iterable[Key]): Unit = synchronized { touched ++= keys }
     def touchedKeys: Set[Key] = synchronized(touched)
@@ -268,12 +250,9 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       else
         for
           pool <- client.getStoragePool(storeId.poolId)
-          // Read before the UnackedCommits walk: see dropOrphanStubs
-          stubs <- target.appliedStubs(storeId)
           _ <- pool.errorTree.foreachInRange(min, max, repairErrorEntry(pool, storeId, policy, deferral, counts))
           _ <- pool.unackedCommitsTree.foreachInRange(min, max,
                  repairUnackedEntry(pool, storeId, policy, deferral, counts))
-          _ <- dropOrphanStubs(pool, storeId, stubs, deferral, counts)
         yield
           // A cancelled scan did not see every entry it would have: pruning by what it touched would drop live ones
           if !control.cancelled then deferral.retain(counts.touchedKeys)
@@ -350,41 +329,6 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
             else
               logger.debug(s"Swept the bootstrap trees' nodes on $storeId: $result")
             result
-
-  /** Drops the stubs of the store that no UnackedCommits entry needs any more: those that this scan and the
-    * previous successful one of the store both found orphaned (Ruling 8). A scan finds a stub orphaned when it is in
-    * `before`, the store's stubs read before the walk, its transaction had no entry in the walk, and a point lookup
-    * of its own entry finds nothing.
-    *
-    * A stub may be written before its entry is durable: a driver finalized by another driver's TxFinalized lists the
-    * stores its own cancelled mark planned, without waiting for that write (Ruling 7). Two consecutive scans give such
-    * an entry a whole scan period to land; once it has, the stub is no longer orphaned and the suspicion is dropped.
-    * The suspicions live in the store's DeferralState, in memory on the repairing host: a restart, or a scan
-    * abandoned when the store left the host, starts them again, which only delays a drop.
-    *
-    * The pre-walk snapshot still matters. A stub written during the walk is not in `before`, so this scan neither
-    * suspects nor drops it: its entry may sit behind the walk's cursor. An entry can also leave a walk unseen
-    * without being gone, if the tree is restructured under the walk, and one deleted by another scan is rightly
-    * gone: hence the point lookup. The drop names the txid exactly, so a stub is never dropped for another's entry.
-    * A scan that fails part way changes no suspicion; one whose store left this host mid-walk does nothing here.
-    */
-  private def dropOrphanStubs(pool: StoragePool, storeId: StoreId, before: Set[TransactionId],
-                              deferral: DeferralState, counts: Counts): Future[Unit] =
-    val candidates = before -- counts.unackedTxidsSeen
-    if abandoned(storeId, counts) then
-      Future.unit
-    else
-      val found = candidates.foldLeft(Future.successful(Set[TransactionId]())): (f, txid) =>
-        f.flatMap: orphans =>
-          pool.unackedCommitsTree.get(UnackedCommitEntry.key(storeId, txid)).map: entry =>
-            if entry.isEmpty then orphans + txid else orphans
-      found.map: orphans =>
-        // Cancelled during the lookups: only a scan that ran to its end may count as one of the two
-        if !counts.control.cancelled then
-          deferral.confirmOrphans(orphans).foreach: txid =>
-            logger.info(s"Dropping the applied stub of $txid on $storeId: two scans found no UnackedCommits entry " +
-                        "for it")
-            target.dropAppliedStub(storeId, txid)
 
   /** Whether the pool's entry for the store names this host and the device the store is loaded from here, read
     * fresh. A store with no device here is not owned
@@ -514,7 +458,6 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
         counts.unackedSeen.incrementAndGet()
         counts.control.sawEntry()
         val txid = UnackedCommitEntry.decodeTransactionId(key)
-        counts.sawUnacked(txid)
         if target.holdsTransaction(storeId, txid) then
           logger.debug(s"Skipping UnackedCommits entry of $txid on $storeId: the store holds it live")
           counts.deferred.incrementAndGet()
@@ -560,10 +503,6 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           entryKeys.foreach((_, entryKey) => deferral.clear(entryKey))
           deleteIfStillOwned(storeId, counts, pool.unackedCommitsTree, value.revision, key).map: deleted =>
             if deleted then
-              // Only the head's deletion drops the stub: the lookups that decide whether the store applies a
-              // late commit name the head (UnackedCommitEntry.key), so the stub must outlive it, not the other
-              // chunks, which only carry more objects to repair
-              if UnackedCommitEntry.isHeadKey(key) then target.dropAppliedStub(storeId, txid)
               logger.info(s"Repair complete for UnackedCommits entry of $txid on store $storeId")
               counts.repaired.incrementAndGet()
             else

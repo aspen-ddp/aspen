@@ -319,7 +319,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
     driver.receiveTxResolved(TxResolved(ds0, ds1, txd.transactionId, committed = false, late = false, proof = false))
     reported.size shouldBe 1
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false, owed = Set()))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     reported.size shouldBe 2
 
     messenger.clear()
@@ -361,7 +362,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     val messenger = new TMessenger()
     val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set()))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     messenger.clear()
     driver.heartbeat()
 
@@ -750,7 +752,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     finalizer.created should be (true)
     finalizer.cancelled should be (false)
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds0, txd.transactionId, true, late = false, owed = Set()))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds0, txd.transactionId, true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
 
     driver.testFinalized should be (true)
     completed should be (true)
@@ -1155,7 +1158,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     var completed = false
     val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true)
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set()))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
 
     completed should be (true)
     finalizer.createCount should be (0)
@@ -1181,7 +1185,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     finalizer.createCount should be (1)
     messenger.clear()
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set()))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
 
     completed should be (true)
     finalizer.cancelled should be (true)
@@ -1213,13 +1218,15 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     // late
     val m2 = new TMessenger()
     val d2 = new TTD(ds0, m2, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
-    d2.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set(ds1)))
+    d2.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set(ds1),
+      startTimestamp = HLCTimestamp.now))
     owedSent(m2) should be (Set(Set[StoreId]()))
 
     // abort
     val m3 = new TMessenger()
     val d3 = new TTD(ds0, m3, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
-    d3.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false, owed = Set(ds1)))
+    d3.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false, owed = Set(ds1),
+      startTimestamp = HLCTimestamp.now))
     owedSent(m3) should be (Set(Set[StoreId]()))
   }
 
@@ -1237,7 +1244,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       finalizer.createCount should be (1)
       messenger.clear()
 
-      driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+      driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1),
+        startTimestamp = HLCTimestamp.now))
 
       // Cancelled first, so no mark is handed off after the planned set is read
       finalizer.cancelled should be (true)
@@ -1260,12 +1268,14 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     for from <- List(ds0, ds1) do
       driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
         Right(TxAcceptResponse.Accepted(true))))
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1),
+      startTimestamp = HLCTimestamp.now))
     messenger.clear()
 
     // Late messages reach a finalized driver: nothing they do can drop the planned stores or send late
     driver.receiveTxResolved(TxResolved(ds0, ds2, txd.transactionId, committed = true, late = true, proof = false))
-    driver.receiveTxFinalized(TxFinalized(ds0, ds2, txd.transactionId, committed = true, late = true, owed = Set()))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds2, txd.transactionId, committed = true, late = true, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     driver.heartbeat()
     messenger.messages.collect { case r: TxResolved => r } should be (Nil)
     messenger.messages.collect { case f: TxFinalized => (f.owed, f.late) }.toSet should be (Set((Set(ds0, ds1), false)))
@@ -1283,7 +1293,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     for from <- List(ds0, ds1) do
       driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
         Right(TxAcceptResponse.Accepted(true))))
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1),
+      startTimestamp = HLCTimestamp.now))
     driver.testFinalized should be (true)
     calls.get should be (1)
 
@@ -1302,7 +1313,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     val messenger = new TMessenger()
     val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
     driver.receiveTxResolved(TxResolved(ds0, ds1, txd.transactionId, committed = true, late = true, proof = false))
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1),
+      startTimestamp = HLCTimestamp.now))
     messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set[StoreId]()))
   }
 
@@ -1349,7 +1361,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     val messenger = new TMessenger()
     val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false, owed = Set()))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     val round = driver.testProposalId
     messenger.clear()
 
@@ -1463,7 +1476,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     factory.created.head.done.failure(new Exception("marker gave up"))
     messenger.clear()
 
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1)))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false, owed = Set(ds1),
+      startTimestamp = HLCTimestamp.now))
     driver.testFinalized should be (true)
     messenger.messages.collect { case f: TxFinalized => f.owed }.toSet should be (Set(Set(ds1, ds2)))
 
@@ -1480,7 +1494,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     tasks.tasks = Nil
     commitBy(driver, txd)
     factory.created.head.done.failure(new Exception("action gave up"))
-    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set()))
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = true, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
     driver.testFinalized should be (true)
     tasks.runAll()
     factory.created.size should be (1)

@@ -24,8 +24,6 @@ class RepairServiceSuite extends IntegrationTestSuite:
     def repairableStoreIds: List[StoreId] = storeIds
     def isRepairable(storeId: StoreId): Boolean = storeIds.contains(storeId)
     def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
-    def appliedStubs(sid: StoreId): Future[Set[TransactionId]] = Future.successful(Set())
-    def dropAppliedStub(sid: StoreId, txid: TransactionId): Unit = ()
     def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
       p.success(RepairSnapshot.missing(pointer.id))
     def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
@@ -93,8 +91,6 @@ class RepairServiceSuite extends IntegrationTestSuite:
       def repairableStoreIds: List[StoreId] = hosted
       def isRepairable(storeId: StoreId): Boolean = hosted.contains(storeId)
       def holdsTransaction(sid: StoreId, txid: TransactionId): Boolean = false
-      def appliedStubs(sid: StoreId): Future[Set[TransactionId]] = Future.successful(Set())
-      def dropAppliedStub(sid: StoreId, txid: TransactionId): Unit = ()
       def snapshot(sid: StoreId, pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
         p.success(RepairSnapshot.missing(pointer.id))
       def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,

@@ -10,8 +10,9 @@ import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{TKVLInsert, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Key, KeyValueObjectPointer, ObjectId,
-                                           ObjectPointer, ObjectRefcount, Value}
+                                           ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
+import org.aspen_ddp.aspen.common.network.TxPrepare
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.server.store.backend.RepairSlotOccupied
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StoragePoolState}
@@ -885,6 +886,99 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       storeKeys(2, kvPtr) shouldBe Set(k0, k1, k3)
       remaining shouldBe empty
 
+  /** Builds and starts committing a transaction whose messages are held back from every store: it takes its start
+    * timestamp now but reaches no store until `deliver`. Completes with the transaction's id, its commit, and
+    * `deliver`, which hands the held prepares to every store but those in `missing`, and keeps dropping every message
+    * of it to those (they miss it outright). They are reported offline while it is built, so none leads it: a leader
+    * whose messages are dropped would stall it. The commit settles only after `deliver`
+    */
+  private def heldTx(missing: Set[Int] = Set())(build: Transaction => Unit)
+                    : Future[(TransactionId, Future[Unit], () => Future[Unit])] =
+    val tx = TestTransactions.replaySafe(client.newTransaction())
+    build(tx)
+    val held = scala.collection.mutable.ListBuffer[TxPrepare]()
+    net.recordTxMessage = m => m.transactionId == tx.id
+    net.dropTxMessage = m => m.transactionId == tx.id
+    net.offlineStores = missing.map(sid)
+    val committed = tx.commit().map(_ => ())
+
+    def untilHeld(until: Long): Future[Unit] =
+      val prepares = net.takeRecordedTxMessages().collect { case p: TxPrepare => p }
+      held ++= prepares
+      if held.map(_.to).toSet.size == net.stores.size then Future.unit
+      else if System.nanoTime() > until then Future.failed(new AssertionError("prepares never sent"))
+      else Future { Thread.sleep(1); net.handleEvents() }.flatMap(_ => untilHeld(until))
+
+    def deliver(): Future[Unit] =
+      val dropped = missing.map(sid)
+      net.recordTxMessage = _ => false
+      net.dropTxMessage = _ => false
+      net.offlineStores = dropped
+      net.droppedTx = net.droppedTx ++ dropped.map(s => (s, tx.id))
+      held.filterNot(p => dropped.contains(p.to)).foreach(net.deliverTransactionMessage)
+      pump(committed, deadline()).transformWith: c =>
+        settle().transform: s =>
+          net.droppedTx = net.droppedTx -- dropped.map(s => (s, tx.id))
+          net.offlineStores = Set()
+          c.flatMap(_ => s)
+
+    untilHeld(deadline()).map: _ =>
+      net.offlineStores = Set()
+      (tx.id, committed, () => deliver())
+
+  /** Store `i`'s object timestamp for `ptr` */
+  private def storeTimestamp(i: Int, ptr: ObjectPointer): Option[HLCTimestamp] =
+    stored(i, ptr.id).map(_.metadata.timestamp)
+
+  test("an entry for a blind write applied ahead of an earlier-started one completes in one pass (repair F3)"):
+    // T0 starts first but applies last on every store; store 2 misses T1. The entry records T1's start. Applies keep
+    // the object timestamp monotone, so the read's timestamp reaches T1's start and the gate passes
+    val repairer = StoreRepairer(client, SeamTarget())
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      (_, _, deliverT0) <- heldTx()(kvUpdate(kvPtr, List(Insert(k2, Array[Byte](2)))))
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
+      t1Applied = storeTimestamp(0, kvPtr).get
+      _ <- deliverT0()
+      marked <- errorEntries(2)
+      _ = withClue("store 2 missed only T1, and T0 applied last without lowering the timestamp: "):
+            storeKeys(2, kvPtr) shouldBe Set(k0, k2)
+            storeKeys(0, kvPtr) shouldBe Set(k0, k1, k2)
+            storeTimestamp(0, kvPtr) shouldBe Some(t1Applied)
+            marked should not be empty
+      _ <- pass(2, repairer, DeferralState())
+      remaining <- errorEntries(2)
+    yield
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1, k2)
+      remaining shouldBe empty
+
+  test("an entry whose missed transaction started before the store's copied timestamp completes with its content"):
+    // Store 2's copy is installed by repair from a read, so its timestamp is copied (as a rebuild's is), and is
+    // later than T0's start: T0 started before that read but reaches the other stores only afterwards. The entry for
+    // T0 completes only once a read reflects T0, and the install gives store 2 T0's key
+    val repairer = StoreRepairer(client, SeamTarget())
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      (_, _, deliverT0) <- heldTx(missing = Set(2))(kvUpdate(kvPtr, List(Insert(k2, Array[Byte](2)))))
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
+      _ <- pass(2, repairer, DeferralState())
+      copied = storeTimestamp(2, kvPtr).get
+      afterCopy <- errorEntries(2)
+      _ = withClue("store 2's copy was installed by repair: "):
+            storeKeys(2, kvPtr) shouldBe Set(k0, k1)
+            afterCopy shouldBe empty
+      _ <- deliverT0()
+      marked <- errorEntries(2)
+      _ = withClue("store 2 missed T0, whose start precedes its copied timestamp: "):
+            storeKeys(2, kvPtr) shouldBe Set(k0, k1)
+            storeTimestamp(2, kvPtr) shouldBe Some(copied)
+            marked should not be empty
+      _ <- pass(2, repairer, DeferralState())
+      remaining <- errorEntries(2)
+    yield
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1, k2)
+      remaining shouldBe empty
+
   // ---- UnackedCommits entries, deferral and proofs ---------------------------------------------------------------
 
   /** The live host, with test seams: `live` stands in for transactions a store still holds live, `lockedKeys` and
@@ -940,6 +1034,48 @@ class StoreRepairerSuite extends IntegrationTestSuite:
                yield p
       _ <- scanAllUntilQuiet()
     yield ptr
+
+  test("a repair stale for several passes asks the store to wait for the object to settle, and completes (repair F8)"):
+    // Store 2's copy is busy at every install unless the repair waits for it to settle (the Frontend side of that
+    // wait: FrontendSuite "a repair asked to wait for its object to settle ...")
+    @volatile var asked = List[Boolean]()
+    val target = new SeamTarget:
+      override def reconcile(storeId: StoreId, snapshot: RepairSnapshot, read: ClientObjectState,
+                             p: Promise[ReconcileResult]): Unit =
+        if storeId == sid(2) then synchronized { asked = snapshot.awaitSettle :: asked }
+        if storeId == sid(2) && !snapshot.awaitSettle then p.success(ReconcileResult(Set(), false, stale = true))
+        else super.reconcile(storeId, snapshot, read, p)
+    val repairer = StoreRepairer(client, target)
+    val deferral = DeferralState()
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
+      _ <- passes(StoreRepairer.ParkAfterStalePasses, 2, repairer, deferral)
+      afterStale <- errorEntries(2)
+      _ = withClue("each busy pass leaves the entry: "):
+            afterStale should not be empty
+            storeKeys(2, kvPtr) shouldBe Set(k0)
+      _ <- pass(2, repairer, deferral)
+      remaining <- errorEntries(2)
+    yield
+      asked.reverse shouldBe List.fill(StoreRepairer.ParkAfterStalePasses)(false) :+ true
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1)
+      remaining shouldBe empty
+      deferral.size shouldBe 0
+
+  test("a pass that is not stale resets an entry's stale count"):
+    Future.successful:
+      val deferral = DeferralState()
+      val key = Key(Array[Byte](1, 2, 3))
+      val stale = ReconcileResult(Set(), false, stale = true)
+      deferral.recordStale(key, stale) shouldBe 1
+      deferral.recordStale(key, stale) shouldBe 2
+      deferral.staleCount(key) shouldBe 2
+      deferral.recordStale(key, ReconcileResult(Set(k0), false, stale = false)) shouldBe 0
+      deferral.staleCount(key) shouldBe 0
+      deferral.recordStale(key, stale) shouldBe 1
+      deferral.clear(key)
+      deferral.staleCount(key) shouldBe 0
 
   test("a UnackedCommits entry for a transaction the store holds live is skipped"):
     val target = SeamTarget()
@@ -1025,6 +1161,55 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     yield
       afterFirst shouldBe true
       hasStub(2, orphan) shouldBe false
+
+  test("a cancelled scan's orphan pass counts toward no drop (repair F9)"):
+    val repairer = StoreRepairer(client, SeamTarget())
+    val deferral = DeferralState()
+    val orphan = TransactionId(new UUID(77, 2))
+    val cancelled = ScanControl()
+    cancelled.cancel()
+    for
+      _ <- writeStub(2, orphan)
+      _ <- pass(2, repairer, deferral)
+      _ <- settle()
+      _ <- pump(repairer.scan(sid(2), RepairPolicy.Default, deferral, cancelled), deadline())
+      afterCancelled = hasStub(2, orphan)
+      _ <- pass(2, repairer, deferral)
+    yield
+      withClue("the cancelled scan neither dropped the stub nor reset the suspicion: "):
+        afterCancelled shouldBe true
+      hasStub(2, orphan) shouldBe false
+
+  test("a scan cancelled part way starts no further entry and keeps the store's deferral state (repair F9)"):
+    // Two objects, each with an entry. The first reconcile cancels the scan: the second entry is left untouched, and
+    // the cancelled scan does not prune the deferral state by the few entries it saw
+    val control = ScanControl()
+    @volatile var reconciled = List[ObjectId]()
+    val repairer = StoreRepairer(client, SeamTarget(), testingOnlyBeforeReconcile = (s, ptr) =>
+      if s == sid(2) then
+        synchronized { reconciled = ptr.id :: reconciled }
+        control.cancel()
+      Future.unit)
+    val deferral = DeferralState()
+    val unrelated = StoreRepairer.errorDeferralKey(Key(Array[Byte](2, 9)), ObjectRevision(TransactionId(new UUID(9, 9))))
+    deferral.record(unrelated, ReconcileResult(Set(k0), false, false))
+    for
+      a <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      b <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      _ <- missedBy(2)(kvUpdate(a, List(Insert(k1, Array[Byte](1)))))
+      _ <- missedBy(2)(kvUpdate(b, List(Insert(k1, Array[Byte](1)))))
+      before <- errorEntries(2)
+      _ = before.size shouldBe 2
+      _ <- settle()
+      result <- pump(repairer.scan(sid(2), RepairPolicy.Default, deferral, control), deadline())
+      _ <- settle()
+      after <- errorEntries(2)
+    yield
+      reconciled.size shouldBe 1
+      result.seen shouldBe 1
+      control.sawEntries shouldBe true
+      after.size shouldBe 1
+      deferral.deferredKeys(unrelated) shouldBe Some(Set(k0))
 
   test("a stub whose entry lands between two scans is kept"):
     val target = SeamTarget()

@@ -119,6 +119,7 @@ class Store(val storageDeviceId: StorageDeviceId,
     frontend.transactions.values.foreach(_.checkCollisionWait())
     frontend.retryUnackedLookups()
     frontend.retryQuarantineVerifications()
+    frontend.expireParkedRepairs()
     frontend.expiryHeartbeat()
     removeExpiredDrivers()
     frontend.transactions.values.foreach { tx =>

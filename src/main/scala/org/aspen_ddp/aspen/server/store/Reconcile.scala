@@ -18,12 +18,17 @@ import org.aspen_ddp.aspen.common.store.StoreId
   * @param proven set by the repairer: parts a committed proof transaction showed the read to be current on
   *               (RepairProofs). The locks the read reports on them are ignored; the store's own locks still defer
   *               them
+  * @param awaitSettle set by the repairer once the object's repair has been stale for several passes (repair F8): a
+  *                    store whose object is unsettled (a commit or repair write in flight, or held for recovery)
+  *                    parks the reconcile until the object settles, up to Frontend.RepairSettleWait, instead of
+  *                    answering stale at once
   */
 final case class RepairSnapshot(objectId: ObjectId, revision: ObjectRevision, refcount: ObjectRefcount,
                                 timestamp: HLCTimestamp, keyRevisions: Map[Key, ObjectRevision],
                                 objectLevel: Option[KVObjectLevel],
                                 only: Option[Set[Key]] = None,
-                                proven: ReadLocks = ReadLocks.None):
+                                proven: ReadLocks = ReadLocks.None,
+                                awaitSettle: Boolean = false):
 
   /** The store holds no copy: a live object never has a zero count */
   def isMissing: Boolean = refcount.count == 0

@@ -3425,7 +3425,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   /** A Frontend over a DeferredCommitBackend, with a cache that holds two empty data objects */
   def commitWindowFixture(cacheBytes: Long = 2 * HostObjectCache.EntryOverhead, crl: CrashRecoveryLog = new TestCrl,
-                          statusCache: TransactionStatusCache = new TransactionStatusCache())
+                          statusCache: TransactionStatusCache = new TransactionStatusCache(),
+                          wallClockMillis: () => Long = () => System.currentTimeMillis())
       : (Frontend, DeferredCommitBackend, StoreObjectCache, TestNet) =
     val backend = new DeferredCommitBackend
     populate(backend)
@@ -3434,7 +3435,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       backend.bootstrapAllocate(p.id, os.objectType, os.metadata, os.data)
     val cache = new HostObjectCache(cacheBytes).forStore(storeId)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, loadedAt = FrontendSuite.longLoaded)
+    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, loadedAt = FrontendSuite.longLoaded,
+                                wallClockMillis = wallClockMillis)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, backend, cache, net)
 
@@ -3810,6 +3812,72 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val done = Promise[ReconcileResult]()
     frontend.reconcileForRepair(repairSnapshot(frontend, op1), newerRepairState(), done)
     done.future.value.get.get.stale shouldBe true
+    backend.repairs shouldBe 0
+  }
+
+  // Repair F8: a repair asked to wait for its object to settle parks while the object is busy
+  test("a repair asked to wait for its object to settle installs once the in-flight commit completes") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, op1).copy(awaitSettle = true), newerRepairState(), done)
+    done.isCompleted shouldBe false
+    backend.repairs shouldBe 0
+
+    backend.deliverCommits()
+    val result = done.future.value.get.get
+    result.complete shouldBe true
+    result.changed shouldBe true
+    backend.repairs shouldBe 1
+    backend.m(oid1).metadata.revision shouldBe ObjectRevision(txid2)
+  }
+
+  test("a parked repair over a part the completing commit changed answers stale and writes nothing") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    // Taken before the commit: the commit changes the revision the snapshot recorded
+    val snapshot = repairSnapshot(frontend, op1)
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(snapshot.copy(awaitSettle = true), newerRepairState(), done)
+    done.isCompleted shouldBe false
+    backend.deliverCommits()
+    done.future.value.get.get.stale shouldBe true
+    backend.repairs shouldBe 0
+  }
+
+  test("a parked repair whose object never settles answers stale at its deadline") {
+    val now = new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+    val (frontend, backend, _, net) = commitWindowFixture(wallClockMillis = () => now.get)
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, op1).copy(awaitSettle = true), newerRepairState(), done)
+    frontend.expireParkedRepairs()
+    done.isCompleted shouldBe false
+
+    now.addAndGet(Frontend.RepairSettleWait.toMillis)
+    frontend.expireParkedRepairs()
+    done.future.value.get.get.stale shouldBe true
+    // The commit completing later finds nothing parked
+    backend.deliverCommits()
+    backend.repairs shouldBe 0
+  }
+
+  test("fail-stop fails a parked repair") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, op1).copy(awaitSettle = true), newerRepairState(), done)
+    frontend.failStop("test")
+    done.future.value.get.isFailure shouldBe true
     backend.repairs shouldBe 0
   }
 

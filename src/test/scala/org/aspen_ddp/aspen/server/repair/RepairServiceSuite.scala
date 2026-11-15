@@ -45,8 +45,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
     val maxInFlight = AtomicInteger(0)
     val scanned = AtomicInteger(0)
 
-    override protected def scanStore(storeId: StoreId,
-                                     policy: RepairPolicy): Future[ScanResult] =
+    override protected def scanStore(storeId: StoreId, policy: RepairPolicy, control: ScanControl): Future[ScanResult] =
       if failFor.contains(storeId) then
         Future.failed(RuntimeException(s"scan of $storeId failed"))
       else
@@ -130,8 +129,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
     class FindingService extends RepairService(client, HostId.BootstrapHostId, FixedTarget(),
                                                BackgroundTaskManager.NoBackgroundTaskManager,
                                                () => clock.get):
-      override protected def scanStore(storeId: StoreId,
-                                       policy: RepairPolicy): Future[ScanResult] =
+      override protected def scanStore(storeId: StoreId, policy: RepairPolicy, control: ScanControl): Future[ScanResult] =
         Future.successful(ScanResult(seen = 3, repaired = 2, deferred = 1))
 
     val svc = FindingService()
@@ -162,7 +160,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
     class RecordingService extends RepairService(client, HostId.BootstrapHostId, Target(),
                                                  BackgroundTaskManager.NoBackgroundTaskManager, () => clock.get):
       @volatile var seen: List[(StoreId, DeferralState)] = Nil
-      override protected def scanStore(storeId: StoreId, policy: RepairPolicy): Future[ScanResult] =
+      override protected def scanStore(storeId: StoreId, policy: RepairPolicy, control: ScanControl): Future[ScanResult] =
         synchronized { seen = (storeId -> deferralOf(storeId)) :: seen }
         Future.successful(ScanResult.Empty)
 
@@ -192,8 +190,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
       override protected def scanDeadline: FiniteDuration =
         FiniteDuration(50, MILLISECONDS)
 
-      override protected def scanStore(storeId: StoreId,
-                                       policy: RepairPolicy): Future[ScanResult] =
+      override protected def scanStore(storeId: StoreId, policy: RepairPolicy, control: ScanControl): Future[ScanResult] =
         if storeId == storeIds.head then Promise[ScanResult]().future
         else Future.successful(ScanResult.Empty)
 
@@ -213,6 +210,50 @@ class RepairServiceSuite extends IntegrationTestSuite:
       svc.cancel()
       bgTasks.shutdown(FiniteDuration(2, SECONDS))
 
+  /** One store whose scans hang until their deadline, having seen entries when `sawEntries` */
+  private class TimingOutService(clock: AtomicLong, bgTasks: BackgroundTaskManager, sawEntries: Boolean)
+    extends RepairService(client, HostId.BootstrapHostId,
+                          new FixedTarget { override def repairableStoreIds: List[StoreId] = List(metadataStore) },
+                          bgTasks, () => clock.get):
+    @volatile var controls: List[ScanControl] = Nil
+    @volatile var deferralsSeen: List[DeferralState] = Nil
+    override protected def scanDeadline: FiniteDuration = FiniteDuration(50, MILLISECONDS)
+    override protected def scanStore(storeId: StoreId, policy: RepairPolicy, control: ScanControl): Future[ScanResult] =
+      synchronized:
+        controls = control :: controls
+        deferralsSeen = deferralOf(storeId) :: deferralsSeen
+      if sawEntries then control.sawEntry()
+      Promise[ScanResult]().future
+
+  private def timeOutTwice(sawEntries: Boolean): Future[(TimingOutService, ScanState)] =
+    val clock = AtomicLong(0L)
+    val bgTasks = BackgroundTaskManager(scala.concurrent.ExecutionContext.global)
+    val svc = TimingOutService(clock, bgTasks, sawEntries)
+    val f = for
+      _ <- svc.sweep()
+      _ = clock.set(60_000L)
+      _ <- svc.sweep()
+      _ = clock.set(10 * 60_000L)
+      _ <- svc.sweep()
+    yield (svc, svc.testingOnlyScanStates(metadataStore))
+    f.andThen: _ =>
+      svc.cancel()
+      bgTasks.shutdown(FiniteDuration(2, SECONDS))
+
+  test("a scan cut off by its deadline after seeing entries keeps the store at the floor and its deferrals (repair F9)"):
+    timeOutTwice(sawEntries = true).map: (svc, state) =>
+      state.currentInterval shouldBe RepairPolicy.Default.scanIntervalFloor
+      svc.controls.size shouldBe 2
+      svc.controls.map(_.cancelled) shouldBe List(true, true)
+      // Both scans shared one DeferralState: lock-deferral counts carry across timed-out scans
+      svc.deferralsSeen.distinct.size shouldBe 1
+      svc.testingOnlyDeferrals.get(metadataStore).exists(_ eq svc.deferralsSeen.head) shouldBe true
+
+  test("a scan cut off by its deadline before seeing any entry backs off"):
+    timeOutTwice(sawEntries = false).map: (svc, state) =>
+      svc.controls.map(_.cancelled) shouldBe List(true, true)
+      state.currentInterval shouldBe Duration(120, SECONDS)
+
   test("a metadata read that never completes does not wedge the sweep"):
     val clock = AtomicLong(0L)
     val bgTasks = BackgroundTaskManager(scala.concurrent.ExecutionContext.global)
@@ -225,8 +266,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
       override protected def readPolicy(poolId: PoolId): Future[RepairPolicy] =
         Promise[RepairPolicy]().future
 
-      override protected def scanStore(storeId: StoreId,
-                                       policy: RepairPolicy): Future[ScanResult] =
+      override protected def scanStore(storeId: StoreId, policy: RepairPolicy, control: ScanControl): Future[ScanResult] =
         Future.successful(ScanResult.Empty)
 
     val svc = HangingMetadataService()
@@ -254,13 +294,14 @@ class RepairServiceSuite extends IntegrationTestSuite:
                           new FixedTarget { override def repairableStoreIds: List[StoreId] = stores },
                           bgTasks, () => clock.get):
     @volatile var swept: List[StoreId] = Nil
+    @volatile var sweepControls: List[ScanControl] = Nil
 
     def touchDeferrals(storeId: StoreId): DeferralState = deferralOf(storeId)
 
     override protected def sweepDeadline: FiniteDuration = deadline
-    override protected def scanStore(storeId: StoreId, policy: RepairPolicy): Future[ScanResult] = scan
-    override protected def sweepStore(storeId: StoreId, policy: RepairPolicy): Future[SweepResult] =
-      synchronized { swept = storeId :: swept }
+    override protected def scanStore(storeId: StoreId, policy: RepairPolicy, control: ScanControl): Future[ScanResult] = scan
+    override protected def sweepStore(storeId: StoreId, policy: RepairPolicy, control: ScanControl): Future[SweepResult] =
+      synchronized { swept = storeId :: swept; sweepControls = control :: sweepControls }
       sweepOf
 
   private val bootstrapStore = StoreId(PoolId.BootstrapPoolId, 0)
@@ -295,19 +336,20 @@ class RepairServiceSuite extends IntegrationTestSuite:
       svc.testingOnlyScanStates(bootstrapStore).currentInterval shouldBe
         RepairPolicy.Default.scanIntervalFloor * 2
 
-  test("a sweep cut off by its deadline keeps the store at the floor and drops its deferrals"):
+  test("a sweep cut off by its deadline keeps the store at the floor and keeps its deferrals"):
     val clock = AtomicLong(0L)
     val bgTasks = BackgroundTaskManager(scala.concurrent.ExecutionContext.global)
     val svc = SweepingService(clock, List(bootstrapStore), Future.successful(ScanResult.Empty),
                               Promise[SweepResult]().future, bgTasks, FiniteDuration(50, MILLISECONDS))
     val f = for
       _ <- svc.sweep()
-      _ = svc.touchDeferrals(bootstrapStore)
+      kept = svc.touchDeferrals(bootstrapStore)
       _ = clock.set(60_000L)
       _ <- svc.sweep()
     yield
       svc.testingOnlyScanStates(bootstrapStore).currentInterval shouldBe RepairPolicy.Default.scanIntervalFloor
-      svc.testingOnlyDeferrals.keySet should not contain bootstrapStore
+      svc.testingOnlyDeferrals.get(bootstrapStore).exists(_ eq kept) shouldBe true
+      svc.sweepControls.headOption.exists(_.cancelled) shouldBe true
     f.andThen: _ =>
       svc.cancel()
       bgTasks.shutdown(FiniteDuration(2, SECONDS))

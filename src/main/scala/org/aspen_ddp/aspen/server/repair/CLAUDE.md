@@ -30,10 +30,15 @@
   pruned by `retainSweep` after a complete walk). It creates and deletes no entries; an unreadable node counts as
   incomplete. `SweepResult.needsAnotherPass` is true when anything was reconciled or left incomplete, or a walk
   missed nodes
+- A scan or sweep cut off by its deadline (`ScanTimedOut`, `SweepTimedOut`) has its `ScanControl` cancelled: it starts
+  no further entry or node, and skips `retain`/`retainSweep` and the orphan pass's `confirmOrphans`, so the store
+  keeps its DeferralState (repair F9). A timed-out scan counts as having found entries if it had seen any
+  (`ScanControl.sawEntries`): a backlog keeps the store at the floor, while a scan that reached no entry backs off. A
+  reconcile in flight at the cancel still records, which can bring a proof one pass early
 - `RepairService.scanOne` runs the sweep for a store of the bootstrap pool right after its entry scan settles (success
-  or failure), under its own deadline (`SweepDeadline`, 90 s; `SweepTimedOut` drops the store's DeferralState as
-  `ScanTimedOut` does). The store's pacing is advanced with `foundEntries || sweep.needsAnotherPass`: a failed or
-  timed-out sweep counts as needing another pass (unlike a failed entry scan), so the store stays at
+  or failure), under its own deadline (`SweepDeadline`, 90 s). The store's pacing is advanced with
+  `foundEntries || sweep.needsAnotherPass`: a failed or timed-out sweep counts as needing another pass (unlike a
+  failed entry scan; a timed-out one counts as found if it had seen entries), so the store stays at
   `scanIntervalFloor` until its trees converge and a clean sweep lets it back off to `scanIntervalCap`. A node
   skipped because the store stopped being repairable here counts as incomplete too. A missed untracked write is
   therefore healed within about one cap interval (Backlog.txt "Bootstrap tree sweep staleness window"). While the
@@ -45,6 +50,14 @@
   deletes no entry, so the ownership fence and `mayJoinTransaction` do not apply. `complete` clears the quarantine
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
+- A proof cannot help a `stale` pass (the store's own copy is busy or changed), so stale passes escalate by waiting
+  (repair F8): `DeferralState.recordStale` counts them per entry, and from `StoreRepairer.ParkAfterStalePasses` (3)
+  on the repair sets `RepairSnapshot.awaitSettle`, so the store parks the reconcile until the object settles (up to
+  1 s; `server/store/CLAUDE.md`). Every `proofAfterDeferrals` stale passes in a row log a warning. The bootstrap
+  sweep (no proofs) neither counts nor parks
+- The completion gate (`read.timestamp >= missedTimestamp`) is sound (repair F3, X7): object timestamps never
+  decrease, and a copied one (Reconcile, rebuild) is a read's, the max over the stores matching its revision, so a
+  read that reflects the missed transaction passes it
 - Absence from the AllocationTree is not a deletion (repair F5): it may be an AllocationFinalizationAction running
   late. For an entry older than `RepairPolicy.minErrorEntryAgeForDeletion` (60 s), `repairAbsent` reads the object
   through its pool, using the entry's pointer (an UnackedCommits entry's own, or one rebuilt from an ErrorTree value,

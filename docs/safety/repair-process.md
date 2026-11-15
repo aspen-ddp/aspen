@@ -528,7 +528,9 @@ applies. If any proof of a group fails, the object-level group is entirely unpro
 ### 8.3 What a proof cannot do
 
 - It cannot help a `stale` outcome (`DeferralState` comment, `:36-43`): `stale` means the store's own copy is busy or
-  moved. Nothing escalates a persistently `stale` object (F8).
+  moved. A persistently `stale` object escalates differently (F8, FIXED 2026-11-15): after
+  `StoreRepairer.ParkAfterStalePasses` (3) stale passes in a row the store parks the reconcile until the object
+  settles (`RepairSnapshot.awaitSettle`).
 - It proves revision equality, not equality of min/max/left/right (F11).
 
 ---
@@ -668,9 +670,9 @@ Numbered for review; the code that enforces each is in section 7. "Holds" means 
 | E10 | An entry whose repair fails (read fails, promise fails, store left, backend write fails, `stale`, any deferral) stays. | Holds |
 | E11 | A UnackedCommits entry is not acted on while the store holds that transaction live or is loading CRL state. | Holds (M11) |
 | E12 | Repair transactions never create new entries. | Holds for proofs and entry deletions; the cost is F7 |
-| E13 | A complete result implies the read was not older than the entry's `missedTimestamp`. | Holds, but the converse (an in-sync store always completes) does not (F3) |
+| E13 | A complete result implies the read was not older than the entry's `missedTimestamp`. | Holds. The converse (a read that reflects the missed transaction passes the gate) holds since object timestamps are monotone (F3, FIXED 2026-11-15) |
 | E14 | Missing/failed metadata, policy, or limits never stops a scan: last-good or defaults are used. | Holds (`RepairService.scala:133-158`) |
-| E15 | Progress: for each entry whose object is reconcilable (no hot lock, no persistent stale), the scan removes it within a bounded number of passes. | Does not hold in general (F3, F8, F9) |
+| E15 | Progress: for each entry whose object is reconcilable (no hot lock, no persistent stale), the scan removes it within a bounded number of passes. | Holds since 2026-11-15 (F3, F8, F9 FIXED). Residual: an object whose copy changes under every install, or never settles within `Frontend.RepairSettleWait`, stays stale, now with a warning every `proofAfterDeferrals` passes (F8) |
 
 Assumptions the invariants rest on, to be checked by the reviewer: (A1) the lock set a store reports includes every
 transaction that has voted commit and not yet applied, for every locking requirement; (A2) a store that holds a
@@ -791,7 +793,9 @@ path. Safe.
 ### 12.8 ErrorTree unavailable (metadata pool degraded)
 
 - The tree walk or an `allocationTree.get` hangs: `withDeadline` fails the scan after 90 s (`ScanTimedOut`). The
-  abandoned walk keeps running in the background, DeferralState is discarded, the store's interval doubles (F9).
+  scan's `ScanControl` is cancelled, so the abandoned walk starts no further entry and prunes nothing. The store keeps
+  its DeferralState. A scan that had seen no entry backs off (interval doubles), as here; one cut off while working
+  through entries stays at the floor (F9, FIXED 2026-11-15).
 - The tree walk fails: logged, scan failed, treated as clean, interval doubles toward the 15 min cap.
 - Entry insert (marker): `retryUntilSuccessful`; the finalization action cannot complete, so the transaction is not
   forgotten: servers keep its state ("clog up", per CLAUDE.md). No entry is lost. A permanent error
@@ -840,12 +844,12 @@ completion gate are unchanged.
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
 | F1, F2 | unchanged | Opportunistic rebuild paths untouched | `Frontend.scala` rebuild path, `Tx.scala:429-441` |
-| F3 | **narrowed** 2026-11-14 | Applies take the max object timestamp (requirements F4); the gate still relies on copied timestamps (X7) | `RequirementsApplyer.apply` |
+| F3 | **narrowed** 2026-11-14 (**FIXED** 2026-11-15, see the note under F3) | Applies take the max object timestamp (requirements F4); the gate still relies on copied timestamps (X7) | `RequirementsApplyer.apply` |
 | F4 | **narrowed** | TKVL deletes now carry `KeyRevision(k, rev)`, so a delete of k at a store where k is absent fails at apply, is reported and marked instead of applying as an invisible no-op; blind deletes unchanged. *2026-11-14:* `TransactionBuilder` refuses blind deletes (`BlindKeyValueWrite`), so the invisible no-op needs a client that bypasses the builder | `KeyValueListNode.scala:505-506`; `RequirementsChecker.scala:141` |
 | F5 | unchanged (**FIXED** 2026-11-14, Todo 2.6, see the note under F5) | Absence heuristic unchanged at the time; the allocation action never skips an entry now (Ruling 28), which does not shorten its delay | `StoreRepairer.scala:249-256` |
 | F6 | unchanged (**FIXED** 2026-11-14, see 13.2) | `deleteObjectForRepair` untouched | |
 | F7 | unchanged | Entry deletions still untracked; `deleteEntry` now pins on `KeyRevision` of the value read | `StoreRepairer.scala` |
-| F8, F9 | unchanged (load larger) | More entries per store (R-N4 in transaction-recovery) | |
+| F8, F9 | unchanged (load larger) (**FIXED** 2026-11-15, see the notes under F8, F9) | More entries per store (R-N4 in transaction-recovery) | |
 | F10 | unchanged (reach widened) | Blind upsert kept (`PutRequirement.Blind`), and the batch is `replaySafe`, so a replayed or re-run batch also regresses entries (transaction-requirements Q-N5) | `MissedUpdateMarker.scala:145-148,165` |
 | F11-F15 | unchanged (F11, F13 **FIXED** 2026-11-14, see 13.2) | Not in the diff | |
 | N1, N2 | unchanged | Not in the diff | |
@@ -886,13 +890,13 @@ head first".
 |----|-------|----------|------------|
 | F1 | Opportunistic rebuild replaces `os.data` of a KeyValue object but not `os.kvState` | high if real | medium-high |
 | F2 | Opportunistic and pre-transaction rebuild overwrite whole KeyValue content when revisions are equal, regressing blind writes applied since the read | high if real | medium |
-| F3 | Completion gate `read.timestamp >= missedTimestamp` assumes monotone timestamps; blind KV writes and refcount updates break that | medium (livelock of one entry) | medium |
+| F3 | **FIXED** 2026-11-15 (timestamps monotone since 2026-11-14; tests). Completion gate `read.timestamp >= missedTimestamp` assumes monotone timestamps; blind KV writes and refcount updates break that | medium (livelock of one entry) | medium |
 | F4 | **FIXED** 2026-11-14 (stores refuse blind writes). A blind key delete applied as a no-op at the store between snapshot and install is invisible to the snapshot check, so repair re-creates the deleted key at that store | medium | medium |
 | F5 | **FIXED** 2026-11-14 (a read decides). `repairDelete` on allocation absence: object live but not yet in the AllocationTree for over 60 s loses the store's slice and the entry (unguarded delete) | medium impact, low probability | low-medium |
 | F6 | **FIXED** 2026-11-14. `repairDelete` has no in-flight/pending-read guard | low | low |
 | F7 | Repair's entry-deletion transaction has tracking disabled unconditionally, so a store missing it is never marked | low | medium |
-| F8 | `stale` outcomes never escalate: a hot or perpetually busy object is retried forever | medium (resource), low-medium | medium |
-| F9 | `ScanTimedOut` throws away deferral counts and doubles the interval while a backlog exists | low-medium | medium |
+| F8 | **FIXED** 2026-11-15 (park until settled). `stale` outcomes never escalate: a hot or perpetually busy object is retried forever | medium (resource), low-medium | medium |
+| F9 | **FIXED** 2026-11-15. `ScanTimedOut` throws away deferral counts and doubles the interval while a backlog exists | low-medium | medium |
 | F10 | **FIXED** 2026-11-14. Marker overwrite can replace a newer `missedTimestamp` with an older one | low | medium |
 | F11 | **FIXED** 2026-11-14 (stores refuse blind writes). Object-level proof is a `ExclusiveRevisionLock`; blind SetMin/SetMax/SetLeft/SetRight do not move the revision | low | low |
 | F12 | Reader ranks revisions by timestamp before count; timestamp bumps from refcount updates can make a stale revision win the ranking and stall reads | low (availability) | low |
@@ -946,6 +950,19 @@ Confidence: medium (depends on a blind-write workload and on the timing; the cod
 > transaction, transaction-requirements F4), so the scenario below no longer lowers it. The gate itself is unchanged:
 > it still trusts timestamps that rebuild and Reconcile copy from reads (X7), and Todo 4.5 keeps the post-install
 > equality option.
+
+> **FIXED 2026-11-15 (Todo 4.5).** The gate is kept. Copied timestamps cannot defeat it. Every object timestamp on a
+> store is one a transaction's apply set (the max of the current timestamp and the transaction's start), or one copied
+> from a read: Reconcile installs `read.timestamp` only when it is higher, and a rebuild writes it into a staging store.
+> A read's timestamp is the max over the stores matching its revision (`BaseObjectReader`), so a copied value is one
+> that some store really holds, and no store's timestamp ever decreases. When a read reflects the missed transaction T,
+> some matching store applied T, so the read's timestamp is at least T's start and the gate passes. When the read does
+> not reflect T, the entry rightly stays. Gating on post-install equality would be weaker: equality with a read says
+> nothing about whether the read includes T, and the timestamp is the only link to T. Tests: StoreRepairerSuite "an
+> entry for a blind write applied ahead of an earlier-started one completes in one pass (repair F3)" (fails with the
+> 2.2 max removed), and "an entry whose missed transaction started before the store's copied timestamp completes with
+> its content" (the store's timestamp copied by a repair install, as a rebuild's is). The rebuild path itself rests on
+> the argument: no end-to-end rebuild-then-repair test.
 `stale` is set when `os.timestamp < minTimestamp`, with `os.timestamp` = max over matching stores of the *last applied*
 transaction's start timestamp. Updates without a required revision (blind KeyValue inserts/deletes) never check the
 object timestamp (`RequirementsChecker.scala:220-226` is called only for revision-bearing requirements;
@@ -1044,6 +1061,26 @@ as described; low impact.
 > **Verification 2026-11-09: PLAUSIBLE. Severity: liveness.** unsettled/stale paths in Frontend.reconcile (Frontend.scala:~895-905) return stale without escalation; trigger needs a perpetually busy object.
 > *Fix sketch:* Count stale passes toward proofs, add backoff.
 
+> **FIXED 2026-11-15 (Todo 4.5).** A proof cannot help (8.3), so a stale result escalates by waiting instead.
+> `DeferralState.recordStale` counts an entry's consecutive stale passes. From `StoreRepairer.ParkAfterStalePasses`
+> (3) on, the repair sets `RepairSnapshot.awaitSettle`. A store whose object is then unsettled (a commit or repair
+> write in flight or held, a failed commit, a deletion, or holding for recovery) parks the reconcile instead of
+> answering stale. `Frontend.commitTurnFree` runs it first, at the one moment the object is settled: before any
+> waiting transaction is told, so before the next commit can start. The end of holding runs it too. It runs
+> through the ordinary snapshot-checked reconcile, so a part the completing commit changed still comes back stale,
+> and safety is unchanged. It runs once, and a parked repair that never sees its object settle answers stale after
+> `Frontend.RepairSettleWait` (1 s), checked on the store heartbeat. Fail-stop and close fail it. At most one is
+> parked per object. With nothing parked the commit path pays one empty-map check. Every `proofAfterDeferrals`
+> stale passes in a row log a warning naming the object.
+> Residual: an object whose copy changes under every install (a part the completing commit always touches), or one
+> that never settles (a failed commit stays until reload), is still retried every pass, now visibly, and a parked
+> repair holds its scan up to the deadline plus one heartbeat period.
+> Tests: FrontendSuite "a repair asked to wait for its object to settle installs once the in-flight commit
+> completes", "a parked repair over a part the completing commit changed answers stale and writes nothing", "a
+> parked repair whose object never settles answers stale at its deadline", "fail-stop fails a parked repair";
+> StoreRepairerSuite "a repair stale for several passes asks the store to wait for the object to settle, and
+> completes (repair F8)", "a pass that is not stale resets an entry's stale count".
+
 **F8. `stale` never escalates** (`StoreRepairer.scala:36-43,58-61`; `Frontend.scala:888-906`).
 `unsettled` and snapshot mismatches yield `stale`, which neither counts toward `proofAfterDeferrals` nor triggers a
 proof. For a DataObject the store's revision can only change by the store applying the chain, so staleness is
@@ -1055,6 +1092,20 @@ to the entry (the scan stays at the floor because `foundEntries` is true). Confi
 
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness (slower recovery).** ScanTimedOut is recovered as foundEntries=false, which doubles the interval, and DeferralState is dropped (RepairService.scala:189-203, ScanState.advance).
 > *Fix sketch:* Treat a timeout as 'found entries' and keep deferral counts.
+
+> **FIXED 2026-11-15 (Todo 4.5).** Each scan and bootstrap sweep gets a `ScanControl`. On its deadline
+> `RepairService` cancels it: the abandoned scan starts no further entry (or node), and skips `DeferralState.retain`,
+> `retainSweep` and the orphan pass's `confirmOrphans`, which only a scan that ran to its end may do. The store's
+> DeferralState is therefore kept, so lock-deferral counts carry across timed-out scans and an always-locked entry
+> reaches its proof. A timed-out scan that had seen an entry counts as having found entries (the store stays at the
+> floor). One that had seen none, its trees unreadable say, backs off as a failed scan does (12.8). Residual: a
+> reconcile in flight when the cancel lands still records its result, adding at most one pass to an entry's count (a
+> proof may come one pass early, which is safe), and a hung read stays outstanding in the background.
+> Tests: RepairServiceSuite "a scan cut off by its deadline after seeing entries keeps the store at the floor and its
+> deferrals (repair F9)", "a scan cut off by its deadline before seeing any entry backs off", "a sweep cut off by its
+> deadline keeps the store at the floor and keeps its deferrals"; StoreRepairerSuite "a scan cancelled part way
+> starts no further entry and keeps the store's deferral state (repair F9)", "a cancelled scan's orphan pass counts
+> toward no drop (repair F9)".
 
 **F9. Timed-out scans** (`RepairService.scala:194-200,235`; `ScanState.scala:34-38`).
 A scan that exceeds 90 s is counted as "found nothing", doubles the store's interval (toward 15 min), and its
@@ -1118,7 +1169,7 @@ which is then ignored by the revision check). Availability only. Confidence: low
 > **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica (narrow).** Reconcile.planData treats read.timestamp < current.timestamp as complete with no change (Reconcile.scala:151-153). A store that missed data write D but applied a later refcount update R2 that the read quorum has not yet applied has a higher timestamp than the read, so the miss is treated as caught up and the entry is dropped. Needs R2 committed but unapplied at the read quorum.
 > *Fix sketch:* Mark stale when the revision differs but timestamp is newer, and retry.
 
-> **Fixed 2026-11-14 (Todo 2.5).** `Reconcile.planData` reports a read older than the store with a differing revision as `stale`. The entry stays, and a later pass reads once the read quorum has applied the later refcount update. If the quorum still holds that update's locks, the read reports the object locked and it is deferred. Same revision still changes nothing. Test: ReconcileSuite "a DataObject's data is installed when its revision differs and the read is not older". A stale result that persists is Todo 4.5 (F8).
+> **Fixed 2026-11-14 (Todo 2.5).** `Reconcile.planData` reports a read older than the store with a differing revision as `stale`. The entry stays, and a later pass reads once the read quorum has applied the later refcount update. If the quorum still holds that update's locks, the read reports the object locked and it is deferred. Same revision still changes nothing. Test: ReconcileSuite "a DataObject's data is installed when its revision differs and the read is not older". A stale result that persists escalates since 2026-11-15 (F8).
 
 **F13. DataObject silent skip** (`Reconcile.scala:151-153`).
 `read.timestamp < current.timestamp` skips the data without marking stale, so the result is `complete` and the entry is

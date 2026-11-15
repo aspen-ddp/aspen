@@ -55,6 +55,24 @@ final case class SweepResult(nodes: Int, reconciled: Int, incomplete: Int, walkC
 object SweepResult:
   val Empty: SweepResult = SweepResult(0, 0, 0, walkComplete = true)
 
+/** One scan's (or sweep's) cancellation and progress, shared with whoever runs it (RepairService). A scan cut off by
+  * its deadline keeps running in the background, since a hung read cannot be interrupted: `cancel` makes it stop at
+  * the next entry or node, and skip the work that only a scan that ran to its end may do (pruning DeferralState,
+  * confirming orphan stubs). So the store's DeferralState can be kept for its next scan (repair F9). `sawEntries` is
+  * whether the scan had reached any entry by then: a scan cut off while working through a backlog is not quiet.
+  * Safe to use from any thread.
+  */
+final class ScanControl:
+  @volatile private var isCancelled = false
+  private val entries = AtomicInteger(0)
+
+  def cancel(): Unit = isCancelled = true
+  def cancelled: Boolean = isCancelled
+
+  /** Whether the scan has seen an entry of either tree */
+  def sawEntries: Boolean = entries.get > 0
+  private[repair] def sawEntry(): Unit = entries.incrementAndGet()
+
 /** Lock deferrals of one store's repair entries, and its suspected orphan stubs (`confirmOrphans`), kept in memory
   * across its scans by RepairService. A host restart forgets them: the next pass then reconciles each whole object
   * again and restarts the count, and an orphan stub needs two more scans to be dropped.
@@ -63,11 +81,29 @@ object SweepResult:
   * count: `deferredKeys` and `objectLevelDeferred`, the latter including a refcount deferred under an object lock. A
   * pass that is only `stale` defers nothing by a lock: the object is retried on the next pass, but the pass neither
   * counts toward `RepairPolicy.proofAfterDeferrals` nor triggers a proof, since a proof cannot help an object whose
-  * copy is busy with an outstanding write. Safe to call from any thread.
+  * copy is busy with an outstanding write. Stale passes are counted on their own (`recordStale`): after
+  * `StoreRepairer.ParkAfterStalePasses` in a row the store is asked to wait for the object to settle before
+  * reconciling (RepairSnapshot.awaitSettle, repair F8). Safe to call from any thread.
   */
 final class DeferralState:
 
   private var entries: Map[Key, DeferralState.Deferral] = Map()
+  private var stalePasses: Map[Key, Int] = Map()
+
+  /** Records whether one pass's final result was stale. Returns the count of consecutive stale passes, this one
+    * included, or 0 when it was not stale (the count then resets)
+    */
+  def recordStale(entryKey: Key, result: ReconcileResult): Int = synchronized:
+    if result.stale then
+      val count = stalePasses.getOrElse(entryKey, 0) + 1
+      stalePasses += entryKey -> count
+      count
+    else
+      stalePasses -= entryKey
+      0
+
+  /** Consecutive stale passes of the entry's object so far */
+  def staleCount(entryKey: Key): Int = synchronized(stalePasses.getOrElse(entryKey, 0))
 
   /** Records one pass's reconciliation of the entry's object. Returns the count of consecutive passes in which
     * something was deferred by a lock, this one included. It resets, and the entry is forgotten, when a pass defers
@@ -98,6 +134,7 @@ final class DeferralState:
 
   def clear(entryKey: Key): Unit = synchronized:
     entries -= entryKey
+    stalePasses -= entryKey
 
   /** The keys the next pass reconciles, when the last pass deferred only keys and left nothing else undone. None
     * means the whole object
@@ -110,8 +147,10 @@ final class DeferralState:
     * verification keys (verifyDeferralKey), which a complete verification clears
     */
   private[repair] def retain(entryKeys: Set[Key]): Unit = synchronized:
-    entries = entries.filter((k, _) =>
-      StoreRepairer.isSweepDeferralKey(k) || StoreRepairer.isVerifyDeferralKey(k) || entryKeys.contains(k))
+    def kept(k: Key): Boolean =
+      StoreRepairer.isSweepDeferralKey(k) || StoreRepairer.isVerifyDeferralKey(k) || entryKeys.contains(k)
+    entries = entries.filter((k, _) => kept(k))
+    stalePasses = stalePasses.filter((k, _) => kept(k))
 
   /** Forgets every sweep key not in `sweepKeys`: the nodes a complete sweep did not visit are gone */
   private[repair] def retainSweep(sweepKeys: Set[Key]): Unit = synchronized:
@@ -191,7 +230,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
             logger.warn(s"Abandoning repair scan of $storeId: its pool no longer records it on this host and device")
         owned
 
-  private final class Counts(val fence: OwnershipFence):
+  private final class Counts(val fence: OwnershipFence, val control: ScanControl):
     val seen = AtomicInteger(0)
     val repaired = AtomicInteger(0)
     val deferred = AtomicInteger(0)
@@ -207,9 +246,15 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     def touchedKeys: Set[Key] = synchronized(touched)
     def result: ScanResult = ScanResult(seen.get, repaired.get, deferred.get, unackedSeen.get)
 
-  def scan(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState = DeferralState()): Future[ScanResult] =
+  /** Scans the store once. `control` cancels it (RepairService, on its deadline): a cancelled scan starts no further
+    * entry and leaves `deferral` unpruned, so the next scan may share it. A reconcile in flight when it is cancelled
+    * still records its result, which can add one pass to an entry's lock-deferral count: a proof may come a pass
+    * early, which is safe
+    */
+  def scan(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState = DeferralState(),
+           control: ScanControl = ScanControl()): Future[ScanResult] =
     val fence = OwnershipFence(storeId)
-    val counts = Counts(fence)
+    val counts = Counts(fence, control)
 
     // Both trees' keys start with the poolIndex, so one store's entries are the half-open range [poolIndex,
     // poolIndex+1).
@@ -230,7 +275,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                  repairUnackedEntry(pool, storeId, policy, deferral, counts))
           _ <- dropOrphanStubs(pool, storeId, stubs, deferral, counts)
         yield
-          deferral.retain(counts.touchedKeys)
+          // A cancelled scan did not see every entry it would have: pruning by what it touched would drop live ones
+          if !control.cancelled then deferral.retain(counts.touchedKeys)
           counts.result
 
   /** Reconciles the store's copy of every node of the bootstrap pool's own errorTree, then of its unackedCommitsTree,
@@ -255,7 +301,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     repairUpdate(storeId, ptr, minTimestamp, StoreRepairer.verifyDeferralKey(ptr.id), policy, deferral,
       allowProof = true)
 
-  def sweepBootstrapTrees(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState): Future[SweepResult] =
+  def sweepBootstrapTrees(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState,
+                          control: ScanControl = ScanControl()): Future[SweepResult] =
     if storeId.poolId != PoolId.BootstrapPoolId then
       Future.failed(new IllegalArgumentException(s"Only stores of the bootstrap pool are swept, not $storeId"))
     else
@@ -265,8 +312,9 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       var sweepKeys = Set[Key]()
 
       def sweepNode(tier: Int, pointer: KeyValueObjectPointer): Future[Unit] =
-        if abandoned(storeId) then
-          // Not repairable here, which may be only until the next tick (offline, rebuilding): the node was not swept
+        if control.cancelled || abandoned(storeId) then
+          // Cut off by its deadline, or not repairable here, which may be only until the next tick (offline,
+          // rebuilding): the node was not swept
           incomplete.incrementAndGet()
           Future.unit
         else
@@ -294,7 +342,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
             unackedWalk <- pool.unackedCommitsTree.foreachNode(sweepNode)
           yield
             val walkComplete = errorWalk.complete && unackedWalk.complete
-            if walkComplete && !abandoned(storeId) then deferral.retainSweep(synchronized(sweepKeys))
+            if walkComplete && !control.cancelled && !abandoned(storeId) then
+              deferral.retainSweep(synchronized(sweepKeys))
             val result = SweepResult(nodes.get, reconciled.get, incomplete.get, walkComplete)
             if result.needsAnotherPass then
               logger.info(s"Swept the bootstrap trees' nodes on $storeId: $result")
@@ -330,9 +379,12 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           pool.unackedCommitsTree.get(UnackedCommitEntry.key(storeId, txid)).map: entry =>
             if entry.isEmpty then orphans + txid else orphans
       found.map: orphans =>
-        deferral.confirmOrphans(orphans).foreach: txid =>
-          logger.info(s"Dropping the applied stub of $txid on $storeId: two scans found no UnackedCommits entry for it")
-          target.dropAppliedStub(storeId, txid)
+        // Cancelled during the lookups: only a scan that ran to its end may count as one of the two
+        if !counts.control.cancelled then
+          deferral.confirmOrphans(orphans).foreach: txid =>
+            logger.info(s"Dropping the applied stub of $txid on $storeId: two scans found no UnackedCommits entry " +
+                        "for it")
+            target.dropAppliedStub(storeId, txid)
 
   /** Whether the pool's entry for the store names this host and the device the store is loaded from here, read
     * fresh. A store with no device here is not owned
@@ -363,8 +415,9 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       else
         Future.successful(false)
 
-  /** As `abandoned`, or the scan's fence found the store owned elsewhere */
-  private def abandoned(storeId: StoreId, counts: Counts): Boolean = counts.fence.lost || abandoned(storeId)
+  /** As `abandoned`, or the scan's fence found the store owned elsewhere, or the scan was cancelled */
+  private def abandoned(storeId: StoreId, counts: Counts): Boolean =
+    counts.control.cancelled || counts.fence.lost || abandoned(storeId)
 
   /** The store left this host mid-scan. foreachInRange has no early exit so the remaining tree-node reads still
     * happen, but those are cheap next to the per-object read and transactions each remaining entry would otherwise
@@ -390,6 +443,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       // log the failure and continue.
       Future.unit.flatMap: _ =>
         counts.seen.incrementAndGet()
+        counts.control.sawEntry()
         val objectId = decodeObjectId(key)
         val errorEntry = MissedUpdateFinalizationAction.decodeErrorEntry(value.value)
         val entryKey = errorDeferralKey(key, value.revision)
@@ -458,6 +512,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     else
       Future.unit.flatMap: _ =>
         counts.unackedSeen.incrementAndGet()
+        counts.control.sawEntry()
         val txid = UnackedCommitEntry.decodeTransactionId(key)
         counts.sawUnacked(txid)
         if target.holdsTransaction(storeId, txid) then
@@ -600,7 +655,9 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       taken <- snapshot.future
       // Narrowing to the deferred keys serves proofs. Without them (the sweep) every pass reconciles the whole object:
       // a later untracked write the store missed records nothing, so `complete` must mean the whole copy matches
-      snap = taken.copy(only = if allowProof then deferral.deferredKeys(entryKey) else None)
+      // An object stale for several passes in a row has a busy copy here: the store waits for it to settle
+      snap = taken.copy(only = if allowProof then deferral.deferredKeys(entryKey) else None,
+                        awaitSettle = allowProof && deferral.staleCount(entryKey) >= ParkAfterStalePasses)
       // A full read: only full reads report the stores' locks
       os <- readObject(ptr)
       _ <- testingOnlyBeforeReconcile(storeId, ptr)
@@ -619,6 +676,11 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
               deferral.afterProof(entryKey, afterProof)
               afterProof
     yield
+      if allowProof then
+        val stale = deferral.recordStale(entryKey, result)
+        if stale >= policy.proofAfterDeferrals && stale % policy.proofAfterDeferrals == 0 then
+          logger.warn(s"Repair of object ${ptr.id} on store $storeId has been stale for $stale passes in a row: its " +
+                      s"copy there stays busy, or changes under every install")
       if result.complete then
         // A sweep's node that was already converged is the common case
         if allowProof || result.changed then
@@ -707,6 +769,12 @@ object StoreRepairer:
 
   /** How long a scan may rely on one read of the pool's entry for its store before an entry delete reads it again */
   val OwnershipRecheck: FiniteDuration = 1.second
+
+  /** Consecutive stale passes after which a repair asks the store to wait for the object to settle before
+    * reconciling it (RepairSnapshot.awaitSettle, repair F8). A stale pass is usually a commit that happened to be in
+    * flight, which the next pass misses, so waiting is kept for an object whose copy stays busy
+    */
+  val ParkAfterStalePasses: Int = 3
 
   /** The DeferralState key of an errorTree entry: the entry's key and value revision. A store that misses another
     * update rewrites the entry, and the rewritten entry starts over with its whole object

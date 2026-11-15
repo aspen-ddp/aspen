@@ -153,6 +153,13 @@
   `server/host/CLAUDE.md`
 - `Reconcile` (exact repair install): `server/repair/CLAUDE.md`; `ReconcileResult.changed` is true only when the
   install was applied (every deferred, stale or no-op path reports false)
+- Parked repairs (repair F8): a reconcile whose `RepairSnapshot.awaitSettle` is set, finding its object unsettled (a
+  commit or repair write in flight or held, a failed commit, a deletion, holding for recovery), waits in
+  `parkedRepairs` (at most one per object, a newer one answers the older stale) instead of answering stale.
+  `commitTurnFree` runs it before telling any waiting transaction, so at a settled moment before the next commit
+  starts, and `releaseHeldMessages` runs all of them when holding ends. It runs once, through `reconcileForRepair`
+  with `awaitSettle` off. Past `Frontend.RepairSettleWait` (1 s, `expireParkedRepairs` on the store heartbeat) it
+  answers stale. Fail-stop and close fail it
 - `deleteObjectForRepair` refuses (`Frontend.RepairDeleteDeferred`) while the store holds for recovered transactions or
   the object has a pending backend read, a commit, repair write or deletion in flight, or a transaction referencing
   it (repair F6); while its backend removal is outstanding the object counts in `deleting`, so reads, snapshots and

@@ -59,15 +59,17 @@ class RepairService(client: AspenClient,
 
   def cancel(): Unit = sweepTask.cancel()
 
-  /** Overridable so tests can count concurrency without doing I/O. */
-  protected def scanStore(storeId: StoreId, policy: RepairPolicy): Future[ScanResult] =
-    repairer.scan(storeId, policy, deferralOf(storeId))
+  /** Overridable so tests can count concurrency without doing I/O. `control` is cancelled when the scan's deadline
+    * passes
+    */
+  protected def scanStore(storeId: StoreId, policy: RepairPolicy, control: ScanControl): Future[ScanResult] =
+    repairer.scan(storeId, policy, deferralOf(storeId), control)
 
   /** Overridable like scanStore. Sweeps the bootstrap pool's tree nodes. A sweep that skipped nodes because the store
     * stopped being repairable here reports needsAnotherPass = true: the store may be repairable again at the next tick.
     */
-  protected def sweepStore(storeId: StoreId, policy: RepairPolicy): Future[SweepResult] =
-    repairer.sweepBootstrapTrees(storeId, policy, deferralOf(storeId))
+  protected def sweepStore(storeId: StoreId, policy: RepairPolicy, control: ScanControl): Future[SweepResult] =
+    repairer.sweepBootstrapTrees(storeId, policy, deferralOf(storeId), control)
 
   /** Verifies a quarantined object of a store (StoreRepairer.verifyObject): true once the store's copy matches a read at
     * least `minTimestamp`. Bounded by VerifyDeadline, since a read of an unavailable object never settles
@@ -208,10 +210,11 @@ class RepairService(client: AspenClient,
     */
   private def scanOne(storeId: StoreId): Future[Unit] =
     val policy = policyOf(storeId.poolId)
+    val scanControl = ScanControl()
 
     val fFound = Future.unit
       .flatMap(_ => withDeadline(scanDeadline, ScanTimedOut(storeId, scanDeadline)):
-        scanStore(storeId, policy))
+        scanStore(storeId, policy, scanControl))
       .map: result =>
         if result.foundEntries then
           logger.info(s"Repair scan of $storeId: ${result.seen} seen, ${result.unackedSeen} UnackedCommits " +
@@ -220,12 +223,13 @@ class RepairService(client: AspenClient,
 
     val recovered = fFound.recover:
       case t: ScanTimedOut =>
-        // The abandoned scan keeps running and recording deferrals. The next scan gets a fresh DeferralState rather
-        // than share one with it, losing the counts as a host restart does
-        synchronized:
-          deferrals -= storeId
+        // The cut-off scan stops at its next entry and prunes nothing, so the store keeps its DeferralState: lock
+        // deferral counts carry over to the next scan, which a proof needs when scans keep timing out. A scan cut off
+        // while working through entries found some, and the store stays at the floor: its backlog is what made it
+        // slow. One that had reached none (its pool's trees unreadable) backs off like a failed scan (repair F9)
+        scanControl.cancel()
         logger.warn(s"Repair scan of $storeId failed: $t")
-        false
+        scanControl.sawEntries
       case t: Throwable =>
         logger.warn(s"Repair scan of $storeId failed: $t")
         false
@@ -237,14 +241,15 @@ class RepairService(client: AspenClient,
       if storeId.poolId != PoolId.BootstrapPoolId then
         Future.successful(false)
       else
+        val sweepControl = ScanControl()
         Future.unit
           .flatMap(_ => withDeadline(sweepDeadline, SweepTimedOut(storeId, sweepDeadline)):
-            sweepStore(storeId, policy))
+            sweepStore(storeId, policy, sweepControl))
           .map(_.needsAnotherPass)
           .recover:
             case t: SweepTimedOut =>
-              synchronized:
-                deferrals -= storeId
+              // As for a cut-off scan: it stops at its next node and the DeferralState is kept
+              sweepControl.cancel()
               logger.warn(s"Repair sweep of $storeId failed: $t")
               true
             case t: Throwable =>
@@ -279,8 +284,9 @@ object RepairService:
     * holding one of the few concurrent scan slots. A deadline close to the cap would let a
     * handful of stores in an unreachable pool collapse host-wide scan throughput and eventually
     * trip StallAfter under exactly the conditions this service exists to tolerate. An interrupted
-    * scan loses no completed work: every repaired entry is deleted as it goes, and the next scan
-    * resumes from the tree head.
+    * scan loses no completed work: every repaired entry is deleted as it goes, the store keeps its
+    * DeferralState, and the next scan resumes from the tree head. The interrupted scan is cancelled
+    * (ScanControl) and starts no further entry.
     */
   val ScanDeadline: FiniteDuration = FiniteDuration(90, SECONDS)
 

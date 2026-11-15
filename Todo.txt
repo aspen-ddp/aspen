@@ -48,13 +48,6 @@ PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.5  Repair livelock: Repair F3, F8, F9, X7                                                                 [S-M]
-     F3/X7: applies are now monotone (2.2, done 2026-11-14), but the gate still trusts timestamps that rebuild
-            and Reconcile copy from reads. Consider gating on post-install equality.
-     F8: stale outcomes never escalate. Count them, and escalate to a proof after N.
-     F9: a timed-out scan discards deferral state and doubles the interval. Keep the state, and treat the
-         timeout as "found entries".
-
 4.6  Stub accumulation: CRL F22, RP-N6                                                                      [S-M]
      A stalled scan lets stubs grow against device admission (~4.5 M per device). Cap stubs per store and fall
      back to the case-3 lookup.

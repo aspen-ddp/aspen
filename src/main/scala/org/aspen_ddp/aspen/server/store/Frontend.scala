@@ -35,6 +35,12 @@ object Frontend {
     */
   val MissingDataWait: Duration = Duration(5, SECONDS)
 
+  /** How long a repair reconcile may wait for its object to settle (RepairSnapshot.awaitSettle, repair F8). Checked
+    * on the store's heartbeat, so a parked repair that never sees its object settle answers stale up to a heartbeat
+    * period later
+    */
+  val RepairSettleWait: FiniteDuration = FiniteDuration(1, SECONDS)
+
   /** How long a UnackedCommits lookup may go unanswered before the store heartbeat makes another. An answer can be
     * lost: one completing before its store is installed in the StoreRouter is dropped
     */
@@ -446,9 +452,13 @@ class Frontend(val storeId: StoreId,
     */
   private def commitTurnFree(oid: ObjectId): Unit =
     if !txCommitsInFlight.contains(oid) then
-      heldCommits.get(oid) match
-        case Some(next :: _) => next.commitPersisted(oid)
-        case _ => commitWaiters.remove(oid).foreach(_.foreach(_.commitPersisted(oid)))
+      // A parked repair goes first, at the one moment the object is settled: told first, a waiting transaction would
+      // start the next commit. A repair write it starts takes the turn, and its completion passes it on
+      retryParkedRepair(oid)
+      if !txCommitsInFlight.contains(oid) then
+        heldCommits.get(oid) match
+          case Some(next :: _) => next.commitPersisted(oid)
+          case _ => commitWaiters.remove(oid).foreach(_.foreach(_.commitPersisted(oid)))
 
   /** Outstanding backend commits, oldest first. Each holds a reference to its state (see retain) from commit until
     * the backend reports it complete, so the state is served and checked from memory rather than read from a backend
@@ -466,6 +476,17 @@ class Frontend(val storeId: StoreId,
     * meanwhile may return the state such a commit replaces, so it is never cached. See backendReadComplete
     */
   private val committing = scala.collection.mutable.HashMap[ObjectId, List[ObjectState]]()
+
+  /** A repair reconcile waiting for its object to settle (RepairSnapshot.awaitSettle, repair F8), until `until`
+    * (wallClockMillis)
+    */
+  private final class ParkedRepair(val snapshot: RepairSnapshot, val read: ClientObjectState,
+                                   val p: Promise[ReconcileResult], val until: Long)
+
+  /** At most one per object: one scan repairs an object at a time, and a newer request replaces an older one.
+    * Declared before the constructor's recovery, which can release held messages (releaseHeldMessages)
+    */
+  private val parkedRepairs = scala.collection.mutable.HashMap[ObjectId, ParkedRepair]()
   private val commitStage = s"store commit (${backend.getClass.getSimpleName})"
 
   /** A transaction's backend commits on this store, made through commit.
@@ -899,6 +920,7 @@ class Frontend(val storeId: StoreId,
 
   private def releaseHeldMessages(): Unit =
     if !holding then
+      parkedRepairs.keys.toList.foreach(retryParkedRepair)
       val held = heldMessages.reverse
       heldMessages = Nil
       held.foreach(handleTransactionMessage)
@@ -1005,6 +1027,7 @@ class Frontend(val storeId: StoreId,
   /** Closes the store. Its entries stay live in the CRL unless the closer takes them out, so what its transactions
     * were admitted for stays counted, retained for the store (CrlAdmission.retain) */
   def close(): Future[Unit] =
+    failParkedRepairs()
     // A stub not yet durable has not replaced its transaction's state: that stays counted too
     admission.retain(storeId, admitted.valuesIterator.map(_.bytes).sum + stubReplacedAdmissions.valuesIterator.sum +
       stubBytesCharged)
@@ -1166,6 +1189,7 @@ class Frontend(val storeId: StoreId,
   def failStop(reason: String): Unit =
     if !stopped then
       stopped = true
+      failParkedRepairs()
       logger.error(s"Store $storeId fail-stops: $reason. It handles nothing more and will be rebuilt")
       onFailStop(new IllegalStateException(s"Store $storeId fail-stopped: $reason"))
 
@@ -1503,10 +1527,46 @@ class Frontend(val storeId: StoreId,
         // uncached load is the store's state
         case Some(os) => referenced.get(objectId).exists(r => !(r eq os)) || served.exists(c => !(c eq os))
         case None => served.nonEmpty)
-    if unsettled then
+    if unsettled && snapshot.awaitSettle && !stopped then
+      parkRepair(snapshot, read, p)
+    else if unsettled then
       p.success(ReconcileResult(Set(), false, stale = true))
     else
       reconcileSettled(snapshot, read, p, loaded)
+
+  private def parkRepair(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult]): Unit =
+    val objectId = read.pointer.id
+    parkedRepairs.remove(objectId).foreach(_.p.trySuccess(ReconcileResult(Set(), false, stale = true)))
+    logger.trace(s"Store $storeId: repair of $objectId waits for the object to settle")
+    parkedRepairs(objectId) = ParkedRepair(snapshot, read, p, wallClockMillis() + Frontend.RepairSettleWait.toMillis)
+
+  /** Whether `objectId` has none of the in-flight work that makes a repair of it unsettled. The served-state check
+    * of reconcile is made again when the parked repair runs
+    */
+  private def settledForRepair(objectId: ObjectId): Boolean =
+    !(holding || commitInFlight(objectId) || commitFailed(objectId) || committing.contains(objectId) ||
+      deleting.contains(objectId))
+
+  /** Runs the repair parked on `objectId` once the object is settled. It runs once: still unsettled then (the store
+    * serves another state, say), it answers stale
+    */
+  private def retryParkedRepair(objectId: ObjectId): Unit =
+    if parkedRepairs.nonEmpty && settledForRepair(objectId) then
+      parkedRepairs.remove(objectId).foreach: parked =>
+        reconcileForRepair(parked.snapshot.copy(awaitSettle = false), parked.read, parked.p)
+
+  /** Answers stale every parked repair past its deadline. Called on the store's heartbeat */
+  def expireParkedRepairs(): Unit =
+    if parkedRepairs.nonEmpty then
+      val now = wallClockMillis()
+      parkedRepairs.filter((_, parked) => parked.until <= now).foreach: (objectId, parked) =>
+        parkedRepairs.remove(objectId)
+        parked.p.trySuccess(ReconcileResult(Set(), false, stale = true))
+
+  private def failParkedRepairs(): Unit =
+    val parked = parkedRepairs.values.toList
+    parkedRepairs.clear()
+    parked.foreach(_.p.tryFailure(new IllegalStateException(s"Store $storeId stopped")))
 
   private def reconcileSettled(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult],
                                loaded: Option[ObjectState]): Unit =

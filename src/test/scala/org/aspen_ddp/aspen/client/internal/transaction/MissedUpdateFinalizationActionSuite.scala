@@ -336,7 +336,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     // two of each per write, and two writes
     val marker = new ObservedMarker(maxEntries = 2)
     val updates = List.fill(3)(missed(net.storeId0))
-    val entry = UnackedCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
+    val entry = UnackedCommitEntry(missedTimestamp, None, List(pointerWith(Array[Byte](3))))
     val txids = List.fill(3)(TransactionId(UUID.randomUUID()))
     val unacked = txids.map(MissedUnackedCommit(net.storeId0, _, entry))
 
@@ -446,7 +446,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entries <- unackedEntries(Radicle.poolId, txd.transactionId)
     yield
       entries shouldBe Map(UnackedCommitEntry.key(net.storeId2, txd.transactionId) ->
-        UnackedCommitEntry(txd.startTimestamp, List(ptr)))
+        UnackedCommitEntry(txd.startTimestamp, None, List(ptr)))
 
   /** Marks `txd` as a driver that counted `voters` reports them, with every store in `commitErrors` having replied */
   private def runMarkWithVoters(txd: TransactionDescription, voters: Set[StoreId],
@@ -508,7 +508,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entries <- unackedEntries(Radicle.poolId, txd.transactionId)
     yield
       entries shouldBe Map(UnackedCommitEntry.key(net.storeId1, txd.transactionId) ->
-        UnackedCommitEntry(txd.startTimestamp, List(ptr)))
+        UnackedCommitEntry(txd.startTimestamp, None, List(ptr)))
 
   atest("a flagged KV delete without a required revision gets an entry, and so does an insert-only update"):
     val delPtr = KeyValueObjectPointer(ObjectId(UUID.randomUUID()), Radicle.poolId)
@@ -546,14 +546,14 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       a <- unackedEntries(Radicle.poolId, txd.transactionId)
       b <- unackedEntries(poolB, txd.transactionId)
     yield
-      a.values.toList shouldBe List.fill(3)(UnackedCommitEntry(txd.startTimestamp, List(ptrA)))
+      a.values.toList shouldBe List.fill(3)(UnackedCommitEntry(txd.startTimestamp, None, List(ptrA)))
       b shouldBe Map(UnackedCommitEntry.key(StoreId(poolB, 0.toByte), txd.transactionId) ->
-        UnackedCommitEntry(txd.startTimestamp, List(ptrB)))
+        UnackedCommitEntry(txd.startTimestamp, None, List(ptrB)))
 
   atest("UnackedCommits entries are written in the same transaction as the pool's ErrorTree marks"):
     val marker = new ObservedMarker
     val txid = TransactionId(UUID.randomUUID())
-    val entry = UnackedCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
+    val entry = UnackedCommitEntry(missedTimestamp, None, List(pointerWith(Array[Byte](3))))
     for
       _ <- marker.mark(List(missed(net.storeId0), missed(net.storeId1)),
                        List(MissedUnackedCommit(net.storeId0, txid, entry), MissedUnackedCommit(net.storeId1, txid, entry)))
@@ -564,7 +564,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
 
   test("a unacked commit entry round-trips and its key names the transaction"):
     val ptr = pointerWith(Array[Byte](9, 9, 9))
-    val entry = UnackedCommitEntry(missedTimestamp, List(ptr, pointerWith(Array[Byte]())))
+    val entry = UnackedCommitEntry(missedTimestamp, None, List(ptr, pointerWith(Array[Byte]())))
     val txid = TransactionId(UUID.randomUUID())
     UnackedCommitEntry.decode(entry.encode) shouldBe entry
     UnackedCommitEntry.decodeTransactionId(UnackedCommitEntry.key(net.storeId1, txid)) shouldBe txid
@@ -573,7 +573,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
 
   test("an entry within the limit is its only chunk; a larger one splits in order, each chunk within it"):
     val ptrs = List.tabulate(10)(i => pointerWith(Array[Byte](5, i.toByte)))
-    val entry = UnackedCommitEntry(missedTimestamp, ptrs)
+    val entry = UnackedCommitEntry(missedTimestamp, None, ptrs)
     entry.chunks(entry.encodedSize) shouldBe List(entry)
     entry.encode.length shouldBe entry.encodedSize
 
@@ -614,7 +614,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
   atest("an entry too large for the tree is written as chunks under consecutive keys, head first"):
     val txid = TransactionId(UUID.randomUUID())
     val ptrs = List.tabulate(12)(i => pointerWith(Array[Byte](6, i.toByte)))
-    val entry = UnackedCommitEntry(missedTimestamp, ptrs)
+    val entry = UnackedCommitEntry(missedTimestamp, None, ptrs)
     val limit = entry.encodedSize / 4
     val marker = new SmallEntryMarker(limit)
     for
@@ -628,7 +628,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
 
   atest("a real tree's limit writes an ordinary entry whole"):
     val txid = TransactionId(UUID.randomUUID())
-    val entry = UnackedCommitEntry(missedTimestamp, List.tabulate(3)(i => pointerWith(Array[Byte](7, i.toByte))))
+    val entry = UnackedCommitEntry(missedTimestamp, None, List.tabulate(3)(i => pointerWith(Array[Byte](7, i.toByte))))
     for
       pool <- client.getStoragePool(Radicle.poolId)
       max <- client.missedUpdateMarker.maxUnackedEntrySize(pool)
@@ -650,7 +650,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
   atest("a mark batch is checked and marked replay-safe"):
     val marker = new ObservedMarker
     val txid = TransactionId(UUID.randomUUID())
-    val entry = UnackedCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
+    val entry = UnackedCommitEntry(missedTimestamp, None, List(pointerWith(Array[Byte](3))))
     val update = missed(net.storeId0)
     val errorKey = buildErrorKey(update.store, update.objectId)
     val unackedKey = UnackedCommitEntry.key(net.storeId0, txid)
@@ -710,7 +710,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
 
   atest("an UnackedCommits entry written again is kept as it was"):
     val txid = TransactionId(UUID.randomUUID())
-    val entry = UnackedCommitEntry(missedTimestamp, List(pointerWith(Array[Byte](3))))
+    val entry = UnackedCommitEntry(missedTimestamp, None, List(pointerWith(Array[Byte](3))))
     val key = UnackedCommitEntry.key(net.storeId0, txid)
     for
       _ <- new MissedUpdateMarker(client).mark(Nil, List(MissedUnackedCommit(net.storeId0, txid, entry)))

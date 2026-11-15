@@ -18,9 +18,10 @@
   every allocation records its AllocationTree entry, which repair and rebuild find objects by (rebuild F17).
   `ObjectAllocator` does not add it
 - UnackedCommits (`StoragePoolState.UnackedCommitsTreeKey`, `UnackedCommitEntry.key(store, txid)`): for every
-  committed transaction, the finalizer writes `UnackedCommitEntry(timestamp, objects)` for each counted commit voter
+  committed transaction, the finalizer writes `UnackedCommitEntry(timestamp, incarnation, objects)` for each counted commit voter
   that sent no TxCommitted (`FinalizationAction.commitVoters`; all stores that sent none when voters are unknown),
-  in the ErrorTree batch. `MissedUpdateFinalizationAction` runs last, so an entry durable means every other
+  in the ErrorTree batch. Value: `[timestamp:8][incarnation:16][count:4][pointers]`; the incarnation is the store's
+  `StoreIncarnation` UUID, the zero UUID meaning `None` (unknown), copied into every chunk. `MissedUpdateFinalizationAction` runs last, so an entry durable means every other
   finalization action is done
 - `MissedUpdateFinalizationAction` disables missed-update tracking on an ErrorTree write only when the transaction
   references the pool the entry is about (in practice the bootstrap pool)

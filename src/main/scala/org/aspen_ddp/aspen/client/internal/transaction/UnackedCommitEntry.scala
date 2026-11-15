@@ -5,15 +5,17 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectPointer}
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 
 /** A UnackedCommits tree value: a store missed a transaction whose change to `objects` leaves nothing for
   * repair to compare (a refcount change, or a key delete), so the transaction's start `timestamp` and
-  * the pointers, which keep their store pointers, are recorded for the store's repair.
+  * the pointers, which keep their store pointers, are recorded for the store's repair. `incarnation` is the
+  * incarnation of the store's data that missed it, None when unknown (encoded as the zero UUID).
   */
-final case class UnackedCommitEntry(timestamp: HLCTimestamp, objects: List[ObjectPointer]):
-  def encodedSize: Int = HLCTimestamp.EncodedSize + 4 + objects.map(_.encodedSize + 4).sum
+final case class UnackedCommitEntry(timestamp: HLCTimestamp, incarnation: Option[StoreIncarnation],
+                                    objects: List[ObjectPointer]):
+  def encodedSize: Int = HLCTimestamp.EncodedSize + UnackedCommitEntry.IncarnationSize + 4 + objects.map(_.encodedSize + 4).sum
 
   /** This entry as consecutive entries of the same timestamp, each encoding to at most `maxEncodedSize` bytes and
     * holding at least one object, together holding every object once, in order. Just this entry if it fits (or
@@ -21,7 +23,7 @@ final case class UnackedCommitEntry(timestamp: HLCTimestamp, objects: List[Objec
     * split depends only on the objects and the limit, so a re-run marker writes the same chunks
     */
   def chunks(maxEncodedSize: Int): List[UnackedCommitEntry] =
-    val empty = HLCTimestamp.EncodedSize + 4
+    val empty = HLCTimestamp.EncodedSize + UnackedCommitEntry.IncarnationSize + 4
     val (done, last, _) = objects.foldLeft((List[List[ObjectPointer]](), List[ObjectPointer](), empty)):
       case ((done, current, size), ptr) =>
         val ptrSize = ptr.encodedSize + 4
@@ -29,13 +31,16 @@ final case class UnackedCommitEntry(timestamp: HLCTimestamp, objects: List[Objec
           (current.reverse :: done, List(ptr), empty + ptrSize)
         else
           (done, ptr :: current, size + ptrSize)
-    if done.isEmpty then List(this) else (last.reverse :: done).reverse.map(UnackedCommitEntry(timestamp, _))
+    if done.isEmpty then List(this) else (last.reverse :: done).reverse.map(UnackedCommitEntry(timestamp, incarnation, _))
 
   def encode: Array[Byte] =
     val ptrs = objects.map(_.toArray)
-    val bb = ByteBuffer.allocate(HLCTimestamp.EncodedSize + 4 + ptrs.map(_.length + 4).sum)
+    val bb = ByteBuffer.allocate(encodedSize)
     bb.order(ByteOrder.BIG_ENDIAN)
     bb.putLong(timestamp.asLong)
+    val inc = incarnation.map(_.uuid).getOrElse(UnackedCommitEntry.ZeroUUID)
+    bb.putLong(inc.getMostSignificantBits)
+    bb.putLong(inc.getLeastSignificantBits)
     bb.putInt(ptrs.size)
     ptrs.foreach: p =>
       bb.putInt(p.length)
@@ -43,16 +48,20 @@ final case class UnackedCommitEntry(timestamp: HLCTimestamp, objects: List[Objec
     bb.array()
 
 object UnackedCommitEntry:
+  private[transaction] val IncarnationSize = 16
+  private[transaction] val ZeroUUID = new UUID(0L, 0L)
+
   def decode(bytes: Array[Byte]): UnackedCommitEntry =
     val bb = ByteBuffer.wrap(bytes)
     bb.order(ByteOrder.BIG_ENDIAN)
     val ts = HLCTimestamp(bb.getLong())
+    val inc = new UUID(bb.getLong(), bb.getLong())
     val count = bb.getInt()
     val objects = List.fill(count):
       val p = new Array[Byte](bb.getInt())
       bb.get(p)
       ObjectPointer.fromArray(p)
-    UnackedCommitEntry(ts, objects)
+    UnackedCommitEntry(ts, if inc == ZeroUUID then None else Some(StoreIncarnation(inc)), objects)
 
   /** The bytes a pair's key, revision, timestamp and length varints may add to an entry's value in a tree node, at
     * most. Covers the 19-byte chunk key

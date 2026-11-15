@@ -136,7 +136,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
       else
         val objects = txd.allHostedObjects(storeId).filter(ptr => changed.contains(ptr.id))
         Option.when(objects.nonEmpty):
-          MissedUnackedCommit(storeId, txd.transactionId, UnackedCommitEntry(txd.startTimestamp, objects))
+          MissedUnackedCommit(storeId, txd.transactionId, UnackedCommitEntry(txd.startTimestamp, None, objects))
 
     reportMarks(errors.map(_.store))
 

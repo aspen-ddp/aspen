@@ -622,7 +622,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     val start = HLCTimestamp.now
     for
       txid <- missedByTx(i)(build)
-      entry = MissedUnackedCommit(sid(i), txid, UnackedCommitEntry(start, objects.toList))
+      entry = MissedUnackedCommit(sid(i), txid, UnackedCommitEntry(start, None, objects.toList))
       _ <- pump(client.missedUpdateMarker.mark(Nil, List(entry)), deadline())
       _ <- settle()
     yield txid
@@ -912,7 +912,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       _ <- pass(2, repairer, deferral) // No entry yet: the stub is suspected
       // The planned entry lands. The store holds the transaction live, so the scan leaves the entry alone
       _ <- pump(client.missedUpdateMarker.mark(Nil,
-             List(MissedUnackedCommit(sid(2), txid, UnackedCommitEntry(HLCTimestamp.now, Nil)))), deadline())
+             List(MissedUnackedCommit(sid(2), txid, UnackedCommitEntry(HLCTimestamp.now, None, Nil)))), deadline())
       _ <- settle()
       _ = target.live += (sid(2) -> txid)
       _ <- pass(2, repairer, deferral)
@@ -974,7 +974,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   /** Writes UnackedCommits entry chunks for store `i` and `txid`, each naming `objects`, under the given chunk indexes */
   private def writeChunks(i: Int, txid: TransactionId, objects: List[ObjectPointer], chunks: Int*): Future[Unit] =
     // Older than the objects, so a read of them is not stale against it
-    val entry = Value(UnackedCommitEntry(HLCTimestamp(1000L), objects).encode)
+    val entry = Value(UnackedCommitEntry(HLCTimestamp(1000L), None, objects).encode)
     for
       pool <- client.getStoragePool(PoolId.BootstrapPoolId)
       tx = TestTransactions.replaySafe(client.newRepairTransaction())
@@ -1166,7 +1166,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       pool <- client.getStoragePool(PoolId.BootstrapPoolId)
       tx = TestTransactions.replaySafe(client.newRepairTransaction())
       _ <- pool.unackedCommitsTree.set(UnackedCommitEntry.key(sid(2), txid),
-             Value(UnackedCommitEntry(HLCTimestamp.now, List(ptr)).encode))(using tx)
+             Value(UnackedCommitEntry(HLCTimestamp.now, None, List(ptr)).encode))(using tx)
       _ <- pump(tx.commit(), deadline())
       result <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState())
       remaining <- unackedEntries(2)

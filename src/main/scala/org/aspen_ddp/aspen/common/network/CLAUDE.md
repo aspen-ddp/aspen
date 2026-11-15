@@ -5,6 +5,10 @@
 - A common pattern and naming scheme is used for all encode/decode functions
 - The common.network.Message module defines all network messages
 - Messages are sent between logical entities e.g. Clients and DataStores or DataStores to other DataStores.
+- `CurrentAllocationsRequest`/`CurrentAllocationsReply` (client request/response): a store's list of the
+  allocations in its pool held by transactions it has not seen finalized or abort (`PendingAllocation`). A rebuild
+  asks its peers through `AspenClient.currentAllocations` (`client/internal/CurrentAllocationsQuery`), which resends to
+  silent stores until enough answer (Rebuild F10)
 - Low-level networking dealing with things like network endpoints, transport protocols, and the like are mostly 
   handled by the networking plugin.
 - The Network Layer is pluggable via `common.network.NetworkPlugin`. QUIC is the only plugin

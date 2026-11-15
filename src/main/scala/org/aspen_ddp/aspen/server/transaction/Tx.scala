@@ -222,6 +222,9 @@ class Tx( trs: TransactionRecoveryState,
   def mayExpire: Boolean =
     ofinalized.isEmpty && loadCompleted && !lateCommitHeld && !forgetLookupHeld
 
+  /** TxFinalized (or its equivalent) has concluded this Tx */
+  def isFinalized: Boolean = ofinalized.isDefined
+
   /** The outcome this Tx knows, if resolved: see ExpiryTally.decide */
   def knownOutcome: Option[Boolean] = oresolution
 

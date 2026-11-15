@@ -40,6 +40,11 @@
   host's own client ratchets) by more; the designated leader does not drive it (`Store`). The client's retransmission
   is answered once the clock catches up. This is what makes the `acceptorSince` mute independent of client clocks
   (paxos P-N2), and it caps how far stored timestamps, and so client HLCs, run ahead of the hosts
+- Current allocations (`CurrentAllocationsRequest`, Rebuild F10; `StoreRouter` routes it to the store's executor):
+  `Frontend.currentAllocations` lists, for every held Tx neither finalized nor known aborted, the objects it allocates
+  in this store's pool, and whether it is known committed. Silent while the CRL loads (`awaitingCrl`): it may hold
+  transactions it does not know yet. A committed Tx is held until TxFinalized, after its AllocationFinalizationAction,
+  so every allocation whose AllocationTree entry may still be missing is listed by each store holding it
 - Status query (`TxStatusRequest`, carrying the transaction's `startTimestamp`; horizon design section 2): every
   store answers. A store with a Tx replies with its status, finalized, late and `holdsAcceptorState`, false only for a Tx
   muted for good (before `acceptorSince`, or below the floor): one muted only for starting too far ahead may yet join. With no

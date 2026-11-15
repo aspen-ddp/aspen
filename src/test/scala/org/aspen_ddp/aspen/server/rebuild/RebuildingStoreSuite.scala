@@ -2,7 +2,9 @@ package org.aspen_ddp.aspen.server.rebuild
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.scalatest.compatible
-import org.aspen_ddp.aspen.client.Transaction
+import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
+import org.aspen_ddp.aspen.common.network.CurrentAllocationsReply
+import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectId, ObjectPointer, Value}
@@ -14,7 +16,7 @@ import org.aspen_ddp.aspen.server.store.backend.rocksdb.BufferedConsistentRocksD
 
 import java.nio.ByteBuffer
 import java.util.UUID
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{FiniteDuration, SECONDS}
 import scala.util.Try
 
@@ -188,6 +190,138 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     yield
       seenOnResume should not be empty
       seenOnResume.distinct should be(List(first))
+
+  /** Holds the finalization of every transaction carrying it until the test completes `release`, so its stores keep
+   *  holding it: an allocation whose AllocationFinalizationAction may still be pending */
+  private object Blocker extends FinalizationActionFactory with RegisteredTypeFactory:
+    val typeUUID: UUID = UUID.fromString("6d1f0c2a-3b4e-4f5a-9c8d-7e6f5a4b3c2d")
+    @volatile var release: Promise[Unit] = Promise()
+    def createFinalizationAction(client: AspenClient, txd: TransactionDescription,
+                                 data: Array[Byte]): FinalizationAction =
+      val held = release.future
+      new FinalizationAction:
+        def complete: Future[Unit] = held
+        def execute(): Unit = ()
+
+  override def userTypeFactories: List[RegisteredTypeFactory] = List(Blocker)
+
+  /** Allocates an object whose transaction stays unfinalized until `Blocker.release`, and removes its allocation-tree
+   *  entry once its AllocationFinalizationAction wrote it: an allocation the walks cannot see */
+  private def allocateHeldWithoutEntry(): Future[ObjectPointer] =
+    given ExecutionContext = executionContext
+    Blocker.release = Promise()
+    def awaitEntry(ptr: ObjectPointer, n: Int): Future[Unit] =
+      client.getStoragePool(ptr.poolId).flatMap(_.allocationTree.get(Key(ptr.id.toBytes))).flatMap:
+        case Some(_) => Future.unit
+        case None if n == 0 => Future.failed(new Exception(s"allocation-tree entry of ${ptr.id} never written"))
+        case None => Future(()).flatMap(_ => awaitEntry(ptr, n - 1))
+    for
+      ptr <- client.transactUntilSuccessful: tx =>
+        given Transaction = tx
+        tx.replaySafe("test")
+        tx.addFinalizationAction(FinalizationActionId(Blocker.typeUUID), Some(Array[Byte]()))
+        client.getStoragePool(PoolId.BootstrapPoolId).flatMap(_.allocator.allocateDataObject(Array[Byte](9)))
+      _ <- awaitEntry(ptr, 5000)
+      _ <- dropEntry(ptr)
+    yield ptr
+
+  private def peers: List[StoreId] = List(net.storeId1, net.storeId2)
+
+  private def releaseBlocked(): Future[Unit] =
+    Blocker.release.trySuccess(())
+    net.waitForTransactionsToComplete()
+
+  atest("an allocation its peers hold unfinalized, with no tree entry, is restored by the sweep (Rebuild F10)"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    for
+      _ <- populate(5)
+      _ <- net.waitForTransactionsToComplete()
+      held <- allocateHeldWithoutEntry()
+      listed <- client.currentAllocations(peers, 2, () => false)
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                    testingOnlyTrackRestoredKeys = true)
+      _ <- rebuild.complete
+      _ <- releaseBlocked()
+      after <- client.currentAllocations(peers, 2, () => false)
+    yield
+      listed.keySet should be(peers.toSet)
+      listed.values.foreach: allocations =>
+        allocations.filter(_.pointers.exists(_.id == held.id)).map(_.committed) should be(List(true))
+      after.values.flatten.exists(_.pointers.exists(_.id == held.id)) should be(false)
+      rebuild.testingOnlyRestoredKeys.map(_.bytes.toList) should contain(held.id.toBytes.toList)
+      os.exists(dev / storeId.directoryName) should be(true)
+
+  atest("a listed allocation whose transaction finalizes before the sweep is restored from a read"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    for
+      _ <- populate(5)
+      _ <- net.waitForTransactionsToComplete()
+      held <- allocateHeldWithoutEntry()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                    testingOnlyTrackRestoredKeys = true,
+                                    testingOnlyAfterQuery = () => releaseBlocked())
+      _ <- rebuild.complete
+    yield
+      rebuild.testingOnlyRestoredKeys.map(_.bytes.toList) should contain(held.id.toBytes.toList)
+
+  atest("a listed allocation deleted before its transaction finalizes is settled by a read proving the deletion"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    def delete(ptr: ObjectPointer): Future[Unit] =
+      client.transactUntilSuccessful: tx =>
+        given Transaction = tx
+        client.read(ptr.asInstanceOf[org.aspen_ddp.aspen.common.objects.DataObjectPointer]).map: os =>
+          tx.setRefcount(ptr, os.refcount, os.refcount.update(0))
+    for
+      _ <- populate(5)
+      _ <- net.waitForTransactionsToComplete()
+      held <- allocateHeldWithoutEntry()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                    testingOnlyTrackRestoredKeys = true,
+                                    testingOnlyAfterQuery = () => delete(held).flatMap(_ => releaseBlocked()))
+      _ <- rebuild.complete
+    yield
+      rebuild.testingOnlyRestoredKeys.map(_.bytes.toList) should not contain(held.id.toBytes.toList)
+      os.exists(dev / storeId.directoryName) should be(true)
+
+  atest("a rebuild does not complete until a quorum of its peers has listed their pending allocations"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    // Replication(3, 2): width - writeThreshold + 1 = 2, so both peers must answer
+    net.dropClientResponse =
+      case r: CurrentAllocationsReply => r.fromStore == net.storeId2
+      case _ => false
+    for
+      _ <- populate(5)
+      _ <- net.waitForTransactionsToComplete()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends)
+      stalled <- outcomeOrStalled(rebuild)
+      _ = net.dropClientResponse = _ => false
+      _ <- rebuild.complete
+    yield
+      stalled should be(None)
+      os.exists(dev / storeId.directoryName) should be(true)
+
+  atest("a cancel while waiting for the peers' quorum fails the rebuild"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    net.dropClientResponse =
+      case _: CurrentAllocationsReply => true
+      case _ => false
+    for
+      _ <- populate(5)
+      _ <- net.waitForTransactionsToComplete()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends)
+      stalled <- outcomeOrStalled(rebuild)
+      _ = rebuild.cancel()
+      outcome <- rebuild.complete.transform(scala.util.Success.apply)
+    yield
+      net.dropClientResponse = _ => false
+      stalled should be(None)
+      outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
+      os.exists(dev / storeId.directoryName) should be(false)
 
   atest("a rebuilt store records that its acceptor covers only transactions started after its rebuild"):
     given ExecutionContext = executionContext

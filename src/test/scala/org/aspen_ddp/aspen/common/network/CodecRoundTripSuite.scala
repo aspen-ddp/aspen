@@ -499,6 +499,16 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decoded = Codec.decode(Codec.encode(original))
     decoded shouldBe original
 
+  test("CurrentAllocationsRequest round-trip"):
+    val original = CurrentAllocationsRequest(storeId(1), ClientId(uuid(2)), uuid(3))
+    Codec.decode(Codec.encode(original)) shouldBe original
+
+  test("CurrentAllocationsReply round-trip"):
+    val original = CurrentAllocationsReply(ClientId(uuid(1)), storeId(2), uuid(3), List(
+      PendingAllocation(TransactionId(uuid(4)), committed = true, List(dataPtr(5), kvPtr(6))),
+      PendingAllocation(TransactionId(uuid(7)), committed = false, Nil)))
+    Codec.decode(Codec.encode(original)) shouldBe original
+
   test("TransactionResolved round-trip"):
     val original = TransactionResolved(ClientId(uuid(1)), storeId(2), TransactionId(uuid(3)), committed = true)
     val decoded = Codec.decode(Codec.encode(original))

@@ -163,6 +163,11 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
           store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, r.objectPointer, r.readType)
 
 
+    case r: CurrentAllocationsRequest =>
+      // Tx state is the store's: answered on its executor. An unknown store says nothing, so it counts toward no
+      // rebuild's quorum
+      route(r.toStore, () => ())(_.frontend.receiveCurrentAllocationsRequest(r))
+
     case s: TransactionCompletionQuery =>
       // Reads only the thread-safe txStatusCache, so it is answered in the dispatch step
       ctx.threading.dispatch.execute: () =>

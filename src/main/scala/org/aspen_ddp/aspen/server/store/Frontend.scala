@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
+import org.aspen_ddp.aspen.common.network.{ClientId, CurrentAllocationsReply, CurrentAllocationsRequest, PendingAllocation, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
@@ -208,6 +208,32 @@ class Frontend(val storeId: StoreId,
 
   /** The store's CRL state is still to be recovered (awaitRecovery): see Store.driveTransaction */
   def recoveryPending: Boolean = awaitingCrl
+
+  /** The allocations in this store's pool held by transactions it has not seen finalized and not seen abort, for a
+    * rebuilding peer (Rebuild F10). None while the CRL is still loading: transactions it does not know yet may be
+    * among them. A committed transaction stays held until TxFinalized, which comes only once its
+    * AllocationFinalizationAction has recorded the objects in the AllocationTree, so an allocation that may still be
+    * missing from the tree is listed by every store that holds its transaction
+    */
+  def currentAllocations(): Option[List[PendingAllocation]] =
+    if awaitingCrl then
+      None
+    else
+      Some(transactions.valuesIterator.flatMap: tx =>
+        val txd = tx.txd
+        if txd.allocatingObjects.isEmpty || tx.isFinalized || tx.knownOutcome.contains(false) then
+          None
+        else
+          val pointers = txd.allReferencedObjectsSet.iterator
+            .filter(p => p.poolId == storeId.poolId && txd.allocatingObjects.contains(p.id))
+            .toList
+          if pointers.isEmpty then None
+          else Some(PendingAllocation(txd.transactionId, tx.knownOutcome.contains(true), pointers))
+      .toList)
+
+  def receiveCurrentAllocationsRequest(req: CurrentAllocationsRequest): Unit =
+    currentAllocations().foreach: allocations =>
+      net.sendClientResponse(CurrentAllocationsReply(req.fromClient, storeId, req.queryUUID, allocations))
 
   def awaitLocksReleased(holder: TransactionId, waiter: Tx): Unit =
     val others = collisionWaiters.getOrElse(holder, Nil).filterNot(_ eq waiter)

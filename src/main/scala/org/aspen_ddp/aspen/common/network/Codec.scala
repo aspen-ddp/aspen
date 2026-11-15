@@ -878,6 +878,37 @@ object Codec extends Logging:
     TransactionCompletionQuery(toStore, fromClient, queryUuid, txid)
 
 
+  def encode(o: CurrentAllocationsRequest): codec.CurrentAllocationsRequest =
+    codec.CurrentAllocationsRequest(
+      toStore = Some(encode(o.toStore)),
+      fromClient = Some(encodeUUID(o.fromClient.uuid)),
+      queryUuid = Some(encodeUUID(o.queryUUID))
+    )
+
+  def decode(m: codec.CurrentAllocationsRequest): CurrentAllocationsRequest =
+    CurrentAllocationsRequest(decode(m.toStore.get), ClientId(decodeUUID(m.fromClient.get)), decodeUUID(m.queryUuid.get))
+
+  def encode(o: CurrentAllocationsReply): codec.CurrentAllocationsReply =
+    codec.CurrentAllocationsReply(
+      fromStore = Some(encode(o.fromStore)),
+      toClient = Some(encodeUUID(o.toClient.uuid)),
+      queryUuid = Some(encodeUUID(o.queryUUID)),
+      allocations = o.allocations.map: a =>
+        codec.PendingAllocation(
+          transactionUuid = Some(encodeUUID(a.transactionId.uuid)),
+          committed = a.committed,
+          pointers = a.pointers.map(p => encode(p)))
+    )
+
+  def decode(m: codec.CurrentAllocationsReply): CurrentAllocationsReply =
+    CurrentAllocationsReply(
+      ClientId(decodeUUID(m.toClient.get)),
+      decode(m.fromStore.get),
+      decodeUUID(m.queryUuid.get),
+      m.allocations.toList.map: a =>
+        PendingAllocation(TransactionId(decodeUUID(a.transactionUuid.get)), a.committed,
+          a.pointers.toList.map(p => decode(p))))
+
   def encode(o: TransactionCompletionResponse): codec.TransactionCompletionResponse =
     codec.TransactionCompletionResponse(
       toClient = Some(encodeUUID(o.toClient.uuid)),

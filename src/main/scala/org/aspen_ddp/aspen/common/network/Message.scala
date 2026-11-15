@@ -209,6 +209,26 @@ final case class TransactionCompletionResponse(
                                                 isComplete: Boolean) extends ClientResponse:
   override def toString: String = f"TransactionCompletionResponse to $toClient from $fromStore query $queryUUID isComplete $isComplete"
 
+/** Asks a store for the allocations in its pool that it holds unfinalized (Rebuild F10). A store still loading its
+  * CRL does not answer */
+final case class CurrentAllocationsRequest(toStore: StoreId,
+                                           fromClient: ClientId,
+                                           queryUUID: UUID) extends ClientRequest:
+  override def toString: String = s"CurrentAllocationsRequest to $toStore from $fromClient query $queryUUID"
+
+/** A transaction a store holds unfinalized that allocates `pointers` in the store's pool. `committed` is false while
+  * the store knows no resolution */
+final case class PendingAllocation(transactionId: TransactionId,
+                                   committed: Boolean,
+                                   pointers: List[ObjectPointer])
+
+final case class CurrentAllocationsReply(toClient: ClientId,
+                                         fromStore: StoreId,
+                                         queryUUID: UUID,
+                                         allocations: List[PendingAllocation]) extends ClientResponse:
+  override def toString: String =
+    s"CurrentAllocationsReply to $toClient from $fromStore query $queryUUID: ${allocations.size} transactions"
+
 final case class TransactionResolved(
                                       toClient: ClientId,
                                       fromStore: StoreId,

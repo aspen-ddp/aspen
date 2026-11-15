@@ -351,8 +351,9 @@ G6. Allocation-tree dependency: rebuild F10/F17, repair F5 and requirements F11 
     *2026-11-14 (Todo 2.11): analysed.* A missing entry cannot occur: `TransactionBuilder.addAllocatingObject` adds
     the allocation action, and bootstrap lists what it creates (rebuild F17, closed). A late entry has three effects:
     (1) *Missing slice.* A rebuild walk that passed the key never restores an allocation the lost store acknowledged.
-    The delta walk now restores entries written since the walk started (rebuild F10, narrowed). Residual: an entry
-    later than the delta walk too, which needs a finalization stalled for longer than both walks.
+    The delta walk restores entries written since the walk started, and the allocations still pending are listed by a
+    quorum of the pool's other stores (`CurrentAllocationsRequest`) and restored directly (rebuild F10, fixed).
+    Residual: the pool lost the Paxos state of `writeThreshold` stores while T was unfinalized (beyond its tolerance).
     (2) *Stale deletion decision.* Repair no longer takes absence from the tree as a deletion. A read decides
     (`InvalidObject.provesDeletion`, repair F5 fixed), so a late entry costs only deferral. Residual, unrelated to
     lateness: an object already below its write threshold reads as deleted.

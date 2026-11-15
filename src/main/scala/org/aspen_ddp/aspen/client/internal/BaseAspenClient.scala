@@ -27,7 +27,7 @@ import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 import org.aspen_ddp.aspen.compute.systemtask.{NewSystemTaskAdded, SystemTaskExecutorService, SystemTaskMessage, SystemTaskServiceState}
 
 import java.util.UUID
-import scala.concurrent.duration.{Duration, MILLISECONDS}
+import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS}
 import scala.concurrent.{ExecutionContext, Future}
 
 private object Namespaces:
@@ -609,8 +609,25 @@ abstract class BaseAspenClient(
 
   override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
 
+  private val allocationQueries = new java.util.concurrent.ConcurrentHashMap[UUID, CurrentAllocationsQuery]()
+
+  override private[aspen] def currentAllocations(stores: List[StoreId], needed: Int, stopWhen: () => Boolean)
+    : Future[Map[StoreId, List[PendingAllocation]]] =
+    val q = new CurrentAllocationsQuery(clientId, messenger.sendClientRequest, backgroundTaskManager, stores, needed,
+      stopWhen, id => allocationQueries.remove(id))
+    allocationQueries.put(q.queryUUID, q)
+    // A query that completed before it was registered must not stay registered
+    if q.result.isCompleted then allocationQueries.remove(q.queryUUID)
+    q.result
+
+  override private[aspen] def after(delay: FiniteDuration): Future[Unit] =
+    val p = scala.concurrent.Promise[Unit]()
+    backgroundTaskManager.schedule(delay)(p.trySuccess(()))
+    p.future
+
   def receiveClientResponse(msg: ClientResponse): Unit = msg match
     case m: ReadResponse => rmgr.receive(m)
+    case m: CurrentAllocationsReply => Option(allocationQueries.get(m.queryUUID)).foreach(_.receive(m))
     case m: TransactionCompletionResponse => rmgr.receive(m)
     case m: TransactionResolved => txManager.receive(m)
     case m: TransactionFinalized => txManager.receive(m)

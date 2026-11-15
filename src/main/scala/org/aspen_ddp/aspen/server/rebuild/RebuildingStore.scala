@@ -1,13 +1,16 @@
 package org.aspen_ddp.aspen.server.rebuild
 
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, InvalidObject, KeyValueObjectState, MetadataObjectState, ObjectState}
+import org.aspen_ddp.aspen.client.internal.CurrentAllocationsQuery
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.tkvl.{KeyValueListNode, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectType}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.TransactionHorizon
+import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.network.PendingAllocation
+import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId}
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost}
 import scribe.Logging
@@ -117,7 +120,9 @@ class RebuildingStore(client: AspenClient,
                       testingOnlyOnRestored: () => Unit = () => (),
                       testingOnlyOnFinishClosed: () => Unit = () => (),
                       deltaMargin: FiniteDuration = RebuildingStore.DeltaMargin,
-                      testingOnlyAfterWalk: () => Future[Unit] = () => Future.unit) extends StoreRebuild with Logging:
+                      testingOnlyAfterWalk: () => Future[Unit] = () => Future.unit,
+                      testingOnlyAfterQuery: () => Future[Unit] = () => Future.unit)
+  extends StoreRebuild with Logging:
 
   import RebuildingStore.*
 
@@ -254,6 +259,10 @@ class RebuildingStore(client: AspenClient,
       opened <- openStaging(stagingCfg)
       _ = synchronized:
             backend = opened
+      // Before the walk: an allocation the lost store acknowledged is either listed by a peer now, or already in the
+      // tree, where the walk or the delta walk finds it (Rebuild F10)
+      pending <- queryPeers(pstate.ida)
+      _ <- testingOnlyAfterQuery()
       pool <- client.getStoragePool(storeId.poolId)
       tree = pool.allocationTree
       _ <- resume.flatMap(_.lastRestoredKey) match
@@ -264,7 +273,8 @@ class RebuildingStore(client: AspenClient,
              case None => tree.foreach(restoreObject(_, _, _), stopWhen = aborted)
       _ <- testingOnlyAfterWalk()
       _ <- deltaWalk(tree)
-      // Check the abort latch after the walks complete. If it's set, fail the pass before
+      _ <- sweepPending(pstate.ida, pending, 0)
+      // Check the abort latch after the walks and the sweep complete. If it's set, fail the pass before
       // retryFailures() and finish() run, leaving the checkpoint in staging.
       _ <- synchronized(abortCause) match
              case Some(cause) => Future.failed(cause)
@@ -317,6 +327,94 @@ class RebuildingStore(client: AspenClient,
         if value.timestamp < threshold then Future.unit
         else restoreObject(node, key, value, advance = false),
         stopWhen = aborted)
+
+  /** The allocations this pool's other stores hold unfinalized, by transaction, once `width - writeThreshold + 1` of
+   *  them have answered (Rebuild F10).
+   *
+   *  A committed transaction is held by at least `writeThreshold` of its commit voters in this pool until TxFinalized,
+   *  which comes only after its AllocationFinalizationAction recorded its objects. The lost store may have been one of
+   *  them, so that many replies include a holder of every committed allocation whose entry may not have landed. It is
+   *  never more than the consistent read threshold the rebuild needs anyway. Waits until the quorum answers; fails
+   *  with the abort cause if the rebuild is aborted meanwhile.
+   */
+  private def queryPeers(ida: IDA): Future[Map[TransactionId, PendingAllocation]] =
+    val peers = (0 until ida.width).filter(_ != storeId.poolIndex.toInt)
+      .map(i => StoreId(storeId.poolId, i.toByte)).toList
+    val needed = ida.width - ida.writeThreshold + 1
+    if needed > peers.size then
+      // A single-store pool: there is no one to ask, and nothing to read the objects from either
+      Future.successful(Map())
+    else
+      client.currentAllocations(peers, needed, aborted).transform:
+        case scala.util.Success(replies) =>
+          val merged = replies.valuesIterator.flatten.toList.groupBy(_.transactionId).map: (txid, as) =>
+            txid -> PendingAllocation(txid, as.exists(_.committed), as.flatMap(_.pointers).distinctBy(_.id))
+          scala.util.Success(merged)
+        case scala.util.Failure(_: CurrentAllocationsQuery.Abandoned) =>
+          scala.util.Failure(synchronized(abortCause).getOrElse(RebuildCancelled(storeId)))
+        case scala.util.Failure(err) => scala.util.Failure(err)
+
+  /** Restores the objects of the allocations the peers listed before the walk (Rebuild F10), directly rather than
+   *  through the tree, whose entries may not land until their transactions finalize. Each round asks the peers again:
+   *  - still listed, unresolved: wait for its resolution
+   *  - still listed, committed: restore each object. Any read failure is retried, since while the transaction is held
+   *    its commit may not have applied yet, which reads like a deletion
+   *  - no longer listed: finalized, or aborted and forgotten. A restore, or a read proving the object is not live
+   *    (`InvalidObject.provesDeletion`: the allocation aborted, or the object was deleted since), settles it
+   *  Transactions first listed in later rounds started after the store was lost and are covered by its missed-update
+   *  marks, so they are ignored.
+   */
+  private def sweepPending(ida: IDA, pending: Map[TransactionId, PendingAllocation], round: Int): Future[Unit] =
+    if pending.isEmpty || aborted() then
+      Future.unit
+    else
+      def settle(p: PendingAllocation, now: Option[PendingAllocation]): Future[Option[PendingAllocation]] =
+        now match
+          case Some(c) if !c.committed => Future.successful(Some(p))
+          case _ =>
+            val gone = now.isEmpty
+            Future.sequence(p.pointers.map: ptr =>
+              restorePending(ptr).map:
+                case None => None
+                case Some(e: InvalidObject) if gone && e.provesDeletion => None
+                case Some(_) => Some(ptr))
+            .map: left =>
+              val remaining = left.flatten
+              if remaining.isEmpty then None else Some(p.copy(pointers = remaining))
+
+      for
+        now <- queryPeers(ida)
+        settled <- Future.sequence(pending.values.toList.map(p => settle(p, now.get(p.transactionId))))
+        remaining = settled.flatten.map(p => p.transactionId -> p).toMap
+        _ <- nextRound(ida, remaining, round)
+      yield ()
+
+  private def nextRound(ida: IDA, remaining: Map[TransactionId, PendingAllocation], round: Int): Future[Unit] =
+    if remaining.isEmpty || aborted() then
+      Future.unit
+    else
+      if round % 10 == 9 then
+        logger.info(s"Rebuild of $storeId: still waiting on ${remaining.size} allocations its peers hold " +
+                    s"unfinalized (${remaining.keys.take(5).mkString(", ")})")
+      val delay = FiniteDuration(math.min(1L << math.min(round, 5), 30L), SECONDS)
+      client.after(delay).flatMap(_ => sweepPending(ida, remaining, round + 1))
+
+  /** Restores one object a peer listed as pending. None once restored (or when the restore cannot be attempted for a
+   *  reason the abort latch already carries), else the read failure */
+  private def restorePending(ptr: ObjectPointer): Future[Option[Throwable]] =
+    if aborted() then
+      Future.successful(None)
+    else
+      val key = Key(ptr.id.toBytes)
+      attemptRestore(key, ptr).transformWith:
+        case scala.util.Success(_) =>
+          recordRestored(key, advance = false).map(_ => None)
+        case scala.util.Failure(err) if isOutOfSpace(err) =>
+          latchOutOfSpace(err)
+          Future.successful(None)
+        case scala.util.Failure(err) =>
+          logger.debug(s"Rebuild of $storeId: pending allocation ${ptr.id} not restored yet: $err")
+          Future.successful(Some(err))
 
   /** Copy one object's slice of this store into the backend.
    *

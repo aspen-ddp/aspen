@@ -376,6 +376,26 @@ message TransactionCompletionResponse {
   bool is_complete = 4;
 }
 
+// A rebuild asks its pool's other stores for the allocations they hold unfinalized (Rebuild F10)
+message CurrentAllocationsRequest {
+  StoreId to_store = 1;
+  UUID from_client = 2;
+  UUID query_uuid = 3;
+}
+
+message PendingAllocation {
+  UUID transaction_uuid = 1;
+  bool committed = 2; // false: unresolved as far as the store knows
+  repeated ObjectPointer pointers = 3; // the objects the transaction allocates in the store's pool
+}
+
+message CurrentAllocationsReply {
+  StoreId from_store = 1;
+  UUID to_client = 2;
+  UUID query_uuid = 3;
+  repeated PendingAllocation allocations = 4;
+}
+
 message TransactionResolved {
   StoreId from_store = 1;
   UUID to_client = 2;
@@ -526,6 +546,8 @@ message Message {
     HostEndpointQuery host_endpoint_query = 33;
     HostEndpointAnswer host_endpoint_answer = 34;
     WrongHost wrong_host = 35;
+    CurrentAllocationsRequest current_allocations_request = 36;
+    CurrentAllocationsReply current_allocations_reply = 37;
   }
   UUID to_host = 100; // Intended destination HostId. Absent when the sender did not say
 }

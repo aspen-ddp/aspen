@@ -13,8 +13,14 @@
   restores entries whose timestamp is at or after `walkStartedAt - DeltaMargin` (horizon + `AcceptorSinceMargin`,
   30 s): allocations the lost store acknowledged whose entry landed behind the walk. `walk-started-at` is the first
   pass's, kept in the checkpoint across resumes (a checkpoint without it does not load). The delta walk does not move
-  the checkpoint. Residual: an entry landing after the delta walk passed it (a finalization stalled for longer than
-  both walks)
+  the checkpoint. It covers entries that landed between the first walk start and a pass's peer query
+- Pending allocations (Rebuild F10): before each pass's walk, `queryPeers` asks the pool's other stores
+  (`CurrentAllocationsRequest`) and waits, resending, for `width - writeThreshold + 1` answers. That many answers
+  include a holder of every committed, unfinalized allocation the lost store voted for, and the count never exceeds
+  the consistent read threshold. After the delta walk, `sweepPending` restores the listed objects directly, re-querying
+  in rounds (1 s doubling to 30 s): unresolved waits; committed restores, retrying any read failure; no longer listed
+  restores, or settles on `InvalidObject.provesDeletion`. It never waits on a finalization, which could need this
+  store. A cancel abandons the wait (`CurrentAllocationsQuery.Abandoned`)
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
   `StoreRebuildFactory.createRebuild`)
 - A promoted bootstrap-pool store may hold stale copies of the bootstrap pool's own ErrorTree/UnackedCommits nodes

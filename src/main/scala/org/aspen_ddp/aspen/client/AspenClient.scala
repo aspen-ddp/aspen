@@ -780,6 +780,14 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   private[aspen] val radicle: KeyValueObjectPointer
 
   private[aspen] def receiveClientResponse(msg: ClientResponse): Unit
+
+  /** The allocations `stores` hold unfinalized, once `needed` of them have answered (`CurrentAllocationsRequest`,
+   *  Rebuild F10). Resends until then; fails with `CurrentAllocationsQuery.Abandoned` once `stopWhen` holds */
+  private[aspen] def currentAllocations(stores: List[StoreId], needed: Int, stopWhen: () => Boolean)
+    : Future[Map[StoreId, List[org.aspen_ddp.aspen.common.network.PendingAllocation]]]
+
+  /** Completes after `delay`, on the client's background timer */
+  private[aspen] def after(delay: scala.concurrent.duration.FiniteDuration): Future[Unit]
   private[aspen] def sendHostMessage(msg: HostMessage): Unit
 
   /** Sends a message that is purely a latency optimization: the receiving host reaches the

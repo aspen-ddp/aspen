@@ -97,11 +97,14 @@ start (131)                      ┌── finalPath exists ──► cleanupSta
   │                              │
   └─ no finalPath ► runPass (168)┘
         load checkpoint (171)  ► mkdir staging ► read pool state (183) ► write config.yaml (185-187)
-        ► openStaging (188, 214)  ► read pool (191)
+        ► openStaging (188, 214)
+        ► queryPeers: CurrentAllocationsRequest to the other stores, until width - writeThreshold + 1 answer (F10)
+        ► read pool (191)
         ► walk allocation tree: foreach / foreachFrom(lastRestoredKey) (193-198)
               per entry: restoreObject (237) ► attemptRestore ► restore (326) ► recordRestored (344)
                           every 1000: flush THEN checkpoint (385)
         ► delta walk: foreach, entries at or after walkStartedAt - DeltaMargin only, no checkpoint (F10)
+        ► sweepPending: restore the queried allocations directly, re-querying in rounds until settled (F10)
         ► abort latch check (201)         [out of space, >10000 failures, cancel]
         ► retryFailures (204, 420)         [re-read allocation-tree entry; deleted ► skip]
         ► finish (205, 455): flush, close, remove checkpoint, os.move(staging ► final), sync dir
@@ -236,6 +239,12 @@ remains (`:134-139`). Otherwise `runPass`.
   only entries whose `ValueState.timestamp` is at or after `walkStartedAt - DeltaMargin` (horizon 20 s +
   `AcceptorSinceMargin` 10 s). It does not move the checkpoint, so a pass failing in it resumes the main walk near its
   end and reruns it. A failure in it is recorded once (`recordFailure` dedupes) and retried with the rest.
+* Pending allocations (2026-11-14, F10): before the walk, `queryPeers` sends `CurrentAllocationsRequest` to the pool's
+  other stores, resending until `width - writeThreshold + 1` answer. Each lists the allocations in the pool held by
+  transactions it has not seen finalized or abort (`Frontend.currentAllocations`; a store still loading its CRL does
+  not answer). After the delta walk, `sweepPending` restores those objects directly, in rounds that query again:
+  unresolved waits; committed restores, retrying any read failure; no longer listed (finalized, or aborted and
+  forgotten) restores, or settles on a read proving the object is not live. A cancel abandons the wait.
 * `retryFailures` (`:420-452`): for each failed id re-reads the allocation-tree entry; absent means deleted since,
   skipped; present is re-read and restored; any remaining failure fails the pass ("incomplete") with the failure list
   checkpointed.
@@ -545,8 +554,9 @@ the slice. While the tree entry has not landed, a young ErrorTree entry is defer
 (`StoreRepairer.scala:184-201,380-402`). Safe. (b) The entry lands before the walk reaches it: the walk restores it at
 its then current state; ErrorTree repair completes any later change. Safe. (c) The allocation committed **before** the
 store was lost, with the store having acknowledged it, and its tree entry lands after the walk passed that key: there is
-no ErrorTree mark (the store reported success) and the walk skipped it. Since 2026-11-14 the delta walk restores it
-(F10, NARROWED); only an entry landing after the delta walk has also passed its key stays unrestored.
+no ErrorTree mark (the store reported success) and the walk skipped it. Since 2026-11-14 it is restored (F10,
+FIXED): by the delta walk if its entry landed before the peers were queried, else directly by the sweep, from the
+peers' list of allocations they hold unfinalized.
 
 **FS10 Tree restructuring during the walk.** Splits are benign (entries move to the right, the walk's read node already
 held them). Joins and tail removals delete nodes with a version bump; a stale link read raises `InvalidObject` and the
@@ -780,16 +790,32 @@ promoted S has a stale slice of each such node and no ErrorTree entry; it is onl
 
 **Verification: PLAUSIBLE-low, severity stale-replica.** `MissedUpdateMarker.writeBatch.onFail` (`:143-154`) converts `UnknownStoragePool` (benign: pool deleted) and `TransactionCreationError` ("always permanent" per its comment) into `StopRetrying`; the batch is dropped with the warning at `:133`. Trigger needs a permanent creation error, which was not found to occur in normal operation.
 
-> **F10 NARROWED (2026-11-14, Todo 2.11).** After the walk, a delta walk restores every entry written since the first
-> pass's walk start, less `RebuildingStore.DeltaMargin` (30 s). An entry the walk missed was written by a transaction
-> that prepared after the walk started. Its timestamp is the entry's (`RequirementsApplyer`), and stores refuse a
-> prepare started more than the horizon behind their clock; the rest of the margin covers `MaxStartLead` and host skew,
-> as for `acceptor-since`. The walk start is checkpointed (`walk-started-at`), so a resume looks back from the first
-> pass. Test: RebuildingStoreSuite "an allocation-tree entry landing after the walk passed its key is restored by the
-> delta walk (Rebuild F10)", "a resumed rebuild keeps its first pass's walk start". **Residual**: an entry landing
-> after the delta walk passed its key. That needs the allocation's finalization stalled for longer than both walks.
-> Finalization of a committed transaction has no time bound, and a long-unfinalized alarm (Todo 4.9) is the detector.
-> Closing it would need the pool's peers to report committed, unfinalized allocations.
+> **F10 FIXED (2026-11-14).** Two parts. First (Todo 2.11), after the walk a delta walk restores every entry written
+> since the first pass's walk start, less `RebuildingStore.DeltaMargin` (30 s). An entry the walk missed was written by a
+> transaction that prepared after the walk started; its timestamp is the entry's, and stores refuse a prepare started
+> more than the horizon behind their clock. `walk-started-at` is checkpointed, so a resume looks back from the first
+> pass. Second, the pending allocations themselves. Before each pass's walk the rebuild asks the pool's other stores
+> for the allocations they hold unfinalized (`CurrentAllocationsRequest`/`Reply`) and waits for `width -
+> writeThreshold + 1` answers. A committed transaction is held by at least `writeThreshold` of its commit voters in
+> the pool until `TxFinalized`, which comes only after its AllocationFinalizationAction recorded its objects, and
+> expiry never discards a committed, unfinalized Tx. The lost store may have been a voter, so that many answers
+> include a holder. That count is never more than the consistent read threshold the rebuild needs anyway
+> (Replication: `writeThreshold >= width/2 + 1 = consistentRestoreThreshold`; RS/RARS: `writeThreshold >=
+> restoreThreshold >= width/2 + 1`), so it adds no availability requirement. After the walks, `sweepPending` restores
+> the listed objects directly, not through the tree, so the rebuild never waits on a finalization. That matters
+> because a finalization could need this very store, in a pool whose write threshold is its width.
+> Coverage: an allocation the lost store acknowledged is either unfinalized at the query, and so listed and restored,
+> or finalized before it. In that case its entry landed before the query, so the main walk (if it landed before the
+> first walk start) or the delta walk sees it. A resumed pass queries again, so nothing pending is checkpointed.
+> Tests: RebuildingStoreSuite "an allocation its peers hold unfinalized, with no tree entry, is restored by the sweep
+> (Rebuild F10)" (fails without the sweep), "a listed allocation whose transaction finalizes before the sweep is
+> restored from a read", "a listed allocation deleted before its transaction finalizes is settled by a read proving the
+> deletion", "a rebuild does not complete until a quorum of its peers has listed their pending allocations", "a cancel
+> while waiting for the peers' quorum fails the rebuild"; the delta-walk tests. **Residuals**: (1) at least
+> `writeThreshold` stores of the pool lost their Paxos state while T was unfinalized, beyond the pool's acceptor
+> tolerance (as F14); (2) a peer rebuilt after T started answers without holding T and still counts. That needs T to
+> start inside the window between that peer's own query and its `acceptor-since`, since its rebuild's query listed
+> everything pending before then.
 
 **F10 (Low) A committed allocation whose tree entry lands after the walk passed the key, on a store that had
 acknowledged it before being lost, is never restored.**

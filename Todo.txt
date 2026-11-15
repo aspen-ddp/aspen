@@ -36,11 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.11 Allocation-tree coverage for rebuilds: Rebuild F10, F17, G6                                            [M]
-     Audit every allocation path (FSIF index bitmap, pool creation, tasks) for an allocation-tree entry, and add a
-     test asserting that every allocated object is present. An allocation whose tree entry lands after the walk
-     passed its key is never restored: add a second walk pass over entries newer than the walk start.
-
 2.12 Store incarnation for repair entries and stubs: X10, Rebuild N3, G5                                    [M]
      ErrorTree/UnackedCommits keys carry no store incarnation, and a rebuilt store has no stubs. Add an
      incarnation epoch to entries (ignore mismatches) or carry inherited stubs into the rebuilt store. Write the

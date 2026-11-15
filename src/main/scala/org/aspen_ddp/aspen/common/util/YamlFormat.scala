@@ -124,6 +124,15 @@ object YamlFormat {
     }
   }
 
+  /** The parser picks Integer or Long by magnitude */
+  object YLong extends Format[Long] {
+    override def format(o: Object): Long = o match {
+      case v: java.lang.Integer => v.longValue()
+      case v: java.lang.Long => v.longValue()
+      case _ => throw new FormatError(s"Long Required")
+    }
+  }
+
   object YDouble extends Format[Double] {
     override def format(o: Object): Double = o match {
       case v: java.lang.Double => v.doubleValue()

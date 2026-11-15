@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.rebuild
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
@@ -18,18 +19,22 @@ import scala.util.control.NonFatal
  *  unquoted `0123456789` parses as a number and a `1e5` as a float, either of which would
  *  come back as something other than the key that was written. `failedObjects` are objects
  *  the walk could not read; the checkpoint advances past them so one unreadable object cannot
- *  wedge the walk forever, and they are retried at the end of the pass.
+ *  wedge the walk forever, and they are retried at the end of the pass. `walkStartedAt` is the
+ *  HLC timestamp (as its long) at which the first pass of this rebuild began its walk; a resume
+ *  keeps it, so the delta walk looks for entries written since the first walk started (Rebuild F10).
  *
  *  ```
  *  store-id: 00000000-0000-0000-0000-000000000000:0
  *  last-restored-key: '0a1b2c'
  *  failed-objects:
  *    - 22222222-2222-2222-2222-222222222222
+ *  walk-started-at: 7301234567890123776
  *  ```
  */
 case class RebuildState(storeId: StoreId,
                         lastRestoredKey: Option[Key],
-                        failedObjects: List[ObjectId]):
+                        failedObjects: List[ObjectId],
+                        walkStartedAt: HLCTimestamp):
 
   def yamlConfig: String =
     val hex = HexFormat.of()
@@ -42,7 +47,7 @@ case class RebuildState(storeId: StoreId,
       else
         "failed-objects:\n" + failedObjects.map(o => s"  - ${o.uuid}\n").mkString
 
-    s"store-id: $storeId\n" + keyLine + failedLines
+    s"store-id: $storeId\n" + keyLine + failedLines + s"walk-started-at: ${walkStartedAt.asLong}\n"
 
 
 object RebuildState extends YObject[RebuildState] with Logging:
@@ -63,14 +68,17 @@ object RebuildState extends YObject[RebuildState] with Logging:
   val storeId: Required[StoreId] = Required("store-id", StoreId.YStoreId)
   val lastRestoredKey: Optional[String] = Optional("last-restored-key", YString)
   val failedObjects: Required[List[UUID]] = Required("failed-objects", YList(YUUID))
+  // Required: a checkpoint without it does not load, so its pass restarts with a fresh walk start
+  val walkStartedAt: Required[Long] = Required("walk-started-at", YLong)
 
-  val attrs: List[Attr] = storeId :: lastRestoredKey :: failedObjects :: Nil
+  val attrs: List[Attr] = storeId :: lastRestoredKey :: failedObjects :: walkStartedAt :: Nil
 
   def create(o: Object): RebuildState =
     RebuildState(
       storeId.get(o),
       lastRestoredKey.get(o).map(s => Key(hex.parseHex(s))),
-      failedObjects.get(o).map(u => ObjectId(u)))
+      failedObjects.get(o).map(u => ObjectId(u)),
+      HLCTimestamp(walkStartedAt.get(o)))
 
   def loadRebuildState(file: os.Path): RebuildState =
     create(loadYamlFile(file))

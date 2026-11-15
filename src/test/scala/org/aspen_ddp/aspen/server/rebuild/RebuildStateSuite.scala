@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.rebuild
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -29,7 +30,7 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
 
   test("a state with no progress round-trips"):
     val dir = tmpDir()
-    val state = RebuildState(storeId, None, Nil)
+    val state = RebuildState(storeId, None, Nil, HLCTimestamp.now)
     RebuildState.save(dir, state)
     RebuildState.load(dir) should be(Some(state))
 
@@ -40,27 +41,34 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
     val key = Key(Array[Byte](0, 1, -1, 127, -128, 42))
     val state = RebuildState(storeId, Some(key),
       List(objectId("22222222-2222-2222-2222-222222222222"),
-           objectId("33333333-3333-3333-3333-333333333333")))
+           objectId("33333333-3333-3333-3333-333333333333")),
+      HLCTimestamp.now)
     RebuildState.save(dir, state)
     val loaded = RebuildState.load(dir).get
+    loaded.walkStartedAt should be(state.walkStartedAt)
     loaded.storeId should be(storeId)
     loaded.lastRestoredKey.map(_.bytes.toList) should be(Some(key.bytes.toList))
     loaded.failedObjects should be(state.failedObjects)
+
+  test("a checkpoint without a walk start does not load, so its pass starts over"):
+    val dir = tmpDir()
+    os.write(dir / RebuildState.stateFilename, s"store-id: $storeId\nfailed-objects: []\n")
+    RebuildState.load(dir) should be(None)
 
   test("load returns None when no checkpoint exists"):
     RebuildState.load(tmpDir()) should be(None)
 
   test("save overwrites an existing checkpoint"):
     val dir = tmpDir()
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](1))), Nil))
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](2))), Nil))
+    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](1))), Nil, HLCTimestamp.now))
+    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](2))), Nil, HLCTimestamp.now))
     RebuildState.load(dir).get.lastRestoredKey.map(_.bytes.toList) should be(Some(List[Byte](2)))
 
   test("save replaces the checkpoint by rename rather than truncating it in place"):
     val dir = tmpDir()
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](1))), Nil))
+    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](1))), Nil, HLCTimestamp.now))
     val first = fileKey(dir / RebuildState.stateFilename)
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](2))), Nil))
+    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](2))), Nil, HLCTimestamp.now))
     val second = fileKey(dir / RebuildState.stateFilename)
 
     // Aspen is crash-only, so a crash between a truncate and the write that follows it is the

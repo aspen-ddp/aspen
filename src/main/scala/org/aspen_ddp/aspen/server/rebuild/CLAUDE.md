@@ -9,6 +9,12 @@
   Rebuilds pass removes it for an Active entry after a crash. A directory at a Rebuilding store's path with neither
   this marker nor `rebuild-required` is retired as a lost copy (`StoreRebuilds.retireForeignCopy`: marked, kept in
   `pending-delete/`, rebuilt)
+- Delta walk (Rebuild F10): after the main walk, `RebuildingStore.deltaWalk` walks the AllocationTree again and
+  restores entries whose timestamp is at or after `walkStartedAt - DeltaMargin` (horizon + `AcceptorSinceMargin`,
+  30 s): allocations the lost store acknowledged whose entry landed behind the walk. `walk-started-at` is the first
+  pass's, kept in the checkpoint across resumes (a checkpoint without it does not load). The delta walk does not move
+  the checkpoint. Residual: an entry landing after the delta walk passed it (a finalization stalled for longer than
+  both walks)
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
   `StoreRebuildFactory.createRebuild`)
 - A promoted bootstrap-pool store may hold stale copies of the bootstrap pool's own ErrorTree/UnackedCommits nodes

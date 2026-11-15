@@ -348,6 +348,21 @@ G3. Zombie drivers/timers after a non-crash store reload, device relinquish and 
 G4. A shared, in-memory host-wide status cache is the anchor for finalization relays and, since the refresh, late-commit evidence (condition 2); no document analyses host restart (cache wiped) combined with rolling restarts of the stores' peers (paxos F6 touches it for one restart only). The horizon and TooOld no longer depend on it. *(2026-11-13: the safety half is covered. A restart, transfer-in or size eviction raises the affected stores' forget floor (load + `MaxStartLead`, or the eviction watermark) at the moment memory is lost, so a store whose host lost its cache never rejoins a transaction it may have forgotten, however many peers restart (paxos 10.10; HorizonIntegrationSuite "a host restart does not let its stores rejoin a transaction they forgot"). Left: the liveness cost across rolling restarts, where each reload refuses the transactions it does not hold started before its load plus `MaxStartLead`, and too many refusing stores in a pool end those transactions Unknown.)*
 G5. ErrorTree/UnackedCommits entry-key incarnation (X10) and the time-line of entry production vs consumption during a T12 move are described only per-document.
 G6. Allocation-tree dependency: rebuild F10/F17, repair F5 and requirements F11 each mention an allocation recorded late or not at all, but nobody analyses the total effect (missing slice, stale deletion decision, replayed allocation) across rebuild, repair and horizon.
+    *2026-11-14 (Todo 2.11): analysed.* A missing entry cannot occur: `TransactionBuilder.addAllocatingObject` adds
+    the allocation action, and bootstrap lists what it creates (rebuild F17, closed). A late entry has three effects:
+    (1) *Missing slice.* A rebuild walk that passed the key never restores an allocation the lost store acknowledged.
+    The delta walk now restores entries written since the walk started (rebuild F10, narrowed). Residual: an entry
+    later than the delta walk too, which needs a finalization stalled for longer than both walks.
+    (2) *Stale deletion decision.* Repair no longer takes absence from the tree as a deletion. A read decides
+    (`InvalidObject.provesDeletion`, repair F5 fixed), so a late entry costs only deferral. Residual, unrelated to
+    lateness: an object already below its write threshold reads as deleted.
+    (3) *Replayed allocation.* It never overwrites a live object (requirements F11). Under the horizon it reaches only
+    stores that never saw T, where a deleted id becomes an orphan slice that repair drops. A re-run allocation action
+    can leave an orphan entry (Todo 5.5).
+    The one cross-process interaction: an orphan entry names an object that reads as deleted, so a rebuild records it
+    as failed and `retryFailures` finds the entry still present. That rebuild cannot finish (rebuild F15, Todo 4.8),
+    so orphan entries are a liveness cost on rebuild, never lost data. Todo 5.5 (no orphan entry) and 4.8 (an
+    operator command to finish past lost objects) together close it.
 G7. Client object caches/pointers (stale `ObjectPointer`, DataObject read caches) are outside all seven; resurrection by a client reading a zombie slice with a cached pointer is not discussed.
 G8. Clock: HLC skew no longer affects replay (the horizon is gone, paxos F3 fixed), but still affects the rebuilt store's `acceptorSince` mute, on which the late-commit rule now also rests (paxos P-N2), repair's 60 s age gate (entry timestamp is the marker transaction's), and rebuild timestamps; no document looks at them together.
     *2026-11-13, partial:* the `acceptorSince` leg is settled (P-N2 FIXED). It now depends only on host-to-host skew

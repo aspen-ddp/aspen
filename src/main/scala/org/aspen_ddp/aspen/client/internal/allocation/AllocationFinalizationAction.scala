@@ -76,9 +76,6 @@ object AllocationFinalizationAction extends RegisteredTypeFactory with Finalizat
     new AllocationFinalizationAction(client, txd, newObject)
   }
 
-  def addToTransaction(newObject: ObjectPointer,
-                       tx: Transaction): Unit = {
-    tx.addFinalizationAction(FinalizationActionId(typeUUID), Some(newObject.toArray))
-  }
+  // Added by TransactionBuilder.addAllocatingObject for every allocated object
 
 }

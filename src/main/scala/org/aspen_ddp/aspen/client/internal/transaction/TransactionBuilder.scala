@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
-import org.aspen_ddp.aspen.client.internal.allocation.DeletionFinalizationAction
+import org.aspen_ddp.aspen.client.internal.allocation.{AllocationFinalizationAction, DeletionFinalizationAction}
 import org.aspen_ddp.aspen.client.{BlindKeyValueWrite, UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.*
@@ -391,8 +391,13 @@ class TransactionBuilder(
     finalizationActions = SerializedFinalizationAction(finalizationActionId, new Array[Byte](0)) :: finalizationActions
   }
 
+  /** Also adds the object's AllocationFinalizationAction, so no allocation is built without the action that records
+    * it in its pool's AllocationTree: the tree is what repair and rebuild find objects by (Rebuild F17)
+    */
   def addAllocatingObject(objectPtr: ObjectPointer): Unit = synchronized {
-    allocatingObjects += objectPtr
+    if !allocatingObjects.contains(objectPtr) then
+      allocatingObjects += objectPtr
+      addFinalizationAction(FinalizationActionId(AllocationFinalizationAction.typeUUID), objectPtr.toArray)
   }
 
   /** Objects this transaction allocates */

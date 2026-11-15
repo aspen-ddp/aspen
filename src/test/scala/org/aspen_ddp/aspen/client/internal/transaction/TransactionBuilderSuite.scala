@@ -13,6 +13,8 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, Exis
 import org.aspen_ddp.aspen.common.objects.ObjectRefcount
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.client.internal.allocation.AllocationFinalizationAction
+import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -45,6 +47,18 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
     val (txd, _, _) = bldr.buildTranaction(Map(kvp.poolId -> Replication(3, 2)),
       Map(kvp.poolId -> None), Map())
     txd.requirements.collectFirst { case r: KeyValueUpdate => r.deletesKeys }.get
+
+  test("every allocated object gets one AllocationFinalizationAction (Rebuild F17)") {
+    val bldr = mkBuilder()
+    bldr.replaySafe("test")
+    val kv2 = KeyValueObjectPointer(ObjectId(new UUID(0, 10)), PoolId(new UUID(0, 0)), Array[Byte]())
+    bldr.addAllocatingObject(kvp)
+    bldr.addAllocatingObject(kv2)
+    bldr.addAllocatingObject(kvp)
+    val (txd, _, _) = bldr.buildTranaction(Map(kvp.poolId -> Replication(3, 2)), Map(kvp.poolId -> None), Map())
+    val allocActions = txd.finalizationActions.filter(_.typeId.uuid == AllocationFinalizationAction.typeUUID)
+    allocActions.map(fa => ObjectPointer(fa.data).id).sortBy(_.uuid) shouldBe List(kvp.id, kv2.id).sortBy(_.uuid)
+  }
 
   test("an update with a key Delete sets deletesKeys") {
     kvDeletesKeys(List(Delete(Key(Array[Byte](1))), Insert(Key(Array[Byte](2)), Array[Byte](1)))) shouldBe true

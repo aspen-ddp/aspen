@@ -1,6 +1,5 @@
 package org.aspen_ddp.aspen.client
 
-import org.aspen_ddp.aspen.client.internal.allocation.AllocationFinalizationAction
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.*
 
@@ -28,14 +27,12 @@ trait ObjectAllocator:
     given ExecutionContext = client.clientContext
     createDataObjectPointer().map: ptr =>
       t.addAllocatingObject(ptr)
-      AllocationFinalizationAction.addToTransaction(ptr, t)
       ptr
 
   def allocateKeyValueObject()(using t: Transaction): Future[KeyValueObjectPointer] =
     given ExecutionContext = client.clientContext
     createKeyValueObjectPointer().map: ptr =>
       t.addAllocatingObject(ptr)
-      AllocationFinalizationAction.addToTransaction(ptr, t)
       ptr
 
   def allocateDataObject(initialContent: DataBuffer,
@@ -54,7 +51,6 @@ trait ObjectAllocator:
                                                   initialRefcount: ObjectRefcount = ObjectRefcount(0,1))
                                                  (using t: Transaction): Unit =
     t.addAllocatingObject(ptr)
-    AllocationFinalizationAction.addToTransaction(ptr, t)
     t.overwrite(ptr, ObjectRevision.Allocating, initialContent)
     t.setRefcount(ptr, ObjectRefcount.Allocating, initialRefcount)
 
@@ -79,7 +75,6 @@ trait ObjectAllocator:
                                                       initialRefcount: ObjectRefcount = ObjectRefcount(0,1))
                                                      (using t: Transaction): Unit =
     t.addAllocatingObject(ptr)
-    AllocationFinalizationAction.addToTransaction(ptr, t)
 
     var ops: List[KeyValueOperation] = initialContent.map((k, v) => Insert(k, v.bytes)).toList
 

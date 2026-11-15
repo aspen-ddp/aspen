@@ -14,6 +14,9 @@
   repair proof locks, repair F11). It fails with `BlindKeyValueWrite`, even when replay-safe, and stores refuse the
   same writes (`BlindWrite`). Blind Inserts are allowed: stores apply them last-writer-wins, but keep nothing to order
   a delete or an object-level change by
+- `TransactionBuilder.addAllocatingObject` adds the object's `AllocationFinalizationAction` itself, once per object, so
+  every allocation records its AllocationTree entry, which repair and rebuild find objects by (rebuild F17).
+  `ObjectAllocator` does not add it
 - UnackedCommits (`StoragePoolState.UnackedCommitsTreeKey`, `UnackedCommitEntry.key(store, txid)`): for every
   committed transaction, the finalizer writes `UnackedCommitEntry(timestamp, objects)` for each counted commit voter
   that sent no TxCommitted (`FinalizationAction.commitVoters`; all stores that sent none when voters are unknown),

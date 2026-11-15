@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.network._
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.paxos
 import org.aspen_ddp.aspen.common.paxos.{Learner, Proposer}
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionDisposition}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
@@ -109,6 +109,13 @@ abstract class TransactionDriver(
   protected var resolved: Boolean = false
   protected var finalized: Boolean = false
   protected var peerDispositions: Map[StoreId, TransactionDisposition.Value] = Map()
+
+  /** The incarnation of every store heard from in any prepare reply, promise or nack, of any round. It cannot change
+    * within one transaction's voting (a rebuilt store is muted for every transaction started before its
+    * acceptorSince), so the latest wins, and a reply without one leaves a known value in place
+    */
+  private var peerIncarnations: Map[StoreId, StoreIncarnation] = Map()
+
   protected var acceptedPeers: Set[StoreId] = Set[StoreId]()
   protected var finalizer: Option[TransactionFinalizer] = None
 
@@ -285,6 +292,8 @@ abstract class TransactionDriver(
 
     synchronized {
       logger.trace(s"Received PrepareResponse ${msg.transactionId} ProposalId: ${msg.proposalId} current ProposalId ${proposer.currentProposalId} from ${msg.from}. Disposition: ${msg.disposition}")
+
+      msg.incarnation.foreach(inc => peerIncarnations += (msg.from -> inc))
 
       if (msg.proposalId != proposer.currentProposalId)
         return
@@ -645,7 +654,7 @@ abstract class TransactionDriver(
         finalizerFailed(None, err)
 
       case Right(f) =>
-        f.commitVoters(countedCommitVoters)
+        f.commitVoters(countedCommitVoters, peerIncarnations)
 
         // Update with initial commitErrors. This avoids problems when all TxCommit messages arrive
         // before we notice that resolution has been achieved

@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory}
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateFinalizationAction
 import org.aspen_ddp.aspen.common.objects.ObjectId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
 import org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.server.network.Messenger
@@ -55,7 +55,8 @@ object RegisteredTransactionFinalizerFactory {
       actions.foreach(_.updateCommitErrors(commitErrors))
     }
 
-    override def commitVoters(voters: Option[Set[StoreId]]): Unit = actions.foreach(_.commitVoters(voters))
+    override def commitVoters(voters: Option[Set[StoreId]], incarnations: Map[StoreId, StoreIncarnation]): Unit =
+      actions.foreach(_.commitVoters(voters, incarnations))
 
     override def handedOffStores: Set[StoreId] = actions.flatMap(_.handedOffStores).toSet
 

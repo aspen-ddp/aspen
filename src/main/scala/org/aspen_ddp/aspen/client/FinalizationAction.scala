@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.common.objects.ObjectId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import scribe.Logging
 
 import scala.concurrent.Future
@@ -26,9 +26,10 @@ trait FinalizationAction extends Logging {
 
   /** Called once, right after creation, with the stores whose commit votes the driver counted towards a write
     * threshold of every object, or None when it learned the outcome without counting them (another driver's
-    * resolution, or a recovered accepted value)
+    * resolution, or a recovered accepted value). `incarnations` holds the incarnation of every store the driver heard
+    * from in any prepare reply, whatever `voters` is; a store absent from it never answered this driver
     */
-  def commitVoters(voters: Option[Set[StoreId]]): Unit = ()
+  def commitVoters(voters: Option[Set[StoreId]], incarnations: Map[StoreId, StoreIncarnation]): Unit = ()
 
   /** The stores this action has handed UnackedCommits entries for to be written (the planned set), whatever the write's
     * outcome. Empty until it hands them off, and for good if `cancel` came first: from then on nothing is written. So a

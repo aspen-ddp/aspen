@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedUnackedCommit, MissedUpdate}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, Value}
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, RefcountUpdate, DataUpdate, DataUpdateOperation, ExclusiveRevisionLock, SharedRevisionLock, TransactionDescription, TransactionId}
 
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -452,7 +452,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
   private def runMarkWithVoters(txd: TransactionDescription, voters: Set[StoreId],
                                 commitErrors: Map[StoreId, List[ObjectId]]): Future[Unit] =
     val fa = new MissedUpdateFinalizationAction(client, txd)
-    fa.commitVoters(Some(voters))
+    fa.commitVoters(Some(voters), Map())
     fa.updateCommitErrors(commitErrors)
     fa.markMissedUpdates()
     fa.complete
@@ -479,11 +479,29 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     yield
       entries.keySet shouldBe Set(UnackedCommitEntry.key(net.storeId1, txd.transactionId))
 
+  atest("an UnackedCommits entry records the voter's incarnation, and unknown for a store the driver never heard"):
+    // The driver learned the commit without counting votes, hearing only store0's prepare reply. No store sent
+    // TxCommitted, so every store gets an entry: store0's with its incarnation, the others' unknown
+    val ptr = pointerWith(Array[Byte](4, 8))
+    val txd = refcountTxd(ptr)
+    val i0 = StoreIncarnation.random()
+    val fa = new MissedUpdateFinalizationAction(client, txd)
+    fa.commitVoters(None, Map(net.storeId0 -> i0))
+    fa.markMissedUpdates()
+    for
+      _ <- fa.complete
+      entries <- unackedEntries(Radicle.poolId, txd.transactionId)
+    yield
+      entries shouldBe Map(
+        UnackedCommitEntry.key(net.storeId0, txd.transactionId) -> UnackedCommitEntry(txd.startTimestamp, Some(i0), List(ptr)),
+        UnackedCommitEntry.key(net.storeId1, txd.transactionId) -> UnackedCommitEntry(txd.startTimestamp, None, List(ptr)),
+        UnackedCommitEntry.key(net.storeId2, txd.transactionId) -> UnackedCommitEntry(txd.startTimestamp, None, List(ptr)))
+
   atest("a finalizer that wrote entries for stores 1 and 2 reports handedOffStores == {1, 2}"):
     val ptr = pointerWith(Array[Byte](4, 6))
     val txd = refcountTxd(ptr)
     val fa = new MissedUpdateFinalizationAction(client, txd)
-    fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)))
+    fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)), Map())
     fa.updateCommitErrors(Map(net.storeId0 -> Nil))
     fa.handedOffStores shouldBe empty
     fa.markMissedUpdates()
@@ -784,7 +802,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
   atest("a late TxCommitted making every store clean cannot complete the marker before its writes land"):
     val txd = refcountTxd(pointerWith(Array[Byte](7, 4)))
     val fa = new PendingWriteMarker(txd)
-    fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)))
+    fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)), Map())
     fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil))
     fa.handedOffStores shouldBe empty
     fa.markMissedUpdates()
@@ -806,7 +824,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     atest(s"a partially failed mark still lists every planned store (cancelled after hand-off: $cancelAfter)"):
       val txd = refcountTxd(pointerWith(Array[Byte](7, 5)))
       val fa = new PendingWriteMarker(txd)
-      fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)))
+      fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)), Map())
       fa.updateCommitErrors(Map(net.storeId0 -> Nil))
       fa.markMissedUpdates()
       if cancelAfter then fa.cancel()

@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectType,
                                            Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, SerializedFinalizationAction, TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
@@ -27,9 +27,15 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
   // The commit voters the driver counted, if it counted them. None: unknown, so every silent store may hold one
   private var voters: Option[Set[StoreId]] = None
 
-  override def commitVoters(voters: Option[Set[StoreId]]): Unit = synchronized {
-    this.voters = voters
-  }
+  // The incarnation of every store the driver heard from in a prepare reply. A store absent from it gets an entry
+  // with an unknown incarnation
+  private var incarnations: Map[StoreId, StoreIncarnation] = Map()
+
+  override def commitVoters(voters: Option[Set[StoreId]], incarnations: Map[StoreId, StoreIncarnation]): Unit =
+    synchronized {
+      this.voters = voters
+      this.incarnations = incarnations
+    }
 
   private var markTask: Option[ScheduledTask] = None
 
@@ -136,7 +142,8 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
       else
         val objects = txd.allHostedObjects(storeId).filter(ptr => changed.contains(ptr.id))
         Option.when(objects.nonEmpty):
-          MissedUnackedCommit(storeId, txd.transactionId, UnackedCommitEntry(txd.startTimestamp, None, objects))
+          MissedUnackedCommit(storeId, txd.transactionId,
+            UnackedCommitEntry(txd.startTimestamp, incarnations.get(storeId), objects))
 
     reportMarks(errors.map(_.store))
 

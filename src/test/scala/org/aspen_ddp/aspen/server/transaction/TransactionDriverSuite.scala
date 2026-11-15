@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.network.{ClientResponse, TxAccept, TxAcceptRes
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.NoBackgroundTaskManager
@@ -112,9 +112,14 @@ object TransactionDriverSuite {
     /** None until the driver reports its commit voters */
     var voters: Option[Option[Set[StoreId]]] = None
 
-    override def commitVoters(voters: Option[Set[StoreId]]): Unit = synchronized {
-      this.voters = Some(voters)
-    }
+    /** None until the driver reports its commit voters */
+    var incarnations: Option[Map[StoreId, StoreIncarnation]] = None
+
+    override def commitVoters(voters: Option[Set[StoreId]], incarnations: Map[StoreId, StoreIncarnation]): Unit =
+      synchronized {
+        this.voters = Some(voters)
+        this.incarnations = Some(incarnations)
+      }
   }
 
 
@@ -617,6 +622,58 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
     finalizer.created should be (true)
     finalizer.voters should be (Some(None))
+  }
+
+  test("a driver that counted a write threshold of commit votes gives the finalizer their incarnations") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val finalizer = new TFinalizer(false)
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), finalizer, _ => ())
+    val incs = Map(ds0 -> StoreIncarnation(new java.util.UUID(1, 0)), ds1 -> StoreIncarnation(new java.util.UUID(1, 1)))
+
+    for from <- List(ds0, ds1) do
+      driver.receiveTxPrepareResponse(TxPrepareResponse(ds0, from, txd.transactionId,
+        Right(TxPrepareResponse.Promise(None)), ProposalId(1, 0), TransactionDisposition.VoteCommit, Nil,
+        Some(incs(from))))
+    for from <- List(ds0, ds1) do
+      driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
+        Right(TxAcceptResponse.Accepted(true))))
+
+    finalizer.created should be (true)
+    finalizer.voters should be (Some(Some(Set(ds0, ds1))))
+    finalizer.incarnations should be (Some(incs))
+  }
+
+  test("a driver that adopted the commit without counting votes still reports the incarnations it heard") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val finalizer = new TFinalizer(false)
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), finalizer, _ => ())
+    val inc0 = StoreIncarnation(new java.util.UUID(2, 0))
+
+    driver.receiveTxPrepareResponse(TxPrepareResponse(ds0, ds0, txd.transactionId,
+      Right(TxPrepareResponse.Promise(None)), ProposalId(1, 0), TransactionDisposition.VoteCommit, Nil, Some(inc0)))
+    driver.receiveTxResolved(org.aspen_ddp.aspen.common.network.TxResolved(ds0, ds1, txd.transactionId,
+      committed = true, late = false, proof = false))
+
+    finalizer.created should be (true)
+    finalizer.voters should be (Some(None))
+    // ds1 and ds2 never answered a prepare, so the driver knows no incarnation for them
+    finalizer.incarnations should be (Some(Map(ds0 -> inc0)))
+  }
+
+  test("a reply without an incarnation does not erase one already heard") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val finalizer = new TFinalizer(false)
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), finalizer, _ => ())
+    val inc0 = StoreIncarnation(new java.util.UUID(3, 0))
+
+    for inc <- List(Some(inc0), None) do
+      driver.receiveTxPrepareResponse(TxPrepareResponse(ds0, ds0, txd.transactionId,
+        Right(TxPrepareResponse.Promise(None)), ProposalId(1, 0), TransactionDisposition.VoteCommit, Nil, inc))
+    driver.receiveTxResolved(org.aspen_ddp.aspen.common.network.TxResolved(ds0, ds1, txd.transactionId,
+      committed = true, late = false, proof = false))
+
+    finalizer.created should be (true)
+    finalizer.incarnations should be (Some(Map(ds0 -> inc0)))
   }
 
   test("Simple AcceptResponse Handling - Ignore invalid acceptor") {

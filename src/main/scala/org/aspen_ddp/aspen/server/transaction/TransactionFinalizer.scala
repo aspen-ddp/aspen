@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.transaction
 
 import org.aspen_ddp.aspen.common.objects.ObjectId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
 import org.aspen_ddp.aspen.server.network.Messenger
 
@@ -24,7 +24,7 @@ trait TransactionFinalizer {
   def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit
 
   /** See FinalizationAction.commitVoters */
-  def commitVoters(voters: Option[Set[StoreId]]): Unit = ()
+  def commitVoters(voters: Option[Set[StoreId]], incarnations: Map[StoreId, StoreIncarnation]): Unit = ()
 
   /** See FinalizationAction.handedOffStores: the union over the actions */
   def handedOffStores: Set[StoreId] = Set()

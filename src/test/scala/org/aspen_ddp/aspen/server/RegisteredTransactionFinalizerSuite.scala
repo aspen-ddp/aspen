@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.client.FinalizationAction
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateFinalizationAction
 import org.aspen_ddp.aspen.common.objects.ObjectId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation}
 import org.aspen_ddp.aspen.server.RegisteredTransactionFinalizerFactory.Finalizer
 import org.aspen_ddp.aspen.server.transaction.TransactionDriverSuite
@@ -45,7 +45,8 @@ object RegisteredTransactionFinalizerSuite:
     override def execute(): Unit = executed = true
     override def cancel(): Unit = cancelled = true
     override def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = errors = commitErrors :: errors
-    override def commitVoters(voters: Option[Set[StoreId]]): Unit = this.voters = voters :: this.voters
+    override def commitVoters(voters: Option[Set[StoreId]], incarnations: Map[StoreId, StoreIncarnation]): Unit =
+      this.voters = voters :: this.voters
 
 class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
   import RegisteredTransactionFinalizerSuite.{*, given}
@@ -62,7 +63,7 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
 
     // Commit errors and voters given before the marker executes reach it
     val errors = Map(TransactionDriverSuite.ds0 -> List.empty[ObjectId])
-    f.commitVoters(Some(Set(TransactionDriverSuite.ds0)))
+    f.commitVoters(Some(Set(TransactionDriverSuite.ds0)), Map())
     f.updateCommitErrors(errors)
     marker.voters should be (List(Some(Set(TransactionDriverSuite.ds0))))
     marker.errors should be (List(errors))

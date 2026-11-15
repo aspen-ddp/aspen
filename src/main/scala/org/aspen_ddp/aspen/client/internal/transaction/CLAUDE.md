@@ -20,7 +20,10 @@
 - UnackedCommits (`StoragePoolState.UnackedCommitsTreeKey`, `UnackedCommitEntry.key(store, txid)`): for every
   committed transaction, the finalizer writes `UnackedCommitEntry(timestamp, incarnation, objects)` for each counted commit voter
   that sent no TxCommitted (`FinalizationAction.commitVoters`; all stores that sent none when voters are unknown),
-  in the ErrorTree batch. Value: `[timestamp:8][incarnation:16][count:4][pointers]`; the incarnation is the store's
+  in the ErrorTree batch. The entry's incarnation comes from `commitVoters`' `incarnations` map, which the driver fills
+  from every prepare reply it got (promise or nack, any round, whether or not it counted votes; a reply without one
+  never erases a known value); a store that never answered the driver gets `None`. Value:
+  `[timestamp:8][incarnation:16][count:4][pointers]`; the incarnation is the store's
   `StoreIncarnation` UUID, the zero UUID meaning `None` (unknown), copied into every chunk. `MissedUpdateFinalizationAction` runs last, so an entry durable means every other
   finalization action is done
 - `MissedUpdateFinalizationAction` disables missed-update tracking on an ErrorTree write only when the transaction

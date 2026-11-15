@@ -263,8 +263,8 @@ Verified OK in the normal flow (E is written 2 s after commit and kept until the
 > UnackedCommits delete, reusing an answer at most one second old (`StoreRepairer.OwnershipRecheck`). A negative answer
 > abandons the rest of the scan and leaves the remaining entries (and their stubs) for the owner. Residual: a delete
 > that commits inside the re-check window (about one second plus the delete's latency) after the pool entry moved.
-> Reaching it needs the old incarnation still serving after its move, that is a mistaken failure of a live device
-> (T12 on a device that still works, until its host reads it Failed and retires it, X1). Closing it outright would put a requirement on the
+> Reaching it needs the old incarnation still serving after its move, that is, a mistaken failure of a live device.
+> Such a device keeps serving until its host reads it Failed and retires it (X1). Closing it outright would put a requirement on the
 > pool state object into every repair delete, adding the bootstrap pool to each. *ErrorTree entries carry no
 > incarnation, by design.* Their writer has no authoritative source: a store is marked because it was silent, so the
 > only source would be a possibly stale cached `StoragePoolState`, and ignoring a mark it got wrong would leave a real
@@ -376,7 +376,7 @@ G5. ErrorTree/UnackedCommits entry-key incarnation (X10) and the time-line of en
     old incarnation, I1 the rebuilt one.
     *In-place rebuild* (T1-T11: lost or corrupt CRL, lost backend; same host, same device, rebuild-process 4.1):
     (1) *I0 serving.* Finalizers of each T in which I0 cast a counted commit vote and sent no `TxCommitted` write
-    UnackedCommits entries tagged I0 (unknown only when the finalizing driver never heard from I0, after a takeover).
+    UnackedCommits entries tagged I0 (unknown only when the finalizing driver never heard from I0, typically after a takeover).
     Transactions I0 was silent for write ErrorTree marks. I0's scans consume both.
     (2) *Marked and Rebuilding.* I0 is discarded with its CRL, stubs included (rebuild-process N3). The store is offline
     and not repairable, so nothing scans the slot. Finalizers still running for T that I0 voted in keep writing entries

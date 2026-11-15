@@ -1,6 +1,21 @@
 Backlog
 =======
 
+--- Moved from Safety Work List ---
+
+3.1  Design protections S11-S15 (SL M1-M5, M11; scenarios SC3-SC7)                                          [L]
+     S11: prove that the rest of the pool can reconstruct a store before discarding it. S12: bound concurrent
+     discarded or rebuilding stores per pool, across hosts. S13: transient, configuration and version conditions
+     are never treated as corruption. S14: discarded state stays recoverable for a retention period. S15: detect
+     a burst of declarations and halt automatic destruction. The SL doc's suggested first step is a test that
+     forces openCRL to throw fleet-wide during a simulated rolling restart. Build that test first.
+     Include: S7/Q1 (crl.lost-<uuid> is kept but never used: define retention and salvage, or delete it), S8
+     (record each declaration durably with its cause, visible in show-* commands), SL Q3-Q6, and the destructive
+     4.2 rows X2/X3/X5/X6/X7 as false-positive amplifiers (X5 removes crl_save.log after a fail-stop). Every
+     automatic fail-stop (backend I/O error, failed CRL recovery, Frontend.failStop) is a lost-store declaration
+     and falls under the same check (Backlog: "System-level protection against correlated lost store
+     declarations").
+
 --- Near term ---
 
 Flaky tests:

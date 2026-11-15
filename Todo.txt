@@ -36,21 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.13 Paxos hardening cluster: P-F4, F5, F6, F7, F11 (and R-F11)                                             [S-M]
-     None of these produces a split alone, but each removes a leg that other faults combine with.
-       F4/R-F11: secondary-pool stores can drive and share proposer ids. Drive only from primary-pool stores,
-                 or derive the proposer id from (pool, index).
-       F5: a restarted leader reuses (1,L). Start a restarted driver at round 2 or higher, or persist the
-           highest round used.
-       F6: aborts drop acceptor state at resolution. The transaction horizon makes a forgotten abort
-           non-re-decidable, so this matters only if a host wall clock steps back by more than ~8 s (paxos F6).
-           Fix if that residual matters: keep the Paxos record until TxFinalized, as commits do. Low priority.
-           The same clock step also weakens the forget floor's time leg, letting a store that forgot T rejoin
-           it, which would reopen the replay residuals 2.9 closed (transaction-recovery Todo 2.9 re-assessment).
-       F7: count Undetermined as no reply, not as an abort vote.
-       F11: Tx, driver and client accept a conflicting resolution silently. Log an error and count it, as split-
-            decision detection, the way the host status cache already does (TransactionStatusCache.splitDecisions).
-
 2.14 Server-side validation of the description: Req F7, Q-N4, Req open question 1                           [M-L]
      The pin rule, thresholds, primary object and one-update-per-object are enforced by the client only. Validate
      at the store: thresholds against the pool IDA (and audit `2T > width` outside IDA construction), at most one

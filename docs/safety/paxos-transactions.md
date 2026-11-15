@@ -880,7 +880,7 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 | Store, after learning commit, before applying | Recovered as Unresolved with its vote and data; commit vote re-locks | Must re-learn: a live driver, status cache, a peer's proof, or the UnackedCommits lookup (`needsUnackedCheck`), which now runs for every recovered commit vote and gates its driver. If every other store finalized and forgot: an entry makes it apply; no entry means it acknowledged (or did not count), and a late commit applies nothing. Without a proof or entry, abort votes may decide abort (F2 residual; closed by the horizon: past the floor no forgotten peer answers, and the Tx ends by expiry, applying T if its entry exists). |
 | Store, after in-memory apply, before backend commit durable | Object data still in the CRL (P13); recovered like the previous row | Same. |
 | Store, after backend commit, before CRL data drop | Recovered Unresolved; `appliedBy` shows the update | `proveCommitted` on the next prepare or `doCommit` skips as already applied (`Tx.scala:689-694`). |
-| Leader/driver, before Accept sent | Driver state lost | Recovery driver after idle timeout; values for round 1 not reused (round >= 2). Leader's own restart restarts at `(1,L)` (F5). |
+| Leader/driver, before Accept sent | Driver state lost | Recovery driver after idle timeout; values for round 1 not reused (round >= 2). Since 2026-11-15 only the leader's first driver (its client's prepare creating the Tx) starts at `(1,L)`; a restarted or replacement leader driver starts at round 2 or above what its own acceptor promised (F5). |
 | Leader, after quorum accepted, before `TxResolved` sent | Accepted state at `t` acceptors | Recovery driver's prepare quorum intersects the accepted set, so it re-proposes the same value (P8). |
 | Leader, after resolution, during FinalizationActions | Stores hold the committed Tx (not finalized), their CRL records kept | Recovery driver: stores still within cache reply `TxResolved`, or answer Promise with their retained accepted commit (P9); it re-runs the finalizer (at-least-once). |
 | Driver, after `TxFinalized` partly sent | Some stores finalized | Idle stores recover via their own driver and the cache (11.1). |
@@ -895,8 +895,9 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
   `TxResolved`/`TxFinalized`.
 * Both resolve and both run FinalizationActions: duplicates are permitted (at-least-once, idempotent). Both send
   `TxFinalized`; stores handle it once (`Tx.scala:925`).
-* Two drivers with the **same id** (secondary-pool store sharing the index; restarted leader): not safe in principle (F4,
-  F5).
+* Two drivers with the **same id**: a secondary-pool store sharing the index can no longer propose (learn-only, F4,
+  2026-11-15), and a restarted leader no longer reuses `(1,L)` (F5). Left: a restarted driver of round >= 2 may repeat
+  an id its own acceptor never saw (F5 residual).
 * A recovery driver racing a `TxResolved` from the cache: the first learned value wins in `onResolution` (P19).
 
 ---
@@ -905,6 +906,16 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 
 Format: ID, confidence that the described behaviour exists and is a real problem, scenario, code. "Confidence" is
 about the finding, not the likelihood of occurrence.
+
+### Re-assessment for Todo 2.13, Paxos hardening (2026-11-15)
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F4 / Recovery F11 | **FIXED** | Only primary-pool stores propose (`TransactionDriver.mayPropose`). A driver on any other store is learn-only: it sends prepares and resolves, proves late and finalizes from what it hears, but sets no proposal and sends no Accept (the retransmit timer included). `designatedLeader` checks the pool too. Its prepares and heartbeats do not count as activity at a Tx (`Tx.fromProposer`), so a primary store still takes an idle transaction over when the leader is unreachable; with no primary store reachable the Tx ends by expiry, which counts only primary-pool answers | TransactionDriverSuite "a driver on a secondary-pool store is learn-only ..."; SimpleTransactionDriverSuite "a learn-only driver's retransmits send prepares, never an Accept ..."; FrontendSuite "prepares and heartbeats from a learn-only driver do not reset ...", "a secondary-pool commit voter whose primary stores answer unknown ..."; LearnOnlyDriverIntegrationSuite |
+| F5 | **NARROWED** | Only the designated leader's first driver, the one a client's prepare creating the Tx starts (`Store.driveTransaction(initialProposal = true)`), keeps `(1,L)`. Every other driver starts at round 2 or higher, above the highest id its own acceptor promised or accepted (`TransactionDriver.Start.highestSeen`, `Tx.highestProposal`). Residual: a restarted driver of round >= 2 may repeat an id its own acceptor never saw. Same-id proposers then compute the same value, since the tally is conclusive only on immutable votes (7.2) now that Undetermined is no vote (F7), and a restarted host refuses every T started before its load (forget floor, 10.10) | SimpleTransactionDriverSuite "only the designated leader's first driver starts at the initial proposal", "... starts above what its own acceptor promised or accepted"; StoreSuite "only a client prepare creating the transaction at its leader ...", "a driver started for an idle Tx starts above ..." |
+| F6 | **CLOSED** (accepted residual) | Not changed, by decision. A live store keeps its in-memory acceptor state until `TxFinalized` whatever the CRL holds, and a restarted one refuses T (forget floor). Keeping the abort's record until `TxFinalized` would only cover the clock-step residual (a wall clock stepping back by more than about 8 s) between resolution and `TxFinalized`, which for an abort is one message, while the same residual applies to every finalized transaction of either outcome | 10.10 |
+| F7 | **FIXED** | `Undetermined` counts neither as a reply nor as an abort vote in the tally. When the votes cannot decide but a promise of the round's quorum carries an accepted value, the driver proposes that value (always safe in Paxos), so stores that answer Undetermined cannot stall a round whose quorum reports the chosen value | TransactionDriverSuite "Undetermined replies are no votes ...", "a quorum reporting an accepted value is proposed while Undetermined replies leave the tally undecided" |
+| F11 | **FIXED** for stores and drivers | A conflicting second outcome is logged as an error and counted in the host status cache's `splitDecisions` (`TransactionStatusCache.recordSplitDecision`) at the Tx (`receiveResolved`, `receiveFinalized`) and the driver (`onResolution`, `receiveTxFinalized`, a late commit after an abort). Each keeps its first outcome; a driver that resolved commit ignores an abort `TxFinalized` (Committed wins, Ruling 30). The client logs a conflicting outcome only when it races the first: `TransactionManager` forgets a driver once it has one, so the stores are the detectors | TransactionDriverSuite "a conflicting TxResolved or TxFinalized after a resolution is reported and changes nothing"; FrontendSuite "an outcome opposite to the one a Tx holds is counted as a split decision ..." |
 
 ### Re-assessment for the transaction horizon (2026-11-13, `e9e6f3f6`)
 
@@ -1040,6 +1051,10 @@ or clamp future timestamps.
 
 ### F4. Secondary-pool stores can become drivers and share the proposal-id space of primary stores. Confidence: structural 85%, exploitability low
 
+> **Refresh (Todo 2.13, 2026-11-15): FIXED.** Drivers on secondary-pool stores are learn-only (`TransactionDriver.mayPropose`):
+> no proposal, no Accept. Their prepares and heartbeats do not reset a Tx's idle time, so a primary store takes an idle
+> transaction over. See the 2026-11-15 re-assessment table.
+
 > **Verification 2026-11-09: PLAUSIBLE. Severity: split-decision (only if proposers can compute different values).** Structure confirmed: designatedLeader compares only the pool index (TransactionDriver.scala:155) while Store.handleTransactionMessage checks the pool (Store.scala:191), Store.heartbeat starts a driver for ANY idle Tx (Store.scala:84-88), Proposer peerId = storeId.poolIndex (TransactionDriver.scala:102), and a secondary-pool store with the leader's index skips nextRound (SimpleTransactionDriver.scala:48) so it starts at the same (1,L). Acceptor accepts an equal id with any value (Acceptor.scala:31). But the tally decides only when conclusive (commit when every object has >= writeThreshold commit votes, abort when some object cannot reach it; TransactionDriver.scala:319-360) and votes are immutable, so same-id proposers compute the same value; a real split needs the non-vote inputs (F7 Undetermined, F2/F6).
 > *Fix sketch:* Restrict driving to primary-pool stores, or make the proposer id the primary-pool index only.
 
@@ -1056,6 +1071,10 @@ include the pool in the id (for instance the leader's primary index only).
 
 ### F5. A restarted leader reuses `(1,L)`; old in-flight Accepts can flip acceptors. Confidence: low-medium
 
+> **Refresh (Todo 2.13, 2026-11-15): NARROWED.** Only the leader's first driver keeps `(1,L)`; any other starts at round
+> 2 or higher, above its own acceptor's highest id. Residual: a restarted round->=2 driver may repeat an id its acceptor
+> never saw, safe while same-id proposers tally the same immutable votes (F7 fixed). See the 2026-11-15 table.
+
 > **Verification 2026-11-09: PLAUSIBLE. Severity: split-decision (rare).** Confirmed that a new driver (restart, or any new driver after the leader's was removed) starts at (1,L) (Proposer.scala:11-13, SimpleTransactionDriver.scala:48) and that Acceptor accepts equal ids (Acceptor.scala:31). A delayed old Accept after a decision still requires the transaction to be unfinalized at a quorum; practically needs a message delayed beyond a restart.
 > *Fix sketch:* Persist the highest round used per transaction, or start a restarted driver at round >= 2 after a Nack-probe.
 
@@ -1070,6 +1089,11 @@ Fix: derive the round from durable state, or let a driver always advance past `p
 its first Accept (it does not, because `receiveTxPrepare` is dead, 7.3).
 
 ### F6. Abort resolution forgets acceptor state before finalization; safety then rests on in-memory caches and the clock. Confidence: low-medium
+
+> **Refresh (Todo 2.13, 2026-11-15): CLOSED as an accepted residual.** The record matters only across a restart, where
+> the forget floor already refuses T. Keeping it until `TxFinalized` would narrow the clock-step residual to the one
+> message between an abort's resolution and its `TxFinalized`, while the same residual covers every finalized
+> transaction. Not worth the extra recovery path.
 
 > **Refresh (horizon, 2026-11-13): RE-ASSESSED; no longer reachable as a split.** The record is still deleted at abort
 > resolution, but a forgotten abort can no longer be re-decided: the store's cache entry outlasts the window in which
@@ -1102,6 +1126,9 @@ abort resolution rather than finalization worth the saved space? Retaining it un
 remove the restart variant at the cost of a longer-lived record.
 
 ### F7. `Undetermined` answers are counted as abort votes. Confidence: high that it happens, low impact
+
+> **Refresh (Todo 2.13, 2026-11-15): FIXED.** Undetermined is no vote in the tally, and a round whose votes cannot
+> decide proposes an accepted value its promise quorum reports.
 
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness/hardening (safe by P7 while some acceptor holds the chosen value).** TransactionDriver.scala:332-335: every non-VoteCommit disposition, including Undetermined, is counted as an abort vote. Tx.answerPrepare/respondToPrepare answer with disposition as-is once oresolution is set (Tx.scala:835-886 region; determineDisposition is skipped when oresolution.nonEmpty, :526-553).
 > *Fix sketch:* Count Undetermined as no vote.
@@ -1179,6 +1206,10 @@ to the dead leader. R's finalizer then sees the store as not having committed, a
 (repair reconciles exactly) but it adds repair load and can delay finalization.
 
 ### F11. Split decisions are undetectable. Confidence: high (hardening)
+
+> **Refresh (Todo 2.13, 2026-11-15): FIXED for stores and drivers.** Tx and driver log and count a conflicting outcome
+> (`TransactionStatusCache.recordSplitDecision`, `splitDecisions`) and keep the first. The client detects only racing
+> duplicates (it forgets a transaction on its first outcome).
 
 > **Verification 2026-11-09: CONFIRMED. Severity: doc-only (observability).** Tx.resolved (Tx.scala:772), onResolution (TransactionDriver.scala:690-693) and Tx.receiveFinalized (:925-930) silently ignore a conflicting second outcome.
 > *Fix sketch:* Log error plus a counter on any conflicting TxResolved/TxFinalized.

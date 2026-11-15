@@ -147,6 +147,43 @@ class StoreSuite extends AnyFunSuite with Matchers:
     crl.txSaved shouldBe false
   }
 
+  /** Records the Start of every driver it creates */
+  private class RecordingFactory extends TransactionDriver.Factory:
+    var starts: List[TransactionDriver.Start] = Nil
+    def create(ec: ExecutionContext, storeId: StoreId, messenger: Messenger, backgroundTasks: BackgroundTaskManager,
+               txd: TransactionDescription, finalizerFactory: TransactionFinalizer.Factory,
+               start: TransactionDriver.Start): TransactionDriver =
+      starts = starts :+ start
+      TransactionDriver.noErrorRecoveryFactory.create(ec, storeId, messenger, backgroundTasks, txd, finalizerFactory,
+        start)
+
+  // Paxos F5
+  test("only a client prepare creating the transaction at its leader starts a driver at the initial proposal") {
+    val factory = new RecordingFactory
+    val (store, _, _) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS), driverFactory = factory)
+    store.receiveTransactionMessage(prepare(leader, leader).copy(fromClient = true))
+    factory.starts.map(_.initialProposal) shouldBe List(true)
+
+    val other = new RecordingFactory
+    val (store2, _, _) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS), driverFactory = other)
+    store2.receiveTransactionMessage(prepare(leader, peer))
+    other.starts.map(_.initialProposal) shouldBe List(false)
+  }
+
+  test("a driver started for an idle Tx starts above what the store's acceptor promised, and reports split decisions") {
+    val factory = new RecordingFactory
+    val statusCache = new TransactionStatusCache()
+    val (store, _, _) = mkStore(peer, statusCache, Duration.Zero, driverFactory = factory)
+    store.receiveTransactionMessage(prepare(peer, leader).copy(proposalId = ProposalId(3, 1), fromClient = true))
+    store.frontend.transactions(txid1).highestProposal shouldBe Some(ProposalId(3, 1))
+
+    store.heartbeat()
+    factory.starts.map(s => (s.initialProposal, s.highestSeen)) shouldBe List((false, Some(ProposalId(3, 1))))
+
+    factory.starts.head.onSplitDecision(txid1, "test")
+    statusCache.splitDecisions shouldBe 1
+  }
+
   /** A fixed start on the injected clock: the store's view of time is the test's alone */
   private val fixedStart = 1_000_000_000_000L
   private def fixedTxd = txd.copy(startTimestamp = HLCTimestamp(fixedStart << 16))

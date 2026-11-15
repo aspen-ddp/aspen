@@ -23,8 +23,10 @@ object SimpleTransactionDriver {
                  messenger: Messenger,
                  backgroundTasks: BackgroundTaskManager,
                  txd: TransactionDescription,
-                 finalizerFactory: TransactionFinalizer.Factory): TransactionDriver =
-        new SimpleTransactionDriver(executionContext, initialDelay, maxDelay, storeId, messenger, backgroundTasks, txd, finalizerFactory)
+                 finalizerFactory: TransactionFinalizer.Factory,
+                 start: TransactionDriver.Start): TransactionDriver =
+        new SimpleTransactionDriver(executionContext, initialDelay, maxDelay, storeId, messenger, backgroundTasks, txd,
+          finalizerFactory, start)
 }
 
 /** Provides a store-side transaction driver with a very simple retransmit strategy and exponential backoff mechanism
@@ -37,15 +39,18 @@ class SimpleTransactionDriver(executionContext: ExecutionContext,
                               messenger: Messenger,
                               backgroundTasks: BackgroundTaskManager,
                               txd: TransactionDescription,
-                              finalizerFactory: TransactionFinalizer.Factory) extends TransactionDriver(
-  storeId, messenger, backgroundTasks, txd, finalizerFactory)(using executionContext) {
+                              finalizerFactory: TransactionFinalizer.Factory,
+                              start: TransactionDriver.Start = TransactionDriver.Start()) extends TransactionDriver(
+  storeId, messenger, backgroundTasks, txd, finalizerFactory, start)(using executionContext) {
 
   private var backoffDelay = initialDelay
   private var nextTry = backgroundTasks.schedule(initialDelay) { sendPeerMessages() }
 
   private var sendCount = 0
 
-  if !designatedLeader then nextRound()
+  // Only the designated leader's first driver keeps the initial proposal (1, L) its client's prepare carries: any other
+  // starts above round 1 and above what its own acceptor promised (TransactionDriver.Start, paxos F5)
+  if !(designatedLeader && start.initialProposal) then nextRound()
 
   /** Set by shutdown: a timer already firing neither sends nor schedules again */
   private var stopped = false
@@ -67,7 +72,7 @@ class SimpleTransactionDriver(executionContext: ExecutionContext,
         messenger.sendTransactionMessages(txd.allDataStores.filter(!knownResolved.contains(_)).toList
           .map(toStore => TxResolved(toStore, storeId, txd.transactionId, resolvedValue, late, proof = false)))
       else
-        proposer.currentAcceptMessage() match
+        currentAcceptMessage() match
           case Some(_) =>
             // If the stores detect resolution before we do, they can discard their transactions. Subsequent accept messages
             // we send will be silently ignored so we'll never receive responses from them. To work around this, we'll

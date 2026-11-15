@@ -752,7 +752,7 @@ Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding 
 | F8 | **narrowed** | As paxos F2: a proof-holding driver resolves late and reports committed | `TransactionDriver.scala:318-319,539-552` |
 | F9 | **fixed** | Eviction no longer reopens a replay window: replay is refused by pins, not by the cache; the eviction warning is gone | `TransactionStatusCache.scala:15-24` |
 | F10 | **fixed** (Ruling 30) | `updateStatus` is monotone: `finalized`/`late` sticky, no revert to Unresolved, so no write downgrades an entry (X3) | `TransactionStatusCache.scala` `updateStatus` |
-| F11 | unchanged | Proposer peer is the pool index | `TransactionDriver.scala:88` |
+| F11 | unchanged (FIXED 2026-11-15 with paxos F4: secondary-pool drivers are learn-only) | Proposer peer is the pool index | `TransactionDriver.scala:88` |
 | F12 | **fixed** (Ruling 31) | `Store.close` shuts down the store's drivers and clears its map; a `SimpleTransactionDriver` timer already firing neither sends nor reschedules. A forgotten abort re-decided by a delayed duplicate client prepare (paxos P-N4) is not affected | `Store.scala` `close`; `SimpleTransactionDriver.scala` `shutdown` |
 | F13 | unchanged | Entries only for counted voters when voters are known | `MissedUpdateFinalizationAction.scala:99` |
 | F14 | unchanged (load larger) | Finalization still waits for the marker, which now also carries an entry per silent voter per transaction (R-N4) | `MissedUpdateFinalizationAction.scala:98-114` |
@@ -982,6 +982,10 @@ dropped as finalized (`Frontend.scala:639`) so they create a fresh `Tx` that tak
 
 > **Verification 2026-11-09: PLAUSIBLE. Severity: split-decision (benign in practice).** Same as paxos F4: the tally is a pure function of immutable votes, so colliding ids propose the same value.
 > *Fix sketch:* As paxos F4.
+
+> **Refresh (Todo 2.13, 2026-11-15): FIXED** with paxos F4: only primary-pool stores propose; a driver on any other store
+> is learn-only (`TransactionDriver.mayPropose`). The leader's reuse of `(1, leader)` after a restart is paxos F5
+> (narrowed: only its first driver keeps it).
 
 **F11 (L) Proposal-id peer is the store's pool index, not (pool, index).** `Proposer(storeId.poolIndex, ...)`
 (`TransactionDriver.scala:88`). A recovery driver on a store of a non-primary pool (any store holding a `Tx` can drive,

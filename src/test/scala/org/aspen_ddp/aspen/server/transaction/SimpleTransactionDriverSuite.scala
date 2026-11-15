@@ -1,6 +1,8 @@
 package org.aspen_ddp.aspen.server.transaction
 
-import org.aspen_ddp.aspen.common.network.{TxAcceptResponse, TxCommitted, TxFinalized, TxPrepareResponse, TxResolved}
+import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxPrepare, TxPrepareResponse, TxResolved}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId}
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, TransactionDisposition}
@@ -47,7 +49,7 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
     factory.failedDriverDuration should be > maxDelay
   }
 
-  /** A leader for stores 0 to 2 whose transaction has committed and whose finalization never completes */
+  /** A leader's first driver for stores 0 to 2 whose transaction has committed and whose finalization never completes */
   def resolvedDriver(handedOff: Set[StoreId] = Set()): (SimpleTransactionDriver, TMessenger, ManualTasks) =
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
@@ -55,7 +57,7 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
     val finalizer = new TFinalizer(autoComplete = false)
     finalizer.handedOff = handedOff
     val driver = new SimpleTransactionDriver(summon[ExecutionContext], 100.milliseconds, 3.seconds, ds0, messenger, tasks,
-      txd, finalizer)
+      txd, finalizer, TransactionDriver.Start(initialProposal = true))
     val proposal = ProposalId(1, 0)
 
     for from <- List(ds0, ds1, ds2) do
@@ -111,6 +113,56 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
     tasks.fireAll(ignoreCancel = true)
     resolvedSentTo(messenger) shouldBe empty
     tasks.pending shouldBe 0
+  }
+
+  def preparedAt(messenger: TMessenger): Set[ProposalId] = messenger.messages.collect { case p: TxPrepare => p.proposalId }.toSet
+
+  def startedDriver(storeId: StoreId, start: TransactionDriver.Start,
+                    txd: org.aspen_ddp.aspen.common.transaction.TransactionDescription =
+                      mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil))
+      : (SimpleTransactionDriver, TMessenger, ManualTasks) =
+    val messenger = new TMessenger()
+    val tasks = new ManualTasks(summon[ExecutionContext])
+    val driver = new SimpleTransactionDriver(summon[ExecutionContext], 100.milliseconds, 3.seconds, storeId, messenger,
+      tasks, txd, new TFinalizer(autoComplete = false), start)
+    tasks.fireAll()
+    (driver, messenger, tasks)
+
+  // Paxos F5: a restarted or replacement leader driver reusing (1, L) would be a second proposer with the first one's id
+  test("only the designated leader's first driver starts at the initial proposal") {
+    val (_, first, _) = startedDriver(ds0, TransactionDriver.Start(initialProposal = true))
+    preparedAt(first) shouldBe Set(ProposalId(1, 0))
+
+    val (_, later, _) = startedDriver(ds0, TransactionDriver.Start())
+    preparedAt(later) shouldBe Set(ProposalId(2, 0))
+  }
+
+  test("a driver that is not the leader's first starts above what its own acceptor promised or accepted") {
+    val (_, leader, _) = startedDriver(ds0, TransactionDriver.Start(highestSeen = Some(ProposalId(5, 2))))
+    preparedAt(leader) shouldBe Set(ProposalId(6, 0))
+
+    val (_, recovery, _) = startedDriver(ds1, TransactionDriver.Start(highestSeen = Some(ProposalId(3, 0))))
+    preparedAt(recovery) shouldBe Set(ProposalId(4, 1))
+  }
+
+  // Paxos F4: the retransmit timer sends the current Accept itself; a learn-only driver must not
+  test("a learn-only driver's retransmits send prepares, never an Accept of an adopted value") {
+    val otherPool = PoolId(java.util.UUID.randomUUID())
+    val otherObj = DataObjectPointer(ObjectId(java.util.UUID.randomUUID()), otherPool, Array[Byte]())
+    val txd = mktxd(simpleObj, List(DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite),
+      DataUpdate(otherObj, rev, DataUpdateOperation.Overwrite)))
+    val secondary = StoreId(otherPool, 0)
+    val (driver, messenger, tasks) = startedDriver(secondary, TransactionDriver.Start(initialProposal = true), txd)
+    val round = preparedAt(messenger).head
+
+    for from <- List(ds0, ds1, ds2) do
+      driver.receiveTxPrepareResponse(TxPrepareResponse(secondary, from, txd.transactionId,
+        Right(TxPrepareResponse.Promise(Some((ProposalId(1, 0), true)))), round, TransactionDisposition.VoteCommit, Nil))
+    messenger.clear()
+
+    tasks.fireAll()
+    messenger.messages.collect { case a: TxAccept => a } shouldBe Nil
+    preparedAt(messenger) should not be empty
   }
 
   // Ruling 31: Store.close shuts its drivers down. A timer already firing must not restart the retry loop

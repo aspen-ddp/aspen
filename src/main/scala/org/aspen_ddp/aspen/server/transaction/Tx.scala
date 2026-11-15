@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.transaction
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
-import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare}
+import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare, ProposalId}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
@@ -983,8 +983,9 @@ class Tx( trs: TransactionRecoveryState,
 
     // The client re-sends its prepares until it learns the outcome, whether or not any driver is
     // making progress. Counting them as activity would keep a transaction whose designated leader
-    // is offline from ever looking idle, so no other store would take it over.
-    if !m.fromClient then
+    // is offline from ever looking idle, so no other store would take it over. Nor do a learn-only driver's
+    // (fromProposer)
+    if !m.fromClient && fromProposer(m.from) then
       updateLastEvent()
 
     if (committed) {
@@ -1076,6 +1077,7 @@ class Tx( trs: TransactionRecoveryState,
     // A proof is meant for drivers only (see proveCommitted): it is no outcome. Store hands every TxResolved to the
     // Frontend as well as to its driver, so the proposer's own Tx sees the proofs sent to it
     if !m.proof then
+      reportConflictingOutcome("TxResolved", m.committed, m.from)
       reportLateOutcome("TxResolved", m.from)
       updateLastEvent()
       if provenCommitted then
@@ -1088,10 +1090,20 @@ class Tx( trs: TransactionRecoveryState,
       else if m.committed || !holdAbort(m) then
         resolved(m.committed)
 
+  /** An outcome opposite to the one this Tx already holds is a split decision (paxos F11): logged as an error and
+    * counted by the host status cache. The Tx keeps what it holds, as before
+    */
+  private def reportConflictingOutcome(kind: String, committed: Boolean, from: StoreId): Unit =
+    ofinalized.orElse(oresolution).foreach: held =>
+      if held != committed then
+        statusCache.recordSplitDecision(transactionId,
+          s"Tx on store $storeId holding the outcome $held received $kind(committed = $committed) from $from")
+
   /** Returns false if the Frontend must not forget the Tx now: the finalization is held for a UnackedCommits lookup
     * (see needsUnackedCheck and lateCommit), or the Tx already concluded itself (applyNothing, lateCommit)
     */
   def receiveFinalized(m: TxFinalized): Boolean =
+    reportConflictingOutcome("TxFinalized", m.committed, m.from)
     if ofinalized.nonEmpty then
       // Already concluded: a Tx is kept past its finalization only by a held commit (finalizeDeferred), which the
       // Frontend has dropped from `transactions` by then, so a later TxFinalized takes its no-Tx path, which hands
@@ -1344,8 +1356,23 @@ class Tx( trs: TransactionRecoveryState,
       held
 
   def receiveHeartbeat(m: TxHeartbeat): Unit = {
-    updateLastEvent()
+    if fromProposer(m.from) then
+      updateLastEvent()
   }
+
+  /** Whether a driver on `from` may propose (TransactionDriver.mayPropose): only then do its prepares and heartbeats
+    * show this store that a driver is making progress. A secondary-pool store's driver is learn-only, and its
+    * retransmits would otherwise keep a transaction whose designated leader is offline from ever looking idle here,
+    * so no primary store would take it over and nothing would decide it until expiry
+    */
+  private def fromProposer(from: StoreId): Boolean = from.poolId == txd.primaryObject.poolId
+
+  /** The highest proposal id this store's acceptor promised or accepted: a driver this store starts begins above it
+    * (TransactionDriver.Start)
+    */
+  def highestProposal: Option[ProposalId] =
+    val ps = acceptor.persistentState
+    (ps.promised.toList ++ ps.accepted.map(_._1).toList).maxOption
 
   /** A muted Tx holds no acceptor state. It is a permanent non-holder only if muted for good: started before the
     * rebuilt store's acceptor, or below the store's forget floor. One muted for starting too far ahead is forgotten once

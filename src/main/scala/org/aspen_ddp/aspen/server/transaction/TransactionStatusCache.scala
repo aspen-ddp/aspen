@@ -89,10 +89,15 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
         val merged = if status == TransactionStatus.Unresolved then old.status else status
         Entry(merged, old.finalized || finalized, old.late || late))
     opposite.foreach: recorded =>
-      splitDecisionCount.incrementAndGet()
-      logger.error(s"Split decision: transaction $txid was recorded $recorded and is now reported $status. " +
-        s"Committed is kept")
+      recordSplitDecision(txid, s"recorded $recorded and now reported $status in the status cache. Committed is kept")
   }
+
+  /** Logs a split decision of `txid` as an error and counts it (splitDecisions). Called by the cache itself on an
+    * opposite outcome, and by Txs and drivers of the host that are given a conflicting second outcome (paxos F11)
+    */
+  def recordSplitDecision(txid: TransactionId, detail: String): Unit =
+    splitDecisionCount.incrementAndGet()
+    logger.error(s"Split decision: transaction $txid: $detail")
 
   def getStatus(txid: TransactionId): Option[Entry] = {
     cache.getIfPresent(txid)

@@ -465,12 +465,13 @@ class TestNetwork(executionContext: ExecutionContext,
       new TransactionDriver.Factory:
         def create(ec: ExecutionContext, storeId: StoreId, messenger: ServerMessenger,
                    backgroundTasks: BackgroundTaskManager, txd: TransactionDescription,
-                   finalizerFactory: TransactionFinalizer.Factory): TransactionDriver =
-          if txd.designatedLeaderUID == storeId.poolIndex then
+                   finalizerFactory: TransactionFinalizer.Factory,
+                   start: TransactionDriver.Start): TransactionDriver =
+          if txd.designatedLeaderUID == storeId.poolIndex && txd.primaryObject.poolId == storeId.poolId then
             TransactionDriver.noErrorRecoveryFactory.create(ec, storeId, messenger, backgroundTasks, txd,
-              finalizerFactory)
+              finalizerFactory, start)
           else
-            recovery.create(ec, storeId, messenger, driverTimers, txd, finalizerFactory)
+            recovery.create(ec, storeId, messenger, driverTimers, txd, finalizerFactory, start)
 
   /** The stores any host of this network has loaded */
   private var everLoaded: Set[StoreId] = Set()

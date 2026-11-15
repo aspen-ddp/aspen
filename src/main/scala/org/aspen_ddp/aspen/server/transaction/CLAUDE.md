@@ -26,7 +26,22 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   round-trips and optimize data flow. The details are only important when working on transaction message
   handling.
 - The CRL stores the persistent state Paxos requires (`server/crl/CLAUDE.md`)
-- The driver tallies each object's votes from its own pool's stores
+- The driver tallies each object's votes from its own pool's stores. `Undetermined` (a Tx resolved before it voted)
+  is no vote: it counts neither as a reply nor as an abort. A round whose votes cannot decide proposes an accepted
+  value its promise quorum reports (paxos F7)
+- Proposer ids are pool indexes, so only the primary pool's stores propose (`TransactionDriver.mayPropose`). A driver on
+  any other store is learn-only: it sends prepares and resolves, proves late and finalizes from what it hears, but sets
+  no proposal and sends no Accept. A Tx counts prepares and heartbeats as driver activity only from a primary-pool
+  sender (`Tx.fromProposer`), so a learn-only driver's retransmits never stop a primary store taking over an idle
+  transaction; with no primary store reachable, the Tx ends by expiry (paxos F4)
+- Only the designated leader's first driver, the one its client's prepare creating the Tx starts
+  (`Store.driveTransaction(initialProposal = true)`), keeps the initial proposal `(1, L)`. Every other driver starts
+  at round 2 or higher, above the highest id its own acceptor promised or accepted (`TransactionDriver.Start`,
+  `Tx.highestProposal`; paxos F5)
+- A conflicting second outcome (split decision) is logged as an error and counted in the host status cache's
+  `splitDecisions` (`TransactionStatusCache.recordSplitDecision`) by the cache itself, the Tx (`receiveResolved`,
+  `receiveFinalized`) and the driver (`Start.onSplitDecision`); each keeps its first outcome, and a driver that resolved
+  commit ignores an abort `TxFinalized` (paxos F11)
 
 #### Proofs and late resolution
 - A prepare for a transaction a store does not know, whose update an object there already shows (its revision, or

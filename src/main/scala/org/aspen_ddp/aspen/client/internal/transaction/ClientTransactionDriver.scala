@@ -42,7 +42,15 @@ class ClientTransactionDriver(
 
   def shutdown(): Unit = {}
 
+  /** An outcome opposite to the one already reached is a split decision (paxos F11) and is logged as an error. Only
+    * duplicates that race the first outcome can reach here: TransactionManager forgets the driver once it has one, so
+    * the stores and their drivers are the detectors
+    */
   protected def complete(outcome: ClientOutcome): Unit = synchronized {
+    promise.future.value.flatMap(_.toOption).foreach { first =>
+      if (first != outcome && first != ClientOutcome.Unknown && outcome != ClientOutcome.Unknown)
+        logger.error(s"Split decision: transaction ${txd.transactionId} concluded $first, then reported $outcome")
+    }
     if (!promise.isCompleted) {
       logger.trace(s"Client Transaction Completed: ${txd.transactionId}")
       HLCTimestamp.update(txd.startTimestamp)

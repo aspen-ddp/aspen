@@ -4,9 +4,9 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network._
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.paxos
-import org.aspen_ddp.aspen.common.paxos.{Learner, Proposer}
+import org.aspen_ddp.aspen.common.paxos.{Learner, ProposalId, Proposer}
 import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
-import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionDisposition}
+import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionDisposition, TransactionId}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
 import scribe.Logging
@@ -27,6 +27,26 @@ object TransactionDriver {
     val delay = FinalizerRetryInitial * math.pow(2, doublings)
     if delay > FinalizerRetryMax then FinalizerRetryMax else delay
 
+  /** How a driver starts.
+    *
+    * @param initialProposal the driver is the designated leader's first for the transaction: the one its client's
+    *                        prepare creates, at the proposal id that prepare carries, `(1, L)`. Every other driver starts
+    *                        at round 2 or higher (paxos F5): a restarted or replacement leader reusing `(1, L)` would be
+    *                        a second proposer with the first one's id, and a delayed Accept of the first could flip
+    *                        acceptors that hold the second's value
+    * @param highestSeen     the highest proposal id this store's own acceptor promised or accepted for the transaction.
+    *                        A driver that does not start at the initial proposal starts above it
+    * @param onSplitDecision called with a conflicting second outcome (paxos F11), to log it as an error and count it.
+    *                        A store passes its host status cache's TransactionStatusCache.recordSplitDecision; the
+    *                        default only logs
+    */
+  case class Start(initialProposal: Boolean = false,
+                   highestSeen: Option[ProposalId] = None,
+                   onSplitDecision: (TransactionId, String) => Unit = logSplitDecision)
+
+  private def logSplitDecision(txid: TransactionId, detail: String): Unit =
+    scribe.error(s"Split decision: transaction $txid: $detail")
+
   trait Factory {
     def failedDriverDuration: Duration = Duration(2, SECONDS)
 
@@ -35,7 +55,8 @@ object TransactionDriver {
                messenger:Messenger,
                backgroundTasks: BackgroundTaskManager,
                txd: TransactionDescription,
-               finalizerFactory: TransactionFinalizer.Factory): TransactionDriver
+               finalizerFactory: TransactionFinalizer.Factory,
+               start: Start): TransactionDriver
   }
 
   object noErrorRecoveryFactory extends Factory {
@@ -45,8 +66,9 @@ object TransactionDriver {
                                       messenger: Messenger,
                                       backgroundTasks: BackgroundTaskManager,
                                       txd: TransactionDescription,
-                                      finalizerFactory: TransactionFinalizer.Factory) extends TransactionDriver(
-      storeId, messenger, backgroundTasks, txd, finalizerFactory)(using ec) {
+                                      finalizerFactory: TransactionFinalizer.Factory,
+                                      start: Start) extends TransactionDriver(
+      storeId, messenger, backgroundTasks, txd, finalizerFactory, start)(using ec) {
 
       given ExecutionContext = ec
 
@@ -84,8 +106,9 @@ object TransactionDriver {
                messenger:Messenger,
                backgroundTasks: BackgroundTaskManager,
                txd: TransactionDescription,
-               finalizerFactory: TransactionFinalizer.Factory): TransactionDriver = {
-      new NoRecoveryTransactionDriver(ec, storeId, messenger, backgroundTasks, txd, finalizerFactory)
+               finalizerFactory: TransactionFinalizer.Factory,
+               start: Start): TransactionDriver = {
+      new NoRecoveryTransactionDriver(ec, storeId, messenger, backgroundTasks, txd, finalizerFactory, start)
     }
   }
 }
@@ -96,10 +119,21 @@ abstract class TransactionDriver(
                                   val messenger: Messenger,
                                   val backgroundTasks: BackgroundTaskManager,
                                   val txd: TransactionDescription,
-                                  private val finalizerFactory: TransactionFinalizer.Factory)(using ec: ExecutionContext) extends Logging {
+                                  private val finalizerFactory: TransactionFinalizer.Factory,
+                                  val start: TransactionDriver.Start = TransactionDriver.Start())(using ec: ExecutionContext) extends Logging {
   def ida: IDA = txd.primaryObjectIDA
 
   protected val proposer: Proposer = new Proposer(storeId.poolIndex, ida.width, ida.writeThreshold)
+  start.highestSeen.foreach(proposer.updateHighestProposalId)
+
+  /** Only the primary pool's stores propose (paxos F4, transaction-recovery F11). The proposer id is the store's pool
+    * index, so a store of another pool with the same index would be a second proposer with the same ids, and an
+    * acceptor accepts an equal id with any value. A driver on any other store is learn-only: it sends prepares, whose
+    * replies (and the status-cache relays they draw) tell it the outcome, and it resolves, proves late and finalizes
+    * as any driver does, but it never sets a proposal and never sends an Accept. Its prepares do not count as
+    * activity at the primary stores (Tx.receivePrepare), so one of them still takes the transaction over when idle
+    */
+  val mayPropose: Boolean = storeId.poolId == txd.primaryObject.poolId
   protected val learner: Learner = new Learner(ida.width, ida.writeThreshold)
   protected val validAcceptorSet: Set[Byte] = (0 until ida.width).map(_.toByte).toSet
   protected val allObjects: Set[ObjectPointer] = txd.allReferencedObjectsSet
@@ -176,7 +210,13 @@ abstract class TransactionDriver(
   private var txMessages: Option[List[TxMessage]] = None
   private var heartbeatDue: Boolean = false
 
-  def designatedLeader: Boolean = txd.designatedLeaderUID == storeId.poolIndex
+  def designatedLeader: Boolean = mayPropose && txd.designatedLeaderUID == storeId.poolIndex
+
+  /** Reports a conflicting second outcome (Start.onSplitDecision), which logs it as an error. Under the horizon none
+    * should ever arise (paxos F11)
+    */
+  private def splitDecision(detail: String): Unit =
+    start.onSplitDecision(txd.transactionId, s"driver on store $storeId: $detail")
 
   def complete: Future[TransactionDescription] = completionPromise.future
 
@@ -339,8 +379,8 @@ abstract class TransactionDriver(
           if (holdsProof && !resolved && proposer.prepareQuorumWithoutAcceptedCommit)
             resolveLate()
           else if (holdsProof && !resolved && proposer.prepareQuorumReached && proposer.proposalValue.isDefined)
-            shouldSendAcceptMessages = true
-          else if (!holdsProof && proposer.prepareQuorumReached && !proposer.haveLocalProposal) {
+            shouldSendAcceptMessages = mayPropose
+          else if (mayPropose && !holdsProof && proposer.prepareQuorumReached && !proposer.haveLocalProposal) {
 
             var canCommitTransaction = true
             var cantAttempt = false
@@ -356,14 +396,16 @@ abstract class TransactionDriver(
                 val objIDA = txd.poolIDAMap(ptr.poolId)
 
                 (0 until objIDA.width).foreach { poolIndex =>
-                  peerDispositions.get(StoreId(ptr.poolId, poolIndex.toByte)).foreach { disposition =>
-                    nReplies += 1
-                    disposition match {
-                      case TransactionDisposition.VoteCommit => nCommitVotes += 1
-                      case _ =>
-                        // TODO: We can be quite a bit smarter about choosing when we must abort
-                        nAbortVotes += 1
-                    }
+                  // Undetermined is no vote (paxos F7): a Tx resolved before it voted answers so, and counting it as
+                  // an abort could let a later round propose abort over write-threshold real commit votes
+                  peerDispositions.get(StoreId(ptr.poolId, poolIndex.toByte)).foreach {
+                    case TransactionDisposition.Undetermined => ()
+                    case TransactionDisposition.VoteCommit =>
+                      nReplies += 1
+                      nCommitVotes += 1
+                    case _ =>
+                      nReplies += 1
+                      nAbortVotes += 1
                   }
                 }
 
@@ -384,13 +426,18 @@ abstract class TransactionDriver(
                 canCommitTransaction = canCommitTransaction && canCommitObject
               }
 
-            if (cantAttempt)
-              return
+            // The votes cannot decide yet, but a promise of this round's quorum carries an accepted value, which a
+            // proposer may always propose. Without this, stores answering Undetermined (resolved before voting)
+            // would stall a round whose quorum already reports the chosen value
+            if (cantAttempt) {
+              if (proposer.maySendAccept)
+                shouldSendAcceptMessages = true
+            } else {
+              // If we get here, we've made our decision. A driver holding a proof never reaches here
+              proposer.setLocalProposal(canCommitTransaction)
 
-            // If we get here, we've made our decision. A driver holding a proof never reaches here
-            proposer.setLocalProposal(canCommitTransaction)
-
-            shouldSendAcceptMessages = true
+              shouldSendAcceptMessages = true
+            }
           }
       }
     }
@@ -469,7 +516,13 @@ abstract class TransactionDriver(
   def receiveTxFinalized(msg: TxFinalized): Unit = {
     synchronized {
       knownResolved += msg.from
-      if (msg.committed && msg.late)
+      // A late commit after an abort is reported by resolveLate
+      if ((resolved || finalized) && resolvedValue != msg.committed && !(msg.committed && msg.late))
+        splitDecision(s"TxFinalized(committed = ${msg.committed}) from ${msg.from} after the outcome $resolvedValue")
+      if (resolved && resolvedValue && !msg.committed) {
+        // Committed wins, as in the status cache (Ruling 30): the stores hold the commit and nothing rolls it back, so
+        // this driver keeps finalizing it rather than spreading the abort
+      } else if (msg.committed && msg.late)
         resolveLate()
       else {
         // Ruling 7: finalizes at once, inside the status-cache window, never waiting for this driver's own mark. The
@@ -565,9 +618,14 @@ abstract class TransactionDriver(
     }
   }
 
+  /** The Accept of the current round, if any. None on a learn-only driver (mayPropose) */
+  protected def currentAcceptMessage(): Option[paxos.Accept] = synchronized {
+    if mayPropose then proposer.currentAcceptMessage() else None
+  }
+
   protected def sendAcceptMessages(): Unit = {
     synchronized {
-      proposer.currentAcceptMessage().map(paxAccept => (paxAccept, acceptedPeers))
+      currentAcceptMessage().map(paxAccept => (paxAccept, acceptedPeers))
     } foreach { t =>
       val (paxAccept, alreadyAccepted) = t
       val messages = primaryObjectDataStores.filter(!alreadyAccepted.contains(_)).map { toStoreId =>
@@ -632,7 +690,7 @@ abstract class TransactionDriver(
   private def resolveLate(): Unit = synchronized {
     if (!finalized) {
       if (resolved && !resolvedValue)
-        logger.error(s"Tx ${txd.transactionId} on store $storeId: late commit after an abort resolution; ignored")
+        splitDecision("late commit after an abort resolution; ignored")
       else {
         logger.info(s"Tx ${txd.transactionId} on store $storeId: late commit, finalization actions already ran")
         late = true
@@ -722,6 +780,8 @@ abstract class TransactionDriver(
     * or a late outcome.
     */
   protected def onResolution(committed: Boolean, sendResolutionMessage: Boolean): Unit = synchronized {
+    if (resolved && resolvedValue != committed)
+      splitDecision(s"resolved $committed after the outcome $resolvedValue; the first is kept")
     if (!resolved) {
 
       resolved = true

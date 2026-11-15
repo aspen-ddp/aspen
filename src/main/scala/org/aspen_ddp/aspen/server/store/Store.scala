@@ -143,13 +143,22 @@ class Store(val storageDeviceId: StorageDeviceId,
     * without the proof an entry gives could decide abort on their votes, a decision a later proof cannot undo. The
     * heartbeat starts the driver once the lookup has answered (Ruling 20). A lookup that never completes leaves the Tx
     * waiting, holding its locks, as the design intends for an unavailable lookup
+    *
+    * @param initialProposal the client's prepare is creating the transaction at its designated leader: this is the
+    *                        leader's first driver for it, which keeps the prepare's initial proposal (1, L). Every
+    *                        other driver starts above round 1 and above what this store's acceptor promised or
+    *                        accepted (TransactionDriver.Start, paxos F5)
     */
-  def driveTransaction(txd: TransactionDescription): Unit = {
+  def driveTransaction(txd: TransactionDescription, initialProposal: Boolean = false): Unit = {
     val awaitsLookup = frontend.recoveryPending ||
       frontend.transactions.get(txd.transactionId).exists(_.awaitsFirstUnackedLookup)
     if (!transactionDrivers.contains(txd.transactionId) && !awaitsLookup) {
 
-      val driver = txDriverFactory.create(executionContext, storeId, net, backgroundTasks, txd, finalizerFactory)
+      val start = TransactionDriver.Start(
+        initialProposal = initialProposal,
+        highestSeen = frontend.transactions.get(txd.transactionId).flatMap(_.highestProposal),
+        onSplitDecision = txStatusCache.recordSplitDecision)
+      val driver = txDriverFactory.create(executionContext, storeId, net, backgroundTasks, txd, finalizerFactory, start)
 
       transactionDrivers += txd.transactionId -> driver
 
@@ -242,7 +251,8 @@ class Store(val storageDeviceId: StorageDeviceId,
         val refused = frontend.belowForgetFloor(m.txd) && !frontend.transactions.contains(m.txd.transactionId)
         if (notFinalized && m.txd.primaryObject.poolId == storeId.poolId && m.txd.designatedLeaderUID == storeId.poolIndex
             && !frontend.startsTooFarAhead(m.txd) && !refused) {
-          driveTransaction(m.txd)
+          // Handled before the Frontend sees the prepare, so no Tx yet means this prepare creates it
+          driveTransaction(m.txd, initialProposal = m.fromClient && !frontend.transactions.contains(m.txd.transactionId))
         }
 
       case m: TxPrepareResponse =>

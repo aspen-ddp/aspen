@@ -60,8 +60,9 @@ object TransactionDriverSuite {
              finalizerFactory: Factory,
              onComplete: TransactionId => Unit,
              tasks: BackgroundTaskManager = NoBackgroundTaskManager,
-             ec: ExecutionContext = scala.concurrent.ExecutionContext.global)
-    extends TransactionDriver(storeId, messenger, tasks, initialPrepare.txd, finalizerFactory)(using ec) {
+             ec: ExecutionContext = scala.concurrent.ExecutionContext.global,
+             start: TransactionDriver.Start = TransactionDriver.Start())
+    extends TransactionDriver(storeId, messenger, tasks, initialPrepare.txd, finalizerFactory, start)(using ec) {
     override protected def onFinalized(committed: Boolean): Unit = {
       super.onFinalized(committed)
       onComplete(txd.transactionId)
@@ -175,6 +176,102 @@ object TransactionDriverSuite {
 class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
   import TransactionDriverSuite._
+
+  private def promiseFrom(driver: TransactionDriver, from: StoreId, disposition: TransactionDisposition.Value,
+                      accepted: Option[(ProposalId, Boolean)] = None, proposal: ProposalId = ProposalId(1, 0)): Unit =
+    driver.receiveTxPrepareResponse(TxPrepareResponse(driver.storeId, from, driver.txd.transactionId,
+      Right(TxPrepareResponse.Promise(accepted)), proposal, disposition, Nil))
+
+  private def accepts(messenger: TMessenger): List[TxAccept] = messenger.messages.collect { case a: TxAccept => a }
+
+  // Paxos F7: a Tx resolved before it voted answers Undetermined. Counted as aborts, two of them make commit look
+  // impossible for a width-3, threshold-2 object, though they are no votes at all
+  test("Undetermined replies are no votes: they never make the tally propose abort") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+
+    promiseFrom(driver, ds0, TransactionDisposition.VoteCommit)
+    promiseFrom(driver, ds1, TransactionDisposition.Undetermined)
+    promiseFrom(driver, ds2, TransactionDisposition.Undetermined)
+
+    driver.testHaveLocalProposal shouldBe false
+    accepts(messenger) shouldBe Nil
+  }
+
+  test("a quorum reporting an accepted value is proposed while Undetermined replies leave the tally undecided") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val driver = new TTD(ds0, messenger, mkprep(2, 0, 0, txd), new TFinalizer(), _ => ())
+
+    promiseFrom(driver, ds1, TransactionDisposition.Undetermined, accepted = Some((ProposalId(1, 1), true)))
+    promiseFrom(driver, ds2, TransactionDisposition.Undetermined)
+
+    driver.testHaveLocalProposal shouldBe false
+    accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, true), (ds1, true), (ds2, true))
+  }
+
+  // Paxos F4: proposer ids are pool indexes, so a store of another pool with the leader's index would share its ids
+  test("a driver on a secondary-pool store is learn-only: no proposal and no Accept, but it learns the outcome") {
+    val otherPool = PoolId(java.util.UUID.randomUUID())
+    val otherObj = DataObjectPointer(ObjectId(java.util.UUID.randomUUID()), otherPool, Array[Byte]())
+    val txd = mktxd(simpleObj, List(DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite),
+      DataUpdate(otherObj, rev, DataUpdateOperation.Overwrite)))
+    val secondary = StoreId(otherPool, 0)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    val finalizedSent = Promise[Unit]()
+    val driver = new TTD(secondary, messenger, mkprep(1, 0, 0, txd), finalizer, _ => finalizedSent.trySuccess(()))
+
+    driver.designatedLeader shouldBe false
+    driver.mayPropose shouldBe false
+
+    for from <- List(ds0, ds1, ds2, StoreId(otherPool, 0), StoreId(otherPool, 1), StoreId(otherPool, 2)) do
+      promiseFrom(driver, from, TransactionDisposition.VoteCommit, accepted = Some((ProposalId(1, 0), true)))
+
+    driver.testHaveLocalProposal shouldBe false
+    accepts(messenger) shouldBe Nil
+
+    driver.receiveTxResolved(TxResolved(secondary, ds1, txd.transactionId, committed = true, late = false,
+      proof = false))
+    scala.concurrent.Await.result(finalizedSent.future, scala.concurrent.duration.Duration(5, "s"))
+    finalizer.created shouldBe true
+    accepts(messenger) shouldBe Nil
+  }
+
+  // Paxos F11
+  test("a conflicting TxResolved or TxFinalized after a resolution is reported and changes nothing") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    var reported: List[String] = Nil
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(autoComplete = false), _ => (),
+      start = TransactionDriver.Start(onSplitDecision = (_, detail) => reported = detail :: reported))
+
+    commitBy(driver, txd)
+    driver.hasOutcome shouldBe true
+    reported shouldBe Nil
+
+    driver.receiveTxResolved(TxResolved(ds0, ds1, txd.transactionId, committed = false, late = false, proof = false))
+    reported.size shouldBe 1
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = false, late = false, owed = Set()))
+    reported.size shouldBe 2
+
+    messenger.clear()
+    driver.heartbeat()
+    driver.heartbeat()
+    messenger.messages.collect { case f: TxFinalized => f.committed }.toSet should not contain false
+  }
+
+  test("an agreeing TxResolved after a resolution is not reported") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    var reported = 0
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), new TFinalizer(autoComplete = false), _ => (),
+      start = TransactionDriver.Start(onSplitDecision = (_, _) => reported += 1))
+
+    commitBy(driver, txd)
+    driver.receiveTxResolved(TxResolved(ds0, ds1, txd.transactionId, committed = true, late = false, proof = false))
+    reported shouldBe 0
+  }
 
   test("A driver sends heartbeats only once it has outlived a heartbeat period") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)

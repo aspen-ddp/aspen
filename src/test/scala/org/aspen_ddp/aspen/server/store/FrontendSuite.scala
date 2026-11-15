@@ -4,7 +4,7 @@ import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, FullObject, Insert, Key, KeySet, KeyValueOperation, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -395,6 +395,45 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.receiveTransactionMessage(prepare)
 
     tx.lastEventTime should be > firstEvent
+  }
+
+  // Paxos F4: a secondary-pool store's driver is learn-only. Its retransmits must not keep a transaction whose
+  // designated leader is offline from looking idle at the primary stores, or none would take it over
+  test("prepares and heartbeats from a learn-only driver do not reset a transaction's idle time") {
+    val (frontend, _, _) = mkFrontend()
+    val txd = mktxd()
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true))
+    val tx = frontend.transactions(txid1)
+    val firstEvent = tx.lastEventTime
+    val learnOnly = StoreId(PoolId(new UUID(0, 77)), txd.designatedLeaderUID)
+
+    Thread.sleep(5)
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false).copy(from = learnOnly))
+    frontend.receiveTransactionMessage(TxHeartbeat(storeId, learnOnly, txid1))
+    tx.lastEventTime shouldBe firstEvent
+
+    frontend.receiveTransactionMessage(TxHeartbeat(storeId, StoreId(poolId, 1), txid1))
+    tx.lastEventTime should be > firstEvent
+  }
+
+  // Paxos F11
+  test("an outcome opposite to the one a Tx holds is counted as a split decision, and the Tx keeps its own") {
+    val backend = new MapBackend(storeId)
+    val statusCache = new TransactionStatusCache()
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
+      new TestCrl, statusCache, loadedAt = FrontendSuite.longLoaded)
+    val leader = StoreId(poolId, 1)
+    frontend.receiveTransactionMessage(mkPrepare(mktxd(), fromClient = true))
+    val tx = frontend.transactions(txid1)
+
+    frontend.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true, late = false, proof = false))
+    statusCache.splitDecisions shouldBe 0
+    frontend.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true, late = false, proof = false))
+    statusCache.splitDecisions shouldBe 0
+
+    frontend.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = false, late = false, proof = false))
+    statusCache.splitDecisions shouldBe 1
+    tx.knownOutcome shouldBe Some(true)
   }
 
   test("repair deletion succeeds when the store does not have the object") {
@@ -4747,6 +4786,31 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       lockedWriteTransactions(frontend, net, op1) shouldBe empty
       backend.get(oid1).get.data.size shouldBe 0
       statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Unresolved)
+  }
+
+  // Paxos F4: a secondary-pool store's driver is learn-only, so when no primary store is reachable its Tx ends by
+  // expiry. Only the primary pool's answers decide; its own pool's do not
+  test("a secondary-pool commit voter whose primary stores answer unknown is discarded once a lookup finds no entry") {
+    withExpiryFrontend: (frontend, _, net, crl, lookup, clock, _) =>
+      val txd = expiringTxd(List(overwrite(op1), DataUpdate(otherPtr, rev0, DataUpdateOperation.Overwrite)))
+        .copy(primaryObject = otherPtr, poolIDAMap = Map(poolId -> ida, otherPoolId -> ida))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+
+      // Its own pool's peers are no acceptors of T
+      reply(frontend, net, peer1, None)
+      reply(frontend, net, peer2, None)
+      lookup.requests shouldBe Nil
+
+      reply(frontend, net, StoreId(otherPoolId, 0), None)
+      reply(frontend, net, StoreId(otherPoolId, 1), None)
+      lookup.requests shouldBe List(txid1)
+      lookup.answer(txid1, lookup.absent)
+      frontend.transactions.contains(txid1) shouldBe false
+      crl.deleted should contain (txid1)
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
   }
 
   test("a commit voter past the horizon with an UnackedCommits entry applies and resolves committed") {

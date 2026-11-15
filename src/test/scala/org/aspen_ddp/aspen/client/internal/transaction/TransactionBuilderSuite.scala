@@ -249,6 +249,19 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
       val b = mkBuilder(); b.exclusiveLockRevision(p1, rev1); b.replaySafe("harmless")
       val (txd, _, _) = buildPin(b)
       txd.notes should contain ("replay-safe: harmless")
+      txd.replaySafe shouldBe true
+  }
+  test("a description records whether it is replaySafe, for the stores' pin check") {
+    val b = mkBuilder(); b.bumpVersion(p1, rev1)
+    buildPin(b)._1.replaySafe shouldBe false
+  }
+  test("a KeyValueUpdate is flagged pinned only when it writes a key it carries a KeyRevision on") {
+    def flag(ops: List[KeyValueOperation]): Boolean =
+      val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, List(KeyRevision(k1, rev1)), ops)
+      buildPin(b)._1.requirements.collectFirst { case u: KeyValueUpdate => u.pinned }.get
+    flag(List(ins1)) shouldBe true
+    flag(List(Delete(k1), Insert(k2, Array[Byte](1)))) shouldBe true
+    flag(List(Insert(k2, Array[Byte](1)))) shouldBe false
   }
   test("replaySafe on a pinned transaction changes nothing") {
     withPins:

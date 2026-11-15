@@ -145,6 +145,7 @@ message KeyValueUpdate {
   repeated KeyRevision content_lock = 3;
   repeated KVReq requirements = 4;
   bool deletes_keys = 5;
+  bool pinned = 6;
 }
 
 enum LocalTimeRequirementEnum {
@@ -190,6 +191,7 @@ message TransactionDescription {
   repeated string notes = 9;
   repeated PoolIDA pool_idas = 10;
   repeated UUID allocating_objects = 11;
+  bool replay_safe = 12;
 }
 
 //---------------------------------------------------------------------------

@@ -5,6 +5,10 @@
   key the update writes, a `RefcountUpdate` that changes the count). Allocations, locks and `DoesNotExist` are not
   pins. `TransactionBuilder` fails an unpinned one with `UnpinnedTransaction` unless `Transaction.replaySafe(reason)`
   marked it (reason logged in `notes`; replay must be provably harmless); the retry helpers treat it as permanent.
+  The rule lives in `common.transaction.Pins`. The builder records it for the stores, which check it too
+  (`server/store/DescriptionValidator`): `KeyValueUpdate.pinned` when the update writes a key it carries a
+  `KeyRevision` on, and `TransactionDescription.replaySafe`. The builder's check is `Pins.declared` over the flagged
+  requirements, the same test the stores apply.
   So a forgotten transaction replayed by a delayed prepare cannot gather a write threshold of commit votes, and there
   is no time horizon. A refcount-0 object is `MissingObject` for every requirement. Design:
   `docs/superpowers/specs/2026-11-09-replay-pins-design.md`

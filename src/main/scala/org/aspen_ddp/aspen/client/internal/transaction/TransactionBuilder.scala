@@ -112,8 +112,9 @@ class TransactionBuilder(
     keyValueUpdates.valuesIterator.foreach(refuseBlindWrites)
 
     keyValueUpdates.valuesIterator.foreach: kvu =>
-      requirements = KeyValueUpdate(kvu.pointer, kvu.requiredRevision, kvu.contentLock, kvu.requirements,
-        deletesKeys = kvu.operations.exists(_.isInstanceOf[Delete])) :: requirements
+      val kv = KeyValueUpdate(kvu.pointer, kvu.requiredRevision, kvu.contentLock, kvu.requirements,
+        deletesKeys = kvu.operations.exists(_.isInstanceOf[Delete]))
+      requirements = kv.copy(pinned = Pins.writesCheckedKey(kv, kvu.operations)) :: requirements
 
     // Ensure the transaction has at least one requirement
     require(requirements.nonEmpty)
@@ -132,11 +133,11 @@ class TransactionBuilder(
 
     val txd = TransactionDescription(transactionId, startTimestamp, primaryObject, designatedLeaderUID,
       requirements, finalizationActions, originatingClient, notifyOnResolution.toList,
-      notes, primaryObjectIDA, poolIDAMap, allocatingObjects.map(_.id))
+      notes, primaryObjectIDA, poolIDAMap, allocatingObjects.map(_.id), replaySafeFlag)
 
     val kvOps = keyValueUpdates.map((p, kvu) => p.id -> kvu.operations)
     onBuilt.foreach(_(Built(txd, kvOps, replaySafeFlag)))
-    if !replaySafeFlag && !Pins.hasPin(requirements, kvOps) then
+    if !replaySafeFlag && !Pins.declared(requirements) then
       throw UnpinnedTransaction(transactionId)
 
     var updates = Map[StoreId, TransactionData]()

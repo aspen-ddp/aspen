@@ -5,11 +5,11 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare, ProposalId}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, InvalidDescription, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
-import org.aspen_ddp.aspen.server.store.{Frontend, KVWrites, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
+import org.aspen_ddp.aspen.server.store.{DescriptionValidator, Frontend, KVWrites, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
 import scribe.Logging
 
 import scala.concurrent.duration._
@@ -671,6 +671,15 @@ class Tx( trs: TransactionRecoveryState,
     * its vote withheld and no locks taken (see Frontend.commitInFlight); the requirements are checked against the state
     * as it is once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
     */
+  /** Why the description breaks a rule the store checks before voting (DescriptionValidator), if it does. Checked
+    * at vote only: the result depends on the description and the store's pool alone, so a committed transaction
+    * passed it
+    */
+  private lazy val invalidDescription: Option[String] =
+    val reason = DescriptionValidator.validate(txd, storeId, frontend.poolIDA)
+    reason.foreach(r => logger.warn(s"Tx $transactionId on store $storeId: refusing its description, which $r"))
+    reason
+
   private def determineDisposition(): Unit = {
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
     val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet
@@ -689,6 +698,10 @@ class Tx( trs: TransactionRecoveryState,
       waitingOn = Set()
       awaitingCommits = Set()
       decideDisposition(Map(), List(NoClientPrepare()))
+    else if invalidDescription.nonEmpty then
+      waitingOn = Set()
+      awaitingCommits = Set()
+      decideDisposition(Map(), List(InvalidDescription(invalidDescription.get)))
     else if failed.nonEmpty then
       waitingOn = Set()
       awaitingCommits = Set()

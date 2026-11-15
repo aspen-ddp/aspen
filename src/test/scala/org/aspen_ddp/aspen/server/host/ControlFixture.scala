@@ -291,10 +291,11 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
 
   private def loadStore(storageDeviceId: StorageDeviceId,
                         backend: org.aspen_ddp.aspen.server.store.backend.Backend,
-                        maxSliceSize: Option[Long]): Future[Unit] =
+                        maxSliceSize: Option[Long],
+                        poolIDA: Option[org.aspen_ddp.aspen.common.ida.IDA]): Future[Unit] =
     synchronized:
       loadStoreRequests += ((storageDeviceId, backend.storeId))
-    val queued = attached.loadStore(storageDeviceId, backend, maxSliceSize)
+    val queued = attached.loadStore(storageDeviceId, backend, maxSliceSize, poolIDA)
     storeLoadGate.get.map(_.future).getOrElse(queued)
 
   /** Records the close and completes it (or holds it, see holdShutdownCloses) without touching the event queue. The

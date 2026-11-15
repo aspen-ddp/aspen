@@ -71,6 +71,21 @@ object BootstrapConfig:
       RandomAccessReedSolomon(width.get(o), readThreshold.get(o), writeThreshold.get(o),
         cellSize.get(o).getOrElse(RandomAccessReedSolomon.DefaultCellSize))
 
+  /** The attributes of an IDA in the IDAOptions format, each line indented by two spaces: the body of an IDA key */
+  def idaYaml(ida: IDA): String =
+    val sb = StringBuilder()
+    sb.append(s"  type: ${ida.name}\n")
+    ida match
+      case _:Replication =>
+      case _:ReedSolomon =>
+        sb.append(s"  read-threshold: ${ida.consistentRestoreThreshold}\n")
+      case a:RandomAccessReedSolomon =>
+        sb.append(s"  read-threshold: ${ida.consistentRestoreThreshold}\n")
+        sb.append(s"  cell-size: ${a.cellSize}\n")
+    sb.append(s"  write-threshold: ${ida.writeThreshold}\n")
+    sb.append(s"  width: ${ida.width}\n")
+    sb.toString
+
   val IDAOptions =  Map(
     "replication" -> ReplicationFormat,
     "reed-solomon" -> ReedSolomonFormat,
@@ -162,16 +177,7 @@ object BootstrapConfig:
 
     sb.append(s"aspen-system-id: $aspenSystemId\n")
     sb.append(s"bootstrap-ida:\n")
-    sb.append(s"  type: ${ida.name}\n")
-    ida match
-      case _:Replication =>
-      case _:ReedSolomon =>
-        sb.append(s"  read-threshold: ${ida.consistentRestoreThreshold}\n")
-      case a:RandomAccessReedSolomon =>
-        sb.append(s"  read-threshold: ${ida.consistentRestoreThreshold}\n")
-        sb.append(s"  cell-size: ${a.cellSize}\n")
-    sb.append(s"  write-threshold: ${ida.writeThreshold}\n")
-    sb.append(s"  width: ${ida.width}\n")
+    sb.append(idaYaml(ida))
     sb.append("bootstrap-hosts:\n")
     hostStates.foreach: host =>
       val storesOnHost = storeMap.filter(t => t._2 == host.hostId).map(t => t._1)

@@ -68,7 +68,7 @@ makes that safe.
   keyed by transaction id only; `Entry(status, finalized, late)`; `expireAfterWrite(txStatusCacheDuration)`, max
   4,000,000 entries (`server/transaction/TransactionStatusCache.scala:8-24`).
 * **Pin / late commit** (since the refresh; the horizon is gone): every client transaction carries a pin or is marked
-  `replaySafe` (`client/internal/transaction/Pins.scala`, `TransactionBuilder.scala:140-141`); a commit a driver learns
+  `replaySafe` (`common/transaction/Pins.scala`, `TransactionBuilder.buildTranaction`); a commit a driver learns
   only after the transaction was finalized is *late* and is applied only by stores whose UnackedCommits entry says they
   are owed it (`TransactionDriver.resolveLate`, `Tx.lateCommit`). See paxos-transactions.md 10.5.
 

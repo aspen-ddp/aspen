@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.common.config.BootstrapConfig
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, FsifConfig, RocksDBConfig}
@@ -12,6 +14,10 @@ backend:
   storage-engine: rocksdb
   max-slice-size: 2048      # optional, backend limit
 pool-max-slice-size: 4096   # optional, pool limit
+ida:                        # required, the pool's IDA (BootstrapConfig.IDAOptions)
+  type: replication
+  write-threshold: 2
+  width: 3
 
 or, for an FSIF store:
 backend:
@@ -21,10 +27,14 @@ backend:
 */
 /** @param poolMaxSliceSize The pool's maxSliceSize, copied from the StoragePoolState when the store was created.
   *                         None means the pool has no limit.
+  * @param ida              The pool's IDA, copied from the StoragePoolState when the store was created (a pool's IDA
+  *                         never changes). Stores refuse a transaction description that names another IDA for their
+  *                         pool (Frontend.poolIDA, DescriptionValidator)
   */
 case class StoreConfig(storeId: StoreId,
                        backend: StoreConfig.StorageBackend,
-                       poolMaxSliceSize: Option[Int]):
+                       poolMaxSliceSize: Option[Int],
+                       ida: IDA):
 
   /** The limit the store enforces: the smaller of the pool limit and the backend limit when both are present, the
     * only one present otherwise, or None when the store is unlimited.
@@ -44,7 +54,8 @@ case class StoreConfig(storeId: StoreId,
     s"""store-id: $storeId
        |backend:
        |  storage-engine: ${backend.name}$backendAttrs$poolLimit
-       |""".stripMargin
+       |ida:
+       |${BootstrapConfig.idaYaml(ida)}""".stripMargin
 
 
 object StoreConfig extends YObject[StoreConfig]:
@@ -103,10 +114,13 @@ object StoreConfig extends YObject[StoreConfig]:
 
   val poolMaxSliceSize: Optional[Int] = Optional("pool-max-slice-size", YInt)
 
-  val attrs: List[Attr] = storeId :: backend :: poolMaxSliceSize :: Nil
+  val ida: Required[IDA] = Required("ida", Choice("type", BootstrapConfig.IDAOptions))
+
+  val attrs: List[Attr] = storeId :: backend :: poolMaxSliceSize :: ida :: Nil
 
   def create(o: Object): StoreConfig =
-    StoreConfig(storeId.get(o), backend.get(o), positiveLimit("pool-max-slice-size", poolMaxSliceSize.get(o)))
+    StoreConfig(storeId.get(o), backend.get(o), positiveLimit("pool-max-slice-size", poolMaxSliceSize.get(o)),
+      ida.get(o))
 
   /** `limit` unchanged, or a FormatError if it is present but not positive: a slice limit of zero or less admits
     * nothing, so such a file is corrupt rather than a deliberate setting

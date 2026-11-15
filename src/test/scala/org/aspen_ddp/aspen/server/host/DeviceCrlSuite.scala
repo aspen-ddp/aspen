@@ -247,7 +247,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     given ExecutionContext = executionContext
     val storeDir = deviceDir / sid.directoryName
     os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(sid, StoreConfig.RocksDB(None), None).yamlConfig)
+    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(sid, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
     // Not the suite's serial context: bootstrapAllocate blocks on work it runs there
     val initial = new RocksDBBackend(storeDir, sid, ExecutionContext.global)
     initial.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
@@ -638,7 +638,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     val storeDir = deviceDir / storeId.directoryName
     os.makeDir.all(storeDir)
     os.write.over(storeDir / StoreConfig.configFilename,
-      StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
+      StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
     storeDir
 
   /** Gives the device an empty CRL, as one that has run before has */
@@ -973,7 +973,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ = os.makeDir.all(copy)
       _ = os.write.over(copy / StoreConfig.configFilename,
-            StoreConfig(elsewhere, StoreConfig.RocksDB(None), None).yamlConfig)
+            StoreConfig(elsewhere, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
       host = newCrlHost(hostRoot, factory)
       _ <- checked(host)
       keptWhileRebuilding = os.exists(copy)

@@ -335,7 +335,8 @@ object Codec extends Logging:
       requiredRevision = o.requiredRevision.map(encode),
       contentLock = o.contentLock.map(lck => lck.fullContents.map(encode)).getOrElse(Seq.empty),
       requirements = o.requirements.map(encode),
-      deletesKeys = o.deletesKeys
+      deletesKeys = o.deletesKeys,
+      pinned = o.pinned
     )
 
   def decode(m: codec.KeyValueUpdate): KeyValueUpdate =
@@ -350,7 +351,7 @@ object Codec extends Logging:
 
     val requirements = m.requirements.map(decode).toList
 
-    KeyValueUpdate(objectPointer, requiredRevision, contentLock, requirements, m.deletesKeys)
+    KeyValueUpdate(objectPointer, requiredRevision, contentLock, requirements, m.deletesKeys, m.pinned)
 
 
   def encodeLocalTimeRequirementEnum(o: LocalTimeRequirement.Requirement.Value): codec.LocalTimeRequirementEnum = o match
@@ -433,7 +434,8 @@ object Codec extends Logging:
           ida = Some(encode(ida))
         )
       }.toSeq,
-      allocatingObjects = o.allocatingObjects.map(oid => encodeUUID(oid.uuid)).toSeq
+      allocatingObjects = o.allocatingObjects.map(oid => encodeUUID(oid.uuid)).toSeq,
+      replaySafe = o.replaySafe
     )
 
   def decode(m: codec.TransactionDescription): TransactionDescription =
@@ -453,7 +455,7 @@ object Codec extends Logging:
     val allocatingObjects = m.allocatingObjects.map(u => ObjectId(decodeUUID(u))).toSet
 
     TransactionDescription(txuuid, startTs, primaryObj, designatedLeader, requirements,
-      serializedFas, origClient, notifyOnRes, notes, primaryObjectIDA, poolIDAMap, allocatingObjects)
+      serializedFas, origClient, notifyOnRes, notes, primaryObjectIDA, poolIDAMap, allocatingObjects, m.replaySafe)
 
 
   def encode(o: ProposalId): codec.ProposalId =

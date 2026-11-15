@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.common.ida.IDA
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, CurrentAllocationsReply, CurrentAllocationsRequest, PendingAllocation, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
@@ -139,7 +140,11 @@ class Frontend(val storeId: StoreId,
                /** Which life of the store's data this is. None: StoreIncarnation.default(storeId). A default cannot
                  * name storeId in the same parameter list
                  */
-               incarnationOverride: Option[StoreIncarnation] = None) extends Logging {
+               incarnationOverride: Option[StoreIncarnation] = None,
+               /** The IDA of the store's pool (StoreConfig.ida), which a description must name for it
+                 * (DescriptionValidator). None skips that check: tests only
+                 */
+               val poolIDA: Option[IDA] = None) extends Logging {
 
   /** Which life of the store's data this is: prepare replies carry it (TxPrepareResponse.incarnation) */
   val incarnation: StoreIncarnation = incarnationOverride.getOrElse(StoreIncarnation.default(storeId))

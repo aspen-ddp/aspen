@@ -507,8 +507,8 @@ class TestNetwork(executionContext: ExecutionContext,
       missingDataWait = hostOptions.missingDataWait, storeLoadedAt = storeLoadedAt),
     transactionHorizon = hostOptions.transactionHorizon)
 
-  // Stands in for each store's StoreConfig.effectiveMaxSliceSize, which Host reads from the store config file
-  private val storesLoaded = (stores ++ metadataStores).map(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))
+  // Stand in for each store's StoreConfig.effectiveMaxSliceSize and ida, which Host reads from the store config file
+  private val storesLoaded = (stores ++ metadataStores).map(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize, Some(ida)))
 
   // A host not in lockstep runs its own events once started; the network is usable once its stores are loaded
   if !lockstep then
@@ -519,7 +519,7 @@ class TestNetwork(executionContext: ExecutionContext,
     * held in memory, and recovers its transactions from `crl` (HostOptions.recordCrl). Completes once loaded; the
     * caller drains events meanwhile
     */
-  def restartStore(backend: MapBackend): Future[Unit] = smgr.loadStore(storageDeviceId, backend, storeMaxSliceSize)
+  def restartStore(backend: MapBackend): Future[Unit] = smgr.loadStore(storageDeviceId, backend, storeMaxSliceSize, Some(ida))
 
   private var lastHeartbeat: Long = System.nanoTime()
 
@@ -578,7 +578,7 @@ class TestNetwork(executionContext: ExecutionContext,
       if closeFirst then from.control.loader.closeStore(backend.storeId, extractCrl = false) else Future.unit
     closed.flatMap: _ =>
       storeHosts += backend.storeId -> to
-      to.loadStore(storageDeviceId, backend, storeMaxSliceSize)
+      to.loadStore(storageDeviceId, backend, storeMaxSliceSize, Some(ida))
 
   // ---- Rebalancing test helpers -------------------------------------------------
 

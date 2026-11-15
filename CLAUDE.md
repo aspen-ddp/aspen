@@ -65,7 +65,8 @@ Further design docs: `docs/superpowers/specs/` (dated designs), `docs/safety`, `
   applied (a `DataUpdate`/`VersionBump` at a required revision, a `KeyValueUpdate` with a required revision, a
   `KeyRevision` on a key the update writes, a `RefcountUpdate` that changes the count). Allocations, locks and
   `DoesNotExist` are not pins. `TransactionBuilder` fails an unpinned one with `UnpinnedTransaction` unless
-  `Transaction.replaySafe(reason)` marks it (replay must be provably harmless)
+  `Transaction.replaySafe(reason)` marks it (replay must be provably harmless). Stores enforce it too, with the
+  builder's other structural rules (`server/store/DescriptionValidator`)
 - Every transaction that allocates an object must also store the new ObjectPointer in another object
 - Crash-only architecture: there is no clean shutdown process
 - Logical addressing: messages go to logical entities (DataStores); the endpoint of the host currently holding one

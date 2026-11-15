@@ -4,6 +4,15 @@
   stubs, status cache): `server/transaction/CLAUDE.md`. Read both when changing `Frontend` or `Tx`
 - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
   non-object requirements)
+- The description itself is checked before the vote (`DescriptionValidator`, transaction-requirements F7, Q-N4). The
+  store's own pool entry in `poolIDAMap` must be its pool's IDA (`StoreConfig.ida`, written at store creation, passed
+  as `Frontend.poolIDA`; `None` skips the check, tests only), so each pool's stores guard their own thresholds. The
+  primary object must be referenced, with its pool's IDA, the most failure-tolerant pool, and a leader among its
+  stores. Per object: one content update, one `RefcountUpdate`, no lock on an updated object, no shared lock beside
+  another. And the pin rule must hold from the description alone (`Pins.declared`), or the description must be
+  `replaySafe` (a trusted client claim). A key pin is the update's `pinned` flag. The stores holding that object
+  refuse a false flag (`FalsePin`, in `RequirementsChecker` beside `UnflaggedDelete`), so a store that does not hold
+  it may rely on the flag
 
 #### Requirement locks and collisions
 - Stores hold requirement locks from a commit vote until the transaction resolves. `SharedRevisionLock` is a

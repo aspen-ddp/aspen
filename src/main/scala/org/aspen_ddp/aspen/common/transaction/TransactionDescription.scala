@@ -72,7 +72,13 @@ final case class TransactionDescription (
   poolIDAMap: Map[PoolId, IDA],
 
   /** Objects being allocated by this transaction */
-  allocatingObjects: Set[ObjectId] = Set.empty) {
+  allocatingObjects: Set[ObjectId] = Set.empty,
+
+  /** The client marked the transaction `replaySafe`: it carries no pin, and replaying it after it committed is
+    * harmless. Stores refuse a description with neither a pin nor this flag (DescriptionValidator). The one claim
+    * about the description that stores must trust
+    */
+  replaySafe: Boolean = false) {
 
   def objectRequirements: List[TransactionObjectRequirement] = requirements.flatMap {
     case tor: TransactionObjectRequirement => Some(tor)

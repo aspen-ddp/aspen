@@ -55,6 +55,18 @@ case class UnflaggedDelete() extends RequirementError
   */
 case class BlindWrite() extends RequirementError
 
+/** A KeyValueUpdate is flagged `pinned` but writes none of the keys it carries a KeyRevision on. Stores that do not
+  * hold the object count the flag as the transaction's pin, so the stores holding it refuse a false one. Purely
+  * local, like RequirementCheckFailure.
+  */
+case class FalsePin() extends RequirementError
+
+/** The transaction description breaks a rule the store checks before voting (DescriptionValidator): its pool IDAs,
+  * primary object, designated leader, one update per object, or the pin rule. The store's whole vote is abort.
+  * Purely local, like RequirementCheckFailure.
+  */
+case class InvalidDescription(reason: String) extends RequirementError
+
 /** An Append delta does not apply to the store's current slice.
   *
   * Either the payload could not be decoded or its expected slice length or trailer differs from

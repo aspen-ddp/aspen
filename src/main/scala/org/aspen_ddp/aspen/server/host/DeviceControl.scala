@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -60,7 +61,7 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val deviceScanPeriod: Duration,
                           val storeRebuildFactory: StoreRebuildFactory,
                           val maxConcurrentRebuilds: Int,
-                          val loadStore: (StorageDeviceId, Backend, Option[Long]) => Future[Unit],
+                          val loadStore: (StorageDeviceId, Backend, Option[Long], Option[IDA]) => Future[Unit],
                           val tryLoadStore: (LocalStorageDeviceState, os.Path, Option[() => Unit]) => Unit,
                           val loadStoreById: (StorageDeviceId, StoreId) => Unit,
                           val warn: (os.Path, String) => Unit,

@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.paxos.PersistentState
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.TempDirManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
@@ -268,10 +268,13 @@ object FrontendSuite {
     TxPrepare(storeId, StoreId(poolId, txd.designatedLeaderUID), txd,
       ProposalId.initialProposal(txd.designatedLeaderUID), Nil, fromClient)
 
-  /** Started now on the wall clock: after the Frontends built before it loaded, inside the forget floor */
+  /** Started now on the wall clock: after the Frontends built before it loaded, inside the forget floor. Marked
+    * replaySafe: many tests here are lock-only or allocate without a pin, which a client would mark so. The pin rule
+    * is tested with replaySafe = false (DescriptionValidator tests below)
+    */
   def mktxd(): TransactionDescription =
     TransactionDescription(txid1, HLCTimestamp(System.currentTimeMillis() << 16), op1, 0, Nil, Nil, Some(clientId), Nil, Nil, ida,
-      Map(poolId -> ida))
+      Map(poolId -> ida), replaySafe = true)
 
   def mkObjectState(objectId: ObjectId): ObjectState =
     new ObjectState(objectId,
@@ -1558,8 +1561,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   val fenceOid = ObjectId(new UUID(0, 12))
   val fencePtr = DataObjectPointer(fenceOid, poolId, Array[Byte]())
 
+  /** The primary object is one the transaction references, as stores require (DescriptionValidator) */
   def lockTxd(txid: TransactionId, reqs: List[TransactionRequirement]): TransactionDescription =
-    mktxd().copy(transactionId = txid, requirements = reqs)
+    val primary = reqs.collectFirst { case r: TransactionObjectRequirement => r.objectPointer }.getOrElse(op1)
+    mktxd().copy(transactionId = txid, requirements = reqs, primaryObject = primary)
 
   def overwrite(ptr: ObjectPointer): DataUpdate = DataUpdate(ptr, rev0, DataUpdateOperation.Overwrite)
 
@@ -1873,6 +1878,71 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     vs.revision shouldBe ObjectRevision(txid2)
     stored.metadata.timestamp shouldBe HLCTimestamp(now << 16)
     stops() shouldBe Nil
+  }
+
+  // ---- The store validates the description before voting (transaction-requirements F7, Q-N4; DescriptionValidator) ----
+
+  /** lockFixture whose Frontend knows its pool's IDA */
+  def validatingFixture(): (Frontend, MapBackend, TestNet) =
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl,
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded, poolIDA = Some(ida))
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    (frontend, backend, net)
+
+  def insertK(n: Int): DataBuffer = KeyValueOperation.encode(List(new Insert(k(n), Array[Byte](9))), ida)(0)
+
+  /** A key update on kvPtr checking k(1) at its revision, flagged pinned */
+  def pinnedUpdate: KeyValueUpdate =
+    KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(1), rev0)), pinned = true)
+
+  test("a store votes abort on a description naming another IDA for its pool") {
+    val (frontend, _, net) = validatingFixture()
+    val other = Replication(5, 3)
+    val txd = lockTxd(txid1, List(overwrite(op1))).copy(primaryObjectIDA = other, poolIDAMap = Map(poolId -> other))
+    prepare(frontend, net, txd).disposition shouldBe TransactionDisposition.VoteAbort
+    frontend.holdsLocks(txid1) shouldBe false
+  }
+
+  test("a store votes abort on a description that updates one object twice") {
+    val (frontend, _, net) = validatingFixture()
+    val txd = lockTxd(txid1, List(pinnedUpdate, KeyValueUpdate(kvPtr, Some(rev0), None, Nil)))
+    prepare(frontend, net, txd, insertK(1)).disposition shouldBe TransactionDisposition.VoteAbort
+  }
+
+  test("a store votes abort on an unpinned description not marked replaySafe, and commit once it is marked") {
+    val (frontend, _, net) = validatingFixture()
+    val blind = KeyValueUpdate(kvPtr, None, None, Nil)
+    prepare(frontend, net, lockTxd(txid1, List(blind)).copy(replaySafe = false), insertK(4)).disposition shouldBe
+      TransactionDisposition.VoteAbort
+    prepare(frontend, net, lockTxd(txid2, List(blind)), insertK(4)).disposition shouldBe
+      TransactionDisposition.VoteCommit
+  }
+
+  test("a store votes abort on a pinned flag whose checked key the update does not write") {
+    val (frontend, _, net) = validatingFixture()
+    val txd = lockTxd(txid1, List(pinnedUpdate)).copy(replaySafe = false)
+    prepare(frontend, net, txd, insertK(2)).disposition shouldBe TransactionDisposition.VoteAbort
+    prepare(frontend, net, txd.copy(transactionId = txid2), insertK(1)).disposition shouldBe
+      TransactionDisposition.VoteCommit
+  }
+
+  test("a store relies on the pinned flag of an object another pool holds") {
+    // The store holds only kvPtr's unpinned blind insert. The pin is on another pool's object, whose stores check
+    // the flag: a false one gets their abort votes, so the transaction cannot commit
+    val (frontend, _, net) = validatingFixture()
+    val elsewhere = KeyValueObjectPointer(ObjectId(new UUID(0, 13)), otherPoolId, Array[Byte]())
+    val pinElsewhere = KeyValueUpdate(elsewhere, None, None, List(KeyValueUpdate.KeyRevision(k(1), rev0)), pinned = true)
+    val txd = lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None, Nil), pinElsewhere)).copy(
+      replaySafe = false, poolIDAMap = Map(poolId -> ida, otherPoolId -> ida))
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid2, insertK(4)))))
+    net.txMessage() match
+      case Some(r: TxPrepareResponse) => r.disposition shouldBe TransactionDisposition.VoteCommit
+      case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
   }
 
   // ---- Fail-stop of a commit voter that cannot hold the update it voted for (transaction-requirements F5, F6) ----

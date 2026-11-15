@@ -36,13 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.14 Server-side validation of the description: Req F7, Q-N4, Req open question 1                           [M-L]
-     The pin rule, thresholds, primary object and one-update-per-object are enforced by the client only. Validate
-     at the store: thresholds against the pool IDA (and audit `2T > width` outside IDA construction), at most one
-     update per object, and a pin marker the store can check. Decide how much of the trust model to change.
-     Done 2026-11-14 (2.5): stores refuse blind key deletes and object-level changes without a required revision
-     (BlindWrite).
-
 2.16 Recovered commit vote whose apply re-check fails (residual of Req F5)                                    [S-M]
      A live commit voter that cannot apply its committed update fail-stops the store (Tx.issueCommits). A
      recovered one only logs, because a later transaction built on it may have superseded its update before the

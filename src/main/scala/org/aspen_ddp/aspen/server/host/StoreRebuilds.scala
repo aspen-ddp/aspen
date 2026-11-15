@@ -110,7 +110,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             Future.successful(false)
           else
             val backendCfg = StoreConfig.storageBackendFor(pstate.backendConfig)
-            val storeConfig = StoreConfig(storeId, backendCfg, pstate.maxSliceSize)
+            val storeConfig = StoreConfig(storeId, backendCfg, pstate.maxSliceSize, pstate.ida)
 
             os.makeDir.all(storePath)
             os.write.over(storePath / StoreConfig.configFilename, storeConfig.yamlConfig)

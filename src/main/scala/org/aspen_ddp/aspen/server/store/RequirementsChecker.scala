@@ -157,6 +157,9 @@ object RequirementsChecker extends Logging {
             }
             if ops.exists(_.exists(_.isInstanceOf[Delete])) && !r.deletesKeys then
               throw ObjectErr(r.objectPointer.id, UnflaggedDelete())
+            // Stores that do not hold the object rely on the flag as the transaction's pin (DescriptionValidator)
+            if r.pinned && !Pins.writesCheckedKey(r, ops.getOrElse(Nil)) then
+              throw ObjectErr(r.objectPointer.id, FalsePin())
             refuseBlindWrites(r, ops.getOrElse(Nil))
             val writes = ops.map(KVWrites.of)
 

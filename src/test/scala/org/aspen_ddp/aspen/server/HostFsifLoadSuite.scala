@@ -153,7 +153,8 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val storeDir = deviceDir / storeId.directoryName
     os.makeDir.all(storeDir)
     os.write.over(storeDir / StoreConfig.configFilename,
-      StoreConfig(storeId, StoreConfig.Fsif(layout.segmentPayloadSize, layout.segmentCount), None).yamlConfig)
+      StoreConfig(storeId, StoreConfig.Fsif(layout.segmentPayloadSize, layout.segmentCount), None,
+        org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
     storeDir
 
   /** Loads the store as tryLoadStore does after a restart, and runs the events that load queues */
@@ -588,7 +589,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     val storeDir = deviceDir / storeId.directoryName
     os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
+    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
     os.write.over(storeDir / StoreTransfer.TransferOutMarkerFile, Array.emptyByteArray)
     load(host) // skipped for its marker: offline
     host.control.router.offlineStores should contain(storeId)

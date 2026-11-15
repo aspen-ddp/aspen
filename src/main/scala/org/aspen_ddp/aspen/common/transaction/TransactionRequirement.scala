@@ -68,13 +68,17 @@ sealed abstract class KeyValueTransactionRequirement extends TransactionObjectRe
 /** @param deletesKeys Set when the operations contain a key `Delete`. `DeleteMin`/`DeleteMax`/`DeleteLeft`/
   *                    `DeleteRight` do not set it, and a use of them without a required revision is a traceless
   *                    change this flag does not cover.
+  * @param pinned      Set when one of the update's KeyRevision keys is written (Inserted or Deleted) by its
+  *                    operations: the update is a pin (Pins). Stores holding the object check the claim
+  *                    (RequirementsChecker, FalsePin), so stores that do not hold it may rely on it.
   */
 case class KeyValueUpdate(
                            objectPointer: KeyValueObjectPointer,
                            requiredRevision: Option[ObjectRevision],
                            contentLock: Option[KeyValueUpdate.FullContentLock],
                            requirements: List[KeyValueUpdate.KeyRequirement],
-                           deletesKeys: Boolean = false) extends KeyValueTransactionRequirement
+                           deletesKeys: Boolean = false,
+                           pinned: Boolean = false) extends KeyValueTransactionRequirement
 
 object KeyValueUpdate {
 

@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectState as ClientObjectState}
 import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
 import org.aspen_ddp.aspen.common.HLCTimestamp
@@ -35,7 +36,8 @@ object Host:
 
   private[server] case class HostMsg(msg: HostMessage) extends Event
   private[server] case class LoadStore(storageDeviceId: StorageDeviceId, backend: Backend,
-                                  maxSliceSize: Option[Long], completion: Promise[Unit]) extends Event
+                                  maxSliceSize: Option[Long], completion: Promise[Unit],
+                                  poolIDA: Option[IDA] = None) extends Event
   private[server] case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
   /** The CRL state of a loaded store failed to load: it is unloaded, if it is still the store installed */
   private[server] case class UnloadFailedStore(storeId: StoreId, store: Store) extends Event
@@ -137,7 +139,7 @@ object Host:
                          closeForTransferOut: Option[StoreId => Future[Unit]] = None,
                          closeForShutdown: Option[StoreId => Future[Unit]] = None,
                          gossipStoreOnline: Option[StoreId => Unit] = None,
-                         loadStore: Option[(StorageDeviceId, Backend, Option[Long]) => Future[Unit]] = None,
+                         loadStore: Option[(StorageDeviceId, Backend, Option[Long], Option[IDA]) => Future[Unit]] = None,
                          tryLoadStore: Option[(LocalStorageDeviceState, os.Path, Option[() => Unit]) => Unit] = None,
                          loadStoreById: Option[(StorageDeviceId, StoreId) => Unit] = None,
                          scheduleShutdownWorkTimeout: Option[(StorageDeviceId, () => Unit) => Unit] = None,
@@ -251,7 +253,7 @@ class Host(val client: AspenClient,
     storeRebuildFactory = storeRebuildFactory,
     maxConcurrentRebuilds = maxConcurrentRebuilds,
     loadStore = seams.loadStore.getOrElse(
-      (deviceId, backend, maxSliceSize) => Host.this.loadStore(deviceId, backend, maxSliceSize)),
+      (deviceId, backend, maxSliceSize, poolIDA) => Host.this.loadStore(deviceId, backend, maxSliceSize, poolIDA)),
     tryLoadStore = seams.tryLoadStore.getOrElse(
       (sds, path, onServed) => deviceControl.loader.tryLoadStore(sds, path, onServed)),
     loadStoreById = seams.loadStoreById.getOrElse((deviceId, storeId) => Host.this.loadStoreById(deviceId, storeId)),
@@ -383,10 +385,13 @@ class Host(val client: AspenClient,
 
   def logTransactionStatus(log: String => Unit): Unit = deviceControl.router.logTransactionStatus(log)
 
-  /** @param maxSliceSize the store's effective slice size limit, from its StoreConfig. None means unlimited. */
-  def loadStore(storageDeviceId: StorageDeviceId, backend: Backend, maxSliceSize: Option[Long]): Future[Unit] = {
+  /** @param maxSliceSize the store's effective slice size limit, from its StoreConfig. None means unlimited.
+    * @param poolIDA the IDA of the store's pool, from its StoreConfig (Frontend.poolIDA). None: unchecked, tests only
+    */
+  def loadStore(storageDeviceId: StorageDeviceId, backend: Backend, maxSliceSize: Option[Long],
+                poolIDA: Option[IDA] = None): Future[Unit] = {
     val p = Promise[Unit]()
-    post(LoadStore(storageDeviceId, backend, maxSliceSize, p))
+    post(LoadStore(storageDeviceId, backend, maxSliceSize, p, poolIDA))
     p.future
   }
 

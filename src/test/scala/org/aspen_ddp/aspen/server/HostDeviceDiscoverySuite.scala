@@ -1777,7 +1777,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
     val storeDir = deviceDir / storeId.directoryName
     os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
+    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
     os.write.over(storeDir / StoreTransfer.TransferredInMarkerFile, Array.emptyByteArray)
 
     val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
@@ -1799,7 +1799,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
     val storeDir = deviceDir / storeId.directoryName
     os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
+    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
     os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, Array.emptyByteArray)
 
     val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
@@ -1898,7 +1898,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
   private def writeStoreDir(deviceDir: os.Path): os.Path =
     val storeDir = deviceDir / storeId.directoryName
     os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
+    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
     storeDir
 
   atest("a store whose CRL save file is truncated is not served and its load fails"):

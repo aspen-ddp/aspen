@@ -128,15 +128,15 @@ makes the requirement non-deterministic; a non-object failure aborts the store's
 The client builder rejects (`client/internal/transaction/TransactionBuilder.scala`): two updates to one object
 (`MultipleDataUpdatesToObject`, `:246-249`, `:273`, `:287`, `:307`, `:336`), a lock combined with an update or a
 shared/exclusive lock mix on one object (`ConflictingRequirements`, `:346-358`), two refcount updates (`:319`). A
-`RefcountUpdate` may accompany a data or KV update of the same object (allocation does this, `:96-107`). **The stores do
-not enforce any of this.** See flaw F7.
+`RefcountUpdate` may accompany a data or KV update of the same object (allocation does this, `:96-107`). *2026-11-15
+(Todo 2.14):* stores enforce these too (`DescriptionValidator`, see F7); before that they enforced none of it.
 
 Since the refresh the builder also enforces the **pin rule** (`TransactionBuilder.scala:140-141`, `Pins.scala:18-33`):
 a transaction must carry a write that invalidates its own requirement once applied (a `DataUpdate` at a non-allocating
 revision, a `VersionBump`, a KV update with a required revision, a `KeyRevision` on a key the same update inserts or
 deletes, or a refcount change), or be marked `replaySafe(reason)`. Allocations, locks, `DoesNotExist`/`Exists`/
-`MayExist`, `WithinRange`, timestamp requirements and identity refcount updates are not pins. Stores do not check it
-(Q-N4). TKVL planners now derive **per-write checks** (`KeyValueListNode.putRequirements`/`deleteRequirements`,
+`MayExist`, `WithinRange`, timestamp requirements and identity refcount updates are not pins. *2026-11-15:* stores
+check it too (Q-N4), from the description: `TransactionDescription.replaySafe` and `KeyValueUpdate.pinned`. TKVL planners now derive **per-write checks** (`KeyValueListNode.putRequirements`/`deleteRequirements`,
 `client/tkvl/KeyValueListNode.scala:489-510`): a put gets `KeyRevision(k, rev)` for a key the node read holds and
 `DoesNotExist(k)` otherwise (`PutRequirement.Checked`, the default); a delete gets `KeyRevision(k, rev)`.
 `PutRequirement.Blind` opts out and is used only by `MissedUpdateMarker` (`MissedUpdateMarker.scala:145-148`).
@@ -731,6 +731,22 @@ unresolved lifetime.
 > revision or a content lock, and an object-level change without a required revision, fail at every store unless the
 > transaction allocates the object. The rest of (a)-(c), and the pin rule (Q-N4), remain client-side (Todo 2.14).
 
+> **FIXED 2026-11-15 (Todo 2.14), within the trust model.** Before voting, every store checks the description
+> (`server/store/DescriptionValidator.scala`, called from `Tx.determineDisposition`; a refusal is the non-object error
+> `InvalidDescription`, so the store's whole vote is abort):
+> (b) the store's own pool entry in `poolIDAMap` must equal its pool's IDA (`StoreConfig.ida`, persisted at store
+> creation, passed as `Frontend.poolIDA`), and every referenced pool must have an entry. Each referenced pool's stores
+> check their own entry, so a lowered `writeThreshold` for any pool gets abort votes from every honest store of that pool
+> and cannot reach commit. (c) `primaryObjectIDA` must be the primary pool's entry, the primary object must be referenced,
+> its pool must tolerate no fewer failures than any other (the builder's `maxBy`), and the designated leader must be one
+> of its stores. (a) Per object, at most one content update (`DataUpdate`/`KeyValueUpdate`/`VersionBump`) and one
+> `RefcountUpdate`, no lock on an updated object, no shared lock beside another lock. The builder allows a duplicate
+> `ExclusiveRevisionLock`, which is harmless, so stores allow it too.
+> The check runs at vote only: it depends on the description and the store's pool alone, so a committed transaction
+> passed it at a write threshold of every pool's stores. Tests: `DescriptionValidatorSuite`, FrontendSuite "The store
+> validates the description before voting". Residual: the trust model is unchanged. A malicious client is out of scope,
+> and the `replaySafe` claim is trusted (Q-N4).
+
 
 (a) The "one update per object" and "lock xor update" rules are enforced only in `TransactionBuilder`; a hand-built
 description with two `KeyValueUpdate`s on one object has `KVWrites.from` keep only the last (`toMap`,
@@ -869,6 +885,18 @@ can starve shared lockers. Documented behaviour.
 > stores accept any description (F7). A client built without the check (an older version, a tool or test building
 > `TransactionDescription` directly) sends replayable transactions, which the store-side late-commit rule does not
 > catch (a pinless replay gets fresh commit votes and commits normally).
+>
+> **FIXED 2026-11-15 (Todo 2.14); residual: the `replaySafe` claim.** The description now carries what a store needs
+> to check the rule without the other stores' operations. `KeyValueUpdate.pinned` claims that the update writes a key it
+> carries a `KeyRevision` on (the builder sets it, `Pins.writesCheckedKey`), and `TransactionDescription.replaySafe`
+> records `Transaction.replaySafe`. Every store refuses a description with neither a pin by `Pins.declared` (which takes
+> `pinned` as the key pin) nor `replaySafe` (`DescriptionValidator`, `InvalidDescription`). The stores holding a
+> `pinned` object check the claim against their operations (`RequirementsChecker`, `FalsePin`, next to
+> `UnflaggedDelete`). A store that does not hold the object relies on the flag: a false one gets abort votes on its
+> object from every honest store of that pool, so the transaction cannot commit. A replay of a truly pinned
+> transaction fails the pin's requirement at those same stores. The `replaySafe` bit remains a trusted client claim,
+> since no store can prove a replay harmless. It is the same trust `Transaction.replaySafe(reason)` already carried,
+> now one visible bit in the description.
 
 #### Q-N5. `replaySafe` claims at the four product sites. Confidence: medium
 
@@ -935,7 +963,12 @@ can starve shared lockers. Documented behaviour.
 ### Open questions
 
 1. Is the `2T > width` property enforced anywhere other than IDA construction (e.g. when a pool is created from a
-   deserialized IDA, or in a description arriving over the network)?
+   deserialized IDA, or in a description arriving over the network)? *Answered 2026-11-15 (Todo 2.14):* it does not
+   need to be. Every IDA is a case class whose constructor requires it (`Replication`: `writeThreshold >= width/2+1`;
+   `ReedSolomon` and `RandomAccessReedSolomon`: a majority `restoreThreshold <= writeThreshold`, `common/ida/IDA.scala`),
+   and every decoder builds IDAs through those constructors (`Codec.decode(codec.IDA)`, `IDA.deserializeIDAType`,
+   `BootstrapConfig.IDAOptions`). A deserialized pool or description IDA therefore satisfies it, or fails to decode.
+   Stores also refuse a description that names another IDA for their pool (F7).
 2. Should the apply path detect a committed transaction overriding a held commit-voter lock and report it (F10)?
 3. Should `Frontend.opportunisticRebuild` and `Tx.completeLoad`'s pre-transaction rebuild share one guarded implementation (F3)?
 4. Should object-level KV operations without a required revision be flagged like `deletesKeys` for the traceless path (F8)?

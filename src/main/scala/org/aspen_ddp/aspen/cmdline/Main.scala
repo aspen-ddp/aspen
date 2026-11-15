@@ -1872,7 +1872,7 @@ object Main {
 
         val storeId = StoreId(PoolId.BootstrapPoolId, poolIndex.toByte)
         val storeRoot = bootstrapDevDir / storeId.toString
-        val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB(None), None)
+        val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB(None), None, bootstrapIda)
 
         println(s"Creating data store $storeId. Path $storeRoot")
         os.makeDir.all(storeRoot)
@@ -1886,7 +1886,7 @@ object Main {
       yield
         val storeId = StoreId(PoolId.InitialMetadataPoolId, poolIndex.toByte)
         val storeRoot = bootstrapDevDir / storeId.toString
-        val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB(None), None)
+        val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB(None), None, bootstrapIda)
 
         println(s"Creating data store $storeId. Path $storeRoot")
         os.makeDir.all(storeRoot)

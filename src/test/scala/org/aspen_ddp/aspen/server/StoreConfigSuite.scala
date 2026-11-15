@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat
@@ -11,11 +12,16 @@ import java.util.UUID
 
 class StoreConfigSuite extends AnyFunSuite with Matchers:
 
+  private val ida = Replication(3, 2)
+
+  /** The ida key of a yaml config for `ida` */
+  private val idaYaml = "ida:\n  type: replication\n  write-threshold: 2\n  width: 3\n"
+
   private val zero = UUID.fromString("00000000-0000-0000-0000-000000000000")
 
   private val sample = StoreConfig(
     StoreId(PoolId(UUID.fromString("44444444-4444-4444-4444-444444444444")), 3.asInstanceOf[Byte]),
-    StoreConfig.RocksDB(None), None)
+    StoreConfig.RocksDB(None), None, ida)
 
   test("configFilename is aspen-store-config.yaml"):
     StoreConfig.configFilename should be("aspen-store-config.yaml")
@@ -37,6 +43,10 @@ class StoreConfigSuite extends AnyFunSuite with Matchers:
     val docExampleYaml = """store-id: 00000000-0000-0000-0000-000000000000:0
 backend:
   storage-engine: rocksdb
+ida:
+  type: replication
+  write-threshold: 2
+  width: 3
 """
 
     val f = os.temp(prefix = "aspen-store-docexample", suffix = ".yaml")
@@ -47,9 +57,10 @@ backend:
       cfg.storeId should be(StoreId(PoolId(zero), 0.asInstanceOf[Byte]))
       cfg.backend should be(StoreConfig.RocksDB(None))
       cfg.poolMaxSliceSize should be(None)
+      cfg.ida should be(ida)
 
       StoreConfig(StoreId(PoolId(zero), 0.asInstanceOf[Byte]),
-                  StoreConfig.RocksDB(None), None).yamlConfig should be(docExampleYaml)
+                  StoreConfig.RocksDB(None), None, ida).yamlConfig should be(docExampleYaml)
     finally
       os.remove(f)
 
@@ -64,34 +75,34 @@ backend:
       os.remove(f)
 
   test("yaml round trip with both limits"):
-    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), Some(4096))
+    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), Some(4096), ida)
     cfg.yamlConfig should include("pool-max-slice-size: 4096")
     cfg.yamlConfig should include("max-slice-size: 2048")
     roundTrip(cfg) should be(cfg)
 
   test("yaml round trip with only the pool limit"):
-    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(None), Some(4096))
+    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(None), Some(4096), ida)
     roundTrip(cfg) should be(cfg)
 
   test("yaml round trip with only the backend limit"):
-    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), None)
+    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), None, ida)
     roundTrip(cfg) should be(cfg)
 
   test("yaml round trip with neither limit"):
-    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(None), None)
+    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(None), None, ida)
     cfg.yamlConfig should not include "max-slice-size"
     roundTrip(cfg) should be(cfg)
 
   test("yaml round trip of an FSIF backend"):
-    val cfg = StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), Some(8192))
+    val cfg = StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), Some(8192), ida)
     cfg.yamlConfig should include("storage-engine: fsif")
     cfg.yamlConfig should include("segment-payload-size: 4097")
     cfg.yamlConfig should include("segment-count: 1000")
     roundTrip(cfg) should be(cfg)
     cfg.effectiveMaxSliceSize should be(Some(4097))
-    StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), None).effectiveMaxSliceSize should be(Some(4097))
-    roundTrip(StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), None)) should be(
-      StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), None))
+    StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), None, ida).effectiveMaxSliceSize should be(Some(4097))
+    roundTrip(StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), None, ida)) should be(
+      StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), None, ida))
 
   test("an FSIF backend needs a positive segment payload size and count"):
     def load(backend: String): StoreConfig =
@@ -101,7 +112,7 @@ backend:
           s"""store-id: 00000000-0000-0000-0000-000000000000:0
              |backend:
              |  storage-engine: fsif
-             |$backend""".stripMargin)
+             |$backend$idaYaml""".stripMargin)
         StoreConfig.loadStoreConfig(f)
       finally
         os.remove(f)
@@ -112,12 +123,25 @@ backend:
     a[YamlFormat.FormatError] should be thrownBy load("  segment-payload-size: 0\n  segment-count: 2\n")
     a[YamlFormat.FormatError] should be thrownBy load("  segment-payload-size: 10\n  segment-count: 0\n")
 
+  test("yaml round trip of each IDA type"):
+    List(Replication(5, 3), ReedSolomon(5, 3, 4), RandomAccessReedSolomon(6, 4, 5, 512)).foreach: i =>
+      val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(None), None, i)
+      roundTrip(cfg) should be(cfg)
+
+  test("a config without an ida is a FormatError"):
+    val f = os.temp(prefix = "aspen-store-noida", suffix = ".yaml")
+    try
+      os.write.over(f, "store-id: 00000000-0000-0000-0000-000000000000:0\nbackend:\n  storage-engine: rocksdb\n")
+      a[YamlFormat.FormatError] should be thrownBy StoreConfig.loadStoreConfig(f)
+    finally
+      os.remove(f)
+
   test("effectiveMaxSliceSize is the smaller, the only one, or None"):
-    StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), Some(4096)).effectiveMaxSliceSize should be(Some(2048))
-    StoreConfig(storeId0, StoreConfig.RocksDB(Some(8192)), Some(4096)).effectiveMaxSliceSize should be(Some(4096))
-    StoreConfig(storeId0, StoreConfig.RocksDB(None), Some(4096)).effectiveMaxSliceSize should be(Some(4096))
-    StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), None).effectiveMaxSliceSize should be(Some(2048))
-    StoreConfig(storeId0, StoreConfig.RocksDB(None), None).effectiveMaxSliceSize should be(None)
+    StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), Some(4096), ida).effectiveMaxSliceSize should be(Some(2048))
+    StoreConfig(storeId0, StoreConfig.RocksDB(Some(8192)), Some(4096), ida).effectiveMaxSliceSize should be(Some(4096))
+    StoreConfig(storeId0, StoreConfig.RocksDB(None), Some(4096), ida).effectiveMaxSliceSize should be(Some(4096))
+    StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), None, ida).effectiveMaxSliceSize should be(Some(2048))
+    StoreConfig(storeId0, StoreConfig.RocksDB(None), None, ida).effectiveMaxSliceSize should be(None)
 
   test("zero or negative slice limits are reported as a FormatError"):
     def load(backendLimit: String, poolLimit: String): StoreConfig =
@@ -127,7 +151,7 @@ backend:
           s"""store-id: 00000000-0000-0000-0000-000000000000:0
              |backend:
              |  storage-engine: rocksdb$backendLimit$poolLimit
-             |""".stripMargin)
+             |$idaYaml""".stripMargin)
         StoreConfig.loadStoreConfig(f)
       finally
         os.remove(f)

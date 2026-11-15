@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.HLCTimestamp
 
 import com.github.blemale.scaffeine.Scaffeine
@@ -62,7 +63,9 @@ class Store(val storageDeviceId: StorageDeviceId,
               */
             onFailStop: (Store, Throwable) => Unit = (_, _) => (),
             /** Which life of the store's data this is (Frontend.incarnation). None: StoreIncarnation.default(storeId) */
-            incarnationOverride: Option[StoreIncarnation] = None) extends Logging {
+            incarnationOverride: Option[StoreIncarnation] = None,
+            /** The IDA of the store's pool (Frontend.poolIDA). None: unchecked, tests only */
+            poolIDA: Option[IDA] = None) extends Logging {
 
   /** How long past the horizon an unresolved Tx starts its status queries: Frontend.expiryMargin */
   val expiryMargin: FiniteDuration = Frontend.expiryMargin(
@@ -80,7 +83,7 @@ class Store(val storageDeviceId: StorageDeviceId,
       case Some(postTo) => task => postTo(s => if s eq this then task()),
     acceptorSince = acceptorSince, deferRecovery = deferRecovery, wallClockMillis = wallClockMillis,
     horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, expiryMargin = expiryMargin,
-    onFailStop = err => onFailStop(this, err), incarnationOverride = incarnationOverride)
+    onFailStop = err => onFailStop(this, err), incarnationOverride = incarnationOverride, poolIDA = poolIDA)
 
   /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
    *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's

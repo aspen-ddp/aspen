@@ -59,6 +59,11 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   given stands, but later data is still used to apply a commit. A delayed duplicate client prepare of an aborted
   transaction cannot commit it: every store that took part remembers the abort for longer than it would join T, and
   refuses T past its forget floor (below)
+- Description validation (transaction-requirements F7, Q-N4): a client-prepared Tx checks its description once,
+  before its requirements (`DescriptionValidator`, `Tx.invalidDescription`). A refusal votes abort for every object
+  (`InvalidDescription`, a non-object error, never waited out) and logs a warning. The check covers its pool's IDA
+  (`Frontend.poolIDA`), the primary object and leader, one update per object, and the pin rule. It runs at vote only,
+  never at the apply re-check
 - Muted prepares at rebuilt stores (`acceptor-since`) and for start timestamps ahead of the host's clock
   (`Frontend.MaxStartLead`): `server/store/CLAUDE.md`
 - Transaction horizon (`common.transaction.TransactionHorizon`, 20 s on `startTimestamp` against the host's wall

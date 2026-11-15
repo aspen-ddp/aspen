@@ -855,3 +855,16 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
 
   test("decodeGossip rejects garbage"):
     Codec.decodeGossip(Array[Byte](1, 2, 3)).isLeft shouldBe true
+
+  test("the pinned and replaySafe flags round trip (DescriptionValidator)"):
+    val ida = Replication(3, 2)
+    val pinned = KeyValueUpdate(kvPtr(1), None, None, List(KeyValueUpdate.KeyRevision(Key(Array[Byte](1)), rev(2))),
+      pinned = true)
+    Codec.decode(Codec.encode(pinned)).asInstanceOf[KeyValueUpdate].pinned shouldBe true
+    Codec.decode(Codec.encode(pinned.copy(pinned = false))).asInstanceOf[KeyValueUpdate].pinned shouldBe false
+    val txd = TransactionDescription(TransactionId(uuid(3)), HLCTimestamp(1), kvPtr(1), 0, List(pinned), Nil, None,
+      Nil, Nil, ida, Map(kvPtr(1).poolId -> ida), replaySafe = true)
+    val decoded = Codec.decode(Codec.encode(txd))
+    decoded.replaySafe shouldBe true
+    decoded.requirements.collectFirst { case u: KeyValueUpdate => u.pinned } shouldBe Some(true)
+    Codec.decode(Codec.encode(txd.copy(replaySafe = false))).replaySafe shouldBe false

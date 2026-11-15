@@ -202,9 +202,10 @@ refresh the proof is not an outcome: the receiving driver only stops proposing a
 **P16 Pin rule (client-enforced).** Every client transaction built by `TransactionBuilder` carries a *pin* (a
 `DataUpdate` at a non-allocating revision, a `VersionBump`, a KV update with a required revision, a `KeyRevision` on a
 key the same update inserts or deletes, or a refcount change), or is marked `replaySafe(reason)`; otherwise it fails
-with `UnpinnedTransaction` before anything is sent (`client/internal/transaction/Pins.scala:18-33`,
-`TransactionBuilder.scala:140-141`). After a pinned T commits, at most `w - t` stores of the pinned object both hold the
-pre-T state and do not know T, so a replay cannot collect `t` commit votes on it. Stores do not check the rule (Q-N4 in
+with `UnpinnedTransaction` before anything is sent (`common/transaction/Pins.scala`, `TransactionBuilder.buildTranaction`).
+After a pinned T commits, at most `w - t` stores of the pinned object both hold the pre-T state and do not know T, so a
+replay cannot collect `t` commit votes on it. *2026-11-15:* stores check the rule too, from the description
+(`DescriptionValidator`; `KeyValueUpdate.pinned` and `TransactionDescription.replaySafe`, Q-N4 in
 transaction-requirements.md). The rule covers committed transactions only (P-N4). There is no age test left: a
 replayed *client* prepare is checked like a new one (`Frontend.scala:812-831`). (addendum) Aborted transactions are
 covered by prefer-abort instead (6.2): a driver's prepare never gathers a fresh commit vote, so only a delayed duplicate

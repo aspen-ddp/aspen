@@ -13,10 +13,10 @@ import org.aspen_ddp.aspen.common.paxos.PersistentState
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyValueObjectPointer,
   ObjectId, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.repair.{RepairPolicy, StoreRepairer}
-import org.aspen_ddp.aspen.server.store.UnackedCommitLookup
+import org.aspen_ddp.aspen.server.store.{UnackedCommitLookup, UnackedLookupResult}
 
 import java.nio.{ByteBuffer, ByteOrder}
 import scala.concurrent.Future
@@ -47,12 +47,13 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
     */
   class HoldingLookup(inner: UnackedCommitLookup) extends UnackedCommitLookup:
     final class Held(val storeId: StoreId, val transactionId: TransactionId, val requestId: Long,
-                     val answer: Try[Boolean] => Unit):
+                     val answer: Try[UnackedLookupResult] => Unit):
       def release(): Unit = inner.lookup(storeId, transactionId, requestId, answer)
     @volatile var holding = false
     @volatile var pending: List[Held] = Nil
     @volatile var made: Int = 0
-    def lookup(storeId: StoreId, transactionId: TransactionId, requestId: Long, answer: Try[Boolean] => Unit): Unit =
+    def lookup(storeId: StoreId, transactionId: TransactionId, requestId: Long,
+               answer: Try[UnackedLookupResult] => Unit): Unit =
       made += 1
       if holding then pending = pending :+ Held(storeId, transactionId, requestId, answer)
       else inner.lookup(storeId, transactionId, requestId, answer)
@@ -303,7 +304,7 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
       List(first, second) = lookups.pending: @unchecked
       _ = first.requestId shouldBe second.requestId
       // The first store's answer, that the entry is there, arrives after it was replaced
-      _ = first.answer(scala.util.Success(true))
+      _ = first.answer(scala.util.Success(UnackedLookupResult.Found(Some(StoreIncarnation.default(sid(2))))))
       _ = net.handleEvents()
       _ = withClue("the replacement does not take its predecessor's answer: "):
             storeKeys(2, nodePtr) should contain (k)

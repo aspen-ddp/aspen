@@ -178,6 +178,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     val lookup = new ManualLookup
     val (store, net, crl) = mkStore(storeId, new TransactionStatusCache(), Duration.Zero,
       wallClockMillis = () => now, unackedLookup = lookup)
+    lookup.frontend = Some(store.frontend)
     store.receiveTransactionMessage(TxPrepare(storeId, leader, fixedTxd, ProposalId.initialProposal(1.toByte),
       List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), fromClient = true))
     store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true, late = false, proof = false))
@@ -190,7 +191,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     val round = net.sentTx.collect { case r: TxStatusRequest => r }
     round.map(_.to).toSet shouldBe Set(leader, peer)
     round.foreach(r => store.receiveTransactionMessage(TxStatusResponse(storeId, r.to, txid1, r.requestUUID, None)))
-    lookup.answer(txid1, scala.util.Success(false)) // Not owed a stub
+    lookup.answer(txid1, lookup.absent) // Not owed a stub
     store.frontend.transactions.contains(txid1) shouldBe false
     crl.deleted should contain (txid1)
 
@@ -277,7 +278,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     */
   private def foundEntryStore(): (Store, RecordingNet, StubFinalizer) =
     val (store, net, finalizer, lookup, backend) = recoveredVoteStore()
-    lookup.answer(foundTxid, scala.util.Success(true))
+    lookup.answer(foundTxid, lookup.own)
     KVObjectState.decode(backend.get(oid2).get.data).content.keySet should not contain k(2)
     store.heartbeat() // The Tx has been idle for the zero heartbeat timeout: its store drives it
     store.hasTransactions shouldBe true
@@ -305,6 +306,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.parasitic, backend, cache, net,
       BackgroundTaskManager.NoBackgroundTaskManager, crl, new TransactionStatusCache(), finalizer,
       TransactionDriver.noErrorRecoveryFactory, Duration.Zero, None, unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
+    lookup.frontend = Some(store.frontend)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     (store, net, finalizer, lookup, backend)
 
@@ -388,7 +390,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.hasTransactions shouldBe false
     lookup.requests.count(_ == foundTxid) shouldBe 2
 
-    lookup.answer(foundTxid, scala.util.Success(true))
+    lookup.answer(foundTxid, lookup.own)
     store.heartbeat()
     store.hasTransactions shouldBe true
 
@@ -402,7 +404,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
   test("a recovered vote whose first lookup finds no entry is driven as usual, without a proof") {
     val (store, net, _, lookup, _) = recoveredVoteStore()
-    lookup.answer(foundTxid, scala.util.Success(false))
+    lookup.answer(foundTxid, lookup.absent)
     store.heartbeat()
     store.hasTransactions shouldBe true
 
@@ -414,7 +416,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     // The driver finalized the abort at once
     net.sentTx.collect { case f: TxFinalized if f.from == storeId => f.committed }.distinct shouldBe List(false)
 
-    lookup.answer(foundTxid, scala.util.Success(true))
+    lookup.answer(foundTxid, lookup.own)
     store.frontend.transactions(foundTxid).status shouldBe TransactionStatus.Committed
   }
 

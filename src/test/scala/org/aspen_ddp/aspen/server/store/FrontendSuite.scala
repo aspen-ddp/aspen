@@ -85,15 +85,20 @@ object FrontendSuite {
     var frontend: Option[Frontend] = None
     /** The lookups made, oldest first, with their request ids */
     var made: List[(TransactionId, Long)] = Nil
-    private var answers: Map[(TransactionId, Long), Try[Boolean] => Unit] = Map()
+    private var answers: Map[(TransactionId, Long), Try[UnackedLookupResult] => Unit] = Map()
     def requests: List[TransactionId] = made.map(_._1)
-    def lookup(storeId: StoreId, transactionId: TransactionId, requestId: Long, answer: Try[Boolean] => Unit): Unit =
+    def lookup(storeId: StoreId, transactionId: TransactionId, requestId: Long,
+               answer: Try[UnackedLookupResult] => Unit): Unit =
       made = made :+ (transactionId -> requestId)
       answers += (transactionId, requestId) -> answer
     /** Answers the lookup `requestId` of `txid`, by default the latest made */
-    def answer(txid: TransactionId, result: Try[Boolean], requestId: Option[Long] = None): Unit =
+    def answer(txid: TransactionId, result: Try[UnackedLookupResult], requestId: Option[Long] = None): Unit =
       val id = requestId.getOrElse(made.filter(_._1 == txid).last._2)
       answers((txid, id))(result)
+    /** An entry naming the incarnation of `frontend`, the store that made the lookup */
+    def own: Try[UnackedLookupResult] = Success(UnackedLookupResult.Found(Some(frontend.get.incarnation)))
+    /** No entry */
+    def absent: Try[UnackedLookupResult] = Success(UnackedLookupResult.Absent)
 
   class TestCrl extends CrashRecoveryLog {
 
@@ -1774,8 +1779,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     resolve(frontend, net, txid1, committed = false)
     // Neither the recovery's UnackedCommits lookup nor the one started after the abort finds an entry
-    lookup.answer(txid1, Success(false))
-    lookup.answer(txid1, Success(false))
+    lookup.answer(txid1, lookup.absent)
+    lookup.answer(txid1, lookup.absent)
     prepare(frontend, net, lockTxd(txid3, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
   }
 
@@ -2524,7 +2529,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     kvKeys(backend) should contain (k(2))
 
     val log = unackedLog:
-      lookup.answer(unackedTxid, Success(true))
+      lookup.answer(unackedTxid, lookup.own)
 
     kvKeys(backend) should not contain k(2)
     frontend.transactions(unackedTxid).provesCommitToItsDriver shouldBe true
@@ -2563,7 +2568,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     lookup.requests shouldBe List(unackedTxid)
 
-    lookup.answer(unackedTxid, Success(true))
+    lookup.answer(unackedTxid, lookup.own)
 
     backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](9)
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
@@ -2575,13 +2580,13 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("a recovered commit vote without a UnackedCommits entry accepts an abort") {
     val (frontend, backend, _, crl, lookup) = unackedFixture()
-    lookup.answer(unackedTxid, Success(false))
+    lookup.answer(unackedTxid, lookup.absent)
 
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false, late = false, owed = Set()))
     // The abort waits for a lookup started after it arrived
     lookup.requests.count(_ == unackedTxid) shouldBe 2
     frontend.transactions.contains(unackedTxid) shouldBe true
-    lookup.answer(unackedTxid, Success(false))
+    lookup.answer(unackedTxid, lookup.absent)
 
     kvKeys(backend) should contain (k(2))
     frontend.transactions.contains(unackedTxid) shouldBe false
@@ -2592,37 +2597,57 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     // A driver resends its resolution until it hears back: each copy moving the counting window forward would keep a
     // lookup in flight from ever counting, and the Tx holding its locks
     val (frontend, _, _, _, lookup) = unackedFixture()
-    lookup.answer(unackedTxid, Success(false))
+    lookup.answer(unackedTxid, lookup.absent)
 
     frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false, late = false, proof = false))
     frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false, late = false, proof = false))
     lookup.requests.count(_ == unackedTxid) shouldBe 2
-    lookup.answer(unackedTxid, Success(false))
+    lookup.answer(unackedTxid, lookup.absent)
 
     frontend.transactions.get(unackedTxid).map(_.status).forall(_ == TransactionStatus.Aborted) shouldBe true
     frontend.transactions.get(unackedTxid).map(_.holdsLocks) shouldBe Some(false)
   }
 
+  test("a recovered commit vote whose entry names no incarnation resolves committed, applies nothing and never accepts its held abort") {
+    val statusCache = new TransactionStatusCache()
+    val (frontend, backend, net, crl, lookup) = unackedFixture(statusCache = statusCache)
+    lookup.answer(unackedTxid, lookup.absent)
+
+    frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false, late = false,
+      proof = false))
+    lookup.requests.count(_ == unackedTxid) shouldBe 2
+    lookup.answer(unackedTxid, Success(UnackedLookupResult.Found(None)))
+
+    // T committed and was finalized (its entry is durable only then), and nothing of it is applied here
+    kvKeys(backend) should contain (k(2))
+    committedMessages(net) shouldBe Nil
+    frontend.transactions.contains(unackedTxid) shouldBe false
+    crl.stubsSaved shouldBe Nil
+    crl.deleted should contain (unackedTxid)
+    statusCache.getStatus(unackedTxid).map(_.status) shouldBe Some(TransactionStatus.Committed)
+    lockedWriteTransactions(frontend, net, kvPtr) should not contain (unackedTxid)
+  }
+
   test("a held TxFinalized abort is not replaced by a later held TxResolved, so the Tx is forgotten once accepted") {
     val (frontend, _, _, _, lookup) = unackedFixture()
-    lookup.answer(unackedTxid, Success(false))
+    lookup.answer(unackedTxid, lookup.absent)
 
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = false, late = false, owed = Set()))
     frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false, late = false, proof = false))
-    lookup.answer(unackedTxid, Success(false))
+    lookup.answer(unackedTxid, lookup.absent)
 
     frontend.transactions.contains(unackedTxid) shouldBe false
   }
 
   test("an abort arriving before the UnackedCommits entry is visible waits for a later lookup and then commits") {
     val (frontend, backend, _, _, lookup) = unackedFixture()
-    lookup.answer(unackedTxid, Success(false))
+    lookup.answer(unackedTxid, lookup.absent)
 
     frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false, late = false, proof = false))
     lookup.requests.count(_ == unackedTxid) shouldBe 2 // a fresh lookup started after the abort
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Unresolved
 
-    lookup.answer(unackedTxid, Success(true))
+    lookup.answer(unackedTxid, lookup.own)
     kvKeys(backend) should not contain k(2)
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
   }
@@ -2633,11 +2658,11 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lookup.requests.count(_ == unackedTxid) shouldBe 1
 
     // Started before the abort, so its answer does not count: another lookup is made
-    lookup.answer(unackedTxid, Success(false))
+    lookup.answer(unackedTxid, lookup.absent)
     lookup.requests.count(_ == unackedTxid) shouldBe 2
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Unresolved
 
-    lookup.answer(unackedTxid, Success(false))
+    lookup.answer(unackedTxid, lookup.absent)
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Aborted
     kvKeys(backend) should contain (k(2))
   }
@@ -2665,7 +2690,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       List(KeyValueUpdate.KeyRevision(k(2), new ObjectRevision(new UUID(0, 41)))), deletesKeys = true)
     val (frontend, backend, _, crl, lookup) = unackedFixture(List(stale))
 
-    lookup.answer(unackedTxid, Success(true))
+    lookup.answer(unackedTxid, lookup.own)
 
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
     kvKeys(backend) should contain (k(2))
@@ -2687,11 +2712,11 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lookup.requests.count(_ == unackedTxid) shouldBe 2
 
     // The lost lookup read the tree before the abort arrived: its late answer finding no entry does not count
-    lookup.answer(unackedTxid, Success(false), Some(lost))
+    lookup.answer(unackedTxid, lookup.absent, Some(lost))
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Unresolved
     lookup.requests.count(_ == unackedTxid) shouldBe 2
 
-    lookup.answer(unackedTxid, Success(true))
+    lookup.answer(unackedTxid, lookup.own)
     kvKeys(backend) should not contain k(2)
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
   }
@@ -2702,13 +2727,13 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     kvKeys(backend) should not contain k(2)
     frontend.transactions.contains(unackedTxid) shouldBe false
 
-    lookup.answer(unackedTxid, Success(true))
+    lookup.answer(unackedTxid, lookup.own)
     frontend.transactions.contains(unackedTxid) shouldBe false
   }
 
   test("a recovered commit vote that found its entry is forgotten on a later abort without undoing its update") {
     val (frontend, backend, net, crl, lookup) = unackedFixture()
-    lookup.answer(unackedTxid, Success(true))
+    lookup.answer(unackedTxid, lookup.own)
     kvKeys(backend) should not contain k(2)
     val committedBefore = committedMessages(net).size
     committedBefore should be > 0
@@ -2727,7 +2752,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a recovered commit vote that found its entry is forgotten on a late commit without applying it again") {
     val statusCache = new TransactionStatusCache()
     val (frontend, backend, net, _, lookup) = unackedFixture(statusCache = statusCache)
-    lookup.answer(unackedTxid, Success(true))
+    lookup.answer(unackedTxid, lookup.own)
     val committedBefore = committedMessages(net).size
 
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = true, owed = Set()))
@@ -2744,7 +2769,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   /** A live Frontend over populated objects, whose op1 commit vote for txid1 is in place, with lookups through `lookup` */
   private def lateFixture(statusCache: TransactionStatusCache = new TransactionStatusCache(),
-                          stubs: Set[TransactionId] = Set())
+                          stubs: Set[TransactionId] = Set(),
+                          incarnation: Option[StoreIncarnation] = None,
+                          acceptorSince: Option[HLCTimestamp] = None)
       : (Frontend, MapBackend, TestNet, TestCrl, ManualLookup) =
     val backend = new MapBackend(storeId)
     populate(backend)
@@ -2753,7 +2780,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = stubs
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
-      statusCache, unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
+      statusCache, unackedLookup = lookup, acceptorSince = acceptorSince, loadedAt = FrontendSuite.longLoaded,
+      incarnationOverride = incarnation)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, backend, net, crl, lookup)
@@ -2775,7 +2803,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lookup.requests shouldBe List(txid1)
     frontend.transactions(txid1).status shouldBe TransactionStatus.Unresolved
 
-    lookup.answer(txid1, Success(true))
+    lookup.answer(txid1, lookup.own)
     backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
     frontend.transactions.contains(txid1) shouldBe false
     committedMessages(net).map(_.objectCommitErrors).distinct shouldBe List(Nil)
@@ -2793,13 +2821,81 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lateCommit(frontend, finalized = false)
     lateCommit(frontend, finalized = true) // A retransmit makes no second lookup
     lookup.requests shouldBe List(txid1)
-    lookup.answer(txid1, Success(false))
+    lookup.answer(txid1, lookup.absent)
 
     backend.get(oid1).get.data.size shouldBe 0
     frontend.transactions.contains(txid1) shouldBe false
     committedMessages(net) shouldBe Nil
     crl.deleted should contain (txid1)
     lockedWriteTransactions(frontend, net, op1) shouldBe empty
+    statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
+      finalized = true, late = true))
+  }
+
+  // ---- Store incarnation (Todo 2.12, Rebuild N3): an entry applies only at the incarnation it names ----
+
+  private val incarnationA = StoreIncarnation(new UUID(0xA, 1))
+  private val incarnationB = StoreIncarnation(new UUID(0xB, 1))
+
+  /** A live commit vote of `frontend` for dataUpdateTxd, its late commit held for a lookup answered with `entry` */
+  private def lateCommitAnswered(frontend: Frontend, net: TestNet, lookup: ManualLookup,
+                                 entry: Option[StoreIncarnation]): Unit =
+    frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+    expectVote(net, TransactionDisposition.VoteCommit)
+    lateCommit(frontend, finalized = false)
+    lookup.requests shouldBe List(txid1)
+    lookup.answer(txid1, Success(UnackedLookupResult.Found(entry)))
+
+  /** The late commit was concluded committed without applying anything: see lateCommitAnswered */
+  private def appliedNothing(frontend: Frontend, backend: MapBackend, net: TestNet, crl: TestCrl,
+                             statusCache: TransactionStatusCache): Unit =
+    backend.get(oid1).get.data.size shouldBe 0
+    committedMessages(net) shouldBe Nil
+    frontend.transactions.contains(txid1) shouldBe false
+    crl.stubsSaved shouldBe Nil
+    crl.deleted should contain (txid1)
+    statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
+      finalized = true, late = true))
+    lockedWriteTransactions(frontend, net, op1) shouldBe empty
+
+  test("a replay at a rebuilt store applies nothing through an entry for the store's earlier incarnation") {
+    // The N3 reproduction: the rebuilt store (incarnation B) inherited the entry its earlier incarnation A was owed.
+    // Its acceptorSince is earlier than T's start, so the replayed client prepare is not muted and votes commit
+    val statusCache = new TransactionStatusCache()
+    val since = HLCTimestamp((System.currentTimeMillis() - 60000) << 16)
+    val (frontend, backend, net, crl, lookup) = lateFixture(statusCache, incarnation = Some(incarnationB),
+      acceptorSince = Some(since))
+    frontend.incarnation shouldBe incarnationB
+    lateCommitAnswered(frontend, net, lookup, Some(incarnationA))
+    appliedNothing(frontend, backend, net, crl, statusCache)
+  }
+
+  test("a live Tx with its own commit vote applies nothing on a late commit when its entry's incarnation is unknown") {
+    val statusCache = new TransactionStatusCache()
+    val (frontend, backend, net, crl, lookup) = lateFixture(statusCache, incarnation = Some(incarnationB))
+    lateCommitAnswered(frontend, net, lookup, None)
+    appliedNothing(frontend, backend, net, crl, statusCache)
+  }
+
+  test("a held late commit at a store holding a stub applies nothing whatever its entry's incarnation") {
+    val statusCache = new TransactionStatusCache()
+    val (frontend, backend, net, crl, lookup) = lateFixture(statusCache, incarnation = Some(incarnationB))
+    frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
+    expectVote(net, TransactionDisposition.VoteCommit)
+    lateCommit(frontend, finalized = true)
+    lookup.requests shouldBe List(txid1)
+    // Recorded while the lookup is in flight
+    frontend.recordAppliedStub(txid1)(())
+    crl.stubsSaved shouldBe List(txid1)
+
+    lookup.answer(txid1, Success(UnackedLookupResult.Found(Some(incarnationA))))
+
+    backend.get(oid1).get.data.size shouldBe 0
+    committedMessages(net) shouldBe Nil
+    frontend.transactions.contains(txid1) shouldBe false
+    frontend.hasAppliedStub(txid1) shouldBe true
+    crl.stubsSaved shouldBe List(txid1)
+    crl.stubsDeleted shouldBe Nil
     statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
       finalized = true, late = true))
   }
@@ -2820,7 +2916,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.retryUnackedLookups(System.nanoTime() + Frontend.UnackedLookupTimeout.toNanos + 1)
     lookup.requests.count(_ == txid1) shouldBe 3
 
-    lookup.answer(txid1, Success(true))
+    lookup.answer(txid1, lookup.own)
     backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
     frontend.transactions.contains(txid1) shouldBe false
   }
@@ -2854,7 +2950,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     // Forgotten without a TxFinalized listing owed: it looks up its entry first (replay-pins addendum A, case 3)
     lookup.requests shouldBe List(txid1)
-    lookup.answer(txid1, Success(false))
+    lookup.answer(txid1, lookup.absent)
     backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
     committedMessages(net).size shouldBe committedBefore
     frontend.transactions.contains(txid1) shouldBe false
@@ -2961,7 +3057,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("applying through a found entry writes a stub") {
     // A recovered commit vote: kept until TxFinalized (Ruling 9), which writes the stub though it lists no one
     val (frontend, backend, _, crl, lookup) = unackedFixture()
-    lookup.answer(unackedTxid, Success(true))
+    lookup.answer(unackedTxid, lookup.own)
     kvKeys(backend) should not contain k(2)
     crl.stubsSaved shouldBe Nil
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false,
@@ -2975,7 +3071,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     late.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
     expectVote(lateNet, TransactionDisposition.VoteCommit)
     lateCommit(late, finalized = true)
-    lateLookup.answer(txid1, Success(true))
+    lateLookup.answer(txid1, lateLookup.own)
     lateBackend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
     late.transactions.contains(txid1) shouldBe false
     lateCrl.stubsSaved shouldBe List(txid1)
@@ -3004,7 +3100,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.retryUnackedLookups()
     lookup.requests shouldBe List(txid1, txid1)
 
-    lookup.answer(txid1, Success(true))
+    lookup.answer(txid1, lookup.own)
     frontend.transactions.contains(txid1) shouldBe false
     crl.stubsSaved shouldBe List(txid1)
     crl.deleted should not contain (txid1)
@@ -3037,7 +3133,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lateCommit(inFlight, finalized = true)
     inFlightLookup.requests shouldBe List(txid1)
     inFlight.recordAppliedStub(txid1)(())
-    inFlightLookup.answer(txid1, Success(true))
+    inFlightLookup.answer(txid1, inFlightLookup.own)
     inFlightBackend.get(oid1).get.data.size shouldBe 0
     committedMessages(inFlightNet) shouldBe Nil
     inFlight.transactions.contains(txid1) shouldBe false
@@ -3046,7 +3142,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a recovered commit vote with a stub applies nothing") {
     val (frontend, backend, net, crl, lookup) = unackedFixture(stubs = Set(unackedTxid))
     frontend.hasAppliedStub(unackedTxid) shouldBe true
-    lookup.answer(unackedTxid, Success(true))
+    lookup.answer(unackedTxid, lookup.own)
 
     kvKeys(backend) should contain (k(2))
     // Its TxCommitted reports the object it did not change, so a driver's finalizer marks it for repair
@@ -3065,7 +3161,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (late, lateBackend, _, _, lateLookup) = unackedFixture(stubs = Set(unackedTxid))
     late.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = true,
       owed = Set()))
-    lateLookup.answer(unackedTxid, Success(true))
+    lateLookup.answer(unackedTxid, lateLookup.own)
     kvKeys(lateBackend) should contain (k(2))
     late.transactions.contains(unackedTxid) shouldBe false
   }
@@ -4400,8 +4496,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false, late = false, proof = false))
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false, late = false, owed = Set()))
     // Neither the recovery's UnackedCommits lookup nor the one started after the aborts finds an entry
-    lookup.answer(txid1, Success(false))
-    lookup.answer(txid1, Success(false))
+    lookup.answer(txid1, lookup.absent)
+    lookup.answer(txid1, lookup.absent)
     crl.deleted should contain (txid1)
     admission.admittedBytes shouldBe 0
   }
@@ -4629,7 +4725,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       reply(frontend, net, peer2, None)
       lookup.requests shouldBe List(txid1)
 
-      lookup.answer(txid1, Success(false))
+      lookup.answer(txid1, lookup.absent)
       frontend.transactions.contains(txid1) shouldBe false
       crl.deleted should contain (txid1)
       lockedWriteTransactions(frontend, net, op1) shouldBe empty
@@ -4645,7 +4741,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       reply(frontend, net, peer1, None)
       reply(frontend, net, peer2, None)
 
-      lookup.answer(txid1, Success(true))
+      lookup.answer(txid1, lookup.own)
       // Owed: T committed and was finalized (its entry is durable), so it applies and is forgotten as a late commit
       backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
       frontend.transactions.contains(txid1) shouldBe false
@@ -4674,7 +4770,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.transactions.contains(txid1) shouldBe true
 
       frontend.retryUnackedLookups()
-      lookup.answer(txid1, Success(false))
+      lookup.answer(txid1, lookup.absent)
       frontend.transactions.contains(txid1) shouldBe false
       backend.get(oid1).get.data.size shouldBe 0
   }
@@ -4732,7 +4828,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       lookup.requests shouldBe List(txid1)
       frontend.transactions.contains(txid1) shouldBe true
 
-      lookup.answer(txid1, Success(false))
+      lookup.answer(txid1, lookup.absent)
       frontend.transactions.contains(txid1) shouldBe false
       crl.deleted should contain (txid1)
       backend.get(oid1).get.data.size shouldBe 0
@@ -4748,7 +4844,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         late = false, holdsAcceptorState = false)))
       lookup.requests shouldBe List(txid1)
 
-      lookup.answer(txid1, Success(false)) // Not owed: it applies nothing
+      lookup.answer(txid1, lookup.absent) // Not owed: it applies nothing
       frontend.transactions.contains(txid1) shouldBe false
       backend.get(oid1).get.data.size shouldBe 0
   }
@@ -4792,8 +4888,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup,
       wallClockMillis = () => clock.now, horizon = FiniteDuration(20, SECONDS), loadedAt = Some(floorNow))
+    lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
-    lookup.answer(txid1, Success(true))
+    lookup.answer(txid1, lookup.own)
     kvKeys(backend) should not contain k(2)
     frontend.transactions(txid1).provesCommitToItsDriver shouldBe true
 
@@ -4835,7 +4932,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
         // Concluded as a late commit of a transaction applied here: its own entry decides whether a stub is owed
         lookup.requests shouldBe List(txid1)
-        lookup.answer(txid1, Success(found))
+        lookup.answer(txid1, if found then lookup.own else lookup.absent)
         frontend.transactions.contains(txid1) shouldBe false
         if found then crl.stubsSaved should contain (txid1) else crl.deleted should contain (txid1)
         lockedWriteTransactions(frontend, net, op1) shouldBe empty
@@ -4860,7 +4957,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.expiryHeartbeat()
       reply(frontend, net, peer1, Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = true,
         late = false, holdsAcceptorState = false)))
-      lookup.answer(txid1, Success(false))
+      lookup.answer(txid1, lookup.absent)
       frontend.transactions.contains(txid1) shouldBe false
   }
 
@@ -4900,7 +4997,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.transactions.contains(txid2) shouldBe true
       net.sentTx = Nil
 
-      lookup.answer(txid2, Success(false)) // T2 is discarded, releasing its locks
+      lookup.answer(txid2, lookup.absent) // T2 is discarded, releasing its locks
       frontend.transactions.contains(txid2) shouldBe false
       frontend.expiryHeartbeat()
       frontend.transactions.values.foreach(_.checkCollisionWait(Long.MaxValue))

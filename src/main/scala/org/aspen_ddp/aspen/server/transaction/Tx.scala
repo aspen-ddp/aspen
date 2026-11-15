@@ -1279,6 +1279,26 @@ class Tx( trs: TransactionRecoveryState,
       if late then
         frontend.forget(this)
 
+  /** The pool's UnackedCommits tree holds this store's entry for the transaction, but it names another incarnation
+    * of the store (the one whose vote counted, lost to a rebuild since) or none (the driver never heard from this
+    * store): T committed, and this incarnation is owed nothing through the entry. A replayed client prepare at a
+    * rebuilt store, or at a store that never saw T, would otherwise apply T over newer state.
+    *
+    * A late commit of a transaction already applied here (lateCommit) writes its stub and is forgotten, as for a
+    * matching entry: a stub only ever suppresses an apply. Otherwise the entry is durable only after every other
+    * finalization action, so T is committed and finalized: the Tx concludes committed without applying anything,
+    * its locks and objects released and any held aborts dropped, never accepted. A held late commit at a store
+    * holding an applied stub applies nothing too, the stub unchanged. No stub is written. The entry is left for the
+    * repair scan, whose reconcile installs the committed state
+    */
+  def unackedCommitNotOwed(): Unit =
+    if forgetLookupHeld && ofinalized.isEmpty then
+      unackedCommitFound()
+    else if lateCommitHeld && oresolution.isEmpty && frontend.hasAppliedStub(transactionId) then
+      applyNothing(committed = true, finalMessage = true, late = true)
+    else if awaitsUnackedLookup then
+      applyNothing(committed = true, finalMessage = true, late = true)
+
   /** A UnackedCommits lookup that counts found no entry. A held late commit applies nothing: this store is not owed it
     * (it applied the commit durably, or its vote did not count). Otherwise either the transaction did not commit, or
     * this store applied it durably: returns the held aborts, for the Frontend to handle again; they are accepted now

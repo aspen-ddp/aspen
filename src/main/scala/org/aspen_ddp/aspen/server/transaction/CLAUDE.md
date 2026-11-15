@@ -35,8 +35,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   nothing, records nothing in the status cache, and casts no commit vote. A driver holding a proof never proposes
   abort (an abort Paxos already accepted still resolves). A resolution reached after the transaction was forgotten
   is late (`late = true`; the cached outcome is finalized): the driver runs no finalization actions, and a store
-  applies it only when it holds its own commit vote and its UnackedCommits entry exists. Everything else (abort
-  vote, prover, muted Tx) applies nothing and sends no TxCommitted
+  applies it only when it holds its own commit vote and its UnackedCommits entry names the store's own incarnation
+  (UnackedCommits below). Everything else (abort vote, prover, muted Tx) applies nothing and sends no TxCommitted
 - Driver prepares are prefer-abort (`fromClient == false`): a Tx with no vote and no client prepare never checks
   requirements on one. It proves at once if it can (`appliedBy`), else withholds its whole response until the data, a
   client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes: then it votes abort
@@ -63,6 +63,14 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   entry applies and is forgotten at once). A failed or unanswered lookup holds the
   abort and retries at heartbeat (`Frontend.UnackedLookupTimeout`, 5 s). Past the horizon its peers refuse its
   driver, so such a Tx ends by expiry (below)
+- The apply decision (`Frontend.unackedLookupComplete`; the lookup answers `UnackedLookupResult.Absent` or
+  `Found(incarnation)`, `Host.unackedLookup` decoding the entry): only `Found(Some(own))`, naming
+  `Frontend.incarnation`, applies through the entry (`Tx.unackedCommitFound`). `Found` of another incarnation (a
+  rebuilt store, Rebuild N3) or `None` (the driver never heard from the store) logs both at info and calls
+  `Tx.unackedCommitNotOwed`: T committed and was finalized, so the Tx concludes committed with nothing applied
+  (`applyNothing`), held aborts dropped and never accepted, no stub written; a forget-lookup (`forgetLookupHeld`,
+  T already applied here) writes its stub as for any found entry. A found entry of any incarnation is never taken
+  as absent. The entry is left for the repair scan, whose reconcile installs the committed state
 - A recovered Tx whose saved status is resolved (re-saved by a prepare or accept after the resolution) restores it
   into `oresolution`. It takes no locks and needs no lookup: once its objects load it applies the commit with the
   recovered re-check rules, or deletes the abort's state, then waits for TxFinalized as a live resolved Tx does
@@ -114,9 +122,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   `objectCommitErrors`. The repair scan drops a stub with its entry (a chunked entry's head), and an orphan stub (pre-walk snapshot, no entry)
   only once two consecutive scans found it so. An entry with no stub is harmless at a store that saw T: it never
   rejoins T, so no replay Tx exists there to apply through it (a second driver's lost TxFinalized included). Residual:
-  a store that never saw T (below a quorum) applies T late through its entry. That is what it is owed, and the
-  entry's reconcile heals any write superseded meanwhile, since repair leaves the entry until the store can no
-  longer join T (`server/repair/CLAUDE.md`; transaction-recovery Todo 2.9 re-assessment)
+  a store that never saw T (below a quorum) gets T from reconcile: its entry can exist only through the unknown-voters
+  case, which names no incarnation, so a late commit there applies nothing through it, and the entry's reconcile
+  installs the committed state, since repair leaves the entry until the store can no longer join T
+  (`server/repair/CLAUDE.md`; transaction-recovery Todo 2.9 re-assessment)
 - A Tx finalized while its commit is held for its turn defers concluding its state (`Frontend.finalizationDeferred`).
   Every deferring Tx of the txid (a replay's too) is listed, and the state is deleted or stubbed only by the call that
   empties the list; a stub owed meanwhile passes to every listed Tx

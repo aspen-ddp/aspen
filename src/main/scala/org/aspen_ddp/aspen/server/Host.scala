@@ -15,7 +15,8 @@ import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDevice
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
-import org.aspen_ddp.aspen.server.store.{Frontend, ReconcileResult, RepairSnapshot, Store, UnackedCommitLookup}
+import org.aspen_ddp.aspen.server.store.{Frontend, ReconcileResult, RepairSnapshot, Store, UnackedCommitLookup,
+  UnackedLookupResult}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler, DefaultBackendOpener}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
@@ -221,7 +222,9 @@ class Host(val client: AspenClient,
     Future.unit
       .flatMap(_ => client.getStoragePool(storeId.poolId))
       .flatMap(_.unackedCommitsTree.get(UnackedCommitEntry.key(storeId, txid)))
-      .onComplete(result => answer(result.map(_.isDefined)))
+      .onComplete(result => answer(result.map:
+        case None => UnackedLookupResult.Absent
+        case Some(vs) => UnackedLookupResult.Found(UnackedCommitEntry.decode(vs.value.bytes).incarnation)))
 
   private val deviceControl: DeviceControl = new DeviceControl(
     metadata = seams.wrapMetadata.fold(hostMetadata)(wrap => wrap(hostMetadata)),

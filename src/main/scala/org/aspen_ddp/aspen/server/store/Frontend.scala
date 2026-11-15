@@ -595,13 +595,15 @@ class Frontend(val storeId: StoreId,
 
   /** The answer to UnackedCommits lookup `requestId`, delivered on the store's executor.
     *
-    * An entry found resolves the Tx committed, whichever lookup found it (Tx.unackedCommitFound). None found releases
-    * the aborts it held, or makes a held late commit apply nothing, if the lookup was made after the latest of them
-    * arrived; otherwise, if it was the latest lookup, another is made.
+    * An entry found resolves the Tx committed, whichever lookup found it. It applies through the entry only if the
+    * entry names this store's own incarnation (Tx.unackedCommitFound); one naming another incarnation, or none,
+    * concludes it committed with nothing applied (Tx.unackedCommitNotOwed). Either way it is never taken as absent.
+    * None found releases the aborts it held, or makes a held late commit apply nothing, if the lookup was made after
+    * the latest of them arrived; otherwise, if it was the latest lookup, another is made.
     * A failure of the latest lookup keeps the aborts held, and retryUnackedLookups tries again. Ignored once the Tx
     * no longer needs it (it learned its outcome another way), and for a lookup this Frontend did not make
     */
-  def unackedLookupComplete(txid: TransactionId, requestId: Long, result: Try[Boolean]): Unit =
+  def unackedLookupComplete(txid: TransactionId, requestId: Long, result: Try[UnackedLookupResult]): Unit =
     unackedLookups.get(txid).filter(_.latest >= requestId).foreach: l =>
       transactions.get(txid).filter(_.awaitsUnackedLookup) match
         case None => unackedLookups.remove(txid)
@@ -612,11 +614,19 @@ class Frontend(val storeId: StoreId,
           if result.isSuccess then
             tx.unackedLookupAnswered() // Its store may now drive it: see Store.driveTransaction
           result match
-            case Success(true) =>
+            case Success(UnackedLookupResult.Found(found)) =>
               unackedLookups.remove(txid)
-              // Forgotten by the Tx itself only for a held late commit: see Tx.unackedCommitFound
-              tx.unackedCommitFound()
-            case Success(false) if requestId >= l.firstCounting =>
+              if found.contains(incarnation) then
+                // Forgotten by the Tx itself only for a held late commit: see Tx.unackedCommitFound
+                tx.unackedCommitFound()
+              else
+                // Another incarnation's vote counted (this store was rebuilt since), or the driver never heard from
+                // this store: T committed, but nothing is owed to this incarnation. See Tx.unackedCommitNotOwed
+                logger.info(s"Store $storeId (incarnation ${incarnation.uuid}): the UnackedCommits entry for " +
+                  s"transaction $txid names incarnation ${found.fold("unknown")(_.uuid.toString)}: applying nothing " +
+                  s"through it")
+                tx.unackedCommitNotOwed()
+            case Success(UnackedLookupResult.Absent) if requestId >= l.firstCounting =>
               unackedLookups.remove(txid)
               val held = tx.unackedCommitAbsent()
               // A held abort is a real outcome: it is taken over an expiry discard
@@ -624,7 +634,7 @@ class Frontend(val storeId: StoreId,
                 expireTransaction(tx)
               else
                 held.foreach(handleTransactionMessage)
-            case Success(false) =>
+            case Success(UnackedLookupResult.Absent) =>
               if isLatest then
                 startUnackedLookup(txid, l)
             case Failure(err) =>

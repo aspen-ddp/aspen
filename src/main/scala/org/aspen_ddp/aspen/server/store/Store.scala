@@ -164,7 +164,8 @@ class Store(val storageDeviceId: StorageDeviceId,
       val start = TransactionDriver.Start(
         initialProposal = initialProposal,
         highestSeen = frontend.transactions.get(txd.transactionId).flatMap(_.highestProposal),
-        onSplitDecision = txStatusCache.recordSplitDecision)
+        onSplitDecision = txStatusCache.recordSplitDecision,
+        pastExpiry = () => frontend.pastExpiry(txd))
       val driver = txDriverFactory.create(executionContext, storeId, net, backgroundTasks, txd, finalizerFactory, start)
 
       transactionDrivers += txd.transactionId -> driver

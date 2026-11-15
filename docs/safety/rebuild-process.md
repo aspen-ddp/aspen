@@ -743,6 +743,13 @@ host siblings also wait. No backoff schedule, no in-pass retry of the right-neig
 **Verification: PLAUSIBLE, severity liveness.** `CheckStorageDevicesPeriod` = 1 hour (`cmdline/Main.scala:82`), the failure path deliberately does not re-check its own device (`StoreRebuilds.scala:288-302`), and `readRight` (`TierEngine.scala:158`) can raise on a concurrently joined node. Whether the pass can fail repeatedly depends on delete churn; not executed. Fix sketch: retry the failed read inside the pass with a bounded count and backoff, and schedule a delayed self-recheck with exponential backoff.
 
 **F6 (Medium) A Rebuilding (silent) store can stall transactions whose live voters disagree.**
+
+> **FIXED 2026-11-15 (Todo 4.1, with paxos F8).** The stall was permanent, not limited to the outage: transaction
+> expiry `Hold`s (both live voters hold acceptor state, so at most `w - t` non-holders), and the silent store, once
+> back past the horizon, refuses the prepare without a reply. The driver now waits until T is past the horizon plus
+> the expiry margin, which tolerates transient silence, and then proposes abort unless its promise quorum reports an
+> accepted value (paxos-transactions P7a). Residual: the commit voters' locks are held for up to horizon + expiry
+> margin (about 31 s) plus one driver resend interval.
 Scenario: Replication(3,2), S0 rebuilding. A transaction's prepare gets commit from S1 and abort from S2 (S2 lags).
 `nReplies = 2 >= writeThreshold`, but `nReplies != width && nCommitVotes (1) < writeThreshold && width - nAbortVotes (2)
 >= writeThreshold` sets `cantAttempt` (`server/transaction/TransactionDriver.scala:281-288`); the driver returns and

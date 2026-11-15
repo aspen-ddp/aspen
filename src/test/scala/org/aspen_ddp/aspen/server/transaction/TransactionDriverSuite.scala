@@ -211,6 +211,72 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, true), (ds1, true), (ds2, true))
   }
 
+  // Paxos F8: the tally stopped at the first object short of answers, even when another object could no longer commit
+  test("an object that can no longer commit decides abort though another object is short of answers") {
+    val otherPool = PoolId(java.util.UUID.randomUUID())
+    val otherObj = DataObjectPointer(ObjectId(java.util.UUID.randomUUID()), otherPool)
+    val primaryUpdate = DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite)
+    val otherUpdate = DataUpdate(otherObj, rev, DataUpdateOperation.Overwrite)
+    // Both orders of the object set, so the short object is visited first in one of them
+    for updates <- List(List(primaryUpdate, otherUpdate), List(otherUpdate, primaryUpdate)) do
+      val txd = mktxd(simpleObj, updates)
+      val messenger = new TMessenger()
+      val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+
+      promiseFrom(driver, ds0, TransactionDisposition.VoteCommit)
+      promiseFrom(driver, ds1, TransactionDisposition.Undetermined) // a quorum, but one vote: short of answers
+      promiseFrom(driver, StoreId(otherPool, 1), TransactionDisposition.VoteAbort)
+      promiseFrom(driver, StoreId(otherPool, 2), TransactionDisposition.VoteAbort)
+
+      accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, false), (ds1, false), (ds2, false))
+  }
+
+  // Rebuild F6: one commit vote, one abort vote and a silent store leave the outcome to the silent store. Expiry never
+  // ends it (both voters hold acceptor state), and a store returning past the horizon refuses the prepare silently
+  test("an undecided tally waits until past expiry, then proposes abort") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    var past = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => (),
+      start = TransactionDriver.Start(pastExpiry = () => past))
+
+    promiseFrom(driver, ds0, TransactionDisposition.VoteCommit)
+    promiseFrom(driver, ds1, TransactionDisposition.VoteAbort)
+    driver.testHaveLocalProposal shouldBe false
+    accepts(messenger) shouldBe Nil
+
+    // The resent prepares' replies re-run the tally
+    past = true
+    promiseFrom(driver, ds1, TransactionDisposition.VoteAbort)
+    accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, false), (ds1, false), (ds2, false))
+  }
+
+  test("past expiry, a quorum reporting an accepted commit is proposed, not abort") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val driver = new TTD(ds0, messenger, mkprep(2, 0, 0, txd), new TFinalizer(), _ => (),
+      start = TransactionDriver.Start(pastExpiry = () => true))
+
+    promiseFrom(driver, ds0, TransactionDisposition.VoteCommit, accepted = Some((ProposalId(1, 1), true)))
+    promiseFrom(driver, ds1, TransactionDisposition.VoteAbort)
+
+    accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, true), (ds1, true), (ds2, true))
+  }
+
+  test("past expiry, a driver holding a proof does not propose abort on an undecided tally") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val driver = new TTD(ds0, messenger, mkprep(2, 0, 0, txd), new TFinalizer(), _ => (),
+      start = TransactionDriver.Start(pastExpiry = () => true))
+
+    driver.receiveTxResolved(TxResolved(ds0, ds0, txd.transactionId, committed = true, late = false, proof = true))
+    val round = driver.testProposalId
+    promiseFrom(driver, ds0, TransactionDisposition.VoteCommit, proposal = round)
+    promiseFrom(driver, ds1, TransactionDisposition.VoteAbort, proposal = round)
+
+    accepts(messenger).filter(!_.value) shouldBe Nil
+  }
+
   // Paxos F4: proposer ids are pool indexes, so a store of another pool with the leader's index would share its ids
   test("a driver on a secondary-pool store is learn-only: no proposal and no Accept, but it learns the outcome") {
     val otherPool = PoolId(java.util.UUID.randomUUID())

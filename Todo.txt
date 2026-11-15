@@ -48,11 +48,6 @@ PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.1  Tally stalls on a silent store: P-F8, Rebuild F6                                                       [S-M]
-     cantAttempt breaks on the first pool short of answers. With one commit voter, one abort voter and a silent
-     store (any offline or Rebuilding store), locks are held for the whole outage. Fix: evaluate every object and
-     decide abort as soon as any object cannot reach its write threshold. The P2/P6 safety argument needs review.
-
 4.2  Hung backend commit: Req F12                                                                           [S-M]
      awaitingCommits has no timer, so an FSIF ENOSPC freeze stalls the object forever. Add a long watchdog that
      votes BackendCommitFailed and keeps the store serving. Never fail-stop for out of space.

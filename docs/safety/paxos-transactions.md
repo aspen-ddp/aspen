@@ -138,6 +138,14 @@ decided commit is backed by locked, durable commit votes at a write quorum of ev
 without violating anything (aborts apply nothing). So misclassifying a non-vote as an abort vote (F7) can cost
 liveness/throughput but not safety, provided P8 holds.
 
+**P7a The expiry abort is an ordinary abort proposal (2026-11-15, F8).** Past expiry a driver proposes abort on an
+undecided tally. It does so under exactly the conditions of the vote-based abort: a promise quorum of the current
+round, no proof held, and `Proposer.proposalValue` preferring any accepted value of that quorum. Only the vote count is
+relaxed, and by P7 the vote count never makes an abort safe; P6 concerns commit only. A commit chosen and then
+forgotten is not overturned: an acceptor forgets T only at TxFinalized and never rejoins it (forget floor), so every
+promise quorum meets the accepting quorum at a store that still reports the accepted commit. A commit voter whose
+driver decides abort still makes its UnackedCommits lookup first when expiring (`needsUnackedCheck`).
+
 **P8 Single chosen value.** For one transaction at most one of {commit, abort} is chosen by the primary pool's
 acceptors, given P1-P3 and that the acceptor state of a possibly-chosen value is still held by a quorum-intersecting
 set of acceptors (P9). The proposer picks the highest accepted value reported in its promise quorum before it falls
@@ -439,8 +447,10 @@ Properties (verified by case analysis):
 * Once `c >= t` or `a > w - t` is true it stays true (votes are immutable and only accumulate). So different drivers
   using the same vote set agree; they can differ only through non-votes counted as aborts (F7) or through amnesia
   (F2, F6; since 2026-11-13 no driver counts an acceptor that forgot T, so amnesia no longer feeds the tally, 10.10).
-* The decision is gated on *every* object's pool having `t` answers, even when abort is already certain for another
-  object (F8).
+* (2026-11-15, F8 fixed) Every object is classified, none skipped: commit-certain (`c >= t`), abort-certain
+  (`w - a < t`) or undecided. Any abort-certain object decides abort, whatever the other objects lack. Otherwise any
+  undecided object waits, and from expiry on proposes abort (P7a). This matches the table above except that the
+  first short object no longer hides a later abort-certain one.
 
 ### 7.3 Rounds, Nacks, backoff
 
@@ -865,7 +875,7 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 | Slow store (behind) | It votes late or never; the quorum decides without it. If it missed the commit it is marked for repair by the finalizer. |
 | Leader partitioned from some stores | Driver cannot reach a quorum -> waits; recovery drivers on other stores start after 5 heartbeats; dueling resolved by Paxos. |
 | Minority of acceptors partitioned | Proceeds. A majority-or-more partition: no progress (liveness), no unsafe decision. |
-| Secondary pool below `t` reachable | The tally cannot decide even an abort (F8); commit-vote locks stay held; the client retransmits forever. |
+| Secondary pool below `t` reachable, or a silent store whose vote would decide | (2026-11-15, F8) An object already abort-certain decides abort at once. Otherwise the driver waits until T is past the horizon plus the expiry margin, then proposes abort; commit-vote locks are held for at most that long plus one resend interval. |
 
 ### 11.3 Crash at each step
 
@@ -944,7 +954,7 @@ Findings the horizon (10.10) touches. Every other finding of this document is un
 | F5 | unchanged | A new driver still starts at `(1,L)` | `Proposer.scala:11`; `SimpleTransactionDriver.scala` |
 | F6 | unchanged (reach widened) | Abort still deletes the CRL record at resolution; with no horizon a forgotten abort is re-decidable by any later prepare (P-N4) | `Tx.scala:749`; `Frontend.scala:589-591` |
 | F7 | unchanged | Every non-`VoteCommit` counts as abort | `TransactionDriver.scala:332-337` |
-| F8 | unchanged | Tally still `break()`s on the first short pool (a proof holder adopting an accepted value skips it) | `TransactionDriver.scala:341-349` |
+| F8 | **fixed** 2026-11-15 | Every object is classified; any abort-certain object decides abort at once; an undecided tally proposes abort past expiry | `TransactionDriver.receiveTxPrepareResponse`; `Store.driveTransaction` (`Start.pastExpiry`) |
 | F9 | **fixed** (Ruling 30) | `TransactionStatusCache.updateStatus` is monotone (atomic compute): `finalized` and `late` are sticky and a resolved status never reverts to Unresolved, so neither `Tx.resolved` nor the `Tx` constructor can downgrade an entry (X3) | `TransactionStatusCache.scala` `updateStatus` |
 | F10 | unchanged | `lastProposer` still follows client prepares; the proof is sent there too (P-N1) | `Tx.scala:806,630` |
 | F11 | unchanged | Conflicting outcomes are still ignored silently; `resolveLate` logs an error only for late-after-abort | `Tx.scala:772`; `TransactionDriver.scala:601-602,691` |
@@ -1144,6 +1154,19 @@ value; combined with F6 it widens the amnesia window. Fix: count `Undetermined` 
 `n`).
 
 ### F8. The tally cannot decide an abort while any referenced pool has fewer than `t` answers. Confidence: medium (liveness)
+
+> **FIXED 2026-11-15 (Todo 4.1, with rebuild-process F6).** The tally classifies every object (no `break()`): one
+> abort-certain object (`w - a < t`) decides abort at once, since votes never change. A tally that is undecided because
+> stores have not voted waits, as a transient partition or restart may heal, until T is past the horizon plus the
+> expiry margin on the driver's store (`TransactionDriver.Start.pastExpiry`, `Frontend.pastExpiry`); it then proposes
+> abort, unless the promise quorum reports an accepted value (P7a). The horizon alone did not bound the wait: expiry
+> discards only with more than `w - t` non-holders, so a commit voter and an abort voter that both hold acceptor state
+> `Hold` forever, and a silent store returning past the horizon refuses the prepare without a reply. Tests:
+> TransactionDriverSuite "an object that can no longer commit decides abort though another object is short of
+> answers", "an undecided tally waits until past expiry, then proposes abort", "past expiry, a quorum reporting an
+> accepted commit is proposed, not abort"; StoreSuite "a commit voter whose peer voted abort and whose third store is
+> silent aborts past expiry, not before". Residual: locks wait up to horizon + expiry margin (about 31 s) plus one
+> driver resend interval while a silent store's vote would decide.
 
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness.** The object loop iterates a Set and `break()`s with cantAttempt on the first object whose pool has fewer than writeThreshold replies (TransactionDriver.scala:341-344) even if an earlier or later object is already abort-certain; with one pool down, voters on the other objects keep their locks and the client retransmits forever.
 > *Fix sketch:* Evaluate all objects first; decide abort as soon as any object cannot reach commit; only wait when no object is abort-certain.

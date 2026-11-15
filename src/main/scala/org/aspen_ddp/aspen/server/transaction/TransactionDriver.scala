@@ -13,7 +13,7 @@ import scribe.Logging
 
 import scala.concurrent.duration.{Duration, NANOSECONDS, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success, boundary}, boundary.break
+import scala.util.{Failure, Success}
 import scala.util.control.NonFatal
 
 object TransactionDriver {
@@ -39,10 +39,16 @@ object TransactionDriver {
     * @param onSplitDecision called with a conflicting second outcome (paxos F11), to log it as an error and count it.
     *                        A store passes its host status cache's TransactionStatusCache.recordSplitDecision; the
     *                        default only logs
+    * @param pastExpiry      whether the transaction is past the horizon plus the expiry margin on this store's clock
+    *                        (Frontend.pastExpiry). From then on a tally the votes cannot decide proposes abort (paxos
+    *                        F8, rebuild F6): every store that could still join has joined or refused, the client has
+    *                        reported TransactionOutcomeUnknown, and a silent store's vote may never come. The default
+    *                        never expires
     */
   case class Start(initialProposal: Boolean = false,
                    highestSeen: Option[ProposalId] = None,
-                   onSplitDecision: (TransactionId, String) => Unit = logSplitDecision)
+                   onSplitDecision: (TransactionId, String) => Unit = logSplitDecision,
+                   pastExpiry: () => Boolean = () => false)
 
   private def logSplitDecision(txid: TransactionId, detail: String): Unit =
     scribe.error(s"Split decision: transaction $txid: $detail")
@@ -382,60 +388,56 @@ abstract class TransactionDriver(
             shouldSendAcceptMessages = mayPropose
           else if (mayPropose && !holdsProof && proposer.prepareQuorumReached && !proposer.haveLocalProposal) {
 
-            var canCommitTransaction = true
-            var cantAttempt = false
+            // Every object is classified, none skipped (paxos F8). Votes never change, so an object that can no
+            // longer reach its write threshold of commit votes, whatever the silent stores say, makes abort certain
+            // however many answers other objects still lack. An object is undecided while it has fewer than its write
+            // threshold of commit votes and could still reach it
+            var abortCertain = false
+            var undecided = false
 
-            // Before we can make a decision, we must ensure that we have a write-threshold number of replies for
-            // each of the objects referenced by the transaction
-            boundary:
-              for (ptr <- allObjects) {
-                var nReplies = 0
-                var nAbortVotes = 0
-                var nCommitVotes = 0
-                var canCommitObject = true
-                val objIDA = txd.poolIDAMap(ptr.poolId)
+            for (ptr <- allObjects) {
+              var nAbortVotes = 0
+              var nCommitVotes = 0
+              val objIDA = txd.poolIDAMap(ptr.poolId)
 
-                (0 until objIDA.width).foreach { poolIndex =>
-                  // Undetermined is no vote (paxos F7): a Tx resolved before it voted answers so, and counting it as
-                  // an abort could let a later round propose abort over write-threshold real commit votes
-                  peerDispositions.get(StoreId(ptr.poolId, poolIndex.toByte)).foreach {
-                    case TransactionDisposition.Undetermined => ()
-                    case TransactionDisposition.VoteCommit =>
-                      nReplies += 1
-                      nCommitVotes += 1
-                    case _ =>
-                      nReplies += 1
-                      nAbortVotes += 1
-                  }
+              (0 until objIDA.width).foreach { poolIndex =>
+                // Undetermined is no vote (paxos F7): a Tx resolved before it voted answers so, and counting it as
+                // an abort could let a later round propose abort over write-threshold real commit votes
+                peerDispositions.get(StoreId(ptr.poolId, poolIndex.toByte)).foreach {
+                  case TransactionDisposition.Undetermined => ()
+                  case TransactionDisposition.VoteCommit => nCommitVotes += 1
+                  case _ => nAbortVotes += 1
                 }
-
-                if (nReplies < objIDA.writeThreshold) {
-                  cantAttempt = true
-                  break()
-                }
-
-                if (nReplies != objIDA.width && nCommitVotes < objIDA.writeThreshold && objIDA.width - nAbortVotes >= objIDA.writeThreshold) {
-                  cantAttempt = true
-                  break()
-                }
-
-                if (objIDA.width - nAbortVotes < objIDA.writeThreshold)
-                  canCommitObject = false
-
-                // Once canCommitTransaction flips to false, it stays there
-                canCommitTransaction = canCommitTransaction && canCommitObject
               }
 
-            // The votes cannot decide yet, but a promise of this round's quorum carries an accepted value, which a
-            // proposer may always propose. Without this, stores answering Undetermined (resolved before voting)
-            // would stall a round whose quorum already reports the chosen value
-            if (cantAttempt) {
-              if (proposer.maySendAccept)
-                shouldSendAcceptMessages = true
-            } else {
-              // If we get here, we've made our decision. A driver holding a proof never reaches here
-              proposer.setLocalProposal(canCommitTransaction)
+              if (objIDA.width - nAbortVotes < objIDA.writeThreshold)
+                abortCertain = true
+              else if (nCommitVotes < objIDA.writeThreshold)
+                undecided = true
+            }
 
+            if (abortCertain) {
+              proposer.setLocalProposal(false)
+              shouldSendAcceptMessages = true
+            } else if (!undecided) {
+              // A write threshold of commit votes on every object (P6). A driver holding a proof never reaches here
+              proposer.setLocalProposal(true)
+              shouldSendAcceptMessages = true
+            } else if (proposer.maySendAccept) {
+              // The votes cannot decide yet, but a promise of this round's quorum carries an accepted value, which a
+              // proposer may always propose. Without this, stores answering Undetermined (resolved before voting)
+              // would stall a round whose quorum already reports the chosen value
+              shouldSendAcceptMessages = true
+            } else if (start.pastExpiry()) {
+              // The outcome rests on stores that have not voted. Until expiry they may still: a partition or a
+              // restart heals, and an abort would cost the client a retry. Past it, a store that never joined refuses
+              // for good (forget floor), and expiry cannot discard a Tx whose peers all hold acceptor state, so
+              // waiting could hold the commit voters' locks forever (rebuild F6). Abort is always a valid proposal
+              // (P7): any accepted value in the promise quorum still wins (Proposer.proposalValue)
+              val silent = allDataStores.filter(s => !peerDispositions.get(s).exists(_ != TransactionDisposition.Undetermined))
+              logger.info(s"Tx ${txd.transactionId} on store $storeId: past expiry with undecided votes, proposing " +
+                s"abort. Votes: $peerDispositions. No vote from: ${silent.mkString(",")}")
+              proposer.setLocalProposal(false)
               shouldSendAcceptMessages = true
             }
           }

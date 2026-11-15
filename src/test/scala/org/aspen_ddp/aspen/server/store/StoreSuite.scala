@@ -40,9 +40,9 @@ class StoreSuite extends AnyFunSuite with Matchers:
                       driverFactory: TransactionDriver.Factory = TransactionDriver.noErrorRecoveryFactory,
                       loadedAt: Option[Long] = FrontendSuite.longLoaded,
                       wallClockMillis: () => Long = () => System.currentTimeMillis(),
-                      unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never) =
+                      unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
+                      net: TestNet = new TestNet) =
     val backend = backendOverride.getOrElse(new MapBackend(id))
-    val net = new TestNet
     val crl = new TestCrl
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.global, backend,
       new HostObjectCache(1024 * 1024).forStore(id), net, backgroundTasks, crl, statusCache,
@@ -234,6 +234,66 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
     store.heartbeat()
     store.hasTransactions shouldBe false
+  }
+
+  /** Also records batched sends (a driver's Accepts), which TestNet drops */
+  private class BatchNet extends TestNet:
+    var batched: List[TxMessage] = Nil
+    override def sendTransactionMessages(msg: List[TxMessage]): Unit = batched = batched ++ msg
+
+  // Rebuild F6, paxos F8: a commit vote, an abort vote and a silent third store. Expiry holds (both voters hold
+  // acceptor state), so until the driver proposes abort past expiry, the commit voter's locks are held for good
+  test("a commit voter whose peer voted abort and whose third store is silent aborts past expiry, not before") {
+    var now = fixedStart
+    val lookup = new ManualLookup
+    val batchNet = new BatchNet
+    val (store, net, crl) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS),
+      wallClockMillis = () => now, unackedLookup = lookup, net = batchNet)
+    lookup.frontend = Some(store.frontend)
+    store.receiveTransactionMessage(TxPrepare(leader, leader, fixedTxd, ProposalId.initialProposal(1.toByte),
+      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), fromClient = true))
+    val own = net.sentTx.collect { case r: TxPrepareResponse => r }
+    own.map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+    val round = own.head.proposalId
+
+    def promise(from: StoreId, disposition: TransactionDisposition.Value): Unit =
+      store.receiveTransactionMessage(TxPrepareResponse(leader, from, txid1, Right(TxPrepareResponse.Promise(None)),
+        round, disposition, Nil))
+    def sentAccepts = batchNet.batched.collect { case a: TxAccept => (a.to, a.value) }.toSet
+
+    promise(leader, TransactionDisposition.VoteCommit)
+    promise(peer, TransactionDisposition.VoteAbort)
+    sentAccepts shouldBe empty
+
+    // Just short of expiry, a resent prepare's reply still waits for the silent store
+    now = fixedStart + 20_000 + store.expiryMargin.toMillis
+    promise(peer, TransactionDisposition.VoteAbort)
+    sentAccepts shouldBe empty
+
+    // Past expiry: the expiry round holds, as the peer holds acceptor state and the silent store may
+    now += 1
+    store.heartbeat()
+    val status = net.sentTx.collect { case r: TxStatusRequest => r }
+    status.map(_.to).toSet shouldBe Set(storeId, peer)
+    status.filter(_.to == peer).foreach: r =>
+      store.receiveTransactionMessage(TxStatusResponse(leader, peer, txid1, r.requestUUID,
+        Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
+          holdsAcceptorState = true))))
+    store.frontend.transactions.contains(txid1) shouldBe true
+
+    // The next reply to the driver's resent prepares makes it propose abort
+    promise(peer, TransactionDisposition.VoteAbort)
+    sentAccepts shouldBe Set((storeId, false), (leader, false), (peer, false))
+
+    for from <- List(leader, peer) do
+      store.receiveTransactionMessage(TxAcceptResponse(leader, from, txid1, round,
+        Right(TxAcceptResponse.Accepted(false))))
+    store.receiveTransactionMessage(TxResolved(leader, leader, txid1, committed = false, late = false, proof = false))
+    // An expiring commit vote looks up its UnackedCommits entry before it lets go of an abort
+    lookup.answer(txid1, lookup.absent)
+    store.receiveTransactionMessage(TxFinalized(leader, leader, txid1, committed = false, late = false, owed = Set()))
+    store.frontend.transactions.contains(txid1) shouldBe false
+    crl.deleted should contain (txid1)
   }
 
   // Ruling 31: a closed store's drivers would otherwise keep re-preparing its transactions from their timers

@@ -248,10 +248,11 @@ the rebuilt store's later zombie slices (rebuild reading an object that is delet
 Verified OK in the normal flow (E is written 2 s after commit and kept until the store is repairable), listed as a place where X1 turns it into data loss.
 > **2026-11-14 (Todo 2.12): NARROWED.** *The N3 leg is closed, without a clock.* Each store directory keeps an
 > `incarnation` UUID (`server/store/StoreIncarnationFile`): load reads it or creates it durably before the store
-> serves, `RebuildingStore.finish` writes a fresh one before its `rebuild-complete` marker, and transfers and
-> adoptions carry it with the archived directory. Every prepare reply carries it; the driver records it for every
-> store it hears from, a takeover driver included, and `MissedUpdateFinalizationAction` writes it into each
-> UnackedCommits entry (unknown only for a store that never answered the finalizing driver). A store applies T
+> serves, `RebuildingStore.finish` writes a fresh one before its `rebuild-complete` marker, a transfer carries it
+> with the archived directory, and an adoption takes over the device, the directory and its file unchanged. Every
+> prepare reply carries it; the driver records it for every store it hears from, a takeover driver included (a store
+> reporting two different incarnations is recorded as unknown), and `MissedUpdateFinalizationAction` writes it into each
+> UnackedCommits entry (unknown only for a store that never answered the finalizing driver, or that answered it with two). A store applies T
 > through an entry only when the entry names its own incarnation (`Frontend.unackedLookupComplete`, then
 > `Tx.unackedCommitFound`). Another or an unknown incarnation concludes T committed with nothing applied
 > (`Tx.unackedCommitNotOwed`), never as an abort, and the entry is left for the scan, whose exact reconcile heals the
@@ -403,8 +404,9 @@ G5. ErrorTree/UnackedCommits entry-key incarnation (X10) and the time-line of en
     *Why ErrorTree marks carry no incarnation.* A mark's writer has no authoritative incarnation (only a possibly stale
     cached `StoragePoolState`), and ignoring a mark it got wrong would leave a real miss unrepaired forever; an exact
     reconcile makes an inherited mark harmless.
-    *Transfers and adoptions* are not rebuilds: the archived directory carries the incarnation file, so the store keeps
-    its identity and keeps applying through its own entries.
+    *Transfers and adoptions* are not rebuilds: a transfer's archived directory carries the incarnation file, and an
+    adoption takes over the device with the directory unchanged, so the store keeps its identity and keeps applying
+    through its own entries.
 G6. Allocation-tree dependency: rebuild F10/F17, repair F5 and requirements F11 each mention an allocation recorded late or not at all, but nobody analyses the total effect (missing slice, stale deletion decision, replayed allocation) across rebuild, repair and horizon.
     *2026-11-14 (Todo 2.11): analysed.* A missing entry cannot occur: `TransactionBuilder.addAllocatingObject` adds
     the allocation action, and bootstrap lists what it creates (rebuild F17, closed). A late entry has three effects:

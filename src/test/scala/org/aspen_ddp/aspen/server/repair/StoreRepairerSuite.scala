@@ -960,6 +960,35 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     yield
       hasStub(2, txid) shouldBe false
 
+  test("a UnackedCommits entry whose delete the ownership fence refuses keeps the entry and the store's stub"):
+    // The pool moves store 2 to another host after the scan's first check, before the entry's delete, which re-checks
+    // (ownershipRecheck = Duration.Zero): the entry and its stub stay for the store's current copy
+    val target = new SeamTarget:
+      override def localDevice(storeId: StoreId): Option[StorageDeviceId] = net.smgr.localDevice(storeId)
+    val moved = new AtomicBoolean(false)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
+      txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
+      _ <- dropErrorEntries(2)
+      _ <- writeStub(2, txid)
+      poolState <- client.getStoragePoolState(sid(2).poolId)
+      owner = poolState.stores(sid(2).poolIndex)
+      repairer = StoreRepairer(client, target, Some(owner.hostId), ownershipRecheck = Duration.Zero,
+        testingOnlyBeforeReconcile = (_, _) =>
+          if moved.compareAndSet(false, true) then
+            movePoolEntry(sid(2), HostId(new UUID(5, 5)), owner.storageDeviceId)
+          else
+            Future.unit)
+      result <- pass(2, repairer, DeferralState())
+      remaining <- unackedEntries(2)
+    yield
+      moved.get shouldBe true
+      // The entry's object was reconciled, so only the fence kept its delete from running
+      storeKeys(2, kvPtr) shouldBe Set(k0)
+      result.repaired shouldBe 0
+      remaining shouldBe List(UnackedCommitEntry.key(sid(2), txid))
+      hasStub(2, txid) shouldBe true
+
   // Ruling 8: a stub may be written before its entry is durable (Ruling 7), so one scan finding no entry is not enough
   test("an orphan stub survives one scan and is dropped by the second"):
     val repairer = StoreRepairer(client, SeamTarget())

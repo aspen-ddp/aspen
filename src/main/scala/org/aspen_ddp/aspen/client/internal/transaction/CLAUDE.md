@@ -22,7 +22,8 @@
   that sent no TxCommitted (`FinalizationAction.commitVoters`; all stores that sent none when voters are unknown),
   in the ErrorTree batch. The entry's incarnation comes from `commitVoters`' `incarnations` map, which the driver fills
   from every prepare reply it got (promise or nack, any round, whether or not it counted votes; a reply without one
-  never erases a known value); a store that never answered the driver gets `None`. Value:
+  never erases a known value); a store that never answered the driver gets `None`, as does one that reported two
+  different incarnations (`TransactionDriver.recordIncarnation`: recorded as unknown for good). Value:
   `[timestamp:8][incarnation:16][count:4][pointers]`; the incarnation is the store's
   `StoreIncarnation` UUID, the zero UUID meaning `None` (unknown), copied into every chunk. `MissedUpdateFinalizationAction` runs last, so an entry durable means every other
   finalization action is done

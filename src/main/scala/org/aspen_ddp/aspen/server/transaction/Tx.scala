@@ -140,6 +140,12 @@ class Tx( trs: TransactionRecoveryState,
   /** See foundUnackedEntry */
   def provesCommitToItsDriver: Boolean = foundUnackedEntry && ofinalized.isEmpty
 
+  /** A recovered or expiring commit vote found an UnackedCommits entry naming another incarnation of this store, or
+    * none (unackedCommitNotOwed): T committed, and nothing of it is applied here (doCommit), as when the store holds an
+    * applied stub. It also sets foundUnackedEntry: the entry proves the commit to its driver all the same
+    */
+  private var notOwedHere = false
+
   /** Some UnackedCommits lookup of this Tx has been answered, finding the entry or not */
   private var unackedAnswered = false
 
@@ -249,14 +255,17 @@ class Tx( trs: TransactionRecoveryState,
         frontend.forget(this)
       case None => ()
 
-  /** ExpiryTally decided Discard for a Tx that applied T through its UnackedCommits entry (provesCommitToItsDriver):
+  /** ExpiryTally decided Discard for a Tx that learned T from its UnackedCommits entry (provesCommitToItsDriver):
     * no quorum holds T, so no TxFinalized will come, and T committed and was finalized (its entry is durable only once
     * every other finalization action is done). It concludes as a late commit does: finalized, an applied stub in place
-    * of its CRL state, and forgotten
+    * of its CRL state if it applied through the entry (none for an entry not owed here: notOwedHere), and forgotten
     */
   def concludeOwedCommit(): Unit =
     lateOutcome = true
-    logger.info(s"Tx $transactionId on store $storeId: applied from its UnackedCommits entry, and its peers can no " +
+    val how =
+      if notOwedHere then "committed by its UnackedCommits entry, nothing owed here"
+      else "applied from its UnackedCommits entry"
+    logger.info(s"Tx $transactionId on store $storeId: $how, and its peers can no " +
       s"longer decide it past the transaction horizon: concluded as finalized")
     finalized(true)
     frontend.forget(this)
@@ -778,9 +787,14 @@ class Tx( trs: TransactionRecoveryState,
     unlock()
 
     // An applied stub: the store already holds this transaction's update (or must never take it through its
-    // UnackedCommits entry), so nothing is applied again, as for a recovered commit vote whose entry was found
-    if frontend.hasAppliedStub(transactionId) then
-      logger.info(s"Tx $transactionId. Store $storeId holds an applied stub for it: nothing is applied again")
+    // UnackedCommits entry), so nothing is applied again, as for a recovered commit vote whose entry was found. A
+    // recovered vote whose entry names another incarnation, or none, applies nothing either (unackedCommitNotOwed)
+    if notOwedHere || frontend.hasAppliedStub(transactionId) then
+      if notOwedHere then
+        logger.info(s"Tx $transactionId. Store $storeId is owed nothing through its UnackedCommits entry: nothing " +
+          s"is applied")
+      else
+        logger.info(s"Tx $transactionId. Store $storeId holds an applied stub for it: nothing is applied again")
       pendingObjectCommits = 0
       issuedCommits = Set()
       // Reported as not committed here: a store holding a stub may never have seen the transaction (owed, no Tx), so
@@ -1283,21 +1297,31 @@ class Tx( trs: TransactionRecoveryState,
     * of the store (the one whose vote counted, lost to a rebuild since) or none (the driver never heard from this
     * store): T committed, and this incarnation is owed nothing through the entry. A replayed client prepare at a
     * rebuilt store, or at a store that never saw T, would otherwise apply T over newer state.
-    *
-    * A late commit of a transaction already applied here (lateCommit) writes its stub and is forgotten, as for a
-    * matching entry: a stub only ever suppresses an apply. Otherwise the entry is durable only after every other
-    * finalization action, so T is committed and finalized: the Tx concludes committed without applying anything,
-    * its locks and objects released and any held aborts dropped, never accepted. A held late commit at a store
-    * holding an applied stub applies nothing too, the stub unchanged. No stub is written. The entry is left for the
-    * repair scan, whose reconcile installs the committed state
+    *  - A late commit of a transaction already applied here (lateCommit's forget-lookup): it writes its stub and is
+    *    forgotten, as for a matching entry (unackedCommitFound): a stub only ever suppresses an apply.
+    *  - A held late commit, or a commit vote whose expiry Discard was decided: a real late outcome exists (T was
+    *    finalized), so it concludes committed and is forgotten without applying anything (applyNothing), its held
+    *    aborts dropped, never accepted. It writes no stub of its own (one already owed, stubDue, is still written).
+    *  - A recovered or expiring commit vote otherwise: T committed, but its finalization may not be complete (the
+    *    marker may still be writing other stores' entries, and no TxFinalized may have been sent). So, exactly as when
+    *    a matching entry is found, it resolves committed without recording anything in the host's status cache, its
+    *    held aborts dropped, never accepted, its locks released, and it stays until TxFinalized (or its heartbeat
+    *    driver, which the entry gives the proof, or expiry concludes it). Its commit applies nothing (notOwedHere),
+    *    reporting its objects in objectCommitErrors as the stub-held path does. No stub is due for it.
+    * The entry is left for the repair scan, whose reconcile installs the committed state
     */
   def unackedCommitNotOwed(): Unit =
     if forgetLookupHeld && ofinalized.isEmpty then
       unackedCommitFound()
-    else if lateCommitHeld && oresolution.isEmpty && frontend.hasAppliedStub(transactionId) then
+    else if (lateCommitHeld && oresolution.isEmpty) || (needsUnackedCheck && expiryDiscardDecided) then
       applyNothing(committed = true, finalMessage = true, late = true)
-    else if awaitsUnackedLookup then
-      applyNothing(committed = true, finalMessage = true, late = true)
+    else if needsUnackedCheck then
+      notOwedHere = true
+      heldAborts = Nil
+      updateLastEvent()
+      resolved(true, record = false)
+      // Its store's driver for it holds the proof (Store.driveTransaction), as for a matching entry
+      foundUnackedEntry = true
 
   /** A UnackedCommits lookup that counts found no entry. A held late commit applies nothing: this store is not owed it
     * (it applied the commit durably, or its vote did not count). Otherwise either the transaction did not commit, or

@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.server.DurableFiles
 import scribe.Logging
 
 import java.util.UUID
-import scala.util.Try
+import scala.util.{Failure, Success, Try}
 
 /** The store's durable identity: one UUID in the store directory's `incarnation` file. It survives restarts and
  *  transfers (the transfer archives the whole directory) and is replaced by `RebuildingStore.finish`, so a rebuilt
@@ -21,8 +21,15 @@ object StoreIncarnationFile extends Logging:
     else
       val file = backendPath / FileName
       val existing =
-        if os.exists(file) then Try(StoreIncarnation(UUID.fromString(os.read(file).trim))).toOption
-        else None
+        if os.exists(file) then
+          Try(StoreIncarnation(UUID.fromString(os.read(file).trim))) match
+            case Success(incarnation) => Some(incarnation)
+            case Failure(err) =>
+              logger.warn(s"Store $storeId: cannot read its incarnation file $file, replacing it with a fresh " +
+                s"incarnation: $err")
+              None
+        else
+          None
       existing.getOrElse:
         val created = writeFresh(backendPath)
         logger.info(s"Store $storeId has incarnation ${created.uuid}")

@@ -470,19 +470,28 @@ txStatus == Unresolved && oresolution.isEmpty`, for every transaction, not only 
   status cache (Ruling 12), and its driver starts holding a proof (Ruling 15, `Store.scala:108-110`). A later abort or late
   commit concludes it without applying again. *2026-11-14 (Todo 2.12):* this applies only to an entry naming this
   store's own incarnation (`Frontend.unackedLookupComplete` compares it with `Frontend.incarnation`).
-* (2026-11-14, Todo 2.12) Entry found naming another incarnation, or none (`Tx.unackedCommitNotOwed`), at a
-  recovered or expiring commit vote, or at a Tx holding a late commit: the Tx is forgotten at once, as committed,
-  finalized and late (`applyNothing`), unlike the matching path, which is kept until `TxFinalized`. It applies
-  nothing, writes no stub, drops its held aborts without accepting them, and releases its locks. Safe to forget early:
-  (1) the entry is durable only after every other finalization action of T is done (the marker runs last), so T is
-  committed and its finalization complete, and nothing waits on this Tx; (2) nothing was applied here, so there is no
-  local state for a later `TxFinalized` to conclude, and the entry is left for the repair scan, whose exact reconcile
-  installs the committed state; (3) the status cache now holds T as finalized Committed, so a later prepare of T (its
-  own driver's retransmit, a replay) is ignored rather than creating a fresh Tx, and past the cache window the forget
-  floor refuses it (paxos 10.10). The exception is a Tx that already applied T and is held for its lookup before
-  being forgotten (`forgetLookupHeld`, 5.4 case 3): it behaves as for an entry of its own incarnation
-  (`unackedCommitFound`), writing the applied stub and being forgotten. That is safe too, since a stub only ever
-  suppresses an apply.
+* (2026-11-14, Todo 2.12) Entry found naming another incarnation, or none (`Tx.unackedCommitNotOwed`): T committed
+  (an entry exists only for a committed T), but this incarnation is owed nothing through it. It applies nothing
+  through the entry, drops its held aborts without accepting them, and never writes a stub of its own. The entry is
+  left for the repair scan, whose exact reconcile installs the committed state. Three cases:
+  - A recovered or expiring commit vote with no held late commit and no expiry Discard decided: exactly as for a
+    matching entry, except that nothing is applied. It resolves committed without recording anything in the status
+    cache (`resolved(true, record = false)`), releases its locks, sets `foundUnackedEntry` (its store's driver holds
+    the proof) and is **not** forgotten: it waits for `TxFinalized`. Its commit applies nothing (`notOwedHere`, as
+    `doCommit` does for a store holding an applied stub) and its `TxCommitted` reports its objects in
+    `objectCommitErrors`. It cannot be forgotten early: an entry durable means only that the actions before the
+    marker completed, while the marker may still be writing other stores' entries and no `TxFinalized` may have been
+    sent; and a finalized status-cache entry here would let the finalized relay report T late to other stores, which
+    could then look up entries not yet durable (the ordering premise of `TransactionDriver.onResolution`). It ends as
+    a matching-entry Tx does: on `TxFinalized` from the original driver, from its own heartbeat driver (which holds
+    the proof, so it resolves on the peers' accepted commit and finalizes, or resolves late on a memoryless quorum and
+    finalizes at once), or from its relay, or by expiry (`concludeOwedCommit`, no stub).
+  - A held late commit, or a commit vote whose expiry Discard was decided: a real late outcome exists, so the Tx is
+    concluded as committed, finalized and late and forgotten at once (`applyNothing`). Its only stub is one already
+    owed (`stubDue`, from an owed-listing `TxFinalized`).
+  - A Tx that already applied T and is held for its lookup before being forgotten (`forgetLookupHeld`, 5.4 case 3):
+    it behaves as for an entry of its own incarnation (`unackedCommitFound`), writing the applied stub and being
+    forgotten. Safe, since a stub only ever suppresses an apply.
 * Entry absent: held aborts are accepted (`unackedCommitAbsent`, `Tx.scala:1032-1041`).
 * Lookup failure: retried at heartbeat; an unanswered one is re-issued after `UnackedLookupTimeout` (5 s)
   (`Frontend.scala:401-411`). The `Tx` holds aborts, its locks, and its driver, for as long as it takes (R-N3).

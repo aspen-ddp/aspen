@@ -110,11 +110,28 @@ abstract class TransactionDriver(
   protected var finalized: Boolean = false
   protected var peerDispositions: Map[StoreId, TransactionDisposition.Value] = Map()
 
-  /** The incarnation of every store heard from in any prepare reply, promise or nack, of any round. It cannot change
-    * within one transaction's voting (a rebuilt store is muted for every transaction started before its
-    * acceptorSince), so the latest wins, and a reply without one leaves a known value in place
+  /** The incarnation of every store heard from in any prepare reply, promise or nack, of any round. A reply without
+    * one leaves a known value in place. It should not change within one transaction's voting (a rebuilt store is muted
+    * for every transaction started before its acceptorSince), but that leans on the mute's clock assumptions: a store
+    * that reports two different incarnations is recorded as unknown instead (conflictedIncarnations), for good, so its
+    * entry names no incarnation and no incarnation of it applies through it
     */
   private var peerIncarnations: Map[StoreId, StoreIncarnation] = Map()
+
+  /** Stores that reported more than one incarnation: see peerIncarnations */
+  private var conflictedIncarnations: Set[StoreId] = Set()
+
+  /** Must hold the lock */
+  private def recordIncarnation(from: StoreId, inc: StoreIncarnation): Unit =
+    if !conflictedIncarnations.contains(from) then
+      peerIncarnations.get(from) match
+        case Some(known) if known != inc =>
+          logger.warn(s"Tx ${txd.transactionId} on store $storeId: store $from reported incarnations ${known.uuid} " +
+            s"and ${inc.uuid}: recorded as unknown")
+          peerIncarnations -= from
+          conflictedIncarnations += from
+        case _ =>
+          peerIncarnations += (from -> inc)
 
   protected var acceptedPeers: Set[StoreId] = Set[StoreId]()
   protected var finalizer: Option[TransactionFinalizer] = None
@@ -293,7 +310,7 @@ abstract class TransactionDriver(
     synchronized {
       logger.trace(s"Received PrepareResponse ${msg.transactionId} ProposalId: ${msg.proposalId} current ProposalId ${proposer.currentProposalId} from ${msg.from}. Disposition: ${msg.disposition}")
 
-      msg.incarnation.foreach(inc => peerIncarnations += (msg.from -> inc))
+      msg.incarnation.foreach(inc => recordIncarnation(msg.from, inc))
 
       if (msg.proposalId != proposer.currentProposalId)
         return
@@ -590,7 +607,8 @@ abstract class TransactionDriver(
     *    predates c and shows nothing of Q's acceptance. That quorum intersects the responding one, so some acceptor in
     *    Q forgot the transaction. An acceptor forgets a
     *    committed transaction only on TxFinalized, or on a late commit, which follows it (Tx.unackedCommitFound
-    *    applies an owed update but keeps the Tx until then); a rebuilt one is muted and does not answer. The mute
+    *    applies an owed update but keeps the Tx until then, as Tx.unackedCommitNotOwed does for a recovered vote,
+    *    applying nothing); a rebuilt one is muted and does not answer. The mute
     *    compares the client-chosen start timestamp with the rebuilt store's acceptor-since time, and holds because no
     *    store joins a transaction started more than Frontend.MaxStartLead ahead of its host's clock: residual, hosts'
     *    clocks skewed by more than RebuildingStore.AcceptorSinceMargin less that lead, or a zombie old copy. A prover
@@ -693,12 +711,13 @@ abstract class TransactionDriver(
     * actions other than the UnackedCommits marker already completed. A store forgets a committed transaction it voted on only on TxFinalized
     * (Frontend.receiveTransactionMessage via Tx.receiveFinalized), or on a late commit, which follows TxFinalized
     * (Tx.lateCommit). Finding its UnackedCommits entry (Tx.unackedCommitFound) applies the update but does not forget
-    * it. So everything the first finalizer to complete writes, in every pool, is durable before any voter forgets the
+    * it, nor does finding one of another incarnation (Tx.unackedCommitNotOwed), which applies nothing. So everything the first finalizer to complete writes, in every pool, is durable before any voter forgets the
     * transaction. A second driver finalized by its TxFinalized does not wait for its own cancelled mark: entries that
     * mark had already handed off may land after its TxFinalized, which lists their stores (Ruling 7); so may those of
     * this driver's own failed finalizers, whose stores its TxFinalized lists too (`failedHandedOff`). A
     * muted Tx (Frontend.forgetMuted) and a prover (Tx.proveCommitted) are dropped without TxFinalized, but neither
-    * voted commit. Tx.unackedCommitFound and Tx.proveCommitted record nothing in the host's status cache, so a
+    * voted commit. Tx.unackedCommitFound, Tx.unackedCommitNotOwed (for a recovered or expiring vote) and
+    * Tx.proveCommitted record nothing in the host's status cache, so a
     * finalized status, and the TxFinalized(late = true) a store relays from it, always stems from a real TxFinalized
     * or a late outcome.
     */

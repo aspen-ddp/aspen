@@ -6,6 +6,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
+import java.util.concurrent.LinkedBlockingQueue
 
 class StoreIncarnationFileSuite extends AnyFunSuite with Matchers:
   private val storeId = StoreId(PoolId(new UUID(1, 2)), 3.toByte)
@@ -23,9 +24,20 @@ class StoreIncarnationFileSuite extends AnyFunSuite with Matchers:
   test("an unreadable file is replaced by a fresh incarnation"):
     val dir = os.temp.dir()
     try
-      os.write.over(dir / StoreIncarnationFile.FileName, "not a uuid")
-      val fresh = StoreIncarnationFile.loadOrCreate(dir, storeId)
-      os.read(dir / StoreIncarnationFile.FileName).trim should be(fresh.uuid.toString)
+      val file = dir / StoreIncarnationFile.FileName
+      os.write.over(file, "not a uuid")
+      val lines = new LinkedBlockingQueue[(scribe.Level, String)]()
+      val handler = scribe.handler.LogHandler(scribe.Level.Info): r =>
+        val text = r.logOutput.plainText
+        if text.contains(file.toString) then
+          lines.add(r.level -> text)
+      scribe.Logger.root.withHandler(handler).replace()
+      val fresh =
+        try StoreIncarnationFile.loadOrCreate(dir, storeId)
+        finally scribe.Logger.root.withoutHandler(handler).replace()
+      // Replaced loudly, naming the file: the store loses its identity
+      lines.toArray(Array.empty[(scribe.Level, String)]).toList.map(_._1) should be(List(scribe.Level.Warn))
+      os.read(file).trim should be(fresh.uuid.toString)
       StoreIncarnationFile.loadOrCreate(dir, storeId) should be(fresh)
     finally os.remove.all(dir)
 

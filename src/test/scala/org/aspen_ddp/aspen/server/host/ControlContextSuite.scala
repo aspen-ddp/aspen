@@ -72,7 +72,8 @@ class ControlContextSuite extends AnyFunSuite with Matchers:
       offline = Set(offline, unserved),
       rebuilding = Set(rebuilding),
       transferringOut = Set(transferring),
-      devicePaths = Map())
+      devicePaths = Map(),
+      storeDevices = Map())
     view.repairable should be(Set(healthy))
     view.served should be(Set(healthy, offline, rebuilding, transferring))
     view.offline should be(Set(offline, unserved))

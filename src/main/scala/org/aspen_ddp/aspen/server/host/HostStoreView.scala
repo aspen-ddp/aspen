@@ -31,5 +31,5 @@ object HostStoreView:
          rebuilding: Set[StoreId],
          transferringOut: Set[StoreId],
          devicePaths: Map[StorageDeviceId, os.Path],
-         storeDevices: Map[StoreId, StorageDeviceId] = Map()): HostStoreView =
+         storeDevices: Map[StoreId, StorageDeviceId]): HostStoreView =
     HostStoreView(served, offline, served -- offline -- rebuilding -- transferringOut, devicePaths, storeDevices)

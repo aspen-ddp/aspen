@@ -2618,14 +2618,30 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lookup.requests.count(_ == unackedTxid) shouldBe 2
     lookup.answer(unackedTxid, Success(UnackedLookupResult.Found(None)))
 
-    // T committed and was finalized (its entry is durable only then), and nothing of it is applied here
+    // T committed, but its finalization may not be complete: the Tx resolves committed, applies nothing, and waits for
+    // TxFinalized, recording nothing in the status cache (as for a matching entry), its held abort never accepted
     kvKeys(backend) should contain (k(2))
-    committedMessages(net) shouldBe Nil
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid2)) // reported as not committed here
+    val tx = frontend.transactions(unackedTxid)
+    tx.status shouldBe TransactionStatus.Committed
+    tx.isFinalized shouldBe false
+    tx.provesCommitToItsDriver shouldBe true
+    tx.awaitsUnackedLookup shouldBe false
+    tx.holdsLocks shouldBe false
+    crl.deleted should not contain (unackedTxid)
+    crl.stubsSaved shouldBe Nil
+    statusCache.getStatus(unackedTxid) shouldBe
+      Some(TransactionStatusCache.Entry(TransactionStatus.Unresolved, finalized = false, late = false))
+    lockedWriteTransactions(frontend, net, kvPtr) should not contain (unackedTxid)
+
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false,
+      owed = Set()))
     frontend.transactions.contains(unackedTxid) shouldBe false
+    kvKeys(backend) should contain (k(2))
     crl.stubsSaved shouldBe Nil
     crl.deleted should contain (unackedTxid)
-    statusCache.getStatus(unackedTxid).map(_.status) shouldBe Some(TransactionStatus.Committed)
-    lockedWriteTransactions(frontend, net, kvPtr) should not contain (unackedTxid)
+    statusCache.getStatus(unackedTxid) shouldBe
+      Some(TransactionStatusCache.Entry(TransactionStatus.Committed, finalized = true, late = false))
   }
 
   test("a held TxFinalized abort is not replaced by a later held TxResolved, so the Tx is forgotten once accepted") {
@@ -4870,8 +4886,11 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       statusResponses(net).map(_.status) shouldBe List(None)
   }
 
-  test("a recovered commit vote applied from its entry concludes as finalized once its peers can no longer decide T") {
-    // Its TxFinalized never comes: every peer forgot T. Applied from its UnackedCommits entry, it waits for nothing else
+  /** A recovered commit vote whose lookup answers `found` (`None`: its own incarnation) never gets its TxFinalized:
+    * every peer forgot T. Having learned T from its UnackedCommits entry, it waits for nothing else, and concludes as
+    * finalized once its peers can no longer decide T. Returns the backend and the CRL
+    */
+  private def entryCommitConcludesAtExpiry(found: Option[Option[StoreIncarnation]]): (MapBackend, TestCrl) =
     val clock = new TestClock(floorNow)
     val statusCache = new TransactionStatusCache(wallClockMillis = () => clock.now)
     val backend = new MapBackend(storeId)
@@ -4890,8 +4909,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       wallClockMillis = () => clock.now, horizon = FiniteDuration(20, SECONDS), loadedAt = Some(floorNow))
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
-    lookup.answer(txid1, lookup.own)
-    kvKeys(backend) should not contain k(2)
+    lookup.answer(txid1, found.fold(lookup.own)(inc => Success(UnackedLookupResult.Found(inc))))
     frontend.transactions(txid1).provesCommitToItsDriver shouldBe true
 
     passHorizon(clock)
@@ -4903,10 +4921,23 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     reply(frontend, net, peer2, None)
 
     frontend.transactions.contains(txid1) shouldBe false
-    crl.stubsSaved should contain (txid1)
     lookup.requests shouldBe List(txid1) // The entry was already found
     statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
       finalized = true, late = true))
+    (backend, crl)
+
+  test("a recovered commit vote applied from its entry concludes as finalized once its peers can no longer decide T") {
+    val (backend, crl) = entryCommitConcludesAtExpiry(None)
+    kvKeys(backend) should not contain k(2)
+    crl.stubsSaved should contain (txid1)
+  }
+
+  test("a recovered commit vote whose entry names no incarnation concludes as finalized, applying nothing, once its " +
+    "peers can no longer decide T") {
+    val (backend, crl) = entryCommitConcludesAtExpiry(Some(None))
+    kvKeys(backend) should contain (k(2))
+    crl.stubsSaved shouldBe Nil
+    crl.deleted should contain (txid1)
   }
 
   // ---- Expiry of a Tx that knows its outcome but missed its TxFinalized ----

@@ -66,11 +66,16 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - The apply decision (`Frontend.unackedLookupComplete`; the lookup answers `UnackedLookupResult.Absent` or
   `Found(incarnation)`, `Host.unackedLookup` decoding the entry): only `Found(Some(own))`, naming
   `Frontend.incarnation`, applies through the entry (`Tx.unackedCommitFound`). `Found` of another incarnation (a
-  rebuilt store, Rebuild N3) or `None` (the driver never heard from the store) logs both at info and calls
-  `Tx.unackedCommitNotOwed`: T committed and was finalized, so the Tx concludes committed with nothing applied
-  (`applyNothing`), held aborts dropped and never accepted, no stub written; a forget-lookup (`forgetLookupHeld`,
-  T already applied here) writes its stub as for any found entry. A found entry of any incarnation is never taken
-  as absent. The entry is left for the repair scan, whose reconcile installs the committed state
+  rebuilt store, Rebuild N3) or `None` (the driver never heard from the store, or heard two incarnations from it)
+  logs both at info and calls `Tx.unackedCommitNotOwed`: T committed, and nothing is applied through the entry, held
+  aborts dropped and never accepted. A recovered or expiring commit vote does as for a matching entry, applying
+  nothing (`notOwedHere`, as with an applied stub: its objects in `objectCommitErrors`): it resolves committed,
+  records nothing in the status cache, proves the commit to its driver and stays until TxFinalized, since T's
+  finalization may still be running (the marker writing other stores' entries). A held late commit, or a vote whose
+  expiry Discard was decided, concludes at once (`applyNothing`, a real late outcome exists). Neither writes a stub of
+  its own (`applyNothing` still writes one already owed: `stubDue`). A forget-lookup (`forgetLookupHeld`, T already
+  applied here) writes its stub as for any found entry. A found entry of any incarnation is never taken as absent.
+  The entry is left for the repair scan, whose reconcile installs the committed state
 - A recovered Tx whose saved status is resolved (re-saved by a prepare or accept after the resolution) restores it
   into `oresolution`. It takes no locks and needs no lookup: once its objects load it applies the commit with the
   recovered re-check rules, or deletes the abort's state, then waits for TxFinalized as a live resolved Tx does

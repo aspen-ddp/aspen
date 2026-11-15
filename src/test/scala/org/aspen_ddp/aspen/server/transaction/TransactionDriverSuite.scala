@@ -676,6 +676,25 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     finalizer.incarnations should be (Some(Map(ds0 -> inc0)))
   }
 
+  test("a store that reports two different incarnations is recorded as unknown") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val finalizer = new TFinalizer(false)
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), finalizer, _ => ())
+    val inc0 = StoreIncarnation(new java.util.UUID(4, 0))
+    val inc0b = StoreIncarnation(new java.util.UUID(4, 1))
+    val inc1 = StoreIncarnation(new java.util.UUID(4, 2))
+
+    // ds0 reports two incarnations, then the first again: once conflicted, it stays unknown
+    for (from, inc) <- List(ds0 -> inc0, ds1 -> inc1, ds0 -> inc0b, ds0 -> inc0) do
+      driver.receiveTxPrepareResponse(TxPrepareResponse(ds0, from, txd.transactionId,
+        Right(TxPrepareResponse.Promise(None)), ProposalId(1, 0), TransactionDisposition.VoteCommit, Nil, Some(inc)))
+    driver.receiveTxResolved(org.aspen_ddp.aspen.common.network.TxResolved(ds0, ds1, txd.transactionId,
+      committed = true, late = false, proof = false))
+
+    finalizer.created should be (true)
+    finalizer.incarnations should be (Some(Map(ds1 -> inc1)))
+  }
+
   test("Simple AcceptResponse Handling - Ignore invalid acceptor") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val prep = mkprep(1, 0, 0, txd)

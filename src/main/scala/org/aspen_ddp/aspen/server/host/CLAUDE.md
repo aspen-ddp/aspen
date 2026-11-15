@@ -43,7 +43,8 @@
   with no locks. Rules (scaladoc of `HostThreading.scala`): the only `given ExecutionContext` is the control context;
   never block the control thread on a Future; other threads read control state only through the `@volatile`
   `HostStoreView` (an immutable snapshot the control thread republishes on every change: `containsStore`,
-  `getStoreIds`, `getDevicePath`, `isRepairable`) or the router's concurrent map
+  `getStoreIds`, `getDevicePath`, `isRepairable`, `storeDevices`: the device each served store is loaded from, read by
+  `Host.localDevice` for the repair fence's `RepairTarget.localDevice`) or the router's concurrent map
   (`hasTransactions`, `logTransactionStatus`); store and control state stay apart: control posts store work to the
   executor (`StoreRouter.onStore`) and gets results back through a Future whose callbacks name the control context
 - Callbacks name the control context. Work run elsewhere (backend opens, client transactions on the host's `ec`) names

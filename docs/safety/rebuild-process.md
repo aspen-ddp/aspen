@@ -923,7 +923,8 @@ residual is host clock skew beyond 8 s, and the missing store incarnation on ent
 *2026-11-14 (Todo 2.12): FIXED.* The apply no longer rests on the mute or on any clock. Each store directory keeps an
 `incarnation` UUID (`StoreIncarnationFile`), and `RebuildingStore.finish` writes a fresh one before the
 `rebuild-complete` marker, so a rebuilt store never shares its predecessor's. Each UnackedCommits entry records the
-incarnation of the counted voter (`MissedUpdateFinalizationAction`, from the prepare replies the driver heard), and a
+incarnation of the counted voter (`MissedUpdateFinalizationAction`, from the prepare replies the driver heard; a store
+that reported two different incarnations is recorded as unknown, so the entry does not lean on the mute either), and a
 store applies T through an entry only when the entry names its own (`Frontend.unackedLookupComplete`). The replay
 below therefore finds an entry naming the old incarnation and concludes T committed with nothing applied
 (`Tx.unackedCommitNotOwed`); the entry's reconcile then installs the committed state exactly. Residual for the apply:

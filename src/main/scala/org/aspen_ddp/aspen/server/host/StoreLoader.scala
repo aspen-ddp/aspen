@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.server.Host.{BackendFailed, BackendOpened, LoadStore,
   SpaceWait, StoreFailedOnClose, UnloadFailedStore}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.server.store.Store
+import org.aspen_ddp.aspen.server.store.{Store, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendStateLost}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -356,6 +356,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited),
                 ctx.unackedLookup, Some(router.post(backend.storeId)),
                 RebuildingStore.readAcceptorSince(backend.path),
+                incarnationOverride = Some(StoreIncarnationFile.loadOrCreate(backend.path, storeId)),
                 // Its backend's completion handler is set below, after the Store is built: recovered transactions read
                 // their objects once it is installed (awaitCrlLoad)
                 deferRecovery = true,

@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Metadata, 
   ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription,
   TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
@@ -23,7 +23,7 @@ import org.aspen_ddp.aspen.server.crl.simple.{Recovery, SimpleCRL}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome,
   TransferOutcome}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
-import org.aspen_ddp.aspen.server.store.Frontend
+import org.aspen_ddp.aspen.server.store.{Frontend, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, DefaultBackendOpener, RocksDBConfig}
 import org.aspen_ddp.aspen.server.RecordingRebuildFactory
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
@@ -1032,6 +1032,27 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     yield
       loaded should be(Some(since))
       reloaded should be(None)
+
+  atest("a store keeps its incarnation across a restart"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      first = host.control.router.loaded(storeId).frontend.incarnation
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = factory.shutdownAll()
+      second = newFactory()
+      restarted = newCrlHost(hostRoot, second)
+      _ <- pumpUntil(restarted, restarted.control.router.loaded.contains(storeId))
+      reloaded = restarted.control.router.loaded(storeId).frontend.incarnation
+      _ <- restarted.control.router.loaded(storeId).backend.close()
+      _ = second.shutdownAll()
+    yield
+      os.exists(storeDir / StoreIncarnationFile.FileName) should be(true)
+      reloaded should be(first)
+      first should not be StoreIncarnation.default(storeId)
 
   atest("a network transfer out of an unloaded store ships its device-CRL entries in its crl_save.log"):
     given ExecutionContext = executionContext

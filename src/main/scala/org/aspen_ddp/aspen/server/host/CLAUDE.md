@@ -25,6 +25,8 @@
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
   install and after close the backend and directory belong to the control side, which otherwise reads only
   `storeId`, `path`, `crlSaveFile` and the thread-safe `hasFailed`/`isWriteFrozen`. `release` frees the slot
+- Store identity: `StoreLoader` passes `StoreIncarnationFile.loadOrCreate(backend.path, storeId)` to the Store, creating
+  the `incarnation` file on first load (`server/store/CLAUDE.md`)
 - Load time and the forget floor (`server/store/CLAUDE.md`): every Store `StoreLoader` builds records its load
   (`Frontend.loadedAt`), so after a restart, adoption or transfer in it refuses, for good, each transaction it does
   not hold that started before the load plus `MaxStartLead`. A store that arrived from another host had joined by that

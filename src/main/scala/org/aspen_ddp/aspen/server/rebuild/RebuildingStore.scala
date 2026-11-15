@@ -12,6 +12,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.PendingAllocation
 import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId}
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
+import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost}
 import scribe.Logging
 
@@ -661,6 +662,8 @@ class RebuildingStore(client: AspenClient,
       RebuildState.removeAll(stagingPath)
       // The rebuilt store has no Paxos state: it takes no part in transactions started before now (plus the margin)
       writeAcceptorSince(stagingPath)
+      // A new life for the store, replacing any incarnation the staging directory carried
+      StoreIncarnationFile.writeFresh(stagingPath)
       // Last before the move: the directory is a finished rebuild, kept out of service until its flip commits
       DurableFiles.write(stagingPath / RebuildCompleteMarkerFile, "")
 

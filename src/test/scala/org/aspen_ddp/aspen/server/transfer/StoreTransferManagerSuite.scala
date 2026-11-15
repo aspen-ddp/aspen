@@ -130,6 +130,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
 
   private def mkTree(dir: os.Path): Unit =
     os.write(dir / "a", bigFile)
+    os.write(dir / "incarnation", "source-incarnation")
     os.write(dir / "sub" / "b", "hello", createFolders = true)
     os.makeDir.all(dir / "sub" / "empty")
 
@@ -267,6 +268,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     s.close()
     await(f).isSuccess should be(true)
     assertExtracted(dest / sid.directoryName)
+    os.read(dest / sid.directoryName / "incarnation") should be("source-incarnation")
 
   test("existing destination store directory is replaced"):
     val m = newManager()

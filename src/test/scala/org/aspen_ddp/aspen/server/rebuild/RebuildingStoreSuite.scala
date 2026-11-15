@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectId, 
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
+import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, DefaultBackendOpener}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.BufferedConsistentRocksDB
 
@@ -339,6 +340,22 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // At least the margin past the start of the rebuild, and no more than the margin past its end
       (since.get - before) should be >= RebuildingStore.AcceptorSinceMargin.asInstanceOf[scala.concurrent.duration.Duration]
       (since.get - after) should be <= RebuildingStore.AcceptorSinceMargin.asInstanceOf[scala.concurrent.duration.Duration]
+
+  atest("a rebuild gives the store a fresh incarnation"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val seeded = "00000000-0000-0000-0000-00000000abcd"
+    os.write.over(dev / RebuildingStore.RebuildDirectory / storeId.directoryName / StoreIncarnationFile.FileName, seeded,
+      createFolders = true)
+    for
+      _ <- populate(3)
+      _ <- net.waitForTransactionsToComplete()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends)
+      _ <- rebuild.complete
+    yield
+      val written = os.read(dev / storeId.directoryName / StoreIncarnationFile.FileName).trim
+      written should not be seeded
+      Try(UUID.fromString(written)).isSuccess should be(true)
 
   atest("an unreadable acceptor-since file reads as now plus the margin, and an absent one as none"):
     given ExecutionContext = executionContext

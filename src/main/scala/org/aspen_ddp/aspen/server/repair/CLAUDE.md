@@ -39,6 +39,10 @@
   therefore healed within about one cap interval (Backlog.txt "Bootstrap tree sweep staleness window"). While the
   bootstrap pool is unreadable, a bootstrap store's scan and sweep each run to their 90 s deadline, so it holds a scan
   slot most of each floor interval (spec-mandated)
+- `StoreRepairer.verifyObject` (through `RepairService.verifyObject`, `VerifyDeadline` 30 s) verifies an object a
+  store quarantined (`server/store/CLAUDE.md`, Quarantine): `repairUpdate` with the quarantining transaction's start as
+  `minTimestamp`, proofs allowed, keyed `verifyDeferralKey` (prefix 3, kept by `DeferralState.retain`). It reads and
+  deletes no entry, so the ownership fence and `mayJoinTransaction` do not apply. `complete` clears the quarantine
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
 - Absence from the AllocationTree is not a deletion (repair F5): it may be an AllocationFinalizationAction running

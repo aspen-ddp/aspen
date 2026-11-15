@@ -106,10 +106,12 @@ final class DeferralState:
     entries.get(entryKey).flatMap(_.only)
 
   /** Forgets every entry not in `entryKeys`: those a completed scan did not see are gone or were rewritten. Sweep keys
-    * (StoreRepairer.sweepDeferralKey) are kept: they belong to the sweep, which prunes them with `retainSweep`
+    * (StoreRepairer.sweepDeferralKey) are kept: they belong to the sweep, which prunes them with `retainSweep`. So are
+    * verification keys (verifyDeferralKey), which a complete verification clears
     */
   private[repair] def retain(entryKeys: Set[Key]): Unit = synchronized:
-    entries = entries.filter((k, _) => StoreRepairer.isSweepDeferralKey(k) || entryKeys.contains(k))
+    entries = entries.filter((k, _) =>
+      StoreRepairer.isSweepDeferralKey(k) || StoreRepairer.isVerifyDeferralKey(k) || entryKeys.contains(k))
 
   /** Forgets every sweep key not in `sweepKeys`: the nodes a complete sweep did not visit are gone */
   private[repair] def retainSweep(sweepKeys: Set[Key]): Unit = synchronized:
@@ -242,6 +244,17 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * incomplete, not as a failure of the sweep. Once the store stops being repairable here the remaining nodes are
     * skipped and counted incomplete.
     */
+  /** Verifies a quarantined object (Frontend.quarantine, QuarantineVerifier): reconciles the store's copy with a read of
+    * it as repairUpdate does for an entry whose update started at `minTimestamp`, with proofs after lock deferrals.
+    * `complete` means the store's copy now matches a read no older than `minTimestamp`, exactly what an entry needs to
+    * be dropped. No entry is read or deleted, so the scan fence and mayJoinTransaction do not apply: the reconcile is an
+    * ordinary repair install and changes only this copy
+    */
+  def verifyObject(storeId: StoreId, ptr: ObjectPointer, minTimestamp: HLCTimestamp, policy: RepairPolicy,
+                   deferral: DeferralState): Future[ReconcileResult] =
+    repairUpdate(storeId, ptr, minTimestamp, StoreRepairer.verifyDeferralKey(ptr.id), policy, deferral,
+      allowProof = true)
+
   def sweepBootstrapTrees(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState): Future[SweepResult] =
     if storeId.poolId != PoolId.BootstrapPoolId then
       Future.failed(new IllegalArgumentException(s"Only stores of the bootstrap pool are swept, not $storeId"))
@@ -710,6 +723,12 @@ object StoreRepairer:
     Key(Array[Byte](2) ++ nodeId.toBytes)
 
   private[repair] def isSweepDeferralKey(key: Key): Boolean = key.bytes.nonEmpty && key.bytes(0) == 2
+
+  /** The DeferralState key of a quarantined object's verification (verifyObject) */
+  private[repair] def verifyDeferralKey(objectId: ObjectId): Key =
+    Key(Array[Byte](3) ++ objectId.toBytes)
+
+  private[repair] def isVerifyDeferralKey(key: Key): Boolean = key.bytes.nonEmpty && key.bytes(0) == 3
 
   /** Decodes the ObjectId from an errorTree key: one poolIndex byte then the UUID, big-endian. */
   private[repair] def decodeObjectId(key: Key): ObjectId =

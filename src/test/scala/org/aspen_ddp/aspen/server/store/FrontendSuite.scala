@@ -100,6 +100,17 @@ object FrontendSuite {
     /** No entry */
     def absent: Try[UnackedLookupResult] = Success(UnackedLookupResult.Absent)
 
+  /** Records quarantine verifications and answers them when the test says */
+  class ManualVerifier extends QuarantineVerifier:
+    var made: List[(ObjectId, HLCTimestamp)] = Nil
+    private var answers: List[Try[Boolean] => Unit] = Nil
+    def verify(storeId: StoreId, pointer: ObjectPointer, minTimestamp: HLCTimestamp,
+               answer: Try[Boolean] => Unit): Unit =
+      made = made :+ (pointer.id -> minTimestamp)
+      answers = answers :+ answer
+    /** Answers the latest verification */
+    def answer(result: Try[Boolean]): Unit = answers.last(result)
+
   class TestCrl extends CrashRecoveryLog {
 
     var txSaved = false
@@ -2009,7 +2020,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
                     txd: TransactionDescription = lockTxd(txid1, List(overwrite(op1))),
                     status: TransactionStatus.Value = TransactionStatus.Unresolved,
                     updates: List[ObjectUpdate] = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))),
-                    crl: TestCrl = new TestCrl)
+                    crl: TestCrl = new TestCrl,
+                    verifier: QuarantineVerifier = QuarantineVerifier.Never)
       : (Frontend, TestNet, () => List[Throwable]) =
     val backend = new MapBackend(storeId):
       private var failNext = readError
@@ -2031,8 +2043,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     var stops = List[Throwable]()
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
-      unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded, deferRecovery = true,
-      onFailStop = err => stops = stops :+ err)
+      unackedLookup = lookup, quarantineVerifier = verifier, loadedAt = FrontendSuite.longLoaded,
+      deferRecovery = true, onFailStop = err => stops = stops :+ err)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     frontend.recover(StoreRecoveryState(List(trs), Set()))
@@ -2063,13 +2075,70 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     net.clientMessage().isDefined shouldBe true
   }
 
-  test("a recovered commit vote whose update a later transaction superseded applies nothing and does not fail-stop") {
+  /** A recovered commit vote of txid1 (overwrite op1 at rev0) whose re-check fails: the store holds op1 at txid2's
+    * revision. Either txid2 superseded txid1's update before the crash, or the state was invalidated under txid1's locks:
+    * the store cannot tell, so op1 is quarantined once txid1 resolves committed
+    */
+  def quarantinedVote(): (Frontend, TestNet, TestCrl, ManualVerifier, () => List[Throwable]) =
     val later = mkObjectState(oid1)
     later.metadata = later.metadata.copy(revision = ObjectRevision(txid2))
-    val (frontend, net, stops) = recoveredVote(later)
+    val crl = new TestCrl
+    val verifier = new ManualVerifier
+    val (frontend, net, stops) = recoveredVote(later, crl = crl, verifier = verifier)
     frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+    (frontend, net, crl, verifier, stops)
+
+  test("a recovered commit vote whose apply re-check fails quarantines the object rather than count with neither " +
+       "its lock nor its update (Req F5, Todo 2.16)") {
+    val (frontend, net, crl, verifier, stops) = quarantinedVote()
     committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
     stops() shouldBe Nil
+    frontend.failStopped shouldBe false
+    frontend.isQuarantined(oid1) shouldBe true
+    verifier.made.map(_._1) shouldBe List(oid1)
+    // Its object data stays: a reloaded store recovers the transaction and quarantines again
+    crl.dropped shouldBe Nil
+
+    // Before the fix this voted commit: with txid1's lock gone and its update possibly never applied, a transaction
+    // built on the store's state could commit beside txid1
+    prepare(frontend, net, lockTxd(txid3, List(overwriteAfter(txid2)))).disposition shouldBe
+      TransactionDisposition.VoteAbort
+  }
+
+  test("a quarantine clears once repair verifies the object, and the CRL state it kept is then concluded") {
+    val (frontend, net, crl, verifier, stops) = quarantinedVote()
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set()))
+    frontend.transactions.contains(txid1) shouldBe false
+    // Kept: the quarantine lives in memory only, and the CRL state is what quarantines again after a crash
+    crl.deleted shouldBe Nil
+
+    // Not complete: retried after 1 heartbeat, then 2
+    verifier.answer(Success(false))
+    frontend.isQuarantined(oid1) shouldBe true
+    frontend.retryQuarantineVerifications()
+    verifier.made.size shouldBe 2
+    verifier.answer(Failure(new Exception("read failed")))
+    frontend.retryQuarantineVerifications()
+    verifier.made.size shouldBe 2
+    frontend.retryQuarantineVerifications()
+    verifier.made.size shouldBe 3
+
+    verifier.answer(Success(true))
+    frontend.isQuarantined(oid1) shouldBe false
+    crl.deleted shouldBe List(txid1)
+    stops() shouldBe Nil
+    prepare(frontend, net, lockTxd(txid3, List(overwriteAfter(txid2)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+  }
+
+  test("a transaction committed by other stores' votes applies nothing to a quarantined object and reports it") {
+    val (frontend, net, _, _, stops) = quarantinedVote()
+    prepare(frontend, net, lockTxd(txid3, List(overwriteAfter(txid2)))).disposition shouldBe
+      TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid3, committed = true)
+    committedMessages(net).filter(_.transactionId == txid3).map(_.objectCommitErrors) shouldBe List(List(oid1))
+    stops() shouldBe Nil
+    frontend.isQuarantined(oid1) shouldBe true
   }
 
   test("a commit vote recovered with a persisted Committed status applies its update on load (R-F6)") {
@@ -2587,7 +2656,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   /** A Frontend recovering T, a commit vote of `reqs` deleting key 2 of kvPtr, with its lookups made through `lookup` */
   private def unackedFixture(reqs: List[TransactionRequirement] = List(deleteK2),
                              statusCache: TransactionStatusCache = new TransactionStatusCache(),
-                             stubs: Set[TransactionId] = Set())
+                             stubs: Set[TransactionId] = Set(),
+                             verifier: QuarantineVerifier = QuarantineVerifier.Never)
       : (Frontend, MapBackend, TestNet, TestCrl, ManualLookup) =
     val backend = new MapBackend(storeId)
     populate(backend)
@@ -2603,7 +2673,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       override def getAppliedStubs(storeId: StoreId): Set[TransactionId] = stubs
     val net = new TestNet
     val lookup = new ManualLookup
-    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
+    val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup,
+      quarantineVerifier = verifier, loadedAt = FrontendSuite.longLoaded)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, backend, net, crl, lookup)
@@ -2809,18 +2880,25 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lockedWriteTransactions(frontend, net, kvPtr) should contain (unackedTxid)
   }
 
-  test("an object whose requirements fail on the UnackedCommits local apply is skipped and the Tx still completes") {
+  test("an object whose requirements fail on the UnackedCommits local apply is quarantined and the Tx still completes") {
     // The store's key 2 is at a different revision than T requires
     val stale = KeyValueUpdate(kvPtr, None, None,
       List(KeyValueUpdate.KeyRevision(k(2), new ObjectRevision(new UUID(0, 41)))), deletesKeys = true)
-    val (frontend, backend, _, crl, lookup) = unackedFixture(List(stale))
+    val verifier = new ManualVerifier
+    val (frontend, backend, _, crl, lookup) = unackedFixture(List(stale), verifier = verifier)
 
     lookup.answer(unackedTxid, lookup.own)
 
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
     kvKeys(backend) should contain (k(2))
+    frontend.isQuarantined(oid2) shouldBe true
     frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false, owed = Set()))
     frontend.transactions.contains(unackedTxid) shouldBe false
+    // The store may not hold T's update: its state, not a stub, stays until repair verifies the object
+    crl.stubsSaved shouldBe Nil
+    crl.deleted shouldBe Nil
+    verifier.answer(Success(true))
+    frontend.isQuarantined(oid2) shouldBe false
     crl.stubsSaved should contain (unackedTxid) // An applied stub replaces its state (replay-pins addendum A)
   }
 

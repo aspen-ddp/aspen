@@ -1,7 +1,9 @@
 package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, runBoundedParallel}
@@ -16,6 +18,10 @@ case class ScanTimedOut(storeId: StoreId, after: Duration)
 
 case class SweepTimedOut(storeId: StoreId, after: Duration)
   extends Exception(s"Repair sweep of $storeId did not complete within $after")
+
+case class VerifyTimedOut(storeId: StoreId, objectId: ObjectId)
+  extends Exception(s"Verification of quarantined object $objectId on $storeId did not complete within " +
+    s"${RepairService.VerifyDeadline}")
 
 case class MetadataReadTimedOut(what: String, after: Duration)
   extends Exception(s"Repair metadata read for $what did not complete within $after")
@@ -62,6 +68,15 @@ class RepairService(client: AspenClient,
     */
   protected def sweepStore(storeId: StoreId, policy: RepairPolicy): Future[SweepResult] =
     repairer.sweepBootstrapTrees(storeId, policy, deferralOf(storeId))
+
+  /** Verifies a quarantined object of a store (StoreRepairer.verifyObject): true once the store's copy matches a read at
+    * least `minTimestamp`. Bounded by VerifyDeadline, since a read of an unavailable object never settles
+    */
+  def verifyObject(storeId: StoreId, ptr: ObjectPointer, minTimestamp: HLCTimestamp): Future[Boolean] =
+    withDeadline(VerifyDeadline, VerifyTimedOut(storeId, ptr.id)):
+      Future.unit.flatMap: _ =>
+        repairer.verifyObject(storeId, ptr, minTimestamp, policyOf(storeId.poolId), deferralOf(storeId))
+          .map(_.complete)
 
   /** Overridable so the sweep deadline can be tested without waiting for it. */
   protected def sweepDeadline: FiniteDuration = SweepDeadline
@@ -273,6 +288,9 @@ object RepairService:
     * sweep counts as needing another pass and the next one starts from the beginning.
     */
   val SweepDeadline: FiniteDuration = FiniteDuration(90, SECONDS)
+
+  /** A quarantined object's verification (verifyObject) reads one object; a cut-off one is retried by its store */
+  val VerifyDeadline: FiniteDuration = FiniteDuration(30, SECONDS)
 
   /** Metadata reads are advisory -- the fallback is a cached or default policy, which is cheap
     * and correct -- so they get a far tighter bound than a scan. Long enough to ride out ordinary

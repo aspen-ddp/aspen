@@ -65,6 +65,9 @@ object Frontend {
   /** The most store heartbeats between an expiring Tx's status queries: they start one heartbeat apart and double */
   val MaxExpiryQueryInterval: Int = 8
 
+  /** The most store heartbeats between retries of a quarantined object's verification (Frontend.quarantine) */
+  val MaxQuarantineRetryInterval: Int = 60
+
   /** How often, at most, a store warns of a client prepare it refuses (refusePrepare). While a status cache eviction's
     * watermark is the binding part of the floor, every client prepare is refused
     */
@@ -97,6 +100,8 @@ class Frontend(val storeId: StoreId,
                val admission: CrlAdmission = CrlAdmission.Unlimited,
                /** Looks up recovered commit votes in the pool's UnackedCommits tree: see requestUnackedLookup */
                val unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
+               /** Verifies quarantined objects through repair: see quarantine */
+               val quarantineVerifier: QuarantineVerifier = QuarantineVerifier.Never,
                /** Runs a task on this store's executor: how completions arriving on other threads, such as a repair's
                  * backend write, get back to the Frontend's state. Inline by default, for tests with synchronous
                  * backends
@@ -289,6 +294,111 @@ class Frontend(val storeId: StoreId,
     * whose writes are frozen (Tx.objectLoadFailed), which must keep serving rather than fail-stop
     */
   def poisonObject(oid: ObjectId): Unit = failedCommits += oid
+
+  // ---- Quarantine (transaction-requirements F5 residual, Todo 2.16) ----
+
+  /** A quarantined object: see quarantine.
+    *
+    * @param minTimestamp the latest start of the transactions that quarantined it: a verification must read the object
+    *                     at least this new
+    * @param txids        the transactions whose CRL state the quarantine keeps
+    * @param attempt      identifies the latest verification: an answer to an older one is ignored
+    * @param countdown    store heartbeats until the next verification, while none is outstanding
+    * @param interval     heartbeats between the next failed verification and the one after it, doubling to
+    *                     MaxQuarantineRetryInterval
+    */
+  private final class Quarantine(val pointer: ObjectPointer, var minTimestamp: HLCTimestamp,
+                                 var txids: Set[TransactionId], var attempt: Long, var inFlight: Boolean,
+                                 var countdown: Int, var interval: Int, var failures: Int)
+  private val quarantined = scala.collection.mutable.HashMap[ObjectId, Quarantine]()
+
+  /** Finalized transactions whose CRL state a quarantine keeps (concludeTransactionState), and whether an applied stub
+    * is owed: concluded once no quarantine names them
+    */
+  private val quarantinedConclusions = scala.collection.mutable.HashMap[TransactionId, Boolean]()
+
+  /** The object is quarantined: every transaction on it votes abort (ObjectQuarantined) and a committed one applies
+    * nothing to it, until repair verifies the store's copy
+    */
+  def isQuarantined(oid: ObjectId): Boolean = quarantined.contains(oid)
+
+  /** Quarantines placed by this Frontend (quarantine), for tests that cannot observe one before its verification clears
+    * it
+    */
+  @volatile private[aspen] var testingOnlyQuarantines: Int = 0
+
+  /** Quarantines an object a recovered commit vote could not apply its committed update to (Tx.issueCommits). Before
+    * the crash the store may have applied it and a later transaction superseded it, or the state may have been
+    * invalidated under the recovered locks: the vote then counts with neither its lock nor its update. The store does
+    * not tell these apart. Every transaction on the object votes abort, as the lock would have made it, and committed
+    * ones apply nothing to it (reported, so their finalizers mark the store for repair), until a verification
+    * (QuarantineVerifier) shows the store's copy matches a read of the object no older than `minTimestamp`, the
+    * transaction's start: what repair requires before it drops an ErrorTree entry for the transaction. Repair is not
+    * held off the object, unlike commitFailed.
+    *
+    * In memory only: the quarantining transaction's CRL state, object data included, is kept until the quarantine
+    * clears (concludeTransactionState), so a reloaded store recovers it, fails the same re-check, and quarantines the
+    * object again. Nothing is written for this. It replaces the fail-stop a live voter gets, so it declares no lost store
+    */
+  def quarantine(pointer: ObjectPointer, minTimestamp: HLCTimestamp, txid: TransactionId, reason: String): Unit =
+    val oid = pointer.id
+    logger.error(s"Store $storeId quarantines object $oid: recovered commit vote of transaction $txid cannot apply its " +
+      s"committed update ($reason). Every transaction on it votes abort until repair verifies the store's copy is at " +
+      s"least as new as $minTimestamp")
+    testingOnlyQuarantines += 1
+    quarantined.get(oid) match
+      case Some(q) =>
+        q.txids += txid
+        if q.minTimestamp < minTimestamp then
+          q.minTimestamp = minTimestamp
+          startVerification(oid, q)
+      case None =>
+        val q = new Quarantine(pointer, minTimestamp, Set(txid), 0, false, 0, 1, 0)
+        quarantined(oid) = q
+        startVerification(oid, q)
+
+  private def startVerification(oid: ObjectId, q: Quarantine): Unit =
+    q.attempt += 1
+    q.inFlight = true
+    val attempt = q.attempt
+    quarantineVerifier.verify(storeId, q.pointer, q.minTimestamp,
+      result => post(() => verificationComplete(oid, attempt, result)))
+
+  /** A verification of a quarantined object answered. Complete: the quarantine clears and the CRL state it kept is
+    * concluded. Otherwise it is retried at heartbeat, after 1 heartbeat doubling to MaxQuarantineRetryInterval
+    */
+  def verificationComplete(oid: ObjectId, attempt: Long, result: Try[Boolean]): Unit =
+    quarantined.get(oid).filter(_.attempt == attempt).foreach: q =>
+      q.inFlight = false
+      result match
+        case Success(true) =>
+          logger.info(s"Store $storeId: repair verified quarantined object $oid at least as new as " +
+            s"${q.minTimestamp}. Quarantine cleared")
+          quarantined.remove(oid)
+          q.txids.foreach: txid =>
+            if !quarantined.valuesIterator.exists(_.txids.contains(txid)) then
+              quarantinedConclusions.remove(txid).foreach: writeStub =>
+                concludeTransactionState(txid, writeStub, keepAdmission = transactions.contains(txid))
+        case other =>
+          q.failures += 1
+          q.countdown = q.interval
+          q.interval = math.min(q.interval * 2, MaxQuarantineRetryInterval)
+          val why = other match
+            case Failure(err) => s"failed: $err"
+            case _ => "is not complete yet (stale, or deferred by locks)"
+          logger.warn(s"Store $storeId: verification of quarantined object $oid $why (${q.failures} in a row). " +
+            s"Retrying in ${q.countdown} heartbeats")
+
+  /** Store heartbeat: starts the verifications whose retry is due */
+  def retryQuarantineVerifications(): Unit =
+    quarantined.toList.foreach: (oid, q) =>
+      if !q.inFlight then
+        q.countdown -= 1
+        if q.countdown <= 0 then
+          startVerification(oid, q)
+
+  private def quarantineKeeps(txid: TransactionId): Boolean =
+    quarantined.valuesIterator.exists(_.txids.contains(txid))
 
   /** `waiter` withholds its vote until each of `oids` has no commit in flight: it is then told through
     * Tx.commitPersisted, once per object
@@ -953,7 +1063,10 @@ class Frontend(val storeId: StoreId,
     *                      keeps it, and releases it when it is forgotten
     */
   private def concludeTransactionState(txid: TransactionId, writeStub: Boolean, keepAdmission: Boolean): Unit =
-    if writeStub && !stubs.contains(txid) then
+    if quarantineKeeps(txid) then
+      // Kept until the quarantine clears (verificationComplete): a reloaded store recovers it and quarantines again
+      quarantinedConclusions(txid) = quarantinedConclusions.getOrElse(txid, false) || writeStub
+    else if writeStub && !stubs.contains(txid) then
       recordAppliedStub(txid, keepAdmission)(())
     else
       crl.deleteTransaction(storeId, txid)

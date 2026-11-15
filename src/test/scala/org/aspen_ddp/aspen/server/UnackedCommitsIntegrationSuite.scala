@@ -291,6 +291,62 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
       after.revision shouldBe ObjectRevision(txid)
       after.data.getByteArray.toSeq shouldBe Seq[Byte](2)
 
+  private def frontendOf(i: Int) = net.smgr.control.router.loaded.get(sid(i)).map(_.frontend)
+
+  test("a recovered commit vote superseded before its crash quarantines the object until repair verifies it " +
+       "(Req F5, Todo 2.16)"):
+    // Store 2 applies T from its UnackedCommits entry and T2, built on T, supersedes it. Store 2 then crashes with T's
+    // CRL state still held (restored below): the recovered vote's re-check fails, as for a state invalidated under its
+    // locks. Rather than fail-stop, or count with neither lock nor update, the store quarantines the object until the
+    // host's repair service verifies its copy against a read of the pool at least as new as T
+    val crl = net.crl.asInstanceOf[TestNetwork.RecordingCRL]
+    for
+      dataPtr <- client.transactUntilSuccessful: tx =>
+                   given Transaction = tx
+                   tx.replaySafe("test")
+                   client.getStoragePool(Radicle.poolId).flatMap(_.allocator.allocateDataObject(DataBuffer(Array[Byte](1))))
+      _ <- settle(clock = false)
+      before <- client.read(dataPtr)
+      txid <- commitHeldBy(Set(sid(2))): tx =>
+                tx.overwrite(dataPtr, before.revision, DataBuffer(Array[Byte](2)))
+                Future.unit
+      _ = neverAccepted(2, txid)
+      held = crl.getFullRecoveryState(sid(2)).find(_.txd.transactionId == txid).get
+      _ <- restartAfterForgotten(txid, List(2))
+      _ <- eventually("store 2 applied T", clock = true):
+             Future.successful(storeRevision(2, dataPtr).contains(ObjectRevision(txid)))
+      _ <- settle(clock = true)
+      // A store refuses transactions started within MaxStartLead of its load
+      _ <- eventually("store 2 joins new transactions", clock = true)(Future.successful(net.loadFloorPassed(sid(2))))
+      tx2 = TestTransactions.replaySafe(client.newTransaction())
+      _ = tx2.overwrite(dataPtr, ObjectRevision(txid), DataBuffer(Array[Byte](3)))
+      _ <- pump(tx2.commit(), clock = true)
+      _ <- settle(clock = true)
+      _ <- eventually("every store applied T2", clock = true):
+             Future.successful((0 until 5).forall(i => storeRevision(i, dataPtr).contains(ObjectRevision(tx2.id))))
+      _ <- settle(clock = true)
+      // A crash while T's state is still in the CRL
+      _ = crl.save(txid, held, () => ())
+      _ = crl.deleteAppliedStub(sid(2), txid)
+      _ <- pump(net.restartStore(net.stores(2)), clock = true)
+      _ <- eventually("store 2 quarantined the object", clock = true):
+             Future.successful(frontendOf(2).exists(_.testingOnlyQuarantines > 0))
+      _ <- eventually("repair verified the object and the quarantine cleared", clock = true):
+             Future.successful(frontendOf(2).exists(f => !f.isQuarantined(dataPtr.id)))
+      _ <- eventually("T's CRL state concluded", clock = true):
+             Future.successful(!crl.getFullRecoveryState(sid(2)).exists(_.txd.transactionId == txid))
+      _ <- eventually("store 2 joins new transactions again", clock = true):
+             Future.successful(net.loadFloorPassed(sid(2)))
+      tx3 = TestTransactions.replaySafe(client.newTransaction())
+      _ = tx3.overwrite(dataPtr, ObjectRevision(tx2.id), DataBuffer(Array[Byte](4)))
+      _ <- pump(tx3.commit(), clock = true)
+      _ <- eventually("every store applied T3", clock = true):
+             Future.successful((0 until 5).forall(i => storeRevision(i, dataPtr).contains(ObjectRevision(tx3.id))))
+      _ <- settle(clock = true)
+    yield
+      (0 until 5).foreach(i => storeRevision(i, dataPtr) shouldBe Some(ObjectRevision(tx3.id)))
+      frontendOf(2).exists(_.failStopped) shouldBe false
+
   test("a UnackedCommits lookup answer for a replaced store is not taken by its successor"):
     for
       (tree, nodePtr) <- treeHoldingK()

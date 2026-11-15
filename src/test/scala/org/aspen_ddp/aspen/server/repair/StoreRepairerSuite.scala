@@ -310,6 +310,29 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       result.deferred shouldBe 1
       stillThere shouldBe true
 
+  test("verifying a quarantined object reconciles it and is complete for a read at least the transaction's start"):
+    val target = RecordingTarget(List(storeId))
+    val repairer = StoreRepairer(client, target)
+    for
+      ptr <- allocateObjectPointer()
+      os <- client.read(ptr)
+      result <- repairer.verifyObject(storeId, ptr, os.timestamp, RepairPolicy.Default, DeferralState())
+    yield
+      target.repairs shouldBe List(ptr.id)
+      result.complete shouldBe true
+
+  test("verifying a quarantined object against a read older than the transaction's start is not complete"):
+    val target = RecordingTarget(List(storeId))
+    val repairer = StoreRepairer(client, target)
+    for
+      ptr <- allocateObjectPointer()
+      os <- client.read(ptr)
+      result <- repairer.verifyObject(storeId, ptr, HLCTimestamp.happensAfter(os.timestamp), RepairPolicy.Default,
+        DeferralState())
+    yield
+      target.repairs shouldBe List(ptr.id)
+      result.complete shouldBe false
+
   test("an update missed while the repair is underway leaves the entry in place"):
     // The repair reads the object, then the store misses an update and the entry is rewritten
     // with that update's timestamp before the repair completes.

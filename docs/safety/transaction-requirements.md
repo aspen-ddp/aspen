@@ -675,6 +675,28 @@ diverges by design.
 
 ### F5. A commit voter that does not apply the committed update drops its lock and becomes, effectively, a lost commit vote that still counts toward `T`. Confidence: Low.
 
+> **Residual closed 2026-11-15: quarantine (Todo 2.16).** A recovered commit vote whose apply re-check fails no
+> longer only logs. `Tx.issueCommits` quarantines each changed object it could not apply (`Frontend.quarantine`).
+> The store does not try to tell a superseded update (10.5a) from a state invalidated under the recovered locks.
+> While the object is quarantined, every transaction on it votes abort (`ObjectQuarantined`), which restores the
+> effect of the lost lock: no conflicting transaction gets a commit vote here. Committed transactions apply nothing to
+> it and report it in `objectCommitErrors`, so their finalizers mark the store. The store has its host's repair
+> service verify the object (`QuarantineVerifier` → `RepairService.verifyObject` → `StoreRepairer.verifyObject`, which
+> is `repairUpdate` with `minTimestamp` = T's start, with proofs after lock deferrals). A `complete` result means the
+> store's copy matches a pool read no older than T. That is the condition repair already requires before dropping an
+> ErrorTree entry for T, so the store is then as good as one that missed T and was repaired. Incomplete and failed
+> verifications retry at heartbeat, backing off from 1 to 60 heartbeats. The quarantine is in memory only and costs
+> no write: the quarantining Tx's CRL state, object data included, is kept until it clears
+> (`Frontend.concludeTransactionState` defers a finalization or stub). A reloaded store therefore recovers T, fails the
+> same re-check and quarantines again. An apply that throws still fail-stops. Costs fall only on this rare path: one
+> store votes abort on the object until repair completes, the CRL space stays held, and each verification attempt
+> costs one pool read. An alternative was rejected: a durable "applied" mark plus a gate would have added a CRL write
+> to every commit. Tests: FrontendSuite "a recovered commit vote whose apply re-check fails quarantines the object ...",
+> "a quarantine clears once repair verifies the object ...", "a transaction committed by other stores' votes applies
+> nothing to a quarantined object ...", "an object whose requirements fail on the UnackedCommits local apply is
+> quarantined ..."; StoreRepairerSuite "verifying a quarantined object ..."; UnackedCommitsIntegrationSuite "a
+> recovered commit vote superseded before its crash quarantines the object until repair verifies it".
+
 > **Fixed 2026-11-14: fail-stop.** Keeping the lock would not help, because the store never gets the update. Instead
 > `Tx.issueCommits` fail-stops the store (`Frontend.failStop`: it drops every message, read and repair from then on,
 > and its host marks it rebuild-required and unloads it, `Host.StoreFailStopped`) when a commit voter's apply throws

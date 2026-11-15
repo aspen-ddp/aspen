@@ -104,12 +104,22 @@
   transaction only checks or locks get no backend commit, so concurrent `SharedRevisionLock` holders never wait
 - Fail-stop (`Frontend.failStop`, transaction-requirements F5/F6): a commit voter has dropped its locks before it
   applies, so one that cannot hold the update it voted for fail-stops the store. That covers an apply that throws, a
-  live voter's failed apply re-check (a recovered voter's may legitimately fail: superseded before the crash), and a
-  recovered commit vote whose object fails to load with anything but `ObjectNotFound`. A fail-stopped store drops
-  every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
+  live voter's failed apply re-check, and a recovered commit vote whose object fails to load with anything but
+  `ObjectNotFound`. A recovered voter's failed re-check quarantines the object instead (below). A fail-stopped store
+  drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
   store is rebuilt as a failed backend is. Never for a full device: a write-frozen store poisons the object instead
   (`poisonObject`, the `BackendCommitFailed` rule) and keeps serving. Every fail-stop is a lost-store declaration
   (Backlog: correlated declarations)
+- Quarantine (`Frontend.quarantine`, transaction-requirements F5, Todo 2.16): a recovered commit vote whose apply
+  re-check fails may have been superseded before the crash (10.5a) or invalidated under its locks, and the store does
+  not tell these apart. Each changed object it could not apply is quarantined: every transaction on it votes abort
+  (`ObjectQuarantined`), and committed ones apply nothing to it and report it. Repair is not held off, unlike
+  `commitFailed`. The store asks its host to verify the object (`QuarantineVerifier`, Host →
+  `RepairService.verifyObject`, bounded by `VerifyDeadline`, 30 s). It clears once `StoreRepairer.verifyObject` reports the copy complete against a
+  read at least the transaction's start. Otherwise it retries at heartbeat, 1 doubling to
+  `MaxQuarantineRetryInterval` (60) heartbeats. In memory only: the quarantining transaction's CRL state, object data
+  included, is kept until it clears (`concludeTransactionState` defers a finalization or stub to
+  `verificationComplete`), so a reloaded store quarantines again. Nothing is written for it
 - Ranged-write/append deltas are read through `EncodedAppendDelta`, which parses only the header and region table
   and XORs straight from the encoded buffer, so checking and applying never copy the delta
 

@@ -33,6 +33,11 @@ case class StaleObjectState() extends RequirementError
   */
 case class BackendCommitFailed() extends RequirementError
 
+/** The object is quarantined on this store (Frontend.quarantine): a recovered commit vote could not apply its committed
+  * update, and the store's copy is not trusted until repair verifies it. Purely local, like RequirementCheckFailure.
+  */
+case class ObjectQuarantined() extends RequirementError
+
 /** A transaction allocates an object this store already holds (in memory or in its backend): a replayed allocation,
   * which must not overwrite the live object (transaction-requirements F11). Purely local, like RequirementCheckFailure.
   */

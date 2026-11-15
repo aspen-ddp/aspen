@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare, ProposalId}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, DataUpdate, InvalidDescription, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, ObjectQuarantined, DataUpdate, InvalidDescription, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -92,6 +92,11 @@ class Tx( trs: TransactionRecoveryState,
 
   /** Some backend commit of this transaction failed: its CRL state, object data included, is kept */
   private var backendCommitFailed: Boolean = false
+
+  /** The objects this recovered commit vote quarantined (issueCommits, Frontend.quarantine). Its CRL state, object data
+    * included, is kept until their quarantine clears
+    */
+  private var quarantining: Set[ObjectId] = Set()
   private var committed: Boolean = false
   private var committing: Boolean = false
   private var commitHeld: Boolean = false
@@ -682,6 +687,7 @@ class Tx( trs: TransactionRecoveryState,
 
   private def determineDisposition(): Unit = {
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
+    val quarantined = pointersById.keysIterator.filter(frontend.isQuarantined).toList
     val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet
 
     if muted && oresolution.isEmpty && !outcomeKnown then
@@ -702,10 +708,10 @@ class Tx( trs: TransactionRecoveryState,
       waitingOn = Set()
       awaitingCommits = Set()
       decideDisposition(Map(), List(InvalidDescription(invalidDescription.get)))
-    else if failed.nonEmpty then
+    else if failed.nonEmpty || quarantined.nonEmpty then
       waitingOn = Set()
       awaitingCommits = Set()
-      decideDisposition(failed.map(_ -> BackendCommitFailed()).toMap, Nil)
+      decideDisposition(quarantined.map(_ -> ObjectQuarantined()).toMap ++ failed.map(_ -> BackendCommitFailed()), Nil)
     else if inFlight.nonEmpty && oresolution.isEmpty && !outcomeKnown then
       // Once the outcome is known the vote no longer matters, so nothing waits for it: a resolved transaction may
       // decide here only because its objects finished loading after the resolution
@@ -835,16 +841,24 @@ class Tx( trs: TransactionRecoveryState,
     val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
     // An object whose earlier backend commit failed is neither changed nor committed: missing from the objects applied
-    // to, it is uncommittable and reported in TxCommitted, and repair restores it
+    // to, it is uncommittable and reported in TxCommitted, and repair restores it. So is a quarantined one
+    // (Frontend.quarantine): its copy is not trusted until repair verifies it
     val changed = RequirementsApplyer.changedObjects(requirements)
     val failedHere = objects.keySet.filter(oid => changed.contains(oid) && frontend.commitFailed(oid))
     failedHere.foreach { objectId =>
       logger.warn(s"Tx $transactionId. Store $storeId does not apply the committed update of object $objectId: an " +
         s"earlier backend commit of it failed")
     }
+    val quarantinedHere = objects.keySet.filter(oid => changed.contains(oid) && !failedHere.contains(oid) &&
+      frontend.isQuarantined(oid))
+    quarantinedHere.foreach { objectId =>
+      logger.warn(s"Tx $transactionId. Store $storeId does not apply the committed update of object $objectId: it is " +
+        s"quarantined until repair verifies it")
+    }
+    val notApplied = failedHere ++ quarantinedHere
 
     val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, requirements,
-      objects -- failedHere, ou, frontend.maxSliceSize, allocatedOver, txd.allocatingObjects)
+      objects -- notApplied, ou, frontend.maxSliceSize, allocatedOver, txd.allocatingObjects)
 
     // Objects that threw partway through their update hold partially-applied, potentially
     // corrupt state. Drop them from the cache so the next access reloads the last durable
@@ -857,11 +871,11 @@ class Tx( trs: TransactionRecoveryState,
     // Skipped because they already show this transaction's update (see proveCommitted): applied, though not by this
     // commit. Only skipped objects are looked at, so a commit applied normally pays nothing for this
     val alreadyApplied = RequirementsApplyer.appliedBy(transactionId, requirements,
-      objects.filter((oid, _) => result.skipped.contains(oid) && !failedHere.contains(oid)), allocatedOver)
+      objects.filter((oid, _) => result.skipped.contains(oid) && !notApplied.contains(oid)), allocatedOver)
     if alreadyApplied.nonEmpty then
       logger.info(s"Tx $transactionId. Store $storeId already holds the committed update of objects $alreadyApplied")
 
-    result.skippedReasons.filterNot((objectId, _) => failedHere.contains(objectId) || alreadyApplied.contains(objectId))
+    result.skippedReasons.filterNot((objectId, _) => notApplied.contains(objectId) || alreadyApplied.contains(objectId))
       .foreach { (objectId, reason) =>
       val current = objects.get(objectId).map(_.metadata.revision.lastUpdateTxUUID)
       logger.warn(s"Tx $transactionId. Store $storeId cannot apply the committed update of object $objectId: $reason. " +
@@ -871,16 +885,35 @@ class Tx( trs: TransactionRecoveryState,
     // A commit voter that cannot hold the update it voted for has already dropped its locks (doCommit): its vote, which
     // may count towards the write threshold, would then stand for neither. So the store fail-stops (Frontend.failStop)
     // when an apply threw, and when a live voter's apply re-check fails: it has held its locks since its own check, so
-    // the state changed under them (transaction-requirements F5). A recovered vote's re-check may fail legitimately: a
-    // later transaction built on it superseded its update before the crash. An earlier failed backend commit poisons
-    // the object instead (failedHere: every later transaction on it votes abort)
+    // the state changed under them (transaction-requirements F5). An earlier failed backend commit poisons the object
+    // instead (failedHere: every later transaction on it votes abort).
+    //
+    // A recovered vote's re-check may fail legitimately: before the crash the store applied the update and a later
+    // transaction built on it superseded it (10.5a). That cannot be told from a state invalidated under the recovered
+    // locks, so the object is quarantined instead (Frontend.quarantine): every transaction on it votes abort, as the
+    // lost lock would have made them, until repair shows the store's copy matches a read of the object at least as new
+    // as this transaction. That is what repair requires to drop an ErrorTree entry for it, so the store is then as good
+    // as one that missed the transaction and was repaired. Only changed objects: a lock-only one has no update to lose.
+    // An object already quarantined is quarantined by this vote too, so its bound covers this transaction
     if disposition == TransactionDisposition.VoteCommit then
-      val unapplied =
-        if recovered then result.failed -- failedHere
-        else result.uncommittable -- alreadyApplied -- failedHere
-      if unapplied.nonEmpty then
-        frontend.failStop(s"Tx $transactionId voted commit but cannot apply its committed update of objects " +
-          s"$unapplied: ${result.skippedReasons.filter((oid, _) => unapplied.contains(oid))}")
+      if recovered then
+        val threw = result.failed -- notApplied
+        if threw.nonEmpty then
+          frontend.failStop(s"Tx $transactionId voted commit but its update of objects $threw threw")
+        else
+          val invalidated = (result.uncommittable -- alreadyApplied -- notApplied)
+            .filter(oid => changed.contains(oid) && objects.contains(oid))
+          val toQuarantine = invalidated ++ quarantinedHere
+          if toQuarantine.nonEmpty then
+            quarantining = toQuarantine
+            toQuarantine.foreach: oid =>
+              frontend.quarantine(pointerOf(oid), txd.startTimestamp, transactionId,
+                result.skippedReasons.get(oid).map(_.toString).getOrElse("already quarantined"))
+      else
+        val unapplied = result.uncommittable -- alreadyApplied -- notApplied
+        if unapplied.nonEmpty then
+          frontend.failStop(s"Tx $transactionId voted commit but cannot apply its committed update of objects " +
+            s"$unapplied: ${result.skippedReasons.filter((oid, _) => unapplied.contains(oid))}")
 
     val uncommittable = result.uncommittable -- alreadyApplied
 
@@ -909,7 +942,8 @@ class Tx( trs: TransactionRecoveryState,
     committed = true
     // A failed backend commit keeps the object data: a reloaded store recovers the transaction from it. See
     // Frontend.transactionFinalized
-    if !backendCommitFailed then
+    // A quarantining one keeps it too: a reloaded store recovers the transaction, which quarantines its objects again
+    if !backendCommitFailed && quarantining.isEmpty then
       saveObjectUpdates = false
       crl.dropTransactionObjectData(storeId, transactionId)
     val m = TxCommitted(lastProposer, storeId, transactionId, objectCommitErrors)

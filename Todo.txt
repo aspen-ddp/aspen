@@ -36,15 +36,7 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.16 Recovered commit vote whose apply re-check fails (residual of Req F5)                                    [S-M]
-     A live commit voter that cannot apply its committed update fail-stops the store (Tx.issueCommits). A
-     recovered one only logs, because a later transaction built on it may have superseded its update before the
-     crash (10.5a), and that legitimate skip looks the same as a state invalidated under the recovered locks. An
-     invalidated one leaves the vote counted with neither the lock nor the update.
-     Fix: tell the cases apart. Treat the skip as superseded only when the object's timestamp is later than T's
-     start and its revision is neither T's nor the one T requires, and fail-stop otherwise. Or, simpler to reason
-     about, persist an "applied" mark with T's CRL record once its backend commits succeed, so a recovered vote
-     knows whether it already applied.
+(no open items)
 
 
 PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)

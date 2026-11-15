@@ -246,6 +246,30 @@ Keys are `(poolIndex, objectId)` / `(poolIndex, txid)`; values carry no incarnat
 incarnation: harmless (reconcile is exact), but the opposite order is unprotected: entries consumed (deleted as complete) by the old incarnation shortly before its loss mean
 the rebuilt store's later zombie slices (rebuild reading an object that is deleted a moment later; the entry E for the delete was written before the restore) rely on E surviving.
 Verified OK in the normal flow (E is written 2 s after commit and kept until the store is repairable), listed as a place where X1 turns it into data loss.
+> **2026-11-14 (Todo 2.12): NARROWED.** *The N3 leg is closed, without a clock.* Each store directory keeps an
+> `incarnation` UUID (`server/store/StoreIncarnationFile`): load reads it or creates it durably before the store
+> serves, `RebuildingStore.finish` writes a fresh one before its `rebuild-complete` marker, and transfers and
+> adoptions carry it with the archived directory. Every prepare reply carries it; the driver records it for every
+> store it hears from, a takeover driver included, and `MissedUpdateFinalizationAction` writes it into each
+> UnackedCommits entry (unknown only for a store that never answered the finalizing driver). A store applies T
+> through an entry only when the entry names its own incarnation (`Frontend.unackedLookupComplete`, then
+> `Tx.unackedCommitFound`). Another or an unknown incarnation concludes T committed with nothing applied
+> (`Tx.unackedCommitNotOwed`), never as an abort, and the entry is left for the scan, whose exact reconcile heals the
+> store (rebuild-process N3, FIXED). *The reverse direction is narrowed.* An old incarnation consuming entries
+> written for the new one is still kept out by the repair fence, not by the entry, and the fence is tighter:
+> `StoreRepairer.ownedHere` requires the pool entry to name both this host and the device the store is loaded from
+> (`HostStoreView.storeDevices`, `RepairTarget.localDevice`), failing closed on an unknown device or a failed read, so
+> a same-host device move is fenced too; and a per-scan `OwnershipFence` re-checks ownership before each ErrorTree or
+> UnackedCommits delete, reusing an answer at most one second old (`StoreRepairer.OwnershipRecheck`). A negative answer
+> abandons the rest of the scan and leaves the remaining entries (and their stubs) for the owner. Residual: a delete
+> that commits inside the re-check window (about one second plus the delete's latency) after the pool entry moved.
+> Reaching it needs the old incarnation still serving after its move, that is a mistaken failure of a live device
+> (T12 on a device that still works, until its host reads it Failed and retires it, X1). Closing it outright would put a requirement on the
+> pool state object into every repair delete, adding the bootstrap pool to each. *ErrorTree entries carry no
+> incarnation, by design.* Their writer has no authoritative source: a store is marked because it was silent, so the
+> only source would be a possibly stale cached `StoragePoolState`, and ignoring a mark it got wrong would leave a real
+> miss unrepaired forever. ErrorTree reconcile is exact, so marks a new incarnation inherits cost one reconcile each
+> and are harmless. The production and consumption timeline is G5.
 
 ### X11. Late-acknowledged entries x replayed allocation (transaction-recovery R-N1 x requirements F11 x repair 5.3)
 Verdict: PLAUSIBLE.  Severity: resurrection / overwrite of a live object.
@@ -347,6 +371,40 @@ G2. Mixed-version/rolling-upgrade protocol skew (message formats, finalizer type
 G3. Zombie drivers/timers after a non-crash store reload, device relinquish and transfer-out (X4). Only recovery F12 mentions it, with no interaction analysis.
 G4. A shared, in-memory host-wide status cache is the anchor for finalization relays and, since the refresh, late-commit evidence (condition 2); no document analyses host restart (cache wiped) combined with rolling restarts of the stores' peers (paxos F6 touches it for one restart only). The horizon and TooOld no longer depend on it. *(2026-11-13: the safety half is covered. A restart, transfer-in or size eviction raises the affected stores' forget floor (load + `MaxStartLead`, or the eviction watermark) at the moment memory is lost, so a store whose host lost its cache never rejoins a transaction it may have forgotten, however many peers restart (paxos 10.10; HorizonIntegrationSuite "a host restart does not let its stores rejoin a transaction they forgot"). Left: the liveness cost across rolling restarts, where each reload refuses the transactions it does not hold started before its load plus `MaxStartLead`, and too many refusing stores in a pool end those transactions Unknown.)*
 G5. ErrorTree/UnackedCommits entry-key incarnation (X10) and the time-line of entry production vs consumption during a T12 move are described only per-document.
+    *2026-11-14 (Todo 2.12): written.* Entries for a pool slot are keyed by its pool index; since Todo 2.12 an
+    UnackedCommits entry also records the incarnation of the store that cast the counted commit vote (X10). I0 is the
+    old incarnation, I1 the rebuilt one.
+    *In-place rebuild* (T1-T11: lost or corrupt CRL, lost backend; same host, same device, rebuild-process 4.1):
+    (1) *I0 serving.* Finalizers of each T in which I0 cast a counted commit vote and sent no `TxCommitted` write
+    UnackedCommits entries tagged I0 (unknown only when the finalizing driver never heard from I0, after a takeover).
+    Transactions I0 was silent for write ErrorTree marks. I0's scans consume both.
+    (2) *Marked and Rebuilding.* I0 is discarded with its CRL, stubs included (rebuild-process N3). The store is offline
+    and not repairable, so nothing scans the slot. Finalizers still running for T that I0 voted in keep writing entries
+    tagged I0 (or unknown). Transactions in the pool mark the slot in the ErrorTree, since the store is silent. I1
+    casts no vote yet: it does not serve, and once it does it is muted for every T started before its `acceptorSince`.
+    (3) *Finish.* `RebuildingStore.finish` writes a fresh incarnation I1 before the `rebuild-complete` marker, so a
+    finished rebuild never keeps I0's identity, and the flip makes the store Active. From here on, entries for new T
+    are tagged I1.
+    (4) *I1 serving.* I1 inherits every entry of stages 1-2. An inherited UnackedCommits entry names I0 or nothing, so
+    no Tx of I1's (a replay's fresh Tx; a recovered vote of I1's own always matches I1) applies through it: the lookup
+    concludes T committed with nothing applied (`Tx.unackedCommitNotOwed`), and I1's scan reconciles the entry's objects
+    exactly and deletes it. Inherited ErrorTree marks are reconciled exactly, costing one reconcile each.
+    *Move to a new device* (T12, `FailedStorageDeviceDurableTask.moveStore`, onto device D1, on the same host or
+    another): stages 1 and 2 are as above, except that the pool entry is rewritten to the destination (host, D1) in
+    the same transaction that records the store Rebuilding on D1. Stages 3 and 4 run on D1 and are unchanged. The difference is that
+    I0 may still exist: if D0 was failed by mistake while still working, I0 serves on D0 until its host reads D0 Failed
+    and retires it (X1).
+    *Who may consume entries.* Only the store the pool entry names on the device it names
+    (`StoreRepairer.ownedHere`: host and device both, failing closed on an unknown device), and only repairable
+    (served, not Rebuilding) stores are scanned. Ownership is re-checked before each ErrorTree or UnackedCommits delete
+    (`OwnershipFence`, answers at most one second old), and a negative answer abandons the scan. So in an in-place
+    rebuild only I1 ever consumes the slot's entries after stage 1, and in a move I0 is fenced out from the flip,
+    except a delete committing within about one second plus its latency of the flip (X10's residual).
+    *Why ErrorTree marks carry no incarnation.* A mark's writer has no authoritative incarnation (only a possibly stale
+    cached `StoragePoolState`), and ignoring a mark it got wrong would leave a real miss unrepaired forever; an exact
+    reconcile makes an inherited mark harmless.
+    *Transfers and adoptions* are not rebuilds: the archived directory carries the incarnation file, so the store keeps
+    its identity and keeps applying through its own entries.
 G6. Allocation-tree dependency: rebuild F10/F17, repair F5 and requirements F11 each mention an allocation recorded late or not at all, but nobody analyses the total effect (missing slice, stale deletion decision, replayed allocation) across rebuild, repair and horizon.
     *2026-11-14 (Todo 2.11): analysed.* A missing entry cannot occur: `TransactionBuilder.addAllocatingObject` adds
     the allocation action, and bootstrap lists what it creates (rebuild F17, closed). A late entry has three effects:

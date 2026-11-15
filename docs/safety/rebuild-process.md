@@ -920,6 +920,16 @@ but its cause is logged separately for the systemic-loss work (Todo 3.1).
 an old incarnation's entry.** *2026-11-13: NARROWED.* The mute no longer depends on the client's clock (paxos P-N2
 FIXED: no store joins a transaction started more than `Frontend.MaxStartLead` ahead of its host's clock). The
 residual is host clock skew beyond 8 s, and the missing store incarnation on entries (X10, Todo 2.12).
+*2026-11-14 (Todo 2.12): FIXED.* The apply no longer rests on the mute or on any clock. Each store directory keeps an
+`incarnation` UUID (`StoreIncarnationFile`), and `RebuildingStore.finish` writes a fresh one before the
+`rebuild-complete` marker, so a rebuilt store never shares its predecessor's. Each UnackedCommits entry records the
+incarnation of the counted voter (`MissedUpdateFinalizationAction`, from the prepare replies the driver heard), and a
+store applies T through an entry only when the entry names its own (`Frontend.unackedLookupComplete`). The replay
+below therefore finds an entry naming the old incarnation and concludes T committed with nothing applied
+(`Tx.unackedCommitNotOwed`); the entry's reconcile then installs the committed state exactly. Residual for the apply:
+none. An entry of unknown incarnation (a store the finalizing driver never heard from) never applies either; it is
+healed by the same reconcile. The mute stays, for the acceptor state it protects (X2). The production and
+consumption timeline across a rebuild or a move is cross-document-review G5.
 Verdict: PLAUSIBLE, low (inherits paxos P-N2). A rebuild discards the store's CRL
 entries, stubs included (`dropStore`; with a lost CRL they go with it). The addendum design calls this harmless because
 a rebuilt store is muted for older transactions (`Frontend.scala:802`: muted iff `txd.startTimestamp <

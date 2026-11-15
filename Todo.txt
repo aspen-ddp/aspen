@@ -36,11 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.12 Store incarnation for repair entries and stubs: X10, Rebuild N3, G5                                    [M]
-     ErrorTree/UnackedCommits keys carry no store incarnation, and a rebuilt store has no stubs. Add an
-     incarnation epoch to entries (ignore mismatches) or carry inherited stubs into the rebuilt store. Write the
-     entry timeline for a T12 move (G5).
-
 2.13 Paxos hardening cluster: P-F4, F5, F6, F7, F11 (and R-F11)                                             [S-M]
      None of these produces a split alone, but each removes a leg that other faults combine with.
        F4/R-F11: secondary-pool stores can drive and share proposer ids. Drive only from primary-pool stores,

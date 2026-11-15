@@ -471,32 +471,51 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.hasTransactions shouldBe false
   }
 
-  // ---- Ruling 20: no driver for a recovered commit vote until its first UnackedCommits lookup answers ----
+  // ---- Recovered commit votes are driven at once (Todo 4.4, R-N3; Ruling 20's wait for the first lookup is gone) ----
 
-  test("a recovered vote whose lookup is unanswered or failing gets no driver, and once found its driver holds the proof") {
+  test("a recovered vote whose lookup is unanswered or failing is driven at once, and an entry found later gives its running driver the proof") {
     val (store, net, finalizer, lookup, _) = recoveredVoteStore()
-    store.heartbeat() // Idle past the zero heartbeat timeout, but the lookup is unanswered
-    store.hasTransactions shouldBe false
-    // Nor does a prepare reaching its designated leader start one
-    store.receiveTransactionMessage(TxPrepare(storeId, StoreId(poolId, 1), store.frontend.transactions(foundTxid).txd,
-      ProposalId(5, 1), Nil, fromClient = false))
-    store.hasTransactions shouldBe false
-
-    lookup.answer(foundTxid, scala.util.Failure(new Exception("metadata pool down")))
-    store.heartbeat() // Retries the lookup, still no driver
-    store.hasTransactions shouldBe false
-    lookup.requests.count(_ == foundTxid) shouldBe 2
-
-    lookup.answer(foundTxid, lookup.own)
-    store.heartbeat()
+    store.heartbeat() // Idle past the zero heartbeat timeout: driven although the lookup is unanswered
     store.hasTransactions shouldBe true
 
+    lookup.answer(foundTxid, scala.util.Failure(new Exception("metadata pool down")))
+    store.heartbeat() // Retries the lookup; the driver keeps running
+    lookup.requests.count(_ == foundTxid) shouldBe 2
+    store.hasTransactions shouldBe true
+
+    lookup.answer(foundTxid, lookup.own)
+    // The proof reached the running driver: it starts a post-proof round, and memoryless promises resolve it late
     val p = currentProposal(net)
+    p should not be initialProposal
     promise(store, 1, p, None)
     promise(store, 2, p, None)
     net.sentTx.collect { case a: TxAccept => a.value } shouldBe Nil
     net.sentTx.collect { case f: TxFinalized => (f.committed, f.late) }.distinct shouldBe List((true, true))
     finalizer.created shouldBe 0
+  }
+
+  test("with lookups failing, a recovered vote whose peers all hold commit votes commits") {
+    // A cold start of the whole cluster with the metadata group unreadable: every store recovered its commit vote
+    val (store, net, finalizer, lookup, _) = recoveredVoteStore()
+    lookup.answer(foundTxid, scala.util.Failure(new Exception("metadata pool down")))
+    store.heartbeat()
+    store.hasTransactions shouldBe true
+
+    val p = currentProposal(net)
+    for i <- List(1, 2) do
+      store.receiveTransactionMessage(TxPrepareResponse(storeId, StoreId(poolId, i.toByte), foundTxid,
+        Right(TxPrepareResponse.Promise(None)), p, TransactionDisposition.VoteCommit, Nil))
+    val accepts = net.sentTx.collect { case a: TxAccept => a }
+    accepts.map(_.value).distinct shouldBe List(true)
+    for i <- List(1, 2) do
+      store.receiveTransactionMessage(TxAcceptResponse(storeId, StoreId(poolId, i.toByte), foundTxid,
+        accepts.head.proposalId, Right(TxAcceptResponse.Accepted(true))))
+    finalizer.created shouldBe 1
+
+    // The non-late commit reaches the Tx: it applies T and releases its locks with no lookup answered
+    store.receiveTransactionMessage(TxResolved(storeId, storeId, foundTxid, committed = true, late = false,
+      proof = false))
+    store.frontend.transactions(foundTxid).status shouldBe TransactionStatus.Committed
   }
 
   test("a recovered vote whose first lookup finds no entry is driven as usual, without a proof") {
@@ -505,8 +524,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.heartbeat()
     store.hasTransactions shouldBe true
 
-    // A later lookup follows an abort, which reaches the store's driver too: the driver resolves on it, so no proof
-    // could reach it unresolved (why Tx.unackedCommitFound sends none)
+    // A later lookup follows an abort, which reaches the store's driver too: the driver resolves on it, so a proof
+    // handed to it later starts no round
     store.receiveTransactionMessage(TxResolved(storeId, StoreId(poolId, 1), foundTxid, committed = false,
       late = false, proof = false))
     lookup.requests.count(_ == foundTxid) shouldBe 2 // The Tx holds the abort for a fresh lookup

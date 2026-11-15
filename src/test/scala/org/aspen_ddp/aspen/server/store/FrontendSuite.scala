@@ -2714,7 +2714,6 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     kvKeys(backend) should not contain k(2)
     frontend.transactions(unackedTxid).provesCommitToItsDriver shouldBe true
-    frontend.transactions(unackedTxid).awaitsFirstUnackedLookup shouldBe false
     // Ruling 9: still live, its CRL and acceptor state kept until TxFinalized. Ruling 12: no status cache entry
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
     crl.deleted should not contain (unackedTxid)
@@ -3160,6 +3159,39 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.contains(txid1) shouldBe false
     crl.deleted should contain (txid1)
     crl.stubsSaved shouldBe Nil
+  }
+
+  test("a late commit of an applied Tx whose lookup never answers is forgotten without a stub once past expiry") {
+    // R-N10 (Todo 4.4): the case-3 lookup only decides the stub. Past the horizon the forget floor refuses every new Tx
+    // for T here, so a stub could suppress nothing, and the Tx need not wait for the metadata group
+    withExpiryFrontend: (frontend, backend, net, crl, lookup, clock, statusCache) =>
+      val txd = expiringTxd(List(overwrite(op1)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      expectVote(net, TransactionDisposition.VoteCommit)
+      frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, txid1, committed = true, late = false,
+        proof = false))
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+      lateCommit(frontend, finalized = false)
+      lookup.requests shouldBe List(txid1)
+      lookup.answer(txid1, scala.util.Failure(new Exception("metadata pool down")))
+
+      frontend.expiryHeartbeat()
+      frontend.transactions.contains(txid1) shouldBe true // Not yet past expiry: still held for its lookup
+
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      frontend.transactions.contains(txid1) shouldBe false
+      crl.stubsSaved shouldBe Nil
+      crl.deleted should contain (txid1)
+      frontend.hasAppliedStub(txid1) shouldBe false
+      statusCache.getStatus(txid1).map(e => (e.status, e.finalized)) shouldBe Some((TransactionStatus.Committed, true))
+      statusRequests(net) shouldBe Nil // Concluded without querying its peers
+
+      // A retry made meanwhile, answered late, changes nothing
+      frontend.retryUnackedLookups(System.nanoTime() + Frontend.UnackedLookupTimeout.toNanos + 1)
+      lookup.requests shouldBe List(txid1)
+      lookup.answer(txid1, lookup.own)
+      crl.stubsSaved shouldBe Nil
   }
 
   test("a late TxFinalized for an unknown transaction is cached as finalized, committed and late") {

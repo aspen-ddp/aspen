@@ -354,10 +354,10 @@ The problem statement and sections 3 to 9 stand. Two interactions change:
   UnackedCommits entries in its pool's metadata group (transaction-recovery T-M2). A correlated CRL loss still destroys
   the votes themselves, so section 2's arithmetic is unchanged; the entries only let repair reconcile the rebuilt stores
   (repair-process 2.3), which needs a read quorum that still holds T.
-* **Recovery now depends on the metadata group.** Every recovered unresolved commit vote waits for its UnackedCommits
-  lookup before its store drives it (transaction-recovery R-N3). A systemic event that also takes the metadata pool
-  below a read quorum leaves recovered votes holding their locks with no driver until it returns: a stall, not a
-  declaration, so it does not feed D1-D7.
+* **Recovery now depends on the metadata group.** A recovered unresolved commit vote accepts no abort before its
+  UnackedCommits lookup answers (transaction-recovery R-N3). Since 2026-11-15 (Todo 4.4) it is driven meanwhile, so a
+  commit still completes. A systemic event that also takes the metadata pool below a read quorum leaves a recovered
+  vote whose T aborted holding its locks until the pool returns: a stall, not a declaration, so it does not feed D1-D7.
 
 ## 12. Refresh for the replay-pins addendum (2026-11-10, `c181375b`)
 

@@ -152,7 +152,12 @@ class Frontend(val storeId: StoreId,
                  */
                val poolIDA: Option[IDA] = None,
                /** The lane of `admission` this store's new transactions use: its pool's (StoreConfig.admissionTier) */
-               val admissionTier: AdmissionTier = AdmissionTier.Data) extends Logging {
+               val admissionTier: AdmissionTier = AdmissionTier.Data,
+               /** Called on the store's executor when an UnackedCommits lookup finds the entry of a commit vote that
+                 * now proves the commit to its driver (Tx.provesCommitToItsDriver): the Store hands the proof to a
+                 * driver already running (Store.giveProof). The default does nothing, for tests
+                 */
+               onCommitProven: TransactionId => Unit = _ => ()) extends Logging {
 
   /** Which life of the store's data this is: prepare replies carry it (TxPrepareResponse.incarnation) */
   val incarnation: StoreIncarnation = incarnationOverride.getOrElse(StoreIncarnation.default(storeId))
@@ -729,8 +734,6 @@ class Frontend(val storeId: StoreId,
           val isLatest = requestId == l.latest
           if isLatest then
             l.inFlight = false
-          if result.isSuccess then
-            tx.unackedLookupAnswered() // Its store may now drive it: see Store.driveTransaction
           result match
             case Success(UnackedLookupResult.Found(found)) =>
               unackedLookups.remove(txid)
@@ -744,6 +747,8 @@ class Frontend(val storeId: StoreId,
                   s"transaction $txid names incarnation ${found.fold("unknown")(_.uuid.toString)}: applying nothing " +
                   s"through it")
                 tx.unackedCommitNotOwed()
+              if tx.provesCommitToItsDriver then
+                onCommitProven(txid)
             case Success(UnackedLookupResult.Absent) if requestId >= l.firstCounting =>
               unackedLookups.remove(txid)
               val held = tx.unackedCommitAbsent()
@@ -796,7 +801,10 @@ class Frontend(val storeId: StoreId,
     * transaction, first at the heartbeat it is found so, then after 1, 2, 4 and then every MaxExpiryQueryInterval
     * heartbeats, until it decides from the replies (ExpiryTally): it adopts an outcome, is discarded (concluded, if it
     * knows its outcome: Tx.concludeKnownOutcome), or keeps holding. Only the replies decide, so a Tx whose peers still
-    * hold T loses nothing by asking
+    * hold T loses nothing by asking.
+    *
+    * A Tx held only to decide its applied stub (Tx.forgetLookupPending) asks nothing: past the margin it is forgotten
+    * without one (Tx.forgetWithoutStubPastExpiry, R-N10), and its lookup is dropped
     */
   def expiryHeartbeat(): Unit =
     val now = wallClockMillis()
@@ -804,7 +812,10 @@ class Frontend(val storeId: StoreId,
       if !transactions.get(txid).exists(_.mayExpire) then
         expiryRounds.remove(txid)
     transactions.values.toList.foreach: tx =>
-      if tx.mayExpire && tx.pastHorizon(now, horizon, expiryMargin) then
+      if tx.forgetLookupPending && tx.pastHorizon(now, horizon, expiryMargin) then
+        unackedLookups.remove(tx.transactionId)
+        tx.forgetWithoutStubPastExpiry()
+      else if tx.mayExpire && tx.pastHorizon(now, horizon, expiryMargin) then
         expiryRounds.get(tx.transactionId) match
           case None =>
             tx.beginExpiry()

@@ -83,8 +83,11 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - Written by the finalizer for each commit voter that sent no TxCommitted (`client/internal/transaction/CLAUDE.md`);
   an entry durable means every other finalization action is done
 - A recovered unresolved commit vote looks its entry up (`UnackedCommitLookup`, from the
-  Host) once loaded and again before accepting any abort; no driver starts for it before the first lookup answers or
-  while the CRL loads. A found entry proves the commit to its own driver; the Tx applies its saved update locally, logs
+  Host) once loaded and again before accepting any abort. It is driven at once (no driver only while the CRL loads,
+  `Frontend.recoveryPending`): under the forget floor no store that forgot T answers a driver, so Paxos cannot choose
+  abort over a chosen commit (Todo 4.4, R-N3; Ruling 20's wait is gone). A found entry proves the commit to its own
+  driver, at its start or, if one already runs, through `Frontend.onCommitProven` -> `Store.giveProof`; the Tx applies
+  its saved update locally, logs
   it at info and stays until TxFinalized, writing no status-cache entry (a Tx holding a late commit that finds its
   entry applies and is forgotten at once). A failed or unanswered lookup holds the
   abort and retries at heartbeat (`Frontend.UnackedLookupTimeout`, 5 s). Past the horizon its peers refuse its
@@ -100,7 +103,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   finalization may still be running (the marker writing other stores' entries). A held late commit, or a vote whose
   expiry Discard was decided, concludes at once (`applyNothing`, a real late outcome exists). Neither writes a stub of
   its own (`applyNothing` still writes one already owed: `stubDue`). A forget-lookup (`forgetLookupHeld`, T already
-  applied here) writes its stub as for any found entry. A found entry of any incarnation is never taken as absent.
+  applied here) writes its stub as for any found entry; one still unanswered once T is past the horizon plus the
+  expiry margin is forgotten as finalized without a stub (`Tx.forgetWithoutStubPastExpiry`, from
+  `Frontend.expiryHeartbeat`; R-N10): the floor then refuses every new Tx for T, so the stub could suppress nothing. A found entry of any incarnation is never taken as absent.
   The entry is left for the repair scan, whose reconcile installs the committed state
 - A recovered Tx whose saved status is resolved (re-saved by a prepare or accept after the resolution) restores it
   into `oresolution`. It takes no locks and needs no lookup: once its objects load it applies the commit with the
@@ -132,7 +137,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   of a transaction applied here (its own lookup decides the stub); an abort as finalized.
   Discarding releases locks and objects, deletes the CRL state as for a forgotten abort, forgets the Tx, and leaves the
   status cache alone (no outcome is known). An expiring commit vote also holds an abort for a lookup, as a recovered
-  one does, but its store drives it meanwhile (`awaitsFirstUnackedLookup` is for recovered votes only)
+  one does, and its store drives it meanwhile, as it does a recovered one
 - Why discarding is safe: an acceptor forgets T only once T is decided (an abort at resolution, a commit at
   TxFinalized), and a store answers "unknown" only below its forget floor, so a non-holder never becomes a holder.
   More than `w - t` of them rule out a committed, unfinalized T, which a full quorum would still hold. So T aborted,

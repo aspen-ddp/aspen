@@ -48,11 +48,6 @@ PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.4  Waits on the metadata group: R-N3, R-N10                                                               [M]
-     Recovered commit votes hold their locks with no driver until their first UnackedCommits lookup answers.
-     Case-3 holds applied Txs in memory. After a bound, start the driver while forbidding it to propose abort
-     until the lookup answers. Bound R-N10 the same way.
-
 4.5  Repair livelock: Repair F3, F8, F9, X7                                                                 [S-M]
      F3/X7: applies are now monotone (2.2, done 2026-11-14), but the gate still trusts timestamps that rebuild
             and Reconcile copy from reads. Consider gating on post-install equality.

@@ -151,17 +151,6 @@ class Tx( trs: TransactionRecoveryState,
     */
   private var notOwedHere = false
 
-  /** Some UnackedCommits lookup of this Tx has been answered, finding the entry or not */
-  private var unackedAnswered = false
-
-  def unackedLookupAnswered(): Unit = unackedAnswered = true
-
-  /** A recovered unresolved commit vote whose first UnackedCommits lookup has not been answered: its store gives it no
-    * driver yet (Store.driveTransaction, Ruling 20). Found, its driver holds the proof (foundUnackedEntry); absent, it
-    * is driven as usual
-    */
-  def awaitsFirstUnackedLookup: Boolean = recovered && needsUnackedCheck && !unackedAnswered
-
   /** This Tx's outcome is a late commit: its status cache entry and status answers say so */
   private var lateOutcome = false
 
@@ -177,6 +166,29 @@ class Tx( trs: TransactionRecoveryState,
     * (replay-pins addendum A, case 3). See lateCommit
     */
   private var forgetLookupHeld = false
+
+  /** A late commit of a transaction applied here waits for its UnackedCommits lookup to decide its stub: see
+    * forgetLookupHeld
+    */
+  def forgetLookupPending: Boolean = forgetLookupHeld && ofinalized.isEmpty
+
+  /** Forgotten as finalized without a stub (no entry found, or past expiry) */
+  private def concludeForgetLookup(): Unit =
+    forgetLookupHeld = false
+    finalized(true)
+    frontend.forget(this)
+
+  /** A forget-lookup unanswered once T is past the horizon plus the expiry margin (Frontend.expiryHeartbeat; Todo 4.4,
+    * R-N10). The lookup only decides the applied stub, which keeps a replay from applying T again here. Past the
+    * forget floor this store refuses every prepare for T it does not hold, so no later Tx for T can arise to apply
+    * through the entry, and the stub could suppress nothing: the Tx is forgotten without one rather than waiting on
+    * the metadata group. The entry is left for the repair scan; an entry with no stub is harmless at a store that saw T
+    */
+  def forgetWithoutStubPastExpiry(): Unit =
+    if forgetLookupPending then
+      logger.info(s"Tx $transactionId on store $storeId: past expiry with its UnackedCommits lookup unanswered, " +
+        s"forgotten without an applied stub")
+      concludeForgetLookup()
 
   /** A TxFinalized listing this store in `owed` reached the store after this Tx was finalized and forgotten while its
     * commit is held for its turn (Frontend.deferredFinalizations): the stub replaces its state once the commit persists
@@ -199,8 +211,8 @@ class Tx( trs: TransactionRecoveryState,
     *
     * An expiring live commit vote (see expiring) is in the same position: its peers may have finalized and forgotten
     * T while its TxFinalized was lost, so it too accepts an abort, or discards itself, only once a lookup started after
-    * finds no entry. It looks the entry up only then: its store drives it meanwhile (awaitsFirstUnackedLookup is for
-    * recovered votes only), since past the horizon no store that forgot T answers a driver
+    * finds no entry. It looks the entry up only then. Either kind is driven meanwhile (Store.driveTransaction): under
+    * the forget floor no store that forgot T answers a driver, so Paxos cannot choose abort over a chosen commit
     */
   def needsUnackedCheck: Boolean =
     (recovered || expiringTx) && disposition == TransactionDisposition.VoteCommit &&
@@ -1331,9 +1343,8 @@ class Tx( trs: TransactionRecoveryState,
         finalized(true)
       else
         resolved(true, record = false)
-        // Its store's driver for it holds the proof (Store.driveTransaction). No driver can already be running
-        // unresolved here: none starts before the first lookup answers (awaitsFirstUnackedLookup), and a later lookup
-        // follows a held abort, which the store's driver received too and resolved on
+        // Its store's driver for it holds the proof: given when it starts, or by the Frontend now if one runs
+        // (Frontend.onCommitProven, Store.giveProof)
         foundUnackedEntry = true
       val changed = RequirementsApplyer.changedObjects(requirements).intersect(pointersById.keySet)
       def ids(objects: Iterable[ObjectId]) = objects.map(_.uuid).mkString(", ")
@@ -1379,7 +1390,7 @@ class Tx( trs: TransactionRecoveryState,
       heldAborts = Nil
       updateLastEvent()
       resolved(true, record = false)
-      // Its store's driver for it holds the proof (Store.driveTransaction), as for a matching entry
+      // Its store's driver for it holds the proof, as for a matching entry (Frontend.onCommitProven)
       foundUnackedEntry = true
 
   /** A UnackedCommits lookup that counts found no entry. A held late commit applies nothing: this store is not owed it
@@ -1387,10 +1398,8 @@ class Tx( trs: TransactionRecoveryState,
     * this store applied it durably: returns the held aborts, for the Frontend to handle again; they are accepted now
     */
   def unackedCommitAbsent(): List[TxMessage] =
-    if forgetLookupHeld && ofinalized.isEmpty then
-      forgetLookupHeld = false
-      finalized(true)
-      frontend.forget(this)
+    if forgetLookupPending then
+      concludeForgetLookup()
       Nil
     else if lateCommitHeld then
       applyNothing(committed = true, finalMessage = true, late = true)

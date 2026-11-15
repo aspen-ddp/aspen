@@ -494,7 +494,9 @@ txStatus == Unresolved && oresolution.isEmpty`, for every transaction, not only 
     forgotten. Safe, since a stub only ever suppresses an apply.
 * Entry absent: held aborts are accepted (`unackedCommitAbsent`, `Tx.scala:1032-1041`).
 * Lookup failure: retried at heartbeat; an unanswered one is re-issued after `UnackedLookupTimeout` (5 s)
-  (`Frontend.scala:401-411`). The `Tx` holds aborts, its locks, and its driver, for as long as it takes (R-N3).
+  (`Frontend.scala:401-411`). The `Tx` holds aborts and its locks for as long as it takes (R-N3). *2026-11-15 (Todo
+  4.4):* it no longer holds its driver: the store drives it at once, and a lookup that later finds the entry hands
+  the proof to the running driver (`Frontend.onCommitProven`, `Store.giveProof`).
 
 **Late commit at any commit voter** (`Tx.lateCommit`, `Tx.scala:920-932`), recovered or live: held for a lookup started
 then; found, it applies and is forgotten as finalized; absent, it applies nothing. Any Tx without its own commit vote
@@ -759,14 +761,14 @@ Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding 
 | F15 | unchanged | Non-voters still get no entry | `MissedUpdateFinalizationAction.scala:99` |
 | F16 | unchanged | Leader trigger is still `notFinalized` | `Store.scala:182-184` |
 | F17 | unchanged (open) | Not re-derived | |
-| F18 | **narrowed** | No driver starts while the store's CRL state loads or a recovered vote awaits its first lookup | `Store.scala:95-98`; `Frontend.scala:99` |
+| F18 | **narrowed** | No driver starts while the store's CRL state loads. *2026-11-15 (Todo 4.4):* a recovered vote no longer waits for its first lookup (R-N3) | `Store.driveTransaction`; `Frontend.recoveryPending` |
 
 ### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
 
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
 | R-N1 | **closed** 2026-11-14 (was narrowed) | Todo 2.9: under the horizon only a store that never saw T can hold a replay's Tx, so of the residual below only R-N9 remains. Before: a store that forgot T on a `TxFinalized` listing it in `owed`, applied T through its entry, or found its entry through the case-3 lookup holds an applied stub and applies nothing on a replay's commit, late or not. The R-N1 quorum scenario is tested end to end (ReplayIntegrationSuite "a replay at a pool whose stores all acknowledged late leaves every store unchanged"). Remaining: stores with an entry and no stub: the self-healing minority that never saw T (R-N9), a second driver's entries (R-N7, narrowed by Ruling 7), and a lost `TxFinalized` after a re-run finalizer (R-N6) | `Tx.scala:642-648,935-936,984-1007,1078-1092`; `Frontend.scala:768-778` |
-| R-N3 | unchanged (widened slightly) | The case-3 lookup also depends on the metadata group, but holds no locks: a committed, applied Tx stays in memory (status cache not yet finalized) until the lookup answers or a non-late `TxFinalized` arrives (R-N10) | `Tx.scala:990-997`; `Frontend.scala:484-494` |
+| R-N3 | **narrowed** 2026-11-15 (Todo 4.4; was unchanged, widened slightly). R-N10 **fixed** the same day | The case-3 lookup also depends on the metadata group, but holds no locks: a committed, applied Tx stays in memory (status cache not yet finalized) until the lookup answers or a non-late `TxFinalized` arrives (R-N10) | `Tx.scala:990-997`; `Frontend.scala:484-494` |
 | R-N4 | unchanged (cost added) | Each entry for a store that forgets T on a listing `TxFinalized` now also costs one stub in the device CRL until the scan drops it (repair-process RP-N6) | `Frontend.scala:395-409` |
 | R-N6 | **narrowed** (2026-11-14: to the orphan allocation entry, Todo 5.5; the marker part is FIXED, R-N1's re-arming is closed by the horizon) | The re-run marker's entries come with a non-late `TxFinalized` listing them; stores with no Tx write stubs (`Frontend.scala:763-773`), so the re-created entries no longer re-arm R-N1 unless that `TxFinalized` is lost at a store. The ErrorTree regression and the orphan allocation entry are unchanged | as cited |
 | F2 / R-N2 | unchanged | Still no failure path: a write that gives up never completes the action, so a driver relying on its own finalizer never finalizes (`MissedUpdateFinalizationAction.scala:140-146`). A second driver finalized by another's `TxFinalized` lists its planned set whatever its write's outcome (Ruling 7; R-N7 variant 2 closed) | `TransactionDriver.scala:411-430` |
@@ -805,7 +807,8 @@ That is sufficient:
   is now covered: entries name every changed object (requirements F8, fixed). The other was a false abort, which
   the horizon closed.
 - A recovered uncounted voter either learns the commit from its peers' caches and applies it, or is discarded past
-  the horizon and relies on its mark. While it waits it holds its locks: that is liveness (R-N3).
+  the horizon and relies on its mark. While it waits it holds its locks: that is liveness (R-N3; since Todo 4.4 it
+  is driven meanwhile).
 - R-N4 (Todo 4.7) may narrow entries further, but it must keep one entry per unacknowledged counted voter, because
   this argument depends on it.
 
@@ -1208,6 +1211,25 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 > client retransmit of latency.
 > *Fix sketch:* after a bound, start the driver holding no proof but forbidding it to propose abort until the lookup answers.
 
+> **2026-11-15 (Todo 4.4): NARROWED.** *The wait was no longer load-bearing.* Ruling 20 kept a recovered vote
+> undriven so that a driver without the entry's proof could not decide abort on the fresh votes of stores that had
+> finalized and forgotten T. The forget floor (paxos 10.10) closed that: a store that forgot T refuses its prepares
+> below its floor, or answers from its status cache inside it (a size eviction raises the floor), so every promise a
+> driver counts comes from real acceptor state, and Paxos, safe with offline acceptors, never chooses abort once
+> commit was chosen. Todo 4.1's past-expiry abort is an ordinary proposal (P7a) and is covered by the same argument.
+> The fix sketch's bound and abort ban would therefore add machinery with no safety role. *Fix:* `Store.driveTransaction`
+> no longer waits for the first lookup (`Tx.awaitsFirstUnackedLookup` is gone), so the vote is driven at heartbeat or
+> by a leader's prepare like any recovered Tx. When a lookup later finds the entry (of any incarnation), the Frontend
+> hands the proof to the running driver (`Frontend.onCommitProven` -> `Store.giveProof`). The load-time lookup, the
+> hold on aborts until a lookup finds no entry, and the lookups for a held late commit and an expiry discard are
+> unchanged. Tests: StoreSuite "a recovered vote whose lookup is unanswered or failing is driven at once, and an entry
+> found later gives its running driver the proof", "with lookups failing, a recovered vote whose peers all hold commit
+> votes commits" (a cold start with the metadata group down, which before stalled forever, as did any vote under
+> `UnackedCommitLookup.Never`). *Residual:* during a metadata-group outage, a recovered vote whose T aborted keeps its
+> locks while its abort is held for a lookup. A held late commit (`lateCommitHeld`) and an expiry discard of a commit
+> vote also wait, since only the tree says whether the store is owed T. And no driver starts while the CRL state loads
+> (`Frontend.recoveryPending`, F18).
+
 > **R-N4. Verdict: CONFIRMED (capacity). Severity: liveness (tree growth, finalization latency, repair load).**
 > UnackedCommits entries are keyed `(poolIndex, txid)` and never merge, unlike ErrorTree entries keyed by object
 > (`UnackedCommitEntry.scala`; `MissedUpdateMarker.scala:145-148`). Every committed transaction with a silent counted
@@ -1345,6 +1367,14 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 > which may never come (the driver that would send it finalized long ago). Same dependency as R-N3, without the lock
 > cost (Task 4 concern 5).
 
+> **2026-11-15 (Todo 4.4): FIXED.** The case-3 lookup only decides the applied stub, which keeps a replay from
+> applying T again here. Past the horizon plus the expiry margin the store refuses every prepare for T it does not
+> hold (forget floor), so no later Tx for T can arise to apply through the entry, and the stub could suppress nothing.
+> `Frontend.expiryHeartbeat` now forgets such a Tx as finalized without a stub (`Tx.forgetWithoutStubPastExpiry`) and
+> drops its lookup. The entry is left for the repair scan; an entry with no stub is harmless at a store that saw T.
+> Test: FrontendSuite "a late commit of an applied Tx whose lookup never answers is forgotten without a stub once past
+> expiry".
+
 > **R-N11. Verdict: PLAUSIBLE (very narrow). Severity: stale-replica at one store, self-healing.**
 > `deferredFinalizations` is keyed by txid and `transactionFinalized` removes the key whatever Tx calls it
 > (`Frontend.scala:221-224,654-655`). If a Tx A is finalized while its commit is held for its turn, and a second Tx B
@@ -1394,4 +1424,4 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 | Apply an aborted update | none found for the UnackedCommits path (entries exist only for committed transactions); paxos P-N4 closed by the horizon (2026-11-13) |
 | Replay a forgotten transaction | F4 (narrowed), F10 (narrowed), R-N1 (narrowed by stubs), R-N7 (narrowed), R-N9, paxos P-N3; F7, F9 and R-N8 fixed |
 | Fail to record a missed update | F14; F13 closed (2026-11-14); F2 fixed, R-N2 narrowed (marks wait for a permanently failing action) |
-| Hang forever | F12; F14 (long); R-N2 (a failure repeating forever, logged); R-N3 (recovered votes without lookups); R-N10 (case-3 lookup, no locks); F1, F2 fixed |
+| Hang forever | F12; F14 (long); R-N2 (a failure repeating forever, logged); R-N3 (narrowed: aborts and late commits held for a lookup); R-N10 fixed; F1, F2 fixed |

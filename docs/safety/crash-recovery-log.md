@@ -767,7 +767,7 @@ described. Only findings whose *consequence* runs through the transaction layer 
 | F18 | unchanged (still RESOLVED by the X2 mute) | Its reasoning no longer rests on `TransactionTooOld`; the late-commit rule now also relies on the mute (paxos P-N2) | `Frontend.scala:676` |
 
 New, CRL-facing: every recovered unresolved commit vote now waits for its UnackedCommits lookup before its store drives
-it (transaction-recovery R-N3), and a prover saves an abort vote with a memoryless promise to the CRL on each later
+it (transaction-recovery R-N3; since 2026-11-15, Todo 4.4, it is driven at once), and a prover saves an abort vote with a memoryless promise to the CRL on each later
 prepare (Ruling 10, `Tx.scala:786-788,817-836`): one extra record per prover, within admission.
 
 ### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)

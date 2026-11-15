@@ -78,6 +78,14 @@ class Store(val storageDeviceId: StorageDeviceId,
       case _ => 5 * heartbeatPeriod,
     heartbeatPeriod)
 
+  /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
+   *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's
+   *  checker thread, through Host.hasTransactions), so it is an immutable Map in a `@volatile` field and those two
+   *  read one snapshot of it. TransactionDrivers keep their own locks for their timer threads, and are never handed
+   *  the Store, so those threads never reach its state. Declared before the Frontend, whose
+   *  onCommitProven may run while it is built. */
+  @volatile private var transactionDrivers: Map[TransactionId, TransactionDriver] = Map()
+
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
     missingDataWait = missingDataWait, admission = admission, unackedLookup = unackedLookup,
@@ -89,14 +97,8 @@ class Store(val storageDeviceId: StorageDeviceId,
     acceptorSince = acceptorSince, deferRecovery = deferRecovery, wallClockMillis = wallClockMillis,
     horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, expiryMargin = expiryMargin,
     onFailStop = err => onFailStop(this, err), incarnationOverride = incarnationOverride, poolIDA = poolIDA,
-    admissionTier = admissionTier)
-
-  /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
-   *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's
-   *  checker thread, through Host.hasTransactions), so it is an immutable Map in a `@volatile` field and those two
-   *  read one snapshot of it. TransactionDrivers keep their own locks for their timer threads, and are never handed
-   *  the Store, so those threads never reach its state. */
-  @volatile private var transactionDrivers: Map[TransactionId, TransactionDriver] = Map()
+    admissionTier = admissionTier,
+    onCommitProven = txid => transactionDrivers.get(txid).foreach(giveProof(txid, _)))
 
   /** Stops the store's transaction drivers first (Ruling 31): left running, their timers would keep re-preparing
     * transactions for a store that is gone. Drivers on other stores, and their heartbeat recovery, take over
@@ -145,14 +147,16 @@ class Store(val storageDeviceId: StorageDeviceId,
     .maximumSize(1000)
     .build[TransactionId, List[TxPrepareResponse]]()
 
-  /** Starts a driver for `txd`, unless one runs or the store cannot yet know whether it owes the transaction.
+  /** Starts a driver for `txd`, unless one runs or the store's CRL state is still being loaded
+    * (Frontend.recoveryPending): a recovered Tx may be among it, and the driver must start above what its acceptor
+    * promised or accepted (TransactionDriver.Start.highestSeen, paxos F5).
     *
-    * A recovered unresolved commit vote waiting for its first UnackedCommits lookup (Tx.awaitsFirstUnackedLookup), or
-    * any transaction while the store's CRL state is still being loaded (Frontend.recoveryPending: such a vote may be
-    * among it), gets no driver yet. The other stores may have finalized and forgotten the transaction, and a driver
-    * without the proof an entry gives could decide abort on their votes, a decision a later proof cannot undo. The
-    * heartbeat starts the driver once the lookup has answered (Ruling 20). A lookup that never completes leaves the Tx
-    * waiting, holding its locks, as the design intends for an unavailable lookup
+    * A recovered unresolved commit vote is driven at once, before its UnackedCommits lookup answers (Todo 4.4, R-N3;
+    * this replaces Ruling 20's wait). The wait guarded against a driver without the entry's proof deciding abort on
+    * the fresh votes of stores that had finalized and forgotten the transaction. The forget floor closed that: a store
+    * that forgot T refuses its prepares, or answers from its status cache, so Paxos chooses abort only from real
+    * acceptor state, and never once commit was chosen (paxos 10.10). The Tx still accepts no abort before a lookup
+    * finds no entry. A lookup that finds the entry later hands the proof to the running driver (giveProof)
     *
     * @param initialProposal the client's prepare is creating the transaction at its designated leader: this is the
     *                        leader's first driver for it, which keeps the prepare's initial proposal (1, L). Every
@@ -160,9 +164,7 @@ class Store(val storageDeviceId: StorageDeviceId,
     *                        accepted (TransactionDriver.Start, paxos F5)
     */
   def driveTransaction(txd: TransactionDescription, initialProposal: Boolean = false): Unit = {
-    val awaitsLookup = frontend.recoveryPending ||
-      frontend.transactions.get(txd.transactionId).exists(_.awaitsFirstUnackedLookup)
-    if (!transactionDrivers.contains(txd.transactionId) && !awaitsLookup) {
+    if (!transactionDrivers.contains(txd.transactionId) && !frontend.recoveryPending) {
 
       val start = TransactionDriver.Start(
         initialProposal = initialProposal,
@@ -173,13 +175,9 @@ class Store(val storageDeviceId: StorageDeviceId,
 
       transactionDrivers += txd.transactionId -> driver
 
-      // A recovered commit vote that found its UnackedCommits entry knows the transaction committed: its driver holds
-      // that proof from the start, exactly as if a prover had sent it (Tx.foundUnackedEntry). The other stores may
-      // have forgotten the transaction, so deciding abort on their votes would be wrong. Given before the cached
-      // prepare responses below, which could otherwise complete a tally at the initial proposal first
-      if frontend.transactions.get(txd.transactionId).exists(_.provesCommitToItsDriver) then
-        driver.receiveTxResolved(TxResolved(storeId, storeId, txd.transactionId, committed = true, late = false,
-          proof = true))
+      // Given before the cached prepare responses below, which could otherwise complete a tally at the initial
+      // proposal first
+      giveProof(txd.transactionId, driver)
 
       prepareResponseCache.getIfPresent(txd.transactionId).foreach { lst =>
         lst.foreach(driver.receiveTxPrepareResponse(_))
@@ -187,6 +185,15 @@ class Store(val storageDeviceId: StorageDeviceId,
       }
     }
   }
+
+  /** A commit vote that found its UnackedCommits entry (of any incarnation) knows the transaction committed: its
+    * driver holds that proof, exactly as if a prover had sent it (Tx.foundUnackedEntry), so it never proposes abort
+    * and resolves late on a memoryless post-proof quorum. Given when the driver starts, or when the lookup answers
+    * while one runs (Frontend.onCommitProven). A second proof, or one reaching a resolved driver, starts no round
+    */
+  private def giveProof(txid: TransactionId, driver: TransactionDriver): Unit =
+    if frontend.transactions.get(txid).exists(_.provesCommitToItsDriver) then
+      driver.receiveTxResolved(TxResolved(storeId, storeId, txid, committed = true, late = false, proof = true))
 
   def snapshotForRepair(pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
     frontend.snapshotForRepair(pointer, p)

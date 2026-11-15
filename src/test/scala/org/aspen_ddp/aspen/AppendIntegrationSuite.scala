@@ -12,12 +12,23 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import scala.concurrent.Future
+import scala.concurrent.duration.{Duration, SECONDS}
 import scala.language.implicitConversions
 import scala.util.Random
 
 /** End-to-end coverage of data object append and byte-range reads against live test networks. */
-trait AppendIntegrationTests:
-  this: IntegrationTestSuite =>
+trait AppendIntegrationTests extends IntegrationTestSuite:
+
+  /** Repair leaves an entry while its store may still join the entry's transaction (RepairTarget.mayJoinTransaction),
+    * so the store-behind test waits out each missed transaction's forget floor, about the horizon. A 3 s horizon keeps
+    * it fast; its transactions reach every store within milliseconds. Not below about 2 s, for slack under load
+    * (ReplayIntegrationSuite)
+    */
+  private val storeBehindTest = "a store behind on appends is repaired and later appends still succeed"
+
+  override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
+    if name == storeBehindTest then testHostOptions.copy(transactionHorizon = Duration(3, SECONDS))
+    else testHostOptions
 
   private def ida: IDA = net.ida
 
@@ -404,7 +415,7 @@ trait AppendIntegrationTests:
         _ <- repairUntilCurrent(id, revision, attempts - 1)
       yield ()
 
-  atest("a store behind on appends is repaired and later appends still succeed"):
+  atest(storeBehindTest):
     val rnd = new Random(6)
     val first = List.fill(20)(chunkOf(rnd, 1 + rnd.nextInt(500)))
     val second = List.fill(5)(chunkOf(rnd, 1 + rnd.nextInt(500)))

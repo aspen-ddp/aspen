@@ -17,12 +17,23 @@ import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
 import scala.concurrent.Future
+import scala.concurrent.duration.{Duration, SECONDS}
 import scala.language.implicitConversions
 import scala.util.Random
 
 /** End-to-end coverage of ranged writes against live test networks */
-trait RangedWriteIntegrationTests:
-  this: IntegrationTestSuite =>
+trait RangedWriteIntegrationTests extends IntegrationTestSuite:
+
+  /** Repair leaves an entry while its store may still join the entry's transaction (RepairTarget.mayJoinTransaction),
+    * so the store-behind test waits out each missed transaction's forget floor, about the horizon. A 3 s horizon keeps
+    * it fast; its transactions reach every store within milliseconds. Not below about 2 s, for slack under load
+    * (ReplayIntegrationSuite)
+    */
+  private val storeBehindTest = "a store behind on ranged writes is repaired and later ranged writes still succeed"
+
+  override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
+    if name == storeBehindTest then testHostOptions.copy(transactionHorizon = Duration(3, SECONDS))
+    else testHostOptions
 
   private def ida: IDA = net.ida
 
@@ -317,7 +328,7 @@ trait RangedWriteIntegrationTests:
       bytesShouldMatch(after.data.getByteArray, expected)
       succeed
 
-  atest("a store behind on ranged writes is repaired and later ranged writes still succeed"):
+  atest(storeBehindTest):
     val rnd = new Random(110)
     val R = rowBytes
     val content = chunkOf(rnd, 6 * R + 5)

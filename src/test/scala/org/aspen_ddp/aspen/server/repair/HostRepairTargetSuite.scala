@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
-import scala.concurrent.Promise
+import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration.{Duration, FiniteDuration, SECONDS}
 import scala.util.{Success, Try}
 
@@ -74,6 +74,15 @@ class HostRepairTargetSuite extends IntegrationTestSuite:
       result.isFailure shouldBe true
       result.failed.get shouldBe a [StoreNotHosted]
 
+  /** Runs `f`, handling the host's events until it completes. Under LockstepThreading a store's posted work runs only
+    * when events are handled, so a scan's later steps would otherwise wait for some unrelated event to do it
+    */
+  private def pumpUntilComplete[T](f: Future[T]): Future[T] =
+    if f.isCompleted then
+      f
+    else
+      Future { Thread.sleep(1); net.handleEvents() }.flatMap(_ => pumpUntilComplete(f))
+
   test("a sweep drives the live host's own stores end to end"):
     val clock = AtomicLong(0L)
     val bgTasks = BackgroundTaskManager(scala.concurrent.ExecutionContext.global)
@@ -83,9 +92,9 @@ class HostRepairTargetSuite extends IntegrationTestSuite:
     val testFuture = for
       // The first sweep only admits. The second, past the floor, is the one that scans: it walks
       // each store's real errorTree through the live host rather than a stubbed target.
-      _ <- svc.sweep()
+      _ <- pumpUntilComplete(svc.sweep())
       _ = clock.set(120_000L)
-      _ <- svc.sweep()
+      _ <- pumpUntilComplete(svc.sweep())
     yield
       svc.testingOnlyScanStates.keySet shouldBe net.smgr.repairableStoreIds.toSet
       // Store 0 is never the one TestNetwork makes miss updates, so its scan finds nothing and

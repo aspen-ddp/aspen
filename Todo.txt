@@ -48,12 +48,6 @@ PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.2  Hung backend commit: Req F12                                                                           [S-M]
-     awaitingCommits has no timer, so an FSIF ENOSPC freeze stalls the object forever. Add a long watchdog that
-     votes BackendCommitFailed and keeps the store serving. Never fail-stop for out of space.
-     RocksDBBackend.commit completes only on success (fcommit.foreach), so a failed put hangs its commit the same
-     way. Backlog "Full storage devices".
-
 4.3  Admission vs finalization: X5, CRL F15, R-F14 (+ G10)                                                  [M]
      No admission lane is exempt, so data-pool CRL pressure on a device shared with metadata stores blocks the
      marker writes that would free it. Reserve admission for metadata-pool, marker-batch and TxFinalized

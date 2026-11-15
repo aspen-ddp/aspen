@@ -24,6 +24,13 @@ object Backend:
         msg.contains("disk quota exceeded") || msg.contains("edquot")
     Iterator.iterate(t)(_.getCause).takeWhile(_ != null).take(8).exists(matches)
 
+/** A repair's write of `objectId` failed because the store's slot for it holds a different object, `occupant` (FSIF
+  * slot reuse over a missed delete: cross-document-review X6). The repair never overwrites an occupant: the repairer
+  * drops it once the allocation tree no longer lists it, and the next pass installs `objectId`
+  */
+final class RepairSlotOccupied(val objectId: ObjectId, val occupant: ObjectId)
+  extends Exception(s"Repair of $objectId: its slot holds $occupant")
+
 /** Thrown by a backend's open when the store's acknowledged state cannot be reconstructed: the store must be rebuilt */
 class BackendStateLost(msg: String) extends Exception(msg)
 

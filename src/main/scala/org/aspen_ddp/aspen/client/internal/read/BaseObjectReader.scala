@@ -118,7 +118,7 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
             case Right(_) => t
 
         if (invalidCount >= corruptCount)
-          Some(Left(new InvalidObject(pointer)))
+          Some(Left(new InvalidObject(pointer, provesDeletion = invalidCount > width - ida.writeThreshold)))
         else
           Some(Left(new CorruptedObject(pointer)))
       else
@@ -171,7 +171,7 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
         if refcount.count > 0 then
           Some(Right(MetadataObjectState(pointer, revision, refcount, timestamp, readTime)))
         else
-          Some(Left(InvalidObject(pointer)))
+          Some(Left(InvalidObject(pointer, provesDeletion = true)))
       else
         try
           val restoredObject = restoreObject(revision, refcount, timestamp, readTime, matchingStoreStates, allStoreStates, debug)
@@ -184,7 +184,7 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
           if restoredObject.refcount.count > 0 then
             Some(Right(restoredObject))
           else
-            Some(Left(InvalidObject(pointer)))
+            Some(Left(InvalidObject(pointer, provesDeletion = true)))
         catch
           case NotRestorable(reason) =>
             if (debug)

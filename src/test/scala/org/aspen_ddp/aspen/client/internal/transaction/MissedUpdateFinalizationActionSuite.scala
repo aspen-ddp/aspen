@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedUnackedCommit, MissedUpdate}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, RefcountUpdate, DataUpdate, DataUpdateOperation, ExclusiveRevisionLock, SharedRevisionLock, TransactionDescription, TransactionId}
 
@@ -47,13 +47,13 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
 
   private val missedTimestamp = HLCTimestamp(1000L)
 
-  /** Splits an errorTree value into [missedTimestamp:8][storePointer...], written out here for
-    * the same reason as buildErrorKey.
+  /** Splits an errorTree value into [missedTimestamp:8][objectType:1][storePointer...], written out here for
+    * the same reason as buildErrorKey. Type codes: 0 Data, 1 KeyValue, 2 unknown
     */
-  private def decodeErrorValue(value: Value): (HLCTimestamp, Seq[Byte]) =
+  private def decodeErrorValue(value: Value): (HLCTimestamp, Byte, Seq[Byte]) =
     val bb = ByteBuffer.wrap(value.bytes)
     bb.order(ByteOrder.BIG_ENDIAN)
-    (HLCTimestamp(bb.getLong()), value.bytes.toSeq.drop(8))
+    (HLCTimestamp(bb.getLong()), value.bytes(8), value.bytes.toSeq.drop(9))
 
   private def pointerWith(storePointer: Array[Byte]): DataObjectPointer =
     DataObjectPointer(ObjectId(UUID.randomUUID()), Radicle.poolId, storePointer)
@@ -91,11 +91,11 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entry2 <- pool.errorTree.get(buildErrorKey(net.storeId2, ptr.id))
     yield
       entry0.isDefined shouldBe true
-      decodeErrorValue(entry0.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
+      decodeErrorValue(entry0.get.value) shouldBe ((missedTimestamp, 0.toByte, storePointer.toSeq))
       entry1.isDefined shouldBe true
-      decodeErrorValue(entry1.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
+      decodeErrorValue(entry1.get.value) shouldBe ((missedTimestamp, 0.toByte, storePointer.toSeq))
       entry2.isDefined shouldBe true
-      decodeErrorValue(entry2.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
+      decodeErrorValue(entry2.get.value) shouldBe ((missedTimestamp, 0.toByte, storePointer.toSeq))
 
   atest("storePointer is recovered by id when commitErrors reports the object"):
     val storePointer = Array[Byte](5, 6, 7, 8)
@@ -113,7 +113,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entry <- pool.errorTree.get(buildErrorKey(net.storeId2, ptr.id))
     yield
       entry.isDefined shouldBe true
-      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
+      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, 0.toByte, storePointer.toSeq))
 
   atest("a commitErrors id absent from the txd still records an entry"):
     val ptr = pointerWith(Array[Byte](9, 10))
@@ -131,7 +131,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entry <- pool.errorTree.get(buildErrorKey(net.storeId1, unrelatedId))
     yield
       entry.isDefined shouldBe true
-      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, ObjectPointer.EmptyArray.toSeq))
+      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, 2.toByte, ObjectPointer.EmptyArray.toSeq))
 
   atest("an empty storePointer round-trips after the timestamp"):
     // Guards against a fix that writes an encoded pointer or a length prefix rather than the
@@ -147,7 +147,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entry <- pool.errorTree.get(buildErrorKey(net.storeId0, ptr.id))
     yield
       entry.isDefined shouldBe true
-      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, ObjectPointer.EmptyArray.toSeq))
+      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, 0.toByte, ObjectPointer.EmptyArray.toSeq))
 
   atest("marking the same object twice is idempotent"):
     val storePointer = Array[Byte](11, 12, 13)
@@ -171,7 +171,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     yield
       // The re-mark is for the same miss, not a later one, so the first entry is kept.
       entry.isDefined shouldBe true
-      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
+      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, 0.toByte, storePointer.toSeq))
 
   /** Stages an errorTree write for `poolId` on a fresh transaction, applies limitTracking and
     * returns whether tracking is still enabled. The transaction is aborted afterward.
@@ -203,7 +203,24 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
   private def missed(store: StoreId, objectId: ObjectId = ObjectId(UUID.randomUUID()),
                      timestamp: HLCTimestamp = missedTimestamp,
                      storePointer: Array[Byte] = Array[Byte](1)): MissedUpdate =
-    MissedUpdate(store, objectId, timestamp, storePointer)
+    MissedUpdate(store, objectId, Some(ObjectType.Data), storePointer, timestamp)
+
+  test("an errorTree entry value round-trips the timestamp, the object type and the storePointer"):
+    val oid = ObjectId(new UUID(3, 4))
+    val pool = PoolId(new UUID(5, 6))
+    val ts = HLCTimestamp(123456789L)
+    for (objectType, sp) <- List((Some(ObjectType.Data), Array[Byte](1, 2, 3, 4)), (Some(ObjectType.KeyValue), Array[Byte]()),
+                                 (Some(ObjectType.KeyValue), Array[Byte](9)), (None, Array[Byte](7))) do
+      val e = MissedUpdateFinalizationAction.decodeErrorEntry(
+        MissedUpdateFinalizationAction.encodeErrorEntry(ts, objectType, sp))
+      e.missedTimestamp shouldBe ts
+      e.objectType shouldBe objectType
+      e.storePointer.toList shouldBe sp.toList
+      val ptr = e.pointer(pool, oid)
+      ptr.map(_.objectType) shouldBe objectType
+      ptr shouldBe objectType.map: t =>
+        if t == ObjectType.Data then DataObjectPointer(oid, pool, sp) else KeyValueObjectPointer(oid, pool, sp)
+    succeed
 
   /** A marker whose write transactions wait for `release` if one is given, counting them and whether they track */
   private class ObservedMarker(release: Option[Future[Unit]] = None, maxEntries: Int = 256)
@@ -299,8 +316,8 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       fallingEntry <- pool.errorTree.get(buildErrorKey(net.storeId0, falling))
     yield
       queuedDuringWrite shouldBe 2
-      decodeErrorValue(risingEntry.get.value) shouldBe ((newer, Seq[Byte](7)))
-      decodeErrorValue(fallingEntry.get.value) shouldBe ((newer, Seq[Byte](7)))
+      decodeErrorValue(risingEntry.get.value) shouldBe ((newer, 0.toByte, Seq[Byte](7)))
+      decodeErrorValue(fallingEntry.get.value) shouldBe ((newer, 0.toByte, Seq[Byte](7)))
 
   atest("a backlog larger than a batch takes several writes"):
     val marker = new ObservedMarker(maxEntries = 2)
@@ -674,7 +691,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       _ <- second.mark(List(missed(net.storeId0, objectId, older)))
       after <- pool.errorTree.get(buildErrorKey(net.storeId0, objectId))
     yield
-      decodeErrorValue(after.get.value) shouldBe ((newer, Seq[Byte](7)))
+      decodeErrorValue(after.get.value) shouldBe ((newer, 0.toByte, Seq[Byte](7)))
       after.get.revision shouldBe before.get.revision
       // Nothing left to write: no transaction is committed
       second.commits shouldBe 0
@@ -689,7 +706,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       pool <- client.getStoragePool(Radicle.poolId)
       entry <- pool.errorTree.get(buildErrorKey(net.storeId0, objectId))
     yield
-      decodeErrorValue(entry.get.value) shouldBe ((newer, Seq[Byte](7)))
+      decodeErrorValue(entry.get.value) shouldBe ((newer, 0.toByte, Seq[Byte](7)))
 
   atest("an UnackedCommits entry written again is kept as it was"):
     val txid = TransactionId(UUID.randomUUID())

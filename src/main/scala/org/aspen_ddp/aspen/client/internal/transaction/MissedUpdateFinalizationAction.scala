@@ -5,7 +5,8 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedUnackedCommit, MissedUpdate}
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectType,
+                                           Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, SerializedFinalizationAction, TransactionDescription, TransactionId}
@@ -91,13 +92,13 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     })
   }
 
-  // Records missed updates with the missed transaction's timestamp and storePointer bytes. Object
-  // deletion removes the pool's allocationTree entry, which is the only other place those bytes
-  // are persisted, so without this a repair pass cannot locate a deleted object's per-store state.
+  // Records missed updates with the missed transaction's timestamp, the object's type and its storePointer bytes.
+  // Object deletion removes the pool's allocationTree entry, which is the only other place the pointer is persisted,
+  // so without them a repair pass can neither read an object absent from that tree (to tell a deletion from a late
+  // allocation record) nor locate a deleted object's per-store state.
   //
-  // An empty storePointer means "this object has no storePointer". A repair pass treats it as
-  // "delete by ObjectId alone" rather than as an error, which RocksDB stores still rely on.
-  // See StoreRepairer.repairDeletion in aspen.server.repair.
+  // An empty storePointer means "this object has no storePointer" (RocksDB stores).
+  // See StoreRepairer in aspen.server.repair.
   def markMissedUpdates(): Unit = synchronized {
     if !cancelled then writeMissedUpdates()
   }
@@ -110,14 +111,16 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
       commitErrors.get(storeId) match
         case None =>
           txd.allHostedObjects(storeId).filterNot(ptr => lockOnly.contains(ptr.id))
-            .map(ptr => MissedUpdate(storeId, ptr.id, txd.startTimestamp, ptr.storePointer)) ++ l
+            .map(ptr => MissedUpdate(storeId, ptr.id, Some(ptr.objectType), ptr.storePointer, txd.startTimestamp)) ++ l
         case Some(lst) =>
           // Note: this case is not reachable today (ids in commitErrors come from RequirementsChecker,
           // which only reports r.objectPointer.id from this same txd's requirements), but we handle it
-          // defensively by looking up pointers from allReferencedObjectsSet, falling back to EmptyArray.
+          // defensively by looking up pointers from allReferencedObjectsSet. An id with no pointer is still
+          // recorded, with no type and no storePointer: repair can prove its deletion, never install it
           lst.filterNot(lockOnly.contains).map { objectId =>
-            val storePointer = idToPointer.get(objectId).map(_.storePointer).getOrElse(ObjectPointer.EmptyArray)
-            MissedUpdate(storeId, objectId, txd.startTimestamp, storePointer)
+            idToPointer.get(objectId) match
+              case Some(ptr) => MissedUpdate(storeId, objectId, Some(ptr.objectType), ptr.storePointer, txd.startTimestamp)
+              case None => MissedUpdate(storeId, objectId, None, ObjectPointer.EmptyArray, txd.startTimestamp)
           } ++ l
     }
 
@@ -239,28 +242,52 @@ object MissedUpdateFinalizationAction extends RegisteredTypeFactory with Finaliz
         maxAge = 0
         Some(text)
 
-  /** An errorTree entry's value: the missed transaction's start timestamp, big-endian, then the
-    * object's storePointer bytes (possibly empty).
+  /** An errorTree entry's value: the missed transaction's start timestamp, big-endian, the object's type (one byte:
+    * 0 Data, 1 KeyValue, 2 unknown), then the object's storePointer bytes (possibly empty).
     *
     * The timestamp is the one a store gives the object when it applies that transaction, so a
     * repair that installs a state at least that new has caught the store up past the miss. The
     * entry's own key timestamp cannot serve: it belongs to the later transaction that wrote it.
+    *
+    * With the pool (the tree's) and the ObjectId (the key), the type and storePointer rebuild the object's pointer
+    * (ErrorEntry.pointer). Repair needs it to read an object absent from the allocation tree, which is the only other
+    * place the pointer is kept: the read is what tells a deletion from an allocation recorded late (repair F5). The
+    * type is unknown only for a commit error on an object the transaction does not reference, which
+    * RequirementsChecker never reports
     */
-  def encodeErrorEntry(missedTimestamp: HLCTimestamp, storePointer: Array[Byte]): Value =
-    val bb = ByteBuffer.allocate(HLCTimestamp.EncodedSize + storePointer.length)
+  def encodeErrorEntry(missedTimestamp: HLCTimestamp, objectType: Option[ObjectType.Value],
+                       storePointer: Array[Byte]): Value =
+    val bb = ByteBuffer.allocate(HLCTimestamp.EncodedSize + 1 + storePointer.length)
     bb.order(ByteOrder.BIG_ENDIAN)
     bb.putLong(missedTimestamp.asLong)
+    bb.put(objectType match
+      case Some(ObjectType.Data) => 0.toByte
+      case Some(_) => 1.toByte
+      case None => 2.toByte)
     bb.put(storePointer)
     Value(bb.array())
 
-  /** Inverse of `encodeErrorEntry`: the missed transaction's timestamp and the storePointer */
-  def decodeErrorEntry(value: Value): (HLCTimestamp, Array[Byte]) =
+  /** Inverse of `encodeErrorEntry`. Throws on a value too short or with an unknown type code */
+  def decodeErrorEntry(value: Value): ErrorEntry =
     val bb = ByteBuffer.wrap(value.bytes)
     bb.order(ByteOrder.BIG_ENDIAN)
     val ts = HLCTimestamp(bb.getLong())
+    val objectType = bb.get() match
+      case 0 => Some(ObjectType.Data)
+      case 1 => Some(ObjectType.KeyValue)
+      case 2 => None
+      case c => throw new IllegalArgumentException(s"Unknown object type code $c in an errorTree entry")
     val storePointer = new Array[Byte](bb.remaining())
     bb.get(storePointer)
-    (ts, storePointer)
+    ErrorEntry(ts, objectType, storePointer)
+
+  /** A decoded errorTree entry value (encodeErrorEntry) */
+  final case class ErrorEntry(missedTimestamp: HLCTimestamp, objectType: Option[ObjectType.Value],
+                              storePointer: Array[Byte]):
+    /** The object's pointer: its pool is the tree's, its id the entry key's. None when the type is unknown */
+    def pointer(poolId: PoolId, objectId: ObjectId): Option[ObjectPointer] = objectType.map:
+      case ObjectType.Data => DataObjectPointer(objectId, poolId, storePointer)
+      case _ => KeyValueObjectPointer(objectId, poolId, storePointer)
 
   def createFinalizationAction(client: AspenClient,
                                txd: TransactionDescription,

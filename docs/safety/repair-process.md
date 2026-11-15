@@ -661,8 +661,8 @@ Numbered for review; the code that enforces each is in section 7. "Holds" means 
 | E5 | Repair never lowers a refcount's `updateSerial`; it never installs a refcount while an object-level lock is reported. | Holds (M7) |
 | E6 | Repair never installs an older DataObject revision over a newer one the store has applied: data requires `current.revision == snapshot.revision`, `read.revision != current.revision`, `read.timestamp >= current.timestamp`. | Holds if object timestamps order revisions: true for DataObjects, which check `timestamp > txTimestamp` on every revision-bearing update (Q8). An older read with a differing revision is now reported stale (F13), so the entry is never dropped on it |
 | E7 | Repair never creates a copy of an object without installing its refcount, never while the object-level part is locked, never if the store deleted it after the snapshot. | Holds (M9) |
-| E8 | An ErrorTree/UnackedCommits entry is removed only if (a) the object was reconciled completely (`complete`), or (b) the object was absent from the AllocationTree for an entry at least `minErrorEntryAgeForDeletion` old and `repairDelete` succeeded. | Holds in the code; (b) is a heuristic (F5) |
-| E9 | An entry is removed only if it has not been rewritten since the scan read it (ErrorTree/UnackedCommits via `deleteEntryIfUnchanged`). | Holds except branch (b) of E8, which uses unguarded `deleteEntry` (F5) |
+| E8 | An ErrorTree/UnackedCommits entry is removed only if (a) the object was reconciled completely (`complete`), or (b) the object was absent from the AllocationTree for an entry at least `minErrorEntryAgeForDeletion` old, a read of it proved it deleted (`InvalidObject.provesDeletion`), and `repairDelete` succeeded. | Holds (F5 **FIXED** 2026-11-14: (b) was absence alone) |
+| E9 | An entry is removed only if it has not been rewritten since the scan read it (ErrorTree/UnackedCommits via `deleteEntryIfUnchanged`). | Holds |
 | E10 | An entry whose repair fails (read fails, promise fails, store left, backend write fails, `stale`, any deferral) stays. | Holds |
 | E11 | A UnackedCommits entry is not acted on while the store holds that transaction live or is loading CRL state. | Holds (M11) |
 | E12 | Repair transactions never create new entries. | Holds for proofs and entry deletions; the cost is F7 |
@@ -840,7 +840,7 @@ completion gate are unchanged.
 | F1, F2 | unchanged | Opportunistic rebuild paths untouched | `Frontend.scala` rebuild path, `Tx.scala:429-441` |
 | F3 | **narrowed** 2026-11-14 | Applies take the max object timestamp (requirements F4); the gate still relies on copied timestamps (X7) | `RequirementsApplyer.apply` |
 | F4 | **narrowed** | TKVL deletes now carry `KeyRevision(k, rev)`, so a delete of k at a store where k is absent fails at apply, is reported and marked instead of applying as an invisible no-op; blind deletes unchanged. *2026-11-14:* `TransactionBuilder` refuses blind deletes (`BlindKeyValueWrite`), so the invisible no-op needs a client that bypasses the builder | `KeyValueListNode.scala:505-506`; `RequirementsChecker.scala:141` |
-| F5 | unchanged | Absence heuristic unchanged; the allocation action never skips an entry now (Ruling 28), which does not shorten its delay | `StoreRepairer.scala:249-256` |
+| F5 | unchanged (**FIXED** 2026-11-14, Todo 2.6, see the note under F5) | Absence heuristic unchanged at the time; the allocation action never skips an entry now (Ruling 28), which does not shorten its delay | `StoreRepairer.scala:249-256` |
 | F6 | unchanged (**FIXED** 2026-11-14, see 13.2) | `deleteObjectForRepair` untouched | |
 | F7 | unchanged | Entry deletions still untracked; `deleteEntry` now pins on `KeyRevision` of the value read | `StoreRepairer.scala` |
 | F8, F9 | unchanged (load larger) | More entries per store (R-N4 in transaction-recovery) | |
@@ -886,7 +886,7 @@ head first".
 | F2 | Opportunistic and pre-transaction rebuild overwrite whole KeyValue content when revisions are equal, regressing blind writes applied since the read | high if real | medium |
 | F3 | Completion gate `read.timestamp >= missedTimestamp` assumes monotone timestamps; blind KV writes and refcount updates break that | medium (livelock of one entry) | medium |
 | F4 | **FIXED** 2026-11-14 (stores refuse blind writes). A blind key delete applied as a no-op at the store between snapshot and install is invisible to the snapshot check, so repair re-creates the deleted key at that store | medium | medium |
-| F5 | `repairDelete` on allocation absence: object live but not yet in the AllocationTree for over 60 s loses the store's slice and the entry (unguarded delete) | medium impact, low probability | low-medium |
+| F5 | **FIXED** 2026-11-14 (a read decides). `repairDelete` on allocation absence: object live but not yet in the AllocationTree for over 60 s loses the store's slice and the entry (unguarded delete) | medium impact, low probability | low-medium |
 | F6 | **FIXED** 2026-11-14. `repairDelete` has no in-flight/pending-read guard | low | low |
 | F7 | Repair's entry-deletion transaction has tracking disabled unconditionally, so a store missing it is never marked | low | medium |
 | F8 | `stale` outcomes never escalate: a hot or perpetually busy object is retried forever | medium (resource), low-medium | medium |
@@ -978,6 +978,30 @@ medium (needs the delete inside the read-to-install window, and a blind delete o
 
 > **Verification 2026-11-09: PLAUSIBLE. Severity: data-loss (one replica slice).** Mechanism verified: absence from the AllocationTree + entry value timestamp older than minErrorEntryAgeForDeletion (60 s) => repairDeletion + unguarded deleteEntry (StoreRepairer.scala:182-195, 230-236; Frontend.deleteObjectForRepair :822-828 just discards and deletes). Bootstrap objects are registered in the tree (Bootstrap.scala:128-166), so only an allocation recorded >60 s late (stuck AllocationFinalizationAction, e.g. paired with recovery F2) triggers it.
 > *Fix sketch:* Confirm deletion through the pool (refcount read / deletion log) before removing a slice; keep the entry on doubt.
+
+> **Fixed 2026-11-14 (Todo 2.6).** Absence from the AllocationTree no longer counts as a deletion. Once the entry is
+> older than `minErrorEntryAgeForDeletion`, `StoreRepairer.repairAbsent` reads the object through its pool:
+> - A read whose `InvalidObject.provesDeletion` is set drops the slice and the entry. That needs more than
+>   `width - writeThreshold` stores answering `ObjectNotFound`/`ObjectMismatch`, or a consistent majority at refcount
+>   0. A committed live object is on at least writeThreshold stores, and every IDA requires writeThreshold ≥
+>   consistentRestoreThreshold. A read that ended on `StoreNotFound` replies proves nothing.
+> - A read that restores the object shows it live: it is reconciled like a listed object, so a store that missed the
+>   allocation itself gets the slice too.
+> - Anything else (a timeout, `CorruptedObject`) keeps the entry.
+>
+> ErrorTree values carry the object's type (`[ts:8][type:1][storePointer]`), so the pointer can be rebuilt from the
+> tree's pool, the key's ObjectId and the value. The fix also answers this finding's open question: the reader now
+> tells "proven absent" apart from a read that gave up.
+>
+> Residuals:
+> - An object already below writeThreshold live copies, for example through an earlier loss, reads as deleted, and
+>   its last slices are dropped. It was unreadable already.
+> - An ErrorTree entry of unknown type (a commit error on an object the transaction does not reference, which
+>   RequirementsChecker never reports) is acted on only for a proven deletion. A live one is logged and left.
+>
+> Tests: StoreRepairerSuite "an aged errorTree entry for a live object the allocation tree does not list repairs it,
+> not deletes it", "an aged UnackedCommits entry for a live object ...", "an aged entry of unknown type is deleted
+> only on a proof, and a live one is left"; DataObjectReaderSuite "InvalidObject proves a deletion only when ...".
 
 **F5. Allocation-absence heuristic** (`StoreRepairer.scala:184-199,233-239,399-402`).
 Absent from the AllocationTree plus an entry older than 60 s is taken as "deleted". If the allocating transaction's

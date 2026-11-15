@@ -18,7 +18,7 @@ import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.DurableFiles
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitError, CommitState, CompletionHandler, Read,
-  UpdateForm}
+  RepairSlotOccupied, UpdateForm}
 
 /** A store backend that keeps every object slice in a fixed-size segment of one flat `data` file, located through an
   * in-memory index map that is journaled and checkpointed. See docs/superpowers/specs/2026-10-29-fsif-backend-design.md.
@@ -373,7 +373,14 @@ class FsifBackend(val storeId: StoreId,
 
   override def repair(state: CommitState, complete: Promise[Unit]): Unit =
     post(admitted(appendBound(state.data.size)): release =>
-      update(state, repairing = true, promiseReply(complete, s"repair of ${state.objectId}"), release))
+      // A foreign occupant of the slot fails the repair with RepairSlotOccupied, naming it, so the repairer can drop it
+      var occupiedBy = Option.empty[ObjectId]
+      val generic = promiseReply(complete, s"repair of ${state.objectId}")
+      val reply: Reply =
+        case Right(CommitError.ObjectMismatch) if occupiedBy.isDefined =>
+          complete.tryFailure(new RepairSlotOccupied(state.objectId, occupiedBy.get))
+        case r => generic(r)
+      update(state, repairing = true, reply, release, occupant => occupiedBy = Some(occupant)))
 
   override def repairDelete(objectId: ObjectId, storePointer: Array[Byte], complete: Promise[Unit]): Unit =
     post(admitted(MappingAppendSize): release =>
@@ -1245,7 +1252,8 @@ class FsifBackend(val storeId: StoreId,
   // ---- Commit and repair ----
 
   /** `release` is called with the first reply: the journal hard limit stops counting the commit's bound */
-  private def update(state: CommitState, repairing: Boolean, reply0: Reply, release: () => Unit): Unit =
+  private def update(state: CommitState, repairing: Boolean, reply0: Reply, release: () => Unit,
+                     onForeignOccupant: ObjectId => Unit = _ => ()): Unit =
     var replied = false
     val wasThrottled = unappliedBytes > tuning.unappliedBound
     val reply: Reply = r =>
@@ -1265,19 +1273,21 @@ class FsifBackend(val storeId: StoreId,
             if state.data.size > layout.segmentPayloadSize then
               reply(Right(CommitError.SliceTooLarge))
             else
-              withExt(x)(replyOnError(reply)(updateExt(x, state, repairing, reply)))
+              withExt(x)(replyOnError(reply)(updateExt(x, state, repairing, reply, onForeignOccupant)))
     catch
       case NonFatal(t) =>
         reply(Right(CommitError.IOFailure))
         throw t
 
   /** The commit decision table, run once X has no copy-on-write in progress */
-  private def updateExt(x: Int, state: CommitState, repairing: Boolean, reply: Reply): Unit =
+  private def updateExt(x: Int, state: CommitState, repairing: Boolean, reply: Reply,
+                        onForeignOccupant: ObjectId => Unit): Unit =
     val id = state.objectId
     val slot = index.slots(x)
     val occupant = index.ids(x)
     // Ruling 18: Frontend repairs a missed allocation with allocating = false, so a repair allocates an unmapped X.
-    // A repair never overwrites a different occupant: that missed delete heals first through repairDelete.
+    // A repair never overwrites a different occupant: it reports the occupant (RepairSlotOccupied), and the repairer
+    // drops it through repairDelete once the allocation tree no longer lists it (cross-document-review X6).
     val allocating = if repairing then slot < 0 else state.allocating
     if abandoned then
       () // released from behind a gate after an abandoning close: never completes, as if the store had crashed
@@ -1290,6 +1300,7 @@ class FsifBackend(val storeId: StoreId,
       else
         deleteExt(x, reply)
     else if !allocating && (slot < 0 || occupant != id) then
+      if repairing && slot >= 0 then onForeignOccupant(occupant)
       reply(Right(CommitError.ObjectMismatch))
     else
       if allocating && slot >= 0 && occupant != id then

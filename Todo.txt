@@ -36,13 +36,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.6  Absence from the AllocationTree treated as deletion: Repair F5, X6 residual, Rebuild F18               [M]
-     An allocation-tree record more than 60 s late makes repair delete a live slice and its entry, which only a
-     full rebuild restores. FSIF updateExt returns ObjectMismatch forever over a foreign occupant, so a missed
-     delete blocks repair of a reused slot. Fix: confirm the deletion authoritatively (a pool read showing
-     refcount 0 or absence at a read threshold) before repairDelete, and keep the entry on doubt. When a repair
-     of N meets a foreign occupant that the tree no longer lists, drop the occupant.
-
 2.7  Rebuild completion identity: Rebuild F3, F4                                                            [S]
      start() treats any directory at the final path as a finished rebuild (F3). A crash between the staging move
      and the flip leaves a loadable store that serves as a blank acceptor (F4). Fix: write a rebuild-complete

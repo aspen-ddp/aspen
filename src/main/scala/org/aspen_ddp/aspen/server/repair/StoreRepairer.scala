@@ -2,8 +2,8 @@ package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.common.metadata.HostId
 
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ReadLocks, StoragePool, Transaction,
-                                   ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, KeyValueObjectState, ReadLocks, StoragePool,
+                                   Transaction, ObjectState as ClientObjectState}
 import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateFinalizationAction, UnackedCommitEntry}
 import org.aspen_ddp.aspen.client.tkvl.{KeyValueListNode, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.HLCTimestamp
@@ -12,6 +12,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjec
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.{Frontend, ReconcileResult, RepairSnapshot}
+import org.aspen_ddp.aspen.server.store.backend.RepairSlotOccupied
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import scribe.Logging
@@ -316,40 +317,39 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       Future.unit.flatMap: _ =>
         counts.seen.incrementAndGet()
         val objectId = decodeObjectId(key)
-        val (missedTimestamp, storePointer) = MissedUpdateFinalizationAction.decodeErrorEntry(value.value)
+        val errorEntry = MissedUpdateFinalizationAction.decodeErrorEntry(value.value)
         val entryKey = errorDeferralKey(key, value.revision)
         counts.touch(List(entryKey))
+
+        def completed(complete: Boolean): Future[Unit] =
+          if complete then
+            deferral.clear(entryKey)
+            deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key)
+              .map(_ => counts.repaired.incrementAndGet())
+          else
+            counts.deferred.incrementAndGet()
+            Future.unit
 
         for
           oAllocation <- pool.allocationTree.get(Key(objectId.toBytes))
           _ <- oAllocation match
             case Some(allocation) =>
-              repairUpdate(storeId, ObjectPointer(allocation.value.bytes), missedTimestamp, entryKey, policy,
-                           deferral, allowProof = true).flatMap: result =>
-                if result.complete then
-                  deferral.clear(entryKey)
-                  deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key)
-                    .map(_ => counts.repaired.incrementAndGet())
-                else
-                  counts.deferred.incrementAndGet()
-                  Future.unit
+              repairUpdate(storeId, ObjectPointer(allocation.value.bytes), errorEntry.missedTimestamp, entryKey, policy,
+                           deferral, allowProof = true).flatMap(result => completed(result.complete))
 
             case None =>
               // Absent from the allocation tree means either the object was deleted or its
-              // allocation has yet to be recorded. Only the first is safe to act on; the age of
-              // the error entry is what tells them apart.
+              // allocation has yet to be recorded. Only an entry old enough is looked at, and then
+              // a read of the object decides (repairAbsent).
               if errorEntryMayBeDeleted(value.timestamp, HLCTimestamp.now,
                                         policy.minErrorEntryAgeForDeletion) then
-                // The entry value holds the storePointer bytes captured when the update was
-                // missed -- the only surviving copy, since deletion removed the allocation tree
-                // entry. Empty means "delete by ObjectId alone".
-                repairDeletion(storeId, objectId, storePointer).flatMap: deleted =>
-                  if deleted then
-                    deleteEntryIfUnchanged(storeId.poolId, pool.errorTree, value.revision, key)
-                      .map(_ => counts.repaired.incrementAndGet())
-                  else
-                    counts.deferred.incrementAndGet()
-                    Future.unit
+                // The pointer comes from the entry: deletion removed the allocation tree entry. An entry of unknown
+                // type is read as a DataObject: only a read that proves the deletion is acted on then, and error
+                // replies decode nothing
+                val ptr = errorEntry.pointer(storeId.poolId, objectId)
+                repairAbsent(storeId, ptr.getOrElse(DataObjectPointer(objectId, storeId.poolId, errorEntry.storePointer)),
+                             errorEntry.missedTimestamp, entryKey, policy, deferral, typeKnown = ptr.isDefined)
+                  .flatMap(completed)
               else
                 logger.debug(s"Deferring repair of $objectId on $storeId: absent from the " +
                              s"allocation tree but its error entry is too recent to treat as a " +
@@ -362,11 +362,11 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * T was finalized, so it may be owed T. The entry names every object of the store that T changes, traced or
     * traceless; it may also be left over after the store applied T late, and reconciling such objects is a no-op.
     * Skipped while the store holds T live: its Tx applies T (recovery). Otherwise each
-    * object is reconciled, or deleted from the store when its allocation is gone. As for errorTree entries, that
-    * needs the entry to be older than `policy.minErrorEntryAgeForDeletion`: an allocation's RefcountUpdate is
-    * traceless, so a store that missed it gets an entry before AllocationFinalizationAction records the allocation,
-    * and an object absent from the allocation tree meanwhile is live. A younger one is left for a later pass. The
-    * entry is deleted once every object is complete.
+    * object is reconciled, or, when the allocation tree does not list it, handled by repairAbsent. As for errorTree
+    * entries, that needs the entry to be older than `policy.minErrorEntryAgeForDeletion`: an allocation's
+    * RefcountUpdate is traceless, so a store that missed it gets an entry before AllocationFinalizationAction records
+    * the allocation, and an object absent from the allocation tree meanwhile is live. A younger one is left for a
+    * later pass. The entry is deleted once every object is complete.
     */
   private def repairUnackedEntry(pool: StoragePool, storeId: StoreId, policy: RepairPolicy,
                                    deferral: DeferralState, counts: Counts)
@@ -394,7 +394,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
               pool.allocationTree.get(Key(ptr.id.toBytes)).flatMap:
                 case None if errorEntryMayBeDeleted(value.timestamp, HLCTimestamp.now,
                                                     policy.minErrorEntryAgeForDeletion) =>
-                  repairDeletion(storeId, ptr.id, ptr.storePointer).map(deleted => allComplete && deleted)
+                  repairAbsent(storeId, ptr, entry.timestamp, entryKey, policy, deferral)
+                    .map(complete => allComplete && complete)
                 case None =>
                   logger.debug(s"Deferring repair of ${ptr.id} on $storeId: absent from the allocation tree but its " +
                                s"UnackedCommits entry is too recent to treat as a deletion")
@@ -417,6 +418,61 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
               counts.deferred.incrementAndGet()
               Future.unit
 
+  /** Repairs an object of an entry old enough (errorEntryMayBeDeleted) that the allocation tree does not list.
+    * Absence alone does not prove a deletion: the allocating transaction's AllocationFinalizationAction may simply be
+    * late (repair F5), and deleting the slice of a live object would leave the store short with no record of it. So
+    * the object is read through its pool:
+    *  - a read that proves it is not live (InvalidObject.provesDeletion) drops it from the store;
+    *  - a read that restores it shows it live: it is reconciled as if the tree listed it;
+    *  - anything else (a read that times out, a corrupted object, a failure that proves nothing) leaves the entry.
+    * Without `typeKnown` (an errorTree entry recording no type) `ptr` is a guess, so only a proven deletion is acted on.
+    * True when the entry's work on the object is done.
+    */
+  private def repairAbsent(storeId: StoreId, ptr: ObjectPointer, minTimestamp: HLCTimestamp, entryKey: Key,
+                           policy: RepairPolicy, deferral: DeferralState,
+                           typeKnown: Boolean = true): Future[Boolean] =
+    readObject(ptr).map(_ => Some(true))
+      .recover:
+        case e: InvalidObject if e.provesDeletion => Some(false)
+        case err =>
+          logger.info(s"Deferring repair of ${ptr.id} on $storeId: absent from the allocation tree, and a read of " +
+                      s"it neither restores it nor proves it deleted: $err")
+          None
+      .flatMap:
+        case Some(false) => repairDeletion(storeId, ptr.id, ptr.storePointer)
+        case Some(true) if !typeKnown =>
+          logger.error(s"Object ${ptr.id} on $storeId is live but absent from the allocation tree, and its entry " +
+                       s"records no object type: leaving the entry")
+          Future.successful(false)
+        case Some(true) =>
+          logger.warn(s"Object ${ptr.id} on $storeId is live but absent from the allocation tree: repairing it")
+          repairUpdate(storeId, ptr, minTimestamp, entryKey, policy, deferral, allowProof = true).map(_.complete)
+        case None => Future.successful(false)
+
+  private def readObject(ptr: ObjectPointer): Future[ClientObjectState] = ptr match
+    case kp: KeyValueObjectPointer => client.read(kp)
+    case dp: DataObjectPointer => client.read(dp)
+
+  /** The store's slot for `ptr`, a live object (just read), holds `occupant` (Backend.RepairSlotOccupied): FSIF slot
+    * reuse over a missed delete of the occupant (cross-document-review X6, rebuild F18). Two live objects never share
+    * a slot, so the occupant is dead; it is dropped once the allocation tree does not list it either, by an
+    * id-checked repairDelete. The repair of `ptr` is left stale, so its entry stays and the next pass installs it.
+    * A listed occupant is an inconsistency nothing here can settle: it is logged and left.
+    */
+  private def dropOccupant(storeId: StoreId, ptr: ObjectPointer, occupant: ObjectId): Future[Unit] =
+    for
+      pool <- client.getStoragePool(ptr.poolId)
+      listed <- pool.allocationTree.get(Key(occupant.toBytes))
+      _ <-
+        if listed.isDefined then
+          logger.error(s"Repair of ${ptr.id} on $storeId: its slot holds $occupant, which the allocation tree " +
+                       s"still lists. Leaving both")
+          Future.unit
+        else
+          logger.warn(s"Repair of ${ptr.id} on $storeId: its slot holds $occupant, a deleted object. Dropping it")
+          repairDeletion(storeId, occupant, ptr.storePointer).map(_ => ())
+    yield ()
+
   /** Reconciles the store's copy of the object with a read of it (Reconcile): snapshot the store, read, then install
     * what still matches the snapshot. A read older than `minTimestamp`, the update the entry records, comes back as a
     * stale result, so `complete` says exactly whether the entry may be dropped. The result is recorded in `deferral`
@@ -434,8 +490,12 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     def reconcile(snap: RepairSnapshot, os: ClientObjectState): Future[ReconcileResult] =
       val reconciled = Promise[ReconcileResult]()
       target.reconcile(storeId, snap, os, reconciled)
-      reconciled.future.map: installed =>
-        if os.timestamp >= minTimestamp then installed else installed.copy(stale = true)
+      reconciled.future
+        .map: installed =>
+          if os.timestamp >= minTimestamp then installed else installed.copy(stale = true)
+        .recoverWith:
+          case e: RepairSlotOccupied =>
+            dropOccupant(storeId, ptr, e.occupant).map(_ => ReconcileResult(Set(), false, stale = true))
 
     for
       taken <- snapshot.future
@@ -443,9 +503,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       // a later untracked write the store missed records nothing, so `complete` must mean the whole copy matches
       snap = taken.copy(only = if allowProof then deferral.deferredKeys(entryKey) else None)
       // A full read: only full reads report the stores' locks
-      os <- ptr match
-        case kp: KeyValueObjectPointer => client.read(kp)
-        case dp: DataObjectPointer => client.read(dp)
+      os <- readObject(ptr)
       _ <- testingOnlyBeforeReconcile(storeId, ptr)
       first <- reconcile(snap, os)
       passes = deferral.record(entryKey, first)
@@ -573,8 +631,8 @@ object StoreRepairer:
     val lsb = bb.getLong()
     ObjectId(new UUID(msb, lsb))
 
-  /** Whether an errorTree entry has sat long enough that its object's absence from the
-    * allocation tree can be read as proof of deletion.
+  /** Whether an errorTree or UnackedCommits entry has sat long enough that its object's absence
+    * from the allocation tree is worth a read to tell whether it was deleted (StoreRepairer.repairAbsent).
     *
     * An absent allocationTree entry has two possible meanings: the object was deleted, or the
     * allocating transaction's AllocationFinalizationAction has not landed yet -- it runs
@@ -582,8 +640,9 @@ object StoreRepairer:
     * both may re-run after a crash. Acting on the second case would drop the errorTree entry for
     * a live object, leaving the store silently short a slice with no record of it.
     *
-    * Repair is explicitly not latency sensitive, so we wait long enough to make that race
-    * implausible. Waiting costs one more pass; guessing wrong costs a replica.
+    * The read decides, but just after an allocation commits it can report the object missing
+    * while its stores have yet to apply it, so the read waits for the entry to age. Repair is
+    * not latency sensitive: waiting costs one more pass.
     *
     * A future dated entry yields a negative age and is therefore ineligible, which is what we
     * want -- clock skew is not evidence that anything was deleted.

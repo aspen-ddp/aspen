@@ -25,6 +25,10 @@
   transaction changes (a lock changes nothing, so there is nothing to repair and the object's timestamp would not
   catch up). A client's `MissedUpdateMarker` writes one batch per pool at a time and merges waiting entries by key,
   so a slow spell makes batches larger rather than adding colliding writes. Repair: `server/repair/CLAUDE.md`
+- ErrorTree entry: key `[poolIndex:1][objectId:16]`, value `[missedTimestamp:8][objectType:1][storePointer]`
+  (`encodeErrorEntry`; type 0 Data, 1 KeyValue, 2 unknown). With the tree's pool these rebuild the object's pointer
+  (`ErrorEntry.pointer`), which repair needs to read an object the AllocationTree no longer lists (repair F5). The type
+  is unknown only for a commit error on an object the transaction does not reference (not reachable today)
 - Marker entries only move forward (repair F10): its puts are conditional checked inserts (`TKVLInsert.replaces`). An
   ErrorTree mark replaces a held one only for a later `missedTimestamp`; an UnackedCommits entry is written only
   where none is held, so a re-write never moves its revision under the scan's delete. Two clients marking one key at

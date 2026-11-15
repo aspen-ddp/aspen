@@ -5,7 +5,7 @@ import java.nio.{ByteBuffer, ByteOrder}
 import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, StoragePool, Transaction, TransactionCreationError}
 import org.aspen_ddp.aspen.client.tkvl.{NodeSizeExceeded, TKVLInsert}
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -21,8 +21,9 @@ object MissedUpdateMarker:
   /** A store missed `missedTimestamp`'s update of an object */
   final case class MissedUpdate(store: StoreId,
                                 objectId: ObjectId,
-                                missedTimestamp: HLCTimestamp,
-                                storePointer: Array[Byte])
+                                objectType: Option[ObjectType.Value],
+                                storePointer: Array[Byte],
+                                missedTimestamp: HLCTimestamp)
 
   /** A store owes a commit it voted on and did not acknowledge, for some of its objects */
   final case class MissedUnackedCommit(store: StoreId, transactionId: TransactionId, entry: UnackedCommitEntry)
@@ -146,9 +147,9 @@ class MissedUpdateMarker(client: AspenClient,
     // reach the newest miss, so an older one must not overwrite it. A held value that does not decode is replaced
     val inserts = updates.map: u =>
       def replaces(held: Value): Boolean =
-        Try(MissedUpdateFinalizationAction.decodeErrorEntry(held)._1 < u.missedTimestamp).getOrElse(true)
+        Try(MissedUpdateFinalizationAction.decodeErrorEntry(held).missedTimestamp < u.missedTimestamp).getOrElse(true)
       TKVLInsert(errorKey(u.store, u.objectId),
-                 MissedUpdateFinalizationAction.encodeErrorEntry(u.missedTimestamp, u.storePointer),
+                 MissedUpdateFinalizationAction.encodeErrorEntry(u.missedTimestamp, u.objectType, u.storePointer),
                  replaces = Some(replaces))
 
     // An entry too large for half a node (a transaction changing many objects on one store) is written as chunks,

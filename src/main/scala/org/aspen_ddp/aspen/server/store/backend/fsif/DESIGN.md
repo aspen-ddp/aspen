@@ -163,7 +163,9 @@ table:
 | otherwise | journaled |
 
 For `repair`, `allocating` is `slot < 0`. A repair allocates an unmapped X and never overwrites a different
-occupant (Ruling 18).
+occupant (Ruling 18). Over a different occupant it fails with `RepairSlotOccupied(objectId, occupant)` instead of a
+plain `ObjectMismatch`, so the repairer can drop the occupant once the AllocationTree no longer lists it
+(cross-document-review X6).
 
 **Journaled** (`journaled`, `appendDelta`).
 - **Update of the current occupant:** append `Delta(X, slot, header, ranges)`. The ranges come from `rangesOf`:
@@ -540,7 +542,7 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
 - **Tests:** `FsifBackendSuite` "appends into a reused slot never expose the previous occupant", "a non-allocating
   commit to an unmapped or differently occupied ext is ObjectMismatch", "allocating over a missed delete replaces
   the occupant, journaled or copy-on-write", "repairDelete of a stale ObjectId leaves the new occupant readable",
-  and "repair at an ext held by a different object fails with the mismatch".
+  and "repair at an ext held by a different object fails naming the occupant, and succeeds once it is dropped".
 
 ### 3.11 Idempotent recovery
 - **Rule:** every step of `FsifRecovery.recover` falls into one of three kinds:

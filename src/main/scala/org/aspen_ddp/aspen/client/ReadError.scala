@@ -13,8 +13,15 @@ sealed abstract class ReadError(msg: String) extends AspenError(msg) {
 
 sealed abstract class FatalReadError(msg: String) extends ReadError(msg)
 
-/** Thrown when the requested object is not found. */
-class InvalidObject(val pointer: ObjectPointer) extends FatalReadError("InvalidObject")
+/** Thrown when the requested object is not found.
+  *
+  * @param provesDeletion the replies prove the object is not live: a consistent majority restored it at refcount 0,
+  *                       or more than `width - writeThreshold` stores answered that they do not hold it. A committed
+  *                       live object sits on at least writeThreshold stores, so neither can come from one. False when
+  *                       the read gave up on other errors (StoreNotFound, say), which say nothing of the object
+  */
+class InvalidObject(val pointer: ObjectPointer, val provesDeletion: Boolean = false)
+  extends FatalReadError("InvalidObject")
 
 /** Thrown when the object content becomes corrupted. */
 class CorruptedObject(val pointer: ObjectPointer) extends FatalReadError("CorruptedObject")

@@ -13,6 +13,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Ke
                                            ObjectPointer, ObjectRefcount, Value}
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
+import org.aspen_ddp.aspen.server.store.backend.RepairSlotOccupied
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -39,12 +40,15 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     Key(bb.array())
 
   /** Duplicated rather than shared with MissedUpdateFinalizationAction for the same reason as
-    * buildErrorKey: [missedTimestamp:8][storePointer...], big-endian.
+    * buildErrorKey: [missedTimestamp:8][objectType:1][storePointer...], big-endian. Type codes: 0 Data, 1 KeyValue,
+    * 2 unknown. The objects these tests allocate are KeyValue objects
     */
-  private def buildErrorValue(missedTimestamp: HLCTimestamp, storePointer: Array[Byte]): Value =
-    val bb = ByteBuffer.allocate(8 + storePointer.length)
+  private def buildErrorValue(missedTimestamp: HLCTimestamp, storePointer: Array[Byte],
+                              objectType: Byte = 1): Value =
+    val bb = ByteBuffer.allocate(8 + 1 + storePointer.length)
     bb.order(ByteOrder.BIG_ENDIAN)
     bb.putLong(missedTimestamp.asLong)
+    bb.put(objectType)
     bb.put(storePointer)
     Value(bb.array())
 
@@ -87,13 +91,29 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     * TestNetwork, and the entry's shape is all StoreRepairer cares about.
     */
   private def seedErrorEntry(objectId: ObjectId, storePointer: Array[Byte],
-                             missedTimestamp: HLCTimestamp = HLCTimestamp.Zero): Future[Unit] =
+                             missedTimestamp: HLCTimestamp = HLCTimestamp.Zero, objectType: Byte = 1): Future[Unit] =
     errorTree.flatMap: tree =>
       val tx: Transaction = TestTransactions.replaySafe(client.newRepairTransaction())
       given Transaction = tx
       tx.replaySafe("test")
-      tree.set(buildErrorKey(0.toByte, objectId), buildErrorValue(missedTimestamp, storePointer)).flatMap: _ =>
-        tx.commit().map(_ => ())
+      tree.set(buildErrorKey(0.toByte, objectId), buildErrorValue(missedTimestamp, storePointer, objectType))
+        .flatMap: _ =>
+          tx.commit().map(_ => ())
+
+  /** Removes the object's allocationTree entry, standing in for an AllocationFinalizationAction that has yet to run
+    * (repair F5): the object is live, and only its record is missing
+    */
+  private def forgetAllocation(objectId: ObjectId): Future[Unit] =
+    val key = Key(objectId.toBytes)
+    for
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      held <- pool.allocationTree.get(key)
+      tx = TestTransactions.replaySafe(client.newRepairTransaction())
+      _ <- pool.allocationTree.delete(key, None, List(KeyValueUpdate.KeyRevision(key, held.get.revision)))(using tx)
+      _ <- tx.commit()
+      gone <- pool.allocationTree.get(key)
+    yield
+      gone shouldBe None
 
   private def errorEntryExists(objectId: ObjectId): Future[Boolean] =
     errorTree.flatMap(_.get(buildErrorKey(0.toByte, objectId))).map(_.isDefined)
@@ -279,6 +299,60 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       result.deferred shouldBe 1
       result.repaired shouldBe 0
       stillThere shouldBe true
+
+  /** A RecordingTarget whose repair writes fail as an FSIF store's do over a foreign occupant of the slot */
+  private def occupiedTarget(occupant: ObjectId): RecordingTarget = new RecordingTarget(List(storeId)):
+    override def reconcile(sid: StoreId, snapshot: RepairSnapshot, os: ClientObjectState,
+                           p: Promise[ReconcileResult]): Unit =
+      synchronized { repairs = repairs :+ os.pointer.id }
+      p.failure(new RepairSlotOccupied(os.pointer.id, occupant))
+
+  test("a repair over a foreign occupant the allocation tree does not list drops the occupant and keeps the entry"):
+    // cross-document-review X6: a missed delete of the occupant left it in the slot the repaired object now has
+    val occupant = ObjectId(new UUID(21, 21))
+    val target = occupiedTarget(occupant)
+    val repairer = StoreRepairer(client, target)
+    for
+      ptr <- allocateObjectPointer()
+      _ <- seedErrorEntry(ptr.id, ptr.storePointer)
+      result <- repairer.scan(storeId, RepairPolicy.Default)
+      stillThere <- errorEntryExists(ptr.id)
+    yield
+      target.repairs shouldBe List(ptr.id)
+      target.deletions shouldBe List((occupant, ptr.storePointer.toSeq))
+      result.deferred shouldBe 1
+      stillThere shouldBe true
+
+  test("a repair over a foreign occupant the allocation tree still lists leaves the occupant"):
+    for
+      occupant <- allocateObjectPointer()
+      ptr <- allocateObjectPointer()
+      target = occupiedTarget(occupant.id)
+      _ <- seedErrorEntry(ptr.id, ptr.storePointer)
+      result <- StoreRepairer(client, target).scan(storeId, RepairPolicy.Default)
+      stillThere <- errorEntryExists(ptr.id)
+    yield
+      target.deletions shouldBe Nil
+      result.deferred shouldBe 1
+      stillThere shouldBe true
+
+  test("an aged entry of unknown type is deleted only on a proof, and a live one is left"):
+    val policy = RepairPolicy.Default.copy(minErrorEntryAgeForDeletion = Duration(0, SECONDS))
+    val gone = ObjectId(new UUID(22, 22))
+    for
+      live <- allocateObjectPointer()
+      _ <- forgetAllocation(live.id)
+      _ <- seedErrorEntry(gone, Array[Byte](1), objectType = 2)
+      _ <- seedErrorEntry(live.id, live.storePointer, objectType = 2)
+      target = RecordingTarget(List(storeId))
+      _ <- StoreRepairer(client, target).scan(storeId, policy)
+      goneEntry <- errorEntryExists(gone)
+      liveEntry <- errorEntryExists(live.id)
+    yield
+      target.deletions shouldBe List((gone, Seq[Byte](1)))
+      target.repairs shouldBe Nil
+      goneEntry shouldBe false
+      liveEntry shouldBe true
 
   test("a store that departs mid-scan stops receiving repair calls"):
     val objectId = ObjectId(new UUID(10, 10))
@@ -988,6 +1062,38 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       marked should not be empty
       storeHasObject(2, dataPtr.id) shouldBe false
       stored(2, dataPtr.id) shouldBe None
+      remaining shouldBe empty
+
+  // Repair F5: an object absent from the allocation tree may be live, its AllocationFinalizationAction late. Before
+  // Todo 2.6 an aged entry then dropped the store's live slice; now a read decides, and it is repaired instead
+  test("an aged errorTree entry for a live object the allocation tree does not list repairs it, not deletes it"):
+    val repairer = StoreRepairer(client, net.smgr)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
+      marked <- errorEntries(2)
+      _ <- forgetAllocation(kvPtr.id)
+      _ <- pass(2, repairer, DeferralState(), noDeletionAge)
+      remaining <- errorEntries(2)
+    yield
+      marked should not be empty
+      storeHasObject(2, kvPtr.id) shouldBe true
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1)
+      remaining shouldBe empty
+
+  test("an aged UnackedCommits entry for a live object the allocation tree does not list repairs it, not deletes it"):
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      _ <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
+      _ <- dropErrorEntries(2)
+      marked <- unackedEntries(2)
+      _ <- forgetAllocation(kvPtr.id)
+      _ <- pass(2, StoreRepairer(client, net.smgr), DeferralState(), noDeletionAge)
+      remaining <- unackedEntries(2)
+    yield
+      marked should not be empty
+      storeHasObject(2, kvPtr.id) shouldBe true
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1)
       remaining shouldBe empty
 
   /** A policy treating any entry whose object has no allocation as a deletion, however young */

@@ -157,6 +157,18 @@ Fix sketch: exempt (or reserve a lane for) transactions whose pool is a metadata
 
 ### X6. Missed delete marker is a prerequisite for repairing a missed allocation into a reused FSIF slot (FSIF Ruling 18 x repair x rebuild F9 x recovery F2)
 
+> **2026-11-14 (Todo 2.6): FIXED.** A repair no longer depends on the delete entry. FSIF `updateExt` in repair mode
+> fails over a foreign occupant with `RepairSlotOccupied(N, O)`. The repairer has just read N live, and two live
+> objects never share an ext, so once the AllocationTree does not list O it drops O through the id-checked
+> `repairDelete` and leaves N's entry for the next pass, which installs N. An O the tree still lists is logged as an
+> inconsistency and left. The F5 leg is gone too: an entry is dropped on absence only after a read proves the deletion
+> (repair-process F5).
+> Residual: a zombie O on a slot never reused stays until an entry for O is repaired. It costs space only, since
+> quorum reads of O answer not found.
+> Tests: FsifBackendSuite "repair at an ext held by a different object fails naming the occupant, and succeeds once
+> it is dropped"; StoreRepairerSuite "a repair over a foreign occupant the allocation tree does not list drops the
+> occupant and keeps the entry", "... still lists leaves the occupant".
+
 > **Refresh (replay pins): unchanged.**
 > **Refresh (addendum): unchanged; one more consequence.** The same give-up, in the second driver's handed-off write,
 > now also leaves the committed pools' UnackedCommits entries listed in no `owed` (X13).

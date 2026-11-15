@@ -37,6 +37,18 @@
   slot most of each floor interval (spec-mandated)
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
+- Absence from the AllocationTree is not a deletion (repair F5): it may be an AllocationFinalizationAction running
+  late. For an entry older than `RepairPolicy.minErrorEntryAgeForDeletion` (60 s), `repairAbsent` reads the object
+  through its pool, using the entry's pointer (an UnackedCommits entry's own, or one rebuilt from an ErrorTree value,
+  `client/internal/transaction/CLAUDE.md`). Only `InvalidObject.provesDeletion` deletes it from the store: more than
+  `width - writeThreshold` `ObjectNotFound`/`ObjectMismatch` replies, or a consistent majority at refcount 0 (a live
+  object is on at least writeThreshold ≥ consistentRestoreThreshold stores). A restored read means the object is
+  live: it is reconciled as if listed. Any other failure keeps the entry. An ErrorTree entry of unknown type is acted
+  on only for a proven deletion
+- A repair write that meets a foreign occupant of the object's slot (`backend.RepairSlotOccupied`, FSIF slot reuse
+  over a missed delete) drops the occupant with an id-checked `repairDelete` once the AllocationTree does not list it.
+  The object was just read live, and two live objects never share a slot. The entry stays (stale), and the next pass
+  installs the object. A listed occupant is logged as an error and left (cross-document-review X6)
 - A deletion the store refuses because the object is in use (`Frontend.RepairDeleteDeferred`) counts as deferred: the
   entry stays for a later pass
 - A repair scan runs only while the store's pool entry names this host, so a superseded copy never consumes the

@@ -826,6 +826,11 @@ the old id succeeds was not traced. See [repair-process.md](repair-process.md).
 
 **Verification: OPEN, not verified (FSIF slot reuse); see repair-process.md.**
 
+> **2026-11-14 (Todo 2.6): traced and FIXED.** The repair-update of the new object over a slot that still holds the
+> old id fails in `updateExt` with `RepairSlotOccupied`, never overwriting it. The repairer drops the old occupant
+> once the AllocationTree no longer lists it, and installs the new object on the next pass (cross-document-review
+> X6). The repair-delete of the old id stays id-checked, so neither order loses the new object.
+
 **New (verification pass) N1 (Medium) Replay of a recovered commit vote can regress a newer blind write.** A store that crashes between a transaction's backend commit and its CRL record deletion recovers the record and re-applies it; revision requirements stop the replay but blind KV inserts, Exists-guarded deletes and ABA refcounts are applied over newer committed values. Details and fix in crash-recovery-log.md F13. Relevant here because a rebuilt or adopted store recovers through the same path. *2026-11-14 (Todo 2.2): NARROWED.* A replayed blind Insert is a no-op over a newer write of its key (last writer wins), `Exists`-guarded deletes are refused by the builder, and the refcount ABA cannot occur (the refcount check includes `updateSerial`). Residual: an Insert replayed after a later delete of its key resurrects it (Todo 2.9).
 
 **New N2. Crash-recovery-log F2/F4 can raise `BrokenEntryChain` at a restart, which marks every store of the device rebuild-required and so feeds this process (see crash-recovery-log.md F2, Exp3).**

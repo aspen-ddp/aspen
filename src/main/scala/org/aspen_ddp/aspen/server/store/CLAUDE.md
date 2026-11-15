@@ -114,7 +114,9 @@
 #### Backends (`backend/`)
 - Pluggable: RocksDB, in-memory Map, and FSIF (`backend/fsif`, a flat file of fixed-size segments located by a
   4-byte storePointer, with a journal and checkpointed index; design in `backend/fsif/DESIGN.md`). FSIF freezes
-  writes on ENOSPC and keeps serving reads. FSIF pools allocate through `FsifIndexAllocationStrategy`
+  writes on ENOSPC and keeps serving reads. A repair write never overwrites a different occupant of its slot: it
+  fails with `backend.RepairSlotOccupied(objectId, occupant)`, which the repairer uses to drop a dead occupant
+  (cross-document-review X6). FSIF pools allocate through `FsifIndexAllocationStrategy`
   (`client/internal/allocation/CLAUDE.md`)
 - Opening is backend-neutral (`BackendOpener`; only `DefaultBackendOpener` names concrete backends): see
   `server/host/CLAUDE.md`

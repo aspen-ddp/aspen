@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.concurrent.duration.*
-import scala.util.{Random, Try}
+import scala.util.{Failure, Random, Try}
 
 import org.aspen_ddp.aspen.FileBasedTests
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -18,7 +18,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, Completion, CompletionHandler,
-  Read, UpdateForm}
+  Read, RepairSlotOccupied, UpdateForm}
 
 class FsifBackendSuite extends FileBasedTests:
   import FsifBackendSuite.*
@@ -374,13 +374,23 @@ class FsifBackendSuite extends FileBasedTests:
     h.crash()
     h.readData(p).toList shouldBe bytes(100, 1).toList
 
-  test("repair at an ext held by a different object fails with the mismatch"):
+  test("repair at an ext held by a different object fails naming the occupant, and succeeds once it is dropped"):
+    // cross-document-review X6: the repairer drops the occupant named by RepairSlotOccupied, then installs
     val h = new Harness
     h.commitOk(alloc(ptr(4, oid(40)), bytes(30, 1), 1))
-    h.repair(overwrite(ptr(4, oid(41)), bytes(30, 2), 2)).isFailure shouldBe true
-    h.repair(overwrite(ptr(4, oid(41)), bytes(700, 2), 2)).isFailure shouldBe true
+    def occupied(r: Try[Unit]): Unit = r match
+      case Failure(e: RepairSlotOccupied) =>
+        e.objectId shouldBe oid(41)
+        e.occupant shouldBe oid(40)
+      case other => fail(s"expected RepairSlotOccupied, got $other")
+    occupied(h.repair(overwrite(ptr(4, oid(41)), bytes(30, 2), 2)))
+    occupied(h.repair(overwrite(ptr(4, oid(41)), bytes(700, 2), 2)))
     h.readData(ptr(4, oid(40))).toList shouldBe bytes(30, 1).toList
     h.read(ptr(4, oid(41))) shouldBe Right(ReadError.ObjectNotFound)
+    h.repairDelete(oid(40), sp(4)).isSuccess shouldBe true
+    h.repair(overwrite(ptr(4, oid(41)), bytes(30, 2), 2)).isSuccess shouldBe true
+    h.readData(ptr(4, oid(41))).toList shouldBe bytes(30, 2).toList
+    h.read(ptr(4, oid(40))) shouldBe Right(ReadError.ObjectNotFound)
 
   test("deleting an unmapped ext appends nothing and never completes before an earlier delete"):
     val h = new Harness(mkIo = () => new ManualEc)

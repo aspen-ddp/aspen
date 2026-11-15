@@ -135,6 +135,50 @@ class DataObjectReaderSuite extends AnyFunSuite with Matchers {
     }
   }
 
+  test("InvalidObject proves a deletion only when more than width - writeThreshold stores say they lack the object") {
+    // Repair F5: StoreRepairer acts on an object absent from the allocation tree only with this proof. A committed
+    // live object is on at least writeThreshold stores, so more absence replies than the rest cannot come from one
+    def invalid(r: TestReader): InvalidObject = r.result match
+      case Some(Left(e: InvalidObject)) => e
+      case other => fail(s"expected InvalidObject, got $other")
+
+    val absent = TestReader(3, 2)
+    absent.receiveReadResponse(ok(0, r0, t0))
+    absent.receiveReadResponse(err(1, ReadError.ObjectNotFound))
+    absent.receiveReadResponse(err(2, ReadError.ObjectMismatch))
+    invalid(absent).provesDeletion should be (true)
+
+    // Replication(3, 2): two errors end the read, but a StoreNotFound says nothing of the object
+    val unhosted = TestReader(3, 2)
+    unhosted.receiveReadResponse(ok(0, r0, t0))
+    unhosted.receiveReadResponse(err(1, ReadError.ObjectNotFound))
+    unhosted.receiveReadResponse(err(2, ReadError.StoreNotFound))
+    invalid(unhosted).provesDeletion should be (false)
+
+    val noneFound = TestReader(3, 2)
+    noneFound.receiveReadResponse(err(0, ReadError.StoreNotFound))
+    noneFound.receiveReadResponse(err(1, ReadError.StoreNotFound))
+    invalid(noneFound).provesDeletion should be (false)
+
+    // Replication(5, 4): the read ends at three errors (more than width - consistent threshold 3), and two absence
+    // replies already exceed width - writeThreshold = 1
+    val wide = new TestReader(DataObjectPointer(ObjectId(objUUID), pool, Array[Byte]()), Replication(5, 4))
+    wide.receiveReadResponse(err(0, ReadError.ObjectNotFound))
+    wide.receiveReadResponse(err(1, ReadError.ObjectNotFound))
+    wide.receiveReadResponse(err(2, ReadError.StoreNotFound))
+    invalid(wide).provesDeletion should be (true)
+  }
+
+  test("A consistent majority at refcount 0 proves the deletion") {
+    // ok() replies carry refcount 0
+    val r = TestReader(3, 2)
+    r.receiveReadResponse(ok(0, r0, t0))
+    r.receiveReadResponse(ok(1, r0, t0))
+    r.result match
+      case Some(Left(e: InvalidObject)) => e.provesDeletion should be (true)
+      case other => fail(s"expected InvalidObject, got $other")
+  }
+
   test("Simple Corruption Failure") {
     val r = TestReader(3,2)
     r.receiveReadResponse(ok(0, r0, t0))

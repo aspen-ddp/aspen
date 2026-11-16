@@ -1404,6 +1404,80 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       stored(2, dataPtr.id) shouldBe None
       remaining shouldBe empty
 
+  // Cross-document-review G7: a client keeps a deleted object's pointer and the last state it read (an application's
+  // own pointer, amoebafs's cached inode or segment, a TKVL cached node), while one store missed the deletion and
+  // still serves a live copy, a zombie slice. Nothing the client can build from that state reads or revives the
+  // object: every store that applied the deletion fails each requirement on it (MissingObject), and the zombies are
+  // at most width - writeThreshold stores, short of both thresholds. The zombie itself is unchanged, and repair
+  // removes it.
+
+  /** Commits a transaction `build` makes, completing with the failure it ends with */
+  private def attemptFails(build: Transaction => Unit): Future[Throwable] =
+    val tx = TestTransactions.replaySafe(client.newTransaction())
+    build(tx)
+    pump(tx.commit(), deadline()).failed.flatMap(e => settle().map(_ => e))
+
+  private def provesDeletion(e: Throwable): Boolean = e match
+    case io: org.aspen_ddp.aspen.client.InvalidObject => io.provesDeletion
+    case _ => false
+
+  test("a deleted DataObject's stale pointer and state cannot read or revive it through a zombie slice (G7)"):
+    for
+      dataPtr <- sharedDataObject()
+      before <- client.read(dataPtr)
+      deleted = before.refcount.setCount(0)
+      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, deleted))
+      _ = withClue("store 2 missed the deletion: "):
+            storeHasObject(2, dataPtr.id) shouldBe true
+            storeHasObject(0, dataPtr.id) shouldBe false
+            storeHasObject(1, dataPtr.id) shouldBe false
+      zombie = stored(2, dataPtr.id).map(s => (s.metadata.revision, s.metadata.refcount))
+      readFailure <- client.read(dataPtr).failed
+      overwrite <- attemptFails(_.overwrite(dataPtr, before.revision, DataBuffer(Array[Byte](2))))
+      bump <- attemptFails(_.bumpVersion(dataPtr, before.revision))
+      revive <- attemptFails(_.setRefcount(dataPtr, before.refcount, before.refcount.increment()))
+      // The deleter knows the zero refcount it wrote: raising it fails too
+      reviveFromZero <- attemptFails(_.setRefcount(dataPtr, deleted, deleted.setCount(1)))
+      _ <- settle()
+      afterAttempts = stored(2, dataPtr.id).map(s => (s.metadata.revision, s.metadata.refcount))
+      rereadFailure <- client.read(dataPtr).failed
+      _ <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState(), noDeletionAge)
+    yield
+      withClue("the read proves the deletion: ")(provesDeletion(readFailure) shouldBe true)
+      List(overwrite, bump, revive, reviveFromZero).foreach(_ shouldBe a[org.aspen_ddp.aspen.client.TransactionAborted])
+      withClue("the zombie was not written: ")(afterAttempts shouldBe zombie)
+      withClue("no read or transaction spread it: "):
+        storeHasObject(0, dataPtr.id) shouldBe false
+        storeHasObject(1, dataPtr.id) shouldBe false
+      provesDeletion(rereadFailure) shouldBe true
+      withClue("repair removed the zombie: ")(storeHasObject(2, dataPtr.id) shouldBe false)
+
+  test("a deleted KeyValue object's stale pointer cannot take a key write through a zombie slice (G7)"):
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      before <- client.read(kvPtr)
+      _ <- missedBy(2)(_.setRefcount(kvPtr, before.refcount, before.refcount.setCount(0)))
+      _ = withClue("store 2 missed the deletion: "):
+            storeHasObject(2, kvPtr.id) shouldBe true
+            storeHasObject(0, kvPtr.id) shouldBe false
+      readFailure <- client.read(kvPtr).failed
+      // A revision-less insert needs nothing of the object's state, so a client needs only the pointer to send it
+      blindInsert <- attemptFails(_.update(kvPtr, None, None, Nil, List(Insert(k1, Array[Byte](1)))))
+      keyed <- attemptFails(_.update(kvPtr, None, None,
+                 List(KeyValueUpdate.KeyRevision(k0, before.contents(k0).revision)),
+                 List(Delete(k0), Insert(k2, Array[Byte](2)))))
+      atRevision <- attemptFails(_.update(kvPtr, Some(before.revision), None, Nil, List(Insert(k3, Array[Byte](3)))))
+      _ <- settle()
+      zombieKeys = storeKeys(2, kvPtr)
+      _ <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState(), noDeletionAge)
+    yield
+      provesDeletion(readFailure) shouldBe true
+      List(blindInsert, keyed, atRevision).foreach(_ shouldBe a[org.aspen_ddp.aspen.client.TransactionAborted])
+      withClue("the zombie took no key: ")(zombieKeys shouldBe Set(k0))
+      storeHasObject(0, kvPtr.id) shouldBe false
+      storeHasObject(1, kvPtr.id) shouldBe false
+      withClue("repair removed the zombie: ")(storeHasObject(2, kvPtr.id) shouldBe false)
+
   /** Writes the object's allocationTree entry back, standing in for a DeletionFinalizationAction that has yet to run:
     * the object is deleted, and only its record lingers
     */

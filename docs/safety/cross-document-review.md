@@ -523,6 +523,41 @@ G6. Allocation-tree dependency: rebuild F10/F17, repair F5 and requirements F11 
     so orphan entries are a liveness cost on rebuild, never lost data. Todo 5.5 (no orphan entry, done 2026-11-15)
     and 4.8 (an operator command to finish past lost objects) together close it.
 G7. Client object caches/pointers (stale `ObjectPointer`, DataObject read caches) are outside all seven; resurrection by a client reading a zombie slice with a cached pointer is not discussed.
+    *2026-11-16 (Todo 6.6): CLOSED, no flaw found.* A zombie slice is a live copy on a store that did not apply the
+    object's deletion (a missed delete, repair 9.3's pre-deletion install, X1's old incarnation answering under the
+    same store id). What a client can hold, and why none of it reads or revives a deleted object:
+    (1) *Pointers.* Every allocation takes a fresh random id (`StoragePoolAllocationStrategy`,
+    `FsifIndexAllocationStrategy`); no client API allocates at a caller's id, so a stale pointer never names a newer
+    object. Its locator (FSIF's ext number) stays fixed for the object's life: compaction moves slots, not exts, and
+    rebuild and repair write the pointer's ext. After the ext is reused, `readExt` answers `ObjectNotFound` to the
+    foreign occupant and a commit answers `ObjectMismatch`, so a stale pointer never reaches another object's data.
+    (2) *Reads.* A store that applied the deletion answers `ObjectNotFound`, or refcount 0 while the state lingers.
+    Until the deletion applies at its commit voters (at least `writeThreshold`), a read may legitimately still see the
+    object. Afterwards the stores still holding a copy are at most the `width - writeThreshold` others, below the
+    read threshold, so the read ends `InvalidObject`. A store lost and rebuilt counts against the pool's failure
+    budget, as everywhere. That counts as a proof of deletion once more than `width - writeThreshold` stores answer
+    with an absence. Opportunistic rebuild follows only a completed read, so a zombie's state is never sent on.
+    (3) *Writes from stale state.* Every requirement on a missing or refcount-0 object fails `MissingObject`
+    (`RequirementsChecker.loaded`). That covers a revision-less KeyValue insert, which needs only the pointer, and a
+    refcount raise from the zero the deleter wrote. Blind object-level operations are refused, and the zombies,
+    voting commit, are short of the write threshold, so the transaction aborts and the zombie is left as it was.
+    Allocating at a stale pointer happens only in a replayed description: over an existing state it fails
+    `ObjectExists`, and after the deletion has persisted it leaves an orphan slice (requirements F11, existing
+    residual).
+    (4) *Caches.* The client keeps no object cache (`ReadManager`). `TransactionStatusCache` holds outcomes, not
+    object state. The TKVL `LruTierCache` holds upper-tier nodes only: a stale one costs extra reads (eviction, then
+    a restart on `InvalidObject`), and tier-0 writes carry `WithinRange` and per-key requirements. Application caches
+    hold a revision and write under it: amoebafs's cached inode is overwritten at its cached revision, and its
+    segment states (`SimpleFileContent`) likewise. A vdisk is a single fenced writer (a `SharedRevisionLock` on its
+    fence object) whose caches hold its own committed writes. Pool and endpoint caches only route messages (logical
+    addressing). The one consequence of any of these is a stale *read* served from an application's own cache,
+    which no storage guarantee covers.
+    Tests: StoreRepairerSuite "a deleted DataObject's stale pointer and state cannot read or revive it through a
+    zombie slice (G7)" (the read proves the deletion; an overwrite or version bump at the cached revision, a
+    refcount raise from the cached count and one from the deleter's zero all abort; the zombie is unchanged, no
+    other store gains a copy, and repair then removes it) and "a deleted KeyValue object's stale pointer cannot
+    take a key write through a zombie slice (G7)" (a revision-less insert, a key-revision write and a write at the
+    cached revision all abort). Without the refcount-0 rule in `RequirementsChecker.loaded`, both fail.
 G8. Clock: HLC skew no longer affects replay (the horizon is gone, paxos F3 fixed), but still affects the rebuilt store's `acceptorSince` mute, on which the late-commit rule now also rests (paxos P-N2), repair's 60 s age gate (entry timestamp is the marker transaction's), and rebuild timestamps; no document looks at them together.
     *2026-11-13, partial:* the `acceptorSince` leg is settled (P-N2 FIXED). It now depends only on host-to-host skew
     under 8 s, and `Frontend.MaxStartLead` caps every accepted start timestamp, and so every client HLC, at the fastest

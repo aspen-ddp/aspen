@@ -164,7 +164,9 @@ Per cross-document-review §2, no document yet covers:
 - (closed 2026-11-14, Todo 2.12) the incarnation of ErrorTree and UnackedCommits entries, and their production and
   consumption across a rebuild or a move (cross-document G5, X10);
 - a combined analysis of delayed allocation-tree records;
-- client-side caches;
+- (closed 2026-11-16, Todo 6.6) client-side caches and pointers against zombie slices and deleted objects
+  (cross-document G7): ids are never reused, every requirement on a deleted object fails `MissingObject`, and zombies
+  are short of both thresholds, so a stale pointer or cached state can neither read nor revive a deleted object;
 - (closed 2026-11-16, Todo 6.5) clock skew across `acceptorSince`, repair age gates and rebuild timestamps
   (cross-document G8): the age gate only paces (a read decides, and an unapplied allocation reads `AllocationPending`),
   and rebuild's delta walk, whose timestamp filter was unsound, is replaced by a checkpointed list of pending

@@ -10,6 +10,9 @@
   (logged at trace), except that a late `StoreNotFound` still drops the sender's cached endpoint. Stale stores found by
   a read are not repaired by the read: repair is the server's job (`server/repair`). The client keeps no object
   cache, and a `TxPrepare` carries only the transaction's object updates (no pre-transaction rebuilds).
+- A stale pointer or cached state of a deleted object can neither read nor revive it, even through a store that
+  missed the deletion (a zombie slice): ids are never reused, every requirement on a missing or refcount-0 object
+  fails `MissingObject`, and zombies are short of both thresholds (safety cross-document G7)
 - A read chooses the revision `consistentRestoreThreshold` (always a majority) replies hold, whatever its timestamp,
   at object level (`BaseObjectReader.getStoreStates`) and per key (`KeyValueObjectReader.resolve`): timestamps are not
   monotone in commit order (a refcount or revision-less KV update raises a stale store's timestamp; blind key writes

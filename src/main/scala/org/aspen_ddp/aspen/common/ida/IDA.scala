@@ -92,13 +92,15 @@ sealed abstract class IDA extends Ordered[IDA] {
   /** Number of slices/replicas */
   def width: Int
 
-  /** Minimum number of slices needed to restore the object to a readable state.
-    * This value may be less than consistentRestoreThreshold.
+  /** Minimum number of slices needed to rebuild the object's content once its current revision is known.
+    * This value may be less than consistentRestoreThreshold (Replication: 1). It is NOT the read threshold: use
+    * consistentRestoreThreshold for that, in code and in safety arguments.
     */
   def restoreThreshold: Int
 
-  /** Minimum number of slices/replicas that must agree on the current object revision in order to guarantee
-    * consistency.
+  /** The read threshold: minimum number of slices/replicas that must agree on the current object revision in order to
+    * guarantee consistency. A majority of width for every IDA, and at most writeThreshold. An object held consistently
+    * by fewer stores than this is lost: nothing can tell which copy is current.
     */
   def consistentRestoreThreshold: Int
 

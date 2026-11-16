@@ -44,6 +44,13 @@ Further design docs: `docs/superpowers/specs/` (dated designs), `docs/safety`, `
   object-size limits. Ordinary pools keep their ErrorTree/AllocationTree/UnackedCommits trees in metadata pools;
   metadata pools in the bootstrap pool; pool state objects always in the bootstrap pool (details:
   `common/metadata/CLAUDE.md`)
+- **Read threshold** is `IDA.consistentRestoreThreshold`, never `restoreThreshold`: the number of stores that must
+  agree on an object's revision to know which copy is current. It is a majority for every IDA, and
+  `majority <= read threshold <= writeThreshold <= width` always holds. Replication's `restoreThreshold` is 1 only
+  because, once a majority has identified the current copy, any one copy restores the content. So `t + r > w`, and a
+  transaction's decision stays provable (quorum overlap `2t - w`) at least as long as its data stays readable
+  (`t - r` stores lost): an object that drops below the read threshold is lost, and the write threshold's margin above
+  it is the only tolerance for failures on newly updated objects. Use these thresholds in every safety argument
 - **IDA**: Replication, ReedSolomon, RandomAccessReedSolomon. Appends, byte-range reads and ranged writes are
   supported by Replication and RandomAccessReedSolomon only; classic ReedSolomon fails them with
   `RangeReadNotSupported` / `AppendNotSupported` / `RangeWriteNotSupported` (details: `client/CLAUDE.md`)

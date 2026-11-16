@@ -16,6 +16,7 @@ import org.aspen_ddp.aspen.server.transaction.{ExpiryTally, TransactionStatusCac
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.common.util.LogRateLimit
 import scribe.Logging
+import org.aspen_ddp.aspen.server.host.JoinCeiling
 import org.aspen_ddp.aspen.client.{ReadLocks, ObjectState as ClientObjectState}
 
 import scala.concurrent.duration.{Duration, FiniteDuration, SECONDS}
@@ -146,6 +147,11 @@ class Frontend(val storeId: StoreId,
                  * tests
                  */
                arrivedAt: Option[Long] = None,
+               /** The host's join ceiling (server.host.JoinCeiling): the store joins only transactions started below
+                 * it (startsTooFarAhead), and its previous life on this host joined none at or above the ceiling
+                 * that life ran under (loadFloorMillis). Unbounded: no gate and no bound, for tests
+                 */
+               val joinCeiling: JoinCeiling = JoinCeiling.Unbounded,
                /** How long past the horizon an unresolved Tx starts its status queries (Frontend.expiryMargin) */
                val expiryMargin: FiniteDuration = Frontend.DefaultExpiryMargin,
                /** Called once, on the store's executor, when the store fail-stops (failStop): its host takes it
@@ -192,8 +198,15 @@ class Frontend(val storeId: StoreId,
   def forgetFloorMillis: Long =
     math.max(math.max(wallClockMillis() - horizon.toMillis, loadFloorMillis), statusCache.evictionWatermarkMillis)
 
+  /** What bounds the starts of the transactions the store joined on this host before this load (JoinCeiling.boundAtLoad).
+    * Taken once, as the Frontend is built, before the store can join anything
+    */
+  private val ceilingAtLoad: Option[Long] = joinCeiling.boundAtLoad(storeId)
+
   /** The load's part of the forget floor: the load plus MaxStartLead, since before its load the store may have joined,
-    * and forgotten, a transaction started up to MaxStartLead ahead of its host's clock. Plus
+    * and forgotten, a transaction started up to MaxStartLead ahead of its host's clock, or the host's join ceiling
+    * that the store's previous life on this host ran under, if lower (JoinCeiling: a restart longer than the lead plus
+    * JoinCeiling.Step then refuses only what started before the host went down plus about that much). Plus
     * RebuildingStore.AcceptorSinceMargin instead while the store's arrival from another host (a transfer in, an
     * adoption) is less than that margin before the load: it may have joined such a transaction on that host, whose
     * clock may lead this one's by up to the skew the margin also covers (paxos P-N2). A restart within the margin of
@@ -201,8 +214,14 @@ class Frontend(val storeId: StoreId,
     */
   val loadFloorMillis: Long =
     val margin = RebuildingStore.AcceptorSinceMargin.toMillis
-    if arrivedAt.exists(_ + margin > loadedAtMillis) then loadedAtMillis + margin
-    else loadedAtMillis + MaxStartLead.toMillis
+    if arrivedAt.exists(_ + margin > loadedAtMillis) then
+      loadedAtMillis + margin
+    else
+      // Joins on this host were below the ceiling they ran under (JoinCeiling.boundAtLoad), and those on the host it
+      // arrived from below its arrival plus the margin
+      val sinceLoad = loadedAtMillis + MaxStartLead.toMillis
+      val onThisHost = ceilingAtLoad.fold(sinceLoad)(math.min(sinceLoad, _))
+      arrivedAt.fold(onThisHost)(arrived => math.max(onThisHost, arrived + margin))
 
   /** Whether a transaction started now on this host's clock is at or above the load's part of the floor, so the store
     * may join it: past the load's lead (loadFloorMillis). Tests wait for it after a reload
@@ -237,10 +256,12 @@ class Frontend(val storeId: StoreId,
   /** Transactions waiting for a lock holder, by holder. See Tx.awaitableHolders */
   private val collisionWaiters = scala.collection.mutable.HashMap[TransactionId, List[Tx]]()
 
-  /** The transaction started more than MaxStartLead ahead of this host's wall clock: a prepare for it, if unknown, is
-    * muted (see MaxStartLead), and its designated leader does not drive it (Store) */
+  /** The transaction started more than MaxStartLead ahead of this host's wall clock, or at or above the host's join
+    * ceiling (a renewal fell behind, JoinCeiling.mayJoin): a prepare for it, if unknown, is muted (see MaxStartLead),
+    * and its designated leader does not drive it (Store) */
   def startsTooFarAhead(txd: TransactionDescription): Boolean =
-    txd.startTimestamp.wallTime > wallClockMillis() + MaxStartLead.toMillis
+    val start = txd.startTimestamp.wallTime
+    start > wallClockMillis() + MaxStartLead.toMillis || !joinCeiling.mayJoin(start)
 
   def holdsLocks(txid: TransactionId): Boolean = transactions.get(txid).exists(_.holdsLocks)
 
@@ -1408,9 +1429,13 @@ class Frontend(val storeId: StoreId,
     val muted = beforeAcceptor || tooFarAhead
     if tooFarAhead then
       val lead = m.txd.startTimestamp.wallTime - wallClockMillis()
-      logger.warn(s"Store $storeId takes no part in transaction ${m.txd.transactionId} yet: it started ${lead}ms " +
-                  s"ahead of this host's clock (limit ${MaxStartLead.toMillis}ms). The client's clock runs fast, " +
-                  s"or this host's runs slow")
+      if lead > MaxStartLead.toMillis then
+        logger.warn(s"Store $storeId takes no part in transaction ${m.txd.transactionId} yet: it started ${lead}ms " +
+                    s"ahead of this host's clock (limit ${MaxStartLead.toMillis}ms). The client's clock runs fast, " +
+                    s"or this host's runs slow")
+      else
+        logger.warn(s"Store $storeId takes no part in transaction ${m.txd.transactionId} yet: it started at or past " +
+                    s"the host's join ceiling ${joinCeiling.current.getOrElse(0L)}, whose renewal has fallen behind")
     val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates, takeSerializedTxd(m.txd.transactionId))
     val pointers = m.txd.allHostedObjects(m.to)
     val tx = new Tx(trs, m.txd, this, net, crl, statusCache, pointers,

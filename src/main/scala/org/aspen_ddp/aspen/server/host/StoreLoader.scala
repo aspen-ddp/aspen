@@ -367,6 +367,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 horizon = ctx.transactionHorizon,
                 loadedAt = if isNew then Some(0L) else ctx.storeLoadedAt(storeId),
                 arrivedAt = if isNew then None else StoreLoader.readArrivedAt(backend.path),
+                joinCeiling = ctx.joinCeiling,
                 heartbeatPeriod = FiniteDuration(ctx.heartbeatPeriod.toMillis, MILLISECONDS),
                 // On the store's executor: only posts to the control thread
                 onFailStop = (s, err) => ctx.post(Host.StoreFailStopped(s, err, StoreRebuilds.FailStopped)))

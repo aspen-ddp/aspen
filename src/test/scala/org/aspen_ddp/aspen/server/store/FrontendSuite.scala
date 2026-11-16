@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.server.host.JoinCeiling
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, Replication, XorRegion}
@@ -1404,7 +1405,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
                                   new TransactionStatusCache(wallClockMillis = () => floorNow),
                                 crl: TestCrl = new TestCrl,
                                 missingDataWait: Duration = Frontend.MissingDataWait,
-                                admission: CrlAdmission = CrlAdmission.Unlimited)
+                                admission: CrlAdmission = CrlAdmission.Unlimited,
+                                joinCeiling: JoinCeiling = JoinCeiling.Unbounded)
                                (f: (Frontend, MapBackend, TestNet, TestCrl) => Unit): Unit =
     val backend = new MapBackend(storeId)
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
@@ -1414,7 +1416,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, missingDataWait = missingDataWait,
       admission = admission, wallClockMillis = () => floorNow, horizon = FiniteDuration(20, SECONDS),
-      loadedAt = Some(loadedAt), arrivedAt = arrivedAt)
+      loadedAt = Some(loadedAt), arrivedAt = arrivedAt, joinCeiling = joinCeiling)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     f(frontend, backend, net, crl)
 
@@ -1519,6 +1521,69 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val loaded = floorNow - 500
     withFloorFrontend(loadedAt = loaded, arrivedAt = Some(loaded - margin)): (frontend, _, _, _) =>
       frontend.loadFloorMillis shouldBe loaded + lead
+  }
+
+  // The host's join ceiling (JoinCeiling, cross-document review G4): a store's previous life on this host joined no
+  // transaction started at or above the ceiling it ran under, so the load floor goes no higher than that ceiling
+
+  /** A join ceiling the host's previous process persisted at `persisted`, renewed by `clock` as the host's startup
+    * does, unless `renewed` is false
+    */
+  private def ceilingLeftAt(persisted: Long, renewed: Boolean = true, clock: () => Long = () => floorNow): JoinCeiling =
+    val persistence = new JoinCeiling.Persistence:
+      @volatile var value: Option[Long] = Some(persisted)
+      def read(): Option[Long] = value
+      def write(ceiling: Long): Unit = value = Some(ceiling)
+      def remove(): Unit = value = None
+    val ceiling = new JoinCeiling(Some(persistence), FiniteDuration(100, MILLISECONDS), clock)
+    if renewed then ceiling.renew()
+    ceiling
+
+  test("a store restarted after a downtime longer than the lead refuses only what started below its host's ceiling") {
+    val loaded = floorNow - 500
+    val ceiling = loaded - 5_000
+    withFloorFrontend(loadedAt = loaded, joinCeiling = ceilingLeftAt(ceiling)): (frontend, _, net, crl) =>
+      frontend.loadFloorMillis shouldBe ceiling
+      val refused = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp((ceiling - 1) << 16))
+      frontend.receiveTransactionMessage(clientPrepare(refused))
+      frontend.transactions.contains(txid1) shouldBe false
+      net.sentTx shouldBe empty
+      // Started during the downtime, after the ceiling: the store never joined it
+      val joined = lockTxd(txid2, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp(ceiling << 16))
+      frontend.receiveTransactionMessage(clientPrepare(joined))
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+  }
+
+  test("a store restarted soon after its host went down keeps the floor of its load plus the lead") {
+    val loaded = floorNow - 500
+    withFloorFrontend(loadedAt = loaded, joinCeiling = ceilingLeftAt(loaded + lead + 1)): (frontend, _, _, _) =>
+      frontend.loadFloorMillis shouldBe loaded + lead
+  }
+
+  test("a store that arrived from another host keeps its arrival's margin under its host's ceiling") {
+    val loaded = floorNow - 500
+    // Within the margin of the arrival: the margin past the load, whatever the ceiling
+    withFloorFrontend(loadedAt = loaded, arrivedAt = Some(loaded - 100),
+                      joinCeiling = ceilingLeftAt(loaded - 50)): (frontend, _, _, _) =>
+      frontend.loadFloorMillis shouldBe loaded + margin
+    // Past it, a ceiling below the arrival plus the margin does not lower the floor beneath that
+    val arrived = loaded - margin - 1_000
+    withFloorFrontend(loadedAt = loaded, arrivedAt = Some(arrived),
+                      joinCeiling = ceilingLeftAt(arrived + 10)): (frontend, _, _, _) =>
+      frontend.loadFloorMillis shouldBe arrived + margin
+  }
+
+  test("a store mutes an unknown transaction started at or above its host's persisted join ceiling") {
+    // Its renewal has fallen behind: the ceiling persisted is just ahead of now
+    val ceiling = floorNow + 100
+    withFloorFrontend(joinCeiling = ceilingLeftAt(ceiling, renewed = false)): (frontend, _, net, crl) =>
+      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = HLCTimestamp(ceiling << 16))
+      frontend.startsTooFarAhead(txd) shouldBe true
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      votes(net) shouldBe Nil
+      crl.txSaved shouldBe false
+      frontend.joinCeiling.renew()
+      frontend.startsTooFarAhead(txd) shouldBe false
   }
 
   test("a prepare below the eviction watermark is refused") {

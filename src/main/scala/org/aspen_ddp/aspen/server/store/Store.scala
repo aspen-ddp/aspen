@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.server.host.JoinCeiling
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.HLCTimestamp
 
@@ -56,6 +57,8 @@ class Store(val storageDeviceId: StorageDeviceId,
             loadedAt: Option[Long] = None,
             /** When the store last arrived on this host from another (Frontend.arrivedAt). None: never */
             arrivedAt: Option[Long] = None,
+            /** The host's join ceiling (Frontend.joinCeiling) */
+            joinCeiling: JoinCeiling = JoinCeiling.Unbounded,
             /** The host's heartbeat period, which calls heartbeat (Frontend.expiryMargin) */
             heartbeatPeriod: FiniteDuration = FiniteDuration(1, SECONDS),
             /** The host's wall clock (Frontend.wallClockMillis). A test seam */
@@ -95,7 +98,7 @@ class Store(val storageDeviceId: StorageDeviceId,
       case None => task => task()
       case Some(postTo) => task => postTo(s => if s eq this then task()),
     acceptorSince = acceptorSince, deferRecovery = deferRecovery, wallClockMillis = wallClockMillis,
-    horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, expiryMargin = expiryMargin,
+    horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, joinCeiling = joinCeiling, expiryMargin = expiryMargin,
     onFailStop = err => onFailStop(this, err), incarnationOverride = incarnationOverride, poolIDA = poolIDA,
     admissionTier = admissionTier,
     onCommitProven = txid => transactionDrivers.get(txid).foreach(giveProof(txid, _)),

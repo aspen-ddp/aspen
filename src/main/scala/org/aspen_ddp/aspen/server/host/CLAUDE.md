@@ -40,6 +40,16 @@
   (`StoreLoader.newStores`: a `startOpen` with `create`, made only by `StoreRebuilds.createNewStore` for a new pool's
   store with no directory yet). It has never served, so it records no load and joins at once. Tests set load times
   through `Host.Seams.storeLoadedAt`
+- Join ceiling (`JoinCeiling`, cross-document G4, Todo 6.4): `Host` keeps a durable upper bound on the start of every
+  transaction its stores joined. It is one file, `<host-root>/join-ceiling`, written with `DurableFiles`. The bound is
+  renewed once at construction, then every `RenewPeriod` (250 ms) on the host's `ec`, to now + `MaxStartLead` +
+  `Step` (1 s), and only ever rises. Stores join only below the persisted value (`mayJoin`), so a same-host reload
+  needs a load floor no higher than the ceiling its previous life ran under (`boundAtLoad`). That is the value the
+  previous process left (`atStart`) for a store's first load in this process, or the value now for a reload. A failed
+  write removes the file and stops gating for the process; an unreadable file bounds nothing. A host with
+  `NoBackgroundTaskManager` cannot renew, so it has `JoinCeiling.Unbounded` unless `Host.Seams.joinCeiling` supplies a
+  persistence. TestNetwork does, in memory, and renews in `handleEvents` (`Host.Seams.joinCeilingStep`, 100 ms there).
+  `TestNetwork.crashHost`/`restartHost` model a host whose ceiling outlives its process
 - A loading store asks for its CRL state with the non-blocking `readStoreState` from its executor
   (`StoreRouter.readAndRecover`), holding its messages until it recovers, so no store thread blocks on a CRL
 - Device management (the classes `DeviceControl` wires) runs on one control thread, `aspen-host-control`,

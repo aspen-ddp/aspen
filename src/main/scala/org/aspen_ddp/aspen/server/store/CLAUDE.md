@@ -93,7 +93,9 @@
   `StoreRebuilds.createNewStore`, has never served and records no load; a load less than
   `RebuildingStore.AcceptorSinceMargin` after the store's arrival from another host, recorded durably in
   `StoreLoader.ArrivedAtFile` by a transfer in or an adoption and passed as `arrivedAt`, adds that 10 s margin instead,
-  since it joined there by a clock that may lead this host's by up to the P-N2 skew), and the status cache's
+  since it joined there by a clock that may lead this host's by up to the P-N2 skew; otherwise the load part is
+  lowered to the host's join ceiling the store's previous life ran under, if lower, but never below a past arrival
+  plus the margin: `Frontend.joinCeiling`, `server/host/CLAUDE.md`), and the status cache's
   `evictionWatermarkMillis` (which adds the lead too). A Tx the store holds (recovered ones included) is unaffected; a
   prepare whose outcome the cache knows creates a Tx that learns it only above the floor (resolved), and is ignored when
   finalized (the relay). An `acceptorSince` mute is checked first and keeps its muted, possibly proving Tx. The
@@ -101,8 +103,12 @@
   the cache holds an outcome not yet finalized: the fast takeover of a dead remote driver (R-F16, by design). A store therefore never
   rejoins a transaction it may have forgotten; for up to the horizon after a load it looks offline to transactions
   started before the load plus `MaxStartLead`. Accepted cost: on a single host, or after most of a pool's stores
-  restart, such transactions end `TransactionOutcomeUnknown` at about 22 s and are retried. Stores written by bootstrap
-  are not exempt from the load floor. A durable high-water mark is the upgrade path
+  restart, such transactions end `TransactionOutcomeUnknown` at about 22 s and are retried. With the join ceiling,
+  after a restart longer than about 3 s, that covers only what started before the host went down plus about 3 s.
+  Stores written by bootstrap are not exempt from the load floor (and a first load on a host has no ceiling)
+- Join ceiling gate (`Frontend.startsTooFarAhead`, `JoinCeiling.mayJoin`): an unknown transaction started at or above
+  the host's persisted join ceiling is muted as one started too far ahead (warned as a renewal fallen behind), and its
+  designated leader does not drive it. It joins once a renewal passes its start
 - Expiry (`server/transaction/CLAUDE.md`): `Store.heartbeat` calls `Frontend.expiryHeartbeat`, which queries the
   peers of each Tx unfinalized past the horizon plus `expiryMargin` and decides from their `TxStatusResponse`s
   (`ExpiryTally`): adopt an outcome, decide commit (resolve it at every store, apply it, and have the store's driver

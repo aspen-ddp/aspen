@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrashRecoveryLogFactory}
-import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LocalStorageDeviceState, LockstepThreading, StoreRebuilds}
+import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DeviceControl, DeviceMetadata, HostThreading, JoinCeiling, LocalDevices, LocalStorageDeviceState, LockstepThreading, StoreRebuilds}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
@@ -158,7 +158,11 @@ object Host:
                          missingDataWait: Duration = Frontend.MissingDataWait,
                          /** The load time each store loaded records (Frontend.loadedAt), for tests whose stores are
                           *  new, with nothing they could have forgotten: None, now */
-                         storeLoadedAt: StoreId => Option[Long] = _ => None)
+                         storeLoadedAt: StoreId => Option[Long] = _ => None,
+                         /** Where the host keeps its join ceiling (JoinCeiling). None: a file in its root directory */
+                         joinCeiling: Option[JoinCeiling.Persistence] = None,
+                         /** How far past the start lead each renewal sets the join ceiling (JoinCeiling.Step) */
+                         joinCeilingStep: FiniteDuration = JoinCeiling.Step)
 
   object Seams:
     val default: Seams = Seams()
@@ -210,6 +214,16 @@ class Host(val client: AspenClient,
                    /** See TransactionHorizon. Sizes the status cache */
                    val transactionHorizon: FiniteDuration = TransactionHorizon.Horizon) extends Logging with RepairTarget {
   import Host._
+
+  /** Read before any store loads, and renewed once before any can join (JoinCeiling), then every RenewPeriod below.
+   *  A host whose background tasks never run (BackgroundTaskManager.NoBackgroundTaskManager, tests) cannot renew it,
+   *  and a ceiling left behind would soon mute every store: it has none, unless a test supplies one and renews it */
+  val joinCeiling: JoinCeiling =
+    seams.joinCeiling match
+      case Some(persistence) => new JoinCeiling(Some(persistence), seams.joinCeilingStep)
+      case None if backgroundTasks eq BackgroundTaskManager.NoBackgroundTaskManager => JoinCeiling.Unbounded
+      case None => new JoinCeiling(Some(new JoinCeiling.FilePersistence(rootDir)), seams.joinCeilingStep)
+  joinCeiling.renew()
 
   private val txStatusCache = new TransactionStatusCache(Host.txStatusCacheDuration(heartbeatPeriod, transactionHorizon))
 
@@ -292,7 +306,8 @@ class Host(val client: AspenClient,
     quarantineVerifier = quarantineVerifier,
     missingDataWait = seams.missingDataWait,
     storeLoadedAt = seams.storeLoadedAt,
-    transactionHorizon = transactionHorizon)
+    transactionHorizon = transactionHorizon,
+    joinCeiling = joinCeiling)
 
   private val shutdownPromise: Promise[Unit] = Promise()
 
@@ -317,6 +332,12 @@ class Host(val client: AspenClient,
     threading.controlEvents.execute(() => transfers.retransmitPendingStarts())
 
   private def transfers = deviceControl.transfers
+
+  // Keeps the join ceiling ahead of what the stores may join. Its write (an fsync) runs on the host's ec, never on a
+  // store's executor or the control thread
+  private val joinCeilingTask = backgroundTasks.schedulePeriodic(JoinCeiling.RenewPeriod) {
+    joinCeiling.renew()
+  }
 
   // One dispatch step that posts each store's heartbeat to its executor
   private val heartbeatTask = backgroundTasks.schedulePeriodic(heartbeatPeriod) {
@@ -461,6 +482,7 @@ class Host(val client: AspenClient,
     services.shutdown()
     pendingStartTask.cancel()
     heartbeatTask.cancel()
+    joinCeilingTask.cancel()
     systemTaskHeartbeatTask.cancel()
     checkStorageDeviceTask.cancel()
     deviceScanTask.cancel()

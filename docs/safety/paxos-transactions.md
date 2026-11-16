@@ -840,8 +840,20 @@ horizon reports unknown, not aborted".
   from another host. For Ts started before the load that only anticipates the horizon
   by up to 20 s; the extra cost is the Ts started in `[load, load + MaxStartLead)`, which the store would otherwise
   have joined. Those see it as offline and most commit through the other stores. On a single host, or after a restart of most of a pool's
-  stores, too few stores remain and such Ts end `TransactionOutcomeUnknown` at about 22 s, and are retried. A durable
-  per-store high-water mark of joined start times is the upgrade path.
+  stores, too few stores remain and such Ts end `TransactionOutcomeUnknown` at about 22 s, and are retried.
+  *2026-11-16 (Todo 6.4, cross-document G4): narrowed by the host's join ceiling* (`server/host/JoinCeiling.scala`). The
+  host keeps a durable upper bound on the start of every T any of its stores joined. A background renewal every 250 ms
+  sets it to now + `MaxStartLead` + `JoinCeiling.Step` (1 s), only ever raising it. A store joins an unknown T only if T
+  started below the ceiling already persisted (`Frontend.startsTooFarAhead`, the same mute as a start too far ahead).
+  So every T a store joined in an earlier life on this host started below the ceiling that life ran under:
+  the ceiling the previous process left (`JoinCeiling.atStart`) for a store's first load in a process, the ceiling
+  now for a reload within it (`boundAtLoad`). The same-host load floor is min(load + `MaxStartLead`, that bound),
+  and a store that arrived from another host also keeps arrival + `AcceptorSinceMargin` as a lower bound on it. The
+  safety argument is unchanged: below the floor the store may have forgotten T, at or above it the store never
+  held T. A ceiling that cannot be read bounds nothing (load floor alone). A failed renewal removes the file and
+  stops gating; if the removal fails too, the stale ceiling keeps gating, at a liveness cost only. Residual: Ts started within about 3 s after
+  the host went down, every T of a restart shorter than that, a store's first load on a host with no ceiling yet
+  (bootstrap included), and loads within the arrival margin.
 * *Bootstrap stores.* Stores written by bootstrap are not exempt from the load floor (only `createNewStore`'s are). A
   store refuses every transaction it does not hold that started before its load + `MaxStartLead`
   (`Frontend.scala:135-139`), so on a fresh system every transaction started within `MaxStartLead` (2 s) of its

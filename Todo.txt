@@ -60,10 +60,6 @@ PRIORITY 5: performance and hygiene
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
 
-6.4  G4: liveness cost of post-load refusals. After a restart a store refuses, for up to the horizon, every
-     transaction started before its load (forget floor), so rolling restarts can push many transactions to
-     TransactionOutcomeUnknown and a retry. Measure it in a rolling-restart test, and consider a durable
-     high-water mark of joined transactions to shorten the refusal window.                                 [M]
 6.5  G8: combined HLC-skew analysis of the repair age gates and rebuild timestamps, plus a skewed-clock test
      (the acceptorSince leg is covered by Frontend.MaxStartLead).                                           [M]
 6.6  G7: client caches and pointers against zombie slices and deleted objects.                             [M]

@@ -541,3 +541,92 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       cachedStatus(t) shouldBe Some(TransactionStatus.Committed)
       refusedAfterLoad(moved, other, prepare.head)
       storeRevision(moved, x) shouldBe Some(ObjectRevision(t))
+
+  /** Commits a pinned overwrite of `o` at `revision` and waits for it to settle */
+  private def overwrite(o: DataObjectPointer, revision: ObjectRevision): Future[TransactionId] =
+    val tx = client.newTransaction()
+    tx.overwrite(o, revision, DataBuffer(Array[Byte](2)))
+    for
+      _ <- pump(tx.commit(), clock = false)
+      _ <- settle(clock = false)
+    yield tx.id
+
+  /** Serves each of `moved` on a host of its own, once each joins new transactions there */
+  private def ownHosts(moved: List[Int]): Future[Map[Int, Host]] =
+    val hosts = moved.map(i => i -> net.newHost()).toMap
+    for
+      _ <- moved.foldLeft(Future.unit): (f, i) =>
+             f.flatMap(_ => pump(net.moveStore(net.stores(i), hosts(i), closeFirst = true), clock = false))
+      _ <- eventually("the moved stores passed their load floors", clock = false)(moved.forall(i => net.loadFloorPassed(sid(i))))
+    yield hosts
+
+  // Cross-document review G4 (Todo 6.4): a host's join ceiling (JoinCeiling) bounds what its stores joined before it
+  // went down, so once restarted they join what started since, rather than refusing everything started before their
+  // load plus MaxStartLead. Without it both tests fail: the restarted stores refuse the transaction
+
+  test("a restarted host's stores join a transaction started while it was down, which needs them to commit"):
+    for
+      x <- allocateX()
+      xBefore <- client.read(x)
+      host = net.newHost()
+      _ <- pump(net.moveStore(net.stores(3), host, closeFirst = true), clock = false)
+      _ <- pump(net.moveStore(net.stores(4), host, closeFirst = true), clock = false)
+      _ <- eventually("stores 3 and 4 passed their load floors", clock = false)(
+             net.loadFloorPassed(sid(3)) && net.loadFloorPassed(sid(4)))
+      ceiling = host.joinCeiling.current.get
+      _ = net.crashHost(host)
+      // T starts past the ceiling the crashed host persisted, so neither of its stores can have joined T. Stores 0-2
+      // alone cannot commit it: the write threshold is 4
+      _ <- clockPast(ceiling)
+      tx = client.newTransaction()
+      _ = net.recordTxMessage = isClientPrepare(tx.id)
+      _ = tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+      committed = tx.commit()
+      _ <- eventually("stores 0-2 hold T", clock = false)((0 until 3).forall(holds(_, tx.id)))
+      prepares = recordedClientPrepares(tx.id).filter(p => p.to == sid(3) || p.to == sid(4))
+      _ = net.recordTxMessage = _ => false
+      _ = withClue("T cannot commit while the host is down: "):
+            prepares.size shouldBe 2
+            committed.isCompleted shouldBe false
+      restarted <- pump(net.restartHost(host), clock = false)
+      // The client's retransmission reaches the restarted stores: both join T
+      _ = prepares.foreach(net.deliverTransactionMessage)
+      _ = withClue("the restarted stores join T, started below their load plus MaxStartLead: "):
+            holds(3, tx.id) || storeRevision(3, x).contains(ObjectRevision(tx.id)) shouldBe true
+            holds(4, tx.id) || storeRevision(4, x).contains(ObjectRevision(tx.id)) shouldBe true
+      result <- outcome(committed, clock = false)
+      _ <- settle(clock = false)
+    yield
+      assert(restarted ne host)
+      result shouldBe a[Success[?]]
+      (0 until 5).map(storeRevision(_, x)) shouldBe (0 until 5).map(_ => Some(ObjectRevision(tx.id)))
+
+  test("a rolling restart of the stores' hosts loses no transaction, and each restarted store joins at once"):
+    // Each round crashes one host, commits a transaction on the other four stores, restarts the host and, once past
+    // its persisted ceiling (about MaxStartLead plus JoinCeiling.Step after the crash), commits another on an object
+    // every store holds. The restarted store misses the first only. Without the ceiling it would refuse every
+    // transaction started before its load plus MaxStartLead, the second included
+    val rolled = List(2, 3, 4)
+    def round(i: Int, host: Host, missed: DataObjectPointer, y: DataObjectPointer): Future[Unit] =
+      val ceiling = host.joinCeiling.current.get
+      net.crashHost(host)
+      for
+        missedBefore <- client.read(missed)
+        down <- overwrite(missed, missedBefore.revision)
+        _ <- pump(net.restartHost(host), clock = false)
+        _ <- clockPast(ceiling)
+        yBefore <- client.read(y)
+        after <- overwrite(y, yBefore.revision)
+      yield
+        withClue(s"store $i, restarted, missed only the transaction of its downtime: "):
+          storeRevision(i, missed) shouldBe Some(missedBefore.revision)
+          storeRevision(i, y) shouldBe Some(ObjectRevision(after))
+        (0 until 5).filter(_ != i).map(storeRevision(_, missed)) shouldBe List.fill(4)(Some(ObjectRevision(down)))
+    for
+      missed <- rolled.foldLeft(Future.successful(Map[Int, DataObjectPointer]())): (f, i) =>
+                  f.flatMap(m => allocateX().map(o => m + (i -> o)))
+      y <- allocateX()
+      hosts <- ownHosts(rolled)
+      _ <- rolled.foldLeft(Future.unit)((f, i) => f.flatMap(_ => round(i, hosts(i), missed(i), y)))
+    yield
+      (0 until 5).map(storeRevision(_, y)).distinct.size shouldBe 1

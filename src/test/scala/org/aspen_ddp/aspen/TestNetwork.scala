@@ -24,7 +24,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, Host, StorageDeviceConfig, transaction}
-import org.aspen_ddp.aspen.server.host.{HostThreading, LockstepThreading}
+import org.aspen_ddp.aspen.server.host.{HostThreading, JoinCeiling, LockstepThreading}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.{Bootstrap, Frontend, UnackedCommitLookup}
@@ -381,7 +381,12 @@ class TestNetwork(executionContext: ExecutionContext,
           behindTx += ((store, p.transactionId))
         case _ => ()
       behindTx.contains((msg.to, msg.transactionId))
-    missed || droppedTx.contains((msg.to, msg.transactionId)) || dropTxMessage(msg)
+    missed || droppedTx.contains((msg.to, msg.transactionId)) || dropTxMessage(msg) || crashed(hostFor(msg.to)) ||
+      (!isClientPrepare(msg) && crashed(hostFor(msg.from)))
+
+  private def isClientPrepare(msg: TxMessage): Boolean = msg match
+    case p: TxPrepare => p.fromClient
+    case _ => false
 
   /** Delivers `msg` to its store as the client messenger does, bypassing the drop rules and the recording: a message
     * re-delivered late, as a network replay does
@@ -405,7 +410,12 @@ class TestNetwork(executionContext: ExecutionContext,
 
   private def allHosts: List[Host] =
     (poolHosts.values.toList ++ storeHosts.values.toList).foldLeft(List(smgr)): (hosts, h) =>
-      if hosts.exists(_ eq h) then hosts else hosts :+ h
+      if hosts.exists(_ eq h) || crashed(h) then hosts else hosts :+ h
+
+  /** Hosts crashHost stopped: they run nothing more, and messages to or from their stores are dropped */
+  @volatile private var crashedHosts: List[Host] = Nil
+
+  private def crashed(host: Host): Boolean = crashedHosts.exists(_ eq host)
 
   private val smgrThreading: HostThreading = threading(executionContext)
 
@@ -440,7 +450,8 @@ class TestNetwork(executionContext: ExecutionContext,
         case r: Read if r.fromClient == client.clientId => recordRead(r)
         case _ => ()
       handleEvents()
-      hostFor(msg.toStore).receiveClientRequest(msg)
+      if !crashed(hostFor(msg.toStore)) then
+        hostFor(msg.toStore).receiveClientRequest(msg)
       handleEvents()
     }
 
@@ -538,6 +549,25 @@ class TestNetwork(executionContext: ExecutionContext,
       everLoaded += storeId
       Some(0L)
 
+  /** Where a host of this network keeps its join ceiling (Host.Seams.joinCeiling): in memory, written at once, so it
+    * outlives the Host object as a host's file outlives its process (restartHost)
+    */
+  final class MemoryCeiling extends JoinCeiling.Persistence:
+    @volatile private var value: Option[Long] = None
+    def read(): Option[Long] = value
+    def write(ceiling: Long): Unit = value = Some(ceiling)
+    def remove(): Unit = value = None
+
+  private val smgrCeiling = new MemoryCeiling
+
+  /** The hosts' JoinCeiling.Step: short, so a test waits little past a crashed host's ceiling. Every handleEvents
+    * renews it, so it never mutes a transaction a test sends
+    */
+  val CeilingStep: FiniteDuration = Duration(100, MILLISECONDS)
+
+  /** Each host's join ceiling, by host (identity) */
+  private var ceilings: List[(Host, MemoryCeiling)] = Nil
+
   val smgr = new Host(
     client,
     HostId.BootstrapHostId,
@@ -555,7 +585,8 @@ class TestNetwork(executionContext: ExecutionContext,
     Duration(60, SECONDS),
     // Its stores are loaded directly (below), onto a device it never loads
     seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
-      missingDataWait = hostOptions.missingDataWait, storeLoadedAt = storeLoadedAt),
+      missingDataWait = hostOptions.missingDataWait, storeLoadedAt = storeLoadedAt, joinCeiling = Some(smgrCeiling),
+      joinCeilingStep = CeilingStep),
     transactionHorizon = hostOptions.transactionHorizon)
 
   // Stand in for each store's StoreConfig.effectiveMaxSliceSize and ida, which Host reads from the store config file
@@ -608,14 +639,48 @@ class TestNetwork(executionContext: ExecutionContext,
   /** Another lockstep host like the bootstrap one (the same HostOptions and CRL), serving no store yet: moveStore. Its
     * own status cache starts empty, as a host that restarted or never saw the bootstrap host's transactions
     */
-  def newHost(): Host =
+  def newHost(): Host = buildHost(new MemoryCeiling)
+
+  private def buildHost(ceiling: MemoryCeiling): Host =
     hostsBuilt += 1
-    new Host(client, HostId(new UUID(1, hostsBuilt)), new UUID(0, 0), os.root, executionContext,
+    val host = new Host(client, HostId(new UUID(1, hostsBuilt)), new UUID(0, 0), os.root, executionContext,
       new LockstepThreading(executionContext), objectCacheFactory, this, BackgroundTaskManager.NoBackgroundTaskManager,
       TestCRL, FinalizerFactory, txDriverFactory, hostOptions.heartbeatPeriod, Duration(60, SECONDS),
       seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
-        missingDataWait = hostOptions.missingDataWait, storeLoadedAt = storeLoadedAt),
+        missingDataWait = hostOptions.missingDataWait, storeLoadedAt = storeLoadedAt, joinCeiling = Some(ceiling),
+        joinCeilingStep = CeilingStep),
       transactionHorizon = hostOptions.transactionHorizon)
+    synchronized:
+      ceilings = (host, ceiling) :: ceilings
+    host
+
+  /** The stores a host newHost built serves (moveStore) */
+  def storesOf(host: Host): List[MapBackend] =
+    stores.filter(s => storeHosts.get(s.storeId).exists(_ eq host))
+
+  /** Crashes `host`, built by newHost: it runs nothing more, its join ceiling is renewed no more, and every message to
+    * or from its stores, and every client request to them, is dropped. Its stores are reported offline, so no
+    * transaction chooses one as leader
+    */
+  def crashHost(host: Host): Unit =
+    require(!(host eq smgr), "the bootstrap host cannot crash")
+    offlineStores ++= storesOf(host).map(_.storeId)
+    synchronized:
+      crashedHosts = host :: crashedHosts
+
+  /** The crashed `host` restarted: a new host with the same join ceiling (its file outlives its process) and an empty
+    * status cache, which loads every store the crashed one served, as its process's startup does. Completes once they
+    * are loaded; the caller drains events meanwhile
+    */
+  def restartHost(host: Host): Future[Host] =
+    given ExecutionContext = executionContext
+    require(crashed(host), "only a crashed host restarts")
+    val ceiling = synchronized(ceilings.collectFirst { case (h, c) if h eq host => c }).get
+    val restarted = buildHost(ceiling)
+    val served = storesOf(host)
+    Future.traverse(served)(s => moveStore(s, restarted, closeFirst = false)).map: _ =>
+      offlineStores --= served.map(_.storeId)
+      restarted
 
   /** Serves store `backend` on `to` from now on: a new Store there recovers its transactions from `crl`, as a store
     * transferred to `to`, or reloaded once its host restarted, does. With `closeFirst` the host that served it closes
@@ -749,6 +814,8 @@ class TestNetwork(executionContext: ExecutionContext,
 
   /** Drains every lockstep host's events. A host on any other threading runs its own, so it is left alone. */
   def handleEvents(): Unit =
+    // Each live host keeps its join ceiling ahead, as its background renewal does (JoinCeiling.renew)
+    allHosts.foreach(_.joinCeiling.renew())
     val lockstepHosts = allHosts.filter(_.threading.isInstanceOf[LockstepThreading])
     if lockstepHosts.nonEmpty then
       otestThreadId match

@@ -88,7 +88,9 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           /** The load time a store being loaded records (Frontend.loadedAt), by store. None: now. A
                             * test seam (Host.Seams.storeLoadedAt)
                             */
-                          val storeLoadedAt: StoreId => Option[Long] = _ => None):
+                          val storeLoadedAt: StoreId => Option[Long] = _ => None,
+                          /** The host's join ceiling, which its stores join below (Frontend.joinCeiling) */
+                          val joinCeiling: JoinCeiling = JoinCeiling.Unbounded):
   given ExecutionContext = threading.control
 
   lazy val router: StoreRouter = new StoreRouter(this)

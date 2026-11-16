@@ -453,6 +453,20 @@ G3. Zombie drivers/timers after a non-crash store reload, device relinquish and 
     transfer out / a shutdown or relinquish shuts the store's transaction drivers down", "a reload over a loaded store
     that reuses its backend shuts the old store's drivers down" (failed before the fix).
 G4. A shared, in-memory host-wide status cache is the anchor for finalization relays and, since the refresh, late-commit evidence (condition 2); no document analyses host restart (cache wiped) combined with rolling restarts of the stores' peers (paxos F6 touches it for one restart only). The horizon and TooOld no longer depend on it. *(2026-11-13: the safety half is covered. A restart, transfer-in or size eviction raises the affected stores' forget floor (load + `MaxStartLead`, or the eviction watermark) at the moment memory is lost, so a store whose host lost its cache never rejoins a transaction it may have forgotten, however many peers restart (paxos 10.10; HorizonIntegrationSuite "a host restart does not let its stores rejoin a transaction they forgot"). Left: the liveness cost across rolling restarts, where each reload refuses the transactions it does not hold started before its load plus `MaxStartLead`, and too many refusing stores in a pool end those transactions Unknown.)*
+    *2026-11-16 (Todo 6.4): liveness half narrowed.* Measured on the TestNetwork (RS 5/3/4, horizon 2 s, each host
+    renewing a 100 ms-step ceiling): before, a restarted store refused every T it did not hold started before its load +
+    `MaxStartLead`, the whole downtime included. With two of five stores on one crashed host, a T started while it was
+    down could never reach the write threshold and ended Unknown. In a rolling restart each restarted store missed
+    every T started in the 2 s after its load, which repair then had to copy. The host's join ceiling
+    (`JoinCeiling`; paxos 10.10 *Residual costs*) lowers the same-host load floor to the ceiling the store's previous
+    life ran under. That T now commits once the host is back, and each rolled store misses only the Ts of its
+    downtime's first `MaxStartLead` + `JoinCeiling.Step` (3 s in production).
+    Tests: HorizonIntegrationSuite "a restarted host's stores join a transaction started while it was down, which needs
+    them to commit", "a rolling restart of the stores' hosts loses no transaction, and each restarted store joins at
+    once" (both fail with the ceiling dropped at restart); FrontendSuite "a store restarted after a downtime longer
+    than the lead ...", "... keeps the floor of its load plus the lead", "... keeps its arrival's margin under its
+    host's ceiling", "a store mutes an unknown transaction started at or above its host's persisted join ceiling";
+    JoinCeilingSuite. Residual: as paxos 10.10.
 G5. ErrorTree/UnackedCommits entry-key incarnation (X10) and the time-line of entry production vs consumption during a T12 move are described only per-document.
     *2026-11-14 (Todo 2.12): written.* Entries for a pool slot are keyed by its pool index; since Todo 2.12 an
     UnackedCommits entry also records the incarnation of the store that cast the counted commit vote (X10). I0 is the

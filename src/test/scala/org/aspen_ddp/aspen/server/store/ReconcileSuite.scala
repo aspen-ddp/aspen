@@ -101,6 +101,19 @@ class ReconcileSuite extends AnyFunSuite with Matchers:
     p.result.objectLevelDeferred shouldBe false
     p.result.complete shouldBe false
 
+  // Repair 13.3 question 3: a whole-object pass that defers a locked key still takes the read's object timestamp. A
+  // store that had applied every update the read reflects would hold that timestamp too: the deferred key's own
+  // updates all carry timestamps no later than the read's, and its per-key timestamp, not the object's, is what its
+  // requirements check. The entry stays incomplete until a later pass reconciles the key
+  test("a whole-object pass that defers a locked key still advances the object timestamp, and is incomplete"):
+    val store = kvStore(Map(k0 -> rev(1)), timestamp = ts(10))
+    val p = plan(store, store, kvRead(Map(k0 -> rev(1), k1 -> rev(2), k2 -> rev(3)), timestamp = ts(30)),
+      ReadLocks(Set(k1), objectLevel = false))
+    p.installs shouldBe Map(installed(k2, rev(3)))
+    p.timestamp shouldBe Some(ts(30))
+    p.result.deferredKeys shouldBe Set(k1)
+    p.result.complete shouldBe false
+
   test("a pass of only the deferred keys reconciles them and leaves the rest of the object alone"):
     val store = kvStore(Map(k0 -> rev(1), k1 -> rev(2), k2 -> rev(3)))
     // Differing everywhere: only k1 and k2 are in scope, and k2 is still locked

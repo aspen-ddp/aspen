@@ -609,6 +609,10 @@ G10. Capacity interaction: ErrorTree growth during long outages (repair 13.3-6) 
     finalizers (TKVL split, join, tail removal): that is ordinary back-pressure, and it clears as the tier's own
     transactions finalize upward. Still open: the rebuild leg (in-progress rebuilds counted against the failure
     budget, rebuild 6.3) and UnackedCommits growth (Todo 4.7).
+    *2026-11-16 (Todo 6.9), the drain of the repair backlog (repair 13.3-6):* a timed-out scan that saw entries keeps
+    the store at the floor and keeps its deferrals (F9), and a silent voter's UnackedCommits entry costs one delete
+    (RP-N3). The backlog therefore drains in bounded passes, one entry at a time per store. The metadata-pool space it
+    holds during a long outage is not yet bounded by any argument.
 
 G11. Replay ordering: the replay integration tests deliver the leader's copy of the replayed client prepare last (the TestNetwork leader driver does not retransmit), so the ordering where a driver's data-less prepare reaches stores before the replayed client prepare is not exercised end to end. *(Addendum: the headline stub test delivers the pool-B leader's copy before pool A's, because the default order dropped the provers' proofs at a leader with no driver yet (paxos P-N1). Prefer-abort makes a driver-first store withhold everything until the client's prepare arrives, then check it normally, or prove at once (`Tx.awaitingClientPrepare`, `Tx.scala:205-208`); FrontendSuite covers both at unit level, end to end is still untested.)*
     *2026-11-15 (Todo 6.1): CLOSED, the wait leg tested end to end.* Since the forget floor a replay is refused outright

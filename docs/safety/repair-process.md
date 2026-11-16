@@ -1231,27 +1231,72 @@ dependency is real but sound. Confidence: low.
 
 ### 13.3 Other open questions for the reviewer
 
+> **2026-11-16 (Todo 6.9): all answered.** Questions 1, 2, 4 and 5 are closed, 3 is closed by design with a test
+> pinning it, 6 is folded into the capacity argument (cross-document G10), and 7 was fixed as N2. Each has a note below.
+
 1. **Recovered commit votes and E1.** Section 11 relies on a recovered `VoteCommit` Tx retaking its locks before the
    store answers reads (`Frontend.holding`). Confirm in [crash-recovery-log.md](crash-recovery-log.md) that no window
    exists where a store answers a read between CRL recovery and lock retake.
+   > *2026-11-16: CLOSED, no window.* While `Frontend.holding` is true (`awaitingCrl`, a recovered Tx still loading
+   > its objects, or one waiting to decide its vote), `readObjectForNetwork` drops every client read. A dropped read
+   > looks the same as a silent store. `reconcile` treats the object as unsettled, so repair installs nothing either.
+   > `awaitingCrl` is cleared only after `recoverState` has registered every recovered Tx, and each recovered Tx leaves
+   > `recoveringTransactions` only through `recoveredTransactionLoaded`. A Tx with a persisted vote takes its
+   > commit-vote locks there (`completeLoad`). Tests: FrontendSuite "a read of a recovered commit vote's object,
+   > arriving before the vote has locked, is not answered unlocked" and "a repair does not reconcile a store while it
+   > holds for recovered transactions".
 2. **Object timestamp semantics.** Whether the system intends object timestamps to be monotone (the design says "HLC
    timestamps are per transaction, so a read no older than the store reflects every transaction the store applied",
    `Reconcile.scala:147-150`). Q8 says it is not for blind writes and refcount updates. F3 and F13 follow.
+   > *2026-11-16: CLOSED by F3.* Object timestamps are monotone: every apply takes the later of the object's timestamp
+   > and the transaction's (`RequirementsApplyer`, the `later(...)` calls on every requirement kind). Stores refuse blind
+   > writes (F4), and a copied timestamp (Reconcile, rebuild) is a read's, the max over the stores that match its
+   > revision.
 3. **Timestamp advance with deferred keys.** `planKeyValue` sets the object timestamp to the read's even if keys were
    deferred (`:212`). The only readers of the store's timestamp for KeyValue objects are the reader's revision ranking
    and `checkRevision`, so this has no visible effect today; if a future change uses the store's timestamp as a
    "caught up" indicator it would be wrong.
+   > *2026-11-16: CLOSED by design, kept as is.* Since F3, the store's KeyValue object timestamp is also read by
+   > `checkKVRequirements` (`ObjectTimestampError` for a transaction that requires the revision and starts before the
+   > object's timestamp). Advancing it on a whole-object pass that defers some keys is still correct. The read's
+   > timestamp is the max over stores that applied every update the read reflects, so a fully caught-up store would
+   > hold the same timestamp and reject the same transactions. The deferred keys' own updates all carry timestamps no
+   > later than the read's, and key requirements check per-key timestamps (`ValueState.timestamp`), not the object's.
+   > Nothing reads the store's object timestamp as "caught up": the completion gate uses the read's timestamp, and an
+   > entry with a deferred key is incomplete until a later pass reconciles that key. Not advancing it would be worse.
+   > A narrowed pass (`only`) never touches the timestamp, because its read also reflects keys outside its scope. So the
+   > store would stay behind until its next write. Test: ReconcileSuite "a whole-object pass that defers a locked key
+   > still advances the object timestamp, and is incomplete".
 4. **Proof on a refcount-0 or deleted object.** A proof of a refcount for an object that a concurrent delete has set
    to zero aborts on the required refcount. Fine, but not exercised in tests I saw.
+   > *2026-11-16: CLOSED, tested.* Every requirement on a refcount-0 or missing object fails with `MissingObject`
+   > (`RequirementsChecker.loaded`), so each proof aborts and none revives the object. That covers a key proof
+   > (`KeyRevision`, and `DoesNotExist` for a key the read saw absent), the object-level `ExclusiveRevisionLock`, and a
+   > refcount proof at either the read's refcount or the deleted one. A store that missed the deletion (a zombie) is at
+   > most `width - writeThreshold` stores, short of a write threshold (cross-document G7). The aborted proof leaves the
+   > entry, and the next pass's read proves the deletion (`repairListed`, F15). Test: RepairProofsSuite "every proof from
+   > a read taken before the object's deletion aborts, and the object stays deleted".
 5. **`maxConcurrentStoreScans` applies to metadata reads too** (`RepairService.scala:134`). Harmless.
+   > *2026-11-16: CLOSED, harmless (no change).* `refreshPolicies` reuses the bound for its policy reads
+   > (`RepairService.scala:163`). Those reads finish, or hit `metadataDeadline`, before `sweep` starts the tick's scans,
+   > so they never compete with scans for slots, and a failed read keeps the cached policy.
 6. **ErrorTree growth during a long outage.** One entry per (store, object), plus, since the refresh, one
    UnackedCommits entry per (store, transaction) for every committed transaction with that store as a silent voter
    (transaction-recovery R-N4). A store down for days across a workload that touches many objects makes a large tree; the 256-entry
    batch cap and TKVL splitting keep individual writes bounded, but the scan is sequential and F9 limits progress per
    scan.
+   > *2026-11-16: drain answered; capacity folded into G10.* The drain is no longer capped per scan: since F9, a scan
+   > cut off by its deadline after seeing entries keeps the store at `scanIntervalFloor` and keeps its DeferralState.
+   > Each pass therefore resumes the backlog, and E15 bounds the passes per reconcilable entry. Since RP-N3, an
+   > UnackedCommits entry whose object the same scan's ErrorTree pass completed costs only its delete. The scan is
+   > still sequential per store, so a large backlog drains at one entry's read, install and delete at a time. That is
+   > slow but bounded, in keeping with simple handling of a rare failure. What stays open is the space: ErrorTree and
+   > UnackedCommits entries occupy metadata-pool backend space, not CRL bytes (G10, the CRL admission leg). No document
+   > bounds that space against a long outage. Residual: cross-document G10 (UnackedCommits growth and rebuild legs).
 7. **Interaction of repair's own read with opportunistic rebuild.** The repair's `client.read` is an ordinary read and
    may trigger rebuild messages to the store being repaired (10.3), which F1/F2 make unsafe; confirm whether the read
    in `repairUpdate` should disable opportunistic rebuild (`disableOpportunisticRebuild`).
+   > *2026-11-14: CLOSED as N2 (13.4). The opportunistic rebuild path was deleted.*
 
 ### 13.4 New findings from the adversarial verification (2026-11-09)
 

@@ -174,7 +174,12 @@ Per cross-document-review §2, no document yet covers:
   allocations, so `acceptor-since` is rebuild's only clock comparison;
 - the size limits of marker batches;
 - a combined capacity argument covering the ErrorTree, UnackedCommits growth, CRL admission and rebuilds (the CRL
-  admission leg stated 2026-11-15, cross-document G10; UnackedCommits growth and rebuilds still open);
+  admission leg stated 2026-11-15, cross-document G10; the backlog's drain stated 2026-11-16, repair 13.3-6; the
+  space of UnackedCommits and ErrorTree growth, and rebuilds, still open);
+- (closed 2026-11-16, Todo 6.9) repair-process 13.3's open questions: reads and repairs wait for recovered commit
+  votes to retake their locks (tested), timestamps are monotone (F3), a deferred key's pass may advance the object
+  timestamp (tested, by design), every proof on a deleted object aborts (tested), and the scan bound on policy reads
+  is harmless;
 - (closed 2026-11-15, Todo 6.2) how long a transaction may stay unresolved against a rebuilt store's mute (cross-document
   G1): no bound is assumed; tested end to end, which found and fixed the expiry hole above;
 - (closed 2026-11-15, Todo 6.1) a driver's data-less prepare preceding the client's prepare (cross-document G11):

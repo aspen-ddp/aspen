@@ -151,6 +151,34 @@ class RepairProofsSuite extends IntegrationTestSuite:
       after.contents.keySet shouldBe read.contents.keySet
       isMarked shouldBe false
 
+  // Repair 13.3 question 4: a repair that read an object before a delete set its refcount to zero proves from that
+  // read. Every requirement on a refcount-0 or missing object fails (MissingObject), so each kind of proof aborts, a
+  // refcount proof at the deleted refcount included, and none brings the object back
+  test("every proof from a read taken before the object's deletion aborts, and the object stays deleted"):
+    for
+      ptr <- kvObject()
+      read <- client.read(ptr)
+      _ <- client.transactUntilSuccessful: tx =>
+             tx.setRefcount(ptr, read.refcount, read.refcount.setCount(0))
+             Future.unit
+      _ <- net.waitForTransactionsToComplete()
+      presentKey <- RepairProofs.proveKey(client, ptr, k0, Some(read.contents(k0).revision))
+      absentKey <- RepairProofs.proveKey(client, ptr, k1, None)
+      objectLevel <- RepairProofs.proveObjectLevel(client, read)
+      readRefcount <- RepairProofs.proveRefcount(client, ptr, read.refcount)
+      deletedRefcount <- RepairProofs.proveRefcount(client, ptr, read.refcount.setCount(0))
+      _ <- net.waitForTransactionsToComplete()
+      after <- client.read(ptr).failed
+    yield
+      presentKey shouldBe false
+      absentKey shouldBe false
+      objectLevel shouldBe false
+      readRefcount shouldBe false
+      deletedRefcount shouldBe false
+      after match
+        case io: org.aspen_ddp.aspen.client.InvalidObject => io.provesDeletion shouldBe true
+        case other => fail(s"the read after the proofs ended $other, not a proven deletion")
+
   test("proof transactions that change nothing disable missed-update tracking"):
     Future.successful:
       RepairProofs.newProofTransaction(client).missedUpdateTrackingEnabled shouldBe false

@@ -59,8 +59,8 @@ PRIORITY 5: performance and hygiene
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
-                                                
-6.9  Repair 13.3 open questions 1-6 (4: a proof on a refcount-0 object is untested).                       [S each]
+
+(no open items)
 
 
 PRIORITY 7: documentation corrections

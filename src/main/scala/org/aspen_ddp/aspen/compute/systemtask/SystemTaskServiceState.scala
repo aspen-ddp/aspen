@@ -47,6 +47,13 @@ object SystemTaskServiceState:
     if pinned then tree.prepareSetPinned(key, Value(taskStatePtr.toArray), PutRequirement.Checked)
     else tree.set(key, Value(taskStatePtr.toArray))
 
+  /** Whether `taskId` is enrolled */
+  def contains(client: AspenClient,
+               statePtr: KeyValueObjectPointer,
+               taskId: UUID): Future[Boolean] =
+    given ExecutionContext = client.clientContext
+    tkvl(client, statePtr).get(Key(uuid2byte(taskId))).map(_.isDefined)
+
   /** Read all enrolled (taskId, taskStatePointer) pairs. */
   def scan(client: AspenClient,
            statePtr: KeyValueObjectPointer): Future[List[(UUID, KeyValueObjectPointer)]] =

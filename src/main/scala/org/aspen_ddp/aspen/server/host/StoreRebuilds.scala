@@ -630,14 +630,22 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         try
           // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
           // the control-context onComplete; the prepare closure's combinators run on the control thread
-          ctx.client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision) { tx =>
+          // A Rebuilding entry found after an attempt that committed but was reported TransactionOutcomeUnknown is
+          // this request's own, so the rebuild is started now rather than at the next periodic check (Todo 5.10).
+          // Starting it is idempotent should the entry be another writer's
+          val retry = StopRetrying.collisionRetry()
+          ctx.client.transactUntilSuccessfulWithRecovery(retry.onFailure) { tx =>
             for
               ptr <- ctx.client.getStorageDevicePointer(storageDeviceId)
               kvos <- ctx.client.read(ptr)
               state = StorageDeviceState(kvos)
             yield
-              val active = state.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active)
-              if !state.isFailed && state.hostId == ctx.hostId && active then
+              val status = state.stores.get(storeId).map(_.status)
+              val active = status.contains(StorageDeviceState.StoreStatus.Active)
+              val ours = !state.isFailed && state.hostId == ctx.hostId
+              if ours && retry.mayHaveCommitted && status.contains(StorageDeviceState.StoreStatus.Rebuilding) then
+                true
+              else if ours && active then
                 val newState = state.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
                 tx.update(ptr, None, None,
                   List(KeyRevision(StorageDeviceState.StateKey,

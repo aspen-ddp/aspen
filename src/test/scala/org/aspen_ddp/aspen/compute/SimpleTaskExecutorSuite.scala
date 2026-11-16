@@ -187,3 +187,32 @@ class SimpleTaskExecutorSuite extends IntegrationTestSuite:
       allocations.size shouldBe n
       rootAfter.contents.size shouldBe n
       rootAfter.contents.values.map(_.value.bytes.toList).toSet.size shouldBe n
+
+  atest("an allocation that committed but was reported Unknown is not repeated by its retry"):
+    given ExecutionContext = executionContext
+    for
+      pool <- client.getStoragePool(radicle.poolId)
+      allocator = new PoolObjectAllocator(client, pool)
+      tx0 = client.newTransaction()
+      kvos <- client.read(radicle)
+      executorRoot <- allocator.allocateKeyValueObject(Map())(using tx0)
+      _ = tx0.bumpVersion(radicle, kvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
+      executor <- SimpleTaskExecutor(client, allocator, executorRoot)
+
+      // The allocation's commit, the only transaction updating the executor object, is reported Unknown
+      _ = net.reportCommitAsUnknown(_.allReferencedObjectsSet.exists(_.id == executorRoot.id))
+      kvos1 <- client.read(radicle)
+      tx1 = client.newTransaction()
+      _ <- executor.prepareTask(PendingTaskFactory, List(PendingTaskFactory.MarkerKey -> Array[Byte](1)))(using tx1)
+      _ = tx1.bumpVersion(radicle, kvos1.revision)
+      _ <- tx1.commit()
+      _ <- waitForTransactionsToComplete()
+      root <- client.read(executorRoot)
+      taskPtr = KeyValueObjectPointer(root.contents.values.head.value.bytes)
+      task <- client.read(taskPtr)
+    yield
+      net.pendingUnknownCommits should be (0)
+      root.contents.size should be (1)
+      task.contents(PendingTaskFactory.MarkerKey).value.bytes.toList should be (List[Byte](1))

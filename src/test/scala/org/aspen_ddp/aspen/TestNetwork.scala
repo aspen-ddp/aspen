@@ -182,9 +182,17 @@ object TestNetwork {
         given ExecutionContext = executionContext
         getStoragePool(pointer.poolId).map(_.ida).recover { case _: NoSuchElementException => ida }
 
+    /** Retries creates as the production client does (SimpleAspenClient.runCreate), for tests of a create whose
+      * committed attempt the client is told is Unknown */
+    @volatile var retryCreates: Boolean = false
+
     // Single attempt, no retry: test failures must surface rather than being retried away.
     override protected def runCreate[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T]): Future[T] =
-      transact(prepare)
+      if retryCreates then
+        given ExecutionContext = executionContext
+        transactUntilSuccessfulWithRecovery(onCommitFailure)(prepare)
+      else
+        transact(prepare)
 
   /** The TestNetwork client's transaction driver. It sends its prepares once and never retransmits, as
     * ClientTransactionDriver.noErrorRecoveryFactory's does, and gives up with ClientOutcome.Unknown once the client's
@@ -194,8 +202,17 @@ object TestNetwork {
   final class HorizonClientDriver(horizon: FiniteDuration,
                                   client: ReadDriverClient,
                                   txd: TransactionDescription,
-                                  updateData: Map[StoreId, TransactionData])
+                                  updateData: Map[StoreId, TransactionData],
+                                  commitAsUnknown: TransactionDescription => Boolean = _ => false)
     extends ClientTransactionDriver(client, txd, updateData):
+
+    // A transaction the test asked about commits at the stores, but the client is told Unknown, as when it gives up
+    // past the horizon just before the resolution would have reached it (TestNetwork.reportCommitAsUnknown)
+    override protected def complete(outcome: ClientOutcome): Unit =
+      if outcome == ClientOutcome.Committed && !result.isCompleted && commitAsUnknown(txd) then
+        super.complete(ClientOutcome.Unknown)
+      else
+        super.complete(outcome)
 
     /** Gives up if past the horizon; whether the driver has completed */
     def checkGiveUp(): Boolean =
@@ -437,12 +454,31 @@ class TestNetwork(executionContext: ExecutionContext,
     override def isStoreOffline(storeId: StoreId): Boolean = offlineStores.contains(storeId)
   }
 
+  /** Transactions still to be reported Unknown although they commit, by how many remain to be reported */
+  private var unknownCommits: List[(TransactionDescription => Boolean, Int)] = Nil
+
+  /** The next `count` client transactions matching `matching` commit at the stores, but the client is told
+    * TransactionOutcomeUnknown, as past the horizon. Each match uses up one */
+  def reportCommitAsUnknown(matching: TransactionDescription => Boolean, count: Int = 1): Unit = synchronized:
+    unknownCommits = unknownCommits :+ (matching, count)
+
+  /** How many reportCommitAsUnknown matches are still to come */
+  def pendingUnknownCommits: Int = synchronized(unknownCommits.map(_._2).sum)
+
+  private def commitAsUnknown(txd: TransactionDescription): Boolean = synchronized:
+    unknownCommits.indexWhere((m, _) => m(txd)) match
+      case -1 => false
+      case i =>
+        val (m, n) = unknownCommits(i)
+        unknownCommits = if n > 1 then unknownCommits.updated(i, (m, n - 1)) else unknownCommits.patch(i, Nil, 1)
+        true
+
   /** The client's transactions not yet completed (HorizonClientDriver), checked by heartbeat */
   private var clientDrivers: List[HorizonClientDriver] = Nil
 
   private def clientDriverFactory(c: ReadDriverClient, txd: TransactionDescription,
                                   updateData: Map[StoreId, TransactionData]): ClientTransactionDriver =
-    val d = new HorizonClientDriver(hostOptions.transactionHorizon, c, txd, updateData)
+    val d = new HorizonClientDriver(hostOptions.transactionHorizon, c, txd, updateData, commitAsUnknown)
     synchronized:
       clientDrivers = d :: clientDrivers
     d

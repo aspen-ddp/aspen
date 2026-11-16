@@ -50,9 +50,10 @@ object FailedStorageDeviceDurableTask extends DurableTaskFactory:
    *  `AspenClient.prepareSystemDurableTask`. */
   def prepareSystemTask(client: AspenClient,
                         deviceId: StorageDeviceId,
-                        pinned: Boolean = false)(using tx: Transaction): Future[Unit] =
+                        pinned: Boolean = false,
+                        taskId: Option[UUID] = None)(using tx: Transaction): Future[Unit] =
     client.prepareSystemDurableTask(typeUUID, Map(
-      DeviceIdKey -> uuid2byte(deviceId.uuid)), pinned)
+      DeviceIdKey -> uuid2byte(deviceId.uuid)), pinned, taskId)
 
 
 /** Tombstones a failed storage device and drains its stores onto live devices, one at a time.

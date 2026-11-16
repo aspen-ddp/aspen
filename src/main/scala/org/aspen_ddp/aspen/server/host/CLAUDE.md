@@ -131,4 +131,9 @@
   never loaded or claimed; nothing on it is deleted. The tombstone (`FailedStorageDeviceDurableTask`) nudges the
   former host with `CheckStorageDevice`. A repair scan runs only while the store's pool entry names this host
   (`StoreRepairer`), so a superseded copy never consumes the current copy's ErrorTree entries
+- Metadata transactions retried after a `TransactionOutcomeUnknown` recognize their own commit (`client/CLAUDE.md`,
+  paxos-transactions 10.11): `requestRebuild` checks the device at once on finding its Rebuilding entry, `adoptDevice`
+  returns `Adopted` for a device it finds owned here, the executor root init uses a root already present, and the
+  transfer-complete and rebuild-complete updates send the `StoreMoved`/`StoreOffline`/`gossipStoreOnline`
+  announcements and nudges that the committed attempt's `tx.result` could not
 - `DurableFiles` (Linux-only directory durability): `server/CLAUDE.md`

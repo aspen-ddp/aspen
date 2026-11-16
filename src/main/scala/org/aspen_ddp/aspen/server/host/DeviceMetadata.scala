@@ -198,7 +198,32 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
     // index the config does not have, generateBootstrapConfig's two requires, an object that
     // cannot be read -- is permanent, and retrying it would be a 60 s loop for the life of the
     // process that reports nothing at all.
-    client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+    //
+    // After an attempt that committed but was reported TransactionOutcomeUnknown, the retry finds the pool already
+    // repointed. That attempt's tx.result failed, so its announcements are made by the retry (Todo 5.10)
+    val retry = StopRetrying.collisionRetry()
+
+    /** Once the pool names the destination: the source host deletes its copy, the rebalancer learns the transfer is
+      * done, and every host learns where the store lives. `configTimestamp` is the pool config value's */
+    def announceRepointed(fromDev: StorageDeviceState, toDev: StorageDeviceState, configTimestamp: HLCTimestamp,
+                          offline: Boolean): Unit =
+      client.sendHostMessage(CheckStorageDevice(fromDev.hostId, client.clientId, fromDev.storageDeviceId))
+
+      // Best-effort wake-up for the rebalancing service (harmless for non-rebalance
+      // transfers; the service also polls, so delivery is not required for correctness).
+      client.sendServiceMessage(
+        RebalancingDurableService.ServiceUUID,
+        RebalancingMessage.encode(
+          TransferComplete(toDev.storageDeviceSet, storeId, fromDeviceId, toDeviceid)))
+
+      // Tell every other host (and client) where the store now lives. An Offline entry is announced too, followed
+      // by its StoreOffline: the store does live here now, it just does not answer until its device is back in
+      // service.
+      gossipRetransmitter.broadcast(StoreMoved(storeId, toDev.hostId, configTimestamp, HLCTimestamp.now))
+      if offline then
+        gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
+
+    client.transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
       for
         poolPtr <- client.getStoragePoolPointer(storeId.poolId)
         fromDevPtr <- client.getStorageDevicePointer(fromDeviceId)
@@ -297,32 +322,10 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
           val toDevOps = List(Insert(StorageDeviceState.StateKey, newtoDev.encode()))
           tx.update(toDevPtr, None, None, toDevReqs, toDevOps)
 
-          // If state update transaction is successful, send a CheckStorageDevice
-          // message to the host of the old storage device so they can delete
-          // the store content
+          // Announced only once committed, and only on the branches that find the pool repointed by this
+          // call. This transaction wrote the pool config, so its timestamp is the config value's
           tx.result.foreach: timestamp =>
-            val msg = CheckStorageDevice(
-              fromDev.hostId,
-              client.clientId,
-              fromDev.storageDeviceId
-            )
-            client.sendHostMessage(msg)
-
-            // Best-effort wake-up for the rebalancing service (harmless for non-rebalance
-            // transfers; the service also polls, so delivery is not required for correctness).
-            client.sendServiceMessage(
-              RebalancingDurableService.ServiceUUID,
-              RebalancingMessage.encode(
-                TransferComplete(toDev.storageDeviceSet, storeId, fromDeviceId, toDeviceid)))
-
-            // Tell every other host (and client) where the store now lives. Sent only on this
-            // branch: the other outcomes did not repoint the pool. This transaction wrote the pool
-            // config, so its timestamp is the config value's. An Offline entry is announced
-            // too, followed by its StoreOffline: the store does live here now, it just does not
-            // answer until its device is back in service.
-            gossipRetransmitter.broadcast(StoreMoved(storeId, toDev.hostId, timestamp, HLCTimestamp.now))
-            if newEntry.status == StorageDeviceState.StoreStatus.Offline then
-              gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
+            announceRepointed(fromDev, toDev, timestamp, newEntry.status == StorageDeviceState.StoreStatus.Offline)
 
           if newEntry.status == StorageDeviceState.StoreStatus.Offline then TransferOutcome.PoolRepointedOffline
           else TransferOutcome.PoolRepointed
@@ -335,7 +338,13 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
         else if poolCfg.stores(storeId.poolIndex).storageDeviceId == toDeviceid then
           // Offline when that call wrote it Offline, or the shutdown request has taken it Offline
           // since: either way the copy is ours but must not be served.
-          if toDev.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Offline) then
+          val offline = toDev.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Offline)
+          // The repointing may be this call's own, by an attempt reported Unknown that announced nothing. The
+          // announcements are idempotent, so they are made again whoever repointed it
+          if retry.mayHaveCommitted then
+            val configTimestamp = poolKvos.contents(StoragePoolState.ConfigKey).timestamp
+            tx.result.foreach(_ => announceRepointed(fromDev, toDev, configTimestamp, offline))
+          if offline then
             TransferOutcome.PoolRepointedOffline
           else
             TransferOutcome.PoolRepointed
@@ -381,7 +390,10 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
   def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
                              storeId: StoreId,
                              gossipStoreOnline: StoreId => Unit): Future[RebuildOutcome] =
-    client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+    // An attempt that committed but was reported TransactionOutcomeUnknown leaves the entry Active, and its
+    // tx.result, which gossips the store online, failed. The retry gossips it instead (Todo 5.10)
+    val retry = StopRetrying.collisionRetry()
+    client.transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
       for
         ptr <- client.getStorageDevicePointer(storageDeviceId)
         kvos <- client.read(ptr)
@@ -423,7 +435,12 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
                 RebuildOutcome.AdoptOffline
 
             case Some(entry) if entry.status == StorageDeviceState.StoreStatus.Active =>
-              // Already flipped by a concurrent rebuild completion. No update staged.
+              // Already flipped by a concurrent rebuild completion, or by this call's own attempt reported
+              // Unknown. No update staged. Gossiping online again is harmless
+              if retry.mayHaveCommitted then
+                tx.result.foreach: _ =>
+                  logger.info(s"Rebuild of store $storeId complete")
+                  gossipStoreOnline(storeId)
               RebuildOutcome.Adopt
 
             case Some(entry) if entry.status == StorageDeviceState.StoreStatus.Offline =>
@@ -495,7 +512,11 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
         List(KeyRevision(HostState.StateKey, kvos.contents(HostState.StateKey).revision)),
         List(Insert(HostState.StateKey, hs.encode())))
 
-    client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+    // An attempt that committed but was reported TransactionOutcomeUnknown leaves the device owned here, which the
+    // retry recognizes as its own adoption rather than a change by someone else (Todo 5.10). Its disk-side steps
+    // (markRebuildRequired) ran before that commit and are idempotent; the re-read state is what it wrote
+    val retry = StopRetrying.collisionRetry()
+    client.transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
       given Transaction = tx
       for
         devPtr <- client.getStorageDevicePointer(storageDeviceId)
@@ -503,7 +524,12 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
         state = StorageDeviceState(devKvos)
         unclean = uncleanStores(devicePath, state)
         adopted <-
-          if state.isFailed || state.hostId != previousHostId then
+          if retry.mayHaveCommitted && !state.isFailed && state.hostId == hostId && previousHostId != hostId then
+            tx.result.foreach: _ =>
+              logger.info(s"Adopted storage device $storageDeviceId from host $previousHostId (found committed)")
+              client.sendBestEffortHostMessage(CheckStorageDevice(previousHostId, client.clientId, storageDeviceId))
+            Future.successful(AdoptOutcome.Adopted(state))
+          else if state.isFailed || state.hostId != previousHostId then
             Future.successful(AdoptOutcome.Changed)
           else if unclean.nonEmpty then
             Future.successful(AdoptOutcome.Unclean(unclean))

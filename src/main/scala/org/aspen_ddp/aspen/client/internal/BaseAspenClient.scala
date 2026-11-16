@@ -351,7 +351,7 @@ abstract class BaseAspenClient(
       isMetadataGroup
     )
 
-    runCreate(StopRetrying.unlessCollision): tx =>
+    runIdempotentCreate(allocationGroupsTree, ags.groupId.uuid, Future.successful(ags.groupId)): tx =>
       given Transaction = tx
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
@@ -385,7 +385,7 @@ abstract class BaseAspenClient(
         val updated = parentState.copy(memberSets = sds.setId :: parentState.memberSets)
         tx.overwrite(parentPtr, parentDos.revision, DataBuffer(updated.toBytes))
 
-    runCreate(StopRetrying.unlessCollision): tx =>
+    runIdempotentCreate(storageDeviceSetsTree, sds.setId.uuid, Future.successful(sds.setId)): tx =>
       given Transaction = tx
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
@@ -410,7 +410,7 @@ abstract class BaseAspenClient(
 
     // No TaskExecutorRootKey is written. Host inserts it on first start under a
     // DoesNotExist requirement, so seeding it here would only duplicate that.
-    runCreate(StopRetrying.unlessCollision): tx =>
+    runIdempotentCreate(hostsTree, hostId.uuid, Future.successful(hostId)): tx =>
       given Transaction = tx
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
@@ -430,7 +430,7 @@ abstract class BaseAspenClient(
     val deviceId = StorageDeviceId(UUID.randomUUID())
     val state = StorageDeviceState(deviceId, hostId, 0L, 0L, Map(), deviceSetId)
 
-    runCreate(StopRetrying.unlessCollision): tx =>
+    runIdempotentCreate(storageDevicesTree, deviceId.uuid, Future.successful(deviceId)): tx =>
       given Transaction = tx
       for
         bsPool   <- getStoragePool(PoolId.BootstrapPoolId)
@@ -468,6 +468,23 @@ abstract class BaseAspenClient(
 
         deviceId
 
+  /** Runs a create whose id is chosen outside the retry. After an attempt that committed but was reported
+    * TransactionOutcomeUnknown, a tree already mapping `id` holds that attempt's own object (Todo 5.10): nothing is
+    * staged, so the empty transaction succeeds, and `created` is the result. Otherwise the retry would fail with
+    * KeyAlreadyExists, which reads as a name or id someone else took. A first attempt that finds the id taken still
+    * fails that way */
+  private def runIdempotentCreate[T](tree: MetadataTree, id: UUID, created: => Future[T])(
+      prepare: Transaction => Future[T]): Future[T] =
+    given ExecutionContext = clientContext
+    val retry = StopRetrying.collisionRetry()
+    runCreate(retry.onFailure): tx =>
+      if retry.mayHaveCommitted then
+        tree.tree.get(Key(id)).flatMap:
+          case Some(_) => created
+          case None => prepare(tx)
+      else
+        prepare(tx)
+
   override protected def createStoragePool(config: StoragePoolState,
                                            metadataGroup: Option[AllocationGroupId]): Future[PoolId] =
     // Metadata pools' trees live in the bootstrap pool, every other pool's in a metadata group
@@ -476,7 +493,12 @@ abstract class BaseAspenClient(
     // Only a collision is retried: a taken pool name (KeyAlreadyExists), a failed device and an
     // allocation failure are all permanent. The test client's runCreate performs a single
     // attempt regardless.
-    val fStaged = runCreate(StopRetrying.unlessCollision): tx =>
+    // The nudges of a pool found created by an attempt reported Unknown: each device holding one of its stores
+    def createdPoolNudges(): Future[List[CheckStorageDevice]] =
+      Future.sequence(config.stores.map(_.storageDeviceId).distinct.toList.map: deviceId =>
+        getStorageDeviceState(deviceId).map(st => CheckStorageDevice(st.hostId, clientId, deviceId)))
+
+    val fStaged = runIdempotentCreate(storagePoolsTree, config.poolId.uuid, createdPoolNudges()): tx =>
       given Transaction = tx
 
       // The allocator for the trees' root nodes and the NodeAllocator their later nodes come from
@@ -648,10 +670,12 @@ abstract class BaseAspenClient(
   override def createSystemDurableTask(taskTypeUUID: UUID,
                                        initialState: Map[Key, Array[Byte]]): Future[Unit] =
     given ExecutionContext = clientContext
+    // One id for every attempt: a retry after an attempt that committed but was reported Unknown finds it enrolled
+    val taskId = UUID.randomUUID()
     transactUntilSuccessful: tx =>
       given Transaction = tx
       // Nothing else in this transaction pins it
-      prepareSystemDurableTask(taskTypeUUID, initialState, pinned = true)
+      prepareSystemDurableTask(taskTypeUUID, initialState, pinned = true, Some(taskId))
 
   /** Signals that the pool's set pointer already equals the target. Thrown from inside the
    *  transaction so nothing is staged: Aspen has no empty transactions. Recovered to unit. */
@@ -735,27 +759,48 @@ abstract class BaseAspenClient(
   override def failStorageDevice(deviceId: StorageDeviceId): Future[Unit] =
     given ExecutionContext = clientContext
 
-    transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+    // One task id for every attempt. A retry after an attempt that committed but was reported Unknown finds its own
+    // task enrolled, or the device already tombstoned by it, and succeeds rather than enrolling a second task or
+    // failing with DeviceAlreadyFailed (Todo 5.10)
+    val taskId = UUID.randomUUID()
+    val retry = StopRetrying.collisionRetry()
+    transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
       given Transaction = tx
 
       for
         devPtr <- getStorageDevicePointer(deviceId)
         devKvos <- read(devPtr, "fail storage device")
         state = StorageDeviceState(devKvos)
+        enrolled <- if retry.mayHaveCommitted then systemTaskEnrolled(taskId) else Future.successful(false)
         _ <-
-          if state.isFailed then
+          if enrolled then
+            Future.unit
+          else if state.isFailed then
             throw AspenClient.DeviceAlreadyFailed(deviceId)
           else
             // Only the device id is recorded. The task re-reads everything else -- including the
             // device's set -- inside its own transactions, so nothing here can go stale between
             // enrollment and the first pass.
             // The device state is only read, so the enrollment must pin the transaction
-            FailedStorageDeviceDurableTask.prepareSystemTask(this, deviceId, pinned = true)
+            FailedStorageDeviceDurableTask.prepareSystemTask(this, deviceId, pinned = true, Some(taskId))
       yield ()
+
+  /** Whether the system-task registry holds `taskId` */
+  private def systemTaskEnrolled(taskId: UUID): Future[Boolean] =
+    given ExecutionContext = clientContext
+    systemTaskServiceStatePointer().flatMap(statePtr => SystemTaskServiceState.contains(this, statePtr, taskId))
+
+  private def systemTaskServiceStatePointer(): Future[KeyValueObjectPointer] =
+    given ExecutionContext = clientContext
+    servicesTkvl.get(Key(SystemTaskExecutorService.ServiceUUID)).map:
+      case Some(vs) => ServiceEntry.decode(vs.value.bytes).statePointer
+      case None => throw StopRetrying(
+        new IllegalStateException("SystemTaskExecutorService is not registered"))
 
   override def prepareSystemDurableTask(taskTypeUUID: UUID,
                                         initialState: Map[Key, Array[Byte]],
-                                        pinned: Boolean)
+                                        pinned: Boolean,
+                                        fixedTaskId: Option[UUID])
                                        (using tx: Transaction): Future[Unit] =
     given ExecutionContext = clientContext
 
@@ -765,28 +810,33 @@ abstract class BaseAspenClient(
         Future.failed(StopRetrying(
           new IllegalArgumentException(s"prepareSystemDurableTask: no DurableTaskFactory registered for $taskTypeUUID")))
       case Some(_) =>
-        val taskId = UUID.randomUUID()
-
-        def serviceStatePtr(): Future[KeyValueObjectPointer] =
-          servicesTkvl.get(Key(SystemTaskExecutorService.ServiceUUID)).map:
-            case Some(vs) => ServiceEntry.decode(vs.value.bytes).statePointer
-            case None => throw StopRetrying(
-              new IllegalStateException("SystemTaskExecutorService is not registered"))
+        val taskId = fixedTaskId.getOrElse(UUID.randomUUID())
 
         val taskContent: Map[Key, Value] =
           (initialState + (SimpleTaskExecutor.TaskTypeKey -> uuid2byte(taskTypeUUID)))
             .map((k, v) => k -> Value(v))
 
+        def enroll(statePtr: KeyValueObjectPointer): Future[Unit] =
+          for
+            pool <- getStoragePool(Radicle.poolId)
+            allocator = new PoolObjectAllocator(this, pool)
+            taskStatePtr <- allocator.allocateKeyValueObject(taskContent)
+            _ <- SystemTaskServiceState.enrollInTx(this, statePtr, taskId, taskStatePtr, pinned)
+          yield ()
+
+        // Sent whether this attempt enrolled the task or found it enrolled by one reported Unknown, whose own
+        // tx.result failed: the wake-up is best effort and idempotent
+        tx.result.foreach: _ =>
+          sendServiceMessage(SystemTaskExecutorService.ServiceUUID,
+            SystemTaskMessage.encode(NewSystemTaskAdded(taskId)))
+
         for
-          statePtr <- serviceStatePtr()
-          pool <- getStoragePool(Radicle.poolId)
-          allocator = new PoolObjectAllocator(this, pool)
-          taskStatePtr <- allocator.allocateKeyValueObject(taskContent)
-          _ <- SystemTaskServiceState.enrollInTx(this, statePtr, taskId, taskStatePtr, pinned)
-        yield
-          tx.result.foreach: _ =>
-            sendServiceMessage(SystemTaskExecutorService.ServiceUUID,
-              SystemTaskMessage.encode(NewSystemTaskAdded(taskId)))
+          statePtr <- systemTaskServiceStatePointer()
+          enrolled <-
+            if fixedTaskId.isDefined then SystemTaskServiceState.contains(this, statePtr, taskId)
+            else Future.successful(false)
+          _ <- if enrolled then Future.unit else enroll(statePtr)
+        yield ()
 
   def getSystemAttribute(key: String): Option[String] = attributes.get(key)
   def setSystemAttribute(key: String, value: String): Unit = attributes += key -> value

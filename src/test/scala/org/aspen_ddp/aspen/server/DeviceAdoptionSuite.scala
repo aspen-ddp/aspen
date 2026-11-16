@@ -53,6 +53,17 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
                      host.control.reconciler.activeDeviceChecks.isEmpty)
     yield ()
 
+  /** Pumps until `condition` holds or `deadline` (System.nanoTime) passes, waiting in real time between rounds for
+    * work the client schedules on its background timer, such as a retry's backoff */
+  private def pollUntil(deadline: Long)(condition: => Boolean): Future[Unit] =
+    given ExecutionContext = executionContext
+    pumpUntil(condition, 1).flatMap: _ =>
+      if condition || System.nanoTime() > deadline then Future.unit
+      else
+        val p = scala.concurrent.Promise[Unit]()
+        client.backgroundTaskManager.schedule(scala.concurrent.duration.Duration(10, "ms"))(p.success(()))
+        p.future.flatMap(_ => pollUntil(deadline)(condition))
+
   private def scanAndResolve(host: Host): Future[Unit] =
     host.control.reconciler.scan()
     resolve(host)
@@ -192,6 +203,28 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       val moves = storeMoves()
       moves.map(_.storeId) should be(List(s0))
       moves.head.hostId should be(HostId.BootstrapHostId)
+
+  atest("an adoption whose commit is reported Unknown is still brought into service (Todo 5.10)"):
+    given ExecutionContext = executionContext
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 1, registerOldHost = true): ss =>
+                  Map(ss(0) -> offline)
+      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+      d0 = writeClosedStore(deviceDir, stores.head)
+      devPtr <- client.getStorageDevicePointer(deviceA)
+      // The adoption is the only transaction that writes deviceA from here on
+      _ = net.reportCommitAsUnknown(_.allReferencedObjectsSet.exists(_.id == devPtr.id))
+      host = newHost(hostRoot)
+      _ <- resolve(host)
+      // The retry follows the Unknown after the client's real-time backoff
+      _ <- pollUntil(System.nanoTime() + 10_000_000_000L)(loadedDevices(host).contains(deviceA))
+      st <- state(deviceA)
+    yield
+      net.pendingUnknownCommits should be(0)
+      st.hostId should be(HostId.BootstrapHostId)
+      DeviceMarkers.readOwningHost(deviceDir) should be(Some(HostId.BootstrapHostId))
+      loadedDevices(host).contains(deviceA) should be(true)
+      recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
 
   atest("adoption resumes a Rebuilding store"):
     given ExecutionContext = executionContext

@@ -95,28 +95,37 @@ class SimpleTaskExecutor(val client: AspenClient,
     next
 
   private def allocateTaskNow(): Future[(DurableTaskPointer, ObjectRevision)] =
+    // One key for every attempt. An attempt that committed but was reported TransactionOutcomeUnknown leaves it in the
+    // executor object, which onFail re-reads anyway; the retry then returns that attempt's task object instead of
+    // allocating another (Todo 5.10). Its pointer is the key's value
+    val taskKey = Key(UUID.randomUUID())
+    @volatile var committed: Option[KeyValueObjectPointer] = None
+
     // Only a collision is retried, after refreshing the executor's revision. Anything else -- an
     // unreadable executor object, an executor object grown past its size limit -- is permanent.
     def onFail(err: Throwable): Future[Unit] = err match
-      // An unknown outcome is treated like an abort. If the attempt did commit, it leaves a duplicate task, as a false
-      // abort did
       case _: TransactionAborted | _: TransactionOutcomeUnknown =>
         client.read(executorObject).map: kvos =>
           synchronized:
             executorRevision = kvos.revision
+            committed = kvos.contents.get(taskKey).map(vs => KeyValueObjectPointer(vs.value.bytes))
       case e => throw StopRetrying(e)
 
     client.transactUntilSuccessfulWithRecovery[(DurableTaskPointer, ObjectRevision, ObjectRevision)](onFail): tx =>
       given Transaction = tx
       synchronized:
-        val taskKey = Key(UUID.randomUUID())
-        val kreqs = KeyValueUpdate.DoesNotExist(taskKey) :: Nil
-        val requiredRevision = executorRevision
-        for
-          ptr <- taskStateAllocator.allocateKeyValueObject(Map())
-        yield
-          tx.update(executorObject, Some(requiredRevision), None, kreqs, Insert(taskKey, ptr.toArray) :: Nil)
-          (DurableTaskPointer(ptr), requiredRevision, tx.revision)
+        committed match
+          case Some(ptr) =>
+            // Nothing staged: the empty transaction succeeds. executorRevision was refreshed by onFail's read
+            Future.successful((DurableTaskPointer(ptr), executorRevision, executorRevision))
+          case None =>
+            val kreqs = KeyValueUpdate.DoesNotExist(taskKey) :: Nil
+            val requiredRevision = executorRevision
+            for
+              ptr <- taskStateAllocator.allocateKeyValueObject(Map())
+            yield
+              tx.update(executorObject, Some(requiredRevision), None, kreqs, Insert(taskKey, ptr.toArray) :: Nil)
+              (DurableTaskPointer(ptr), requiredRevision, tx.revision)
     .flatMap: (taskPointer, requiredRevision, newRevision) =>
       // Committed. Updated here, so the next allocation in the chain starts from the new revision
       synchronized:

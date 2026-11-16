@@ -839,9 +839,65 @@ horizon reports unknown, not aborted".
   (`TransactionStatusCache.EvictionLogPeriod`); the refusal warning is likewise limited to once per 10 s per store
   (`Frontend.RefusalLogPeriod`).
 * *Slow client clocks.* A client clock more than 20 s slow has its transactions refused (logged with the lag).
-* *Retried unknowns.* An Unknown may have committed; retry-by-default sites that are not idempotent may duplicate work
-  (`SimpleTaskExecutor.allocateTask` is known to; Todo audit entry).
+* *Retried unknowns.* An Unknown may have committed, and the retry re-runs its `prepare` against what that attempt
+  wrote. Audited and fixed 2026-11-15 (10.11); the residual is listed there.
 * *Backward wall-clock steps* beyond about 8 s (above).
+
+### 10.11 Retried unknowns (Todo 5.10, 2026-11-15)
+
+`TransactionOutcomeUnknown` may mean committed. Every `transactUntilSuccessful*` call re-runs its `prepare` with
+fresh reads, so after an Unknown that had committed, the retry runs against the state that attempt wrote. Safety is
+not at stake: a retry whose reads predate the commit's apply collides with it and re-reads. The question is what the
+re-run does with work already done. Every `StopRetrying.unlessCollision` site, `SimpleTaskExecutor.allocateTask` and
+every plain `transactUntilSuccessful` site in `src/main` was audited, including the `StoreRebuilds.createNewStore` flip.
+
+**Mechanism.** `StopRetrying.collisionRetry()` returns a `CollisionRetry`: `unlessCollision` that also records whether
+an earlier attempt ended Unknown (`mayHaveCommitted`). A site that is not naturally idempotent accepts its own
+post-commit state as success only then, and stages nothing, so the empty transaction succeeds. "Its own" is decided
+by an id or key fixed outside the retry closure, or by the exact state the call writes. Outside an Unknown the same
+state is still an error, so a first attempt that finds the work done by someone else still reports it. Post-commit
+announcements that the committed attempt's `tx.result` would have made are made by the retry instead.
+
+| Site | Before | Now |
+|---|---|---|
+| `HostServices.initializeTaskExecutor` (plain retry) | **Livelock**: the retry allocated a new root under `DoesNotExist(TaskExecutorRootKey)`, which aborted at the stores on every attempt; the host never started its task executor, usage tracking or system task runner | A root already present is used; nothing is staged |
+| `BaseAspenClient.failStorageDevice`, `createSystemDurableTask` | **Duplicate**: a second durable task, since `prepareSystemDurableTask` minted a task id per attempt (`failStorageDevice` could also fail with `DeviceAlreadyFailed`) | One task id per call (`prepareSystemDurableTask(taskId = Some(..))`); a registry holding it stages nothing. The registry read is opt-in, so other enrollments pay nothing |
+| `SimpleTaskExecutor.allocateTaskNow` | **Duplicate**: an extra empty task object, recorded in the executor object for good | One key per call; `onFail`'s existing re-read finds it and the retry returns that attempt's object |
+| `StoreRebuilds.requestRebuild` | **Wrong result**: `false`, so the rebuild waited for the periodic device check | A Rebuilding entry after an Unknown counts as this request's: the device is checked at once |
+| `DeviceMetadata.adoptDevice` | **Wrong result**: `Changed`, so the adopted device was not served until the next scan, and the previous host was not nudged | The device owned here after an Unknown is `Adopted(state)`; the nudge is sent |
+| `AspenClient.abortStoreTransfer` | **Wrong result**: `false` and no nudges after a rollback | The retry reports the earlier attempt's rollback and nudges |
+| `AspenClient.transferStore`, `replaceRebuild` | **False error**: `StoreNotActive`/`InvalidDestination` after the change was applied; nudges lost | One transfer id per call (`transferStore`); the call's own post-state is success, with the nudges |
+| `BaseAspenClient` creates (group, device set, host, device, pool) | **False error**: `KeyAlreadyExists`, which reads as a taken name; a pool's host nudges lost | `runIdempotentCreate`: the tree mapping the call's fixed id is success; a pool's nudges are rebuilt from its store entries |
+| `DeviceMetadata.updateStateForTransferredStore`, `markRebuiltStoreActive` | **Lost announcements**: `StoreMoved`/`StoreOffline`, the source host's nudge, `TransferComplete`, `gossipStoreOnline` were sent from the committed attempt's failed `tx.result` | The retry that finds the work done sends them (they are idempotent) |
+
+Idempotent as written, verified: `StoreRebuilds.createNewStore` (the flip finds the entry no longer Initializing and
+stages nothing), `StoreTransfers.abandonIn`, both usage managers, `completeDeviceShutdown`,
+`AllocationGroupState.modifyPool`/`modifyGroup`, `StorageDeviceSetState.moveDevice`, `acceptRebuildLoss`,
+`changeDeviceStatus`, `migratePoolToSet`, the system-task and rebalancing registry writes, `deallocateTask`,
+`reconcileEndpoint`, `SimpleFileContent`, `NetworkCachingService.write`, `DiskCatalog.grow`.
+
+Tests: CommittedUnknownRetrySuite (one per row above, except adoption and allocation), DeviceAdoptionSuite "an
+adoption whose commit is reported Unknown is still brought into service", SimpleTaskExecutorSuite "an allocation
+that committed but was reported Unknown is not repeated by its retry". `TestNetwork.reportCommitAsUnknown` has the
+stores commit while the client is told Unknown. Each test fails without its fix.
+
+**Residual (accepted).**
+
+* `FailedStorageDeviceDurableTask` `tombstone` and `moveStore`, and `MigratePoolToSetDurableTask.markComplete`, detect
+  their own commit by throwing (`DeviceAlreadyFailed`, `StoreAlreadyMoved`, `MigrationSuperseded`), which each step
+  already handles. The cost is a misleading log line, a lost best-effort nudge and one extra poll.
+* `DiskCatalog.takeOwnership` bumps the fence epoch twice; the owner holds the later epoch, which is harmless.
+* `RebalancingDurableService.enroll` could enroll a stale plan again only if the task finished and was removed
+  between the attempts.
+* The "done" checks accept a state someone else produced, but only after an Unknown: `requestRebuild`
+  (a Rebuilding entry), `transferStore` once the transfer has finished (the pool naming the destination),
+  `replaceRebuild`, and `abortStoreTransfer` (nothing outstanding). Each then reports success for a change that
+  happened, though possibly not by its own hand.
+* Durable tasks enrolled by a larger transaction (`UpdateAllocationGroupUsageTask`, `FsifReleaseIndicesTask`,
+  `MigratePoolToSetDurableTask`) still mint a task id per attempt. Their callers' own guards (the usage threshold, the
+  group membership check, `migration` InProgress) keep a retry from enrolling again.
+
+---
 
 ## 11. Failure scenarios
 
@@ -1009,7 +1065,7 @@ commit without a leader tally).
 > commit voter dropping its update, is closed too: it ends by expiry, and applies T through its UnackedCommits entry
 > if it was owed (transaction-recovery F3). Tested end to end by HorizonIntegrationSuite "a stale retransmit of a
 > finalized traceless commit past the horizon reports unknown, not aborted". No residual of the split itself; the cost
-> moves to callers that retry an Unknown that had committed (Todo audit entry).
+> moves to callers that retry an Unknown that had committed (audited and fixed 2026-11-15, 10.11).
 
 > **Refresh (replay pins): NARROWED.** The stale prepare is now checked normally (no `TooOld`). A store showing T's
 > update proves it; the driver that receives the proof never proposes abort (`TransactionDriver.scala:361-362`), runs a

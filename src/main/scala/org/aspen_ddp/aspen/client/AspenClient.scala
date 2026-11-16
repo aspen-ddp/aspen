@@ -334,7 +334,8 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *
    *  Fails with NoSuchElementException if the device does not exist, or DeviceAlreadyFailed if it
    *  is already tombstoned. Two simultaneous calls both enroll, which is harmless: the task's
-   *  steps are idempotent and racing drains lose on their KeyRevision requirements and retry.
+   *  steps are idempotent and racing drains lose on their KeyRevision requirements and retry. A retry after an
+   *  enrollment that committed but was reported TransactionOutcomeUnknown finds its own task and succeeds.
    */
   def failStorageDevice(deviceId: StorageDeviceId): Future[Unit]
 
@@ -510,21 +511,22 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def replaceRebuild(storeId: StoreId, destinationId: StorageDeviceId): Future[Unit] =
     given ExecutionContext = this.clientContext
 
+    // After an attempt that committed but was reported TransactionOutcomeUnknown, the retry finds the pool naming the
+    // destination and the destination Rebuilding, and succeeds with that attempt's nudges rather than failing with
+    // InvalidDestination (Todo 5.10)
+    val retry = StopRetrying.collisionRetry()
+    @volatile var staged: List[CheckStorageDevice] = Nil
+
     val fStaged: Future[List[CheckStorageDevice]] =
-      transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+      transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
         given Transaction = tx
 
-        for
-          poolPtr <- getStoragePoolPointer(storeId.poolId)
-          poolKvos <- read(poolPtr)
-          poolState = StoragePoolState(poolKvos)
-          sourceId = poolState.stores(storeId.poolIndex).storageDeviceId
+        def replace(poolPtr: KeyValueObjectPointer, poolKvos: KeyValueObjectState, poolState: StoragePoolState,
+                    sourceId: StorageDeviceId, dstPtr: KeyValueObjectPointer, dstKvos: KeyValueObjectState,
+                    dstState: StorageDeviceState): Future[List[CheckStorageDevice]] = for
           srcPtr <- getStorageDevicePointer(sourceId)
           srcKvos <- read(srcPtr)
           srcState = StorageDeviceState(srcKvos)
-          dstPtr <- getStorageDevicePointer(destinationId)
-          dstKvos <- read(dstPtr)
-          dstState = StorageDeviceState(dstKvos)
           _ =
             if !srcState.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Rebuilding) then
               throw new StoreNotRebuilding(storeId)
@@ -548,8 +550,25 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
           tx.update(poolPtr, None, None,
             List(KeyRevision(StoragePoolState.ConfigKey, poolKvos.contents(StoragePoolState.ConfigKey).revision)),
             List(Insert(StoragePoolState.ConfigKey, poolState.encode())))
-          List(CheckStorageDevice(dstState.hostId, clientId, destinationId),
-               CheckStorageDevice(srcState.hostId, clientId, sourceId))
+          val nudges = List(CheckStorageDevice(dstState.hostId, clientId, destinationId),
+                            CheckStorageDevice(srcState.hostId, clientId, sourceId))
+          staged = nudges
+          nudges
+
+        for
+          poolPtr <- getStoragePoolPointer(storeId.poolId)
+          poolKvos <- read(poolPtr)
+          poolState = StoragePoolState(poolKvos)
+          sourceId = poolState.stores(storeId.poolIndex).storageDeviceId
+          dstPtr <- getStorageDevicePointer(destinationId)
+          dstKvos <- read(dstPtr)
+          dstState = StorageDeviceState(dstKvos)
+          done = retry.mayHaveCommitted && sourceId == destinationId &&
+            dstState.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Rebuilding)
+          // Nothing staged when done: the empty transaction succeeds
+          nudges <- if done then Future.successful(staged) else replace(poolPtr, poolKvos, poolState, sourceId,
+                                                                          dstPtr, dstKvos, dstState)
+        yield nudges
 
     fStaged.map(_.foreach(sendBestEffortHostMessage))
 
@@ -558,7 +577,14 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
     // Only a collision is retried. The rebalance and migration tasks await this future inside a
     // pass and treat a failure as "back off and retry on the next poll".
-    val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+    //
+    // One transfer id for every attempt. After an attempt that committed but was reported
+    // TransactionOutcomeUnknown, the retry finds the source TransferringOut under this id, or the
+    // pool already naming the destination once the transfer has finished, and succeeds with the
+    // same nudge rather than failing with StoreNotActive or InvalidDestination (Todo 5.10)
+    val transferId = UUID.randomUUID()
+    val retry = StopRetrying.collisionRetry()
+    val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
       given Transaction = tx
 
       for
@@ -577,65 +603,69 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         dstKvos <- read(dstPtr)
         dstState = StorageDeviceState(dstKvos)
       yield
-        if sourceId == destinationId then
-          throw InvalidDestination()
+        val alreadyStarted = retry.mayHaveCommitted && (sourceId == destinationId ||
+          srcState.stores.get(storeId).exists(_.transferId.contains(transferId)))
 
-        // A store on a tombstoned device is silently lost: nothing reconciles it, because
-        // reconcileDeviceState ignores failed devices outright.
-        if dstState.isFailed then
-          throw DeviceFailed(destinationId)
+        if alreadyStarted then
+          // Nothing staged: the empty transaction succeeds, and the destination is nudged again
+          CheckStorageDevice(dstState.hostId, clientId, destinationId)
+        else
+          if sourceId == destinationId then
+            throw InvalidDestination()
 
-        if !dstState.isOperational then
-          throw DeviceNotOperational(destinationId)
+          // A store on a tombstoned device is silently lost: nothing reconciles it, because
+          // reconcileDeviceState ignores failed devices outright.
+          if dstState.isFailed then
+            throw DeviceFailed(destinationId)
 
-        // Fresh per attempt: only the committed attempt's id is ever recorded.
-        val transferId = UUID.randomUUID()
+          if !dstState.isOperational then
+            throw DeviceNotOperational(destinationId)
 
-        srcState.stores.get(storeId) match
-          case None => throw StoreNotActive(storeId)
-          case Some(entry) =>
-            if entry.status != StorageDeviceState.StoreStatus.Active then
-              throw StoreNotActive(storeId)
+          srcState.stores.get(storeId) match
+            case None => throw StoreNotActive(storeId)
+            case Some(entry) =>
+              if entry.status != StorageDeviceState.StoreStatus.Active then
+                throw StoreNotActive(storeId)
 
-            // Update Source Device
-            val newSrcEntry = StorageDeviceState.StoreEntry(
-              StorageDeviceState.StoreStatus.TransferringOut,
-              Some(destinationId),
-              Some(transferId)
-            )
-            val newSrcStores = srcState.stores + (storeId -> newSrcEntry)
-            val newSrcState = srcState.copy(stores = newSrcStores)
+              // Update Source Device
+              val newSrcEntry = StorageDeviceState.StoreEntry(
+                StorageDeviceState.StoreStatus.TransferringOut,
+                Some(destinationId),
+                Some(transferId)
+              )
+              val newSrcStores = srcState.stores + (storeId -> newSrcEntry)
+              val newSrcState = srcState.copy(stores = newSrcStores)
 
-            val srcReqs = List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision))
-            val srcOps = List(Insert(StorageDeviceState.StateKey, newSrcState.encode()))
+              val srcReqs = List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision))
+              val srcOps = List(Insert(StorageDeviceState.StateKey, newSrcState.encode()))
 
-            tx.update(srcPtr, None, None, srcReqs, srcOps)
+              tx.update(srcPtr, None, None, srcReqs, srcOps)
 
-            // Update Destination Device
-            val newDstEntry = StorageDeviceState.StoreEntry(
-              StorageDeviceState.StoreStatus.TransferringIn,
-              Some(sourceId),
-              Some(transferId)
-            )
-            val newDstStores = dstState.stores + (storeId -> newDstEntry)
-            val newDstState = dstState.copy(stores = newDstStores)
+              // Update Destination Device
+              val newDstEntry = StorageDeviceState.StoreEntry(
+                StorageDeviceState.StoreStatus.TransferringIn,
+                Some(sourceId),
+                Some(transferId)
+              )
+              val newDstStores = dstState.stores + (storeId -> newDstEntry)
+              val newDstState = dstState.copy(stores = newDstStores)
 
-            val dstReqs = List(KeyRevision(StorageDeviceState.StateKey, dstKvos.contents(StorageDeviceState.StateKey).revision))
-            val dstOps = List(Insert(StorageDeviceState.StateKey, newDstState.encode()))
+              val dstReqs = List(KeyRevision(StorageDeviceState.StateKey, dstKvos.contents(StorageDeviceState.StateKey).revision))
+              val dstOps = List(Insert(StorageDeviceState.StateKey, newDstState.encode()))
 
-            tx.update(dstPtr, None, None, dstReqs, dstOps)
+              tx.update(dstPtr, None, None, dstReqs, dstOps)
 
-            // Built here, sent by the map below once the transaction has committed.
-            // Registering this on tx.result instead would send it from a task the returned
-            // future does not wait on: tx.commit() hands back the same promise as tx.result,
-            // so a caller that exits the moment this future completes could lose the message.
-            // Each retry attempt builds its own, and only the successful attempt's value
-            // reaches the map below, so a retried transaction cannot double-send.
-            CheckStorageDevice(
-              dstState.hostId,
-              clientId,
-              destinationId
-            )
+              // Built here, sent by the map below once the transaction has committed.
+              // Registering this on tx.result instead would send it from a task the returned
+              // future does not wait on: tx.commit() hands back the same promise as tx.result,
+              // so a caller that exits the moment this future completes could lose the message.
+              // Each retry attempt builds its own, and only the successful attempt's value
+              // reaches the map below, so a retried transaction cannot double-send.
+              CheckStorageDevice(
+                dstState.hostId,
+                clientId,
+                destinationId
+              )
 
     fStaged.map(sendBestEffortHostMessage)
 
@@ -653,8 +683,12 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def abortStoreTransfer(storeId: StoreId): Future[Boolean] =
     given ExecutionContext = this.clientContext
 
-    // As in transferStore: only a collision is retried.
-    val fStaged: Future[List[CheckStorageDevice]] = transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+    // As in transferStore: only a collision is retried. An attempt that committed but was reported
+    // TransactionOutcomeUnknown leaves nothing outstanding, so the retry stages nothing; it then
+    // reports that attempt's rollback and sends its nudges (Todo 5.10)
+    val retry = StopRetrying.collisionRetry()
+    @volatile var staged: List[CheckStorageDevice] = Nil
+    val fStaged: Future[List[CheckStorageDevice]] = transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
       given Transaction = tx
 
       for
@@ -704,6 +738,11 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                List(CheckStorageDevice(dstState.hostId, clientId, outstanding.get))
              else
                Nil)
+        match
+          case Nil if retry.mayHaveCommitted => staged
+          case nudges =>
+            staged = nudges
+            nudges
 
     fStaged.map: nudges =>
       nudges.foreach(sendBestEffortHostMessage)
@@ -911,10 +950,16 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *  The enrollment is a checked insert of a new key, which is not a pin (see `Pins`). A transaction with no other
    *  pin passes `pinned = true`: the insert then also requires the system-task tree node's revision, which serializes
    *  every enrollment on that node. Transactions that carry a pin of their own (FSIF index releases, pool migration,
-   *  allocation group usage updates) leave it false, so they do not contend on the node. */
+   *  allocation group usage updates) leave it false, so they do not contend on the node.
+   *
+   *  The task id is fresh by default. A caller whose own guards would not stop a retry from enrolling again passes
+   *  `taskId`, chosen outside its retry closure: once the registry holds it (an attempt that committed but was
+   *  reported TransactionOutcomeUnknown), nothing is staged, so the retry does not enroll a second task (Todo 5.10).
+   *  That costs a registry read, so it is opt-in. */
   def prepareSystemDurableTask(taskTypeUUID: UUID,
                                initialState: Map[Key, Array[Byte]],
-                               pinned: Boolean = false)
+                               pinned: Boolean = false,
+                               taskId: Option[UUID] = None)
                               (using tx: Transaction): Future[Unit]
 
   private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]]

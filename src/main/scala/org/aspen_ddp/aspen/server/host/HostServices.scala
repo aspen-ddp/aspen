@@ -72,17 +72,23 @@ class HostServices(ctx: DeviceControl) extends Logging:
 
                 // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
                 // the control-context foreach; the prepare closure's combinators run on the control thread
+                // A root already present is used, not replaced: it is this host's own from an attempt that
+                // committed but was reported TransactionOutcomeUnknown, or a concurrent initializer's. Allocating
+                // another under DoesNotExist would abort at the stores on every retry (Todo 5.10). Nothing is staged
+                // then, and the empty transaction succeeds
                 ctx.client.transactUntilSuccessful { tx =>
-                  for
-                    executorRoot <- allocator.allocateKeyValueObject(Map())(using tx)
-                    currentHostKvos <- ctx.client.read(hostPtr)
-                  yield
-                    // The host object's revision as read pins the transaction: the absent key alone (DoesNotExist)
-                    // would not. Written once per host, so requiring the revision costs only a retry on a collision
-                    val reqs = List(DoesNotExist(HostState.TaskExecutorRootKey))
-                    val ops = List(Insert(HostState.TaskExecutorRootKey, executorRoot.toArray))
-                    tx.update(hostPtr, Some(currentHostKvos.revision), None, reqs, ops)
-                    executorRoot
+                  ctx.client.read(hostPtr).flatMap: currentHostKvos =>
+                    currentHostKvos.contents.get(HostState.TaskExecutorRootKey) match
+                      case Some(vs) => Future.successful(KeyValueObjectPointer(vs.value.bytes))
+                      case None =>
+                        allocator.allocateKeyValueObject(Map())(using tx).map: executorRoot =>
+                          // The host object's revision as read pins the transaction: the absent key alone
+                          // (DoesNotExist) would not. Written once per host, so requiring the revision costs only a
+                          // retry on a collision
+                          val reqs = List(DoesNotExist(HostState.TaskExecutorRootKey))
+                          val ops = List(Insert(HostState.TaskExecutorRootKey, executorRoot.toArray))
+                          tx.update(hostPtr, Some(currentHostKvos.revision), None, reqs, ops)
+                          executorRoot
                 }(using ctx.ec)
                 .foreach: executorRoot =>
                   SimpleTaskExecutor(ctx.client, allocator, executorRoot).foreach: executor =>

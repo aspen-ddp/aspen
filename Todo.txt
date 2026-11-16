@@ -54,9 +54,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.10 Audit the `unlessCollision` sites and `host/StoreRebuilds.scala` ~118 for idempotence when a retried
-     `TransactionOutcomeUnknown` had actually committed (`SimpleTaskExecutor.allocateTask` is known to
-     duplicate).                                                                                            [M]
+(no open items)
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

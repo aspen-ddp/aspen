@@ -26,13 +26,15 @@ class AllocationFinalizationAction(val client: AspenClient,
     * applying the allocation, so an object that does not read is not taken to be gone (skipping its entry would lose
     * it on repair and rebuild).
     *  - its entry is already present with this pointer: an earlier run recorded it
-    *  - the object reads: a checked insert, with a lock on the object's revision as just read
+    *  - the object reads: a checked insert, with a shared lock on the object's revision as just read
     *  - it does not read: a checked insert alone
     *
     * Neither the insert of an absent key (`DoesNotExist`) nor the lock is a pin, so the transaction is marked
     * replay-safe. A replay never drops an entry. While the object is readable the lock makes a replay after its
     * deletion fail; a rare run or replay after the deletion that cannot read it can leave an orphan entry, which costs
-    * the repair scan a lookup.
+    * the repair scan a lookup. The lock is shared (transaction-requirements Q-N6): it fails on a deleted or changed
+    * object just as an exclusive one does, and two runs of the action (a leader's and a recovery driver's finalizer)
+    * do not collide on it. It still collides with a concurrent write of the object, whose writer retries.
     */
   // A failure fails the action, and the driver starts the finalizer again (TransactionDriver.startFinalizer)
   def execute(): Unit = client.retryStrategy.retryUntilSuccessful {
@@ -51,7 +53,7 @@ class AllocationFinalizationAction(val client: AspenClient,
               // An allocation tree node allocated by this very object's transaction can hold its own entry: the
               // update of the node then requires the object to exist, and a lock on it would conflict
               _ = ostate.foreach: state =>
-                    try tx.exclusiveLockRevision(newObject, state.revision)
+                    try tx.sharedLockRevision(newObject, state.revision)
                     catch case _: ConflictingRequirements => ()
               _ <- tx.commit()
             yield ()

@@ -77,11 +77,24 @@ class SimpleTaskExecutor(val client: AspenClient,
                 val task = dtt.createTask(client, taskPointer, kvos.revision, kvos.contents, this)
                 active += taskPointer -> task
 
+  /** Completes when the latest allocation started at this executor has finished, successfully or not */
+  private var allocationChain: Future[Unit] = Future.unit
+
   /** Allocates a task object and records it in the executor object. The executor object's update requires its
     * revision (cached, and refreshed after a collision), which pins the transaction: the new key alone
     * (`DoesNotExist`) would not. Completes with the object and its revision once allocated.
+    *
+    * Allocations run one at a time (transaction-requirements Q-N6): concurrent ones would all update the executor
+    * object at the same cached revision, and all but one would collide and retry, O(n^2) attempts for n of them. Each
+    * starts once the previous one has committed and moved the cached revision. Collisions with other processes'
+    * executors on the same object are left to the retry strategy's backoff.
     */
-  private def allocateTask(): Future[(DurableTaskPointer, ObjectRevision)] =
+  private def allocateTask(): Future[(DurableTaskPointer, ObjectRevision)] = synchronized:
+    val next = allocationChain.transformWith(_ => allocateTaskNow())
+    allocationChain = next.transform(_ => scala.util.Success(()))
+    next
+
+  private def allocateTaskNow(): Future[(DurableTaskPointer, ObjectRevision)] =
     // Only a collision is retried, after refreshing the executor's revision. Anything else -- an
     // unreadable executor object, an executor object grown past its size limit -- is permanent.
     def onFail(err: Throwable): Future[Unit] = err match
@@ -93,7 +106,7 @@ class SimpleTaskExecutor(val client: AspenClient,
             executorRevision = kvos.revision
       case e => throw StopRetrying(e)
 
-    client.transactUntilSuccessfulWithRecovery[DurableTaskPointer](onFail): tx =>
+    client.transactUntilSuccessfulWithRecovery[(DurableTaskPointer, ObjectRevision, ObjectRevision)](onFail): tx =>
       given Transaction = tx
       synchronized:
         val taskKey = Key(UUID.randomUUID())
@@ -103,12 +116,12 @@ class SimpleTaskExecutor(val client: AspenClient,
           ptr <- taskStateAllocator.allocateKeyValueObject(Map())
         yield
           tx.update(executorObject, Some(requiredRevision), None, kreqs, Insert(taskKey, ptr.toArray) :: Nil)
-          tx.result.foreach: _ =>
-            synchronized:
-              if executorRevision == requiredRevision then
-                executorRevision = tx.revision
-          DurableTaskPointer(ptr)
-    .flatMap: taskPointer =>
+          (DurableTaskPointer(ptr), requiredRevision, tx.revision)
+    .flatMap: (taskPointer, requiredRevision, newRevision) =>
+      // Committed. Updated here, so the next allocation in the chain starts from the new revision
+      synchronized:
+        if executorRevision == requiredRevision then
+          executorRevision = newRevision
       // A new KeyValue object's revision is not the allocating transaction's, so it is read
       client.readMetadata(taskPointer.kvPointer).map(m => (taskPointer, m.revision))
 

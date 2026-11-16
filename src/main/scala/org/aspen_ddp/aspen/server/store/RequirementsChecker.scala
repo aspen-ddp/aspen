@@ -88,21 +88,29 @@ object RequirementsChecker extends Logging {
             throw ObjectErr(oid, StaleObjectState())
           os
 
+    /** The held shared lock the current requirement collides with, if any. Reported only once the requirement's own
+      * checks pass (see getState), so a requirement that also fails for another reason reports that reason
+      */
+    var sharedCollision: Option[(ObjectId, TransactionId)] = None
+
+    /** Objects whose only error is a collision with a held shared lock, with the holder reported */
+    var sharedBlocked: Map[ObjectId, TransactionId] = Map()
+
     /** State for every object requirement except SharedRevisionLock. `wholeObject` requirements also collide with locks
       * on parts of a KV object, and vice versa, since part-level requirements collide with object-level locks. Held
-      * shared locks block it and open the exclusive preference window so that new shared lockers back off until this
-      * transaction can get in.
+      * shared locks block it too, but that collision is raised only after the requirement's other checks (see the
+      * requirement loop), and it opens the exclusive preference window only for a transaction that fails on nothing
+      * else at this store: one that would get in once the shared holders release, on its retry.
       */
     def getState(oid: ObjectId, wholeObject: Boolean = true): ObjectState =
       val os = loaded(oid)
       if !applying then
         checkObjectLocks(oid, os)
-        os.sharedLocks.find(_ != transactionId).foreach { sharedTxId =>
-          os.exclusiveWaitUntil = nanoTime() + SharedRevisionLock.ExclusivePreferenceWindow.toNanos
-          throw ObjectErr(oid, TransactionCollision(sharedTxId))
-        }
         if wholeObject then
           checkPartLocks(oid, os)
+        os.sharedLocks.find(_ != transactionId).foreach { sharedTxId =>
+          sharedCollision = Some(oid -> sharedTxId)
+        }
       os
 
     /** A shared lock excludes every transaction that modifies or exclusively locks the object */
@@ -121,6 +129,7 @@ object RequirementsChecker extends Logging {
     var nonObjectErrors: List[RequirementError] = Nil
 
     for (req <- requirements) {
+      sharedCollision = None
       try {
         req match {
           case r: LocalTimeRequirement => checkLocalTime(r)
@@ -201,6 +210,10 @@ object RequirementsChecker extends Logging {
           case r: SharedRevisionLock =>
             checkRevision(getSharedState(r.objectPointer.id), r.requiredRevision, txTimestamp)
         }
+        sharedCollision.foreach { (oid, holder) =>
+          sharedBlocked += oid -> holder
+          throw ObjectErr(oid, TransactionCollision(holder))
+        }
       } catch {
         case err: ObjectErr => objectErrors += (err.objectId -> err.err)
         case err: NonObjectErr => nonObjectErrors = err.err :: nonObjectErrors
@@ -229,6 +242,17 @@ object RequirementsChecker extends Logging {
       if objects.contains(oid) then
         objectErrors += (oid -> ObjectExists())
     }
+
+    // The exclusive preference window: new shared lockers back off so that this transaction gets in on its retry. Only
+    // for a transaction blocked by nothing but held shared locks here; one that fails on anything else (a stale
+    // revision, another lock, a non-object error) could not commit after the holders release, so it would only starve
+    // shared lockers (transaction-requirements F13)
+    val onlySharedBlocked = sharedBlocked.nonEmpty && nonObjectErrors.isEmpty && objectErrors.forall { (oid, err) =>
+      sharedBlocked.get(oid).exists(holder => err == TransactionCollision(holder))
+    }
+    if onlySharedBlocked then
+      val until = nanoTime() + SharedRevisionLock.ExclusivePreferenceWindow.toNanos
+      sharedBlocked.keysIterator.foreach(oid => objects(oid).exclusiveWaitUntil = until)
 
     (objectErrors, nonObjectErrors)
   }

@@ -343,8 +343,15 @@ class Tx( trs: TransactionRecoveryState,
     * retransmit. The wait ends with a client's prepare (checked as usual), with the outcome (the vote no longer
     * matters), or after `missingDataWait`, which covers a dead client: the Tx then votes abort (NoClientPrepare, see
     * determineDisposition). A driver's prepare that merely overtakes the client's therefore never aborts a healthy
-    * transaction. A Tx recovered with a vote answers with that vote. Checked only as prepares arrive, since a vote is
-    * of use only to a driver that is still asking for it.
+    * transaction. A Tx recovered with a vote answers with that vote. A Tx recovered without one stays undecided once
+    * loaded, so a retransmit of its client's prepare is still checked, but it does not hold back its answer to a
+    * driver (answerPrepare, paxos-transactions P-N7): its transaction was in flight when the store crashed, its driver
+    * needs this acceptor's promise, and any value it accepted, at once, and an abort vote is always safe. Checked only
+    * as prepares arrive, since a vote is of use only to a driver that is still asking for it.
+    *
+    * The wait runs from the Tx's creation, not from the client's last retransmit: a store never sees the retransmits
+    * that are lost, and the first one it sees ends the wait. So a live client whose prepares to this store are all lost
+    * for longer than `missingDataWait` gets this store's abort vote and retries (P-N8, by design).
     */
   private def awaitingClientPrepare: Boolean =
     disposition == TransactionDisposition.Undetermined && !muted && !clientPrepared && !outcomeKnown &&
@@ -1068,7 +1075,7 @@ class Tx( trs: TransactionRecoveryState,
     if provenCommitted then
       // See proveCommitted. Allowed by Paxos: the vote was decided (abort) and the acceptor has no state to report
       if muted then sendProof(m.from) else answerPrepareAsAcceptor(m)
-    else if awaitingClientPrepare then
+    else if awaitingClientPrepare && !recovered then
       logger.trace(s"Withholding the vote on ${m.transactionId} until the client's prepare arrives")
     else
       // completeLoad left the vote undecided if the Tx was waiting for the client's prepare then. A wait for in-flight

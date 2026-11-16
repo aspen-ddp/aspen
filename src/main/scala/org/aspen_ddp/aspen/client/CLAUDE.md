@@ -26,4 +26,5 @@
   nothing in the client's status cache
 - Retry is the default for both: `StopRetrying.unlessCollision` retries aborted and unknown, and
   `SimpleTaskExecutor.allocateTask` treats unknown like an abort (a committed-but-unknown attempt leaves a duplicate
-  task, as a false abort did). `DiskCatalog.deleteContents` maps unknown to `Fenced`
+  task, as a false abort did). Its allocations run one at a time per executor, so they do not collide on the
+  executor object's cached revision (Q-N6). `DiskCatalog.deleteContents` maps unknown to `Fenced`

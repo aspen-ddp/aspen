@@ -889,6 +889,41 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     crl.txDel shouldBe true
   }
 
+  /** A Frontend recovering txid1 (dataUpdateTxd) undecided, with the given acceptor state, and the default wait for a
+    * client's prepare. Its object is cached so the recovered transaction loads during construction
+    */
+  private def recoveredUndecided(acceptor: PersistentState): (Frontend, TestNet) =
+    val backend = new MapBackend(storeId)
+    backend.bootstrapAllocate(oid1, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(100)),
+      DataBuffer(Array[Byte](1)))
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    cache.insert(backend.get(oid1).get)
+    val trs = TransactionRecoveryState(storeId, dataUpdateTxd.serialize(), Nil, TransactionDisposition.Undetermined,
+      TransactionStatus.Unresolved, acceptor)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
+      loadedAt = FrontendSuite.longLoaded)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    (frontend, net)
+
+  // paxos-transactions P-N7: the wait for the client's prepare is for live transactions only
+  test("a recovered undecided Tx answers a driver's prepare at once, with an abort vote and what it accepted") {
+    val accepted = (ProposalId(2, 2), true)
+    val (frontend, net) = recoveredUndecided(PersistentState(Some(accepted._1), Some(accepted)))
+    frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd).copy(proposalId = ProposalId(3, 2)))
+    votes(net).map(v => (v.disposition, v.response)) shouldBe
+      List((TransactionDisposition.VoteAbort, Right(TxPrepareResponse.Promise(Some(accepted)))))
+  }
+
+  test("a recovered undecided Tx with no Paxos state answers a driver's prepare at once with an abort vote") {
+    val (frontend, net) = recoveredUndecided(PersistentState.initial)
+    frontend.receiveTransactionMessage(driverPrepare(dataUpdateTxd))
+    votes(net).map(v => (v.disposition, v.response)) shouldBe
+      List((TransactionDisposition.VoteAbort, Right(TxPrepareResponse.Promise(None))))
+  }
+
   test("a recovered Tx whose acceptor accepted a value does not prove, and promises what it accepted") {
     // Ruling 16: only a memoryless acceptor proves. An accept has no disposition guard, so an undecided Tx may hold one
     val accepted = (ProposalId(2, 2), true)
@@ -903,8 +938,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val crl = new TestCrl:
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
     val net = new TestNet
-    // No vote and no client prepare: it answers a driver's prepare only once the wait for the client's is over
-    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), None, Duration.Zero, loadedAt = FrontendSuite.longLoaded)
+    // No vote and no client prepare, but recovered: it does not wait for the client's prepare (P-N7)
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
 
     val p = driverPrepare(dataUpdateTxd)

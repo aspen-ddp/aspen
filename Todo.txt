@@ -48,12 +48,7 @@ PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.10 Prefer-abort costs and lock windows: P-N7, P-N8, Req F13, Q-N3, Q-N6                                   [S]
-     P-N7: let a recovered Undetermined Tx answer promptly (abort vote or its accepted value).
-     P-N8: restart the wait on each client retransmit, or document it.
-     F13: set exclusiveWaitUntil only when the colliding exclusive Tx survives.
-     Q-N6: use a shared lock in AllocationFinalizationAction, and back off SimpleTaskExecutor.allocateTask.
-     Q-N3 is by design: tune retries only.
+(no open items)
 
 
 PRIORITY 5: performance and hygiene

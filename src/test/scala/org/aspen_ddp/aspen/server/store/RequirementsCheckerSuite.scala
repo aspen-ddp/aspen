@@ -295,6 +295,44 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(objects(oid1).exclusiveWaitUntil == now + window)
   }
 
+  // transaction-requirements F13: only a writer that fails on nothing but the shared holders opens the window
+  test("a writer at a stale revision reports the mismatch and opens no exclusive preference window") {
+    val objects = sharedLockFixture()
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects, Map())
+    val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now,
+      List(DataUpdate(p1, rev2, DataUpdateOperation.Overwrite)), objects, Map(oid1 -> DataBuffer.Empty),
+      nanoTime = () => now)
+    assert(oerrs == Map(oid1 -> RevisionMismatch()))
+    assert(errs.isEmpty)
+    assert(objects(oid1).exclusiveWaitUntil == 0)
+    val (soerrs, serrs) = checkSharedAt(objects, now + 1)
+    assert(soerrs.isEmpty)
+    assert(serrs.isEmpty)
+  }
+
+  test("a writer that fails on another object opens no exclusive preference window") {
+    val objects = sharedLockFixture() ++ Map(oid2 -> mkobjs()._2)
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects, Map())
+    val reqs = List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite), VersionBump(p2, rev1))
+    val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, reqs, objects,
+      Map(oid1 -> DataBuffer.Empty), nanoTime = () => now)
+    assert(oerrs == Map(oid1 -> TransactionCollision(tx1), oid2 -> RevisionMismatch()))
+    assert(errs.isEmpty)
+    assert(objects(oid1).exclusiveWaitUntil == 0)
+  }
+
+  test("a writer that fails a non-object requirement opens no exclusive preference window") {
+    val objects = sharedLockFixture()
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects, Map())
+    val reqs = List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite),
+      LocalTimeRequirement(HLCTimestamp(1), LocalTimeRequirement.Requirement.LessThan))
+    val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, reqs, objects,
+      Map(oid1 -> DataBuffer.Empty), nanoTime = () => now)
+    assert(oerrs == Map(oid1 -> TransactionCollision(tx1)))
+    assert(errs == List(LocalTimeError()))
+    assert(objects(oid1).exclusiveWaitUntil == 0)
+  }
+
   test("SharedRevisionLock refused during the exclusive preference window") {
     val objects = sharedLockFixture()
     collideWithSharedLock(objects)

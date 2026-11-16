@@ -51,8 +51,10 @@ case class ExclusiveRevisionLock(
   * locks opens an ExclusivePreferenceWindow during which new shared locks are refused, so a writer cannot be starved
   * by a continuous stream of shared lockers.
   *
-  * Any exclusive collision opens the window, even one from a writer that aborts and never retries, so shared lockers
-  * may abort with TransactionCollision for up to ExclusivePreferenceWindow after such a collision.
+  * Only a writer blocked by nothing but held shared locks at a store opens the window there: one that also fails on
+  * anything else (a stale revision, another lock, a non-object requirement) could not get in after the holders
+  * release, so it opens none. A writer that opens it and then aborts for reasons elsewhere, or never retries, still
+  * makes shared lockers abort with TransactionCollision for up to ExclusivePreferenceWindow.
   */
 case class SharedRevisionLock(
                                objectPointer: ObjectPointer,

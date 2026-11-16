@@ -1468,6 +1468,15 @@ Nacks (extra rounds under contention).
 > quorum. No safety effect: no reply is always allowed by Paxos, and the vote, once given, is an abort. It interacts
 > with P-N3 (the recovering acceptor's accepted commit answers first). A recovered `Undetermined` Tx could vote abort
 > at once instead, which is also safe.
+>
+> **FIXED 2026-11-15 (Todo 4.10).** A recovered Tx without a vote (`Undetermined`) no longer withholds its answer from
+> a driver: `answerPrepare` skips the wait for a recovered Tx, so the driver's prepare decides the vote at once
+> (`NoClientPrepare` abort, requirements unchecked) and the promise carries what the acceptor accepted. Once loaded
+> such a Tx still stays undecided (`completeLoad` honours the wait), so a retransmit of its client's prepare that
+> arrives first is checked as usual. Live Txs keep the wait. Tests: FrontendSuite "a recovered undecided Tx answers a
+> driver's prepare at once, ..." (with and without an accepted value), "a recovered Tx whose acceptor accepted a value
+> does not prove, ..." (now with the default wait), and "a recovered transaction with no persisted vote decides only
+> after recovered votes have locked" (the client retransmit path).
 
 #### P-N8. Orphaned and client-starved data-less transactions now abort. Confidence: high
 
@@ -1480,6 +1489,10 @@ Nacks (extra rounds under contention).
 > new abort source for data-less transactions, which data transactions already had through the missing-data wait.
 > Aborts apply nothing, the client retries. This is the user's stated intent (addendum design B, "Orphaned transactions
 > without data").
+>
+> **CLOSED 2026-11-15 by design (Todo 4.10).** Restarting the wait on each client retransmit is not possible: a store
+> never sees the retransmits that are lost, and the first one it sees sets `clientPrepared` and ends the wait. The 5 s
+> therefore run from the Tx's creation, as the `Tx.awaitingClientPrepare` scaladoc now states; the client retries.
 
 #### P-N9. Prefer-abort under CRL backpressure. Confidence: medium
 

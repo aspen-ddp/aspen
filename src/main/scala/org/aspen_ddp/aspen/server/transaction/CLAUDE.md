@@ -70,7 +70,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - Driver prepares are prefer-abort (`fromClient == false`): a Tx with no vote and no client prepare never checks
   requirements on one. It proves at once if it can (`appliedBy`), else withholds its whole response until the data, a
   client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes: then it votes abort
-  (`NoClientPrepare`). This holds for data-less transactions too, so their late resolution may take 5 s longer. A vote
+  (`NoClientPrepare`). The 5 s run from the Tx's creation, not a client retransmit (P-N8). A Tx recovered without a
+  vote does not wait for a driver: it votes abort and promises at once (P-N7), but stays undecided after load so a
+  client retransmit that arrives first is still checked. This holds for data-less transactions too, so their late
+  resolution may take 5 s longer. A vote
   given stands, but later data is still used to apply a commit. A delayed duplicate client prepare of an aborted
   transaction cannot commit it: every store that took part remembers the abort for longer than it would join T, and
   refuses T past its forget floor (below)

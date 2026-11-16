@@ -892,6 +892,16 @@ and it makes new `SharedRevisionLock`s collide for 250 ms (`Checker:69-72`, `:83
 itself (`:86`), so the driver never treats it as a stale race. Under repeated aborted writers on a fence object (vdisk) this
 can starve shared lockers. Documented behaviour.
 
+> **FIXED 2026-11-15 (Todo 4.10); residual stated.** The window exists so that a writer which lost only to shared
+> holders gets in on its retry, a new transaction, so it cannot be tied to the colliding Tx's lifetime. Instead
+> `RequirementsChecker.check` now opens it only for a transaction blocked by nothing but held shared locks at this
+> store: `getState` records the shared collision and raises it only after the requirement's own checks pass, so a
+> requirement that also fails (a stale revision, say) reports that error, and the window is set after the requirement
+> loop only if there are no non-object errors and every object error is such a shared collision. Residual: a writer
+> that opens the window and then aborts for reasons at other stores, or never retries, still makes shared lockers
+> collide for 250 ms. Tests: RequirementsCheckerSuite "a writer at a stale revision ...", "a writer that fails on
+> another object ...", "a writer that fails a non-object requirement ... opens no exclusive preference window".
+
 ### New findings from the replay-pins refresh (2026-11-09)
 
 #### Q-N3. Derived per-write checks turn blind wins into aborts. Confidence: high
@@ -901,6 +911,9 @@ can starve shared lockers. Documented behaviour.
 > aborts and retries (`transactUntilSuccessful`, TKVL retry loops), where before both committed in some order. The
 > checks are per key, so no node-level serialization is added. A stale tier-0 read (a cached node) costs an extra abort.
 > Safety: the checks are evaluated by stores at vote and again at apply; `ignoreLocks` is the only relaxation at apply.
+>
+> **CLOSED 2026-11-15 by design (Todo 4.10).** No change: the loser retries under the retry strategy's randomized
+> exponential backoff.
 
 #### Q-N4. The pin rule is enforced only by the client. Confidence: high
 
@@ -963,6 +976,16 @@ can starve shared lockers. Documented behaviour.
 > allocated object (`AllocationFinalizationAction.scala:53`, section 12), which collides with the allocator's own
 > follow-up writes to it; one side aborts and retries. `SimpleTaskExecutor.allocateTask` now collides on the executor
 > revision under bursts or several mounts (O(n^2) attempts). Neither affects safety.
+>
+> **FIXED 2026-11-15 (Todo 4.10); residuals stated.** `AllocationFinalizationAction` takes a `SharedRevisionLock`: it
+> fails on a deleted or changed object as the exclusive lock did, so the replay guard is unchanged, and the two runs of
+> one allocation's action (a leader's and a recovery driver's finalizer) no longer collide on it. It still collides
+> with the allocator's own follow-up writes, as any lock must. `SimpleTaskExecutor.allocateTask` already retried with
+> randomized exponential backoff; the cost was one executor starting concurrent allocations that all used the same
+> cached revision. Its allocations now run one at a time, each starting after the previous one committed and moved
+> the cached revision. Residual: executors in different processes on the same executor object still collide (backoff
+> only). Tests: AllocationFinalizationActionSuite (the lock is shared), SimpleTaskExecutorSuite "concurrent task
+> allocations at one executor each commit on their first attempt" (4 attempts, 9 before).
 
 ### New findings from the addendum refresh (2026-11-10, `c181375b`)
 

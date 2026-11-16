@@ -18,6 +18,11 @@
 - Stores hold requirement locks from a commit vote until the transaction resolves. `SharedRevisionLock` is a
   non-exclusive requirement on an object's revision: many transactions may hold it, but it collides with any write
   to that object
+- Exclusive preference window (`SharedRevisionLock.ExclusivePreferenceWindow`, 250 ms, `ObjectState.exclusiveWaitUntil`):
+  a writer that collides with held shared locks makes new shared lockers collide meanwhile, so it gets in on its
+  retry. `RequirementsChecker.check` opens it only for a transaction blocked by nothing but shared holders at this
+  store; the shared collision is raised after the requirement's own checks, so another failure (a stale revision)
+  is what gets reported, and such a writer opens no window (transaction-requirements F13)
 - A KeyValue update's operations lock what they write, as requirements do (`KVWrites`): each key an
   Insert or Delete names (an absent key through `absentKeyLocks`, shared with `DoesNotExist`/`MayExist`), and the
   whole object for a min/max/left/right change. Concurrent blind writes of one key collide

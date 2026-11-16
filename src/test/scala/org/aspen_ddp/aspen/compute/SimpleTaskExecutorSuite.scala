@@ -157,3 +157,33 @@ class SimpleTaskExecutorSuite extends IntegrationTestSuite:
         case _ => false
       .shouldBe(true)
       rootAfter.contents.size shouldBe 1
+
+  // transaction-requirements Q-N6: concurrent allocations at one executor would all update the executor object at
+  // the same cached revision, and all but one collide and retry. They run one at a time instead
+  atest("concurrent task allocations at one executor each commit on their first attempt"):
+    given ExecutionContext = executionContext
+    val n = 4
+    for
+      pool <- client.getStoragePool(radicle.poolId)
+      allocator = new PoolObjectAllocator(client, pool)
+      tx0 = client.newTransaction()
+      kvos <- client.read(radicle)
+      executorRoot <- allocator.allocateKeyValueObject(Map())(using tx0)
+      _ = tx0.bumpVersion(radicle, kvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
+      executor <- SimpleTaskExecutor(client, allocator, executorRoot)
+
+      audit = new PinAudit(client)
+      txs = (1 to n).map(_ => client.newTransaction()).toList
+      _ <- Future.sequence(txs.map(tx => executor.prepareTask(PendingTaskFactory, Nil)(using tx)))
+      _ <- Future.sequence(txs.map(_.commit()))
+      _ <- waitForTransactionsToComplete()
+      _ = audit.stop()
+      rootAfter <- client.read(executorRoot)
+    yield
+      // Each allocation is the one transaction that updates the executor object
+      val allocations = audit.touching(executorRoot)
+      allocations.size shouldBe n
+      rootAfter.contents.size shouldBe n
+      rootAfter.contents.values.map(_.value.bytes.toList).toSet.size shouldBe n

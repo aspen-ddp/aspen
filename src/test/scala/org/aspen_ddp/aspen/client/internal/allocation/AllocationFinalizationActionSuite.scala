@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectRevision, Value}
-import org.aspen_ddp.aspen.common.transaction.{ExclusiveRevisionLock, TransactionDescription, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{ExclusiveRevisionLock, SharedRevisionLock, TransactionDescription, TransactionId}
 
 import java.util.UUID
 import scala.concurrent.Future
@@ -77,7 +77,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       first should not be empty
       audit.unpinned shouldBe empty
       audit.replaySafeWith(reason).size shouldBe first.size
-      first.foreach(_.description.requirements should contain (ExclusiveRevisionLock(ptr, state.revision)))
+      first.foreach(_.description.requirements should contain (SharedRevisionLock(ptr, state.revision)))
       // The entry is present with this value: the second run stages nothing
       audit.builtExceptMarks.size shouldBe first.size
       afterSecond shouldBe afterFirst
@@ -99,7 +99,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
     yield
       after shouldBe Some(ptr.toArray.toList)
       audit.unpinned shouldBe empty
-      audit.built.flatMap(_.description.requirements) should contain (ExclusiveRevisionLock(ptr, updated.revision))
+      audit.built.flatMap(_.description.requirements) should contain (SharedRevisionLock(ptr, updated.revision))
 
   // A read straight after resolution can precede the stores applying the allocation, so an object that does not read
   // is never taken to be gone. Deleting it is the deterministic way to make it unreadable here
@@ -125,7 +125,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       audit.replaySafeWith(reason).size shouldBe own.size
       // Unreadable: no lock, which would fail on the missing object and retry forever
       own.flatMap(_.description.requirements).exists:
-        case r: ExclusiveRevisionLock => r.objectPointer.id == ptr.id
+        case r: SharedRevisionLock => r.objectPointer.id == ptr.id
         case _ => false
       .shouldBe(false)
 
@@ -142,7 +142,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
       otherState <- client.read(other)
       replay = client.newTransaction()
-      _ = replay.exclusiveLockRevision(ptr, before.revision)
+      _ = replay.sharedLockRevision(ptr, before.revision)
       _ = replay.update(other, Some(otherState.revision), None, Nil, List(Insert(Key(3), Array[Byte](3))))
       result <- replay.commit().failed
       _ <- waitForTransactionsToComplete()

@@ -239,6 +239,14 @@ Fix sketch: gate on content equality after install (as repair F3 suggests), mand
 > **Refresh (2026-11-11): narrowed.** Recovery F1 is fixed: a creation failure is logged at error and retried with
 > backoff (`TransactionDriver.startFinalizer`), so a host that loads the type later (upgrade completes) finalizes the
 > transaction, marks included. While the skew lasts the transaction still stalls with its CRL state, now visibly.
+> **2026-11-16 (Todo 7.2): NARROWED, not fixed.** Since Ruling 8's revision (2026-11-15) an action that cannot be
+> created is a failed action inside the finalizer (`RegisteredTransactionFinalizerFactory.Finalizer.of`), so the
+> other actions and the marker still run during the skew: the lagging store DOES get its ErrorTree mark and an owed
+> voter its UnackedCommits entry, and repair heals it meanwhile. The "stale-replica" half of the severity and the
+> correlation with X5 (fixed, admission lanes) are gone. Residual, liveness only, accepted with R-N2: while no driver
+> of T can load the type, T stays unfinalized (CRL state and admission bytes held), alarmed by `FINALIZATION STALLED`,
+> until a driver that has the type finalizes it. The fix sketch (a feature version in the txd so old hosts decline to
+> drive) is not implemented; it would only move the stall to "no eligible driver".
 Verdict: PLAUSIBLE.  Severity: liveness, then stale-replica.
 `RegisteredTransactionFinalizerFactory.create` throws `NoSuchElementException` on an unknown type and the driver never finalizes (recovery F1). In a rolling upgrade, a new host
 can start transactions with new FinalizationAction types while old hosts, whose stores hold the CRL state, become recovery drivers for them (idle 5 s). Each wedged

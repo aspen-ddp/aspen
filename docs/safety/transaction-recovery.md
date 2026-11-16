@@ -837,6 +837,9 @@ That is sufficient:
 
 > **Fixed 2026-11-11.** Creation failure is caught in `TransactionDriver.startFinalizer`, logged at error and retried
 > with the finalizer backoff; the resolution messages are queued regardless (re-assessment table above).
+> *2026-11-16 (Todo 7.2):* the action that cannot be created is a failed action inside the finalizer, so the marker
+> still writes the marks while it is retried (Ruling 8 revised). During version skew (cross-document X8, narrowed) the
+> transaction stays unfinalized, alarmed, until a driver that has the type finalizes it.
 
 **F1 (M-H) A host that cannot instantiate a finalization action wedges the transaction permanently.**
 `RegisteredTransactionFinalizerFactory.create` does `client.typeRegistry.getType[FinalizationActionFactory](...).get`

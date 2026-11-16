@@ -20,6 +20,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   one completes, the driver finalizes another way, or it shuts down. Never finalize without the actions: the marker's
   entries are what repair and owed stores rely on. TxFinalized's `owed` includes the planned stores of failed
   finalizers (`failedHandedOff`). An action that gives up must fail its `complete`, never leave it pending
+  An action whose type cannot be created (user jar missing, version skew) is a failed action: the marker still runs,
+  and the transaction stays unfinalized, alarmed, until a driver that has the type finalizes it (safety X8)
 - Marker order (Ruling 8, revised 2026-11-15; `RegisteredTransactionFinalizerFactory.Finalizer`): the
   missed-update marker executes once every other action has settled, succeeded or failed, so a failing action
   still gets the missed stores marked (R-N2). `complete` waits for the marker, then fails with the first failure.

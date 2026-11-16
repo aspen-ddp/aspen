@@ -59,9 +59,7 @@ PRIORITY 5: performance and hygiene
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
-
-6.7  G2/X8 residual: mixed-version rolling upgrades (message, CRL and txd formats, finalizer types). Carry a
-     feature version in the txd so old hosts cannot drive.                                                  [M-L]
+                                                 [M-L]
 6.8  R-F17 (a recovered Tx whose objects fail to load) and R-F18 (driver traffic during recovery): add tests. [S]
 6.9  Repair 13.3 open questions 1-6 (4: a proof on a refcount-0 object is untested).                       [S each]
 

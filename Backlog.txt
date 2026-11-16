@@ -3,23 +3,6 @@ Backlog
 
 --- Moved from Safety Work List ---
 
-3.1  Design protections S11-S15 (SL M1-M5, M11; scenarios SC3-SC7)                                          [L]
-     S11: prove that the rest of the pool can reconstruct a store before discarding it. S12: bound concurrent
-     discarded or rebuilding stores per pool, across hosts. S13: transient, configuration and version conditions
-     are never treated as corruption. S14: discarded state stays recoverable for a retention period. S15: detect
-     a burst of declarations and halt automatic destruction. The SL doc's suggested first step is a test that
-     forces openCRL to throw fleet-wide during a simulated rolling restart. Build that test first.
-     Include: S7/Q1 (crl.lost-<uuid> is kept but never used: define retention and salvage, or delete it), S8
-     (record each declaration durably with its cause, visible in show-* commands), SL Q3-Q6, and the destructive
-     4.2 rows X2/X3/X5/X6/X7 as false-positive amplifiers (X5 removes crl_save.log after a fail-stop). Every
-     automatic fail-stop (backend I/O error, failed CRL recovery, Frontend.failStop) is a lost-store declaration
-     and falls under the same check (Backlog: "System-level protection against correlated lost store
-     declarations").
-
-4.2  Hung backend commit: Req F12                                                                           [L]
-     No per-commit watchdog (decided 2026-11-15). Folded into the Mid Term items "Isolate every device's I/O, and
-     detect and handle hung devices" (per-device latency monitoring) and "Operator alerts".
-
 5.8  Committed apply over a commit voter's lock: Req F10                                                   [L]
      Scenario: commit voter B holds requirement locks at a store. A conflicting transaction A collides there (votes
      abort) but commits on other stores' votes, and its apply ignores B's locks (RequirementsChecker.check with
@@ -39,17 +22,6 @@ Backlog
 
 --- Near term ---
 
-Flaky tests:
-- TKVL "deleting entries that join tier-0 nodes removes their upper-tier entries" failed once in three full runs on
-  7d9c8847 (not investigated).
-
-CRL expansion. If sufficient free disk space is available, add another file to the CRL rather than slowing down
-the transactions. This needs to be capped though. Do not add another file if the total size of all files would
-exceed 3% of the device's size.
-
-Store commit delay FSIF commits seem to be taking longer than they should when backed by NVMe media. Investigate the
-timing of commits.
-
 Bootstrap tree sweep staleness window (accepted 2026-11-14, revisit). Writes to the bootstrap pool's own
 ErrorTree/UnackedCommits nodes run with missed-update tracking disabled (limitTracking), so a bootstrap store that
 misses one gets no entry. With opportunistic rebuild removed, only the bootstrap tree sweep in that store's repair
@@ -59,36 +31,6 @@ the window two bootstrap stores stale on different nodes can let a quorum read l
 permanently loses another pool's missed-update record (X9). Suggested fix: give the sweep its own short interval
 (e.g. 1 min, a new RepairPolicy setting), independent of the scan back-off. Cost: one walk of the bootstrap trees
 per minute per bootstrap store; the trees are small.
-
-vdisk (native TCMU frontend) follow-ups:
-- LockState.Fenced is learned only when a commit fails; part 3 (ALUA) needs an active fence check.
-- TMR ring entries are logged and otherwise ignored (no abort of in-flight commands). Revisit with part 3.
-- vdisk tcmu: a timed-out acquire keeps running and can fence a later successful add of the same disk; needs a
-  cancellable acquire in DiskHandle/VirtualDisk.
-
-vdisk: before the ALUA failover work, verify that readRanges always returns the newest committed revision of an
-object (not a stale one from lagging stores). "Flushed data survives a takeover" depends on it.
-
-vdisk: Add ALUA failover support
-
-vdisk: Rename "vdisk" to "amoeba_disk"
-
-DataObject TKVL test suite sometimes reports hung tests during full test runs though it still succeeds. Although
-apparently not flaky, it suggests that these tests may be taking an inordinately long time to complete. Investigate
-to see if these tests are slower than they should be and where the hung transactions are occurring. Determine if
-this is purely a test issue that can be fixed or if there may be an underlying system issue that needs to be addressed.
-
-"Hung Test" prints now also appear occasionally in TKVLBatchSuite and AppendIntegrationSuite since stores began
-holding requirement locks. They come from finalization actions waiting ~2.5-3.2 s on lock contention and retry
-backoff; the tests pass. Investigate together with the DataObject TKVL item above: determine whether the backoff is
-too conservative or whether finalization actions collide more than they should.
-
-Fixed (2026-11-06): JVM SIGSEGV in librocksdbjni at `rocksdb::WriteBatchInternal::Count`, from
-BufferedConsistentRocksDB.commitOnPool, seen twice in full `sbt test` runs. BufferedConsistentRocksDB.close() released
-the database and the next WriteBatch as soon as no operation was inside begin/endOperation, but a commit still queued
-on the pool, or one past its write, then read the freed nextBatch in its chaining step. close() now waits until no
-commit is queued or in progress, and is idempotent. Covered by the two close tests in BufferedConsistentRocksDBSuite.
-The bug predates the host refactor; the store executors only changed how often closes overlap commits.
 
 --- Mid Term ---
 
@@ -112,6 +54,13 @@ Isolate every device's I/O, and detect and handle hung devices
     per-device CRL design accepts that.
   - This effort should probably address the next item in this document as well, moving the CRL recovery off of the
     host control thread.
+  - Device CRL recovery currently runs on the host control thread
+    - DeviceDiscovery opens and recovers each device's CRL (up to num-streams x file size, 3 x 300 MB by default) on
+      aspen-host-control at startup and adoption. On HDD that can take seconds, stalling all other device management on
+      the host. Move the open off the control thread (as BackendOpener does for FSIF opens) and post the result back.
+      Fold into the device I/O isolation item above.
+    - Since 2026-11-15 (Todo 5.6, CRL F16) the open only reads: it no longer re-saves the live set, so what remains
+      on the control thread is recovery's reads of the walked entries.
   - Per-device I/O latency monitoring (2026-11-15, from Todo 4.2):
     - Ailing hardware delays, or permanently hangs, I/O for every store on the device, so health is judged per
       device, not per store or per commit. Measure latency below the backend, where it is backend-neutral: the device
@@ -137,14 +86,6 @@ Isolate every device's I/O, and detect and handle hung devices
     - Not covered here: `RocksDBBackend.commit` completes only on success, so a failed put never completes. That is
       a lost completion, not device slowness (see "Full storage devices").
 
-Device CRL recovery runs on the host control thread (Related to previous item)
-  - DeviceDiscovery opens and recovers each device's CRL (up to num-streams x file size, 3 x 300 MB by default) on
-    aspen-host-control at startup and adoption. On HDD that can take seconds, stalling all other device management on
-    the host. Move the open off the control thread (as BackendOpener does for FSIF opens) and post the result back.
-    Fold into the device I/O isolation item above.
-  - Since 2026-11-15 (Todo 5.6, CRL F16) the open only reads: it no longer re-saves the live set, so what remains
-    on the control thread is recovery's reads of the walked entries.
-
 Operator alerts
   - Today nothing tells an operator anything except log lines. Several designs need to alert one and let them decide
     by hand rather than act automatically: hung or slow devices (above), the correlated lost-store check (S15, item
@@ -157,26 +98,32 @@ Operator alerts
   - Open points: where the service runs (a Durable Task, or a designated host), how sinks are configured in
     metadata, how the operator acknowledges and clears alerts, and a cmdline view (`show-alerts`).
 
-Off-device CRLs
-  - A reasonable host configuration puts the CRLs of HDD devices on an NVMe device, so already-slow media is not
-    written twice. Today a device's CRL is always `<device>/crl` (CrashRecoveryLog.deviceCrlDir); add a per-device
-    location (e.g. a `crl-dir` in the device config, defaulting to the device directory).
-  - Such a device cannot be adopted without a shutdown: its transaction state is not on the drive. The shutdown must
-    write the CRL state onto the device as its final step before `shutdown.state`/`Shutdown`: copy it into a
-    temporary directory on the device (`<device>/crl.incoming-<uuid>`), force the files and the directory, then
-    atomically rename it to `<device>/crl` and force the device directory.
-  - Adoption already requires `<device>/crl` when the device holds stores
-    (docs/superpowers/specs/2026-11-08-unclean-device-adoption-design.md), so a drive pulled before that rename (or
-    without a shutdown) is refused until it returns to its host. The device directory must therefore never carry a
-    stale `crl` from an earlier move: delete it (durably) once the CRL lives elsewhere again.
-  - The lost-CRL rule in DeviceDiscovery.openDeviceCrl (stores but no `<device>/crl`) must check the configured
-    location instead.
-  - An adopting host whose own config puts the device's CRL elsewhere may move it off the device: copy, force, then
-    switch atomically, never leaving two live copies that could both be opened.
-  - A restart on the same host after a shutdown, or a cancelled shutdown, must open whichever copy is current. Decide
-    which copy wins and make the switch a single durable step.
-  - CRL sizing (`crl-num-streams`/`crl-max-file-size-mb`) still travels with the device config, so a moved CRL opens
-    with the same geometry.
+Mixed-Version Support / Upgrade Process
+  - Need a mechanism for handling rolling updates that can take hours or even days to complete. During that
+    time we either need to block the creation/use of new features that old deployments do not support or,
+    as mentioned in the safety work item below, add versions to things to allow older systems to detect that
+    they do not support it and do not try to drive/execute those items. We might need both
+  - (migrated from safety todo item as it is very impactful on the overall system) G2/X8 residual: mixed-version
+    rolling upgrades (message, CRL and txd formats, finalizer types). Carry a feature version in the txd so old
+    hosts cannot drive.
+      - Finalizer changes that break backwards compatibility should probably create a new UUID and register a new
+        factory
+        - Support for older implementations can be maintained by just keeping the old UUID and factory.
+      - Prior to driving a transaction, check to see if all finalizer UUIDs are supported. Refuse to drive if they
+        do not.
+      - Message & txd format changes are largely mitigated by the use of ProtocolBuffers
+      - CRLs need to have a type UUID added to them in a standard location
+        - Load them via RegisteredTypeFactory. Refuse to load if the type UUID is unknown
+  - Some features may make sense to enable only after a threshold number of hosts have been upgraded. We could
+    track upgrade process through metadata changes. Possibly a software-version field in the HostState that the
+    host updates after coming up successfully. Possibly by additionally sending a nudge to an UpgradeSystemService
+    which can then track the completion and take action.
+  - The design for this should facilitate the implementation of the next item below as that will be used to
+    drive the upgrade process and watch the system for induced problems.
+      - Maybe create an abstract UpgradeDriver interface that allows upgrade strategies to be plugged in that
+        drive the upgrades. That'd facilitate unit testing as well as allow for conservative 1 at a time or more
+        complex batches at a time upgrades. It may also be that this process does not need to address drivers
+        at all. That could be deferred to the next item in this file.
 
 System-level protection against correlated "lost store" declarations
   - The main source of data loss in a system like this is not hardware. It is a systemic bug that wrongly triggers
@@ -229,6 +176,59 @@ System-level protection against correlated "lost store" declarations
   - Related: a rebuild that can't find enough healthy peers must fail loudly rather than rebuild from what's left.
   - Track suspected-loss space use per device, including `crl.lost-*` directories, since retained copies compete
     with live stores; see the "Full storage devices" item.
+  - (moved here from Safety Work Item list) 3.1 Design protections S11-S15 (SL M1-M5, M11; scenarios SC3-SC7)
+       S11: prove that the rest of the pool can reconstruct a store before discarding it. S12: bound concurrent
+       discarded or rebuilding stores per pool, across hosts. S13: transient, configuration and version conditions
+       are never treated as corruption. S14: discarded state stays recoverable for a retention period. S15: detect
+       a burst of declarations and halt automatic destruction. The SL doc's suggested first step is a test that
+       forces openCRL to throw fleet-wide during a simulated rolling restart. Build that test first.
+       Include: S7/Q1 (crl.lost-<uuid> is kept but never used: define retention and salvage, or delete it), S8
+       (record each declaration durably with its cause, visible in show-* commands), SL Q3-Q6, and the destructive
+       4.2 rows X2/X3/X5/X6/X7 as false-positive amplifiers (X5 removes crl_save.log after a fail-stop). Every
+       automatic fail-stop (backend I/O error, failed CRL recovery, Frontend.failStop) is a lost-store declaration
+       and falls under the same check (Backlog: "System-level protection against correlated lost store
+       declarations").
+
+CRL expansion. If sufficient free disk space is available, add another file to the CRL rather than slowing down
+the transactions. This needs to be capped though. Do not add another file if the total size of all files would
+exceed 3% of the device's size.
+
+Store commit delay FSIF commits seem to be taking longer than they should when backed by NVMe media. Investigate the
+timing of commits.
+
+vdisk (native TCMU frontend) follow-ups:
+- LockState.Fenced is learned only when a commit fails; part 3 (ALUA) needs an active fence check.
+- TMR ring entries are logged and otherwise ignored (no abort of in-flight commands). Revisit with part 3.
+- vdisk tcmu: a timed-out acquire keeps running and can fence a later successful add of the same disk; needs a
+  cancellable acquire in DiskHandle/VirtualDisk.
+
+vdisk: before the ALUA failover work, verify that readRanges always returns the newest committed revision of an
+object (not a stale one from lagging stores). "Flushed data survives a takeover" depends on it.
+
+vdisk: Add ALUA failover support
+
+vdisk: Rename "vdisk" to "amoeba_disk"
+
+Off-device CRLs
+  - A reasonable host configuration puts the CRLs of HDD devices on an NVMe device, so already-slow media is not
+    written twice. Today a device's CRL is always `<device>/crl` (CrashRecoveryLog.deviceCrlDir); add a per-device
+    location (e.g. a `crl-dir` in the device config, defaulting to the device directory).
+  - Such a device cannot be adopted without a shutdown: its transaction state is not on the drive. The shutdown must
+    write the CRL state onto the device as its final step before `shutdown.state`/`Shutdown`: copy it into a
+    temporary directory on the device (`<device>/crl.incoming-<uuid>`), force the files and the directory, then
+    atomically rename it to `<device>/crl` and force the device directory.
+  - Adoption already requires `<device>/crl` when the device holds stores
+    (docs/superpowers/specs/2026-11-08-unclean-device-adoption-design.md), so a drive pulled before that rename (or
+    without a shutdown) is refused until it returns to its host. The device directory must therefore never carry a
+    stale `crl` from an earlier move: delete it (durably) once the CRL lives elsewhere again.
+  - The lost-CRL rule in DeviceDiscovery.openDeviceCrl (stores but no `<device>/crl`) must check the configured
+    location instead.
+  - An adopting host whose own config puts the device's CRL elsewhere may move it off the device: copy, force, then
+    switch atomically, never leaving two live copies that could both be opened.
+  - A restart on the same host after a shutdown, or a cancelled shutdown, must open whichever copy is current. Decide
+    which copy wins and make the switch a single durable step.
+  - CRL sizing (`crl-num-streams`/`crl-max-file-size-mb`) still travels with the device config, so a moved CRL opens
+    with the same geometry.
 
 Follow-up to the DataObject TKVL: a RandomAccessReedSolomon-specialized, append-based DataObject node
 encoding. Rather than a full overwrite on every kv insert/delete, append operations insert kv pairs

@@ -55,6 +55,15 @@
   handler runs once the deletion is durable. It creates no live record (`LogEntry.deletesFinally`): an unwritten one
   would pin `oldestEntryNeeded` until recovery broke on the wrap. The exceptions are deletions a stub's save or a
   `dropStore` made, which a later save cancels
+- `dropTransactionObjectData` writes nothing: it only flags the in-memory record, so the next rewrite of the record
+  (a save, a copy-forward) leaves the data out. Until then a restart, and `readStoreState`, still return the data. A
+  store that needs the data durably gone saves the state without it (`Tx.persistWithoutUpdateOf`); a save's update
+  count change rewrites the record's update locations, keeping its txd location (transaction-recovery R-N13)
+- `whenDurable(storeId, handler)` (`Barrier`): runs the handler once every request queued before it is durable: on
+  the current entry if it holds anything, after the write in flight if the current entry is empty
+  (`afterInFlight`), else at once. It orders a write outside the CRL (a backend deletion) after a deletion, which has
+  no completion of its own. The trait's default runs it at once, for CRLs that keep nothing on disk; a CRL that
+  dies never runs it
 - Applied stubs (`StoreRecoveryState`, `saveAppliedStub`/`deleteAppliedStub`): a (store, txid) entry meaning the store
   holds that transaction's update, with the transaction's start timestamp (`Stub.StaticSize`: TxId + 8 B), by which the
   store expires it (`Frontend.expireStubs`). A namespace apart from transaction state (own header counts and deletion

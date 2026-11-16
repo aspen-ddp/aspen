@@ -55,6 +55,7 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   def saveAppliedStub(storeId: StoreId, txid: TransactionId, start: HLCTimestamp, completionHandler: () => Unit): Unit =
     inner.saveAppliedStub(storeId, txid, HLCTimestamp.now, completionHandler)
   def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = inner.deleteAppliedStub(storeId, txid)
+  override def whenDurable(storeId: StoreId, handler: () => Unit): Unit = inner.whenDurable(storeId, handler)
   override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
     val read = inner.readStoreState(storeId)
     readCalled.trySuccess(())

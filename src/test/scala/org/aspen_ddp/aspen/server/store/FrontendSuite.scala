@@ -163,6 +163,18 @@ object FrontendSuite {
 
     override def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit =
       stubsDeleted = stubsDeleted :+ txid
+
+    /** While set, durability barriers complete only when the test runs the handlers held here */
+    var holdBarriers = false
+    var heldBarriers: List[() => Unit] = Nil
+
+    override def whenDurable(storeId: StoreId, handler: () => Unit): Unit =
+      if holdBarriers then heldBarriers = heldBarriers :+ handler else handler()
+
+    def completeHeldBarriers(): Unit =
+      val held = heldBarriers
+      heldBarriers = Nil
+      held.foreach(_())
   }
 
   /** Holds commits until deliverCommits, applying each to the map only then, and counts backend reads and repairs.
@@ -4514,6 +4526,12 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     override def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit =
       crl.dropTransactionObjectData(storeId, txid)
     override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = crl.deleteTransaction(storeId, txid)
+    override def whenDurable(storeId: StoreId, handler: () => Unit): Unit =
+      val done = new LinkedBlockingQueue[java.lang.Boolean]()
+      crl.whenDurable(storeId, () => done.put(true))
+      if done.poll(10, java.util.concurrent.TimeUnit.SECONDS) eq null then
+        fail("SimpleCRL did not complete a durability barrier within 10 seconds")
+      handler()
 
   /** The CRL state a store closed with after txid1's backend commit failed and it was finalized */
   def savedAfterFailedCommit(): List[TransactionRecoveryState] =
@@ -4534,6 +4552,153 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         TransactionDescription.deserialize(trs.serializedTxd).transactionId shouldBe txid1
         trs.objectUpdates.map(ou => (ou.objectId, ou.data.getByteArray.toList)) shouldBe List((oid1, List[Byte](1)))
       case other => throw new AssertionError(s"Expected txid1's entry, got $other")
+  }
+
+  // ---- A deletion is ordered after its allocation's CRL data is durably gone (R-N13, Todo 2.17) ----
+
+  /** Removes an object whose commit sets its refcount to 0, as the RocksDB and FSIF backends do (MapBackend keeps the
+    * zero-refcount state, which a recovered allocation's load would find and refuse) */
+  class DeletingMapBackend extends MapBackend(storeId):
+    private var handler: Option[CompletionHandler] = None
+    override def setCompletionHandler(h: CompletionHandler): Unit =
+      handler = Some(h)
+      super.setCompletionHandler(h)
+    override def commit(state: CommitState, transactionId: TransactionId): Unit =
+      if state.metadata.refcount.count == 0 then
+        repairDelete(state.objectId, Array(), Promise[Unit]())
+        handler.foreach(_.complete(org.aspen_ddp.aspen.server.store.backend.Commit(storeId, state.objectId,
+          transactionId, Left(()))))
+      else
+        super.commit(state, transactionId)
+
+  test("a recovered allocation does not re-create an object deleted after its apply (R-N13)") {
+    val tdir = new TempDirManager
+    try
+      val newPtr = DataObjectPointer(ObjectId(new UUID(0, 37)), poolId, Array[Byte]())
+      val backend = new DeletingMapBackend
+      val crl = new SyncCrl(SimpleCRL(tdir.tdir, 3, 1024 * 1024).crl)
+      try
+        val net = new TestNet
+        val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
+          new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
+        backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+        // txid1 allocates the object and applies; its finalization is still running when txid2 deletes it
+        prepare(frontend, net, allocateData(txid1, newPtr)).disposition shouldBe TransactionDisposition.VoteCommit
+        resolve(frontend, net, txid1, committed = true)
+        backend.get(newPtr.id).isDefined shouldBe true
+        val delete = RefcountUpdate(newPtr, ObjectRefcount.Default,
+          ObjectRefcount(ObjectRefcount.Default.updateSerial + 1, 0))
+        prepare(frontend, net, lockTxd(txid2, List(delete))).disposition shouldBe TransactionDisposition.VoteCommit
+        resolve(frontend, net, txid2, committed = true)
+        backend.get(newPtr.id) shouldBe None
+      finally
+        crl.crl.shutdown()
+      // The crash: the store reloads from the CRL's files, with txid1 unfinalized
+      val reopened = SimpleCRL(tdir.tdir, 3, 1024 * 1024)
+      try
+        val recovered = reopened.trsList.filter(trs =>
+          TransactionDescription.deserialize(trs.serializedTxd).transactionId == txid1)
+        recovered.size shouldBe 1
+        val net = new TestNet
+        val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net,
+          new TestCrl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded, deferRecovery = true)
+        backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+        frontend.recover(StoreRecoveryState(recovered, Map()))
+        frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false,
+          proof = false))
+        backend.get(newPtr.id) shouldBe None
+        committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(newPtr.id))
+        frontend.isQuarantined(newPtr.id) shouldBe false
+      finally
+        reopened.crl.shutdown()
+    finally
+      tdir.delete()
+  }
+
+  /** A store whose txid1 allocated `newPtr` and applied it, with txid2's deletion of it voted for */
+  def allocatedThenDeleting(newPtr: DataObjectPointer)
+      : (Frontend, DeletingMapBackend, TestCrl, TestNet) =
+    val backend = new DeletingMapBackend
+    populate(backend)
+    val crl = new TestCrl
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    prepare(frontend, net, allocateData(txid1, newPtr)).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.get(newPtr.id).isDefined shouldBe true
+    val delete = RefcountUpdate(newPtr, ObjectRefcount.Default,
+      ObjectRefcount(ObjectRefcount.Default.updateSerial + 1, 0))
+    prepare(frontend, net, lockTxd(txid2, List(delete))).disposition shouldBe TransactionDisposition.VoteCommit
+    (frontend, backend, crl, net)
+
+  test("a deletion waits for its unconcluded allocation's CRL state to be saved without the object's update") {
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 38)), poolId, Array[Byte]())
+    val (frontend, backend, crl, net) = allocatedThenDeleting(newPtr)
+    crl.holdTxSaves = true
+    resolve(frontend, net, txid2, committed = true)
+    backend.get(newPtr.id).isDefined shouldBe true // The deletion is held
+    val resaved = crl.savedStates.last
+    TransactionDescription.deserialize(resaved.serializedTxd).transactionId shouldBe txid1
+    resaved.objectUpdates shouldBe Nil
+    // Served as deleted meanwhile
+    readData(frontend, net, newPtr) shouldBe Left(ReadError.ObjectNotFound)
+
+    crl.completeHeldTxSaves()
+    backend.get(newPtr.id) shouldBe None
+    // The update is gone from txid1's state for good: its later saves leave it out
+    frontend.receiveTransactionMessage(TxAccept(storeId, storeId, txid1, ProposalId(9, 0), value = true))
+    crl.completeHeldTxSaves()
+    crl.savedStates.last.objectUpdates shouldBe Nil
+  }
+
+  test("a deletion after its allocation was finalized waits until the allocation's CRL deletion is durable") {
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 39)), poolId, Array[Byte]())
+    val (frontend, backend, crl, net) = allocatedThenDeleting(newPtr)
+    crl.holdBarriers = true
+    finalizeTx1(frontend)
+    crl.deleted shouldBe List(txid1)
+    val saves = crl.savedStates.size
+    resolve(frontend, net, txid2, committed = true)
+    backend.get(newPtr.id).isDefined shouldBe true
+    crl.savedStates.size shouldBe saves // A concluded state is never saved again
+
+    crl.completeHeldBarriers()
+    backend.get(newPtr.id) shouldBe None
+  }
+
+  test("a deletion of an object no allocation here covers is issued at once") {
+    val backend = new DeletingMapBackend
+    populate(backend)
+    val crl = new TestCrl
+    crl.holdBarriers = true
+    crl.holdTxSaves = false
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    val delete = RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 0))
+    prepare(frontend, net, lockTxd(txid2, List(delete))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid2, committed = true)
+    backend.get(oid1) shouldBe None
+    crl.heldBarriers shouldBe Nil
+  }
+
+  test("a repair deletion soon after the object's allocation was finalized waits for the CRL deletion too") {
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 40)), poolId, Array[Byte]())
+    val (frontend, backend, crl, net) = allocatedThenDeleting(newPtr)
+    resolve(frontend, net, txid2, committed = false) // The deletion aborted here; repair deletes the object later
+    crl.holdBarriers = true
+    finalizeTx1(frontend)
+    val completion = Promise[Unit]()
+    frontend.deleteObjectForRepair(newPtr.id, ObjectPointer.EmptyArray, completion)
+    completion.isCompleted shouldBe false
+    backend.get(newPtr.id).isDefined shouldBe true
+
+    crl.completeHeldBarriers()
+    completion.isCompleted shouldBe true
+    backend.get(newPtr.id) shouldBe None
   }
 
   test("a store loaded with such an entry recreates the transaction") {

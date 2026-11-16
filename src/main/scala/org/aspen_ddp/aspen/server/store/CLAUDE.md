@@ -139,6 +139,19 @@
   store is rebuilt as a failed backend is. Never for a full device: a write-frozen store poisons the object instead
   (`poisonObject`, the `BackendCommitFailed` rule) and keeps serving. Every fail-stop is a lost-store declaration
   (Backlog: correlated declarations)
+- Deletion after allocation (transaction-recovery R-N13, Todo 2.17): a recovered allocating commit vote treats a
+  backend miss as "not yet applied" and creates the object from its CRL data, so a deletion must never reach the
+  backend while an allocation's CRL state still durably holds the object's update. `allocationRecords`/
+  `allocationsOf` index the Txs that allocate objects here (registered at both Tx creations) until their CRL state's
+  deletion or stub is durable (`allocationConcluded`, at `concludeTransactionState`, `deleteTransactionState`,
+  `recordAppliedStub`, `forgetMuted`, then a `whenDurable`). `awaitAllocationsDurable` holds a deletion's
+  `backend.commit` (`commit` with refcount 0) and `backend.repairDelete` until each covering allocation's state is
+  saved without the object's update (`Tx.persistWithoutUpdateOf`, which also covers a forgotten Tx whose state the
+  CRL keeps for a failed commit) or, once concluded, its deletion is durable. The deletion's bookkeeping is
+  synchronous, so it is served as in flight meanwhile; a store stopped or closed first never issues it and keeps the
+  deleting transaction's CRL state. Inline for every object no unconcluded allocation covers. MapBackend keeps a
+  refcount-0 state rather than removing it, unlike RocksDB and FSIF, so its tests see no miss: the R-N13 tests use a
+  removing MapBackend
 - Quarantine (`Frontend.quarantine`, transaction-requirements F5, Todo 2.16): a recovered commit vote whose apply
   re-check fails may have been superseded before the crash (10.5a) or invalidated under its locks, and the store does
   not tell these apart. Each changed object it could not apply is quarantined, except one the backend missed and the

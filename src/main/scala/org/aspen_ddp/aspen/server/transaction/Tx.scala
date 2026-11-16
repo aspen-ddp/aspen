@@ -93,6 +93,33 @@ class Tx( trs: TransactionRecoveryState,
   private var lastEvent: Long = System.nanoTime()
   private var saveObjectUpdates: Boolean = true
 
+  /** Objects whose update the CRL state no longer carries: they were deleted here after this transaction allocated
+    * them (persistWithoutUpdateOf). Every later save leaves them out too */
+  private var droppedUpdates: Set[ObjectId] = Set()
+
+  /** The CRL holds, or will hold, a state of this transaction: it was recovered or has saved one */
+  private var savedToCrl: Boolean = recovered
+
+  private def saveState(state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
+    savedToCrl = true
+    crl.save(txd.transactionId, state, completionHandler)
+
+  /** Durably removes `objectId`'s update from this transaction's CRL state, then runs `onDurable` on the store's
+    * executor. The store is deleting the object, which this transaction allocated: a restart must not find the update
+    * and allocate the object again over the deletion (transaction-recovery R-N13). The in-memory drop after the commits
+    * persist (allObjectCommitsComplete) writes nothing, so this saves the state again without it, keeping the other
+    * objects' updates, which a failed backend commit may still need. A transaction that never saved has nothing to
+    * remove. The save is a later request than every earlier save of the state, so it supersedes them
+    */
+  def persistWithoutUpdateOf(objectId: ObjectId)(onDurable: () => Unit): Unit =
+    droppedUpdates += objectId
+    if savedToCrl then
+      val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, txStatus,
+        acceptor.persistentState)
+      saveState(state, () => frontend.post(onDurable))
+    else
+      onDurable()
+
   /** Some backend commit of this transaction failed: its CRL state, object data included, is kept */
   private var backendCommitFailed: Boolean = false
 
@@ -405,7 +432,7 @@ class Tx( trs: TransactionRecoveryState,
     val save = adoptedSaves
     val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
       disposition, txStatus, acceptor.persistentState)
-    crl.save(txd.transactionId, state, () => frontend.post { () =>
+    saveState(state, () => frontend.post { () =>
       // Only the latest save holds all the adopted data
       if save == adoptedSaves then
         adoptedDataUnsaved = false
@@ -591,7 +618,10 @@ class Tx( trs: TransactionRecoveryState,
   }
 
 
-  private def trsObjectUpdates: List[ObjectUpdate] = if (saveObjectUpdates) objectUpdates else Nil
+  private def trsObjectUpdates: List[ObjectUpdate] =
+    if !saveObjectUpdates then Nil
+    else if droppedUpdates.isEmpty then objectUpdates
+    else objectUpdates.filterNot(ou => droppedUpdates.contains(ou.objectId))
 
   /** Objects this transaction allocates whose load found the store's existing state rather than a fresh one: a
     * replayed allocation. Every requirement on them fails (RequirementsChecker.check, ObjectExists), so the replay
@@ -725,7 +755,7 @@ class Tx( trs: TransactionRecoveryState,
       delayedPrepare = None
       val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
         disposition, txStatus, acceptor.persistentState)
-      crl.save(txd.transactionId, state, () =>
+      saveState(state, () =>
         logger.trace(s"AllObjectsLoaded. CRL Save Complete. Sending PrepareResponse for tx ${transactionId}")
         net.sendTransactionMessage(r)
       )
@@ -1178,7 +1208,7 @@ class Tx( trs: TransactionRecoveryState,
     if allObjectsLoaded then
       val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
         disposition, txStatus, acceptor.persistentState)
-      crl.save(txd.transactionId, state, () =>
+      saveState(state, () =>
         logger.trace(s"CRL Transaction save complete. Sending PrepareResponse: ${m.transactionId}")
         net.sendTransactionMessage(txr)
       )
@@ -1198,7 +1228,7 @@ class Tx( trs: TransactionRecoveryState,
     val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
       disposition, txStatus, acceptor.persistentState)
 
-    crl.save(txd.transactionId, state, () =>
+    saveState(state, () =>
       logger.trace(s"CRL Accept save completed for tx: ${tar.transactionId}. Sending AcceptResponse")
       net.sendTransactionMessage(tar)
     )

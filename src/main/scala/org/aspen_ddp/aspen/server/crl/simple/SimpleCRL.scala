@@ -53,6 +53,9 @@ object SimpleCRL extends Logging:
   /** Runs `f` on the CRL thread, in order with the other requests: for tests that hold the thread */
   case class RunOnCrlThread(f: () => Unit) extends ActionRequest
 
+  /** Runs the handler once every request queued before it is durable (CrashRecoveryLog.whenDurable) */
+  case class Barrier(handler: () => Unit) extends ActionRequest
+
 
   case class InitialCRLState(crl: SimpleCRL,
                              trsList: List[TransactionRecoveryState],
@@ -219,6 +222,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   private var queueTail: Option[Record] = None
 
   private var writeInProgress = false
+  /** Barriers queued while the current entry was empty and a write was in progress: they run once it completes */
+  private var afterInFlight: List[() => Unit] = Nil
 
   /** Shuts the writer down, releasing the lock once it has closed the stream files and before `completionHandler` */
   private def shutdownWriter(completionHandler: () => Unit): Unit =
@@ -385,7 +390,20 @@ class SimpleCRL private (val maxSizeInBytes: Long,
           logger.trace(s"CRL write complete for entry serial number: ${serialNumber}")
 
           writeInProgress = false
+          val barriers = afterInFlight.reverse
+          afterInFlight = Nil
+          barriers.foreach(_())
           startWrite()
+
+        case Barrier(handler) =>
+          // Every earlier request is in the current entry, in the entry being written, or already durable
+          if !currentLogEntry.isEmpty then
+            currentLogEntry.addCompletionHandler(handler)
+            startWrite()
+          else if writeInProgress then
+            afterInFlight = handler :: afterInFlight
+          else
+            handler()
 
         case GetRecoveryState(storeId, completion) =>
           onGetRecoveryState(storeId, completion)
@@ -548,6 +566,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   def saveAppliedStub(storeId: StoreId, txid: TransactionId, start: HLCTimestamp, completionHandler: () => Unit): Unit =
     ioQueue.put(SaveAppliedStub(storeId, txid, start, completionHandler))
+
+  override def whenDurable(storeId: StoreId, handler: () => Unit): Unit = ioQueue.put(Barrier(handler))
 
   def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit =
     ioQueue.put(DeleteAppliedStub(storeId, txid))

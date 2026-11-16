@@ -36,10 +36,7 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.17 R-N13: a recovered allocation re-creates an object applied and then deleted before the crash. The CRL's drop of
-     a Tx's object data is in memory only. Make it durable before a deletion of the object can apply (rare path:
-     re-save the allocating Tx without data, hold the deletion's backend commit until durable), and cover the window
-     after TxFinalized. Reproduce end to end first.                                                         [M]
+(no open items)
 
 
 PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)

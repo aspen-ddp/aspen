@@ -1112,7 +1112,7 @@ reconciled by repair for a recovered Tx that is applying a *creation*? Not verif
 > nothing", "a recovered allocating commit vote whose object the backend misses creates it from its saved data", "a
 > recovered allocating commit vote without its data whose object was deleted reports it and quarantines nothing"
 > (fails before the fix). *Residual:* a recovered allocation that still has its data, whose object was applied and
-> then deleted, re-creates it (R-N13, open).
+> then deleted, re-creates it (R-N13; fixed 2026-11-16, Todo 2.17).
 
 > **Verification 2026-11-09: OPEN (not verified). Severity: liveness.** Not re-derived; Store.handleTransactionMessage runs drivers while Frontend holds messages (Store.scala:128-193) as the doc says.
 > *Fix sketch:* Add a test.
@@ -1505,7 +1505,7 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 > applying T there, which the design wants ("must not apply through a replay"). A failed earlier commit also forces
 > every later transaction on the object to vote abort until the store reloads (`BackendCommitFailed`).
 
-> **R-N13 (2026-11-16, Todo 6.8). Verdict: CONFIRMED (store side reproduced). Severity: resurrection.** A recovered
+> **R-N13 (2026-11-16, Todo 6.8). Verdict: FIXED 2026-11-16 (Todo 2.17; was CONFIRMED). Severity: resurrection.** A recovered
 > commit vote that allocates O treats a backend miss as "not yet applied" (`allocationLoaded`) and creates O from its
 > saved data. The miss is ambiguous: the store may have applied the allocation and then a later committed transaction
 > deleted O. The CRL is meant to tell the two apart, since the Tx drops its object data once its commits persist
@@ -1523,6 +1523,29 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 > hold the deletion's backend commit until the save is durable (Todo 2.17). A recovered allocation without its data
 > then reports O (F17 fix) instead of creating it. The window after TxFinalized, when T's in-memory Tx is gone but its
 > CRL deletion is not yet durable, needs the same ordering, or an argument that no peer can still answer non-late.
+>
+> **Fixed 2026-11-16 (Todo 2.17).** Reproduced end to end first: a real SimpleCRL, txid1's allocation applied,
+> txid2's deletion applied, the CRL reopened from its files, and txid1's commit re-created the object. A deletion now
+> reaches the backend only once no allocation's CRL state durably holds the object's update. The Frontend indexes the
+> Txs that allocate objects here until their state's deletion or stub is durable. A deletion's `backend.commit`, and
+> a repair's `repairDelete`, wait (`Frontend.awaitAllocationsDurable`) until each covering allocation either saved its
+> state without the object's update (`Tx.persistWithoutUpdateOf`, keeping other objects' updates, which a failed
+> commit may still need; a Tx that never saved writes nothing) or, its state already concluded, a CRL barrier queued
+> after that deletion or stub completed (`CrashRecoveryLog.whenDurable`). This covers the window after TxFinalized too.
+> The index keeps the Tx after it is forgotten, so a state the CRL keeps for a failed backend commit is re-saved
+> rather than relied on. The cost is one CRL write wait, only for a deletion that follows its object's allocation
+> before the allocation's state is durably gone. A CRL that dies leaves the deletion held, and the store is lost with
+> it. Recovery needed no change: a record's newest static entry wins. Tests: FrontendSuite "a recovered allocation
+> does not re-create an object deleted after its apply (R-N13)" (end to end, failed before), "a deletion waits for its
+> unconcluded allocation's CRL state to be saved without the object's update", "a deletion after its allocation was
+> finalized waits until the allocation's CRL deletion is durable", "a repair deletion soon after the object's
+> allocation was finalized waits for the CRL deletion too" (all three failed before), "a deletion of an object no
+> allocation here covers is issued at once"; SimpleCRLSuite "a drop alone writes nothing: a restart recovers the
+> object data", "a save without one object's update keeps the other's", "whenDurable runs once a deletion queued
+> before it is on disk", "whenDurable on an idle CRL, or behind a write in flight, runs". MapBackend keeps a refcount-0
+> state rather than removing it, so it never showed the miss; the tests use a removing MapBackend, as RocksDB and FSIF
+> behave. *Residual:* none known. The same in-memory drop also leaves data in a transfer's `crl_save.log`, which is
+> harmless now: a deletion re-saves the state before it applies.
 
 ### 10.1 Mapping to the requested hazard classes
 

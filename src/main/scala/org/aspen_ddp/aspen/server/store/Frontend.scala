@@ -553,6 +553,73 @@ class Frontend(val storeId: StoreId,
     if !listed.exists(_ eq tx) then
       deferredFinalizations(tx.transactionId) = listed :+ tx
 
+  /** A transaction that allocates objects here, whose CRL state may still hold their updates. `tx` is its latest Tx,
+    * kept after the Tx is forgotten: its state may stay in the CRL meanwhile (its backend commits outstanding or
+    * failed). `concluded`: its state's deletion or stub is queued in the CRL, not yet known durable
+    */
+  private final class AllocationRecord(var tx: Tx, var objects: Set[ObjectId], var concluded: Boolean)
+
+  /** Transactions that allocate objects here and may still hold their updates in the CRL (R-N13), by txid and by object.
+    * Empty for every object no unconcluded allocation covers, so an ordinary deletion consults nothing else */
+  private val allocationRecords = scala.collection.mutable.HashMap[TransactionId, AllocationRecord]()
+  private val allocationsOf = scala.collection.mutable.HashMap[ObjectId, Set[TransactionId]]()
+
+  private def registerAllocation(tx: Tx, hosted: List[ObjectPointer]): Unit =
+    val allocated = tx.txd.allocatingObjects.intersect(hosted.iterator.map(_.id).toSet)
+    if allocated.nonEmpty then
+      val txid = tx.transactionId
+      allocationRecords.get(txid) match
+        case Some(r) =>
+          r.tx = tx
+          r.concluded = false
+          r.objects ++= allocated
+        case None => allocationRecords(txid) = new AllocationRecord(tx, allocated, false)
+      allocated.foreach(oid => allocationsOf(oid) = allocationsOf.getOrElse(oid, Set()) + txid)
+
+  private def unregisterAllocation(txid: TransactionId, oids: Set[ObjectId]): Unit =
+    oids.foreach: oid =>
+      val rest = allocationsOf.getOrElse(oid, Set()) - txid
+      if rest.isEmpty then allocationsOf.remove(oid) else allocationsOf(oid) = rest
+
+  /** `txid`'s CRL state was deleted or replaced by a stub: no save of it may follow. Its record is dropped once that is
+    * durable, unless a newer Tx registered it again meanwhile */
+  private def allocationConcluded(txid: TransactionId): Unit =
+    allocationRecords.get(txid).foreach: r =>
+      r.concluded = true
+      crl.whenDurable(storeId, () => post { () =>
+        allocationRecords.get(txid).filter(_ eq r).filter(_.concluded).foreach: r =>
+          allocationRecords.remove(txid)
+          unregisterAllocation(txid, r.objects)
+      })
+
+  /** Runs `proceed` once no CRL state of a transaction allocating `oid` here holds its update durably: the store is
+    * about to delete `oid` from its backend, and a restart that recovered the update would allocate the object again
+    * over the deletion (transaction-recovery R-N13). An unconcluded allocation's state is saved again without it
+    * (Tx.persistWithoutUpdateOf); a concluded one's deletion or stub only has to be durable (whenDurable). Inline when
+    * no allocation covers `oid`, which is every deletion but one soon after its object's allocation
+    */
+  private def awaitAllocationsDurable(oid: ObjectId)(proceed: () => Unit): Unit =
+    val txids = allocationsOf.getOrElse(oid, Set())
+    if txids.isEmpty then
+      proceed()
+    else
+      var pending = txids.size
+      def oneDone(): Unit =
+        pending -= 1
+        if pending == 0 then proceed()
+      logger.info(s"Store $storeId deletes object $oid soon after transactions ${txids.mkString(", ")} allocated it: " +
+        s"the deletion waits until their CRL state durably holds no update of it")
+      txids.foreach: txid =>
+        allocationRecords.get(txid) match
+          case Some(r) if !r.concluded =>
+            // The update is gone from its state for good: later deletions of the object need nothing from it
+            r.objects -= oid
+            unregisterAllocation(txid, Set(oid))
+            if r.objects.isEmpty then allocationRecords.remove(txid)
+            r.tx.persistWithoutUpdateOf(oid)(() => oneDone())
+          case _ =>
+            crl.whenDurable(storeId, () => post(() => oneDone()))
+
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
 
   /** The state of every object a transaction or an in-flight backend commit references (see retain), consulted before
@@ -680,6 +747,7 @@ class Frontend(val storeId: StoreId,
         admitRecovered(txd.transactionId, trs)
         val tx = new Tx(trs, txd, this, net, crl, statusCache, pointers, recovered = true)
         transactions += (txd.transactionId -> tx)
+        registerAllocation(tx, pointers)
         // A transaction with no objects here never loads any
         if pointers.nonEmpty then
           recoveringTransactions += (txd.transactionId -> (trs.disposition != TransactionDisposition.Undetermined))
@@ -755,6 +823,7 @@ class Frontend(val storeId: StoreId,
     if !keepAdmission then
       admitted.remove(txid).foreach: a =>
         stubReplacedAdmissions(txid) = stubReplacedAdmissions.getOrElse(txid, 0L) + a.bytes
+    allocationConcluded(txid)
     crl.saveAppliedStub(storeId, txid, stubs(txid), () => post { () =>
       stubReplacedAdmissions.remove(txid).foreach(admission.release)
       onDurable
@@ -1121,11 +1190,13 @@ class Frontend(val storeId: StoreId,
                     s"rebuilt store's acceptor existed")
       transactions -= tx.transactionId
       tx.releaseObjects()
+      allocationConcluded(tx.transactionId) // It saved nothing
       releaseAdmission(tx.transactionId)
 
   /** Deletes a transaction's CRL entry and releases its admission */
   def deleteTransactionState(txid: TransactionId): Unit =
     crl.deleteTransaction(storeId, txid)
+    allocationConcluded(txid)
     releaseAdmission(txid)
 
   /** Releases everything this Frontend's transactions were admitted for: it is closing, or was built and never
@@ -1141,6 +1212,7 @@ class Frontend(val storeId: StoreId,
   /** Closes the store. Its entries stay live in the CRL unless the closer takes them out, so what its transactions
     * were admitted for stays counted, retained for the store (CrlAdmission.retain) */
   def close(): Future[Unit] =
+    closed = true
     failParkedRepairs()
     // A stub not yet durable has not replaced its transaction's state: that stays counted too
     admission.retain(storeId, admitted.valuesIterator.map(_.bytes).sum + stubReplacedAdmissions.valuesIterator.sum +
@@ -1176,7 +1248,13 @@ class Frontend(val storeId: StoreId,
     // Before the backend commit: a synchronous backend completes inside it
     txCommits.getOrElseUpdate(txid, new TxCommits(0, false, false)).outstanding += 1
     txCommitsInFlight(os.objectId) = txCommitsInFlight.getOrElse(os.objectId, 0) + 1
-    backend.commit(cs, txid)
+    // A deletion reaches the backend only once no allocation's CRL state can bring the object back (R-N13). Until then
+    // it is in flight like any commit: reads, snapshots and transactions see the deletion. A store stopped or closed
+    // meanwhile never issues it, and keeps this transaction's CRL state, so a reload applies the deletion again
+    if deletes then
+      awaitAllocationsDurable(os.objectId)(() => if !stopped && !closed then backend.commit(cs, txid))
+    else
+      backend.commit(cs, txid)
 
   /** A transaction was finalized. Its CRL state is deleted now, unless backend commits this store issued for it are
     * outstanding or failed: the store deletes a committed transaction's CRL state only once every backend commit it
@@ -1223,6 +1301,7 @@ class Frontend(val storeId: StoreId,
       recordAppliedStub(txid, stub.get, keepAdmission)(())
     else
       crl.deleteTransaction(storeId, txid)
+      allocationConcluded(txid)
       if !keepAdmission then
         releaseAdmission(txid)
 
@@ -1289,6 +1368,9 @@ class Frontend(val storeId: StoreId,
     * `@volatile` for reads from other threads
     */
   @volatile private var stopped: Boolean = false
+
+  /** close ran: a deletion still waiting for its allocations' CRL state (awaitAllocationsDurable) is not issued */
+  private var closed: Boolean = false
 
   def failStopped: Boolean = stopped
 
@@ -1441,6 +1523,7 @@ class Frontend(val storeId: StoreId,
     val tx = new Tx(trs, m.txd, this, net, crl, statusCache, pointers,
       muted = muted)
     transactions += (m.txd.transactionId -> tx)
+    registerAllocation(tx, pointers)
     tx.receivePrepare(m)
     // The new Tx recorded itself as Unresolved, which the monotone cache does not let replace a known outcome
     known.foreach { _ =>
@@ -1614,7 +1697,9 @@ class Frontend(val storeId: StoreId,
           if n == 0 then deleting.remove(objectId) else deleting(objectId) = n)
         completion.complete(result)
       }(using scala.concurrent.ExecutionContext.parasitic)
-      backend.repairDelete(objectId, storePointer, done)
+      awaitAllocationsDurable(objectId): () =>
+        if stopped || closed then done.failure(new IllegalStateException(s"Store $storeId stopped"))
+        else backend.repairDelete(objectId, storePointer, done)
 
   private def readObjectForTransaction(transaction: Tx, pointer: ObjectPointer): Unit =
     val objectId = pointer.id

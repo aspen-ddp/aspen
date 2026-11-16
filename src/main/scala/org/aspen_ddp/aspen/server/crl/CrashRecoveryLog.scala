@@ -160,7 +160,15 @@ trait CrashRecoveryLog {
 
   def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit
 
+  /** Forgets the object data of `txid`'s state, in memory only: nothing is written, so a restart may still recover
+    * the data until the state is next saved or deleted. A store that needs the data durably gone saves the state
+    * without it (Tx.persistWithoutUpdateOf; transaction-recovery R-N13) */
   def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit
+
+  /** Runs `handler` once every request of `storeId`'s queued before this call is durable, on the CRL's thread. A
+    * deletion has no completion of its own; this orders a later write elsewhere (a backend deletion) after it. The
+    * default runs it at once, for CRLs that keep nothing on disk. A CRL that dies runs it never */
+  def whenDurable(storeId: StoreId, handler: () => Unit): Unit = handler()
 
   /** Deletes the transaction state held for `txid` of `storeId`. An applied stub of it stays */
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit

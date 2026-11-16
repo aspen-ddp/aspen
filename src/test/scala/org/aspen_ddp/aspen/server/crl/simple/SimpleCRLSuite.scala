@@ -2022,4 +2022,63 @@ class SimpleCRLSuite extends FileBasedTests {
   test("dropStore keeps a same-id save that lands in the entry holding its deletion") {
     saveAfterDrop(writeInFlight = true)
   }
+
+  // ---- Durability of object data drops and barriers (transaction-recovery R-N13) ----
+
+  test("a drop alone writes nothing: a restart recovers the object data") {
+    val queue = new LinkedBlockingQueue[String]()
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    i.crl.save(transactionId, trsValidTxd, () => queue.put(""))
+    queue.take()
+    i.crl.dropTransactionObjectData(storeId, transactionId)
+    // The in-memory state still carries it, and so would a transfer's saved state
+    assert(i.crl.getFullRecoveryState(storeId).head.objectUpdates == List(ou1, ou2))
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i2.trsList.head.objectUpdates == List(ou1, ou2))
+    i2.crl.shutdown()
+  }
+
+  test("a save without one object's update keeps the other's") {
+    val queue = new LinkedBlockingQueue[String]()
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    i.crl.save(transactionId, trsValidTxd, () => queue.put(""))
+    queue.take()
+    i.crl.save(transactionId, trsValidTxd.copy(objectUpdates = List(ou2)), () => queue.put(""))
+    queue.take()
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i2.trsList.map(_.objectUpdates) == List(List(ou2)))
+    assert(i2.trsList.head.serializedTxd == trsValidTxd.serializedTxd)
+    i2.crl.shutdown()
+  }
+
+  test("whenDurable runs once a deletion queued before it is on disk") {
+    val queue = new LinkedBlockingQueue[String]()
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    i.crl.save(transactionId, trsValidTxd, () => queue.put(""))
+    queue.take()
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.whenDurable(storeId, () => queue.put("barrier"))
+    assert(queue.poll(10, TimeUnit.SECONDS) == "barrier")
+    // Read from the files while the CRL is still open: the deletion is durable
+    val files = (0 until 3).map(n => (StreamId(n), tdir / s"$n.crl")).toList
+    assert(Recovery.recover(files).trsList.isEmpty)
+    i.crl.shutdown()
+  }
+
+  test("whenDurable on an idle CRL, or behind a write in flight, runs") {
+    val queue = new LinkedBlockingQueue[String]()
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    i.crl.whenDurable(storeId, () => queue.put("idle"))
+    assert(queue.poll(10, TimeUnit.SECONDS) == "idle")
+    // Queued right behind a save: its entry may be in flight, or not yet started
+    for n <- 1 to 50 do
+      i.crl.save(transactionId, trsValidTxd, () => ())
+      i.crl.whenDurable(storeId, () => queue.put(s"b$n"))
+      assert(queue.poll(10, TimeUnit.SECONDS) == s"b$n")
+    i.crl.shutdown()
+  }
 }

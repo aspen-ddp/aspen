@@ -11,6 +11,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - The CrashRecoveryLog is used to store this decision and Paxos is then used to arrive at an overall commit/abort decision
 - The client and all stores are informed of the final decision
 - If committed, FinalizationActions are then run. Once complete, the CRL content is dropped and the transaction is forgotten.
+- A Tx's object data is dropped from its CRL state once its commits persist, in memory only (`crl/CLAUDE.md`). A
+  deletion of an object the Tx allocated first re-saves the state without that object's update
+  (`persistWithoutUpdateOf`, `droppedUpdates`; later saves leave it out too), so a restart cannot allocate it again
+  over the deletion (R-N13; `server/store/CLAUDE.md`, Deletion after allocation)
 - Finalization failure path (`TransactionDriver.startFinalizer`): a finalizer that cannot be created, or whose
   `complete` fails, is logged at error and started again from scratch after a backoff (1 s doubling to 60 s) until
   one completes, the driver finalizes another way, or it shuts down. Never finalize without the actions: the marker's

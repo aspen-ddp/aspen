@@ -44,7 +44,8 @@ when the tree is reachable.
 
 > **Refresh (2026-11-15, Todo 6.2, G1): expiry leg fixed.** The mute kept the rebuilt store out of T's quorums, but
 > expiry (paxos 10.10) counted it as a non-holder for T started before its acceptor, so the last holders of a chosen,
-> unfinalized commit could discard it. It now counts as a possible holder (G1).
+> unfinalized commit could discard it. It now reports itself amnesiac, and the holders decide commit when abort was
+> never chosen and the update is at its read threshold (G1).
 
 > **Refresh (2026-11-13): the fast-client residual is closed.** Every store mutes an unknown transaction whose start
 > leads its host's wall clock by more than `Frontend.MaxStartLead` (2 s), so an old incarnation joined only
@@ -418,12 +419,22 @@ G1. Fast rebuild or lost CRL vs a long-unresolved transaction (X2): no document 
     *Fix.* `Frontend.mayHaveForgottenUndecided(start)` (start before `acceptorSince`). For such a T a rebuilt store
     never replies as a non-holder: with no Tx it stays silent unless its status cache holds an outcome, which it
     reports as possibly holding acceptor state; its muted Tx, and its own entry in its expiry round, count as
-    holding. Residual: a T whose only possible quorum needs the rebuilt store now holds at its holders indefinitely,
-    keeping its locks and CRL state. That is a stall, not a lost commit, and the same trade X2 already accepted.
-    Tests: HorizonIntegrationSuite "holders of a chosen commit keep it past expiry while a rebuilt store may have
-    accepted it" (fails without the fix: every holder discards); FrontendSuite "a Tx muted at a rebuilt store
-    answers holdsAcceptorState = true ...", "a rebuilt store without a Tx never answers unknown ...", "a rebuilt
-    store's cached outcome ... counts as possibly holding it".
+    holding. (First residual, superseded below: a T whose only quorum needed the rebuilt store held indefinitely.)
+    *Revised the same day: expiry decides instead of holding.* An object held consistently by fewer stores than its
+    read threshold (`consistentRestoreThreshold`, a majority) is lost whatever Paxos does, and since `t + r > w` a
+    decision stays provable at least as long as the data stays readable. So past expiry the holders decide from
+    final states: every Tx past expiry is frozen (accepts and promises nothing), and replies carry the latest accept,
+    the vote, and `amnesiac`. Commit when more than `w - t` stores' latest accept is commit (abort was never chosen,
+    and nothing can be chosen again) and commit voters hold the update at the read threshold. The deciding store then
+    resolves T at every store, applies it, and finalizes it, so repair restores the stores that missed it. Discard
+    when the update cannot reach the read threshold (logged as a possible lost commit), or when no commit can be
+    chosen and unfinalized. Otherwise hold, which needs a silent store, or more rebuilt stores than the decision
+    tolerates (`2t - w - 1`, never less than the data's `t - r`; logged `UNDECIDABLE TRANSACTION`). The safety
+    argument, including why applying late is safe, is in paxos 10.10.
+    Tests: HorizonIntegrationSuite "holders of a chosen commit apply it past expiry though a rebuilt store forgot
+    it" (without the fix every holder discards; it now reads T's update); ExpiryTallySuite; FrontendSuite "an
+    expiring commit voter whose peers accepted commit decides commit ...", "a Tx past its expiry promises and accepts
+    nothing", "a rebuilt store without a Tx answers amnesiac ...".
 G2. Mixed-version/rolling-upgrade protocol skew (message formats, finalizer types, CRL entry format, txd fields): systemic doc covers detectors only; recovery covers F1 only for jars.
 G3. Zombie drivers/timers after a non-crash store reload, device relinquish and transfer-out (X4). Only recovery F12 mentions it, with no interaction analysis.
 G4. A shared, in-memory host-wide status cache is the anchor for finalization relays and, since the refresh, late-commit evidence (condition 2); no document analyses host restart (cache wiped) combined with rolling restarts of the stores' peers (paxos F6 touches it for one restart only). The horizon and TooOld no longer depend on it. *(2026-11-13: the safety half is covered. A restart, transfer-in or size eviction raises the affected stores' forget floor (load + `MaxStartLead`, or the eviction watermark) at the moment memory is lost, so a store whose host lost its cache never rejoins a transaction it may have forgotten, however many peers restart (paxos 10.10; HorizonIntegrationSuite "a host restart does not let its stores rejoin a transaction they forgot"). Left: the liveness cost across rolling restarts, where each reload refuses the transactions it does not hold started before its load plus `MaxStartLead`, and too many refusing stores in a pool end those transactions Unknown.)*

@@ -760,6 +760,12 @@ host siblings also wait. No backoff schedule, no in-pass retry of the right-neig
 
 **F6 (Medium) A Rebuilding (silent) store can stall transactions whose live voters disagree.**
 
+> **Refresh (2026-11-15, cross-document G1): ended by expiry, not by the driver.** Past expiry both voters are frozen
+> and accept nothing, so the driver's abort proposal no longer succeeds. The expiry tally ends T instead: no store's
+> latest accept is commit, and the silent store alone cannot make a commit chosen, so it discards (paxos 10.10, rule 3;
+> StoreSuite "a commit voter whose peer voted abort and whose third store is silent is discarded past expiry, not
+> before"). The lock bound below is unchanged.
+
 > **FIXED 2026-11-15 (Todo 4.1, with paxos F8).** The stall was permanent, not limited to the outage: transaction
 > expiry `Hold`s (both live voters hold acceptor state, so at most `w - t` non-holders), and the silent store, once
 > back past the horizon, refuses the prepare without a reply. The driver now waits until T is past the horizon plus

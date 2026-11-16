@@ -41,8 +41,9 @@ object StoreRouterSuite:
   private val rev0 = ObjectRevision(TransactionId(new UUID(15, 5)))
   private val ida = Replication(3, 2)
 
+  /** Started now: a transaction past its expiry is frozen, and its acceptor answers nothing (Tx.frozen) */
   private def overwriteTxd(id: TransactionId): TransactionDescription =
-    TransactionDescription(id, HLCTimestamp(100), ptr, 0,
+    TransactionDescription(id, HLCTimestamp.now, ptr, 0,
       List(DataUpdate(ptr, rev0, DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida, Map(poolId -> ida))
 
   /** Records every message sent, with the sending thread's name, and the backend's closed flag at send time. */

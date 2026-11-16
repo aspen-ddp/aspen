@@ -691,6 +691,7 @@ object Codec extends Logging:
     val (haveStatus, isFinalized, late, holds, status) = o.status match
       case None => (false, false, false, false, codec.TransactionStatus.TRANSACTION_STATUS_UNRESOLVED)
       case Some(stat) => (true, stat.finalized, stat.late, stat.holdsAcceptorState, encodeTransactionStatus(stat.status))
+    val stat = o.status
 
     codec.TxStatusResponse(
       to = Some(encode(o.to)),
@@ -701,12 +702,18 @@ object Codec extends Logging:
       isFinalized = isFinalized,
       late = late,
       holdsAcceptorState = holds,
-      status = status
+      status = status,
+      hasAccepted = stat.exists(_.accepted.nonEmpty),
+      acceptedCommit = stat.exists(_.accepted.contains(true)),
+      votedCommit = stat.exists(_.votedCommit),
+      amnesiac = stat.exists(_.amnesiac)
     )
 
   def decode(m: codec.TxStatusResponse): TxStatusResponse =
     val status = if m.haveStatus then
-      Some(TxStatusResponse.TxStatus(decodeTransactionStatus(m.status), m.isFinalized, m.late, m.holdsAcceptorState))
+      Some(TxStatusResponse.TxStatus(decodeTransactionStatus(m.status), m.isFinalized, m.late, m.holdsAcceptorState,
+        accepted = if m.hasAccepted then Some(m.acceptedCommit) else None, votedCommit = m.votedCommit,
+        amnesiac = m.amnesiac))
     else
       None
 

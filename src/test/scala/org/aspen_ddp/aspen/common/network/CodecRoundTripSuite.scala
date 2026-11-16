@@ -410,6 +410,13 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val lateStatus = withStatus.copy(status = Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = true, late = true, holdsAcceptorState = false)))
     Codec.decode(Codec.encode(lateStatus)) shouldBe lateStatus
 
+    // The expiry tally's fields: the latest accept (none, commit, abort), the vote, and amnesia
+    for accepted <- List(None, Some(true), Some(false)); voted <- List(false, true); amnesiac <- List(false, true) do
+      val expiry = withStatus.copy(status = Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved,
+        finalized = false, late = false, holdsAcceptorState = true, accepted = accepted, votedCommit = voted,
+        amnesiac = amnesiac)))
+      Codec.decode(Codec.encode(expiry)) shouldBe expiry
+
     val noStatus = TxStatusResponse(storeId(1), storeId(2), TransactionId(uuid(3)), uuid(4), None)
     Codec.decode(Codec.encode(noStatus)).status shouldBe None
 

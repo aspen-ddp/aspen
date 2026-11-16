@@ -1159,7 +1159,9 @@ class Tx( trs: TransactionRecoveryState,
     else
       answerPrepareAsAcceptor(m)
 
-  private def answerPrepareAsAcceptor(m: TxPrepare): Unit = {
+  private def answerPrepareAsAcceptor(m: TxPrepare): Unit = if frozen then
+    logger.trace(s"Tx $transactionId on store $storeId is frozen past expiry: no promise to ${m.from}")
+  else {
     val result = acceptor.receivePrepare(Prepare(m.proposalId)) match {
       case Right(p) => Right(TxPrepareResponse.Promise(p.lastAccepted))
       case Left(n) => Left(TxPrepareResponse.Nack(n.promisedProposalId))
@@ -1181,7 +1183,7 @@ class Tx( trs: TransactionRecoveryState,
       delayedPrepare = Some(txr)
   }
 
-  def receiveAccept(m: TxAccept): Unit = if !muted then {
+  def receiveAccept(m: TxAccept): Unit = if !muted && !frozen then {
     updateLastEvent()
 
     val result = acceptor.receiveAccept(Accept(m.proposalId, m.value)) match {
@@ -1503,13 +1505,28 @@ class Tx( trs: TransactionRecoveryState,
     * is never a non-holder: the store's old incarnation may have held T, and lost that state with T undecided
     * (Frontend.mayHaveForgottenUndecided)
     */
-  def receiveStatusRequest(m: TxStatusRequest): Unit = {
-    val nonHolder = muted && frontend.belowForgetFloor(txd) && !frontend.mayHaveForgottenUndecided(txd.startTimestamp)
-    val r = TxStatusResponse(m.from, storeId, transactionId, m.requestUUID,
-      Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = lateOutcome,
-        holdsAcceptorState = !nonHolder)))
-    net.sendTransactionMessage(r)
-  }
+  def receiveStatusRequest(m: TxStatusRequest): Unit =
+    // An unresolved Tx answers only once its reported state is final (ExpiryTally): frozen, or muted for good (amnesiac,
+    // or below the floor). Silent until then, as a store whose state is unknown: one muted only for starting too far
+    // ahead may yet join. Its own clock passes T's expiry within the hosts' skew
+    val mutedForGood = muted && (frontend.mayHaveForgottenUndecided(txd.startTimestamp) || frontend.belowForgetFloor(txd))
+    if oresolution.nonEmpty || frozen || mutedForGood then
+      net.sendTransactionMessage(TxStatusResponse(m.from, storeId, transactionId, m.requestUUID, Some(statusForExpiry)))
+
+  /** This Tx's state as a status reply reports it, and as its own expiry round counts it */
+  def statusForExpiry: TxStatusResponse.TxStatus =
+    val amnesiac = muted && frontend.mayHaveForgottenUndecided(txd.startTimestamp)
+    val nonHolder = muted && frontend.belowForgetFloor(txd) && !amnesiac
+    TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = lateOutcome, holdsAcceptorState = !nonHolder,
+      accepted = if muted then None else acceptor.persistentState.accepted.map(_._2),
+      votedCommit = !muted && disposition == TransactionDisposition.VoteCommit,
+      amnesiac = amnesiac)
+
+  /** T is past expiry by this store's clock (Frontend.pastExpiry): this Tx's acceptor promises and accepts nothing
+    * more, as if offline, which Paxos allows. Its reported vote and accept are then final, so every holder's expiry
+    * tally decides from the same states (ExpiryTally). Derived from the clock, so a reload cannot thaw it
+    */
+  def frozen: Boolean = frontend.pastExpiry(txd)
 
   def commitComplete(objectId: ObjectId, result: Either[Unit, CommitError.Value]): Unit = {
     result match

@@ -98,7 +98,18 @@ class Store(val storageDeviceId: StorageDeviceId,
     horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, expiryMargin = expiryMargin,
     onFailStop = err => onFailStop(this, err), incarnationOverride = incarnationOverride, poolIDA = poolIDA,
     admissionTier = admissionTier,
-    onCommitProven = txid => transactionDrivers.get(txid).foreach(giveProof(txid, _)))
+    onCommitProven = txid => transactionDrivers.get(txid).foreach(giveProof(txid, _)),
+    onExpiryCommit = txd => finalizeExpiryCommit(txd))
+
+  /** Expiry decided T committed at this store (ExpiryTally.Decision.Commit): a driver of this store takes the
+    * resolution as any other store's, and its finalizer marks every store that does not acknowledge the commit, which
+    * repair then restores. Holders that decide it too run their own; finalization actions are idempotent
+    */
+  private def finalizeExpiryCommit(txd: TransactionDescription): Unit =
+    driveTransaction(txd)
+    transactionDrivers.get(txd.transactionId).foreach: driver =>
+      driver.receiveTxResolved(TxResolved(storeId, storeId, txd.transactionId, committed = true, late = false,
+        proof = false))
 
   /** Stops the store's transaction drivers first (Ruling 31): left running, their timers would keep re-preparing
     * transactions for a store that is gone. Drivers on other stores, and their heartbeat recovery, take over

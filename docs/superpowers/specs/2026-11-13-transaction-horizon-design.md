@@ -119,6 +119,11 @@ stores (and, builder's call, to every store of the transaction, since any outcom
 a backoff until it decides. The margin covers `MaxStartLead` and the idle self-drive delay. Recovered Txs follow the same
 rule; the query is harmless for a Tx whose peers still answer, because only the replies decide.
 
+> **Superseded in part (2026-11-15, cross-document G1).** Rules 2-4 below were replaced: past expiry every Tx is
+> frozen, replies carry the latest accept, the vote and `amnesiac`, and the tally commits, discards or holds by the
+> rules in `server/transaction/CLAUDE.md` (Expiry) and paxos-transactions 10.10. The original rule 3 discarded a
+> chosen commit when a rebuilt store answered "unknown".
+
 **Decision, from the replies:**
 
 1. **Any reply carries an outcome** (from a Tx or a status cache): adopt it. Committed takes the normal resolved path,

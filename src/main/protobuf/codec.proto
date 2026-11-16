@@ -302,6 +302,10 @@ message TxStatusResponse {
   bool is_finalized = 7;
   bool late = 8;
   bool holds_acceptor_state = 9;
+  bool has_accepted = 10;
+  bool accepted_commit = 11;
+  bool voted_commit = 12;
+  bool amnesiac = 13;
 }
 
 message TxUnknownStore {

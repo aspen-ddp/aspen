@@ -370,6 +370,13 @@ object TxStatusResponse {
     * A response with no status means: not held, not remembered, and below the store's forget floor, so it can never
     * join the transaction
     */
-  case class TxStatus(status: TransactionStatus.Value, finalized: Boolean, late: Boolean, holdsAcceptorState: Boolean)
+  /** `accepted`: the replying Tx's latest accepted Paxos value (true: commit), None if it accepted nothing.
+    * `votedCommit`: the replying Tx voted commit, so it holds T's update for its objects and applies it on a commit.
+    * `amnesiac`: the replying store was rebuilt after T started (Frontend.mayHaveForgottenUndecided): it holds no
+    * acceptor state, but its old incarnation may have. An unresolved Tx replies only once it is past expiry by its own
+    * clock, when it promises and accepts nothing more (Tx.frozen), so the state it reports is final (ExpiryTally)
+    */
+  case class TxStatus(status: TransactionStatus.Value, finalized: Boolean, late: Boolean, holdsAcceptorState: Boolean,
+                      accepted: Option[Boolean] = None, votedCommit: Boolean = false, amnesiac: Boolean = false)
 }
 

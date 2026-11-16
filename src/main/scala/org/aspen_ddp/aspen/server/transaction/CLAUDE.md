@@ -41,9 +41,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - Every object is classified (paxos F8): commit-certain (`c >= t`), abort-certain (`w - a < t`) or undecided. Any
   abort-certain object decides abort at once; all commit-certain decides commit. An undecided tally waits (silence may
   be transient) until T is past the horizon plus the expiry margin (`TransactionDriver.Start.pastExpiry`, from
-  `Frontend.pastExpiry`), then proposes abort (rebuild F6). Expiry alone never ends it: a commit voter and an abort
-  voter both hold acceptor state, so `ExpiryTally` holds, and a silent store back past the horizon refuses silently.
-  The abort is an ordinary Paxos proposal (paxos-transactions P7a): an accepted value in the quorum still wins
+  `Frontend.pastExpiry`), then proposes abort (rebuild F6). That proposal can no longer succeed at a store past T's
+  expiry, whose acceptor is frozen (below); the expiry tally ends such a T instead (an abort voter means no store's
+  update reaches the read threshold, or no commit accept exists to choose). The abort is an ordinary Paxos proposal
+  (paxos-transactions P7a): an accepted value in the quorum still wins
 - Proposer ids are pool indexes, so only the primary pool's stores propose (`TransactionDriver.mayPropose`). A driver on
   any other store is learn-only: it sends prepares and resolves, proves late and finalizes from what it hears, but sets
   no proposal and sends no Accept. A Tx counts prepares and heartbeats as driver activity only from a primary-pool
@@ -141,15 +142,40 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   heartbeat (`Frontend.expiryHeartbeat`) it sends `TxStatusRequest` to every other store of T, at once, then after 1,
   2, 4 and every 8 heartbeats. Each round has a fresh `requestUUID` and counts only its own replies, plus the Tx's own
   acceptor state (a muted Tx holds none)
-- The pure `ExpiryTally.decide` rules, in order: (1) any reply with an outcome is adopted (a commit over an abort): a
-  committed one through `TxResolved` (late if finalized or late, so a commit vote looks up its entry), an aborted one
-  as a `TxFinalized` abort; (2) otherwise the primary pool's (`txd.primaryObjectIDA`) stores that replied "unknown" or
-  without acceptor state are non-holders, and silent ones possible holders. A rebuilt store is never a non-holder
-  for T started before its `acceptorSince` (`Frontend.mayHaveForgottenUndecided`, cross-document G1): its old
-  incarnation may have accepted T and lost that state undecided; (3) more than `width - writeThreshold`
-  non-holders: `Discard`; (4) else `Hold` and ask again. A Tx that knows its outcome passes it (`known`): rule 1 then
-  adopts only a finalized or late commit of a known commit, and an outcome reply without acceptor state (a status
-  cache answering) is a non-holder, since re-adopting the known outcome would change nothing
+- Freeze (`Tx.frozen`, cross-document G1): once T is past expiry by the store's own clock, its Tx promises and
+  accepts nothing more, as if offline, which Paxos allows. Derived from the clock, so a reload cannot thaw it. An
+  unresolved Tx answers a status request only once frozen (or muted for good), so every state a tally counts is final:
+  a vote never changes and nothing more is accepted. Before that it is silent
+- A reply (`TxStatusResponse.TxStatus`) carries the outcome if known, plus `accepted` (the latest accepted value),
+  `votedCommit` (a commit voter holds T's update for its objects) and `amnesiac` (a rebuilt store, for T started
+  before its `acceptorSince`, `Frontend.mayHaveForgottenUndecided`: no state, but its old incarnation may have
+  accepted T). A silent store counts as possibly having accepted commit and possibly holding the update
+- The pure `ExpiryTally.decide` rules, in order. `w`, `t`: the primary pool's width and write threshold; `r`: each
+  changed object's pool's read threshold, `IDA.consistentRestoreThreshold` (a majority, never `restoreThreshold`).
+  In the primary pool `ac` stores report commit as their latest accept, `k` are amnesiac, `sp` silent; per changed
+  pool `vc` voted commit and `s` are silent.
+  (1) **Adopt** any reply with an outcome (a commit over an abort): a committed one through `TxResolved` (late if
+  finalized or late, so a commit vote looks up its entry), an aborted one as a `TxFinalized` abort.
+  (2) **Commit** when `ac > w - t` and every changed pool has `vc >= r`. Any quorum that chose abort would include one
+  of the `ac` stores, whose latest accept would then be abort, so abort was never chosen; those stores are frozen and
+  the other `t - 1` cannot form a quorum, so nothing is chosen again; and the update is held at its read threshold.
+  The deciding store sends `TxResolved(commit)` to every store of T, applies it (a commit voter's locks have kept its
+  locked parts unchanged: repair defers to a store's own locks, and a conflicting commit would need a locked voter),
+  and its driver finalizes it (`Frontend.onExpiryCommit` -> `Store.finalizeExpiryCommit`), whose missed-update marks
+  repair the stores that never applied it.
+  (3) **Discard** when some changed pool has `vc + s < r` (the update can never be restored: if `ac + k + sp >= t` a
+  commit may have been chosen, and an error says a committed update may be lost, unless T was finalized), or when
+  `ac + k + sp < t` and `ac + sp <= w - t` (no commit is chosen and unfinalized: its `t` acceptors would still hold
+  it, be amnesiac or be silent; nothing new can be chosen; and no observer can see the commit rule's `ac`).
+  (4) **Hold** otherwise: some store is silent, or, every store reported, more stores lost acceptor state than the
+  pool tolerates (logged `UNDECIDABLE TRANSACTION`, then every `Frontend.UndecidableLogRounds` rounds). The latter
+  needs `k >= 2t - w`, beyond the decision's tolerance, which is never less than the data's (`t - r`), so in practice
+  only pools with no margin above their read threshold, such as Replication(3, 2), reach it.
+  Rules 2 and 3 never both hold, for any observers: frozen states never change, a silent store counts on both sides,
+  and a store leaves a count only by deciding, after which it reports its outcome (rule 1).
+  A Tx that knows its outcome passes it (`known`): rule 1 then adopts only a finalized or late commit of a known
+  commit, and otherwise it concludes once more than `w - t` primary stores are non-holders (no acceptor state and not
+  amnesiac: a commit is forgotten only at TxFinalized), or holds
 - `Discard`: an abort voter, a Tx with no vote, a prover or a muted Tx is discarded at once. A commit voter
   (`needsUnackedCheck`, which covers expiring Txs too) first looks up its entry: none found by a lookup started after
   the decision discards it; one found applies T and concludes it as a late commit; a failed lookup keeps it holding and
@@ -159,13 +185,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   Discarding releases locks and objects, deletes the CRL state as for a forgotten abort, forgets the Tx, and leaves the
   status cache alone (no outcome is known). An expiring commit vote also holds an abort for a lookup, as a recovered
   one does, and its store drives it meanwhile, as it does a recovered one
-- Why discarding is safe: an acceptor forgets T only once T is decided (an abort at resolution, a commit at
-  TxFinalized), and a store answers "unknown" only below its forget floor, so a non-holder never becomes a holder.
-  A rebuilt store lost its acceptor state undecided, so it must never count as a non-holder for older T: one false
-  non-holder is enough to discard a chosen commit when `w - t = 1`. Accepted cost: a T whose only quorum needs it
-  holds indefinitely
-  More than `w - t` of them rule out a committed, unfinalized T, which a full quorum would still hold. So T aborted,
-  or committed and was finalized (its finalizer wrote this store's entry if it was owed), or can never be decided
+- Why a rebuilt store must count as amnesiac, never as having nothing: its acceptor state was lost with T undecided,
+  so with one store that never heard of T it once made the last holders of a chosen commit discard it (cross-document
+  G1; HorizonIntegrationSuite "holders of a chosen commit apply it past expiry though a rebuilt store forgot it")
 - A driver of a transaction past the horizon plus the margin that has no outcome is stopped and removed once its
   store holds no Tx for it (`Store.removeExpiredDrivers`). A driver with an outcome keeps running its finalization
 - Rejoin invariant: once a store discards T, its floor makes it refuse every later prepare for T: a discarded

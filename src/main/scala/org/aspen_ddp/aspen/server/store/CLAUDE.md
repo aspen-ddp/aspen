@@ -70,15 +70,16 @@
   transactions it does not know yet. A committed Tx is held until TxFinalized, after its AllocationFinalizationAction,
   so every allocation whose AllocationTree entry may still be missing is listed by each store holding it
 - Status query (`TxStatusRequest`, carrying the transaction's `startTimestamp`; horizon design section 2): every
-  store answers. A store with a Tx replies with its status, finalized, late and `holdsAcceptorState`, false only for a Tx
-  muted for good (below the floor): one muted only for starting too far ahead may yet join. With no
-  Tx but a non-Unresolved status-cache entry it replies with that entry (`holdsAcceptorState = false`). With neither it
-  replies `status = None` ("unknown") only when the start is below its forget floor (`belowForgetFloor(HLCTimestamp)`),
-  which makes the answer permanent; above the floor it stays silent, as it could still join the transaction. A rebuilt
-  store, for T started before its `acceptorSince` (`mayHaveForgottenUndecided`), is never a non-holder: its muted Tx and
-  a cached outcome reply `holdsAcceptorState = true`, it is otherwise silent, and its own Tx's expiry round counts
-  itself a holder. Its old incarnation may have accepted T, and counting it out could discard a chosen commit
-  (cross-document G1)
+  store with a final state answers. A store with a Tx replies with `Tx.statusForExpiry`: status, finalized, late,
+  `holdsAcceptorState` (false only for a Tx muted for good below the floor), its latest `accepted` value and
+  `votedCommit`. An unresolved Tx answers only once frozen (past expiry by its own clock: it promises and accepts
+  nothing more, `Tx.frozen`) or muted for good, so the state it reports is final; before that, and for a Tx muted only
+  for starting too far ahead (it may yet join), it is silent. With no Tx but a non-Unresolved status-cache entry it
+  replies with that entry. With neither it replies `status = None` ("unknown") only when the start is below its forget
+  floor (`belowForgetFloor(HLCTimestamp)`), which makes the answer permanent; above the floor it stays silent, as it
+  could still join the transaction. A rebuilt store, for T started before its `acceptorSince`
+  (`mayHaveForgottenUndecided`), replies `amnesiac` (with a cached outcome if any), never "unknown": its old
+  incarnation may have accepted T (cross-document G1). How the replies decide: `server/transaction/CLAUDE.md`, Expiry
 - Forget floor (`Frontend.forgetFloorMillis`, transaction horizon design section 1): a prepare for a transaction the
   store does not hold (no Tx; a finalized status-cache entry has it ignored instead) whose start is below the floor is
   refused, a resolved but unfinalized cache entry included (Todo 4.6: the host's cache is shared, so another store's Tx
@@ -104,7 +105,8 @@
   are not exempt from the load floor. A durable high-water mark is the upgrade path
 - Expiry (`server/transaction/CLAUDE.md`): `Store.heartbeat` calls `Frontend.expiryHeartbeat`, which queries the
   peers of each Tx unfinalized past the horizon plus `expiryMargin` and decides from their `TxStatusResponse`s
-  (`ExpiryTally`): adopt an outcome, keep holding, or discard (`expireTransaction`: locks and objects released, CRL
+  (`ExpiryTally`): adopt an outcome, decide commit (resolve it at every store, apply it, and have the store's driver
+  finalize it: `onExpiryCommit`), keep holding, or discard (`expireTransaction`: locks and objects released, CRL
   state deleted, status cache untouched; a commit vote only once a later UnackedCommits lookup finds no entry; a
   resolved Tx concludes as finalized). Then
   `removeExpiredDrivers` stops each driver past the horizon with no outcome whose store holds no Tx for it. Store

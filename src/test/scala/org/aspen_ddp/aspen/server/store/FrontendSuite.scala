@@ -1547,8 +1547,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("a recovered Tx older than the floor still answers its peers' prepares") {
-    // Restarted: the store loaded now, and recovered a transaction started long before from its CRL
-    val txd = dataUpdateTxd.copy(startTimestamp = startedAgo(30_000))
+    // Restarted: the store loaded now, and recovered a transaction started long before from its CRL. Before T's
+    // expiry (horizon plus the default 8 s margin), past which its acceptor is frozen
+    val txd = dataUpdateTxd.copy(startTimestamp = startedAgo(22_000))
     val trs = TransactionRecoveryState(storeId, txd.serialize(), Nil, TransactionDisposition.Undetermined,
       TransactionStatus.Unresolved, PersistentState.initial)
     val crl = new TestCrl:
@@ -5199,17 +5200,59 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   private def statusResponses(net: TestNet): List[TxStatusResponse] =
     net.sentTx.collect { case r: TxStatusResponse => r }
 
-  test("a store holding T answers a status request with its status and acceptor state") {
-    withFloorFrontend(): (frontend, _, net, _) =>
-      val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = startedAgo(1_000))
+  test("a store holding T answers a status request only once frozen, with its vote and latest accept") {
+    withExpiryFrontend: (frontend, _, net, _, _, clock, _) =>
+      val txd = expiringTxd(List(overwrite(op1)))
       frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.receiveTransactionMessage(TxAccept(storeId, peer1, txid1, ProposalId.initialProposal(0.toByte), true))
       net.sentTx = Nil
+      // Before T's expiry its acceptor may still accept: its state is not final, so it does not answer
       frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
+      statusResponses(net) shouldBe Nil
 
+      passHorizon(clock)
+      frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
       statusResponses(net).map(r => (r.to, r.requestUUID, r.status)) shouldBe
         List((StoreId(poolId, 1), reqUUID,
           Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
-            holdsAcceptorState = true))))
+            holdsAcceptorState = true, accepted = Some(true), votedCommit = true))))
+  }
+
+  // Cross-document review G1. Replication(3, 2): read threshold 2, width - writeThreshold 1
+  test("an expiring commit voter whose peers accepted commit decides commit, applies it and has it finalized") {
+    var finalizing: List[TransactionId] = Nil
+    withExpiryFrontendAdmitting(CrlAdmission.Unlimited, txd => finalizing ::= txd.transactionId):
+      (frontend, backend, net, _, lookup, clock, statusCache) =>
+        val txd = expiringTxd(List(overwrite(op1)))
+        frontend.receiveTransactionMessage(clientPrepare(txd))
+        passHorizon(clock)
+        frontend.expiryHeartbeat()
+        reply(frontend, net, peer1, acceptedCommit)
+        finalizing shouldBe Nil // One accept: abort may have been chosen by this store and store 2
+        net.sentTx.collect { case r: TxResolved => r } shouldBe Nil
+        reply(frontend, net, peer2, acceptedCommit)
+
+        // Two accepts: abort was never chosen and never can be, and two voters hold the update
+        net.sentTx.collect { case r: TxResolved => (r.to, r.committed, r.late, r.proof) }.toSet shouldBe
+          Set((peer1, true, false, false), (peer2, true, false, false))
+        backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+        frontend.transactions(txid1).status shouldBe TransactionStatus.Committed
+        finalizing shouldBe List(txid1)
+        lookup.requests shouldBe Nil
+  }
+
+  test("a Tx past its expiry promises and accepts nothing") {
+    withExpiryFrontend: (frontend, _, net, crl, _, clock, _) =>
+      val txd = expiringTxd(List(overwrite(op1)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      passHorizon(clock)
+      net.sentTx = Nil
+      frontend.receiveTransactionMessage(driverPrepare(txd))
+      frontend.receiveTransactionMessage(TxAccept(storeId, peer1, txid1, ProposalId(2, 1.toByte), false))
+
+      votes(net) shouldBe Nil
+      net.sentTx.collect { case r: TxAcceptResponse => r } shouldBe Nil
+      frontend.transactions(txid1).statusForExpiry.accepted shouldBe None
   }
 
   test("a store with only a cached outcome answers with it") {
@@ -5255,13 +5298,15 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       statusResponses(net).map(_.status.map(_.holdsAcceptorState)) shouldBe List(Some(true))
   }
 
-  test("a rebuilt store without a Tx never answers unknown for a transaction older than its acceptor") {
+  test("a rebuilt store without a Tx answers amnesiac, never unknown, for a transaction older than its acceptor") {
     withAcceptorSince(): (frontend, _, net, _) =>
       // Below the store's floor too, where an ordinary store answers unknown
       val start = ago(FiniteDuration(3, SECONDS))
       frontend.belowForgetFloor(start) shouldBe true
       frontend.receiveTransactionMessage(statusRequest(start))
-      net.sentTx shouldBe empty
+      statusResponses(net).map(_.status) shouldBe
+        List(Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
+          holdsAcceptorState = true, amnesiac = true)))
   }
 
   test("a rebuilt store's cached outcome for a transaction older than its acceptor counts as possibly holding it") {
@@ -5272,10 +5317,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
       statusResponses(net).map(_.status) shouldBe
         List(Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = false, late = false,
-          holdsAcceptorState = true)))
+          holdsAcceptorState = true, amnesiac = true)))
   }
 
-  test("a Tx muted for starting too far ahead answers holdsAcceptorState = true: it may join once forgotten") {
+  test("a Tx muted for starting too far ahead does not answer: it may join once forgotten") {
     // Its objects are still loading, so it is not forgotten yet (forgetMuted). Once it is, a retransmission after the
     // clock catches up creates an unmuted Tx, so it is a possible holder, not a permanent non-holder
     val backend = new DeferredCommitBackend
@@ -5292,7 +5337,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     net.sentTx = Nil
     frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
 
-    statusResponses(net).map(_.status.map(_.holdsAcceptorState)) shouldBe List(Some(true))
+    // Its state is not final, so it is a silent store: possibly a holder
+    statusResponses(net) shouldBe Nil
   }
 
   // ---- Expiry: an unresolved Tx past the horizon decides from its peers' status (spec section 2) ----
@@ -5310,7 +5356,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
                                      TransactionStatusCache) => Unit): Unit =
     withExpiryFrontendAdmitting(CrlAdmission.Unlimited)(f)
 
-  private def withExpiryFrontendAdmitting(admission: CrlAdmission)
+  private def withExpiryFrontendAdmitting(admission: CrlAdmission,
+                                          onExpiryCommit: TransactionDescription => Unit = _ => ())
                                          (f: (Frontend, MapBackend, TestNet, TestCrl, ManualLookup, TestClock,
                                               TransactionStatusCache) => Unit): Unit =
     val clock = new TestClock(floorNow)
@@ -5323,7 +5370,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, cache, net, crl, statusCache, unackedLookup = lookup,
       wallClockMillis = () => clock.now, horizon = FiniteDuration(20, SECONDS), loadedAt = Some(floorNow - 60_000),
-      admission = admission)
+      admission = admission, onExpiryCommit = onExpiryCommit)
     lookup.frontend = Some(frontend)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     f(frontend, backend, net, crl, lookup, clock, statusCache)
@@ -5344,6 +5391,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   private val holding = Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
     holdsAcceptorState = true))
+
+  /** A frozen peer that voted commit and whose latest accept is commit */
+  private val acceptedCommit = Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false,
+    late = false, holdsAcceptorState = true, accepted = Some(true), votedCommit = true))
 
   test("a Tx past the horizon queries every other store of the transaction, backing off to eight heartbeats") {
     withExpiryFrontend: (frontend, _, net, _, _, clock, _) =>
@@ -5377,9 +5428,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       passHorizon(clock)
       frontend.expiryHeartbeat()
 
+      // Only store 2, silent, could still hold the update: below the read threshold of 2, so T can never be applied
       reply(frontend, net, peer1, None)
-      frontend.transactions.contains(txid1) shouldBe true // One non-holder: a quorum may remain
-      reply(frontend, net, peer2, None)
 
       frontend.transactions.contains(txid1) shouldBe false
       crl.deleted should contain (txid1)
@@ -5418,8 +5468,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   // Paxos F4: a secondary-pool store's driver is learn-only, so when no primary store is reachable its Tx ends by
-  // expiry. Only the primary pool's answers decide; its own pool's do not
-  test("a secondary-pool commit voter whose primary stores answer unknown is discarded once a lookup finds no entry") {
+  // expiry. Its own pool's answers decide too: with both peers unknown, its object's update is held by one store, below
+  // the pool's read threshold
+  test("a secondary-pool commit voter whose pool peers answer unknown is discarded once a lookup finds no entry") {
     withExpiryFrontend: (frontend, _, net, crl, lookup, clock, _) =>
       val txd = expiringTxd(List(overwrite(op1), DataUpdate(otherPtr, rev0, DataUpdateOperation.Overwrite)))
         .copy(primaryObject = otherPtr, poolIDAMap = Map(poolId -> ida, otherPoolId -> ida))
@@ -5428,13 +5479,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       passHorizon(clock)
       frontend.expiryHeartbeat()
 
-      // Its own pool's peers are no acceptors of T
       reply(frontend, net, peer1, None)
+      lookup.requests shouldBe Nil // Store 2 may yet hold the update
       reply(frontend, net, peer2, None)
-      lookup.requests shouldBe Nil
-
-      reply(frontend, net, StoreId(otherPoolId, 0), None)
-      reply(frontend, net, StoreId(otherPoolId, 1), None)
       lookup.requests shouldBe List(txid1)
       lookup.answer(txid1, lookup.absent)
       frontend.transactions.contains(txid1) shouldBe false
@@ -5490,25 +5537,26 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       passHorizon(clock)
       frontend.expiryHeartbeat()
       val first = statusRequests(net).last.requestUUID
-      reply(frontend, net, peer1, None)
+      reply(frontend, net, peer1, acceptedCommit)
       frontend.expiryHeartbeat() // A new round
       statusRequests(net).last.requestUUID should not be first
 
-      // Store 2's answer to the first round, with store 1's from that round, would discard
-      frontend.receiveTransactionMessage(TxStatusResponse(storeId, peer2, txid1, first, None))
-      lookup.requests shouldBe Nil
-      frontend.transactions.contains(txid1) shouldBe true
+      // Store 2's answer to the first round, with store 1's from that round, would decide commit
+      net.sentTx = Nil
+      frontend.receiveTransactionMessage(TxStatusResponse(storeId, peer2, txid1, first, acceptedCommit))
+      net.sentTx.collect { case r: TxResolved => r } shouldBe Nil
+      frontend.transactions(txid1).status shouldBe TransactionStatus.Unresolved
   }
 
-  test("a Tx past the horizon with a quorum of holders keeps holding and later learns the outcome") {
+  test("a Tx past the horizon whose silent peer may have accepted commit keeps holding and later learns the outcome") {
     withExpiryFrontend: (frontend, backend, net, _, lookup, clock, _) =>
       frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
       passHorizon(clock)
       frontend.expiryHeartbeat()
-      reply(frontend, net, peer1, holding)
-      reply(frontend, net, peer2, holding)
+      // One commit accept, and store 2 silent: it may have accepted commit too (commit) or not (discard)
+      reply(frontend, net, peer1, acceptedCommit)
       frontend.expiryHeartbeat()
-      reply(frontend, net, peer1, holding) // Store 2 silent: a possible holder
+      reply(frontend, net, peer1, acceptedCommit)
       lookup.requests shouldBe Nil
       frontend.transactions(txid1).status shouldBe TransactionStatus.Unresolved
       lockedWriteTransactions(frontend, net, op1) should contain (txid1)

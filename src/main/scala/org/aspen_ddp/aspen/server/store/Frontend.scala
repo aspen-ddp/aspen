@@ -72,6 +72,9 @@ object Frontend {
   /** The most store heartbeats between an expiring Tx's status queries: they start one heartbeat apart and double */
   val MaxExpiryQueryInterval: Int = 8
 
+  /** An undecidable expiring Tx (ExpiryTally.Decision.Hold) is logged at its first such round, then every this many */
+  val UndecidableLogRounds: Int = 60
+
   /** The most store heartbeats between retries of a quarantined object's verification (Frontend.quarantine) */
   val MaxQuarantineRetryInterval: Int = 60
 
@@ -163,7 +166,9 @@ class Frontend(val storeId: StoreId,
                  * now proves the commit to its driver (Tx.provesCommitToItsDriver): the Store hands the proof to a
                  * driver already running (Store.giveProof). The default does nothing, for tests
                  */
-               onCommitProven: TransactionId => Unit = _ => ()) extends Logging {
+               onCommitProven: TransactionId => Unit = _ => (),
+               /** Expiry decided T committed here (ExpiryTally.Decision.Commit): the Store has a driver finalize it */
+               onExpiryCommit: TransactionDescription => Unit = _ => ()) extends Logging {
 
   /** Which life of the store's data this is: prepare replies carry it (TxPrepareResponse.incarnation) */
   val incarnation: StoreIncarnation = incarnationOverride.getOrElse(StoreIncarnation.default(storeId))
@@ -875,7 +880,8 @@ class Frontend(val storeId: StoreId,
     * @param decided this round's replies decided: later ones of it are ignored
     */
   private final class ExpiryRound(var requestUUID: UUID, var replies: Map[StoreId, Option[TxStatusResponse.TxStatus]],
-                                  var countdown: Int, var interval: Int, var decided: Boolean)
+                                  var countdown: Int, var interval: Int, var decided: Boolean,
+                                  var undecidableRounds: Int = 0)
   private val expiryRounds = scala.collection.mutable.HashMap[TransactionId, ExpiryRound]()
 
   /** Store heartbeat: each Tx still unfinalized past the horizon plus the expiry margin (Tx.mayExpire: unresolved, or
@@ -915,11 +921,10 @@ class Frontend(val storeId: StoreId,
     round.decided = false
     round.countdown = round.interval
     round.interval = math.min(round.interval * 2, MaxExpiryQueryInterval)
-    // Its own acceptor state: a muted Tx holds none, unless the store's old incarnation may have held it
-    // (mayHaveForgottenUndecided). Never an outcome: one it already knows is what its peers are asked to confirm or end
-    // (ExpiryTally.decide's `known`)
-    round.replies = Map(storeId -> Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false,
-      late = false, holdsAcceptorState = !tx.muted || mayHaveForgottenUndecided(tx.txd.startTimestamp))))
+    // Its own state, frozen like its peers' (it is past expiry). Never an outcome: one it already knows is what its
+    // peers are asked to confirm or end (ExpiryTally.decide's `known`)
+    round.replies = Map(storeId -> Some(tx.statusForExpiry.copy(status = TransactionStatus.Unresolved,
+      finalized = false, late = false)))
     val txd = tx.txd
     // Every store of the transaction, since any outcome-bearing reply decides; only the primary pool's count otherwise
     (txd.allDataStores - storeId).foreach: to =>
@@ -936,7 +941,27 @@ class Frontend(val storeId: StoreId,
 
   private def decideExpiry(tx: Tx, round: ExpiryRound): Unit =
     ExpiryTally.decide(tx.txd, round.replies, tx.knownOutcome) match
-      case ExpiryTally.Decision.Hold => ()
+      case ExpiryTally.Decision.Hold(undecidable) =>
+        if undecidable then
+          round.undecidableRounds += 1
+          if round.undecidableRounds == 1 || round.undecidableRounds % UndecidableLogRounds == 0 then
+            logger.error(s"UNDECIDABLE TRANSACTION ${tx.transactionId} on store $storeId: every store of it has " +
+              s"reported, and more of its primary pool lost their acceptor state than the pool tolerates, so its " +
+              s"outcome cannot be proven. Its locks and CRL state are held. Replies: ${round.replies}")
+      case ExpiryTally.Decision.Commit =>
+        round.decided = true
+        logger.warn(s"Expiring Tx ${tx.transactionId} on store $storeId decides commit: abort was never chosen and " +
+          s"can no longer be, and its update is held at the read threshold. Applying it and finalizing; repair " +
+          s"restores the stores that missed it. Replies: ${round.replies}")
+        val txd = tx.txd
+        // To every store, as a driver's resolution: other holders apply it, and the stores without a Tx record it
+        (txd.allDataStores - storeId).foreach: to =>
+          net.sendTransactionMessage(TxResolved(to, storeId, txd.transactionId, committed = true, late = false,
+            proof = false))
+        handleTransactionMessage(TxResolved(storeId, storeId, txd.transactionId, committed = true, late = false,
+          proof = false))
+        // A driver finalizes it: its missed-update marks drive the repair
+        onExpiryCommit(txd)
       case ExpiryTally.Decision.Adopt(committed, finalizedOrLate) =>
         round.decided = true
         val from = round.replies.collectFirst:
@@ -953,8 +978,12 @@ class Frontend(val storeId: StoreId,
           else
             TxResolved(storeId, from, tx.transactionId, committed = true, late = finalizedOrLate, proof = false)
         handleTransactionMessage(adopted)
-      case ExpiryTally.Decision.Discard =>
+      case ExpiryTally.Decision.Discard(dataLost) =>
         round.decided = true
+        if dataLost then
+          logger.error(s"Expiring Tx ${tx.transactionId} on store $storeId: too few of its commit voters hold its " +
+            s"update to restore it at the read threshold, and it may have committed. Unless it was finalized (its " +
+            s"applied copies are not reported), a committed update is lost. Discarding it. Replies: ${round.replies}")
         if tx.knownOutcome.nonEmpty then
           expiryRounds.remove(tx.transactionId)
           tx.concludeKnownOutcome()
@@ -1314,8 +1343,12 @@ class Frontend(val storeId: StoreId,
   private def receiveStatusRequestWithoutTx(m: TxStatusRequest): Unit =
     val amnesiac = mayHaveForgottenUndecided(m.startTimestamp)
     val reply = statusCache.getStatus(m.transactionId).filter(_.status != TransactionStatus.Unresolved) match
-      case Some(e) => Some(TxStatusResponse.TxStatus(e.status, e.finalized, e.late, holdsAcceptorState = amnesiac))
-      case None if amnesiac => return
+      case Some(e) =>
+        Some(TxStatusResponse.TxStatus(e.status, e.finalized, e.late, holdsAcceptorState = amnesiac, amnesiac = amnesiac))
+      case None if amnesiac =>
+        // Muted for good: it never joins T, and reports that its old incarnation may have accepted in it
+        Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
+          holdsAcceptorState = true, amnesiac = true))
       case None if belowForgetFloor(m.startTimestamp) => None
       case None => return
     net.sendTransactionMessage(TxStatusResponse(m.from, storeId, m.transactionId, m.requestUUID, reply))

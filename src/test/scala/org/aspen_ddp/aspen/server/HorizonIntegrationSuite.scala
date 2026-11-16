@@ -418,13 +418,14 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       xAfter.revision shouldBe ObjectRevision(next.id)
       xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](3)
 
-  test("holders of a chosen commit keep it past expiry while a rebuilt store may have accepted it"):
+  test("holders of a chosen commit apply it past expiry though a rebuilt store forgot it"):
     // Cross-document review G1 (X2 x expiry). T's commit is chosen by stores 0-3 and reported to the client, but no
     // store learns it: its leader, store 0, alone on its host, loses its host and its CRL before it finalizes. Store
     // 0 is rebuilt, blank, and promoted at once; store 4 never hears of T. Past the horizon stores 1-3, the only
-    // holders left, cannot form a quorum and ask their peers. Store 4 is a non-holder, but the rebuilt store is not
-    // one: its old incarnation accepted T. Counting it as one would make two, more than width - writeThreshold, and
-    // the holders would discard a commit the client was told of
+    // holders left, cannot form a quorum and ask their peers. Counting the rebuilt store as a non-holder would make
+    // them discard a commit the client was told of. Instead three stores report commit as their latest accept, more
+    // than width - writeThreshold, so abort was never chosen; and three commit voters hold the update, its read
+    // threshold. So they decide commit, apply it and finalize it (ExpiryTally.Decision.Commit)
     val lost = 0
     val absent = sid(4)
     val hostA = net.newHost()
@@ -455,6 +456,10 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       // Store 0's host crashes and its CRL is lost. The rebuild restores its data as the pool holds it, before T, and
       // writes its acceptor-since; the rebuilt store is promoted on another host
       _ <- pump(hostA.control.loader.closeStore(sid(lost), extractCrl = false), clock = false)
+      // The stalled finalizer, and the lost outcome messages, died with its host. Store 4 still hears nothing of T
+      _ = net.FinalizerFactory.stalled = _ => false
+      _ = net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id && m.to == absent &&
+            !m.isInstanceOf[TxStatusRequest]
       _ = net.crl.deleteTransaction(sid(lost), tx.id)
       _ = RebuildingStore.writeAcceptorSince(rebuiltDir)
       rebuilt = new MapBackend(sid(lost)):
@@ -462,18 +467,17 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       _ = rebuilt.m = lostData
       _ <- pump(net.moveStore(rebuilt, hostB, closeFirst = false), clock = false)
       _ = withClue("the rebuilt store is muted for T: ")(frontend(lost).flatMap(_.acceptorSince).isDefined shouldBe true)
-      // Past the horizon plus the expiry margin, and several query rounds (at once, then after 1, 2 and 4 heartbeats)
-      period = FiniteDuration(testHostOptions.heartbeatPeriod.toMillis, MILLISECONDS)
-      expiryMargin = Frontend.expiryMargin(period * 5, period)
-      start = net.crl.getFullRecoveryState(sid(1)).find(_.txd.transactionId == tx.id).get.txd.startTimestamp.wallTime
-      _ <- eventually("several expiry rounds passed", clock = true):
-             wallMillis() > start + horizon.toMillis + expiryMargin.toMillis + 2000
+      // Past the horizon plus the expiry margin the holders query their peers, decide commit, apply it and finalize it
+      _ <- eventually("the holders applied T and forgot it", clock = true):
+             (1 until 4).forall(i => storeRevision(i, x).contains(ObjectRevision(tx.id))) &&
+               holders(tx.id).isEmpty && crlStores(tx.id).isEmpty
+      _ = net.dropTxMessage = _ => false
+      _ <- settle(clock = true)
+      xAfter <- client.read(x)
     yield
-      net.dropTxMessage = _ => false
-      net.FinalizerFactory.stalled = _ => false
-      withClue("no holder discarded the chosen commit: "):
-        holders(tx.id) shouldBe Set(1, 2, 3)
-        crlStores(tx.id) shouldBe Set(1, 2, 3)
+      withClue("the committed update is readable at its read threshold: "):
+        xAfter.revision shouldBe ObjectRevision(tx.id)
+        xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](2)
 
   /** Delivers T's client prepare to store `i`, which forgot T, once it is served by `host` and loaded after T started:
     * it is refused there, though the host's status cache knows nothing of T and T is inside the horizon

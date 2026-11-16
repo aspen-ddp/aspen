@@ -241,9 +241,10 @@ class StoreSuite extends AnyFunSuite with Matchers:
     var batched: List[TxMessage] = Nil
     override def sendTransactionMessages(msg: List[TxMessage]): Unit = batched = batched ++ msg
 
-  // Rebuild F6, paxos F8: a commit vote, an abort vote and a silent third store. Expiry holds (both voters hold
-  // acceptor state), so until the driver proposes abort past expiry, the commit voter's locks are held for good
-  test("a commit voter whose peer voted abort and whose third store is silent aborts past expiry, not before") {
+  // Rebuild F6, paxos F8: a commit vote, an abort vote and a silent third store. Before expiry the driver's tally
+  // waits for the silent store. Past it both voters are frozen (they promise and accept nothing more), and the expiry
+  // tally discards T: no accept of commit exists, and the silent store alone cannot make one chosen
+  test("a commit voter whose peer voted abort and whose third store is silent is discarded past expiry, not before") {
     var now = fixedStart
     val lookup = new ManualLookup
     val batchNet = new BatchNet
@@ -270,7 +271,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     promise(peer, TransactionDisposition.VoteAbort)
     sentAccepts shouldBe empty
 
-    // Past expiry: the expiry round holds, as the peer holds acceptor state and the silent store may
+    // Past expiry: the peer reports its frozen abort vote, with nothing accepted
     now += 1
     store.heartbeat()
     val status = net.sentTx.collect { case r: TxStatusRequest => r }
@@ -279,20 +280,9 @@ class StoreSuite extends AnyFunSuite with Matchers:
       store.receiveTransactionMessage(TxStatusResponse(leader, peer, txid1, r.requestUUID,
         Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
           holdsAcceptorState = true))))
-    store.frontend.transactions.contains(txid1) shouldBe true
-
-    // The next reply to the driver's resent prepares makes it propose abort
-    promise(peer, TransactionDisposition.VoteAbort)
-    sentAccepts shouldBe Set((storeId, false), (leader, false), (peer, false))
-
-    for from <- List(leader, peer) do
-      store.receiveTransactionMessage(TxAcceptResponse(leader, from, txid1, round,
-        Right(TxAcceptResponse.Accepted(false))))
-    store.receiveTransactionMessage(TxResolved(leader, leader, txid1, committed = false, late = false, proof = false))
-    // An expiring commit vote looks up its UnackedCommits entry before it lets go of an abort
+    // The commit voter looks up its UnackedCommits entry before it discards T
+    lookup.requests shouldBe List(txid1)
     lookup.answer(txid1, lookup.absent)
-    store.receiveTransactionMessage(TxFinalized(leader, leader, txid1, committed = false, late = false, owed = Set(),
-      startTimestamp = HLCTimestamp.now))
     store.frontend.transactions.contains(txid1) shouldBe false
     crl.deleted should contain (txid1)
   }

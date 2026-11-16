@@ -766,49 +766,59 @@ answers unknown only below its floor".
 `TxFinalized` that may never come) past the horizon plus `expiryMargin` (`MaxStartLead` + `txHeartbeatTimeout` + one
 heartbeat, `Frontend.scala:50-55`) queries every other store of T at store heartbeat, at once and then after 1, 2, 4 and
 every 8 heartbeats, each round with a fresh request id (`expiryHeartbeat`, `Frontend.scala:607-640`). The pure
-`ExpiryTally.decide` (`server/transaction/ExpiryTally.scala:34-52`) applies, in order:
+`ExpiryTally.decide` (`server/transaction/ExpiryTally.scala`) applies, in order (rules 2-4 revised 2026-11-15,
+cross-document G1; the earlier rule 3 discarded on more than `w - t` non-holders):
 
 1. any reply with an outcome is adopted (commit over abort), a commit through `TxResolved` (late if finalized or late,
    so a commit voter looks up its UnackedCommits entry), an abort as a finalized abort;
-2. otherwise the primary pool's (`txd.primaryObjectIDA`) stores that replied "unknown" or without acceptor state are
-   non-holders, and silent stores are possible holders, never non-holders;
-3. more than `width - writeThreshold` non-holders: **discard**. A commit voter (`needsUnackedCheck`, which now covers
-   expiring Txs, `Tx.scala:187-189`) first looks up its entry: none found by a lookup started after the decision
-   discards it, one found applies T and concludes it as a late commit, and a failed lookup keeps it holding. A `Tx`
-   that already knows its outcome concludes it instead (`Tx.concludeKnownOutcome`, `Tx.scala:228`). Discarding
-   (`Frontend.expireTransaction`, `:685-694`; `Tx.expire`, `Tx.scala:274`) releases locks and objects, deletes the CRL
-   state as for a forgotten abort, forgets the `Tx`, and writes nothing in the status cache;
-4. otherwise **hold** and ask again.
+2. **commit** when more than `w - t` of the primary pool's stores report commit as their latest accept and, in every
+   pool of a changed object, at least its read threshold `r` (`consistentRestoreThreshold`) of commit voters hold the
+   update. The deciding store resolves T committed at every store, applies it, and its driver finalizes it;
+3. **discard** when some changed object's pool cannot reach `r` even counting its silent stores, or when the commit
+   accepts, amnesiac (rebuilt) and silent primary stores together number fewer than `t` and the accepts and silent
+   stores no more than `w - t`. A commit voter (`needsUnackedCheck`) first looks up its entry: none found by a lookup
+   started after the decision discards it, one found applies T and concludes it as a late commit, and a failed lookup
+   keeps it holding. A `Tx` that already knows its outcome concludes it instead (`Tx.concludeKnownOutcome`) once more
+   than `w - t` primary stores are non-holders. Discarding (`Frontend.expireTransaction`; `Tx.expire`) releases locks
+   and objects, deletes the CRL state as for a forgotten abort, forgets the `Tx`, and writes nothing in the status cache;
+4. otherwise **hold** and ask again: a store is silent, or (logged `UNDECIDABLE TRANSACTION`) every store reported and
+   more of them lost their acceptor state than the pool tolerates.
+
+**Freeze.** A `Tx` past T's expiry by its own store's clock promises and accepts nothing more (`Tx.frozen`), and an
+unresolved `Tx` answers a status query only then (or when muted for good). A frozen acceptor is an offline one, which
+Paxos allows, and it makes every counted state final: votes never change, and nothing more is accepted. A silent store
+counts on every side as possibly holding what would block a decision.
 
 A driver past the horizon plus the margin that has no outcome is stopped and removed once its store holds no `Tx` for
 T (`Store.removeExpiredDrivers`, `Store.scala:110-122`). The client's `TransactionManager` forgets its driver however
 it concludes, `Unknown` included (`client/internal/transaction/TransactionManager.scala:33-45`).
 
-**Why rule 3 is safe.** An acceptor forgets T only once T is decided: an abort at resolution, a commit at `TxFinalized`
-(P9). So a committed but unfinalized T is still held by a full quorum (`t`) of the primary pool's acceptors, and more
-than `w - t` non-holders rule it out. A non-holder can never become a holder, because it answered "unknown" only below
-its floor, or holds a `Tx` muted for good, which accepts nothing: one below the store's floor
-(`Tx.receiveStatusRequest`). A rebuilt store is never a non-holder for T started before its `acceptorSince`
-(`Frontend.mayHaveForgottenUndecided`; 2026-11-15, cross-document G1): its old incarnation may have accepted T and lost
-that state undecided, so it replies only with a cached outcome, counted as possibly holding, and otherwise stays
-silent. A `Tx` muted only for starting too far ahead
-reports itself a possible holder, since once forgotten a retransmission after the clock catches up creates an unmuted
-one. The third kind of non-holder `ExpiryTally` counts is an
-outcome reply without acceptor state (a status-cache answer) when the asking `Tx` already knows its outcome: a cache
-entry exists only for a decided T, so counting it cannot discard an undecided one, and the asking `Tx` concludes the
-outcome it knows rather than discarding (`concludeKnownOutcome`), while a finalized or late commit is adopted by rule 1.
-(Until 2026-11-15 the rebuilt store counted as a non-holder, and this paragraph claimed that was correct within the
-pool's tolerance. It was not: one amnesiac commit voter plus one store that never heard of T is more than `w - t`
-non-holders for any pool with `w - t = 1`, and the last holders discarded a chosen commit. HorizonIntegrationSuite
-"holders of a chosen commit keep it past expiry while a rebuilt store may have accepted it".) So T is one of: aborted; committed and finalized, in which
-case the finalizer wrote this store's UnackedCommits entry before `TxFinalized` if it was owed (the lookup found none,
-so it was not; ErrorTree marks cover a store whose update was not counted); or undecided and undecidable, since no
-quorum can ever form past the horizon. Discarding is correct in all three. Stuck holders short of a quorum report
-themselves honestly as holders and all discard (HorizonIntegrationSuite "stuck holders short of a quorum all
-discard"). Tests: FrontendSuite "an abort voter past the horizon whose peers answer unknown is discarded and releases
-its locks", "a commit voter past the horizon with no UnackedCommits entry is discarded once a later lookup finds none",
-"a commit voter past the horizon with an UnackedCommits entry applies and resolves committed", "a Tx past the horizon
-with a quorum of holders keeps holding and later learns the outcome".
+**Why rules 2 and 3 are safe.** *Commit.* Any quorum (`t` stores) that chose abort includes one of the more than
+`w - t` stores whose latest accept is commit. That store accepted abort at the chosen ballot, and every proposal
+accepted at a later ballot carries the chosen value, so its latest accept would be abort: abort was never chosen. Those
+stores are frozen, and the other `t - 1` cannot form a quorum, so nothing is chosen afterwards either. The update is
+held by at least `r` commit voters per changed pool, so it can be applied and repaired. Applying it late is safe: a
+commit voter has held T's locks since its vote (in memory, or through its CRL record and the recovery hold), repair
+defers to a store's own locks even with a proof (`Reconcile.RepairSnapshot.proven`), and a conflicting commit would
+need `t` votes, which overlap T's locked voters in at least `2t - w` stores. Writes T does not lock are
+order-independent (the builder's rules). If T was already finalized, a counted voter that never acknowledged has an
+UnackedCommits entry, and an uncounted voter's locked copy never moved, so applying it equals a timely apply.
+*Discard.* A commit chosen and not yet finalized has `t` acceptors, each still holding its accept (a later accept
+carries the same value), amnesiac, or silent: an acceptor forgets T only once T is decided, a commit only at
+`TxFinalized` (P9). Fewer than `t` of those rule it out, and the frozen states admit no new choice. Or the update cannot
+reach `r` copies: then a commit of it is lost, as any object below its read threshold is, and discarding keeps T
+atomic. The remaining cases are as before: T aborted, or committed and finalized, in which case the finalizer wrote
+this store's UnackedCommits entry if it was owed (the lookup found none). *Exclusive.* The commit rule needs `vc >= r`
+where data discard needs `vc + s < r`, and more than `w - t` accepts where the other discard allows at most `w - t`
+accepts plus silent stores. Frozen states never change and a store leaves a count only by deciding, after which it
+reports its outcome (rule 1), so no two holders reach opposite decisions.
+Until 2026-11-15 a rebuilt store answered "unknown" for T started before its `acceptorSince`, a claim this argument
+then said was safe within the pool's tolerance. It was not: its old incarnation lost its accept undecided, and with one
+store that never heard of T the last holders of a chosen commit discarded it (cross-document G1). It now reports
+`amnesiac`. Tests: ExpiryTallySuite; FrontendSuite "an expiring commit voter whose peers accepted commit decides commit,
+applies it and has it finalized", "a Tx past its expiry promises and accepts nothing", "a commit voter past the horizon
+with no UnackedCommits entry is discarded once a later lookup finds none"; HorizonIntegrationSuite "holders of a chosen
+commit apply it past expiry though a rebuilt store forgot it", "stuck holders short of a quorum all discard".
 
 **Rejoin invariant.** Once a store discards or forgets T, its floor makes it refuse every later prepare for T: a
 discarded acceptor is indistinguishable from an offline one, and Paxos is safe with offline acceptors. **A store never
@@ -1222,6 +1232,10 @@ value; combined with F6 it widens the amnesia window. Fix: count `Undetermined` 
 `n`).
 
 ### F8. The tally cannot decide an abort while any referenced pool has fewer than `t` answers. Confidence: medium (liveness)
+
+> **Refresh (2026-11-15, cross-document G1).** Past expiry every store's acceptor is frozen, so the driver's abort
+> proposal described below no longer succeeds there; the expiry tally (10.10) ends such a T, discarding it when no
+> commit can be chosen. The StoreSuite test named below is now "... is discarded past expiry, not before".
 
 > **FIXED 2026-11-15 (Todo 4.1, with rebuild-process F6).** The tally classifies every object (no `break()`): one
 > abort-certain object (`w - a < t`) decides abort at once, since votes never change. A tally that is undecided because

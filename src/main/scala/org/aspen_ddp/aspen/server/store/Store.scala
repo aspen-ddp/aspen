@@ -115,10 +115,17 @@ class Store(val storageDeviceId: StorageDeviceId,
     * transactions for a store that is gone. Drivers on other stores, and their heartbeat recovery, take over
     */
   def close(): Future[Unit] =
+    shutdownDrivers()
+    frontend.close()
+
+  /** Stops and drops every transaction driver of this store (Ruling 31). `close` calls it; so does a reload that
+    * replaces this store over the same backend without closing it (StoreRouter.install). A finalizer already running
+    * is not cancelled: it completes its idempotent actions and its TxFinalized still follows them (Todo 6.3)
+    */
+  def shutdownDrivers(): Unit =
     val drivers = transactionDrivers.values
     transactionDrivers = Map()
     drivers.foreach(_.shutdown())
-    frontend.close()
 
   def estimateSize(): Long = backend.estimateSize()
 

@@ -437,6 +437,21 @@ G1. Fast rebuild or lost CRL vs a long-unresolved transaction (X2): no document 
     nothing", "a rebuilt store without a Tx answers amnesiac ...".
 G2. Mixed-version/rolling-upgrade protocol skew (message formats, finalizer types, CRL entry format, txd fields): systemic doc covers detectors only; recovery covers F1 only for jars.
 G3. Zombie drivers/timers after a non-crash store reload, device relinquish and transfer-out (X4). Only recovery F12 mentions it, with no interaction analysis.
+    *2026-11-16 (Todo 6.3): closed.* Every path that takes a served store out of the router reaches `Store.close`:
+    a transfer out (`StoreTransfers.closeForTransferOut` -> `StoreLoader.closeStore(extractCrl = true)`), a device
+    shutdown or relinquish (`DeviceShutdown.closeForShutdown`, used by `closeStoresToRelinquish`, ->
+    `closeStore(extractCrl = false)`), both through `handleClose`; a backend fail-stop, a failed CRL load and a
+    fail-stop (`backendFailed`, `handleUnloadFailed` -> `closeUnloaded`). A transfer out of a store already closed
+    (`extractUnloaded`) has no Store. One path skipped it: a reload over a loaded store that reuses its backend
+    (`StoreRouter.install`; reachable only through `Host.loadStore` directly, i.e. `TestNetwork.restartStore`, since
+    `tryLoadStore` refuses a loaded store), which must not close the shared backend and so left the old store's drivers
+    running. It now calls `Store.shutdownDrivers`. Timers: a store's only timers are its drivers' (retry, hang check,
+    finalizer restart), all cancelled by `shutdown`; the Frontend's work is heartbeat-driven, and the router skips a
+    closed or replaced entry for heartbeats, messages and posted tasks. A finalizer already running is not cancelled:
+    its actions are idempotent, it may complete and send `TxFinalized` after its actions, as the ordering premise
+    requires, and a failure does not restart it once the driver is stopped. Tests: StoreRouterSuite "the close of a
+    transfer out / a shutdown or relinquish shuts the store's transaction drivers down", "a reload over a loaded store
+    that reuses its backend shuts the old store's drivers down" (failed before the fix).
 G4. A shared, in-memory host-wide status cache is the anchor for finalization relays and, since the refresh, late-commit evidence (condition 2); no document analyses host restart (cache wiped) combined with rolling restarts of the stores' peers (paxos F6 touches it for one restart only). The horizon and TooOld no longer depend on it. *(2026-11-13: the safety half is covered. A restart, transfer-in or size eviction raises the affected stores' forget floor (load + `MaxStartLead`, or the eviction watermark) at the moment memory is lost, so a store whose host lost its cache never rejoins a transaction it may have forgotten, however many peers restart (paxos 10.10; HorizonIntegrationSuite "a host restart does not let its stores rejoin a transaction they forgot"). Left: the liveness cost across rolling restarts, where each reload refuses the transactions it does not hold started before its load plus `MaxStartLead`, and too many refusing stores in a pool end those transactions Unknown.)*
 G5. ErrorTree/UnackedCommits entry-key incarnation (X10) and the time-line of entry production vs consumption during a T12 move are described only per-document.
     *2026-11-14 (Todo 2.12): written.* Entries for a pool slot are keyed by its pool index; since Todo 2.12 an

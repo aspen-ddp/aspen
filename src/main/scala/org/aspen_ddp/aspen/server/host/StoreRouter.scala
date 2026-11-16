@@ -311,13 +311,15 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
     // A reload over a loaded store, with no close: its queued tasks run, later ones skip it. Its object cache view is
     // cleared here, on its executor, behind those tasks: the view's bytes belong to that executor. It is closed there
     // too, releasing what its transactions were counted for: the new store counted the recovered ones again. A
-    // backend the new store reuses is left open
+    // backend the new store reuses is left open, but the old store's drivers stop either way (Todo 6.3), as in the
+    // crash a reload over the same backend stands for (TestNetwork.restartStore)
     if replaced != null then
       replaced.executor.execute: () =>
         replaced.closing = true
         replaced.closed = true
         replaced.store.objectCache.clear()
         replaced.store.frontend.releaseAllAdmissions()
+        replaced.store.shutdownDrivers()
         if replaced.store.backend ne store.backend then
           replaced.store.close().failed.foreach(t =>
             logger.warn(s"Failed to close the replaced store ${store.storeId}: $t"))(

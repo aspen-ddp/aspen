@@ -131,7 +131,8 @@ object StoreRouterSuite:
    *  the StoreLoader handlers on the control thread. Its router is ready (as after a Host's startup scan) unless
    *  `ready` is false. */
   private class Fixture(crl: CrashRecoveryLog, ready: Boolean,
-                        objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache):
+                        objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache,
+                        txDriverFactory: TransactionDriver.Factory):
     val threading = new StoreThreadPool(maxThreads = 2)
     val net = new RecordingNet
 
@@ -143,7 +144,7 @@ object StoreRouterSuite:
       crlFactory = null, unloadedDeviceCrl = Some(crl), txStatusCache = new TransactionStatusCache(), wrapCompletionHandler = identity,
       objectCacheFactory = objectCacheFactory,
       finalizerFactory = null,
-      txDriverFactory = TransactionDriver.noErrorRecoveryFactory, heartbeatPeriod = Duration(5, SECONDS),
+      txDriverFactory = txDriverFactory, heartbeatPeriod = Duration(5, SECONDS),
       deviceScanPeriod = Duration(10, SECONDS), storeRebuildFactory = null, maxConcurrentRebuilds = 2,
       loadStore = null, tryLoadStore = null, loadStoreById = null, warn = null,
       storeTransferService = StoreTransferService.Disabled, shutdownWorkTimeout = Duration(60, SECONDS),
@@ -194,12 +195,36 @@ object StoreRouterSuite:
     def shutdown(): Unit = threading.shutdown()
 
   private def withRouter(crl: CrashRecoveryLog, ready: Boolean = true,
-                         objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache = (_, _) => ObjectCache.NoCache)
+                         objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache = (_, _) => ObjectCache.NoCache,
+                         txDriverFactory: TransactionDriver.Factory = TransactionDriver.noErrorRecoveryFactory)
                         (f: Fixture => Unit): Unit =
-    val fx = new Fixture(crl, ready, objectCacheFactory)
+    val fx = new Fixture(crl, ready, objectCacheFactory, txDriverFactory)
     try f(fx) finally fx.shutdown()
 
   private def emptyCrl: CrashRecoveryLog = new GatedCrl(Future.unit)
+
+  /** Records every driver it creates and whether it was shut down (Ruling 31: Store.close stops them) */
+  private class RecordingDriverFactory extends TransactionDriver.Factory:
+    val created = new ConcurrentLinkedQueue[RecordingDriver]()
+
+    class RecordingDriver(ec: ExecutionContext, storeId: StoreId, messenger: Messenger,
+                          backgroundTasks: BackgroundTaskManager, txd: TransactionDescription,
+                          finalizerFactory: org.aspen_ddp.aspen.server.transaction.TransactionFinalizer.Factory,
+                          start: TransactionDriver.Start)
+      extends TransactionDriver.noErrorRecoveryFactory.NoRecoveryTransactionDriver(ec, storeId, messenger,
+        backgroundTasks, txd, finalizerFactory, start):
+      @volatile var stopped = false
+      override def shutdown(): Unit =
+        stopped = true
+        super.shutdown()
+
+    def create(ec: ExecutionContext, storeId: StoreId, messenger: Messenger, backgroundTasks: BackgroundTaskManager,
+               txd: TransactionDescription,
+               finalizerFactory: org.aspen_ddp.aspen.server.transaction.TransactionFinalizer.Factory,
+               start: TransactionDriver.Start): TransactionDriver =
+      val d = new RecordingDriver(ec, storeId, messenger, backgroundTasks, txd, finalizerFactory, start)
+      created.add(d)
+      d
 
 class StoreRouterSuite extends AnyFunSuite with Matchers:
   import StoreRouterSuite.*
@@ -582,3 +607,43 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
         backend.usedAfterClose.get should be(0)
         fx.net.sentAfterClose.get should be(0)
     finally completer.shutdown()
+
+  /** Starts a driver of a fresh transaction on the store loaded as `storeId`, on its executor, and returns it */
+  private def startDriver(fx: Fixture, drivers: RecordingDriverFactory, storeId: StoreId,
+                          txid: TransactionId): RecordingDriverFactory#RecordingDriver =
+    val entry = fx.onControl(fx.ctx.router.entry(storeId).get)
+    val before = drivers.created.size
+    entry.executor.execute(() => entry.store.driveTransaction(overwriteTxd(txid)))
+    fx.awaitExecutor(entry.executor)
+    drivers.created.size should be(before + 1)
+    drivers.created.asScala.last
+
+  // Todo 6.3 (G3): a transfer out (closeForTransferOut: extractCrl) and a shutdown or relinquish (closeForShutdown,
+  // which closeStoresToRelinquish uses) both close through handleClose, so Store.close stops the store's drivers
+  for (what, extractCrl) <- List(("a transfer out", true), ("a shutdown or relinquish", false)) do
+    test(s"the close of $what shuts the store's transaction drivers down"):
+      val s0 = StoreId(poolId, 0)
+      val drivers = new RecordingDriverFactory
+      withRouter(emptyCrl, txDriverFactory = drivers): fx =>
+        fx.addDevice(s0)
+        await(fx.load(bootstrappedBackend(s0)))
+        val driver = startDriver(fx, drivers, s0, TransactionId(new UUID(15, 20)))
+        driver.stopped should be(false)
+        await(fx.ctx.loader.closeStore(s0, extractCrl = extractCrl))
+        driver.stopped should be(true)
+
+  // Todo 6.3 (G3): a reload over a loaded store that reuses its backend (TestNetwork.restartStore) skips Store.close,
+  // which would close the shared backend; its drivers must still stop, as they would in the crash it stands for
+  test("a reload over a loaded store that reuses its backend shuts the old store's drivers down"):
+    val s0 = StoreId(poolId, 0)
+    val drivers = new RecordingDriverFactory
+    withRouter(emptyCrl, txDriverFactory = drivers): fx =>
+      fx.addDevice(s0)
+      val backend = bootstrappedBackend(s0)
+      await(fx.load(backend))
+      val executor = fx.onControl(fx.ctx.router.entry(s0).get.executor)
+      val driver = startDriver(fx, drivers, s0, TransactionId(new UUID(15, 21)))
+      await(fx.load(backend))
+      fx.awaitExecutor(executor)
+      driver.stopped should be(true)
+      backend.closed should be(false)

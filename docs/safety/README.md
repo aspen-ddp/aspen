@@ -128,7 +128,7 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 | Recovery R-N4 / Repair RP-N3 | R-N4 **NARROWED**, RP-N3 **FIXED** 2026-11-15 (Todo 4.7; was CONFIRMED) | A scan's UnackedCommits pass no longer reconciles objects its ErrorTree pass already completed at or after the entry's timestamp, so a silent voter's entry costs one delete. Residual: entries stay one per (store, transaction), because the recovered-vote lookup and the entry-coverage rule need that key, and each one still takes a marker batch slot, a delete and a CRL stub |
 | Cross G9 | **FIXED** 2026-11-11 (was a coverage gap) | An UnackedCommits entry naming more objects than half a metadata-tree node (about 90 with 4 KiB FSIF segments) failed its insert with `NodeSizeExceeded`, retried forever; the marker now writes it as chunks under consecutive keys (repair-process 13.0b), and a node too small for one object gives up into the finalizer failure path. The leftover (a node too small for one object) is an accepted, alarmed stall (2026-11-15) |
 | Recovery F1 / X8 | **FIXED** 2026-11-11 (was CONFIRMED) | An unknown finalizer type threw after resolution and the transaction never finalized; creation now takes the finalizer failure path (logged, retried with backoff) |
-| Recovery F12 / X4 | **FIXED** (Ruling 31) (was CONFIRMED) | `Store.close` shuts down the store's drivers, so no zombie driver keeps re-preparing; P-N4's delayed duplicate client prepare is unaffected |
+| Recovery F12 / X4 | **FIXED** (Ruling 31) (was CONFIRMED) | `Store.close` shuts down the store's drivers, so no zombie driver keeps re-preparing; P-N4's delayed duplicate client prepare is unaffected. 2026-11-16 (Todo 6.3, G3): transfer out, relinquish, shutdown and fail-stop all reach it (tested); a reload over a shared backend, which skips it, now stops the drivers too |
 | CRL F9, F7, F8 | **FIXED** 2026-11-14 (was CONFIRMED / PLAUSIBLE) | A dead CRL fails every pending and later call with `CrlFailed`, and its host unloads the device until restart. The killers are removed: admission counts every recovered record at open (F8), and stream files are preallocated (fallocate on Linux, zeros elsewhere), so a full device cannot fail a CRL write (F7). Residual: copy-on-write file systems |
 | Requirements F12 | CONFIRMED, deferred (2026-11-15, Backlog device health/alerts) | `awaitingCommits` has no timer, so an FSIF ENOSPC freeze stalls the object forever; tolerated by expiry, no per-commit watchdog |
 | Paxos F8, Rebuild F6 | **FIXED** 2026-11-15 (was CONFIRMED) | The tally classifies every object, so one abort-certain object decides abort at once. An undecided tally waits until past the horizon plus the expiry margin, then proposes abort (expiry alone held such a Tx forever). Residual: locks held up to about 31 s plus one resend interval while a silent store's vote would decide |
@@ -156,7 +156,8 @@ repair RP-N5; from the addendum refresh: paxos P-N9, recovery R-N12, requirement
 Per cross-document-review §2, no document yet covers:
 
 - mixed-version rolling upgrades;
-- drivers and timers outliving a store reload;
+- (closed 2026-11-16, Todo 6.3) drivers and timers outliving a store reload, relinquish or transfer out (cross-document
+  G3): every exit reaches `Store.close`, and a reload over a shared backend now stops the old store's drivers;
 - a host restart wiping the status cache (now late-commit evidence), combined with rolling restarts (2026-11-13: the
   safety half is covered by the forget floor's load component, paxos 10.10; the liveness cost of rolling restarts,
   post-load refusals ending Unknown, is stated there but not analysed across many hosts);

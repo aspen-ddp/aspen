@@ -24,7 +24,10 @@
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
   install and after close the backend and directory belong to the control side, which otherwise reads only
-  `storeId`, `path`, `crlSaveFile` and the thread-safe `hasFailed`/`isWriteFrozen`. `release` frees the slot
+  `storeId`, `path`, `crlSaveFile` and the thread-safe `hasFailed`/`isWriteFrozen`. `release` frees the slot.
+  Every exit (transfer out, shutdown, relinquish, fail-stop, failed CRL load) runs `Store.close`, which stops the
+  store's drivers (Ruling 31); a reload over a loaded store reusing its backend skips the close but calls
+  `Store.shutdownDrivers` (cross-document G3). A new exit path must do one or the other
 - Store identity: `StoreLoader` passes `StoreIncarnationFile.loadOrCreate(backend.path, storeId)` to the Store, creating
   the `incarnation` file on first load (`server/store/CLAUDE.md`)
 - Load time and the forget floor (`server/store/CLAUDE.md`): every Store `StoreLoader` builds records its load

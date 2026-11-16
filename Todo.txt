@@ -60,7 +60,6 @@ PRIORITY 5: performance and hygiene
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
 
-6.3  G3: confirm that transfer-out and relinquish go through Store.close, so no driver or timer survives.   [S]
 6.4  G4: liveness cost of post-load refusals. After a restart a store refuses, for up to the horizon, every
      transaction started before its load (forget floor), so rolling restarts can push many transactions to
      TransactionOutcomeUnknown and a retry. Measure it in a rolling-restart test, and consider a durable

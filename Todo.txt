@@ -54,8 +54,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.4  P-F12: send Accepts as soon as the new round's quorum is reached. P-F14: save the Tx when late object
-     data is adopted. P-F15: delete or wire up the unused receiveTxPrepare.                                  [S]
 5.5  Q-N5 split action: re-read before declaring a split node gone. Allocation action: make a re-run after a
      deletion idempotent (no orphan entry).                                                                 [S-M]
 5.6  CRL F16: avoid rewriting the full live set on every open, or do it off the control thread. CRL F12: replace

@@ -13,7 +13,6 @@ class Proposer(
   private var highestAccepted: Option[(ProposalId, Boolean)] = None
 
   private val promisesReceived = new java.util.BitSet(numPeers)
-  private val nacksReceived = new java.util.BitSet(numPeers)
   private var roundHasAcceptedCommit = false
   private var provenCommit = false
 
@@ -34,7 +33,6 @@ class Proposer(
   def haveLocalProposal: Boolean = localProposal.isDefined
 
   def numPromises: Int = promisesReceived.cardinality()
-  def numNacks: Int = nacksReceived.cardinality()
 
   def maySendAccept: Boolean = prepareQuorumReached && (highestAccepted.isDefined || localProposal.isDefined)
 
@@ -65,12 +63,9 @@ class Proposer(
     proposalId = ProposalId(highestProposalId.number+1, peerId)
     highestProposalId = proposalId
     promisesReceived.clear()
-    nacksReceived.clear()
     roundHasAcceptedCommit = false
 
   def currentProposalId: ProposalId = proposalId
-
-  def currentPrepareMessage(): Prepare = Prepare(proposalId)
 
   /** Return value contains an Accept message only if we have reached the quorum threshold and we
     *  have a value to propose.
@@ -78,17 +73,6 @@ class Proposer(
     *  The value may come either from the local proposal or from a peer via the Paxos proposal requirement
     */
   def currentAcceptMessage(): Option[Accept] = proposalValue.map(v => Accept(proposalId,v))
-
-  /** Returns true if this Nack eliminates the possibility of success for the
-    * current proposal id. Returns false if success is still possible.
-    */
-  def receiveNack(nack: Nack) : Boolean =
-    updateHighestProposalId(nack.promisedProposalId)
-
-    if nack.proposalId == proposalId then
-      nacksReceived.set(nack.fromPeer)
-
-    nacksReceived.cardinality() > numPeers - quorumSize
 
   def receivePromise(promise: Promise): Unit =
     updateHighestProposalId(promise.proposalId)

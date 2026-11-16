@@ -389,7 +389,8 @@ admission check (`Frontend.admitPrepare`, `Frontend.scala:519-536`). A data tran
 data. Orphaned **data-less** transactions (refcount changes, version bumps, lock-only) now abort where a store got no
 client prepare (P-N8). The commit's own wait for data is unchanged (`commitAwaitsData`, `Tx.scala:239`): a client
 prepare's data is still adopted so a commit decided by others can be applied (`adoptObjectUpdates`, `:798-802`);
-adopted data is **not** re-saved to the CRL until the next save (F14).
+adopted data is saved to the CRL before a commit applies it (F14, fixed 2026-11-15: `Tx.adoptedDataUnsaved` holds the
+commit until the save is durable).
 
 ### 6.3 Proof of commit on an unknown transaction
 
@@ -460,11 +461,10 @@ Properties (verified by case analysis):
 * `SimpleTransactionDriver.nextRound` doubles a backoff capped at `maxDelay` and sleeps a random time below it
   (`SimpleTransactionDriver.scala:92-105`). The driver re-broadcasts the current prepare/accept every `maxDelay`
   (`:59-90`), interleaving prepares with accepts every third send so stores that forgot the Tx restart it.
-* After a round change `shouldSendAcceptMessages` is not set again (the tally block is skipped because
-  `haveLocalProposal` is already true, `:314`); the Accept for the new round goes out at the next periodic send. Latency
-  only (F12).
-* `TransactionDriver.receiveTxPrepare` (`:277-279`), which would feed other proposers' ids into `highestProposalId`,
-  has no caller.
+* After a round change the tally is skipped (the local proposal is sticky, safe because votes are immutable), and the
+  new round's first prepare quorum queues the Accept at once (`acceptQueuedThisRound`; F12, fixed 2026-11-15).
+* `TransactionDriver.receiveTxPrepare` was deleted (F15): drivers never receive other proposers' prepares, and Nacks
+  carry the promised id.
 
 ### 7.4 Learner and resolution
 
@@ -943,6 +943,14 @@ Findings the horizon (10.10) touches. Every other finding of this document is un
 | P-N4 | **closed** (FIXED by the horizon) | A delayed duplicate of the client's own prepare finds every store that took part in the abort still remembering it (finalized abort in the cache, relayed) inside the window, and refused past the floor. The `Transaction.commit` scaladoc's accepted exception is removed; `TransactionAborted` is final | HorizonIntegrationSuite "a delayed client prepare of a forgotten abort does not commit inside or past the horizon"; `client/Transaction.scala:150-162` |
 | P-N2 | unchanged (FIXED stands) | `MaxStartLead` is now `TransactionHorizon.MaxStartLead`, the same 2 s; the floor's timing argument uses it too | `common/transaction/TransactionHorizon.scala:16` |
 
+### Todo 5.4 (2026-11-15)
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| F12 | **fixed** | A later round's first prepare quorum queues its Accept | `TransactionDriver.queueAcceptMessages`; TransactionDriverSuite "after a round change, ..." |
+| F14 | **fixed** | Adopted data is saved, and the commit held, until the save is durable | `Tx.adoptedDataUnsaved`, `saveAdoptedData`; FrontendSuite "... only once that data is durable" |
+| F15 | **fixed** | Dead code deleted; `maySendAccept` was live and stays | `Proposer.scala`; `ClientTransactionDriver.scala` |
+
 ### Re-assessment for replay pins (2026-11-09, `0d08e3c6`)
 
 | Id | Status | Reason | Evidence |
@@ -1245,6 +1253,13 @@ conflicting `TxResolved`/`TxFinalized` at every site and a counter.
 
 ### F12. After a round change, Accept relies on the timer; `localProposal` is sticky. Confidence: high, latency only
 
+> **FIXED 2026-11-15 (Todo 5.4).** Reproduced with a timer-less driver: after a Nack the round-2 quorum sent no Accept.
+> The first prepare quorum of every round now queues its Accept (`TransactionDriver.queueAcceptMessages`,
+> `acceptQueuedThisRound`, reset in `nextRound`); later promises of the round queue no second batch. The sticky local
+> proposal is documented at the new branch (`Proposer.proposalValue` still prefers an accepted value the quorum
+> reports). TransactionDriverSuite "after a round change, the new round's prepare quorum sends its Accept at once, and
+> only once".
+
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness (latency).** TransactionDriver.scala:314 `!proposer.haveLocalProposal` leaves shouldSendAcceptMessages false in rounds >= 2; SimpleTransactionDriver.sendPeerMessages sends the Accept on the next timer (:59-90).
 > *Fix sketch:* Set shouldSendAcceptMessages when the new round's quorum is reached.
 
@@ -1268,6 +1283,15 @@ driver. Practically masked by the proof, but P4's exception.
 
 ### F14. Adopted late object data is not persisted until the next save. Confidence: medium, low impact
 
+> **FIXED 2026-11-15 (Todo 5.4).** Reproduced: a commit held for data was applied on the late client prepare with no
+> save holding the data, and an abort voter's later commit applied before the prepare's save was durable.
+> `adoptObjectUpdates` now sets `adoptedDataUnsaved` (not for a muted Tx, which applies nothing) and saves the state at
+> once if the objects have loaded, otherwise at `completeLoad` ahead of any outcome learned meanwhile.
+> `commitAwaitsData` includes the flag, so the commit waits for the save, whose completion (through `frontend.post`)
+> clears it and releases the held commit. Only the latest save clears it. Late-data path only, no hot-path cost.
+> FrontendSuite "a commit held for data applies the late client data only once a save holding that data is durable",
+> "an abort voter given late client data applies a later commit only once that data is durable".
+
 > **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (repaired).** adoptObjectUpdates mutates objectUpdates in memory (Tx.scala:798-802) and no CRL save follows.
 > *Fix sketch:* Save the Tx when new object data is adopted.
 
@@ -1279,6 +1303,11 @@ restores it. Safe by repair; noted because P13 ("data lives in the CRL until the
 for adopted data.
 
 ### F15. Dead or unused protocol code. Confidence: high (informational)
+
+> **FIXED 2026-11-15 (Todo 5.4).** Deleted `TransactionDriver.receiveTxPrepare`, `Proposer.receiveNack`,
+> `nacksReceived`/`numNacks` and `currentPrepareMessage`, and the commented client learner and `receive` block in
+> `ClientTransactionDriver`. `Proposer.maySendAccept` was not dead: the tally uses it to propose a quorum's accepted
+> value (F7), so it stays.
 
 > **Refresh (horizon, 2026-11-13): NARROWED; `TxStatusRequest` is wired up.** Expiry sends it to every other store of
 > T, it now carries `startTimestamp`, and every store answers: with a `Tx` (`holdsAcceptorState = !muted || !mutedForGood`), from a

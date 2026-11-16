@@ -122,11 +122,23 @@ object FrontendSuite {
 
     override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = Nil
 
+    /** Every transaction state saved, in order */
+    var savedStates: List[TransactionRecoveryState] = Nil
+    /** While set, transaction saves complete only when the test runs the handlers held here */
+    var holdTxSaves = false
+    var heldTxSaves: List[() => Unit] = Nil
+
+    def completeHeldTxSaves(): Unit =
+      val held = heldTxSaves
+      heldTxSaves = Nil
+      held.foreach(_())
+
     override def save(txid: TransactionId,
                       state: TransactionRecoveryState,
                       completionHandler: () => Unit): Unit =
       txSaved = true
-      completionHandler()
+      savedStates = savedStates :+ state
+      if holdTxSaves then heldTxSaves = heldTxSaves :+ completionHandler else completionHandler()
 
     override def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit =
       aDrop = true
@@ -602,6 +614,47 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       net.txMessage() match
         case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
         case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+  }
+
+  // paxos F14: adopted data must be durable in the CRL before the commit that needs it starts its backend write, or a
+  // crash in between recovers the Tx without it (P13)
+  private def savedWithData(crl: TestCrl): Boolean = crl.savedStates.exists(_.objectUpdates.exists(_.objectId == oid1))
+
+  test("a commit held for data applies the late client data only once a save holding that data is durable") {
+    withDataless(): (frontend, backend, net, crl) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+      crl.holdTxSaves = true
+
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      savedWithData(crl) shouldBe true
+      committedMessages(net) shouldBe Nil
+      backend.get(oid1).get.metadata.revision shouldBe rev0
+
+      crl.holdTxSaves = false
+      crl.completeHeldTxSaves()
+      committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+  }
+
+  test("an abort voter given late client data applies a later commit only once that data is durable") {
+    withDataless(missingDataWait = Duration.Zero): (frontend, backend, net, crl) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      expectVote(net, TransactionDisposition.VoteAbort)
+      crl.holdTxSaves = true
+
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      savedWithData(crl) shouldBe true
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+      committedMessages(net) shouldBe Nil
+      backend.get(oid1).get.metadata.revision shouldBe rev0
+
+      crl.holdTxSaves = false
+      crl.completeHeldTxSaves()
+      committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
       backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
   }
 

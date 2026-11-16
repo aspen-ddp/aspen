@@ -53,6 +53,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   (`Store.driveTransaction(initialProposal = true)`), keeps the initial proposal `(1, L)`. Every other driver starts
   at round 2 or higher, above the highest id its own acceptor promised or accepted (`TransactionDriver.Start`,
   `Tx.highestProposal`; paxos F5)
+- The local proposal is sticky across rounds (votes are immutable), so a later round skips the tally: its first
+  prepare quorum queues the Accept at once (`queueAcceptMessages`, `acceptQueuedThisRound`; paxos F12)
 - A conflicting second outcome (split decision) is logged as an error and counted in the host status cache's
   `splitDecisions` (`TransactionStatusCache.recordSplitDecision`) by the cache itself, the Tx (`receiveResolved`,
   `receiveFinalized`) and the driver (`Start.onSplitDecision`); each keeps its first outcome, and a driver that resolved
@@ -74,7 +76,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   vote does not wait for a driver: it votes abort and promises at once (P-N7), but stays undecided after load so a
   client retransmit that arrives first is still checked. This holds for data-less transactions too, so their late
   resolution may take 5 s longer. A vote
-  given stands, but later data is still used to apply a commit. A delayed duplicate client prepare of an aborted
+  given stands, but later data is still used to apply a commit. Adopted data is saved to the CRL first: the commit
+  waits for that save (`Tx.adoptedDataUnsaved`, `saveAdoptedData`; paxos F14). A delayed duplicate client prepare of an aborted
   transaction cannot commit it: every store that took part remembers the abort for longer than it would join T, and
   refuses T past its forget floor (below)
 - Description validation (transaction-requirements F7, Q-N4): a client-prepared Tx checks its description once,

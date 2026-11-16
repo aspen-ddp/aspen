@@ -223,6 +223,9 @@ abstract class TransactionDriver(
   private val completionPromise: Promise[TransactionDescription] = Promise()
 
   private var shouldSendAcceptMessages: Boolean = false
+
+  /** This round's prepare quorum has queued its Accept: later promises of the round queue no second batch (paxos F12) */
+  private var acceptQueuedThisRound: Boolean = false
   private var clientResolved: Option[TransactionResolved] = None
   private var clientFinalized: Option[TransactionFinalized] = None
   private var txMessages: Option[List[TxMessage]] = None
@@ -373,9 +376,9 @@ abstract class TransactionDriver(
     messenger.dropCacheForStore(msg.from)
   }
 
-  def receiveTxPrepare(msg: TxPrepare): Unit = synchronized {
-    proposer.updateHighestProposalId(msg.proposalId)
-  }
+  private def queueAcceptMessages(): Unit =
+    shouldSendAcceptMessages = true
+    acceptQueuedThisRound = true
 
   def receiveTxPrepareResponse(msg: TxPrepareResponse): Unit = {
 
@@ -444,16 +447,16 @@ abstract class TransactionDriver(
 
             if (abortCertain) {
               proposer.setLocalProposal(false)
-              shouldSendAcceptMessages = true
+              queueAcceptMessages()
             } else if (!undecided) {
               // A write threshold of commit votes on every object (P6). A driver holding a proof never reaches here
               proposer.setLocalProposal(true)
-              shouldSendAcceptMessages = true
+              queueAcceptMessages()
             } else if (proposer.maySendAccept) {
               // The votes cannot decide yet, but a promise of this round's quorum carries an accepted value, which a
               // proposer may always propose. Without this, stores answering Undetermined (resolved before voting)
               // would stall a round whose quorum already reports the chosen value
-              shouldSendAcceptMessages = true
+              queueAcceptMessages()
             } else if (start.pastExpiry()) {
               // The outcome rests on stores that have not voted. Until expiry they may still: a partition or a
               // restart heals, and an abort would cost the client a retry. Past it, a store that never joined refuses
@@ -464,8 +467,13 @@ abstract class TransactionDriver(
               logger.info(s"Tx ${txd.transactionId} on store $storeId: past expiry with undecided votes, proposing " +
                 s"abort. Votes: $peerDispositions. No vote from: ${silent.mkString(",")}")
               proposer.setLocalProposal(false)
-              shouldSendAcceptMessages = true
+              queueAcceptMessages()
             }
+          } else if (mayPropose && !holdsProof && proposer.prepareQuorumReached && !acceptQueuedThisRound) {
+            // A later round (paxos F12). The local proposal outlives the round it was set in: votes never change, so
+            // the tally would decide the same again. Proposer.proposalValue still prefers an accepted value the new
+            // quorum reports. Without this the Accept would wait for the next periodic retransmit
+            queueAcceptMessages()
           }
       }
     }
@@ -609,6 +617,7 @@ abstract class TransactionDriver(
   protected def nextRound(): Unit = synchronized {
     peerDispositions = Map()
     acceptedPeers = Set()
+    acceptQueuedThisRound = false
     proposer.nextRound()
   }
 

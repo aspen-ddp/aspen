@@ -33,7 +33,6 @@ class ClientTransactionDriver(
                                val txd: TransactionDescription,
                                val updateData: Map[StoreId, TransactionData]) extends Logging {
 
-  //protected val learner = new Learner(txd.primaryObject.ida.width, txd.primaryObject.ida.writeThreshold)
   protected val promise: Promise[ClientOutcome] = Promise()
 
   def result: Future[ClientOutcome] = promise.future
@@ -57,22 +56,6 @@ class ClientTransactionDriver(
       promise.success(outcome)
     }
   }
-
-  /*
-  def receive(acceptResponse: TxAcceptResponse): Unit = synchronized {
-    if (promise.isCompleted)
-      return
-
-    acceptResponse.response match {
-      case Left(nack) => // Nothing to do
-      case Right(accepted) =>
-        learner.receiveAccepted(paxos.Accepted(acceptResponse.from.poolIndex, acceptResponse.proposalId, accepted.value)) match {
-          case None =>
-          case Some(committed) => complete(committed)
-        }
-    }
-  }
-  */
 
   def receive(finalized: TransactionFinalized): Unit = complete(ClientOutcome(finalized.committed))
 

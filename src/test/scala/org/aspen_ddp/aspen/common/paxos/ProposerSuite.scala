@@ -8,13 +8,13 @@ class ProposerSuite extends AnyFunSuite with Matchers:
   test("Update Proposal ID"):
     val p = new Proposer(0, 3, 2)
 
-    p.currentPrepareMessage().proposalId should be (ProposalId.initialProposal(0))
+    p.currentProposalId should be (ProposalId.initialProposal(0))
 
     p.updateHighestProposalId(ProposalId(4,1))
 
     p.nextRound()
 
-    p.currentPrepareMessage().proposalId should be (ProposalId(5,0))
+    p.currentProposalId should be (ProposalId(5,0))
   
   test("Prepare quorum ignores duplicate promises"):
     val p = new Proposer(0, 3, 2)
@@ -43,29 +43,6 @@ class ProposerSuite extends AnyFunSuite with Matchers:
     p.prepareQuorumReached should be (false)
     p.currentAcceptMessage() should be (None)
   
-  test("Nack handling"):
-    val p = new Proposer(0, 3, 2)
-    p.setLocalProposal(true)
-    p.nextRound()
-    p.prepareQuorumReached should be (false)
-    p.receivePromise(Promise(0, ProposalId(2,0), None))
-    p.prepareQuorumReached should be (false)
-    p.receiveNack(Nack(2, ProposalId(2,0), ProposalId(1,0))) should be (false)
-    p.prepareQuorumReached should be (false)
-    p.numNacks should be (1)
-    p.numPromises should be (1)
-    p.receivePromise(Promise(1, ProposalId(2,0), None))
-    p.prepareQuorumReached should be (true)
-    p.currentAcceptMessage() should be (Some(Accept(ProposalId(2,0), true)))
-
-    p.nextRound()
-    p.prepareQuorumReached should be (false)
-    p.currentAcceptMessage() should be (None)
-    p.numNacks should be (0)
-    p.receiveNack(Nack(2, ProposalId(3,0), ProposalId(4,0))) should be (false)
-    p.receiveNack(Nack(2, ProposalId(3,0), ProposalId(4,0))) should be (false)
-    p.receiveNack(Nack(1, ProposalId(3,0), ProposalId(4,0))) should be (true)
-  
   test("Leadership acquisition before local value proposal"):
     val p = new Proposer(0, 3, 2)
 
@@ -89,7 +66,7 @@ class ProposerSuite extends AnyFunSuite with Matchers:
   test("Leadership acquisition with already accepted proposals"):
     val p = new Proposer(0, 3, 2)
     p.nextRound()
-    p.currentPrepareMessage().proposalId should be (ProposalId(2,0))
+    p.currentProposalId should be (ProposalId(2,0))
 
     p.receivePromise(Promise(0, ProposalId(2,0), None))
     p.currentAcceptMessage() should be (None)
@@ -101,7 +78,7 @@ class ProposerSuite extends AnyFunSuite with Matchers:
     p.setLocalProposal(true)
 
     p.nextRound()
-    p.currentPrepareMessage().proposalId should be (ProposalId(2,0))
+    p.currentProposalId should be (ProposalId(2,0))
 
     p.receivePromise(Promise(0, ProposalId(2,0), None))
     p.currentAcceptMessage() should be (None)

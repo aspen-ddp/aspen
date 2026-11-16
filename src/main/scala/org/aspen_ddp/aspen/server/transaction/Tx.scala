@@ -388,7 +388,32 @@ class Tx( trs: TransactionRecoveryState,
     * marking a missed update. The wait ends with the data, with a client's prepare, or with TxFinalized, after which
     * nothing is waiting on this store and repair restores it. No locks are held: a commit vote requires the data.
     */
-  private def commitAwaitsData: Boolean = !recovered && !clientPrepared && ofinalized.isEmpty && missingObjectData
+  private def commitAwaitsData: Boolean =
+    adoptedDataUnsaved || (!recovered && !clientPrepared && ofinalized.isEmpty && missingObjectData)
+
+  /** Object data adopted from a later prepare (adoptObjectUpdates) is not yet durable in the CRL. A commit waits for
+    * it: one applied first, then a crash before its backend commit completes, would recover the Tx without the data
+    * (paxos F14, P13). Set only on the late-data path: a Tx created by a client prepare starts with its data
+    */
+  private var adoptedDataUnsaved: Boolean = false
+
+  /** Saves the state with the adopted data, then releases a commit held for it. Only once the objects have loaded:
+    * before then completeLoad calls it ahead of applying an outcome learned meanwhile
+    */
+  private def saveAdoptedData(): Unit = if adoptedDataUnsaved && loadCompleted then
+    adoptedSaves += 1
+    val save = adoptedSaves
+    val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
+      disposition, txStatus, acceptor.persistentState)
+    crl.save(txd.transactionId, state, () => frontend.post { () =>
+      // Only the latest save holds all the adopted data
+      if save == adoptedSaves then
+        adoptedDataUnsaved = false
+        releaseHeldCommit()
+    })
+
+  /** Counts saveAdoptedData's saves */
+  private var adoptedSaves: Int = 0
 
   private def releaseHeldCommit(): Unit =
     if commitHeld && !commitAwaitsData && !(commitQueued && !frontend.heldCommitReady(changedHere, this)) then
@@ -651,6 +676,9 @@ class Tx( trs: TransactionRecoveryState,
     // The outcome learned before the objects loaded, if any. Taken before the vote is decided; a prover (see
     // proveCommitted) never resolves itself
     val resolution = oresolution
+
+    // Data adopted before the load is saved before any outcome is applied (see adoptedDataUnsaved)
+    saveAdoptedData()
 
     if !(recovered && disposition != TransactionDisposition.Undetermined) && !awaitingClientPrepare then
       determineDisposition()
@@ -1038,6 +1066,10 @@ class Tx( trs: TransactionRecoveryState,
     val added = m.objectUpdates.filterNot(ou => have.contains(ou.objectId))
     if added.nonEmpty && !committing && !committed then
       objectUpdates = objectUpdates ++ added
+      // A muted Tx applies nothing, so its data need not be durable
+      if !muted then
+        adoptedDataUnsaved = true
+        saveAdoptedData()
 
   def receivePrepare(m: TxPrepare): Unit = {
     logger.trace(s"*** Got Prepare: ${m.transactionId}")

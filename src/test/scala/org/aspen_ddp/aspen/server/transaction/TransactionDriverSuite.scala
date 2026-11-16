@@ -420,6 +420,36 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       TxAccept(ds2, ds0, txd.transactionId, ProposalId(1, 0), value = true)))
   }
 
+  // paxos F12: the local proposal outlives its round, so the tally does not run again after a round change. The new
+  // round's quorum must still send its Accept at once, not wait for a periodic retransmit (this driver has no timer)
+  test("after a round change, the new round's prepare quorum sends its Accept at once, and only once") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+
+    promiseFrom(driver, ds0, TransactionDisposition.VoteCommit)
+    promiseFrom(driver, ds1, TransactionDisposition.VoteCommit)
+    driver.testHaveLocalProposal shouldBe true
+    accepts(messenger).map(_.proposalId).toSet shouldBe Set(ProposalId(1, 0))
+
+    // A competing proposer promised a higher id: the driver moves to a later round
+    driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, ds1, txd.transactionId, ProposalId(1, 0),
+      Left(TxAcceptResponse.Nack(ProposalId(5, 1)))))
+    val round2 = driver.testProposalId
+    round2 should be > ProposalId(5, 1)
+    messenger.clear()
+
+    promiseFrom(driver, ds0, TransactionDisposition.VoteCommit, proposal = round2)
+    accepts(messenger) shouldBe Nil
+    promiseFrom(driver, ds1, TransactionDisposition.VoteCommit, proposal = round2)
+    accepts(messenger).toSet shouldBe Set(ds0, ds1, ds2).map(to => TxAccept(to, ds0, txd.transactionId, round2, value = true))
+
+    // A further promise of the same round queues no second batch
+    messenger.clear()
+    promiseFrom(driver, ds2, TransactionDisposition.VoteCommit, proposal = round2)
+    accepts(messenger) shouldBe Nil
+  }
+
   // A recovery driver for a transaction the other stores forgot: a store that has applied it answers with the commit
   // rather than a vote (Tx.proveCommitted). The votes it gets meanwhile must not decide abort first
   test("A recovery driver waits for a store that proves the commit rather than deciding abort on the other votes") {

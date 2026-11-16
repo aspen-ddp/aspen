@@ -12,11 +12,20 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - The client and all stores are informed of the final decision
 - If committed, FinalizationActions are then run. Once complete, the CRL content is dropped and the transaction is forgotten.
 - Finalization failure path (`TransactionDriver.startFinalizer`): a finalizer that cannot be created, or whose
-  `complete` fails (it fails as soon as any action does), is logged at error and started again from scratch after a
-  backoff (1 s doubling to 60 s) until one completes, the driver finalizes another way, or it shuts down. Never
-  finalize without the actions: the marker's entries are what repair and owed stores rely on. TxFinalized's `owed`
-  includes the planned stores of failed finalizers (`failedHandedOff`). An action that gives up must fail its
-  `complete`, never leave it pending
+  `complete` fails, is logged at error and started again from scratch after a backoff (1 s doubling to 60 s) until
+  one completes, the driver finalizes another way, or it shuts down. Never finalize without the actions: the marker's
+  entries are what repair and owed stores rely on. TxFinalized's `owed` includes the planned stores of failed
+  finalizers (`failedHandedOff`). An action that gives up must fail its `complete`, never leave it pending
+- Marker order (Ruling 8, revised 2026-11-15; `RegisteredTransactionFinalizerFactory.Finalizer`): the
+  missed-update marker executes once every other action has settled, succeeded or failed, so a failing action
+  still gets the missed stores marked (R-N2). `complete` waits for the marker, then fails with the first failure.
+  An action whose type cannot be loaded, or whose factory throws, is a failed action (`Finalizer.of`), not a failed
+  finalizer creation
+- Stall alarm (Todo 4.9): a committed transaction its driver has not finalized `FinalizationStallAfter` (60 s) after
+  resolving it is a stall (`TransactionDriver.finalizationStall`; `Store.stalledFinalizations` is the metric). Each
+  store logs one `FINALIZATION STALLED` error line a minute while it has any (`FinalizationStallReport`). Stalls are
+  by design: an action failing every attempt, a metadata outage blocking the marker (R-F14), an entry too large for
+  a tiny node (repair-process 13.0b)
 - If the refcount of the object is set to zero, it is deleted
 
 #### Paxos
@@ -82,7 +91,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 
 #### UnackedCommits
 - Written by the finalizer for each commit voter that sent no TxCommitted (`client/internal/transaction/CLAUDE.md`);
-  an entry durable means every other finalization action is done
+  an entry durable means T committed, not that the other actions are done (they may be failing and retried): only an
+  acceptor having forgotten T (on TxFinalized) implies that
 - A recovered unresolved commit vote looks its entry up (`UnackedCommitLookup`, from the
   Host) once loaded and again before accepting any abort. It is driven at once (no driver only while the CRL loads,
   `Frontend.recoveryPending`): under the forget floor no store that forgot T answers a driver, so Paxos cannot choose

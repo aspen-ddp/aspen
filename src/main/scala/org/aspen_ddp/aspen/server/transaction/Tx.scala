@@ -276,8 +276,8 @@ class Tx( trs: TransactionRecoveryState,
       case None => ()
 
   /** ExpiryTally decided Discard for a Tx that learned T from its UnackedCommits entry (provesCommitToItsDriver):
-    * no quorum holds T, so no TxFinalized will come, and T committed and was finalized (its entry is durable only once
-    * every other finalization action is done). It concludes as a late commit does: finalized, an applied stub in place
+    * no quorum holds T, so no TxFinalized will come, and T committed (its entry exists) and was finalized (more than
+    * `w - t` acceptors forgot it, which a committed T allows only after TxFinalized, sent once every action is done). It concludes as a late commit does: finalized, an applied stub in place
     * of its CRL state if it applied through the entry (none for an entry not owed here: notOwedHere), and forgotten
     */
   def concludeOwedCommit(): Unit =

@@ -143,7 +143,7 @@ Backward compatibility is not required.
 **Meaning of an entry:** this store cast a commit vote that the commit relied on (or might have), and had not
 acknowledged applying T when T was finalized. It is the durable record that the store is owed T.
 
-**Ordering fact the design relies on (amended: see Amendments, Ruling 8 - the marker now runs last):** entries are written by a finalization action, so they are durable before
+**Ordering fact the design relies on (amended: see Amendments, Ruling 8 and its 2026-11-15 revision - the marker runs once the other actions settle):** entries are written by a finalization action, so they are durable before
 `TxFinalized` is sent, and so before any store forgets T. `TransactionDriver.onResolution` completes the finalizer
 before `onFinalized`.
 
@@ -525,6 +525,13 @@ Ruling 4 is omitted (superseded by 12); Ruling 16 is included as read by Ruling 
 - **8 (finalizer order; amends 1a).** The finalizer runs `MissedUpdateFinalizationAction` only after every other
   finalization action of T, so a durable UnackedCommits entry implies all other actions are done. Forgetting on a found
   entry and skipping actions on a late commit are then safe.
+  *Revised 2026-11-15 (Todo 4.9, transaction-recovery R-N2):* the marker executes once every other action has
+  *settled*, succeeded or failed, and `Finalizer.complete` waits for it, then fails with the first failure. An action
+  failing on every attempt then no longer keeps the missed stores' marks unwritten. A durable entry now implies only
+  that T committed. Nothing load-bearing used the stronger premise: no Tx forgets on a plain found entry (Rulings 9/12),
+  and every path that concludes T finalized rests on acceptors having forgotten T (a late outcome, a memoryless
+  post-proof quorum, an expiry Discard), which happens only on TxFinalized, sent once a finalizer completed every
+  action.
 - **9 and 12 (found entry; amend 1c and 1d; 12 supersedes 4).** `unackedCommitFound` applies the update and resolves
   committed but does not forget: the Tx stays until TxFinalized (or a later abort/late outcome), and writes no status
   cache entry. This avoids cross-pool atomic batches (marker batches are per pool) and stops a sibling store on the host

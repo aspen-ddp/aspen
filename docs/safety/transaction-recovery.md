@@ -232,9 +232,10 @@ Guarantees:
   another's entries.
 * **Finalization is the gate for forgetting**: an acceptor forgets a committed transaction only on `TxFinalized` or a
   late outcome, which follows one (`Tx.scala:874-890,920-964`); a found UnackedCommits entry applies the update but
-  keeps the Tx (Ruling 9, `Tx.scala:997-1010`). The finalizer runs `MissedUpdateFinalizationAction` only after every
-  other action completed (`RegisteredTransactionFinalizerFactory.scala:37-42`, Ruling 8), so a durable entry implies
-  all other actions are done. The exceptions are a muted Tx and a prover, neither of which voted commit, and a
+  keeps the Tx (Ruling 9, `Tx.scala:997-1010`). The finalizer runs `MissedUpdateFinalizationAction` once every
+  other action has settled, succeeded or failed (Ruling 8, revised 2026-11-15), and its driver sends `TxFinalized`
+  only once a finalizer completed every action, so an acceptor that forgot T implies all actions are done (a durable
+  entry alone implies only that T committed). The exceptions are a muted Tx and a prover, neither of which voted commit, and a
   status-cache entry that expires (7 s; 30 s since the horizon, which outlasts the window in which a store would join
   T, paxos 10.10). (horizon) An expiring Tx that knows a commit outcome concludes it past the horizon without a
   `TxFinalized` (`Tx.concludeKnownOutcome`), once its peers can no longer decide T: they forgot T only after its
@@ -299,8 +300,8 @@ the entry is about).
   before any peer forgets the transaction. The entry's value is the transaction's start timestamp plus the object's
   store pointer, which is what a repair compares against (`encodeErrorEntry`, `:203`).
 * **T-M2** Every store that may hold a counted saved commit vote and sent no `TxCommitted` has an UnackedCommits entry
-  keyed `(poolIndex, txid)`, written in the same batch (so atomically with that batch's ErrorTree entries), and after
-  every other finalization action of T (Ruling 8). Entries are one per (store, transaction) and never merge (R-N4, narrowed: repair no longer reconciles them twice).
+  keyed `(poolIndex, txid)`, written in the same batch (so atomically with that batch's ErrorTree entries), and once
+  every other finalization action of T has settled (Ruling 8, revised 2026-11-15). Entries are one per (store, transaction) and never merge (R-N4, narrowed: repair no longer reconciles them twice).
 * A store that applied durably but whose `TxCommitted` was late/lost is still marked (a harmless extra repair pass:
   reconcile is exact and a store already at the committed state is left alone, `server/store/Reconcile`).
 * The scan side (repair-process.md): `StoreRepairer.scan` skips UnackedCommits entries for transactions the store still
@@ -327,7 +328,7 @@ naming S for T is stale" (`StoreRecoveryState`, crash-recovery-log.md 3.6). The 
   set (`TransactionDriver.scala:411-430`). That is the pre-Ruling-3 timing, inside the status-cache window, so D1 never
   retransmits a non-late `TxResolved` after D0's `TxFinalized` reached it, and no later late message can finalize it
   with an empty `owed` (R-N8 fixed). Its entries may land after its `TxFinalized` (still in flight, or given up): a
-  stub can then precede its entry, which the scan allows for (Ruling 8).
+  stub can then precede its entry, which the scan allows for (addendum Ruling 8).
 * **Write points** (Ruling 1: where the record would be deleted, after the backend commits persist; never while they
   are outstanding or failed, `Frontend.recordAppliedStub` requires it, `:395-409`):
   1. `TxFinalized(commit, non-late)` naming S: the Tx sets `stubDue` (`Tx.scala:935-936`) and finalizes with
@@ -574,7 +575,7 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
 ```
  create: each action.execute()  ->  commitVoters(voters?) -> updateCommitErrors(accumulated)
    MissedUpdate: all data stores reported error-free? -> complete (no writes)
-                 runs only after every other action completed (Ruling 8); after errorTimeout: markMissedUpdates
+                 runs once every other action settled (Ruling 8 rev.); after errorTimeout: markMissedUpdates
                       -> MissedUpdateMarker (ErrorTree + UnackedCommits, one txn/pool)
                       -> complete on success; fails on permanent marker failure
    others (alloc/dealloc/TKVL): retryUntilSuccessful; a give-up fails the action
@@ -624,8 +625,9 @@ copy to the committed state. This is the key reason ErrorTree marking must prece
   (R-N8) is gone with Ruling 7.
 * **T10 (missed commits are repairable)** A store that does not apply a committed update either recorded it in the ErrorTree/
   UnackedCommits trees (T8), or its transaction is not finalized yet: since 2026-11-11 a failed tree write or other
-  action restarts the finalizer rather than losing the marks (F2 fixed); a failure that repeats forever stalls the
-  transaction, and the marks with it (R-N2 narrowed).
+  action restarts the finalizer rather than losing the marks (F2 fixed); a failure of another action that repeats forever
+  stalls the transaction but no longer the marks (R-N2 fixed 2026-11-15: the marker runs once the others settle); a
+  failure of the marker itself stalls both (F14, 13.0b), raised by the `FINALIZATION STALLED` alarm.
 * **T11 (apply exactly once, mostly)** A committed transaction's update is applied to an object at most once on a store
   provided the requirements include a revision check on that object; blind KV updates and refcount updates rely on
   other mechanisms (F4).
@@ -788,6 +790,22 @@ Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding 
 | R-N2 | **narrowed** | A failed action no longer loses the marks for good: the fresh finalizer runs the marker once its other actions complete. The marker still waits for them (Ruling 8: a durable entry implies every other action is done, which the late-commit argument uses), so an action failing on every attempt (a deterministic bug, or a type no host can load) keeps the marks unwritten along with the transaction unfinalized. That is a logged stall, not a finalization with missing marks. Running the marker after a failed action would buy repair of the missed stores during such a stall at the cost of Ruling 8; not done | `RegisteredTransactionFinalizerFactory.scala` `Finalizer` |
 | F14 | unchanged | A marker that keeps failing now restarts the whole finalizer rather than hanging, but finalization still needs the write | as F2 |
 
+### Re-assessment for finalization stalls (2026-11-15, Todo 4.9)
+
+Ruling 8 is revised: the marker executes once every other finalization action has settled, succeeded or failed, and
+`Finalizer.complete` waits for it before failing with the first failure. The premise "a durable entry implies every
+other action is done" is dropped. Every argument that cited it holds on the weaker one, "an acceptor that forgot T
+implies TxFinalized, sent only once a finalizer completed every action". Those arguments are the late branches of
+`Tx.unackedCommitFound`/`unackedCommitNotOwed` (a held late commit, or an expiry Discard: more than `w - t`
+non-holders), `Tx.concludeOwedCommit` (Discard), a found entry as proof (late only on a memoryless post-proof
+quorum), `resolveLate` and the addendum's final `owed` set. A plain found entry resolves T and keeps the Tx until
+TxFinalized (Rulings 9/12).
+
+| Id | Status | Reason | Evidence |
+|---|---|---|---|
+| R-N2 | **fixed** (lost marks); stall accepted | An action failing on every attempt no longer keeps the marks unwritten: the marker writes them on each attempt, so repair reaches the stores that missed T during the stall. An action whose type no host can load is a failed action, not a failed finalizer creation, so the marker runs then too. The transaction itself stays unfinalized while the action fails (never finalized without its actions), raised by the stall alarm | `RegisteredTransactionFinalizerFactory.scala` `Finalizer`, `Finalizer.of`; RegisteredTransactionFinalizerSuite "a failed action still runs the marker once the others settle, ..." and "an action that cannot be created is a failed action, ..." |
+| F14 | **narrowed; residual accepted** | Finalization still needs the marker's write, so a metadata outage piles transactions up unfinalized (by design: finalizing without the marks would leave missed stores unrepaired). Each store now logs `FINALIZATION STALLED` once a minute while any committed transaction it drives is unfinalized 60 s after resolution, with the count, the oldest, its failures and the last error; `Store.stalledFinalizations` is the metric | `TransactionDriver.finalizationStall`, `FinalizationStallReport`; TransactionDriverSuite "a committed transaction still unfinalized past FinalizationStallAfter reports a stall, ...", FinalizationStallReportSuite |
+
 ### Re-assessment for recovered resolutions and entry coverage (2026-11-14, Todo 2.8)
 
 | Id | Status | Reason | Evidence |
@@ -838,7 +856,8 @@ driver for a txd whose types are unknown.
 > missed store unmarked (stale, never repaired) and an owed store unable to find its entry, so the transaction is never
 > finalized without them. Instead every failure fails the finalizer, and the driver logs it and starts a fresh one after
 > a backoff (1 s doubling to 60 s); see the re-assessment table above. What remains is a failure that repeats forever:
-> logged on every attempt, with the transaction and its marks waiting (R-N2).
+> logged on every attempt, with the transaction and its marks waiting (R-N2). *2026-11-15:* the marks no longer wait
+> for a failing action (Ruling 8 revised); the stall is alarmed (`FINALIZATION STALLED`).
 
 **F2 (H) Finalization has no failure path: any failed finalizer future, including the missed-update marker's permanent
 failure, hangs the transaction forever.** `f.complete foreach { ... onFinalized }` (`TransactionDriver.scala:496`) ignores
@@ -1030,7 +1049,7 @@ with two such stores).
 > **2026-11-15 (Todo 4.3): narrowed.** CRL admission no longer throttles the marker write: metadata- and
 > bootstrap-pool stores admit in lanes above data traffic (`AdmissionTier`, cross-document-review X5). Residual:
 > finalization still depends on the marker write being available, so a metadata quorum that is unreachable still
-> holds transactions unfinalized with their CRL state (Todo 4.9).
+> holds transactions unfinalized with their CRL state (Todo 4.9: accepted 2026-11-15, alarmed).
 
 **F14 (M) Finalization (and therefore forgetting) depends on the availability of the ErrorTree write; no escape hatch.**
 Any transaction in which one store is silent for `errorTimeout` needs a successful marker transaction, whose own
@@ -1041,6 +1060,9 @@ prepares across the board is outside this scope.
 
 > **Verification 2026-11-09: PLAUSIBLE. Severity: doc-only/open.** Design choice (MissedUpdateFinalizationAction.scala traceless comment).
 > *Fix sketch:* Cross-check against repair doc.
+
+> **2026-11-15 (Todo 4.9): narrowed, residual accepted.** Finalization keeps waiting for the marker's write by design;
+> a long wait is now raised by the `FINALIZATION STALLED` alarm (re-assessment "finalization stalls" above).
 
 **F15 (L) Stores that never held a `Tx` for a committed transaction are not recoverable by lookup at all.** The traceless
 design deliberately excludes non-voters (their `ErrorTree` marks suffice). This is only sound if repair always reaches
@@ -1201,6 +1223,11 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 > one, whose marker runs once the other actions complete. The marker still waits for them (Ruling 8), so an action
 > failing on every attempt keeps the marks unwritten with the transaction unfinalized and logged; see the re-assessment
 > table above.
+
+> **2026-11-15 (Todo 4.9): FIXED for the marks; the stall is accepted and alarmed.** Ruling 8 is revised as the fix
+> sketch proposed: the marker runs once the other actions settle, success or failure, and `complete` waits for it. A
+> durable entry no longer implies the other actions are done; nothing load-bearing used that (re-assessment
+> "finalization stalls").
 
 > **R-N3. Verdict: CONFIRMED (liveness). Severity: liveness (locks held, no driver).** Every recovered unresolved commit
 > vote now waits for its first UnackedCommits lookup before its store will drive it (`Store.scala:95-98`,
@@ -1445,5 +1472,5 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 | Lose a committed update | none open: F6 fixed and F13 closed by design (2026-11-14); F3, F5 closed by the horizon; paxos P-N2 fixed |
 | Apply an aborted update | none found for the UnackedCommits path (entries exist only for committed transactions); paxos P-N4 closed by the horizon (2026-11-13) |
 | Replay a forgotten transaction | F4 (narrowed), F10 (narrowed), R-N1 (narrowed by stubs), R-N7 (narrowed), R-N9, paxos P-N3; F7, F9 and R-N8 fixed |
-| Fail to record a missed update | F14; F13 closed (2026-11-14); F2 fixed, R-N2 narrowed (marks wait for a permanently failing action) |
-| Hang forever | F12; F14 (long); R-N2 (a failure repeating forever, logged); R-N3 (narrowed: aborts and late commits held for a lookup); R-N10 fixed; F1, F2 fixed |
+| Fail to record a missed update | F14; F13 closed (2026-11-14); F2 fixed, R-N2 fixed 2026-11-15 (marks written while an action fails) |
+| Hang forever | F12; F14 (long, alarmed); R-N2 (a failure repeating forever, alarmed); R-N3 (narrowed: aborts and late commits held for a lookup); R-N10 fixed; F1, F2 fixed |

@@ -153,8 +153,8 @@ read), absent means "deleted, or its allocation has not been recorded yet" (sect
    - `MissedUnackedCommit(store, txid, UnackedCommitEntry(txd.startTimestamp, changedObjectsOfStore))` for each
      store that sent no `TxCommitted`, is in the voter set (or the set is unknown), and hosts an object T changes,
      traced or not (`:98-106` at `0d08e3c6`). A store outside a known voter set gets no entry.
-   Since the refresh the marker runs only after every other finalization action of T completed
-   (`RegisteredTransactionFinalizerFactory.scala:37-42`, Ruling 8).
+   Since 2026-11-15 the marker runs once every other finalization action of T has settled, succeeded or failed
+   (`RegisteredTransactionFinalizerFactory.Finalizer`, Ruling 8 revised; it ran only after they all succeeded before).
    Lock-only objects (`ExclusiveRevisionLock`/`SharedRevisionLock` without a change) are never marked (`:36-39`).
 4. `MissedUpdateMarker.mark` (`MissedUpdateMarker.scala:302-309`) queues entries per pool. Per pool at most one write
    is outstanding. Entries arriving meanwhile wait; the queue is a `LinkedHashMap` keyed by (poolIndex, objectId) for
@@ -887,6 +887,8 @@ drops the stub: the recovered-vote and late-commit lookups name the head, so a s
 remains changes nothing they decide, and one kept past the head while a later chunk remains is dropped by the orphan
 pass once the chunks are gone. A `NodeSizeExceeded` that still occurs (a node too small for one object's chunk) is
 permanent: the write gives up and the finalizer failure path retries it with backoff, logged (transaction-recovery F2).
+*2026-11-15 (Todo 4.9): residual accepted.* Such a transaction stays unfinalized by design (finalizing without the
+entry would leave its store unrepaired); its store's `FINALIZATION STALLED` alarm raises it after 60 s.
 Test: StoreRepairerSuite "deleting a later chunk of an UnackedCommits entry keeps the stub; the head's deletion drops
 it"; MissedUpdateFinalizationActionSuite "an entry too large for the tree is written as chunks under consecutive keys,
 head first".

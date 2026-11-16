@@ -48,11 +48,6 @@ PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.9  Finalization stalls by design: R-N2, R-F14, 13.0b residual (NodeSizeExceeded on a tiny node)          [decide]
-     Failing actions keep marks unwritten, with logged backoff. Ruling 8 forbids the marker running alone. Either
-     accept and document it, or revisit Ruling 8. Add a metric or alarm for long-unfinalized transactions either
-     way.
-
 4.10 Prefer-abort costs and lock windows: P-N7, P-N8, Req F13, Q-N3, Q-N6                                   [S]
      P-N7: let a recovered Undetermined Tx answer promptly (abort vote or its accepted value).
      P-N8: restart the wait on each client retransmit, or document it.

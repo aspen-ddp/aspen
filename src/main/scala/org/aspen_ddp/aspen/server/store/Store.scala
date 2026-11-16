@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrlAdmis
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
-import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
+import org.aspen_ddp.aspen.server.transaction.{FinalizationStall, FinalizationStallReport, TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 import scribe.Logging
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
@@ -111,11 +111,20 @@ class Store(val storageDeviceId: StorageDeviceId,
 
   def estimateSize(): Long = backend.estimateSize()
 
+  private val finalizationStallReport = new FinalizationStallReport(storeId)
+
+  /** The committed transactions this store's drivers have not finalized `TransactionDriver.FinalizationStallAfter` or
+    * longer after resolving them (the finalization stall metric; Todo 4.9)
+    */
+  def stalledFinalizations(now: Long = System.nanoTime()): List[FinalizationStall] =
+    transactionDrivers.values.flatMap(_.finalizationStall(now)).toList
+
   /** A fail-stopped store (Frontend.failStop) does nothing more: its drivers and Txs wait for its unload */
   def heartbeat(): Unit = if !frontend.failStopped then {
     transactionDrivers.values.foreach { td =>
       td.heartbeat()
     }
+    finalizationStallReport.report(stalledFinalizations(), System.nanoTime()).foreach(logger.error(_))
     frontend.transactions.values.foreach(_.checkCollisionWait())
     frontend.retryUnackedLookups()
     frontend.retryQuarantineVerifications()

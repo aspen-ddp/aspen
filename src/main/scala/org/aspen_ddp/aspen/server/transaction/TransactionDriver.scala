@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
 import scribe.Logging
 
-import scala.concurrent.duration.{Duration, NANOSECONDS, SECONDS}
+import scala.concurrent.duration.{Duration, FiniteDuration, NANOSECONDS, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 import scala.util.control.NonFatal
@@ -26,6 +26,12 @@ object TransactionDriver {
     val doublings = math.min(failures - 1, 6)
     val delay = FinalizerRetryInitial * math.pow(2, doublings)
     if delay > FinalizerRetryMax then FinalizerRetryMax else delay
+
+  /** How long after its commit resolution a driver's unfinalized transaction counts as a finalization stall
+    * (`finalizationStall`), reported by its store at error (FinalizationStallReport). It is the backoff cap: by then
+    * the finalizer failed several times, or has not finished in a minute
+    */
+  val FinalizationStallAfter: FiniteDuration = FiniteDuration(60, SECONDS)
 
   /** How a driver starts.
     *
@@ -184,6 +190,12 @@ abstract class TransactionDriver(
   /** Failed finalizers so far, for the restart backoff */
   private var finalizerFailures = 0
 
+  /** The last failed finalizer's error, for the stall report */
+  private var lastFinalizerFailure: Option[Throwable] = None
+
+  /** When this driver resolved the transaction committed (System.nanoTime), for the stall report */
+  private var resolvedCommitNanos: Option[Long] = None
+
   private var finalizerRestart: BackgroundTaskManager.ScheduledTask = BackgroundTaskManager.NoTask
 
   /** Set by `shutdown`: no finalizer is started again */
@@ -284,6 +296,19 @@ abstract class TransactionDriver(
         s"Finalizer: ${finalizer.map(_.debugStatus)}")
     }
     due
+  }
+
+  /** A committed transaction this driver has not finalized `FinalizationStallAfter` or longer after resolving it: its
+    * finalizer keeps failing (an action failing on every attempt, a metadata pool unable to take the marker's
+    * writes, an entry too large for the tree), or has not finished. None otherwise. The driver keeps retrying; the
+    * store reports these (FinalizationStallReport) so an operator can find the cause
+    */
+  def finalizationStall(now: Long = System.nanoTime()): Option[FinalizationStall] = synchronized {
+    resolvedCommitNanos.filter(_ => !finalized).flatMap { at =>
+      val age = FiniteDuration(now - at, NANOSECONDS)
+      Option.when(age >= TransactionDriver.FinalizationStallAfter)(
+        FinalizationStall(txd.transactionId, age, finalizerFailures, lastFinalizerFailure))
+    }
   }
 
   /** Records messages for the next sendMessages. Nothing else sends what this replaces, so it must not be unsent */
@@ -532,7 +557,7 @@ abstract class TransactionDriver(
         // cancel comes first: a marker not yet handed off then writes nothing, and one already handed off is not
         // recalled and lists the stores it may still write (handedOffStores), whatever that write's outcome. So the
         // TxFinalized this driver sends lists every store that may get an entry from either driver. A stub may then be
-        // written before its entry is durable; the repair scan allows for that (Ruling 8)
+        // written before its entry is durable; the repair scan allows for that (addendum Ruling 8)
         finalizer.foreach( _.cancel() )
         val planned = if msg.committed then handedOffStores else Set[StoreId]()
         onFinalized(msg.committed, msg.owed ++ planned)
@@ -758,6 +783,7 @@ abstract class TransactionDriver(
         f.cancel()
       finalizer = None
       finalizerFailures += 1
+      lastFinalizerFailure = Some(err)
       val delay = TransactionDriver.finalizerRetryDelay(finalizerFailures)
       logger.error(s"Tx ${txd.transactionId} on store $storeId: finalization failed (attempt $finalizerFailures), " +
         s"starting it again in $delay: $err")
@@ -769,8 +795,8 @@ abstract class TransactionDriver(
     *
     * Ordering premise: this driver sends TxFinalized only from onFinalized, which a commit reaches only once the
     * finalizer completes (`startFinalizer`: a failed one is started again, never skipped), or on a TxFinalized from
-    * another driver, sent under the same rule, or on a late commit (`resolveLate`), which follows a finalization whose
-    * actions other than the UnackedCommits marker already completed. A store forgets a committed transaction it voted on only on TxFinalized
+    * another driver, sent under the same rule, or on a late commit (`resolveLate`), which follows a TxFinalized, so a
+    * finalization whose actions all completed. A store forgets a committed transaction it voted on only on TxFinalized
     * (Frontend.receiveTransactionMessage via Tx.receiveFinalized), or on a late commit, which follows TxFinalized
     * (Tx.lateCommit). Finding its UnackedCommits entry (Tx.unackedCommitFound) applies the update but does not forget
     * it, nor does finding one of another incarnation (Tx.unackedCommitNotOwed), which applies nothing. So everything the first finalizer to complete writes, in every pool, is durable before any voter forgets the
@@ -795,6 +821,8 @@ abstract class TransactionDriver(
       logger.trace(s"Got TxResolved message for transaction ${txd.transactionId}. Committed: $committed")
 
       if (committed) {
+
+        resolvedCommitNanos = Some(System.nanoTime())
 
         // TODO: If sendResolutionMessage is false, another driver sent us a resolution message and will have
         //       started executing the finalizers. Ideally, we'd watch the heartbeats of the other driver and

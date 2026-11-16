@@ -157,7 +157,7 @@ Fix sketch: `Store.close` must `shutdown()` all drivers; a driver should stop wh
 > Residual: (a) finalizers in the same tier as their transaction (TKVL split, join and tail removal) can still stall
 > if that tier's own traffic fills its lane on every device of the pool; lower-tier load can no longer cause it.
 > (b) Finalization still needs the marker write to be *available*: a metadata quorum that is unreachable still holds
-> transactions unfinalized (recovery F14, Todo 4.9). (c) Data-only devices give up 1/4 of their admission headroom
+> transactions unfinalized (recovery F14; accepted 2026-11-15 with the `FINALIZATION STALLED` alarm, Todo 4.9). (c) Data-only devices give up 1/4 of their admission headroom
 > (Backlog.txt).
 > Tests: CrlAdmissionSuite "each tier is admitted below its own ceiling"; FrontendSuite "past the data lane a data
 > store drops a new prepare while a metadata store on the device admits one", "past the metadata lane only a

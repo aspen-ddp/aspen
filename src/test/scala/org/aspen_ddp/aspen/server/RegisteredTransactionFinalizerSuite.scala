@@ -51,7 +51,7 @@ object RegisteredTransactionFinalizerSuite:
 class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
   import RegisteredTransactionFinalizerSuite.{*, given}
 
-  test("the missed-update marker executes only after every other action completes, and complete waits for all") {
+  test("the missed-update marker executes only after every other action settles, and complete waits for all") {
     val a = new StubAction
     val b = new StubAction
     val marker = new StubMarker
@@ -78,9 +78,9 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     f.complete.isCompleted should be (true)
   }
 
-  // The driver's failure path (transaction-recovery F2): a marker that never executes never completes, so complete
-  // must fail on the failed action alone
-  test("a failed action keeps the marker from executing and fails complete at once") {
+  // Ruling 8 (revised 2026-11-15): a failed action still lets the marker write its marks, so the stores that missed
+  // the transaction are repaired while finalization is retried (transaction-recovery R-N2)
+  test("a failed action still runs the marker once the others settle, and complete fails only after the marker settles") {
     val a = new StubAction
     val b = new StubAction
     val marker = new StubMarker
@@ -89,6 +89,39 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     val err = new Exception("action failed")
     b.done.failure(err)
     marker.executed should be (false)
+    f.complete.isCompleted should be (false)
+
+    a.done.success(())
+    marker.executed should be (true)
+    f.complete.isCompleted should be (false)
+
+    marker.done.success(())
+    f.complete.value should be (Some(scala.util.Failure(err)))
+  }
+
+  test("a cancel after a failed action, before the others settle, keeps the marker from executing") {
+    val a = new StubAction
+    val b = new StubAction
+    val marker = new StubMarker
+    val f = new Finalizer(List(a, marker, b))
+
+    b.done.failure(new Exception("action failed"))
+    f.cancel()
+    a.done.success(())
+    marker.executed should be (false)
+    marker.cancelled should be (true)
+  }
+
+  test("an action that cannot be created is a failed action, and the marker still runs") {
+    val a = new StubAction
+    val marker = new StubMarker
+    val err = new NoSuchElementException("unknown finalization action type")
+    val f = Finalizer.of(List(scala.util.Success(a), scala.util.Failure(err), scala.util.Success(marker)))
+
+    a.executed should be (true)
+    a.done.success(())
+    marker.executed should be (true)
+    marker.done.success(())
     f.complete.value should be (Some(scala.util.Failure(err)))
   }
 

@@ -1465,6 +1465,47 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     factory.created.size should be (4)
   }
 
+  test("a committed transaction still unfinalized past FinalizationStallAfter reports a stall, with its failures") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val tasks = new StepTasks
+    val factory = new StepFactory()
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), factory, _ => (), tasks,
+      ExecutionContext.parasitic)
+    tasks.tasks = Nil
+    val before = System.nanoTime()
+    driver.finalizationStall(before + TransactionDriver.FinalizationStallAfter.toNanos * 2) should be (None)
+
+    commitBy(driver, txd)
+    val resolvedBy = System.nanoTime()
+    val err = new Exception("action gave up")
+    factory.created.last.done.failure(err)
+    tasks.runAll()
+    factory.created.last.done.failure(err)
+
+    driver.finalizationStall(before + TransactionDriver.FinalizationStallAfter.toNanos - 1) should be (None)
+    val stall = driver.finalizationStall(resolvedBy + TransactionDriver.FinalizationStallAfter.toNanos).get
+    stall.transactionId should be (txd.transactionId)
+    stall.failures should be (2)
+    stall.lastFailure should be (Some(err))
+    stall.age should be >= TransactionDriver.FinalizationStallAfter
+
+    tasks.runAll()
+    factory.created.last.done.success(())
+    driver.testFinalized should be (true)
+    driver.finalizationStall(resolvedBy + TransactionDriver.FinalizationStallAfter.toNanos * 2) should be (None)
+  }
+
+  test("an aborted transaction never reports a finalization stall") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), new StepFactory(), _ => (), new StepTasks,
+      ExecutionContext.parasitic)
+    for from <- List(ds0, ds1) do
+      driver.receiveTxAcceptResponse(TxAcceptResponse(ds0, from, txd.transactionId, ProposalId(1, 0),
+        Right(TxAcceptResponse.Accepted(false))))
+    driver.testFinalized should be (true)
+    driver.finalizationStall(System.nanoTime() + TransactionDriver.FinalizationStallAfter.toNanos * 2) should be (None)
+  }
+
   test("another driver's TxFinalized during a pending restart finalizes at once, listing the failed plan, and starts no finalizer") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()

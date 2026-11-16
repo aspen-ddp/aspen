@@ -54,7 +54,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.8  Req F10: log an invariant violation when an apply overrides a commit voter's lock.                     [S]
 5.9  Repair F12 residual: reader ranking can prefer a stale store with a higher timestamp (exact ties are
      already handled).                                                                                      [M]
 5.10 Audit the `unlessCollision` sites and `host/StoreRebuilds.scala` ~118 for idempotence when a retried

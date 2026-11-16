@@ -581,7 +581,7 @@ under reordering/crash; Low = needs an unusual precondition or a trust-model vio
 |---|---|---|---|
 | F5 | **fixed** | A commit voter whose apply throws, or a live commit voter whose apply re-check fails, fail-stops the store | `Tx.issueCommits`; `Frontend.failStop`; `StoreRebuilds.handleFailStopped` |
 | F6 | **fixed** | A recovered commit vote whose object fails to load with anything but `ObjectNotFound` fail-stops the store; a write-frozen store poisons the object instead | `Tx.objectLoadFailed`; `Frontend.poisonObject` |
-| F10 | unchanged | An apply still ignores locks; when it invalidates a commit voter's update, that voter now fail-stops instead of skipping silently | FrontendSuite "a commit held behind an in-flight commit ..." needed a non-conflicting fence write |
+| F10 | **closed** (2026-11-15, Todo 5.8) | An apply still ignores locks, by design; when it invalidates a commit voter's update that also commits, the voter fail-stops with an `INVARIANT VIOLATION` naming the overriding transaction (live) or quarantines the object (recovered) | FrontendSuite "a commit held behind an in-flight commit ..." needed a non-conflicting fence write |
 
 ### F1. Sequential blind KV writes of one key (or object-level field) can be applied in opposite orders by a lagging store; permanent divergence with no repair entry. Confidence: Medium.
 
@@ -814,6 +814,19 @@ arrive first. Dead code today; a hazard if wired up.
 
 ### F10. Applying a committed transaction ignores locks held by transactions that already persisted commit votes. Confidence: Low (argued safe under R2, listed for review).
 
+> **Status 2026-11-15: CLOSED (Todo 5.8).** No apply-time report: an apply overriding a commit voter's lock is
+> normal. The holder B usually lost at other stores and keeps its lock here until it learns its abort, and locks are
+> coarser than requirements, so both may commit legitimately (FrontendSuite "a commit held behind an in-flight commit
+> ..." overwrites an object the other locks only by refcount). The violation is B committing too with its requirements
+> broken, and B's apply re-check catches it (`Tx.issueCommits`). A live voter fail-stops the store with an
+> `INVARIANT VIOLATION` error that names, per object, the transaction whose update it now shows. A recovered voter
+> quarantines the object, since its failed re-check may be legitimate (10.5a). The silent overwrite the finding
+> describes is therefore no longer silent at a commit voter. *Residuals:* B's re-check is only what its requirements
+> check, so an override that leaves them holding is not reported (no conflict either); a store that did not vote for B
+> applies nothing and reports the skip, as before. Fail-stopping the whole store for one object is probably overkill
+> (Backlog 5.8). Test: FrontendSuite "a committed apply over a commit voter's lock is not reported, but that voter
+> committing too fail-stops (Req F10)".
+
 > **Verification 2026-11-09: PLAUSIBLE. Severity: doc-only (argued safe under R2).** Applying ignores locks (ignoreLocks = applying).
 > *Fix sketch:* Log an invariant violation when an apply overrides a commit-voter's lock.
 
@@ -1038,7 +1051,9 @@ can starve shared lockers. Documented behaviour.
    and every decoder builds IDAs through those constructors (`Codec.decode(codec.IDA)`, `IDA.deserializeIDAType`,
    `BootstrapConfig.IDAOptions`). A deserialized pool or description IDA therefore satisfies it, or fails to decode.
    Stores also refuse a description that names another IDA for their pool (F7).
-2. Should the apply path detect a committed transaction overriding a held commit-voter lock and report it (F10)?
+2. Should the apply path detect a committed transaction overriding a held commit-voter lock and report it (F10)? *Answered
+   2026-11-15 (Todo 5.8):* not at the apply, where the override is normal; at the holder's own apply re-check, which
+   fail-stops a live voter with an `INVARIANT VIOLATION` naming the overriding transaction (F10).
 3. Should `Frontend.opportunisticRebuild` and `Tx.completeLoad`'s pre-transaction rebuild share one guarded implementation (F3)?
 4. Should object-level KV operations without a required revision be flagged like `deletesKeys` for the traceless path (F8)?
 5. Should the key `ValueState.timestamp` take part in apply (F1, F2), so that blind writes become last-writer-wins by

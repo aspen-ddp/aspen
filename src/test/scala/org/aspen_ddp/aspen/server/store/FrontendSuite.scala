@@ -2109,6 +2109,27 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     net.clientMessage() shouldBe None
   }
 
+  test("a committed apply over a commit voter's lock is not reported, but that voter committing too fail-stops (Req F10)") {
+    val (frontend, backend, net, stops) = failStopFixture()
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    // txid1 collides with txid2's lock here, but the other stores' votes commit it. Its apply ignores the lock: a
+    // holder normally aborts, so the override alone is no violation
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid1, committed = true)
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
+    stops() shouldBe Nil
+
+    // txid2 commits too (R2 violated): its revision requirement no longer holds, and the store fail-stops, naming the
+    // transaction whose update op1 now shows
+    resolve(frontend, net, txid2, committed = true)
+    frontend.failStopped shouldBe true
+    stops().size shouldBe 1
+    val reason = stops().head.getMessage
+    reason should include ("INVARIANT VIOLATION")
+    reason should include (s"now shows Tx ${txid1.uuid}")
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
+  }
+
   test("an abort voter that cannot apply a committed update does not fail-stop") {
     val (frontend, backend, net, stops) = failStopFixture()
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit

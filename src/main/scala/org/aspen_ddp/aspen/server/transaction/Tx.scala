@@ -973,10 +973,21 @@ class Tx( trs: TransactionRecoveryState,
               frontend.quarantine(pointerOf(oid), txd.startTimestamp, transactionId,
                 result.skippedReasons.get(oid).map(_.toString).getOrElse("already quarantined"))
       else
-        val unapplied = result.uncommittable -- alreadyApplied -- notApplied
-        if unapplied.nonEmpty then
-          frontend.failStop(s"Tx $transactionId voted commit but cannot apply its committed update of objects " +
-            s"$unapplied: ${result.skippedReasons.filter((oid, _) => unapplied.contains(oid))}")
+        // Invariant violation: a committed transaction applied over this vote's locks (an apply ignores other
+        // transactions' locks, RequirementsChecker.check) conflicts with this one, which committed too (R2), or the
+        // state changed under the locks. The override alone is not reported: its lock holder normally aborts
+        // (transaction-requirements F10). Naming the update each object now shows identifies the other transaction
+        val threw = result.failed -- notApplied
+        val unapplied = result.skipped -- alreadyApplied -- notApplied
+        if threw.nonEmpty then
+          frontend.failStop(s"Tx $transactionId voted commit but its update of objects $threw threw")
+        else if unapplied.nonEmpty then
+          val shows = unapplied.toList.map: oid =>
+            val now = objects.get(oid).map(_.metadata.revision.lastUpdateTxUUID.toString).getOrElse("not loaded")
+            s"$oid (${result.skippedReasons.get(oid).map(_.toString).getOrElse("not applied")}; now shows Tx $now)"
+          frontend.failStop(s"INVARIANT VIOLATION: Tx $transactionId voted commit and committed, but its requirements " +
+            s"no longer hold on objects ${shows.mkString(", ")}: two conflicting transactions committed, or the " +
+            s"state changed under its locks (transaction-requirements F5, F10)")
 
     val uncommittable = result.uncommittable -- alreadyApplied
 

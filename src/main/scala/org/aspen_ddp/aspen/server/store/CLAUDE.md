@@ -119,8 +119,11 @@
 - Fail-stop (`Frontend.failStop`, transaction-requirements F5/F6): a commit voter has dropped its locks before it
   applies, so one that cannot hold the update it voted for fail-stops the store. That covers an apply that throws, a
   live voter's failed apply re-check, and a recovered commit vote whose object fails to load with anything but
-  `ObjectNotFound`. A recovered voter's failed re-check quarantines the object instead (below). A fail-stopped store
-  drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
+  `ObjectNotFound`. A live voter's failed re-check is logged as an `INVARIANT VIOLATION` naming the transaction
+  whose update each object now shows: a committed apply ignores other transactions' locks, which alone is normal (the
+  holder usually aborts) and not reported, so this is where two conflicting commits surface (transaction-requirements
+  F10; Backlog 5.8: repair the object instead). A recovered voter's failed re-check quarantines the object instead
+  (below). A fail-stopped store drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
   store is rebuilt as a failed backend is. Never for a full device: a write-frozen store poisons the object instead
   (`poisonObject`, the `BackendCommitFailed` rule) and keeps serving. Every fail-stop is a lost-store declaration
   (Backlog: correlated declarations)

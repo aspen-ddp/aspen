@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
-import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
+import org.aspen_ddp.aspen.server.host.{ControlFixture, StoreRebuilds, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.{StoreMoved, StoreOffline}
@@ -120,6 +120,10 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       active = (storeN(0), StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
       oneRebuilding = deviceState(deviceA, Map(active, rebuilding(storeN(1))))
       _ = second.success(oneRebuilding)
+      // deviceA is not in the tree, so the flip fails permanently: the re-check that frees the slot for store 1 is
+      // the backoff retry (Rebuild F11)
+      _ <- yieldUntil(scheduler(host).pending.contains(Host.RebuildRetryInitialDelay))
+      _ = runRebuildRetries(host)
       _ <- yieldUntil(factory.created.size == 2)
     yield
       factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(1)))
@@ -420,3 +424,73 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).loadStoreByIdRequests.exists(_._1 == syntheticA) should be(false)
       // Store 1 should eventually be created (slot was released)
       factory.created.map(_.storeId).toSet should contain(storeN(1))
+
+  test("the rebuild retry backoff doubles from its initial delay up to its cap"):
+    import scala.concurrent.duration.*
+    StoreRebuilds.rebuildRetryDelay(0) should be(Host.RebuildRetryInitialDelay)
+    StoreRebuilds.rebuildRetryDelay(1) should be(Host.RebuildRetryInitialDelay * 2)
+    StoreRebuilds.rebuildRetryDelay(2) should be(Host.RebuildRetryInitialDelay * 4)
+    StoreRebuilds.rebuildRetryDelay(50) should be(Host.RebuildRetryMaxDelay)
+    StoreRebuilds.rebuildRetryDelay(Int.MaxValue) should be(Host.RebuildRetryMaxDelay)
+
+  atest("a failed rebuild pass is retried after a backoff that grows with each failure (Rebuild F5)"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+    val rebuildingState = deviceState(deviceA, Map(rebuilding(storeN(0))))
+
+    val first = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    first.success(rebuildingState)
+
+    def retriesPending = scheduler(host).pending.filter(d =>
+      d >= Host.RebuildRetryInitialDelay && d <= Host.RebuildRetryMaxDelay)
+
+    for
+      _ <- yieldUntil(factory.created.size == 1)
+      _ = factory.created.head.promise.failure(new Exception("disk on fire"))
+      _ <- yieldUntil(retriesPending.nonEmpty)
+      firstDelay = retriesPending
+      _ = recorded(host).armLookup(deviceA).success(rebuildingState)
+      _ = runRebuildRetries(host)
+      _ <- yieldUntil(factory.created.size == 2)
+      _ = factory.created(1).promise.failure(new Exception("disk still on fire"))
+      _ <- yieldUntil(retriesPending.nonEmpty)
+      secondDelay = retriesPending
+    yield
+      firstDelay should be(List(Host.RebuildRetryInitialDelay))
+      secondDelay should be(List(Host.RebuildRetryInitialDelay * 2))
+      factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(0)))
+
+  atest("a permanently failed flip does not restart its rebuild at once, but after a backoff (Rebuild F11)"):
+    val hostRoot = newHostDir()
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+
+    // Not registered in the tree, so the flip's getStorageDevicePointer fails permanently
+    val synthetic = StorageDeviceId(UUID.fromString("cccccccc-0000-0000-0000-000000000003"))
+    val deviceDir = hostRoot / "storage-devices" / "synth-c"
+    os.makeDir.all(deviceDir)
+    injectLoadedDevice(host, new LocalStorageDeviceState(
+      synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL()))
+    val rebuildingState = deviceState(synthetic, Map(rebuilding(storeN(0))))
+
+    val first = recorded(host).armLookup(synthetic)
+    host.control.reconciler.checkAll()
+    first.success(rebuildingState)
+
+    for
+      _ <- yieldUntil(factory.created.size == 1)
+      // Pre-completed: a re-check of this device right after the failed flip would consume it and restart the store
+      _ = recorded(host).armLookup(synthetic).success(rebuildingState)
+      _ = factory.created.head.promise.success(())
+      _ <- yieldUntil(scheduler(host).pending.contains(Host.RebuildRetryInitialDelay), 400)
+      _ <- yieldUntil(factory.created.size == 2, 20)
+      restartedImmediately = factory.created.size
+      _ = runRebuildRetries(host)
+      _ <- yieldUntil(factory.created.size == 2)
+    yield
+      restartedImmediately should be(1)
+      factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(0)))
+      recorded(host).loadStoreByIdRequests.exists(_._1 == synthetic) should be(false)

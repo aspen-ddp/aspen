@@ -18,6 +18,7 @@ import scribe.Logging
 
 import java.util.UUID
 import scala.concurrent.{Future, Promise}
+import scala.concurrent.duration.FiniteDuration
 import scala.util.{Failure, Success}
 import scala.util.control.NonFatal
 
@@ -46,6 +47,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   // running rebuild does: the discard is the first destructive step, so maxConcurrentRebuilds bounds discards too
   // (systemic-loss-protection.md S3).
   private var droppingCrlState: Set[StoreId] = Set()
+
+  // Rebuild F5, F11: by store, how many passes or flips have failed in a row, and the stores with a retry scheduled
+  private var rebuildFailures: Map[StoreId, Int] = Map()
+  private var scheduledRebuildRetries: Set[StoreId] = Set()
+
+  /** The stores with a backoff re-check of their device scheduled */
+  private[server] def rebuildRetriesScheduled: Set[StoreId] = scheduledRebuildRetries
 
   /** The stores whose rebuild is running here, for any device. */
   def rebuildingStoreIds: Set[StoreId] = rebuildingStores.keySet
@@ -167,10 +175,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  Every completion re-checks the host's other loaded devices, because
    *  `rebuildingStores` is host-wide: a slot released by device A's rebuild could unblock a queued
    *  rebuild on device B, and without a re-check of B it would wait for the periodic sweep (one
-   *  hour) with data under-replicated. The three outcomes that settle the store's metadata
-   *  (`Adopt`, `Discard`, and a permanently failed flip) additionally re-check this device, to
-   *  start the next store queued behind the slot just freed. The walk-failure path does not: see
-   *  its comment.
+   *  hour) with data under-replicated. The outcomes that settle the store's metadata (`Adopt`,
+   *  `AdoptOffline`, `Discard`) additionally re-check this device, to start the next store queued
+   *  behind the slot just freed. A failed walk and a permanently failed flip do not, since that
+   *  re-check would restart the same store at once: they schedule a backoff re-check instead
+   *  (scheduleRebuildRetry, Rebuild F5, F11).
    *
    *  A slot is taken from the start of a lost store's discard (`droppingCrlState`), not only once its walk runs, and
    *  passes straight from the discard to the rebuild: otherwise one pass would discard every marked store on the
@@ -215,6 +224,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           .filter(_ != local.storageDeviceId)
           .foreach(ctx.reconciler.checkStorageDevice)
 
+      // The store's metadata is settled: a later failure starts the backoff afresh
+      def settledOutcome(): Unit =
+        rebuildFailures -= storeId
+
       // Guard-map leak defense: invoke `complete` in a try/catch that substitutes Future.failed(t)
       // on throw, so that either way a Future exists and onComplete below is registered. That
       // guarantees the Failure branch's release() runs. The map entry is added unconditionally
@@ -249,6 +262,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 if clearRebuildCompleteMarker(local.devicePath / storeId.directoryName) then
                   ctx.loadStoreById(local.storageDeviceId, storeId)
               finally
+                settledOutcome()
                 release()
                 recheckAll()
 
@@ -256,6 +270,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               try
                 keepRebuiltStoreOffline(local, storeId)
               finally
+                settledOutcome()
                 release()
                 recheckAll()
 
@@ -264,6 +279,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 ctx.devices.discardStoreDirectory(storeId, local.storageDeviceId,
                   "The tree does not say this device owns a rebuilt store")
               finally
+                settledOutcome()
                 release()
                 recheckAll()
 
@@ -274,6 +290,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 logger.info(s"Rebuild of store $storeId finished after device " +
                             s"${local.storageDeviceId} moved to another host. Leaving it to that host")
               finally
+                settledOutcome()
                 release()
                 recheckOtherDevices()
 
@@ -287,10 +304,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 logger.error(s"Failed to record the completed rebuild of store $storeId on " +
                              s"device ${local.storageDeviceId}. The store is on disk in " +
                              s"${local.devicePath / storeId.directoryName} but is not " +
-                             s"loaded, and the device entry still says Rebuilding", t)
+                             s"loaded, and the device entry still says Rebuilding. Retrying with a backoff", t)
               finally
                 release()
-                recheckAll()
+                // Not this device at once: its reconcile restarts the rebuild, which flips again (Rebuild F11)
+                recheckOtherDevices()
+                scheduleRebuildRetry(local.storageDeviceId, storeId)
 
         case Failure(RebuildingStore.RebuildCancelled(_)) =>
           // Cancelled by a shutdown of this device. Not an error, and this device is not
@@ -304,11 +323,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
         case Failure(err) =>
           // The checkpoint survives in the staging directory, so the next check of this device
-          // resumes rather than restarting. That next check is deliberately left to the
-          // ordinary periodic sweep: this device is excluded from the re-check here because
-          // including it is a retry, and an unbounded one. A rebuild that fails in well under a
-          // millisecond -- an unreadable checkpoint, a pool that cannot be read -- would spin
-          // through tree reads and WARN lines forever, with no backoff and no give-up. The
+          // resumes rather than restarting. That check is not immediate: this device is excluded
+          // from the re-check here, because a rebuild that fails in well under a millisecond --
+          // an unreadable checkpoint, a pool that cannot be read -- would spin through tree reads
+          // and WARN lines forever. It comes from scheduleRebuildRetry's backoff (Rebuild F5). The
           // other devices are re-checked because the slot just freed is host-wide and may be
           // what a queued rebuild elsewhere is waiting on.
           try
@@ -316,6 +334,23 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           finally
             release()
             recheckOtherDevices()
+            scheduleRebuildRetry(local.storageDeviceId, storeId)
+
+  /** Checks `deviceId` again after a backoff, so a store whose rebuild pass or flip failed is retried without waiting
+   *  for the periodic sweep (an hour) and without spinning (Rebuild F5, F11). The first delay is
+   *  Host.RebuildRetryInitialDelay, doubled for each failure of the store in a row, up to Host.RebuildRetryMaxDelay;
+   *  a settled flip resets it. At most one is scheduled per store. The check is an ordinary reconcile: a device
+   *  unloaded meanwhile, or an entry that has left Rebuilding, does nothing. */
+  private def scheduleRebuildRetry(deviceId: StorageDeviceId, storeId: StoreId): Unit =
+    val failures = rebuildFailures.getOrElse(storeId, 0)
+    rebuildFailures += storeId -> (failures + 1)
+    if !scheduledRebuildRetries.contains(storeId) then
+      scheduledRebuildRetries += storeId
+      val delay = StoreRebuilds.rebuildRetryDelay(failures)
+      logger.info(s"Retrying the rebuild of store $storeId on device $deviceId in $delay")
+      ctx.scheduler.schedule(delay):
+        scheduledRebuildRetries -= storeId
+        ctx.reconciler.checkStorageDevice(deviceId)
 
   /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of
    *  service: it is not loaded, and it is recorded offline behind an empty transfer-out marker
@@ -617,6 +652,11 @@ object StoreRebuilds:
   val RecoveryFailed = "failed to recover its transactions from its CRL"
   /** Host.StoreFailStopped's `what` for a store that fail-stopped (Frontend.failStop) */
   val FailStopped = "fail-stopped: it cannot hold an update it voted to commit"
+
+  /** The backoff before the re-check that follows a store's `failures + 1`th failed rebuild pass or flip in a row */
+  def rebuildRetryDelay(failures: Int): FiniteDuration =
+    val doubled = Host.RebuildRetryInitialDelay * (1L << math.min(failures, 20))
+    if doubled > Host.RebuildRetryMaxDelay then Host.RebuildRetryMaxDelay else doubled
 
   /** Writes the rebuild-required marker of the store at `storePath`, durably */
   def writeRebuildRequiredMarker(storePath: os.Path): Unit =

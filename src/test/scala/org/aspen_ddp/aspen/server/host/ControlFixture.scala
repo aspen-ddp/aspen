@@ -523,6 +523,11 @@ trait ControlFixture:
     scheduler(host).runWhere(_ == Host.TransferOutRecheckDelay)
     host.testingOnlyHandleEvents()
 
+  /** Runs every rebuild retry waiting out a backoff of at most `upTo`, then drains the events they post. */
+  protected def runRebuildRetries(host: Host, upTo: Duration = Host.RebuildRetryMaxDelay): Unit =
+    scheduler(host).runWhere(d => d >= Host.RebuildRetryInitialDelay && d <= upTo)
+    host.testingOnlyHandleEvents()
+
   private def isMarkerResolution(task: Runnable): Boolean = task match
     case t: Host.EventTask => t.event.isInstanceOf[Host.DeviceOwnershipResolved]
     case _ => false

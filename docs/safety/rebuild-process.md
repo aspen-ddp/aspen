@@ -264,9 +264,10 @@ keeps it offline behind a `transferring-out` marker plus an empty `crl_save.log`
 and only flips the entry). On `Adopt` the host then gossips `StoreMoved` (`HostServices.scala:215`), which clears the
 `StoreOffline` gossiped at start (`StoreRebuilds.scala:222`).
 
-A walk failure re-checks all devices **except** the failing one (`:288-302`), so a failed pass is retried at the next
-periodic device check (an hour, `cmdline/Main.scala:82`) unless a nudge arrives; this is deliberate, to avoid an
-unbounded spin.
+A walk failure re-checks all devices **except** the failing one, so the failed store is not restarted at once (that
+would spin). Since 2026-11-15 (F5, F11) it, and a permanently failed flip, schedule a backoff re-check of the device
+instead (`StoreRebuilds.scheduleRebuildRetry`): 30 s after the first failure, doubling per failure of the same store
+in a row up to 30 min, reset when a flip settles (`Host.RebuildRetryInitialDelay`, `RebuildRetryMaxDelay`).
 
 ---
 
@@ -447,7 +448,7 @@ the design document predates the ErrorTree.
 | after move+sync, before tree flip | final path present with `rebuild-complete`, entry Rebuilding | the device load leaves it offline (marker); `start()` sees the marked final path and flips (F4, fixed 2026-11-14) |
 | after flip committed, before the marker's removal | final path with `rebuild-complete`, entry Active | loaded offline; the reconcile's Completed Rebuilds pass removes the marker and loads it |
 | after flip committed, before `loadStoreById` | final path, entry Active | normal load at restart |
-| flip transaction fails permanently | final path, entry Rebuilding | logged; `release()` and re-check of all devices including this one (`StoreRebuilds.scala:263-276`) re-enter `start()` which flips again (spin bounded only by the device lookup, F11) |
+| flip transaction fails permanently | final path, entry Rebuilding | logged; `release()`, re-check of the other devices, and a backoff re-check of this one (30 s doubling to 30 min) that re-enters `start()`, which flips again (F11, fixed 2026-11-15) |
 | device shutdown mid-walk | staging + checkpoint, entry Rebuilding | `cancelFor` latches `RebuildCancelled` (`StoreRebuilds.scala:53`), pass fails, resumes after restart or adoption |
 | host crash with device adopted elsewhere | staging + checkpoint on the moved disk | new owner's reconcile sees Rebuilding entry (adopt leaves it, `DeviceMetadata.scala:471-`) and `startRebuild` resumes |
 
@@ -729,6 +730,14 @@ it differs from B1/B8 and from `RebuildingStore.scala:135-137`'s claim that only
 **F5 (Medium, narrowed) A walk that fails on a tree read waits for the next hourly device check; under delete churn it
 may never finish.**
 
+> **FIXED 2026-11-15 (Todo 4.8).** A failed pass (any cause but a cancel) schedules a re-check of its own device after
+> a backoff (`StoreRebuilds.scheduleRebuildRetry`): 30 s, doubled for each failure of the store in a row, capped at
+> 30 min, reset when its flip settles. The other devices are still re-checked at once for the freed slot. The re-check
+> is an ordinary reconcile, so a device unloaded or an entry no longer Rebuilding does nothing. Tests:
+> StoreRebuildTriggerSuite "a failed rebuild pass is retried after a backoff that grows with each failure (Rebuild
+> F5)", "the rebuild retry backoff doubles from its initial delay up to its cap", and "a failed rebuild does not
+> immediately restart itself" (no spin).
+
 **Status: narrowed.** The walk now retries a right-neighbour read that a join made fail inside the pass: it descends
 again to the node holding the last visited key and continues after it (`TierEngine.walk`, bounded by
 `MaxJoinRaceRestarts` restarts in a row without a visited key). Delete churn near the cursor no longer fails the pass.
@@ -833,6 +842,11 @@ tree entries newer than the walk start.
 **Verification: PLAUSIBLE-low, not traced.** The walk reads the allocation tree once in key order; an allocation committed after the cursor passed its key on a store that had acknowledged it earlier is not in the ErrorTree. Plausible by construction; no experiment.
 
 **F11 (Low) Flip failure re-enters `start()` through a recheck that includes the failing device.**
+
+> **FIXED 2026-11-15 (Todo 4.8).** A permanently failed flip re-checks only the other devices and schedules the same
+> backoff re-check of its own as a failed pass (F5), so a flip that keeps failing is retried at 30 s doubling to 30 min
+> rather than at once. Test: StoreRebuildTriggerSuite "a permanently failed flip does not restart its rebuild at once,
+> but after a backoff (Rebuild F11)" (it restarted at once before the fix).
 `StoreRebuilds.scala:263-276` calls `recheckAll()` for a permanently failed `markRebuiltStoreActive`; the
 walk-failure path explicitly avoids this to prevent spinning (`:288-302`). The device lookup at the head of every
 check fails for most of the plausible permanent errors, which stops the loop, so the spin appears bounded in practice;

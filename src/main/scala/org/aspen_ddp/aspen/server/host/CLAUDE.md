@@ -113,6 +113,11 @@
   before that leaves the device CRL holding them
 - A rebuilt store's directory carries `rebuild-complete` from its move into place until its entry leaves
   Rebuilding; `tryLoadStore` leaves such a store offline (`server/rebuild/CLAUDE.md`)
+- A failed rebuild pass or a permanently failed flip never re-checks its own device at once, which would restart the
+  same store in a spin: it re-checks the other devices (the slot is host-wide) and schedules a backoff re-check of its
+  own (`StoreRebuilds.scheduleRebuildRetry`: `Host.RebuildRetryInitialDelay` 30 s, doubled per failure of the store in
+  a row up to `RebuildRetryMaxDelay` 30 min, reset when a flip settles; Rebuild F5, F11). Tests drive it with
+  `ControlFixture.runRebuildRetries`
 - Nothing of a lost store is destroyed before its rebuild succeeds: its `pending-delete/` copy (data plus saved CRL
   entries) is deleted by the device's reconcile only once the store is Active again, on this device by its own
   entry, elsewhere by the pool's entry and that device's state; a failed read keeps it. A fail-stopped backend's CRL

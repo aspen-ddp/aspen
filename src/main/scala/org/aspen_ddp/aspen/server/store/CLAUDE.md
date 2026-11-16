@@ -86,7 +86,8 @@
   `evictionWatermarkMillis` (which adds the lead too). A Tx the store holds (recovered ones included) is unaffected; a
   prepare whose outcome the cache knows creates a Tx that learns it only above the floor (resolved), and is ignored when
   finalized (the relay). An `acceptorSince` mute is checked first and keeps its muted, possibly proving Tx. The
-  designated leader starts no driver for a prepare below the floor it does not hold (`Store`). A store therefore never
+  designated leader starts no driver for a prepare below the floor it does not hold (`Store`), but does start one when
+  the cache holds an outcome not yet finalized: the fast takeover of a dead remote driver (R-F16, by design). A store therefore never
   rejoins a transaction it may have forgotten; for up to the horizon after a load it looks offline to transactions
   started before the load plus `MaxStartLead`. Accepted cost: on a single host, or after most of a pool's stores
   restart, such transactions end `TransactionOutcomeUnknown` at about 22 s and are retried. Stores written by bootstrap

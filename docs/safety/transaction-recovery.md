@@ -763,7 +763,7 @@ Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding 
 | F13 | unchanged | Entries only for counted voters when voters are known | `MissedUpdateFinalizationAction.scala:99` |
 | F14 | unchanged (load larger) | Finalization still waits for the marker, which now also carries an entry per silent voter per transaction (R-N4) | `MissedUpdateFinalizationAction.scala:98-114` |
 | F15 | unchanged | Non-voters still get no entry | `MissedUpdateFinalizationAction.scala:99` |
-| F16 | unchanged | Leader trigger is still `notFinalized` | `Store.scala:182-184` |
+| F16 | **closed** (by design, 2026-11-15) | Leader trigger is still `notFinalized`, kept on purpose: it is the fast takeover of a dead remote driver | `Store.scala` `handleTransactionMessage` |
 | F17 | unchanged (open) | Not re-derived | |
 | F18 | **narrowed** | No driver starts while the store's CRL state loads. *2026-11-15 (Todo 4.4):* a recovered vote no longer waits for its first lookup (R-N3) | `Store.driveTransaction`; `Frontend.recoveryPending` |
 
@@ -1078,6 +1078,15 @@ the correct quorum state; see repair-process.md.
 driver when `notFinalized` (`Store.scala:156`), which is true for a cached `Aborted/Committed` non-finalized entry. The driver
 then runs Paxos for an already-resolved transaction (answers come back as `TxResolved` quickly); wasteful rather than unsafe,
 but combined with F10 can produce duplicate finalizer runs.
+
+> **Closed 2026-11-15 (by design, Todo 5.2).** The behavior is kept. The leader's own driver lives until `TxFinalized`
+> (`removeExpiredDrivers` drops only a driver with no outcome), and a crash of the leader's host empties its cache, so a
+> resolved, unfinalized entry with no local driver means a takeover driver on another host decided T. The redundant
+> driver arises only while that driver is still finalizing and a prepare reaches the leader. It costs one Paxos round
+> and one idempotent run of the finalizers. The same trigger is the fast recovery path when that remote driver dies:
+> without it, recovery waits for a holder's Tx to go idle past `txHeartbeatTimeout` (`Store.heartbeat`; client and
+> learn-only prepares do not count as activity, `Tx.receivePrepare`). F10, which made the duplicate worse, is fixed
+> (Ruling 30).
 
 > **Verification 2026-11-09: OPEN (not verified). Severity: stale-replica.** Not re-derived.
 > *Fix sketch:* Add a test.

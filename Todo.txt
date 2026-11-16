@@ -54,7 +54,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.2  R-F16: start a leader driver only when the status cache has no outcome (not merely notFinalized).      [S]
 5.3  Rebuild F7: router.markOffline for a T12 rebuild on a new device, clearOffline on promotion.           [S]
 5.4  P-F12: send Accepts as soon as the new round's quorum is reached. P-F14: save the Tx when late object
      data is adopted. P-F15: delete or wire up the unused receiveTxPrepare.                                  [S]

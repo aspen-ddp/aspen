@@ -276,7 +276,8 @@ class Store(val storageDeviceId: StorageDeviceId,
         // client's prepare once the clocks catch up. The client's retransmission starts the driver then. Nor is one
         // started below the store's forget floor for a transaction it does not hold: the Frontend refuses the prepare
         // (or ignores it, its finalized outcome cached), and a driver could only run rounds with stores
-        // that may have forgotten the transaction
+        // that may have forgotten the transaction. An outcome cached but not finalized is driven on purpose (R-F16):
+        // its deciding driver ran on another host, and if it died this takes over without waiting for an idle Tx
         val refused = frontend.belowForgetFloor(m.txd) && !frontend.transactions.contains(m.txd.transactionId)
         if (notFinalized && m.txd.primaryObject.poolId == storeId.poolId && m.txd.designatedLeaderUID == storeId.poolIndex
             && !frontend.startsTooFarAhead(m.txd) && !refused) {

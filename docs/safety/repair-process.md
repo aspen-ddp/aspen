@@ -869,7 +869,7 @@ opportunistic rebuild, deletion and the completion gate are unchanged.
 | Id | Status | Reason | Evidence |
 |---|---|---|---|
 | RP-N4 | **closed** 2026-11-14 (Todo 2.9; was narrowed: the horizon leaves only never-saw stores, and the forget-floor gate makes their reconcile follow the late apply) | The entry still outlives the store's own late application of T until the scan, but a store that forgot T on a `TxFinalized` listing it, or applied T through the entry, holds an applied stub and applies nothing on a replay's commit. The window stays open only at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) | `Tx.scala:642-648,998-1000`; `StoreRepairer.scala:322` |
-| RP-N3 | unchanged (cost added) | Each such entry also keeps a stub in the device CRL until the scan (RP-N6; since 2026-11-15, until T is past the horizon plus the expiry margin) | `Frontend.scala:395-409` |
+| RP-N3 | **fixed** 2026-11-15 (Todo 4.7; was unchanged, cost added) | The UnackedCommits pass skips objects the same scan's ErrorTree pass completed at or after the entry's timestamp (13.5). Each such entry also keeps a stub in the device CRL until the scan (RP-N6; since 2026-11-15, until T is past the horizon plus the expiry margin) | `Frontend.scala:395-409` |
 | RP-N5 | unchanged (REFUTED stands) | The scan still skips an entry while the store holds T live; the skipped entry now also counts as seen, so its stub is kept | `StoreRepairer.scala:273-278` |
 | F7 | unchanged | Entry deletion is still untracked; the stub drop that follows it is a store-local CRL write | `StoreRepairer.scala:322` |
 | F8, F9 | unchanged (load larger) | One point lookup per orphan candidate per scan (RP-N7); a timed-out scan's background walk still runs its orphan pass against the DeferralState it started with, which `RepairService` has replaced, so it drops only stubs that state already suspected: two successful scans' evidence either way (each drop also checked by a lookup) | `StoreRepairer.scala:187-200`; `RepairService.scala:195-199` |
@@ -1230,6 +1230,14 @@ dependency is real but sound. Confidence: low.
 * **RP-N3 (capacity; CONFIRMED).** Every UnackedCommits entry is reconciled object by object
   (`StoreRepairer.scala:246-261`) even when the same (store, object) also has an ErrorTree entry, as it does for a silent
   store: twice the snapshots, reads and installs per missed object. See transaction-recovery R-N4 for growth.
+  *2026-11-15 (Todo 4.7): FIXED.* A scan records each object its ErrorTree pass completes (a reconcile passing the
+  completion gate, or a proven deletion) with the entry's `missedTimestamp`. The UnackedCommits pass treats an object
+  recorded at or after the entry's timestamp as complete, with no allocation-tree read, snapshot or reconcile
+  (`StoreRepairer.repairUnackedObjects`). This is sound because that completion means the store's copy matched a read
+  at least that new, or the object is gone, which is all the entry needs of it; object timestamps never decrease. The
+  entry's own `holdsTransaction` and `mayJoinTransaction` checks still run first, and a mark left deferred, or one
+  for an older miss, does not stand in. A silent voter's entry now costs its delete only (the entry count is
+  transaction-recovery R-N4's residual).
 * **RP-N4 (resurrection window; PLAUSIBLE).** An entry outlives the store's own late application of T until the scan
   deletes it (`deleteEntryIfUnchanged`, `StoreRepairer.scala:262-266`). Meanwhile a late commit of a replay applies T's
   writes in pools where T has no pin of its own there again: blind or `replaySafe` writes, ABA `DoesNotExist` inserts,

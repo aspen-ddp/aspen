@@ -223,9 +223,19 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     val deferred = AtomicInteger(0)
     val unackedSeen = AtomicInteger(0)
     private var touched = Set[Key]()
+    private var completed = Map[ObjectId, HLCTimestamp]()
 
     def touch(keys: Iterable[Key]): Unit = synchronized { touched ++= keys }
     def touchedKeys: Set[Key] = synchronized(touched)
+
+    /** The errorTree pass completed the store's work on `id` up to `missedTimestamp`: its copy now matches a read at
+      * least that new, or the object was proven deleted and dropped
+      */
+    def recordCompleted(id: ObjectId, missedTimestamp: HLCTimestamp): Unit = synchronized:
+      if completed.get(id).forall(_ < missedTimestamp) then completed = completed.updated(id, missedTimestamp)
+
+    /** The newest missedTimestamp up to which this scan's errorTree pass completed `id`, if it did */
+    def completedAt(id: ObjectId): Option[HLCTimestamp] = synchronized(completed.get(id))
     def result: ScanResult = ScanResult(seen.get, repaired.get, deferred.get, unackedSeen.get)
 
   /** Scans the store once. `control` cancels it (RepairService, on its deadline): a cancelled scan starts no further
@@ -395,6 +405,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
 
         def completed(complete: Boolean): Future[Unit] =
           if complete then
+            // Done whether or not the delete below succeeds: the UnackedCommits pass need not repeat it (RP-N3)
+            counts.recordCompleted(objectId, errorEntry.missedTimestamp)
             deferral.clear(entryKey)
             deleteIfStillOwned(storeId, counts, pool.errorTree, value.revision, key).map: deleted =>
               if deleted then counts.repaired.incrementAndGet() else counts.deferred.incrementAndGet()
@@ -447,6 +459,11 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * RefcountUpdate is traceless, so a store that missed it gets an entry before AllocationFinalizationAction records
     * the allocation, and an object absent from the allocation tree meanwhile is live. A younger one is left for a
     * later pass. The entry is deleted once every object is complete.
+    *
+    * An object this scan's errorTree pass already completed at a missedTimestamp at or after the entry's is complete
+    * without another read (repair-process RP-N3): the store's copy matched a read that new (the completion gate), or
+    * the object was proven deleted, which is all the entry asks of it. The marker marks every store that sent no
+    * TxCommitted, so a silent voter's entry usually costs only its delete.
     */
   private def repairUnackedEntry(pool: StoragePool, storeId: StoreId, policy: RepairPolicy,
                                    deferral: DeferralState, counts: Counts)
@@ -485,18 +502,22 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       val completed = entryKeys.foldLeft(Future.successful(true)): (f, objectEntry) =>
         val (ptr, entryKey) = objectEntry
         f.flatMap: allComplete =>
-          pool.allocationTree.get(Key(ptr.id.toBytes)).flatMap:
-            case None if errorEntryMayBeDeleted(value.timestamp, HLCTimestamp.now,
-                                                policy.minErrorEntryAgeForDeletion) =>
-              repairAbsent(storeId, ptr, entry.timestamp, entryKey, policy, deferral)
-                .map(complete => allComplete && complete)
-            case None =>
-              logger.debug(s"Deferring repair of ${ptr.id} on $storeId: absent from the allocation tree but its " +
-                           s"UnackedCommits entry is too recent to treat as a deletion")
-              Future.successful(false)
-            case Some(_) =>
-              repairUpdate(storeId, ptr, entry.timestamp, entryKey, policy, deferral, allowProof = true)
-                .map(result => allComplete && result.complete)
+          if counts.completedAt(ptr.id).exists(_ >= entry.timestamp) then
+            logger.debug(s"UnackedCommits entry of $txid on $storeId: ${ptr.id} was repaired by its errorTree entry")
+            Future.successful(allComplete)
+          else
+            pool.allocationTree.get(Key(ptr.id.toBytes)).flatMap:
+              case None if errorEntryMayBeDeleted(value.timestamp, HLCTimestamp.now,
+                                                  policy.minErrorEntryAgeForDeletion) =>
+                repairAbsent(storeId, ptr, entry.timestamp, entryKey, policy, deferral)
+                  .map(complete => allComplete && complete)
+              case None =>
+                logger.debug(s"Deferring repair of ${ptr.id} on $storeId: absent from the allocation tree but its " +
+                             s"UnackedCommits entry is too recent to treat as a deletion")
+                Future.successful(false)
+              case Some(_) =>
+                repairUpdate(storeId, ptr, entry.timestamp, entryKey, policy, deferral, allowProof = true)
+                  .map(result => allComplete && result.complete)
 
       completed.flatMap: allComplete =>
         if allComplete then

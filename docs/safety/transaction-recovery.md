@@ -300,7 +300,7 @@ the entry is about).
   store pointer, which is what a repair compares against (`encodeErrorEntry`, `:203`).
 * **T-M2** Every store that may hold a counted saved commit vote and sent no `TxCommitted` has an UnackedCommits entry
   keyed `(poolIndex, txid)`, written in the same batch (so atomically with that batch's ErrorTree entries), and after
-  every other finalization action of T (Ruling 8). Entries are one per (store, transaction) and never merge (R-N4).
+  every other finalization action of T (Ruling 8). Entries are one per (store, transaction) and never merge (R-N4, narrowed: repair no longer reconciles them twice).
 * A store that applied durably but whose `TxCommitted` was late/lost is still marked (a harmless extra repair pass:
   reconcile is exact and a store already at the committed state is left alone, `server/store/Reconcile`).
 * The scan side (repair-process.md): `StoreRepairer.scan` skips UnackedCommits entries for transactions the store still
@@ -771,7 +771,7 @@ Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding 
 |---|---|---|---|
 | R-N1 | **closed** 2026-11-14 (was narrowed) | Todo 2.9: under the horizon only a store that never saw T can hold a replay's Tx, so of the residual below only R-N9 remains. Before: a store that forgot T on a `TxFinalized` listing it in `owed`, applied T through its entry, or found its entry through the case-3 lookup holds an applied stub and applies nothing on a replay's commit, late or not. The R-N1 quorum scenario is tested end to end (ReplayIntegrationSuite "a replay at a pool whose stores all acknowledged late leaves every store unchanged"). Remaining: stores with an entry and no stub: the self-healing minority that never saw T (R-N9), a second driver's entries (R-N7, narrowed by Ruling 7), and a lost `TxFinalized` after a re-run finalizer (R-N6) | `Tx.scala:642-648,935-936,984-1007,1078-1092`; `Frontend.scala:768-778` |
 | R-N3 | **narrowed** 2026-11-15 (Todo 4.4; was unchanged, widened slightly). R-N10 **fixed** the same day | The case-3 lookup also depends on the metadata group, but holds no locks: a committed, applied Tx stays in memory (status cache not yet finalized) until the lookup answers or a non-late `TxFinalized` arrives (R-N10) | `Tx.scala:990-997`; `Frontend.scala:484-494` |
-| R-N4 | unchanged (cost added) | Each entry for a store that forgets T on a listing `TxFinalized` now also costs one stub in the device CRL, until T is past the horizon plus the expiry margin (2026-11-15, Todo 4.6; was until the scan dropped it, repair-process RP-N6) | `Frontend.scala:395-409` |
+| R-N4 | **narrowed** 2026-11-15 (Todo 4.7; was unchanged, cost added) | A repair scan no longer reconciles an entry's objects that its ErrorTree pass already completed (repair-process RP-N3, fixed), so a silent voter's entry costs one marker batch slot, one delete and one stub. Entries stay one per (store, T): the recovered-vote lookup and the 2.8 coverage baseline need that key. Before: each entry for a store that forgets T on a listing `TxFinalized` now also costs one stub in the device CRL, until T is past the horizon plus the expiry margin (2026-11-15, Todo 4.6; was until the scan dropped it, repair-process RP-N6) | `Frontend.scala:395-409` |
 | R-N6 | **narrowed** (2026-11-14: to the orphan allocation entry, Todo 5.5; the marker part is FIXED, R-N1's re-arming is closed by the horizon) | The re-run marker's entries come with a non-late `TxFinalized` listing them; stores with no Tx write stubs (`Frontend.scala:763-773`), so the re-created entries no longer re-arm R-N1 unless that `TxFinalized` is lost at a store. The ErrorTree regression and the orphan allocation entry are unchanged | as cited |
 | F2 / R-N2 | unchanged | Still no failure path: a write that gives up never completes the action, so a driver relying on its own finalizer never finalizes (`MissedUpdateFinalizationAction.scala:140-146`). A second driver finalized by another's `TxFinalized` lists its planned set whatever its write's outcome (Ruling 7; R-N7 variant 2 closed) | `TransactionDriver.scala:411-430` |
 | F3 | unchanged | A live commit voter still accepts an abort at once; the late-commit half is now covered by stubs too | `Tx.scala:176-178` |
@@ -811,8 +811,8 @@ That is sufficient:
 - A recovered uncounted voter either learns the commit from its peers' caches and applies it, or is discarded past
   the horizon and relies on its mark. While it waits it holds its locks: that is liveness (R-N3; since Todo 4.4 it
   is driven meanwhile).
-- R-N4 (Todo 4.7) may narrow entries further, but it must keep one entry per unacknowledged counted voter, because
-  this argument depends on it.
+- R-N4 (Todo 4.7, narrowed 2026-11-15) kept one entry per unacknowledged counted voter, which this argument
+  depends on, and cut only the cost of each entry at repair.
 
 > **Verification 2026-11-09: CONFIRMED. Severity: liveness.** RegisteredTransactionFinalizerFactory.create does getType(...).get (server/RegisteredTransactionFinalizerFactory.scala, create); it runs inside TransactionDriver.onResolution after `resolved = true` and before `finalizer =` and before queueTxMessages (TransactionDriver.scala:471-520), the exception escapes the handler; periodic TxResolved (SimpleTransactionDriver.scala:42-47) still tells stores, but no finalizer ever exists. Needs a host lacking a registered type (version skew, partial --load-jars).
 > *Fix sketch:* Catch creation failure, leave resolved=false so the driver retries, and surface an error; or refuse to drive txds with unknown types.
@@ -1242,6 +1242,20 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 > duplicating the ErrorTree entry for the same object (`StoreRepairer.scala:246-261`).
 > *Fix sketch:* write the entry only when the transaction is traceless or the store voted but its ErrorTree mark would
 > not suffice; or merge entries per store.
+>
+> **2026-11-15 (Todo 4.7): NARROWED.** The duplicate repair is gone: a scan's UnackedCommits pass treats an object as
+> done when the same scan's ErrorTree pass completed it at a `missedTimestamp` at or after the entry's timestamp
+> (repair-process RP-N3, fixed). The marker marks every store without `TxCommitted`, so a silent voter's objects always
+> carry such a mark, and its entry now usually costs only its delete. Neither fix sketch is taken. Writing fewer
+> entries would break the 2.8 coverage baseline (one entry per unacknowledged counted voter). Merging per store would
+> break the point lookup a recovered vote and the stub logic make (`UnackedCommitEntry.key(store, txid)`), and would
+> need a lookup redesign. *Residual:* the entry count is still one per unacknowledged counted voter per transaction (one
+> per silent store when the voters are unknown). Each entry still costs a marker batch slot (at most half the 256-entry
+> cap, the rest shared with its ErrorTree marks), one tracked delete transaction at repair, and one CRL stub until the
+> horizon plus the expiry margin. Tests: StoreRepairerSuite "a UnackedCommits entry whose objects the errorTree pass
+> repaired is deleted without reconciling them again", "... whose object's errorTree repair was deferred reconciles
+> the object itself", "an errorTree mark older than a UnackedCommits entry does not stand in for the entry's
+> reconcile".
 
 > **R-N5. Verdict: REFUTED (harmless).** The finalizer's cancel race (marker `execute` outside the lock,
 > `RegisteredTransactionFinalizerFactory.scala:39-42,56-58`) can let a cancelled marker write marks. Cancellation comes

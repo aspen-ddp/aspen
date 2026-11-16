@@ -1189,6 +1189,85 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       storeKeys(2, kvPtr) should not contain k1
       storeKeys(2, kvPtr) shouldBe Set(k0)
 
+  // A silent voter has an errorTree mark for every object its UnackedCommits entry names (the marker marks every store
+  // that sent no TxCommitted). The errorTree pass's completed repair already covers the entry, so the UnackedCommits
+  // pass does not read and reconcile the object a second time (repair-process RP-N3)
+  test("a UnackedCommits entry whose objects the errorTree pass repaired is deleted without reconciling them again"):
+    @volatile var target: Option[ObjectId] = None
+    val reconciles = java.util.concurrent.atomic.AtomicInteger(0)
+    val repairer = StoreRepairer(client, SeamTarget(), testingOnlyBeforeReconcile = (s, ptr) =>
+      if s == sid(2) && target.contains(ptr.id) then reconciles.incrementAndGet()
+      Future.unit)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
+      _ = target = Some(kvPtr.id)
+      txid <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
+      marks <- errorEntries(2)
+      entries <- unackedEntries(2)
+      result <- pass(2, repairer, DeferralState())
+      remainingMarks <- errorEntries(2)
+      remainingEntries <- unackedEntries(2)
+    yield
+      marks should not be empty
+      entries shouldBe List(UnackedCommitEntry.key(sid(2), txid))
+      remainingMarks shouldBe empty
+      remainingEntries shouldBe empty
+      result.unackedSeen shouldBe 1
+      reconciles.get shouldBe 1
+      storeKeys(2, kvPtr) shouldBe Set(k0)
+
+  test("a UnackedCommits entry whose object's errorTree repair was deferred reconciles the object itself"):
+    @volatile var target: Option[ObjectId] = None
+    val reconciles = java.util.concurrent.atomic.AtomicInteger(0)
+    val seam = SeamTarget()
+    val repairer = StoreRepairer(client, seam, testingOnlyBeforeReconcile = (s, ptr) =>
+      if s == sid(2) && target.contains(ptr.id) then reconciles.incrementAndGet()
+      Future.unit)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1))))
+      _ = target = Some(kvPtr.id)
+      _ <- missedByCrashedVoter(2, kvPtr)(kvUpdate(kvPtr, List(Delete(k1))))
+      _ = seam.lockedKeys = Map(kvPtr.id -> Set(k1))
+      _ <- pass(2, repairer, DeferralState())
+      deferredReconciles = reconciles.get
+      marks <- errorEntries(2)
+      entries <- unackedEntries(2)
+      _ = seam.lockedKeys = Map()
+      _ <- scanUntilQuiet(2, repairer)
+    yield
+      withClue("a mark left deferred does not stand in for the entry's own reconcile: "):
+        deferredReconciles shouldBe 2
+        marks should not be empty
+        entries should not be empty
+      storeKeys(2, kvPtr) shouldBe Set(k0)
+
+  test("an errorTree mark older than a UnackedCommits entry does not stand in for the entry's reconcile"):
+    @volatile var target: Option[ObjectId] = None
+    val reconciles = java.util.concurrent.atomic.AtomicInteger(0)
+    val repairer = StoreRepairer(client, SeamTarget(), testingOnlyBeforeReconcile = (s, ptr) =>
+      if s == sid(2) && target.contains(ptr.id) then reconciles.incrementAndGet()
+      Future.unit)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      _ = target = Some(kvPtr.id)
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
+      // An entry for a transaction that started after the marked miss
+      txid = TransactionId(UUID.randomUUID())
+      later = MissedUnackedCommit(sid(2), txid, UnackedCommitEntry(HLCTimestamp.now, None, List(kvPtr)))
+      _ <- pump(new MissedUpdateMarker(client).mark(Nil, List(later)), deadline())
+      _ <- settle()
+      _ = reconciles.set(0)
+      _ <- pass(2, repairer, DeferralState())
+      marks <- errorEntries(2)
+      entries <- unackedEntries(2)
+    yield
+      withClue("the mark's repair completes, and the entry still reconciles the object: "):
+        marks shouldBe empty
+        reconciles.get shouldBe 2
+      // No read reaches the entry's timestamp, so it stays
+      entries shouldBe List(UnackedCommitEntry.key(sid(2), txid))
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1)
+
   // A replay may create a Tx for T at a store whose floor T is still above, after the scan's holdsTransaction check,
   // and apply T late through the entry once its reconcile is done. Deleting the entry then would leave that apply
   // unrepaired (transaction-recovery R-N9), so the entry waits until no new Tx for T can appear

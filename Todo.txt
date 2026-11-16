@@ -48,12 +48,6 @@ PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.7  UnackedCommits growth: R-N4, RP-N3                                                                     [M]
-     There is one entry per (store, transaction) for every silent voter, never merged, and each is reconciled in
-     addition to the ErrorTree entry. Merge entries per store, and skip in phase B objects already repaired in
-     phase A. The baseline from 2.8 (transaction-recovery F13/F15, closed by design) still holds: every
-     unacknowledged counted voter must remain covered by an entry, merged or not.
-
 4.8  Rebuild liveness: Rebuild F5 residual, F11, F12, F15                                                   [S-M]
      F5: pass failures other than join races wait the hourly device check. Add a backoff self-recheck.
      F11: a flip failure re-enters start() through recheckAll. Exclude the device.

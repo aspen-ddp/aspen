@@ -56,6 +56,14 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private var rebuildFailures: Map[StoreId, Int] = Map()
   private var scheduledRebuildRetries: Set[StoreId] = Set()
 
+  // Rebuild F7: stores this class marked offline in the router for a Rebuilding entry, by device. A store rebuilt on
+  // a device that never held it is not loaded, so without the mark this host would answer UnknownStore/StoreNotFound
+  // for it, and readers would re-send at once, for the whole rebuild.
+  private var silenced: Map[StoreId, StorageDeviceId] = Map()
+
+  /** The stores marked offline for their Rebuilding entry */
+  private[server] def silencedStores: Set[StoreId] = silenced.keySet
+
   /** The stores with a backoff re-check of their device scheduled */
   private[server] def rebuildRetriesScheduled: Set[StoreId] = scheduledRebuildRetries
 
@@ -190,6 +198,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  device at once (systemic-loss-protection.md S3).
    */
   def startRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+    // Silent from the first reconcile that sees the entry, a store queued for a slot included (Rebuild F7)
+    if !silenced.contains(storeId) then
+      ctx.router.markOffline(storeId)
+      silenced += storeId -> local.storageDeviceId
     if !rebuildingStores.contains(storeId) &&
        rebuildingStores.size + droppingCrlState.size < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId) &&
@@ -265,6 +277,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               try
                 // Loaded only once the marker is gone, or tryLoadStore leaves it offline; a failed removal is
                 // retried by the reconcile, which finds the entry Active
+                // The load's install clears the offline mark; a store not loaded stays silent
+                unsilence(storeId, clear = false)
                 if clearRebuildCompleteMarker(local.devicePath / storeId.directoryName) then
                   ctx.loadStoreById(local.storageDeviceId, storeId)
               finally
@@ -274,6 +288,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
             case Success(RebuildOutcome.AdoptOffline) =>
               try
+                unsilence(storeId, clear = false)
                 keepRebuiltStoreOffline(local, storeId)
               finally
                 settledOutcome()
@@ -282,6 +297,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
             case Success(RebuildOutcome.Discard) =>
               try
+                unsilence(storeId, clear = true)
                 ctx.devices.discardStoreDirectory(storeId, local.storageDeviceId,
                   "The tree does not say this device owns a rebuilt store")
               finally
@@ -293,6 +309,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               // The device is another host's now; the copy is left for it. Only the other
               // devices are worth re-checking: this one is not ours to reconcile.
               try
+                // Stays silent: a device not loaded here has its stores silenced by the reconcile anyway
+                unsilence(storeId, clear = false)
                 logger.info(s"Rebuild of store $storeId finished after device " +
                             s"${local.storageDeviceId} moved to another host. Leaving it to that host")
               finally
@@ -321,6 +339,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           // Its entry left this device (abandonUnlisted). This device is checked once more: if the entry is
           // still gone, that check deletes the staging copy; if it reads Rebuilding after all, the rebuild resumes
           try
+            unsilence(storeId, clear = true)
             logger.info(s"Rebuild of store $storeId on device ${local.storageDeviceId} abandoned: the store is " +
                         "no longer being rebuilt here")
           finally
@@ -370,6 +389,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           abandonedRebuilds += storeId
           sr.cancel()
 
+    // A store queued for a slot whose entry left before its rebuild started (Rebuild F7)
+    silenced.foreach: (storeId, deviceId) =>
+      if deviceId == local.storageDeviceId && !listed(storeId) && !rebuildingStores.contains(storeId) then
+        unsilence(storeId, clear = true)
+
     val stagingRoot = local.devicePath / RebuildingStore.RebuildDirectory
     val staged =
       try
@@ -385,6 +409,15 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                       s"device ${local.storageDeviceId}")
           try os.remove.all(dir)
           catch case t: Throwable => logger.warn(s"Failed to delete $dir. Retrying at a later check. Error: $t")
+
+  /** Forgets the Rebuild F7 offline mark of `storeId`. With `clear`, for a store the tree no longer puts here, the
+   *  router mark is removed too, so the host answers UnknownStore for it again, unless a device's offlineStores
+   *  holds the store: that mark belongs to another path (a shutdown, transfer or lost CRL). */
+  private def unsilence(storeId: StoreId, clear: Boolean): Unit =
+    if silenced.contains(storeId) then
+      silenced -= storeId
+      if clear && !ctx.devices.devices.values.exists(_.offlineStores.contains(storeId)) then
+        ctx.router.clearOffline(storeId)
 
   /** Checks `deviceId` again after a backoff, so a store whose rebuild pass or flip failed is retried without waiting
    *  for the periodic sweep (an hour) and without spinning (Rebuild F5, F11). The first delay is

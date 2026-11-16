@@ -32,6 +32,10 @@
 - Placement alarms (Rebuild F12): `REBUILD CO-LOCATED` (the selection had to share a device with the pool),
   `REBUILD OUT OF SPACE`, and a warning for a store with no recorded usage. The remedy for either is re-placement,
   `transfer-store` on the Rebuilding store (`server/host/CLAUDE.md`)
+- Silence (Rebuild F7): `StoreRebuilds.startRebuild` marks a store offline in the router on every reconcile that
+  sees its Rebuilding entry, queued or running (`silenced`), so its host drops its messages rather than answering
+  UnknownStore. An adopted store's load clears the mark; `Discard`, a cancel for an entry that left the device, and
+  `abandonUnlisted` for a queued one clear it unless a device's `offlineStores` holds it; other outcomes keep it
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
   `StoreRebuildFactory.createRebuild`)
 - A promoted bootstrap-pool store may hold stale copies of the bootstrap pool's own ErrorTree/UnackedCommits nodes

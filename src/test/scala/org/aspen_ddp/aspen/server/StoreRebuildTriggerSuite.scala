@@ -59,6 +59,41 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       factory.created.map(_.storeId).toList should be(List(storeN(0)))
       factory.created.head.storageDeviceId should be(deviceA)
 
+  atest("a store rebuilding on a device that never held it is silent, queued ones too (Rebuild F7)"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+
+    val armed = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    armed.success(deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1)))))
+
+    for
+      _ <- yieldUntil(factory.created.nonEmpty)
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+    yield
+      factory.created.map(_.storeId).toList should be(List(storeN(0)))
+      // Dropped rather than answered UnknownStore: the running rebuild and the one waiting for a slot
+      host.control.router.offlineStores should contain allOf (storeN(0), storeN(1))
+
+  atest("a failed rebuild pass keeps its store silent until the retry (Rebuild F7)"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+
+    val armed = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    armed.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
+
+    for
+      _ <- yieldUntil(factory.created.nonEmpty)
+      _ = factory.created.head.promise.failure(new Exception("disk on fire"))
+      _ <- yieldUntil(host.control.rebuilds.rebuildRetriesScheduled.contains(storeN(0)))
+    yield
+      host.control.router.offlineStores should contain(storeN(0))
+
   atest("a rebuild already running is not started twice"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
@@ -382,6 +417,9 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).loadStoreByIdRequests.exists(_._1 == realDeviceId) should be(false)
       // Store directory should be discarded
       os.exists(storePath) should be(false)
+      // Nothing puts the store here any more, so its offline mark is gone (Rebuild F7)
+      host.control.router.offlineStores should not contain storeN(0)
+      host.control.rebuilds.silencedStores should not contain storeN(0)
 
   atest("a permanently failed flip is logged and releases its slot"):
     val hostRoot = newHostDir()
@@ -529,3 +567,37 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(staging(2)) should be(false)
       // Not restarted: nothing lists it here
       factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(1)))
+
+  atest("a rebuild whose entry leaves its device, running or queued, is no longer silenced (Rebuild F7)"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+    val other = storeN(2)
+
+    val first = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    first.success(deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1)), rebuilding(other))))
+
+    for
+      _ <- yieldUntil(factory.created.size == 1)
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+      silencedAtStart = host.control.router.offlineStores
+      // Stores 0 (running) and 1 (queued) re-placed elsewhere; store 2 still queued here
+      reconciled = recorded(host).armLookup(deviceA)
+      _ = host.control.reconciler.checkStorageDevice(deviceA)
+      _ = reconciled.success(deviceState(deviceA, Map(rebuilding(other))))
+      _ <- yieldUntil(factory.created.head.cancelled)
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+      queuedCleared = !host.control.router.offlineStores.contains(storeN(1))
+      runningKept = host.control.router.offlineStores.contains(storeN(0))
+      _ = recorded(host).armLookup(deviceA).success(deviceState(deviceA, Map(rebuilding(other))))
+      _ = factory.created.head.promise.failure(RebuildingStore.RebuildCancelled(storeN(0)))
+      _ <- yieldUntil(!host.control.router.offlineStores.contains(storeN(0)))
+    yield
+      silencedAtStart should contain allOf (storeN(0), storeN(1), other)
+      queuedCleared should be(true)
+      // Still silent while its cancelled rebuild winds down
+      runningKept should be(true)
+      host.control.router.offlineStores should not contain storeN(0)
+      host.control.router.offlineStores should contain(other)

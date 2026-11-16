@@ -295,8 +295,8 @@ before the rebuild (section 4.3), and the in-place rebuild's old directory delet
 | Case | Offline mark set? | Behaviour |
 |---|---|---|
 | In-place rebuild after T1-T11 | yes (`StoreLoader.scala:78`, `StoreRebuilds.scala:356,379`, `DeviceDiscovery` awaiting marks for adoption) | messages dropped; peers retransmit/time out |
-| Rebuild on a destination device after T12 | **no** | `startRebuild` only gossips `StoreOffline` (`StoreRebuilds.scala:222`); the router never marks it offline, so the host answers `TxUnknownStore` to tx messages and `ReadError.StoreNotFound` to reads (`StoreRouter.scala:142-163`) |
-| Host restart during a rebuild (either) | in-place: yes through the marker/offline path; destination: no | same as the rows above |
+| Rebuild on a destination device after T12 | yes (F7 fixed 2026-11-15: `StoreRebuilds.startRebuild` marks it on every reconcile that sees the Rebuilding entry, queued or running) | messages dropped. Before the fix the host answered `TxUnknownStore` and `ReadError.StoreNotFound` |
+| Host restart during a rebuild (either) | in-place: yes through the marker/offline path; destination: yes from the device's first reconcile | same as the rows above; a destination store answers unknown until that reconcile |
 | Device unloaded or not yet loaded | `startDeviceCheck` marks all of the device's stores offline (`DeviceReconciler.scala:482`) | dropped |
 
 Receiver behaviour on "unknown": a transaction driver drops its cached store mapping (`server/transaction/
@@ -774,6 +774,16 @@ objects' locks on S1/S2. The code comment at `:285` itself calls the rule not sm
 [paxos-transactions.md](paxos-transactions.md).
 
 **Verification: CONFIRMED (logic read at `TransactionDriver.scala:257-298`), severity liveness.** For Replication(3,2) with one commit vote, one abort vote and the third store silent: `nReplies (2) >= writeThreshold`, `nReplies != width`, `nCommitVotes (1) < writeThreshold`, `width - nAbortVotes (2) >= writeThreshold` set `cantAttempt` and the driver returns; nothing else re-triggers a decision except a NACK or the silent store's vote. Applies to any silent third store (offline as well as rebuilding), and the locks taken by the commit voters remain until it answers, so the object stays blocked for the whole rebuild. Fix sketch: after a bounded wait, propose abort when the prepare quorum reports no accepted value (a legitimate Paxos proposal), so a silent store cannot hold the commit voters' locks.
+
+> **F7 FIXED (2026-11-15).** `StoreRebuilds.startRebuild` marks the store offline in the router
+> (`router.markOffline`) on every reconcile that finds its Rebuilding entry, before the slot check, so a store queued
+> behind `maxConcurrentRebuilds` is silent too. The mark goes with the outcome. An adopted store's load installs it,
+> which clears the mark, and a store that does not load stays silent. `AdoptOffline` and `NotOwned` leave it offline.
+> `Discard`, a cancel because the entry left the device, and a queued store whose entry left
+> (`abandonUnlisted`) clear it, unless a device's `offlineStores` holds the store for another path. A failed pass
+> keeps it until the retry. Tests: `StoreRebuildTriggerSuite` "(Rebuild F7)". Residual: after a host restart, the
+> store answers unknown until the device's first reconcile lookup returns. Nothing on disk marks a staging directory
+> at startup. The window is short and the answer only costs a re-send.
 
 **F7 (Medium-Low) A rebuild on a new device answers "unknown store" instead of staying silent.**
 Scenario: T12 rebuild on host H2. `startRebuild` gossips `StoreOffline` but never calls `router.markOffline`

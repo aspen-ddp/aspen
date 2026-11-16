@@ -325,6 +325,17 @@ Full storage devices: keep stores serving and route around them system-wide
     (Todo 1.8, CRL F7) must freeze the device's writes, not mark the device failed. Out of space is never a fail-stop
     or a lost-store declaration (see "System-level protection against correlated lost store declarations").
 
+Automate re-placement of a rebuild whose destination is full (revisit, from Todo 4.8 / Rebuild F12, 2026-11-15)
+  - A rebuild that hits ENOSPC latches an abort and logs `REBUILD OUT OF SPACE`. It is retried with a backoff but
+    stays on the full device until an operator runs `transfer-store` on the Rebuilding store
+    (`AspenClient.replaceRebuild`). The same manual step is the only remedy for a `REBUILD CO-LOCATED` placement.
+  - Revisit and automate: after repeated ENOSPC passes, select another device (`selectDeviceForRebuild`, excluding
+    the full one) and re-place the rebuild through the same one-transaction move. The old host's
+    `StoreRebuilds.abandonUnlisted` already cancels the abandoned rebuild and deletes its staging copy.
+  - Design points: how many failures before moving, and a bound on moves per store so it cannot ping-pong between
+    full devices. Who decides (the rebuilding host, or a Durable Task, which avoids cross-host races). Interaction
+    with the rebalancer and with "Operator alerts".
+
 Traceless commits follow-ups (minor, from the 2026-11-08 reviews):
 - TracelessCommits entries are one per transaction (not merged per object like ErrorTree entries), but only for
   commit voters that sent no TxCommitted (all silent stores when the driver did not count the votes), so an offline

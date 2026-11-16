@@ -152,7 +152,8 @@ declaration of a *device* as Failed; only the operator command (`client/AspenCli
 All automatic triggers rebuild the store **on the same device and host**: the pool entry already names it, so nothing
 in the pool changes (`StoreRebuilds.scala:440-447`). If the device itself is the problem (bad media) the rebuild
 writes onto the bad media; there is no automatic path from "store lost" to "move the store to another device". The
-only reassignment is the operator command.
+reassignments are operator commands: `fail-storage-device`, and since 2026-11-15 `transfer-store` on a Rebuilding
+store, which re-places its rebuild (F12).
 
 ### 4.2 Reassignment (T12)
 
@@ -173,7 +174,9 @@ Selection (`StorageDeviceSetState.selectRebuildDevice` `:398`): the failed devic
 hold other stores of the pool are soft-excluded (used only when nothing else exists, so two stores of a pool may share a
 device); the candidate must be Operational and have free space of at least the store's recorded usage
 (`StoragePoolState.getStoreUsageKey`, 0 if absent) minus space already promised (`incomingStores`). Selection failure
-(`AllocationError`) leaves the store on the tombstone; the task retries every poll.
+(`AllocationError`) leaves the store on the tombstone; the task retries every poll. Since 2026-11-15 (F12) a
+selection that falls back onto a device holding another store of the pool logs `REBUILD CO-LOCATED` at error, and an
+absent usage key is warned about.
 
 ### 4.3 The destructive prelude to every rebuild of a marked store
 
@@ -598,8 +601,9 @@ store was loaded and served while the tree said Rebuilding (F4, fixed 2026-11-14
 it offline).
 
 **FS14 Destination device runs out of space.** `isOutOfSpace` latches an abort, the pass fails, staging and checkpoint
-stay, the entry stays Rebuilding "until capacity is added" (`RebuildingStore.scala:288-294`). There is no
-re-placement; the failed-device task only places once (F12). Safe, not live.
+stay, the entry stays Rebuilding, and `REBUILD OUT OF SPACE` names the remedy. Since 2026-11-15 the operator can
+re-place it (`transfer-store` on the Rebuilding store, `AspenClient.replaceRebuild`); the old device's reconcile
+cancels the rebuild and deletes its staging copy (F12). Safe; live once an operator acts.
 
 **FS15 Destination device shut down or failed mid-rebuild.** Shutdown: cancel, resume later. Failed: copy discarded and
 the drain moves the Rebuilding entry again from the new tombstone. Safe.
@@ -858,6 +862,24 @@ needs a test with a persistently failing flip that leaves the lookup healthy.
 **Verification: PLAUSIBLE-low, not traced end to end.** Code as described at `StoreRebuilds.scala:263-276`; boundedness depends on the device lookup failing for a persistent flip error.
 
 **F12 (Medium) Placement can co-locate stores and cannot be revised.**
+
+> **FIXED 2026-11-15 (Todo 4.8), placement still manual.** Alarms: `selectDeviceForRebuild` logs `REBUILD CO-LOCATED`
+> at error when the soft exclusion falls back onto a device holding another store of the pool. It warns when the pool
+> records no usage for the store, so the size check is skipped. `REBUILD OUT OF SPACE` names the remedy.
+> Re-placement: `transfer-store` on a store whose entry is Rebuilding calls `AspenClient.replaceRebuild`. That is one
+> transaction, as `moveStore`: it removes the entry from the current device, writes a Rebuilding entry on the
+> destination, repoints the pool entry, and updates the radicle's bootstrap config for a bootstrap-pool store. It
+> refuses a non-Rebuilding store, the same device, a device that already lists the store, and a failed or
+> non-operational device, and it nudges both hosts. The old host's reconcile (`StoreRebuilds.abandonUnlisted`)
+> cancels a rebuild still running for a store no longer Rebuilding on that device and checks the device again on its
+> completion. It deletes a staging copy only when no rebuild is running, so a stale read cannot delete a live copy.
+> A completion that races the move gets `Discard`. An in-place `pending-delete/` copy is deleted once the store is
+> Active elsewhere (`clearPendingDeletes`). Tests: RebuildEndToEndSuite "a rebuild re-placed on another device moves
+> its device entry and its pool entry (Rebuild F12)"; StoreRebuildTriggerSuite "a rebuild whose entry leaves its
+> device is cancelled and its staging copy deleted (Rebuild F12)" (fails without the reconcile hook);
+> StorageDeviceSetIntegrationSuite "selectDeviceForRebuild raises the co-location alarm ...". **Residuals:**
+> re-placement is the operator's decision, prompted by the alarms; nothing moves a store automatically, and an
+> in-place rebuild never leaves suspect media unless an operator re-places it.
 `selectRebuildDevice` soft-excludes the pool's other devices (`StorageDeviceSetState.scala:398-412`), so a set with one
 other device puts two stores of one pool on it. `requiredSize` falls back to 0 when the usage key is absent
 (`:198-205`). After placement the destination is final: ENOSPC leaves the store Rebuilding "until capacity is added"

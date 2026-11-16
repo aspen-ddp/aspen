@@ -483,7 +483,8 @@ class RebuildingStore(client: AspenClient,
         abortCause = Some(err)
     logger.error(s"REBUILD OUT OF SPACE: store $storeId cannot fit on device " +
                  s"$storageDeviceId at $devicePath. The store will remain Rebuilding " +
-                 s"until capacity is added. Underlying error: $err")
+                 s"until capacity is added or it is re-placed on another device with transfer-store. " +
+                 s"Underlying error: $err")
 
   /** recordFailure keyed by an allocation-tree key rather than by an ObjectId.
    *

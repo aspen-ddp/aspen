@@ -48,14 +48,6 @@ PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.8  Rebuild liveness: Rebuild F5 residual, F11, F12, F15                                                   [S-M]
-     F5: pass failures other than join races wait the hourly device check. Add a backoff self-recheck.
-     F11: a flip failure re-enters start() through recheckAll. Exclude the device.
-     F12: placement can co-locate a pool's stores, and an ENOSPC destination is final. Alarm, and allow
-          re-placement.
-     F15: a permanently unreadable object blocks completion. Add an operator command that records the objects
-          as lost and lets the rebuild finish.
-
 4.9  Finalization stalls by design: R-N2, R-F14, 13.0b residual (NodeSizeExceeded on a tiny node)          [decide]
      Failing actions keep marks unwritten, with logged backoff. Ruling 8 forbids the marker running alone. Either
      accept and document it, or revisit Ruling 8. Add a metric or alarm for long-unfinalized transactions either

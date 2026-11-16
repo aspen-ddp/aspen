@@ -357,6 +357,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         entry.status == StorageDeviceState.StoreStatus.Rebuilding
       ).keys.toList.sortBy(_.poolIndex).foreach: storeId =>
         ctx.rebuilds.startRebuild(local, storeId)
+      // Rebuild work for stores no longer Rebuilding here (re-placed elsewhere, Rebuild F12)
+      ctx.rebuilds.abandonUnlisted(local, remote)
 
       //----------------------
       // Pending Deletes

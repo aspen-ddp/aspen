@@ -195,19 +195,32 @@ final case class StorageDeviceSetState(
             Future.failed(AllocationError(
               s"failedIndex $failedIndex out of range for pool ${poolId.uuid} (${poolState.stores.length} stores)"))
           else
-            val requiredSize = poolKvos.contents
+            val usage = poolKvos.contents
               .get(StoragePoolState.getStoreUsageKey(failedIndex))
               .map(vs => byte2long(vs.value.bytes))
-              .getOrElse(0L)
+            val storeId = StoreId(poolId, failedIndex)
+            if usage.isEmpty then
+              scribe.warn(s"Placing the rebuild of store $storeId without a size check: its " +
+                                                "pool records no usage for it. The destination may run out of space")
+            val requiredSize = usage.getOrElse(0L)
             val failedDevice = poolState.stores(failedIndex).storageDeviceId
-            val poolDevices = poolState.stores.map(_.storageDeviceId).toSet
+            // The other stores' devices: the failed one is the store's own
+            val poolDevices = poolState.stores.zipWithIndex.collect:
+              case (e, i) if i != failedIndex => e.storageDeviceId
+            .toSet
             selectRebuildDevice(
               requiredSize,
               failedDevice,
               poolDevices,
               client.getStorageDeviceSetState,
               id => freeSpaceOfOperational(client, id),
-              rng)
+              rng).map: chosen =>
+                // Rebuild F12: soft exclusion lets a set with too few devices co-locate the pool's stores
+                if poolDevices.contains(chosen) then
+                  scribe.error(s"REBUILD CO-LOCATED: store $storeId is placed on device " +
+                    s"${chosen.uuid}, which already holds another store of its pool, for want of any other device " +
+                    "with room. Losing that device loses both. Re-place it with transfer-store once a device is free")
+                chosen
       yield device
 
   /** Select a device within this set (at any level) to receive a store being migrated here.

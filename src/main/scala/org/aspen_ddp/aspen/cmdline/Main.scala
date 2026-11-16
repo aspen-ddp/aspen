@@ -2591,13 +2591,22 @@ object Main {
                               Future.successful(Left(
                                 f"Source and destination devices are the same " +
                                 f"(${targetDeviceIdStr}); nothing to transfer"))
-                            else if force then
-                              // An operator override. It skips TransferSafety and the post-start
-                              // rollback, so it can leave the pool below its redundancy floor.
-                              println("--force given: the transfer is not being checked for safety")
-                              client.transferStore(storeId, targetDeviceId).map(Right(_))
                             else
-                              safeStart
+                              client.getStorageDeviceState(sourceDeviceId).flatMap: source =>
+                                val rebuilding = source.stores.get(storeId)
+                                  .exists(_.status == StorageDeviceState.StoreStatus.Rebuilding)
+                                if rebuilding then
+                                  // Nothing is served from a store being rebuilt, so moving it cannot take the pool
+                                  // below its redundancy floor: its rebuild starts afresh on the target (Rebuild F12)
+                                  println(s"Store $storeName is being rebuilt: re-placing its rebuild on the target")
+                                  client.replaceRebuild(storeId, targetDeviceId).map(Right(_))
+                                else if force then
+                                  // An operator override. It skips TransferSafety and the post-start
+                                  // rollback, so it can leave the pool below its redundancy floor.
+                                  println("--force given: the transfer is not being checked for safety")
+                                  client.transferStore(storeId, targetDeviceId).map(Right(_))
+                                else
+                                  safeStart
     yield result
 
     Await.ready(f, Duration(30, SECONDS)).value.get match

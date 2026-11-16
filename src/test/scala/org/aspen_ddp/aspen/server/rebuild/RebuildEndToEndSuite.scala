@@ -74,6 +74,41 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       lostEntry should be(defined)
       restoredEntry should be(None)
 
+  atest("a rebuild re-placed on another device moves its device entry and its pool entry (Rebuild F12)"):
+    given ExecutionContext = executionContext
+    val failedId = StorageDeviceId.BootstrapStorageDeviceId
+    val storeId = StoreId(PoolId.BootstrapPoolId, 0.toByte)
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      // The store is Active: there is no rebuild to re-place
+      refusedActive <- client.replaceRebuild(storeId, net.thirdDeviceId).transform(Success(_))
+      _ <- client.failStorageDevice(failedId)
+      _ <- waitForTransactionsToComplete()
+      task <- taskForEnrolled(failedId)
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS), "task completion")
+      _ <- waitForTransactionsToComplete()
+      placed <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      from = placed.stores(storeId.poolIndex).storageDeviceId
+      to = if from == net.secondDeviceId then net.thirdDeviceId else net.secondDeviceId
+      refusedSame <- client.replaceRebuild(storeId, from).transform(Success(_))
+
+      _ <- client.replaceRebuild(storeId, to)
+      _ <- waitForTransactionsToComplete()
+      pool <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      fromState <- client.getStorageDeviceState(from)
+      toState <- client.getStorageDeviceState(to)
+      radicleConfig <- client.read(client.radicle)
+    yield
+      refusedActive.failed.get shouldBe a[AspenClient.StoreNotRebuilding]
+      refusedSame.failed.get shouldBe a[AspenClient.InvalidDestination]
+      fromState.stores.contains(storeId) should be(false)
+      toState.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      pool.stores(storeId.poolIndex).storageDeviceId should be(to)
+      pool.stores(storeId.poolIndex).hostId should be(toState.hostId)
+
   atest("a failed device's stores are reconstructed on a live device"):
     given ExecutionContext = executionContext
     val failedId = StorageDeviceId.BootstrapStorageDeviceId

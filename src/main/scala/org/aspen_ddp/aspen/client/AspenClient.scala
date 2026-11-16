@@ -4,6 +4,7 @@ import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateMarker, TransactionBuilder}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
+import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, IDAPolicy, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
@@ -495,6 +496,62 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
           case _ => throw new StoreNotRebuilding(storeId)
 
     fStaged.map(sendBestEffortHostMessage)
+
+  /** Re-places a store being rebuilt onto `destinationId` (Rebuild F12): its rebuild there starts afresh, and the
+   *  one on its current device is abandoned. The remedy for a destination that is out of space, co-locates the pool's
+   *  stores, or sits on suspect media. One transaction removes the store's Rebuilding entry from its current device,
+   *  writes a Rebuilding entry on the destination, and repoints the pool (and, for a bootstrap-pool store, the
+   *  radicle's bootstrap config), as FailedStorageDeviceDurableTask.moveStore does. Both hosts are nudged: the old
+   *  one's reconcile cancels its rebuild and deletes its staging copy, the new one's starts the rebuild.
+   *
+   *  Fails with StoreNotRebuilding unless the store's entry on the device its pool names is Rebuilding, and with
+   *  InvalidDestination, DeviceFailed or DeviceNotOperational for a destination that cannot take it (the current
+   *  device, a failed or non-operational one, or one that already lists the store). Only a collision is retried. */
+  def replaceRebuild(storeId: StoreId, destinationId: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = this.clientContext
+
+    val fStaged: Future[List[CheckStorageDevice]] =
+      transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+        given Transaction = tx
+
+        for
+          poolPtr <- getStoragePoolPointer(storeId.poolId)
+          poolKvos <- read(poolPtr)
+          poolState = StoragePoolState(poolKvos)
+          sourceId = poolState.stores(storeId.poolIndex).storageDeviceId
+          srcPtr <- getStorageDevicePointer(sourceId)
+          srcKvos <- read(srcPtr)
+          srcState = StorageDeviceState(srcKvos)
+          dstPtr <- getStorageDevicePointer(destinationId)
+          dstKvos <- read(dstPtr)
+          dstState = StorageDeviceState(dstKvos)
+          _ =
+            if !srcState.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Rebuilding) then
+              throw new StoreNotRebuilding(storeId)
+            if sourceId == destinationId || dstState.stores.contains(storeId) then
+              throw InvalidDestination()
+            if dstState.isFailed then
+              throw DeviceFailed(destinationId)
+            if !dstState.isOperational then
+              throw DeviceNotOperational(destinationId)
+          // Repointed before prepRadicleUpdate reads the pool's store map, as moveStore does
+          _ = poolState.stores(storeId.poolIndex) = StoragePoolState.StoreEntry(dstState.hostId, destinationId)
+          _ <- BootstrapConfig.prepRadicleUpdate(this, storeId, poolState, dstState.hostId)
+        yield
+          tx.update(srcPtr, None, None,
+            List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision)),
+            List(Insert(StorageDeviceState.StateKey, srcState.removeStore(storeId).encode())))
+          val newDst = dstState.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
+          tx.update(dstPtr, None, None,
+            List(KeyRevision(StorageDeviceState.StateKey, dstKvos.contents(StorageDeviceState.StateKey).revision)),
+            List(Insert(StorageDeviceState.StateKey, newDst.encode())))
+          tx.update(poolPtr, None, None,
+            List(KeyRevision(StoragePoolState.ConfigKey, poolKvos.contents(StoragePoolState.ConfigKey).revision)),
+            List(Insert(StoragePoolState.ConfigKey, poolState.encode())))
+          List(CheckStorageDevice(dstState.hostId, clientId, destinationId),
+               CheckStorageDevice(srcState.hostId, clientId, sourceId))
+
+    fStaged.map(_.foreach(sendBestEffortHostMessage))
 
   def transferStore(storeId: StoreId, destinationId: StorageDeviceId): Future[Unit] =
     given ExecutionContext = this.clientContext

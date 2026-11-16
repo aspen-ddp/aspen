@@ -494,3 +494,38 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       restartedImmediately should be(1)
       factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(0)))
       recorded(host).loadStoreByIdRequests.exists(_._1 == synthetic) should be(false)
+
+  atest("a rebuild whose entry leaves its device is cancelled and its staging copy deleted (Rebuild F12)"):
+    val hostRoot = newHostDir()
+    val devDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
+    def staging(n: Int): os.Path = devDir / RebuildingStore.RebuildDirectory / storeN(n).directoryName
+
+    val first = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    first.success(deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1)))))
+
+    for
+      _ <- yieldUntil(factory.created.size == 2)
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+      _ = List(0, 1, 2).foreach(n => os.makeDir.all(staging(n)))
+      // Store 0 re-placed elsewhere; store 2's staging copy was left by an earlier rebuild here
+      reconciled = recorded(host).armLookup(deviceA)
+      _ = host.control.reconciler.checkStorageDevice(deviceA)
+      _ = reconciled.success(deviceState(deviceA, Map(rebuilding(storeN(1)))))
+      _ <- yieldUntil(factory.created.head.cancelled)
+      runningCopyKept = os.exists(staging(0))
+      _ = recorded(host).armLookup(deviceA).success(deviceState(deviceA, Map(rebuilding(storeN(1)))))
+      _ = factory.created.head.promise.failure(RebuildingStore.RebuildCancelled(storeN(0)))
+      _ <- yieldUntil(!os.exists(staging(0)))
+    yield
+      factory.created.head.cancelled should be(true)
+      factory.created(1).cancelled should be(false)
+      // Kept while its rebuild was still running, deleted by the check its cancel asked for
+      runningCopyKept should be(true)
+      os.exists(staging(0)) should be(false)
+      os.exists(staging(1)) should be(true)
+      os.exists(staging(2)) should be(false)
+      // Not restarted: nothing lists it here
+      factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(1)))

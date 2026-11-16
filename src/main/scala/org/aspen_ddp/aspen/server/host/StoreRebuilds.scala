@@ -35,6 +35,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private var creatingStores: Set[StoreId] = Set()
 
   private var rebuildingStores: Map[StoreId, StoreRebuild] = Map()
+  // The device each one in rebuildingStores runs on
+  private var rebuildDevices: Map[StoreId, StorageDeviceId] = Map()
+  // Rebuilds cancelled because their entry left their device (abandonUnlisted, Rebuild F12)
+  private var abandonedRebuilds: Set[StoreId] = Set()
   // Completed when the rebuild of each store in rebuildingStores has released its slot, its
   // outcome acted on. What a shutdown waits on for the rebuilds it cancels.
   private var rebuildsSettled: Map[StoreId, Promise[Unit]] = Map()
@@ -197,6 +201,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
       def release(): Unit =
         rebuildingStores -= storeId
+        rebuildDevices -= storeId
         ctx.publishView()
         if rebuildsSettled.get(storeId).exists(_ eq settled) then
           rebuildsSettled -= storeId
@@ -241,6 +246,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           Future.failed(t)
 
       rebuildingStores += storeId -> sr
+      rebuildDevices += storeId -> local.storageDeviceId
       rebuildsSettled += storeId -> settled
       ctx.publishView()
 
@@ -311,6 +317,17 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 recheckOtherDevices()
                 scheduleRebuildRetry(local.storageDeviceId, storeId)
 
+        case Failure(RebuildingStore.RebuildCancelled(_)) if abandonedRebuilds.contains(storeId) =>
+          // Its entry left this device (abandonUnlisted). This device is checked once more: if the entry is
+          // still gone, that check deletes the staging copy; if it reads Rebuilding after all, the rebuild resumes
+          try
+            logger.info(s"Rebuild of store $storeId on device ${local.storageDeviceId} abandoned: the store is " +
+                        "no longer being rebuilt here")
+          finally
+            abandonedRebuilds -= storeId
+            release()
+            recheckAll()
+
         case Failure(RebuildingStore.RebuildCancelled(_)) =>
           // Cancelled by a shutdown of this device. Not an error, and this device is not
           // re-checked: it is shutting down. The checkpoint stays in staging, so the rebuild
@@ -335,6 +352,39 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             release()
             recheckOtherDevices()
             scheduleRebuildRetry(local.storageDeviceId, storeId)
+
+  /** Rebuild F12. Retires the rebuild work on `local` for stores whose entry on it is no longer Rebuilding: re-placed
+   *  elsewhere by AspenClient.replaceRebuild, or gone for another reason. A rebuild still running for one is
+   *  cancelled; its completion checks the device again. A staging directory for one with no rebuild running is
+   *  deleted: nothing will resume it, and a later rebuild of the store here starts over. Called by the reconcile of a
+   *  device this host owns and serves. */
+  def abandonUnlisted(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    def listed(storeId: StoreId): Boolean =
+      remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Rebuilding)
+
+    rebuildDevices.foreach: (storeId, deviceId) =>
+      if deviceId == local.storageDeviceId && !listed(storeId) && !abandonedRebuilds.contains(storeId) then
+        rebuildingStores.get(storeId).foreach: sr =>
+          logger.info(s"Cancelling the rebuild of store $storeId on device $deviceId: its entry there is no " +
+                      "longer Rebuilding")
+          abandonedRebuilds += storeId
+          sr.cancel()
+
+    val stagingRoot = local.devicePath / RebuildingStore.RebuildDirectory
+    val staged =
+      try
+        if os.isDir(stagingRoot) then os.list(stagingRoot).filter(os.isDir(_)).toList else Nil
+      catch
+        case t: Throwable =>
+          logger.warn(s"Failed to list $stagingRoot: $t")
+          Nil
+    staged.foreach: dir =>
+      scala.util.Try(StoreId(dir.last)).toOption.foreach: storeId =>
+        if !listed(storeId) && !rebuildingStores.contains(storeId) then
+          logger.info(s"Deleting the staging copy of store $storeId at $dir: it is no longer being rebuilt on " +
+                      s"device ${local.storageDeviceId}")
+          try os.remove.all(dir)
+          catch case t: Throwable => logger.warn(s"Failed to delete $dir. Retrying at a later check. Error: $t")
 
   /** Checks `deviceId` again after a backoff, so a store whose rebuild pass or flip failed is retried without waiting
    *  for the periodic sweep (an hour) and without spinning (Rebuild F5, F11). The first delay is

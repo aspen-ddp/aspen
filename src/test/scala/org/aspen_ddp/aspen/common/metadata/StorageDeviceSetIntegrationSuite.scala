@@ -474,6 +474,31 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
       picks.toSet should be(Set(net.thirdDeviceId))
       failed
 
+  atest("selectDeviceForRebuild raises the co-location alarm when it must share a device with the pool (Rebuild F12)"):
+    given ExecutionContext = executionContext
+    val lines = new java.util.concurrent.LinkedBlockingQueue[(scribe.Level, String)]()
+    val handler = scribe.handler.LogHandler(scribe.Level.Info): r =>
+      val text = r.logOutput.plainText
+      if text.contains("REBUILD CO-LOCATED") && text.contains(StoreId(PoolId.BootstrapPoolId, 0.toByte).toString) then
+        lines.add(r.level -> text)
+    val bootstrap1 = StoreId(PoolId.BootstrapPoolId, 1.toByte)
+    val picked =
+      for
+        _ <- net.createSecondDevice()
+        _ <- waitForTransactionsToComplete()
+        // Store 1 now lives on the second device, the only one left that store 0 could be rebuilt onto
+        _ <- net.simulateTransferComplete(bootstrap1, StorageDeviceId.BootstrapStorageDeviceId, net.secondDeviceId)
+        _ <- waitForTransactionsToComplete()
+        set <- client.getStorageDeviceSetState(bootSetId)
+        _ = scribe.Logger.root.withHandler(handler).replace()
+        picked <- set.selectDeviceForRebuild(PoolId.BootstrapPoolId, 0.toByte, client)
+      yield picked
+    picked.transform: result =>
+      scribe.Logger.root.withoutHandler(handler).replace()
+      result.map: device =>
+        device should be(net.secondDeviceId)
+        lines.toArray(Array.empty[(scribe.Level, String)]).toList.map(_._1) should be(List(scribe.Level.Error))
+
   /** A store of the bootstrap pool at an index no host serves, so neither a host's reconcile nor
    *  its usage tracker acts on the metadata these tests write for it. */
   private val phantom = StoreId(PoolId.BootstrapPoolId, 9.toByte)

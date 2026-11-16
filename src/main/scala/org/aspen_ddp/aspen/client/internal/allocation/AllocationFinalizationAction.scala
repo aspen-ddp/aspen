@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.allocation
 
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
-import org.aspen_ddp.aspen.client.{AspenClient, ConflictingRequirements, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, ConflictingRequirements, InvalidObject, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription}
 import scribe.Logging
@@ -22,19 +22,23 @@ class AllocationFinalizationAction(val client: AspenClient,
   def complete: Future[Unit] = completionPromise.future
 
   /** Records the new object in its pool's allocation tree. At least once, and possibly long after the allocating
-    * transaction was finalized. The entry is never skipped: a read straight after resolution can precede the stores
-    * applying the allocation, so an object that does not read is not taken to be gone (skipping its entry would lose
-    * it on repair and rebuild).
+    * transaction was finalized.
     *  - its entry is already present with this pointer: an earlier run recorded it
     *  - the object reads: a checked insert, with a shared lock on the object's revision as just read
-    *  - it does not read: a checked insert alone
+    *  - the read proves it deleted (`InvalidObject.provesDeletion`): there is nothing to record, and the action
+    *    completes without a transaction
+    *  - any other read failure: the attempt fails and is retried
+    *
+    * A read straight after resolution can precede the stores applying the allocation. Its commit voters then answer
+    * `AllocationPending`, not `ObjectNotFound`, so the read fails without proof and is retried: a live object is never
+    * taken to be gone (skipping its entry would lose it on repair and rebuild). Residual: an object already below
+    * writeThreshold live copies reads as deleted and gets no entry; it was unreadable already (repair-process F5).
     *
     * Neither the insert of an absent key (`DoesNotExist`) nor the lock is a pin, so the transaction is marked
-    * replay-safe. A replay never drops an entry. While the object is readable the lock makes a replay after its
-    * deletion fail; a rare run or replay after the deletion that cannot read it can leave an orphan entry, which costs
-    * the repair scan a lookup. The lock is shared (transaction-requirements Q-N6): it fails on a deleted or changed
-    * object just as an exclusive one does, and two runs of the action (a leader's and a recovery driver's finalizer)
-    * do not collide on it. It still collides with a concurrent write of the object, whose writer retries.
+    * replay-safe: once the object is deleted its revision lock fails, so a replay or a later run never leaves an
+    * orphan entry (transaction-requirements Q-N5). The lock is shared (Q-N6): it fails on a deleted or changed object
+    * just as an exclusive one does, and two runs of the action (a leader's and a recovery driver's finalizer) do not
+    * collide on it. It still collides with a concurrent write of the object, whose writer retries.
     */
   // A failure fails the action, and the driver starts the finalizer again (TransactionDriver.startFinalizer)
   def execute(): Unit = client.retryStrategy.retryUntilSuccessful {
@@ -45,18 +49,24 @@ class AllocationFinalizationAction(val client: AspenClient,
       _ <- existing match
         case Some(vs) if java.util.Arrays.equals(vs.value.bytes, newObject.toArray) => Future.unit
         case _ =>
-          client.readMetadataOptional(newObject).flatMap: ostate =>
-            val tx = client.newTransaction()
-            tx.replaySafe("never drops an entry; a rare re-run after the object's deletion can leave an orphan entry")
-            for
-              _ <- pool.allocationTree.set(key, Value(newObject.toArray))(using tx)
-              // An allocation tree node allocated by this very object's transaction can hold its own entry: the
-              // update of the node then requires the object to exist, and a lock on it would conflict
-              _ = ostate.foreach: state =>
-                    try tx.sharedLockRevision(newObject, state.revision)
+          client.readMetadata(newObject).map(Some(_)).recover:
+            case e: InvalidObject if e.provesDeletion => None
+          .flatMap:
+            case None =>
+              logger.debug(s"AllocationFA for Tx ${txd.transactionId}: object ${newObject.id} is deleted, nothing " +
+                "to record")
+              Future.unit
+            case Some(state) =>
+              val tx = client.newTransaction()
+              tx.replaySafe("cannot add the entry once the object is deleted: its revision lock fails")
+              for
+                _ <- pool.allocationTree.set(key, Value(newObject.toArray))(using tx)
+                // An allocation tree node allocated by this very object's transaction can hold its own entry: the
+                // update of the node then requires the object to exist, and a lock on it would conflict
+                _ = try tx.sharedLockRevision(newObject, state.revision)
                     catch case _: ConflictingRequirements => ()
-              _ <- tx.commit()
-            yield ()
+                _ <- tx.commit()
+              yield ()
     yield
       logger.debug(s"AllocationFA Completed Successfully for Tx ${txd.transactionId}, Object ${newObject.id}")
       completionPromise.trySuccess(())

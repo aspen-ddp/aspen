@@ -599,6 +599,18 @@ class Tx( trs: TransactionRecoveryState,
     */
   private var allocatedOver: Set[ObjectId] = Set()
 
+  /** The objects this transaction allocates on a backend miss here (allocationLoaded) */
+  private var allocatedHere: Set[ObjectId] = Set()
+
+  /** This store voted to commit the allocation of `objectId` and has not applied it: its fresh state is known only to
+    * this transaction, so a client read misses. The store answers `AllocationPending` rather than `ObjectNotFound`
+    * (Frontend.backendReadComplete), so a read straight after the allocation commits cannot prove the object deleted
+    * (transaction-requirements Q-N5). Once doCommit starts, the in-flight commit's state is served
+    */
+  def allocationUnapplied(objectId: ObjectId): Boolean =
+    allocatedHere.contains(objectId) && disposition == TransactionDisposition.VoteCommit && !committing &&
+      !committed && !oresolution.contains(false)
+
   /** The store's state of `os.objectId`, from its cache or backend. For an object this transaction allocates, the
     * object already exists here. See allocatedOver
     */
@@ -616,6 +628,7 @@ class Tx( trs: TransactionRecoveryState,
     */
   def allocationLoaded(objectId: ObjectId): Unit =
     logger.trace(s"Allocating new object: $objectId in Tx: $transactionId.")
+    allocatedHere += objectId
     val os = new ObjectState(objectId, Metadata(ObjectRevision.Allocating, ObjectRefcount.Allocating,
       txd.startTimestamp), pointerOf(objectId).objectType, DataBuffer.Empty)
     frontend.retain(os, shared = false)

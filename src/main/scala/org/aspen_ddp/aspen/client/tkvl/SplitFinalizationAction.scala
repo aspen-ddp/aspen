@@ -45,7 +45,11 @@ class SplitFinalizationAction(val client: AspenClient,
 
       /** Adds the new node's entry to `tier`. At least once, and possibly long after the split was finalized, so the
         * new node is read first:
-        *  - gone (a later join deleted it): there is nothing to index, and the action completes without a transaction
+        *  - the read proves it deleted (`InvalidObject.provesDeletion`, a later join): there is nothing to index, and
+        *    the action completes without a transaction
+        *  - any other read failure: the attempt fails and is retried. A read straight after resolution can precede
+        *    the stores applying the split; its commit voters then answer `AllocationPending`, so the read proves
+        *    nothing (transaction-requirements Q-N5)
         *  - its entry is already present with this pointer: an earlier run added it
         *  - otherwise a checked insert, with a lock on the new node's revision as just read
         *
@@ -73,7 +77,9 @@ class SplitFinalizationAction(val client: AspenClient,
           } yield ()
         }
 
-        client.readMetadataOptional(newNode).flatMap {
+        client.readMetadata(newNode).map(Some(_)).recover {
+          case e: InvalidObject if e.provesDeletion => None
+        }.flatMap {
           case None => Future.unit // Deleted by a later join: nothing to index
 
           case Some(newNodeState) =>

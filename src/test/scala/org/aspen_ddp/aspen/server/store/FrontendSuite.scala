@@ -3847,6 +3847,41 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     stored.data.getByteArray shouldBe Array[Byte](1)
   }
 
+  // transaction-requirements Q-N5: the finalizer reads a new object as soon as its allocation resolves, possibly
+  // before the stores apply it. A commit voter's fresh state is known only to its Tx, so the read misses; answering
+  // ObjectNotFound there would let a read of a live, committed object prove it deleted
+  test("a read of an allocation voted for but not applied answers AllocationPending") {
+    val (frontend, backend, net) = lockFixture()
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 32)), poolId, Array[Byte]())
+    def read(n: Int): Either[ReadError.Value, ReadResponse.CurrentState] =
+      frontend.readObjectForNetwork(clientId, new UUID(2, n), newPtr, MetadataOnly())
+      takeReadResponse(net).get.result
+
+    read(1) shouldBe Left(ReadError.ObjectNotFound)
+    prepare(frontend, net, allocateData(txid1, newPtr)).disposition shouldBe TransactionDisposition.VoteCommit
+    read(2) shouldBe Left(ReadError.AllocationPending)
+    resolve(frontend, net, txid1, committed = true)
+    read(3).map(_.revision) shouldBe Right(ObjectRevision(txid1))
+
+    // Deleted while the allocating Tx is still held (not finalized): an absence again, not a pending allocation
+    val delete = RefcountUpdate(newPtr, ObjectRefcount.Default,
+      ObjectRefcount(ObjectRefcount.Default.updateSerial + 1, 0))
+    prepare(frontend, net, lockTxd(txid2, List(delete))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid2, committed = true)
+    read(4) match
+      case Left(err) => err shouldBe ReadError.ObjectNotFound
+      case Right(cs) => cs.refcount.count shouldBe 0
+  }
+
+  test("a read of an aborted allocation answers ObjectNotFound") {
+    val (frontend, _, net) = lockFixture()
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 33)), poolId, Array[Byte]())
+    prepare(frontend, net, allocateData(txid1, newPtr)).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = false)
+    frontend.readObjectForNetwork(clientId, new UUID(2, 1), newPtr, MetadataOnly())
+    takeReadResponse(net).get.result shouldBe Left(ReadError.ObjectNotFound)
+  }
+
   test("a replayed allocation over a live object in the backend votes abort, and its commit leaves the object alone") {
     val (frontend, backend, net, stops) = failStopFixture()
     prepare(frontend, net, allocateData(txid1, op1)).disposition shouldBe TransactionDisposition.VoteAbort

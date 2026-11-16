@@ -18,7 +18,11 @@
   inserted into the tier above it.
 - Tier-0 holds the data, the upper tiers consist exclusively of (minimum_key, object-pointer) pairs
 - The root of the tree is replaced every time the current root node is split into two nodes
-- FinalizationActions are used to insert/remove entries in upper tiers as nodes are split/joined
+- FinalizationActions are used to insert/remove entries in upper tiers as nodes are split/joined.
+  `SplitFinalizationAction` takes the new node to be gone (a later join) only when its read proves the deletion
+  (`InvalidObject.provesDeletion`). A read that fails otherwise, such as one straight after the split resolves that
+  the stores answer `AllocationPending`, is retried, so the new node always gets its upper-tier entry
+  (transaction-requirements Q-N5)
 - Left to right navigation in a tier is guaranteed to be consistent. Navigation between tiers is not
 - The entry walks (`foreach*`, through `TierEngine.walk`) survive joins: a right-neighbour read that fails because a
   join deleted the neighbour (often caused by `fn` itself deleting what it visits) descends again to the node holding

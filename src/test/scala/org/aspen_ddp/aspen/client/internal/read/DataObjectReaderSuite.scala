@@ -167,6 +167,14 @@ class DataObjectReaderSuite extends AnyFunSuite with Matchers {
     wide.receiveReadResponse(err(1, ReadError.ObjectNotFound))
     wide.receiveReadResponse(err(2, ReadError.StoreNotFound))
     invalid(wide).provesDeletion should be (true)
+
+    // transaction-requirements Q-N5: a commit voter that has not applied the allocation yet answers AllocationPending,
+    // which is no absence. Read straight after the allocation commits, the object is not proven deleted
+    val pending = TestReader(3, 2)
+    pending.receiveReadResponse(err(0, ReadError.AllocationPending))
+    pending.receiveReadResponse(err(1, ReadError.ObjectNotFound))
+    pending.receiveReadResponse(err(2, ReadError.AllocationPending))
+    invalid(pending).provesDeletion should be (false)
   }
 
   test("A consistent majority at refcount 0 proves the deletion") {

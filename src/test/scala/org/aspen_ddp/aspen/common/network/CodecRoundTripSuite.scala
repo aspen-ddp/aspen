@@ -465,6 +465,10 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decodedErr.result.isLeft shouldBe true
     decodedErr.result.left.toOption.get shouldBe ReadError.ObjectNotFound
 
+    ReadError.values.foreach: err =>
+      val resp = ReadResponse(ClientId(uuid(1)), storeId(2), uuid(3), HLCTimestamp(1000L), Left(err))
+      Codec.decode(Codec.encode(resp)).result shouldBe Left(err)
+
     val successResp = ReadResponse(ClientId(uuid(1)), storeId(2), uuid(3), HLCTimestamp(1000L),
       Right(ReadResponse.CurrentState(
         rev(4), ObjectRefcount(1, 5), HLCTimestamp(2000L), 1024,

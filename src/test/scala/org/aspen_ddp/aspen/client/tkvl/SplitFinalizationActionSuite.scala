@@ -5,7 +5,8 @@ import org.aspen_ddp.aspen.client.TestTransactions
 import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{Insert, IntegerKeyOrdering, Key, KeyValueObjectPointer, Value}
-import org.aspen_ddp.aspen.common.transaction.ExclusiveRevisionLock
+import org.aspen_ddp.aspen.common.network.{TxMessage, TxResolved}
+import org.aspen_ddp.aspen.common.transaction.{ExclusiveRevisionLock, TransactionId}
 
 import scala.concurrent.Future
 
@@ -109,3 +110,42 @@ class SplitFinalizationActionSuite extends IntegrationTestSuite:
       audit.builtExceptMarks shouldBe empty
       tState.contents.contains(k5) shouldBe false
       tState.revision shouldBe tBefore.revision
+
+  // transaction-requirements Q-N5: the action runs as soon as the split resolves, and its read of the new node can
+  // precede the stores applying it. They answer AllocationPending, which proves nothing, so the action retries rather
+  // than taking the node to be gone and leaving it unindexed. Here the node's stores hear the outcome of its
+  // allocation only when the test delivers it
+  atest("a split FA that reads its node before the stores apply it waits, then indexes it"):
+    @volatile var target: Option[TransactionId] = None
+    val held = new java.util.concurrent.ConcurrentLinkedQueue[TxMessage]()
+    def pumpFor(millis: Long): Future[Unit] =
+      val until = System.nanoTime() + millis * 1000000
+      def loop(): Future[Unit] =
+        if System.nanoTime() > until then Future.unit
+        else Future { Thread.sleep(1); net.handleEvents() }.flatMap(_ => loop())
+      loop()
+    for
+      (mgr, t, _) <- tierOneTree()
+      pool <- client.getStoragePool(Radicle.poolId)
+      tx = TestTransactions.replaySafe(client.newTransaction())
+      _ = target = Some(tx.id)
+      _ = net.dropTxMessage = (m: TxMessage) => m match
+            case r: TxResolved if target.contains(r.transactionId) => held.add(r); true
+            case _ => false
+      node <- pool.allocator.allocateKeyValueObject(Map(k5 -> Value(Array[Byte](5))), minimum = Some(k5))(using tx)
+      _ <- tx.commit()
+      action = new SplitFinalizationAction(client, null, mgr, 1, k5, node)
+      _ = action.execute()
+      _ <- pumpFor(300)
+      completedEarly = action.complete.isCompleted
+      during <- client.read(t)
+      _ = net.dropTxMessage = _ => false
+      _ = held.forEach(m => net.deliverTransactionMessage(m))
+      _ <- action.complete
+      _ <- waitForTransactionsToComplete()
+      after <- client.read(t)
+    yield
+      held should not be empty
+      completedEarly shouldBe false
+      during.contents.contains(k5) shouldBe false
+      after.contents.get(k5).map(_.value.bytes.toList) shouldBe Some(node.toArray.toList)

@@ -573,7 +573,7 @@ under reordering/crash; Low = needs an unusual precondition or a trust-model vio
 | F5 | unchanged | A stub holder applies nothing on commit, but it holds the update already (or was never a commit voter of T), and it reports its objects, so the finalizer marks it | `Tx.scala:642-648` |
 | F7 | unchanged | Stores still trust the description; prefer-abort keys on `TxPrepare.fromClient`, which a driver sets false (`TransactionDriver.scala:415,434`) and a client sets true: a forged `fromClient = true` from a store-side component would re-open P-N4's paths, within the same trust model. *2026-11-13:* no longer for a forgotten T: the forget floor refuses any prepare, client or driver, for a transaction a store may have forgotten (paxos 10.10) | `Tx.scala:808-811` |
 | F11 | **narrowed** (2026-11-14, Todo 2.9: under the horizon a replay reaches only stores that never saw T, and an allocation whose object was deleted leaves an orphan slice there, which repair drops) | A replayed allocation reaching a late or non-late commit is no longer applied at a store holding an applied stub for T. It still applies at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) and at stores that acknowledged in time on a non-late commit (paxos P-N3, P-N10) | `Tx.scala:642-648,998-1000` |
-| Q-N5 | **narrowed** (marker site) | A re-run marker's re-created UnackedCommits entries now come with a `TxFinalized` listing them, so stores write stubs for them (transaction-recovery R-N6); the ErrorTree regression is unchanged. *2026-11-14:* the regression is FIXED (Todo 2.4), and a re-created entry is harmless under the horizon (Todo 2.9); left: the allocation action's orphan entry (Todo 5.5) | `Frontend.scala:763-773` |
+| Q-N5 | **narrowed** (marker site) | A re-run marker's re-created UnackedCommits entries now come with a `TxFinalized` listing them, so stores write stubs for them (transaction-recovery R-N6); the ErrorTree regression is unchanged. *2026-11-14:* the regression is FIXED (Todo 2.4), and a re-created entry is harmless under the horizon (Todo 2.9). *2026-11-15:* the allocation action's orphan entry and the split action's early "gone" are FIXED (Todo 5.5): stores answer `AllocationPending` for an allocation they voted for but have not applied, and both actions act only on `provesDeletion` | `Frontend.scala` (`allocationPending`), `AllocationFinalizationAction.scala`, `SplitFinalizationAction.scala` |
 
 ### Re-assessment for commit-voter fail-stop (2026-11-14)
 
@@ -945,13 +945,35 @@ can starve shared lockers. Documented behaviour.
 >   (`RequirementsChecker.scala:57-58`), and a node whose revision moved fails it too. Separate weakness, **PLAUSIBLE
 >   (performance)**: the read-first "gone" (`:76-77`) is also taken when the read precedes the stores applying the
 >   split (the reason Ruling 28 changed the allocation action), so the new node is never indexed in the tier above;
->   lookups still reach it by following links. Its later join path was not traced.
+>   lookups still reach it by following links. Its later join path was not traced. *FIXED 2026-11-15 (Todo 5.5),
+>   see the allocation bullet's fix note:* only a proven deletion means "gone", and the read in that window now
+>   proves nothing, so the action retries.
 > * `AllocationFinalizationAction` ("never drops an entry; ... can leave an orphan entry",
 >   `client/internal/allocation/AllocationFinalizationAction.scala:45-57`): the claim is **honest**; the orphan is
 >   **PLAUSIBLE (stale-replica, leak)** and less rare than "doubly rare": any second run after a quick deletion leaves
 >   one, including the ordinary case of a leader and a recovery driver both finalizing in the live window. An orphan
 >   makes repair treat the deleted object as live (no `repairDeletion` for a store that missed the delete) and the
 >   rebuild walk read a missing object.
+>
+>   **Fix 2026-11-15 (Todo 5.5): FIXED for both actions; residual stated.** Root cause, common to the split action's
+>   early "gone": the finalizer starts at resolution, and a commit voter's fresh `Allocating` state is known only to
+>   its Tx (`retain(shared = false)`), so until the store applies the commit a client read missed it and got
+>   `ObjectNotFound`. Read in that window, a live object was proven deleted (`provesDeletion`). Now a store with a
+>   commit vote on the allocation, not yet applied (`Tx.allocationUnapplied`), answers the new `ReadError.AllocationPending`
+>   on a backend miss (`Frontend.allocationPending`, a scan on misses only). `BaseObjectReader` counts it as an error
+>   but not as an absence. A committed allocation has at least writeThreshold voters, so at most width −
+>   writeThreshold stores answer `ObjectNotFound` and the read cannot prove the deletion. Once the object is deleted,
+>   the deletion's writeThreshold voters held it applied, so the proof is reachable again (writes are majority quorums).
+>   Both actions now read with an explicit three-way outcome: a live object → checked insert under its revision lock,
+>   a proven deletion → no transaction, anything else → the attempt fails and is retried. The lockless insert is
+>   gone, so every entry write carries the lock and a replay or a later run after the deletion leaves no orphan.
+>   Residual: an object already below writeThreshold live copies reads as deleted and gets no entry or index; it was
+>   unreadable already (repair-process F5's residual). Tests: FrontendSuite "a read of an allocation voted for but not
+>   applied answers AllocationPending", "a read of an aborted allocation answers ObjectNotFound";
+>   DataObjectReaderSuite (pending replies prove nothing); AllocationFinalizationActionSuite "the action retries until
+>   the stores apply the allocation, then records the entry under a lock", "a run after the object's deletion records
+>   no entry"; SplitFinalizationActionSuite "a split FA that reads its node before the stores apply it waits, then
+>   indexes it". Both window tests fail without the store change.
 > * `MissedUpdateMarker.writeBatch` ("missed-update marks are idempotent", `MissedUpdateMarker.scala:165`): **PLAUSIBLE
 >   (stale-replica, narrow)**. Re-writing one batch is idempotent, but a replayed or late batch's blind upsert replaces a
 >   newer entry's `missedTimestamp` with an older one (repair F10) and re-creates UnackedCommits entries the repair

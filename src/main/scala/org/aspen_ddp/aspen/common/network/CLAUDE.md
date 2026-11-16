@@ -4,6 +4,8 @@
 - Currently, all encoding and decoding is done within the Codec class and a single codec.proto file
 - A common pattern and naming scheme is used for all encode/decode functions
 - The common.network.Message module defines all network messages
+- `ReadError` (`ObjectReadError` in codec.proto) includes `AllocationPending`: a store's answer to a client read of
+  an object whose allocation it voted to commit but has not applied yet
 - Messages are sent between logical entities e.g. Clients and DataStores or DataStores to other DataStores.
 - `CurrentAllocationsRequest`/`CurrentAllocationsReply` (client request/response): a store's list of the
   allocations in its pool held by transactions it has not seen finalized or abort (`PendingAllocation`). A rebuild

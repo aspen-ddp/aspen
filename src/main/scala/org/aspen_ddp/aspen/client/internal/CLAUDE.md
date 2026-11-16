@@ -10,6 +10,11 @@
   (logged at trace), except that a late `StoreNotFound` still drops the sender's cached endpoint. Stale stores found by
   a read are not repaired by the read: repair is the server's job (`server/repair`). The client keeps no object
   cache, and a `TxPrepare` carries only the transaction's object updates (no pre-transaction rebuilds).
+- `InvalidObject.provesDeletion` counts only `ObjectNotFound`/`ObjectMismatch` replies (or a consistent majority at
+  refcount 0). `StoreNotFound` and `AllocationPending` (a commit voter that has not applied the object's allocation,
+  `server/store/CLAUDE.md`) are errors that prove nothing, so a read of an object whose allocation just committed
+  never proves it deleted. Callers that drop or skip an object on absence (repair, rebuild, the allocation and split
+  finalization actions) act only on the proof
 - `ClientTransactionDriver.result` is a `ClientOutcome` (`Committed`, `Aborted`, `Unknown`). `SimpleClientTransactionDriver`
   stops retransmitting and completes `Unknown` once the client's clock is past `startTimestamp + horizon + MaxStartLead`
   (`TransactionHorizon.clientGiveUp`), checked at each retransmit tick. A transaction already that late at `begin()`

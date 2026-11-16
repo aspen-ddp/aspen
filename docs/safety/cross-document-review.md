@@ -445,11 +445,12 @@ G6. Allocation-tree dependency: rebuild F10/F17, repair F5 and requirements F11 
     lateness: an object already below its write threshold reads as deleted.
     (3) *Replayed allocation.* It never overwrites a live object (requirements F11). Under the horizon it reaches only
     stores that never saw T, where a deleted id becomes an orphan slice that repair drops. A re-run allocation action
-    can leave an orphan entry (Todo 5.5).
+    no longer leaves an orphan entry (Todo 5.5, fixed 2026-11-15: it writes the entry only under the object's revision
+    lock and skips a proven deletion).
     The one cross-process interaction: an orphan entry names an object that reads as deleted, so a rebuild records it
     as failed and `retryFailures` finds the entry still present. That rebuild cannot finish (rebuild F15, Todo 4.8),
-    so orphan entries are a liveness cost on rebuild, never lost data. Todo 5.5 (no orphan entry) and 4.8 (an
-    operator command to finish past lost objects) together close it.
+    so orphan entries are a liveness cost on rebuild, never lost data. Todo 5.5 (no orphan entry, done 2026-11-15)
+    and 4.8 (an operator command to finish past lost objects) together close it.
 G7. Client object caches/pointers (stale `ObjectPointer`, DataObject read caches) are outside all seven; resurrection by a client reading a zombie slice with a cached pointer is not discussed.
 G8. Clock: HLC skew no longer affects replay (the horizon is gone, paxos F3 fixed), but still affects the rebuilt store's `acceptorSince` mute, on which the late-commit rule now also rests (paxos P-N2), repair's 60 s age gate (entry timestamp is the marker transaction's), and rebuild timestamps; no document looks at them together.
     *2026-11-13, partial:* the `acceptorSince` leg is settled (P-N2 FIXED). It now depends only on host-to-host skew

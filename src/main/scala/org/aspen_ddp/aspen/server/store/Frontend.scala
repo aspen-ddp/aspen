@@ -1433,6 +1433,12 @@ class Frontend(val storeId: StoreId,
     val rest = before ++ after.drop(1)
     if rest.isEmpty then committing.remove(os.objectId) else committing(os.objectId) = rest
 
+  /** A miss on `objectId` here is a commit vote on its allocation that is not applied yet, not an absence. Scans the
+    * held transactions, so it runs only on a backend miss for a client read (Tx.allocationUnapplied)
+    */
+  private def allocationPending(objectId: ObjectId): Boolean =
+    !deleting.contains(objectId) && transactions.valuesIterator.exists(_.allocationUnapplied(objectId))
+
   /** Answers a client's read. Dropped while holding for recovered transactions, as a loading store is silent: until a
     * recovered commit vote has loaded its objects and taken its locks, this store would report the state the vote's
     * transaction replaces, unlocked, and a repair trusting the read could undo that commit on a store that applied it
@@ -1763,7 +1769,11 @@ class Frontend(val storeId: StoreId,
 
             case netRead: NetworkRead =>
               logger.trace(s"Completed backend load for read ${netRead.requestUUID}. ERROR $err. Sending read response")
-              val rr = ReadResponse(netRead.clientId, storeId, netRead.requestUUID, HLCTimestamp.now, Left(err) )
+              val reply = if err == ReadError.ObjectNotFound && allocationPending(objectId) then
+                ReadError.AllocationPending
+              else
+                err
+              val rr = ReadResponse(netRead.clientId, storeId, netRead.requestUUID, HLCTimestamp.now, Left(reply) )
               net.sendClientResponse(rr)
 
             case tr: TransactionRead => transactions.get(tr.transactionId).foreach { tx =>

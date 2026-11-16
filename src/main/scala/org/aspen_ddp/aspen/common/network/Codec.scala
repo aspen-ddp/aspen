@@ -719,12 +719,14 @@ object Codec extends Logging:
     case ReadError.ObjectNotFound => codec.ObjectReadError.OBJECT_READ_ERROR_OBJECT_NOT_FOUND
     case ReadError.StoreNotFound => codec.ObjectReadError.OBJECT_READ_ERROR_STORE_NOT_FOUND
     case ReadError.CorruptedObject => codec.ObjectReadError.OBJECT_READ_ERROR_CORRUPTED_OBJECT
+    case ReadError.AllocationPending => codec.ObjectReadError.OBJECT_READ_ERROR_ALLOCATION_PENDING
 
   def decodeReadError(m: codec.ObjectReadError): ReadError.Value = m match
     case codec.ObjectReadError.OBJECT_READ_ERROR_OBJECT_MISMATCH => ReadError.ObjectMismatch
     case codec.ObjectReadError.OBJECT_READ_ERROR_OBJECT_NOT_FOUND => ReadError.ObjectNotFound
     case codec.ObjectReadError.OBJECT_READ_ERROR_STORE_NOT_FOUND => ReadError.StoreNotFound
     case codec.ObjectReadError.OBJECT_READ_ERROR_CORRUPTED_OBJECT => ReadError.CorruptedObject
+    case codec.ObjectReadError.OBJECT_READ_ERROR_ALLOCATION_PENDING => ReadError.AllocationPending
     case codec.ObjectReadError.Unrecognized(v) => throw new EncodingError(f"Invalid ObjectReadError: $v")
 
 

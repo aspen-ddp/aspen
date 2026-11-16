@@ -1017,6 +1017,10 @@ medium (needs the delete inside the read-to-install window, and a blind delete o
 >   allocation itself gets the slice too.
 > - Anything else (a timeout, `CorruptedObject`) keeps the entry.
 >
+> *2026-11-15 (Todo 5.5):* a store that voted for an allocation and has not applied it answers `AllocationPending`
+> rather than `ObjectNotFound`, so `provesDeletion` can no longer fire inside an allocation's apply window, not even
+> without this check's 60 s age gate (transaction-requirements Q-N5).
+>
 > ErrorTree values carry the object's type (`[ts:8][type:1][storePointer]`), so the pointer can be rebuilt from the
 > tree's pool, the key's ObjectId and the value. The fix also answers this finding's open question: the reader now
 > tells "proven absent" apart from a read that gave up.

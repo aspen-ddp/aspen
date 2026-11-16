@@ -41,6 +41,12 @@
   the apply re-check, so a replayed allocation never overwrites a live object. `appliedBy` counts such an object at
   T's own revision as applied. Residual: no tombstones, so an id whose deletion has persisted can be allocated again
   (an orphan slice, Todo 2.9)
+- A fresh `Allocating` state is known only to its Tx (`retain(shared = false)`), so a client read misses it. On a
+  backend miss for a client read, a store that holds a Tx with a commit vote on the object's allocation, not yet
+  applied (`Tx.allocationUnapplied`: no `doCommit` yet, not known aborted), answers `AllocationPending`, not
+  `ObjectNotFound` (`Frontend.allocationPending`; it scans the held transactions, misses only). A read straight after
+  the allocation commits therefore cannot prove the object deleted (transaction-requirements Q-N5). Once `doCommit`
+  starts, the in-flight state is served
 - A prepare that reaches a store after its transaction was finalized is not applied there: the store relies on
   missed-update repair. A collision is an ordinary abort vote, even with an already-completed transaction, except
   one with a lock holder the transaction is built on (it requires the revision the holder writes): the store then

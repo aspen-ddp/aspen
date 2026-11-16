@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjec
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.PendingAllocation
-import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost}
@@ -67,12 +67,6 @@ object RebuildingStore:
    *  incarnation's host and the rebuilding one */
   val AcceptorSinceMargin: FiniteDuration = FiniteDuration(10, SECONDS)
 
-  /** How far before the walk's start the delta walk looks for allocation-tree entries the walk may have missed
-   *  (Rebuild F10). Such an entry was written by a transaction that prepared after the walk started, and stores
-   *  refuse a prepare whose start is more than the horizon behind their clock; the rest covers MaxStartLead and host
-   *  clock skew, as for acceptor-since */
-  val DeltaMargin: FiniteDuration = TransactionHorizon.Horizon + AcceptorSinceMargin
-
   private def acceptorSinceAfter(now: HLCTimestamp): HLCTimestamp =
     HLCTimestamp(now.asLong + (AcceptorSinceMargin.toMillis << 16))
 
@@ -121,7 +115,6 @@ class RebuildingStore(client: AspenClient,
                       maxFailedObjects: Int = RebuildState.MaxFailedObjects,
                       testingOnlyOnRestored: () => Unit = () => (),
                       testingOnlyOnFinishClosed: () => Unit = () => (),
-                      deltaMargin: FiniteDuration = RebuildingStore.DeltaMargin,
                       testingOnlyAfterWalk: () => Future[Unit] = () => Future.unit,
                       testingOnlyAfterQuery: () => Future[Unit] = () => Future.unit)
   extends StoreRebuild with Logging:
@@ -152,8 +145,9 @@ class RebuildingStore(client: AspenClient,
   private var restoredSinceCheckpoint = 0
   private var lastKey: Option[Key] = None
   private var failed: List[ObjectId] = Nil
-  /** When this rebuild's first walk started, kept across resumes by the checkpoint. Set by runPass before the walk */
-  private var walkStartedAt: HLCTimestamp = HLCTimestamp.Zero
+  /** Every allocation the peers listed at the query of this pass or an earlier one, kept across resumes by the
+   *  checkpoint (Rebuild F10). Set by runPass before the walk */
+  private var listedAllocations: Map[TransactionId, PendingAllocation] = Map()
 
   /** Abort latch: when a fatal condition fires (out of space or too many failures), we record
    *  the cause here. The TKVL walks swallow a failing fn by design -- they log and
@@ -239,16 +233,11 @@ class RebuildingStore(client: AspenClient,
 
     os.makeDir.all(stagingPath)
 
-    // A resume keeps the first pass's walk start: entries the earlier walk passed before they were written are found
-    // only by looking back from there
-    val started = resume.map(_.walkStartedAt).getOrElse(HLCTimestamp.now)
-    synchronized:
-      walkStartedAt = started
-
     resume.foreach: st =>
       synchronized:
         lastKey = st.lastRestoredKey
         failed = st.failedObjects
+        listedAllocations = st.pendingAllocations.map(p => p.transactionId -> p).toMap
       logger.info(s"Rebuild of $storeId: resuming from ${st.lastRestoredKey}, " +
                   s"${st.failedObjects.size} objects to retry")
 
@@ -261,9 +250,14 @@ class RebuildingStore(client: AspenClient,
       opened <- openStaging(stagingCfg)
       _ = synchronized:
             backend = opened
-      // Before the walk: an allocation the lost store acknowledged is either listed by a peer now, or already in the
-      // tree, where the walk or the delta walk finds it (Rebuild F10)
-      pending <- queryPeers(pstate.ida)
+      // Before the walk: an allocation the lost store acknowledged is either listed by a peer at the first pass's
+      // query, or was finalized before it, so its entry is in the tree ahead of every walk (Rebuild F10). What an
+      // earlier pass listed is swept again: finalized since, its entry may have landed behind the checkpoint. Every
+      // checkpoint carries the union, so the walk never advances durably past what was listed
+      queried <- queryPeers(pstate.ida)
+      pending = synchronized:
+                  listedAllocations = mergeListed(listedAllocations, queried)
+                  listedAllocations
       _ <- testingOnlyAfterQuery()
       pool <- client.getStoragePool(storeId.poolId)
       tree = pool.allocationTree
@@ -274,7 +268,6 @@ class RebuildingStore(client: AspenClient,
              case Some(k) => tree.foreachFrom(k, restoreObject(_, _, _), stopWhen = aborted)
              case None => tree.foreach(restoreObject(_, _, _), stopWhen = aborted)
       _ <- testingOnlyAfterWalk()
-      _ <- deltaWalk(tree)
       _ <- sweepPending(pstate.ida, pending, 0)
       // Check the abort latch after the walks and the sweep complete. If it's set, fail the pass before
       // retryFailures() and finish() run, leaving the checkpoint in staging.
@@ -307,28 +300,16 @@ class RebuildingStore(client: AspenClient,
         cleanupStaging()
         Future.failed(e)
 
-  /** Restores the entries written since the first walk started, less `deltaMargin` (Rebuild F10).
-   *
-   *  An allocation the lost store acknowledged has no ErrorTree mark, so the walk is its only way back. Its
-   *  AllocationFinalizationAction can land long after the commit, behind the walk's position, and the walk never
-   *  sees it. Any entry the walk missed was written by a transaction that prepared after the walk started, and
-   *  that transaction's timestamp is the entry's: stores refuse a prepare started more than the horizon behind
-   *  their clock, and the rest of the margin covers MaxStartLead and host skew. A tree split rewrites entries with
-   *  newer timestamps, which only restores them again.
-   *
-   *  Not checkpointed: lastKey keeps the main walk's position, so a pass that fails here resumes the main walk
-   *  near its end and runs the whole delta walk again. Residual: an entry landing after this walk passed its key,
-   *  which needs a finalization stalled for longer than both walks.
-   */
-  private def deltaWalk(tree: TieredKeyValueList): Future[Unit] =
-    if aborted() then
-      Future.unit
-    else
-      val threshold = HLCTimestamp(synchronized(walkStartedAt).asLong - (deltaMargin.toMillis << 16))
-      tree.foreach((node, key, value) =>
-        if value.timestamp < threshold then Future.unit
-        else restoreObject(node, key, value, advance = false),
-        stopWhen = aborted)
+  /** `earlier` and `now`, by transaction, with the pointers of both: an allocation listed by any pass stays listed */
+  private def mergeListed(earlier: Map[TransactionId, PendingAllocation],
+                          now: Map[TransactionId, PendingAllocation]): Map[TransactionId, PendingAllocation] =
+    now.foldLeft(earlier): (acc, entry) =>
+      val (txid, p) = entry
+      acc.get(txid) match
+        case None => acc + entry
+        case Some(e) =>
+          acc + (txid -> PendingAllocation(txid, e.committed || p.committed,
+                                           (e.pointers ++ p.pointers).distinctBy(_.id)))
 
   /** The allocations this pool's other stores hold unfinalized, by transaction, once `width - writeThreshold + 1` of
    *  them have answered (Rebuild F10).
@@ -356,8 +337,9 @@ class RebuildingStore(client: AspenClient,
           scala.util.Failure(synchronized(abortCause).getOrElse(RebuildCancelled(storeId)))
         case scala.util.Failure(err) => scala.util.Failure(err)
 
-  /** Restores the objects of the allocations the peers listed before the walk (Rebuild F10), directly rather than
-   *  through the tree, whose entries may not land until their transactions finalize. Each round asks the peers again:
+  /** Restores the objects of the allocations the peers listed before this pass's walk or an earlier pass's (Rebuild
+   *  F10), directly rather than through the tree, whose entries may not land until their transactions finalize, and
+   *  may then land behind the walk. Each round asks the peers again:
    *  - still listed, unresolved: wait for its resolution
    *  - still listed, committed: restore each object. Any read failure is retried, since while the transaction is held
    *    its commit may not have applied yet, which reads like a deletion
@@ -427,8 +409,7 @@ class RebuildingStore(client: AspenClient,
    */
   private def restoreObject(node: KeyValueListNode,
                             key: Key,
-                            value: ValueState,
-                            advance: Boolean = true): Future[Unit] =
+                            value: ValueState): Future[Unit] =
     // If the abort latch is set, return immediately to make the remainder of the walk a cheap
     // no-op rather than thousands of repeated failures.
     if synchronized(abortCause).isDefined then
@@ -451,7 +432,7 @@ class RebuildingStore(client: AspenClient,
         else
           attemptRestore(key, ptr).transformWith:
             case scala.util.Success(_) =>
-              recordRestored(key, advance)
+              recordRestored(key, advance = true)
             case scala.util.Failure(err) if isOutOfSpace(err) =>
               // Distinct from a per-object read failure, and not something to accumulate 10,000
               // of: selectDeviceForRebuild checked free space at placement time against the
@@ -534,7 +515,7 @@ class RebuildingStore(client: AspenClient,
       val localData = os.getRebuildDataForStore(storeId)
       backend.rebuildWrite(ptr, objectType, metadata, localData.getOrElse(DataBuffer()))
 
-  /** `advance`: the walk's position moves to `key` (false for the delta walk, which leaves the checkpoint alone) */
+  /** `advance`: the walk's position moves to `key` (false for the sweep, which leaves the checkpoint alone) */
   private def recordRestored(key: Key, advance: Boolean): Future[Unit] =
     val checkpointNow = synchronized:
       if testingOnlyTrackRestoredKeys then
@@ -556,7 +537,7 @@ class RebuildingStore(client: AspenClient,
 
   private def recordFailure(objectId: ObjectId, err: Throwable): Future[Unit] =
     val over = synchronized:
-      // The delta walk can fail an object the walk already failed: it is one object to retry
+      // A resumed walk can fail an object an earlier pass already failed: it is one object to retry
       if !failed.contains(objectId) then
         failed = objectId :: failed
       failed.size > maxFailedObjects
@@ -610,8 +591,8 @@ class RebuildingStore(client: AspenClient,
     synchronized(checkpointTrace += "flush")
 
   private def saveCheckpoint(): Unit =
-    val (k, f, w) = synchronized((lastKey, failed, walkStartedAt))
-    RebuildState.save(stagingPath, RebuildState(storeId, k, f, w))
+    val (k, f, l) = synchronized((lastKey, failed, listedAllocations))
+    RebuildState.save(stagingPath, RebuildState(storeId, k, f, l.values.toList))
     synchronized(checkpointTrace += "checkpoint")
 
   /** Retry everything the walk could not read. Anything still failing leaves the store

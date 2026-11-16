@@ -795,8 +795,10 @@ object StoreRepairer:
     * both may re-run after a crash. Acting on the second case would drop the errorTree entry for
     * a live object, leaving the store silently short a slice with no record of it.
     *
-    * The read decides, but just after an allocation commits it can report the object missing
-    * while its stores have yet to apply it, so the read waits for the entry to age. Repair is
+    * The read decides, and the gate only paces it: a read just after an allocation commits cannot prove the object
+    * deleted, since a commit voter that has not applied it answers AllocationPending (transaction-requirements Q-N5).
+    * The gate compares this host's HLC with the entry's (the marker transaction's start, another host's), so clock
+    * skew moves it by at most the skew plus MaxStartLead either way, and safety does not rest on it (G8). Repair is
     * not latency sensitive: waiting costs one more pass.
     *
     * A future dated entry yields a negative age and is therefore ineligible, which is what we

@@ -507,8 +507,9 @@ G6. Allocation-tree dependency: rebuild F10/F17, repair F5 and requirements F11 
     *2026-11-14 (Todo 2.11): analysed.* A missing entry cannot occur: `TransactionBuilder.addAllocatingObject` adds
     the allocation action, and bootstrap lists what it creates (rebuild F17, closed). A late entry has three effects:
     (1) *Missing slice.* A rebuild walk that passed the key never restores an allocation the lost store acknowledged.
-    The delta walk restores entries written since the walk started, and the allocations still pending are listed by a
-    quorum of the pool's other stores (`CurrentAllocationsRequest`) and restored directly (rebuild F10, fixed).
+    The allocations still pending are listed by a quorum of the pool's other stores (`CurrentAllocationsRequest`) and
+    restored directly, and the list is checkpointed so a resumed pass sweeps it again (rebuild F10, fixed; the delta
+    walk this note first cited was removed 2026-11-16, G8).
     Residual: the pool lost the Paxos state of `writeThreshold` stores while T was unfinalized (beyond its tolerance).
     (2) *Stale deletion decision.* Repair no longer takes absence from the tree as a deletion. A read decides
     (`InvalidObject.provesDeletion`, repair F5 fixed), so a late entry costs only deferral. Residual, unrelated to
@@ -526,6 +527,36 @@ G8. Clock: HLC skew no longer affects replay (the horizon is gone, paxos F3 fixe
     *2026-11-13, partial:* the `acceptorSince` leg is settled (P-N2 FIXED). It now depends only on host-to-host skew
     under 8 s, and `Frontend.MaxStartLead` caps every accepted start timestamp, and so every client HLC, at the fastest
     host's wall clock plus 2 s. Still open: the repair age gate and rebuild timestamps under host skew.
+    *2026-11-16 (Todo 6.5): CLOSED.* Every clock comparison left in repair and rebuild:
+    (1) *Repair age gate* (`StoreRepairer.errorEntryMayBeDeleted`, 60 s): this host's HLC against the entry's
+    `ValueState.timestamp`, the marker transaction's start, which another host stamped. It paces only. The read
+    decides (`provesDeletion`), and every commit voter that has not applied the allocation answers `AllocationPending`
+    (Q-N5, Todo 5.5), so the window the gate was meant to wait out can no longer prove a deletion. Skew opens the gate
+    at most the skew plus `MaxStartLead` early or late. A future-dated entry waits; an entry's start is capped at the
+    fastest host plus 2 s, so the wait is bounded. Tested with the gate at zero while the allocation is committed and
+    unapplied: StoreRepairerSuite "an entry past the age gate whose allocation has committed but not yet applied is
+    kept, not deleted (G8)" (with stores answering `ObjectNotFound` instead, repair deletes the live object's slice).
+    (2) *`mayJoinTransaction`* (T's start against the store's forget floor): it is the store's own join rule on its
+    own host's clock, so host skew does not enter. Backward wall-clock steps are the shared residual (paxos 10.10).
+    (3) *The completion gate* (`read.timestamp >= missedTimestamp`) compares object timestamps, never a clock (repair F3).
+    (4) *Rebuild `acceptor-since`*: settled above (P-N2).
+    (5) *Rebuild delta walk*: **a flaw, found and fixed.** It restored only entries stamped at or after the first walk's
+    start less `DeltaMargin` (30 s), on the claim that an entry the walk missed came from a transaction that prepared
+    after the walk started. That is false. The entry's transaction is the allocation's
+    AllocationFinalizationAction, and it can prepare long before it is decided: a CRL-recovered Tx after a host's
+    downtime, or the expiry commit decided from frozen states (G1 follow-up). So its timestamp can be older than any
+    fixed margin, with or without skew. The case it mattered for: the first pass lists allocation T (committed,
+    acknowledged by the lost store, unfinalized), walks past T's key, and is cut off before its sweep (a crash, a
+    cancel, an abort). T then finalizes, so the next pass's query no longer lists it, and the resume starts behind
+    the key. The store kept no slice and no ErrorTree mark. Fixed by removing the timestamp from the argument: every
+    checkpoint now carries the union of the allocations listed at every pass's query (`RebuildState.pendingAllocations`),
+    a resume sweeps them again, and the delta walk and `walk-started-at` are gone. Coverage no longer depends on any
+    clock. An allocation the lost store acknowledged committed before the rebuild began, so it is either unfinalized at
+    the first query (listed, and checkpointed with every advance of the walk) or finalized before it (in the tree ahead
+    of every walk). Test: RebuildingStoreSuite "an allocation an earlier pass listed, finalized since with its entry
+    behind the checkpoint, is restored on resume (Rebuild F10, G8)". It fails without the reload of the listed set,
+    and the same scenario failed under the delta walk once the entry's writer predated the margin.
+    Rebuild now holds no clock comparison except `acceptor-since`.
 G9. Marker-batch size/limit: `TransactionCreationError` is treated as permanent (StopRetrying) and wedges finalization (recovery F2); no document asks which creation errors an oversized batch (256 entries x many objects) can hit. *(2026-11-11: no longer a wedge. The give-up fails the actions and their drivers re-run the finalizers with backoff, so a transient creation error heals; one that repeats forever is a logged stall. An oversized UnackedCommits entry surfaced as TKVL `NodeSizeExceeded`, retried in place forever: about 90 objects on one store with 4096-byte FSIF metadata segments. Fixed: such entries are written in chunks of at most half a leaf node (repair-process 13.0b), and a `NodeSizeExceeded` left over is permanent, taking the finalizer failure path. ErrorTree entries are fixed-size and small.)*
 G10. Capacity interaction: ErrorTree growth during long outages (repair 13.3-6) x CRL admission (X5) x rebuild in-progress counts as failure budget (rebuild 6.3): no combined capacity argument.
     *2026-11-15 (Todo 4.3), the CRL admission leg:* ErrorTree and UnackedCommits growth costs backend space in the

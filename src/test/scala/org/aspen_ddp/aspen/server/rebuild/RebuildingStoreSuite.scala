@@ -18,7 +18,6 @@ import org.aspen_ddp.aspen.server.store.backend.rocksdb.BufferedConsistentRocksD
 import java.nio.ByteBuffer
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.concurrent.duration.{FiniteDuration, SECONDS}
 import scala.util.Try
 
 /** Exercises the walk against a real RocksDB backend on a temp directory, driven by the
@@ -141,57 +140,6 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       tx.replaySafe("test")
       client.getStoragePool(PoolId.BootstrapPoolId).flatMap(_.allocator.allocateDataObject(Array[Byte](7)))
 
-  atest("an allocation-tree entry landing after the walk passed its key is restored by the delta walk (Rebuild F10)"):
-    given ExecutionContext = executionContext
-    val dev = deviceDir()
-    for
-      _ <- populate(20)
-      late <- allocateOne()
-      _ <- net.waitForTransactionsToComplete()
-      _ <- dropEntry(late)
-      _ <- net.waitForTransactionsToComplete()
-      // A zero margin makes the delta walk take only entries written after the walk started, so the test can tell
-      // which entries it restored
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
-                                    testingOnlyTrackRestoredKeys = true,
-                                    deltaMargin = FiniteDuration(0, SECONDS),
-                                    testingOnlyAfterWalk = () => landEntry(late))
-      _ <- rebuild.complete
-    yield
-      val restored = rebuild.testingOnlyRestoredKeys.map(_.bytes.toList)
-      val lateKey = late.id.toBytes.toList
-      restored.count(_ == lateKey) should be(1)
-      // Entries older than the walk's start are not restored a second time
-      restored.distinct.size should be(restored.size)
-      os.exists(dev / storeId.directoryName) should be(true)
-
-  atest("a resumed rebuild keeps its first pass's walk start"):
-    given ExecutionContext = executionContext
-    val dev = deviceDir()
-    val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
-    var rebuildRef: RebuildingStore = null
-    var restored = 0
-    var seenOnResume: List[HLCTimestamp] = Nil
-    for
-      _ <- populate(20)
-      _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
-                                    checkpointInterval = 2,
-                                    testingOnlyOnRestored = () =>
-                                      restored += 1
-                                      if restored == 5 then rebuildRef.cancel())
-      _ = rebuildRef = rebuild
-      _ <- rebuild.complete.transform(scala.util.Success.apply)
-      first = RebuildState.load(staging).get.walkStartedAt
-      resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
-                                    checkpointInterval = 1,
-                                    testingOnlyOnRestored = () =>
-                                      RebuildState.load(staging).foreach(st => seenOnResume ::= st.walkStartedAt))
-      _ <- resumed.complete
-    yield
-      seenOnResume should not be empty
-      seenOnResume.distinct should be(List(first))
-
   /** Holds the finalization of every transaction carrying it until the test completes `release`, so its stores keep
    *  holding it: an allocation whose AllocationFinalizationAction may still be pending */
   private object Blocker extends FinalizationActionFactory with RegisteredTypeFactory:
@@ -266,6 +214,39 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- rebuild.complete
     yield
       rebuild.testingOnlyRestoredKeys.map(_.bytes.toList) should contain(held.id.toBytes.toList)
+
+  atest("an allocation an earlier pass listed, finalized since with its entry behind the checkpoint, is restored on resume (Rebuild F10, G8)"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+    var firstRef: RebuildingStore = null
+    for
+      _ <- populate(5)
+      _ <- net.waitForTransactionsToComplete()
+      held <- allocateHeldWithoutEntry()
+      // The first pass lists the held allocation, walks, and is cut off before its sweep
+      first = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                  checkpointInterval = 1,
+                                  testingOnlyAfterWalk = () => { firstRef.cancel(); Future.unit })
+      _ = firstRef = first
+      outcome <- first.complete.transform(scala.util.Success.apply)
+      listed = RebuildState.load(staging).get.pendingAllocations
+      // The entry lands and the transaction finalizes, so the next pass's peers list nothing. The entry's timestamp is
+      // that of the transaction writing it, which may have started long before the walk did (a late decision), so
+      // nothing about it tells the resume to look back
+      _ <- landEntry(held)
+      _ <- releaseBlocked()
+      // And the walk had passed its key
+      st = RebuildState.load(staging).get
+      _ = RebuildState.save(staging, st.copy(lastRestoredKey = Some(Key(Array.fill[Byte](16)(-1)))))
+      resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                    testingOnlyTrackRestoredKeys = true)
+      _ <- resumed.complete
+    yield
+      outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
+      listed.flatMap(_.pointers).map(_.id) should contain(held.id)
+      resumed.testingOnlyRestoredKeys.map(_.bytes.toList) should contain(held.id.toBytes.toList)
+      os.exists(dev / storeId.directoryName) should be(true)
 
   atest("a listed allocation deleted before its transaction finalizes is settled by a read proving the deletion"):
     given ExecutionContext = executionContext
@@ -401,7 +382,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     // cleanupStaging rather than about a directory that was never there.
     val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
     os.makeDir.all(staging)
-    RebuildState.save(staging, RebuildState(storeId, Some(Key(Array[Byte](7))), Nil, HLCTimestamp.now))
+    RebuildState.save(staging, RebuildState(storeId, Some(Key(Array[Byte](7))), Nil, Nil))
 
     for
       _ <- populate(20)
@@ -460,14 +441,12 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ = os.makeDir.all(staging)
       allocatedKeys = ids.map(id => Key(id.toBytes))
       sorted = allocatedKeys.sortWith(ByteArrayKeyOrdering.lt)
-      _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil, HLCTimestamp.now))
+      _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil, Nil))
 
-      // The rebuild should resume from that key. A zero margin keeps the delta walk from restoring the entries
-      // just written, which it would otherwise take as possibly missed
+      // The rebuild should resume from that key
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 5,
-                                    testingOnlyTrackRestoredKeys = true,
-                                    deltaMargin = FiniteDuration(0, SECONDS))
+                                    testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
       restored = rebuild.testingOnlyRestoredKeys
       restoredBytes = restored.map(_.bytes.toList).toSet
@@ -722,7 +701,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // A checkpoint part-way through, as a crashed pass leaves it
       _ = os.makeDir.all(staging)
       sorted = ids.map(id => Key(id.toBytes)).sortWith(ByteArrayKeyOrdering.lt)
-      _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil, HLCTimestamp.now))
+      _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil, Nil))
       _ = opener.lose = true
       lost = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener)
       outcome <- lost.complete.transform(scala.util.Success.apply)

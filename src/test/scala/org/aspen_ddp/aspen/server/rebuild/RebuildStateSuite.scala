@@ -1,9 +1,10 @@
 package org.aspen_ddp.aspen.server.rebuild
 
-import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectId}
+import org.aspen_ddp.aspen.common.network.PendingAllocation
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -30,7 +31,7 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
 
   test("a state with no progress round-trips"):
     val dir = tmpDir()
-    val state = RebuildState(storeId, None, Nil, HLCTimestamp.now)
+    val state = RebuildState(storeId, None, Nil, Nil)
     RebuildState.save(dir, state)
     RebuildState.load(dir) should be(Some(state))
 
@@ -42,15 +43,27 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
     val state = RebuildState(storeId, Some(key),
       List(objectId("22222222-2222-2222-2222-222222222222"),
            objectId("33333333-3333-3333-3333-333333333333")),
-      HLCTimestamp.now)
+      Nil)
     RebuildState.save(dir, state)
     val loaded = RebuildState.load(dir).get
-    loaded.walkStartedAt should be(state.walkStartedAt)
     loaded.storeId should be(storeId)
     loaded.lastRestoredKey.map(_.bytes.toList) should be(Some(key.bytes.toList))
     loaded.failedObjects should be(state.failedObjects)
 
-  test("a checkpoint without a walk start does not load, so its pass starts over"):
+  test("the listed pending allocations round-trip, pointers and all"):
+    val dir = tmpDir()
+    val pool = storeId.poolId
+    val data = DataObjectPointer(objectId("55555555-5555-5555-5555-555555555555"), pool, Array[Byte](1, 2, 3))
+    val kv = KeyValueObjectPointer(objectId("66666666-6666-6666-6666-666666666666"), pool, Array[Byte](1, 2, 3))
+    val pending = List(
+      PendingAllocation(TransactionId(UUID.fromString("44444444-4444-4444-4444-444444444444")), true, List(data, kv)),
+      PendingAllocation(TransactionId(UUID.fromString("77777777-7777-7777-7777-777777777777")), false, Nil))
+    RebuildState.save(dir, RebuildState(storeId, None, Nil, pending))
+    val loaded = RebuildState.load(dir).get.pendingAllocations
+    loaded.map(p => (p.transactionId, p.committed)) should be(pending.map(p => (p.transactionId, p.committed)))
+    loaded.map(_.pointers.map(_.toArray.toList)) should be(pending.map(_.pointers.map(_.toArray.toList)))
+
+  test("a checkpoint without its pending allocations does not load, so its pass starts over"):
     val dir = tmpDir()
     os.write(dir / RebuildState.stateFilename, s"store-id: $storeId\nfailed-objects: []\n")
     RebuildState.load(dir) should be(None)
@@ -60,15 +73,15 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
 
   test("save overwrites an existing checkpoint"):
     val dir = tmpDir()
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](1))), Nil, HLCTimestamp.now))
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](2))), Nil, HLCTimestamp.now))
+    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](1))), Nil, Nil))
+    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](2))), Nil, Nil))
     RebuildState.load(dir).get.lastRestoredKey.map(_.bytes.toList) should be(Some(List[Byte](2)))
 
   test("save replaces the checkpoint by rename rather than truncating it in place"):
     val dir = tmpDir()
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](1))), Nil, HLCTimestamp.now))
+    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](1))), Nil, Nil))
     val first = fileKey(dir / RebuildState.stateFilename)
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](2))), Nil, HLCTimestamp.now))
+    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](2))), Nil, Nil))
     val second = fileKey(dir / RebuildState.stateFilename)
 
     // Aspen is crash-only, so a crash between a truncate and the write that follows it is the

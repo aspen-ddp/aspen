@@ -66,7 +66,9 @@
   `client/internal/transaction/CLAUDE.md`). Only `InvalidObject.provesDeletion` deletes it from the store: more than
   `width - writeThreshold` `ObjectNotFound`/`ObjectMismatch` replies, or a consistent majority at refcount 0 (a live
   object is on at least writeThreshold ≥ consistentRestoreThreshold stores). A restored read means the object is
-  live: it is reconciled as if listed. Any other failure keeps the entry. An ErrorTree entry of unknown type is acted
+  live: it is reconciled as if listed. Any other failure keeps the entry. The age gate only paces (cross-document
+  G8): a commit voter that has not applied the allocation answers `AllocationPending`, which proves nothing, so a
+  clock skewed enough to open the gate early cannot turn a fresh allocation into a deletion. An ErrorTree entry of unknown type is acted
   on only for a proven deletion. A listed object's repair read can find it deleted too (its DeletionFinalizationAction
   not yet run): `repairListed` drops it on the same proof, with no age gate, and defers on an `InvalidObject` short of
   one (repair F15)

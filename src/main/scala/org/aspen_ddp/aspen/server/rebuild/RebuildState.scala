@@ -1,8 +1,9 @@
 package org.aspen_ddp.aspen.server.rebuild
 
-import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectId}
+import org.aspen_ddp.aspen.common.network.PendingAllocation
+import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import scribe.Logging
 
@@ -19,22 +20,26 @@ import scala.util.control.NonFatal
  *  unquoted `0123456789` parses as a number and a `1e5` as a float, either of which would
  *  come back as something other than the key that was written. `failedObjects` are objects
  *  the walk could not read; the checkpoint advances past them so one unreadable object cannot
- *  wedge the walk forever, and they are retried at the end of the pass. `walkStartedAt` is the
- *  HLC timestamp (as its long) at which the first pass of this rebuild began its walk; a resume
- *  keeps it, so the delta walk looks for entries written since the first walk started (Rebuild F10).
+ *  wedge the walk forever, and they are retried at the end of the pass. `pendingAllocations` are
+ *  every allocation the pool's other stores listed as unfinalized at the peer query of any pass so
+ *  far (Rebuild F10): a resume sweeps them again, since one finalized meanwhile may have its tree
+ *  entry behind `lastRestoredKey`, where no walk looks. Pointers are hex-encoded `ObjectPointer`s.
  *
  *  ```
  *  store-id: 00000000-0000-0000-0000-000000000000:0
  *  last-restored-key: '0a1b2c'
  *  failed-objects:
  *    - 22222222-2222-2222-2222-222222222222
- *  walk-started-at: 7301234567890123776
+ *  pending-allocations:
+ *    - transaction-id: 44444444-4444-4444-4444-444444444444
+ *      committed: true
+ *      pointers: ['0a1b2c...']
  *  ```
  */
 case class RebuildState(storeId: StoreId,
                         lastRestoredKey: Option[Key],
                         failedObjects: List[ObjectId],
-                        walkStartedAt: HLCTimestamp):
+                        pendingAllocations: List[PendingAllocation]):
 
   def yamlConfig: String =
     val hex = HexFormat.of()
@@ -47,7 +52,16 @@ case class RebuildState(storeId: StoreId,
       else
         "failed-objects:\n" + failedObjects.map(o => s"  - ${o.uuid}\n").mkString
 
-    s"store-id: $storeId\n" + keyLine + failedLines + s"walk-started-at: ${walkStartedAt.asLong}\n"
+    val pendingLines =
+      if pendingAllocations.isEmpty then
+        "pending-allocations: []\n"
+      else
+        "pending-allocations:\n" + pendingAllocations.map: p =>
+          val ptrs = p.pointers.map(ptr => s"'${hex.formatHex(ptr.toArray)}'").mkString(", ")
+          s"  - transaction-id: ${p.transactionId.uuid}\n    committed: ${p.committed}\n    pointers: [$ptrs]\n"
+        .mkString
+
+    s"store-id: $storeId\n" + keyLine + failedLines + pendingLines
 
 
 object RebuildState extends YObject[RebuildState] with Logging:
@@ -68,17 +82,28 @@ object RebuildState extends YObject[RebuildState] with Logging:
   val storeId: Required[StoreId] = Required("store-id", StoreId.YStoreId)
   val lastRestoredKey: Optional[String] = Optional("last-restored-key", YString)
   val failedObjects: Required[List[UUID]] = Required("failed-objects", YList(YUUID))
-  // Required: a checkpoint without it does not load, so its pass restarts with a fresh walk start
-  val walkStartedAt: Required[Long] = Required("walk-started-at", YLong)
+  // Required: a checkpoint without it does not load, so its pass starts over, walking the whole tree
+  val pendingAllocations: Required[List[PendingAllocation]] = Required("pending-allocations", YList(YPending))
 
-  val attrs: List[Attr] = storeId :: lastRestoredKey :: failedObjects :: walkStartedAt :: Nil
+  val attrs: List[Attr] = storeId :: lastRestoredKey :: failedObjects :: pendingAllocations :: Nil
+
+  object YPending extends YObject[PendingAllocation]:
+    val transactionId: Required[UUID] = Required("transaction-id", YUUID)
+    val committed: Required[Boolean] = Required("committed", YBool)
+    val pointers: Required[List[String]] = Required("pointers", YList(YString))
+
+    val attrs: List[Attr] = transactionId :: committed :: pointers :: Nil
+
+    def create(o: Object): PendingAllocation =
+      PendingAllocation(TransactionId(transactionId.get(o)), committed.get(o),
+                        pointers.get(o).map(s => ObjectPointer(hex.parseHex(s))))
 
   def create(o: Object): RebuildState =
     RebuildState(
       storeId.get(o),
       lastRestoredKey.get(o).map(s => Key(hex.parseHex(s))),
       failedObjects.get(o).map(u => ObjectId(u)),
-      HLCTimestamp(walkStartedAt.get(o)))
+      pendingAllocations.get(o))
 
   def loadRebuildState(file: os.Path): RebuildState =
     create(loadYamlFile(file))

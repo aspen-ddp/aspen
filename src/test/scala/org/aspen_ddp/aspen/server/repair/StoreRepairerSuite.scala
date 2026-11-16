@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Key, KeyValueObjectPointer, ObjectId,
                                            ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionId}
-import org.aspen_ddp.aspen.common.network.TxPrepare
+import org.aspen_ddp.aspen.common.network.{TxPrepare, TxResolved}
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot}
 import org.aspen_ddp.aspen.server.store.backend.RepairSlotOccupied
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StoragePoolState}
@@ -393,6 +393,47 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       result.deferred shouldBe 1
       result.repaired shouldBe 0
       stillThere shouldBe true
+
+  // G8: the age gate compares the repairing host's HLC with the marker transaction's, so a repairer whose clock runs
+  // ahead opens it early. It only paces: the read decides, and a committed allocation its stores have not applied yet
+  // reads as AllocationPending, never as a deletion. An age of zero is the gate a fast enough repairing clock sees
+  test("an entry past the age gate whose allocation has committed but not yet applied is kept, not deleted (G8)"):
+    @volatile var allocating: Option[TransactionId] = None
+    @volatile var held: List[TxResolved] = Nil
+    net.recordTxMessage =
+      case p: TxPrepare if allocating.isEmpty && p.txd.allocatingObjects.nonEmpty =>
+        allocating = Some(p.transactionId)
+        false
+      case _ => false
+    // No store learns the outcome, so every commit voter holds the allocation unapplied
+    net.dropTxMessage =
+      case r: TxResolved if allocating.contains(r.transactionId) =>
+        synchronized { held = r :: held }
+        true
+      case _ => false
+    val target = RecordingTarget(List(storeId))
+    for
+      ptr <- client.transact: tx =>
+        given Transaction = tx
+        tx.replaySafe("test")
+        client.getStoragePool(PoolId.BootstrapPoolId).flatMap: pool =>
+          new PoolObjectAllocator(client, pool).allocateKeyValueObject(Map(Key(Array[Byte](9)) -> Value(Array[Byte](9))))
+      listed <- client.getStoragePool(PoolId.BootstrapPoolId).flatMap(_.allocationTree.get(Key(ptr.id.toBytes)))
+      _ <- seedErrorEntry(ptr.id, ptr.storePointer)
+      result <- StoreRepairer(client, target).scan(storeId, noDeletionAge)
+      stillThere <- errorEntryExists(ptr.id)
+      _ = net.dropTxMessage = _ => false
+      _ = net.recordTxMessage = _ => false
+      _ = synchronized(held).foreach(net.deliverTransactionMessage)
+      _ <- net.waitForTransactionsToComplete()
+      after <- client.read(ptr)
+    yield
+      listed shouldBe None
+      held should not be empty
+      target.deletions shouldBe Nil
+      result.deferred shouldBe 1
+      stillThere shouldBe true
+      after.pointer.id shouldBe ptr.id
 
   /** A RecordingTarget whose repair writes fail as an FSIF store's do over a foreign occupant of the slot */
   private def occupiedTarget(occupant: ObjectId): RecordingTarget = new RecordingTarget(List(storeId)):

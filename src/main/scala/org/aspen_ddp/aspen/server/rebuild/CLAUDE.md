@@ -11,18 +11,17 @@
   Rebuilds pass removes it for an Active entry after a crash. A directory at a Rebuilding store's path with neither
   this marker nor `rebuild-required` is retired as a lost copy (`StoreRebuilds.retireForeignCopy`: marked, kept in
   `pending-delete/`, rebuilt)
-- Delta walk (Rebuild F10): after the main walk, `RebuildingStore.deltaWalk` walks the AllocationTree again and
-  restores entries whose timestamp is at or after `walkStartedAt - DeltaMargin` (horizon + `AcceptorSinceMargin`,
-  30 s): allocations the lost store acknowledged whose entry landed behind the walk. `walk-started-at` is the first
-  pass's, kept in the checkpoint across resumes (a checkpoint without it does not load). The delta walk does not move
-  the checkpoint. It covers entries that landed between the first walk start and a pass's peer query
 - Pending allocations (Rebuild F10): before each pass's walk, `queryPeers` asks the pool's other stores
   (`CurrentAllocationsRequest`) and waits, resending, for `width - writeThreshold + 1` answers. That many answers
   include a holder of every committed, unfinalized allocation the lost store voted for, and the count never exceeds
-  the consistent read threshold. After the delta walk, `sweepPending` restores the listed objects directly, re-querying
-  in rounds (1 s doubling to 30 s): unresolved waits; committed restores, retrying any read failure; no longer listed
-  restores, or settles on `InvalidObject.provesDeletion`. It never waits on a finalization, which could need this
-  store. A cancel abandons the wait (`CurrentAllocationsQuery.Abandoned`)
+  the consistent read threshold. The listed set is merged into `RebuildState.pendingAllocations`, which every
+  checkpoint carries (a checkpoint without it does not load): a resume sweeps what earlier passes listed, since one
+  finalized meanwhile may have its tree entry behind the checkpoint. That is the only cover for such an entry; no
+  timestamp filter can be (its writer may prepare long before it is decided: cross-document G8). An allocation the
+  lost store acknowledged is listed at the first query or already in the tree. After the walk, `sweepPending` restores
+  the listed objects directly, re-querying in rounds (1 s doubling to 30 s): unresolved waits; committed restores,
+  retrying any read failure; no longer listed restores, or settles on `InvalidObject.provesDeletion`. It never waits
+  on a finalization, which could need this store. A cancel abandons the wait (`CurrentAllocationsQuery.Abandoned`)
 - Unreadable objects (Rebuild F15): `retryFailures` fails the pass while any object is still unreadable, unless the
   store's Rebuilding entry carries `acceptLoss` (set by `accept-rebuild-loss`). Then each one still in the
   AllocationTree is marked in the ErrorTree against this store (`MissedUpdateMarker.mark`, missed at

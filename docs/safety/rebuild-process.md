@@ -103,8 +103,8 @@ start (131)                      ┌── finalPath exists ──► cleanupSta
         ► walk allocation tree: foreach / foreachFrom(lastRestoredKey) (193-198)
               per entry: restoreObject (237) ► attemptRestore ► restore (326) ► recordRestored (344)
                           every 1000: flush THEN checkpoint (385)
-        ► delta walk: foreach, entries at or after walkStartedAt - DeltaMargin only, no checkpoint (F10)
-        ► sweepPending: restore the queried allocations directly, re-querying in rounds until settled (F10)
+        ► sweepPending: restore the allocations listed by this pass's query or a checkpointed earlier one directly,
+          re-querying in rounds until settled (F10)
         ► abort latch check (201)         [out of space, >10000 failures, cancel]
         ► retryFailures (204, 420)         [re-read allocation-tree entry; deleted ► skip]
         ► finish (205, 455): flush, close, remove checkpoint, os.move(staging ► final), sync dir
@@ -236,16 +236,14 @@ remains (`:134-139`). Otherwise `runPass`.
   (`:117`).
 * Checkpoint: every 1,000 restored objects (`:37`), `backend.rebuildFlush()` **then** atomic temp+rename save of
   `rebuild-state.yaml` (`:385-416`; `RebuildState.save` `:87`). Contents: store id, last restored key (hex), failed
-  object ids, and `walk-started-at`, the first pass's walk start, kept across resumes. A checkpoint without it does not
-  load, so its pass restarts the walk.
-* Delta walk (2026-11-14, F10): after the walk, `RebuildingStore.deltaWalk` walks the whole tree again and restores
-  only entries whose `ValueState.timestamp` is at or after `walkStartedAt - DeltaMargin` (horizon 20 s +
-  `AcceptorSinceMargin` 10 s). It does not move the checkpoint, so a pass failing in it resumes the main walk near its
-  end and reruns it. A failure in it is recorded once (`recordFailure` dedupes) and retried with the rest.
+  object ids, and `pending-allocations`, the union of the allocations the peers listed at every pass's query so far
+  (2026-11-16, G8). A checkpoint without it does not load, so its pass restarts the walk. (The delta walk of 2026-11-14
+  and its `walk-started-at` were removed the same day: see F10's 2026-11-16 note.)
 * Pending allocations (2026-11-14, F10): before the walk, `queryPeers` sends `CurrentAllocationsRequest` to the pool's
   other stores, resending until `width - writeThreshold + 1` answer. Each lists the allocations in the pool held by
   transactions it has not seen finalized or abort (`Frontend.currentAllocations`; a store still loading its CRL does
-  not answer). After the delta walk, `sweepPending` restores those objects directly, in rounds that query again:
+  not answer). Merged with the checkpoint's listed set, they are carried by every checkpoint. After the walk,
+  `sweepPending` restores those objects directly, in rounds that query again:
   unresolved waits; committed restores, retrying any read failure; no longer listed (finalized, or aborted and
   forgotten) restores, or settles on a read proving the object is not live. A cancel abandons the wait.
 * `retryFailures` (`:420-452`): for each failed id re-reads the allocation-tree entry; absent means deleted since,
@@ -561,8 +559,8 @@ the slice. While the tree entry has not landed, a young ErrorTree entry is defer
 its then current state; ErrorTree repair completes any later change. Safe. (c) The allocation committed **before** the
 store was lost, with the store having acknowledged it, and its tree entry lands after the walk passed that key: there is
 no ErrorTree mark (the store reported success) and the walk skipped it. Since 2026-11-14 it is restored (F10,
-FIXED): by the delta walk if its entry landed before the peers were queried, else directly by the sweep, from the
-peers' list of allocations they hold unfinalized.
+FIXED): directly by the sweep, from the peers' list of allocations they hold unfinalized, checkpointed so that a
+resumed pass sweeps what an earlier pass listed (2026-11-16, G8).
 
 **FS10 Tree restructuring during the walk.** Splits are benign (entries move to the right, the walk's read node already
 held them). Joins and tail removals delete nodes with a version bump; a stale link read raises `InvalidObject` and the
@@ -855,6 +853,20 @@ promoted S has a stale slice of each such node and no ErrorTree entry; it is onl
 > tolerance (as F14); (2) a peer rebuilt after T started answers without holding T and still counts. That needs T to
 > start inside the window between that peer's own query and its `acceptor-since`, since its rebuild's query listed
 > everything pending before then.
+>
+> **2026-11-16 (Todo 6.5, cross-document G8): the delta walk was unsound; replaced.** The first part's premise, that
+> an entry the walk missed was written by a transaction that prepared after the walk started, is false: the
+> AllocationFinalizationAction's transaction can prepare before the walk and be decided long after (CRL recovery after
+> a downtime, or the expiry commit from frozen states), so its entry's timestamp can predate any fixed margin, skew
+> or not. The case that needed it: a pass lists T, walks past T's key, and is cut off before its sweep; T finalizes;
+> the resumed pass's query no longer lists T and its walk starts behind the key. Now every checkpoint carries the union
+> of the allocations listed at each pass's query (`RebuildState.pendingAllocations`), and a resume sweeps them again.
+> The delta walk, `DeltaMargin` and `walk-started-at` are removed. Coverage: an allocation the lost store acknowledged
+> committed before the rebuild, so it is unfinalized at the first query (listed, and on disk with every advance of the
+> walk's checkpoint) or finalized before it (in the tree ahead of every walk). No clock enters. Tests: RebuildingStoreSuite
+> "an allocation an earlier pass listed, finalized since with its entry behind the checkpoint, is restored on resume
+> (Rebuild F10, G8)" (fails without reloading the listed set; the same scenario failed under the delta walk with an
+> entry older than its margin); RebuildStateSuite "the listed pending allocations round-trip, pointers and all".
 
 **F10 (Low) A committed allocation whose tree entry lands after the walk passed the key, on a store that had
 acknowledged it before being lost, is never restored.**

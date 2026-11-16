@@ -80,7 +80,7 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 
 | Id | Verdict | Finding |
 |---|---|---|
-| Rebuild F10, F17 / X G6 | **FIXED** / **CLOSED** 2026-11-14 (was PLAUSIBLE-low / OPEN) | A rebuild walked the AllocationTree once, so an acknowledged allocation whose entry landed behind the walk was never restored (F10), and no one had verified that every allocation records an entry (F17). Before its walk a rebuild now asks a quorum (`width - writeThreshold + 1`, never more than the read quorum) of the pool's other stores for the allocations they hold unfinalized, and restores them directly; a delta walk covers entries landing between the walk start and the query. The builder adds the allocation action for every allocated object (coverage suite). Residual: the pool losing the Paxos state of `writeThreshold` stores while T is unfinalized. G6: orphan entries kept a rebuild from finishing (F15, fixed 2026-11-15: `accept-rebuild-loss`) |
+| Rebuild F10, F17 / X G6 | **FIXED** / **CLOSED** 2026-11-14 (was PLAUSIBLE-low / OPEN) | A rebuild walked the AllocationTree once, so an acknowledged allocation whose entry landed behind the walk was never restored (F10), and no one had verified that every allocation records an entry (F17). Before its walk a rebuild now asks a quorum (`width - writeThreshold + 1`, never more than the read quorum) of the pool's other stores for the allocations they hold unfinalized, and restores them directly. 2026-11-16 (G8): the list is checkpointed, and a resumed pass sweeps what earlier passes listed; this replaces the delta walk, whose timestamp filter missed an entry whose writer prepared long before it was decided. The builder adds the allocation action for every allocated object (coverage suite). Residual: the pool losing the Paxos state of `writeThreshold` stores while T is unfinalized. G6: orphan entries kept a rebuild from finishing (F15, fixed 2026-11-15: `accept-rebuild-loss`) |
 | Rebuild F3, F4 | **FIXED** 2026-11-14 (was PLAUSIBLE) | A rebuild took any directory at the store's path for a finished rebuild (F3), and a crash between the move and the flip let a restart serve the rebuilt store as a blank acceptor while the tree said Rebuilding (F4). A durable `rebuild-complete` marker now identifies a finished rebuild and keeps it offline until its flip commits; any other directory there is retired into `pending-delete/` and rebuilt. Residual: a leftover may serve between a device load and the first reconcile |
 | Paxos F3 / Recovery F7 | **FIXED** (replay pins) (was CONFIRMED) | The horizon trusted the client clock. It is gone; replay is refused by the client pin rule and the late-commit rule |
 | Recovery R-N1 / X11 | **CLOSED** 2026-11-14 by the horizon (Todo 2.9; was NARROWED) | Applied stubs: a store that forgot T on a `TxFinalized` listing it in `owed`, or applied T through its entry, applies nothing on a replay's commit; the whole-pool scenario is tested end to end. Residual: stores with an entry and no stub (R-N7, R-N9, R-N6's lost `TxFinalized`) |
@@ -165,7 +165,10 @@ Per cross-document-review §2, no document yet covers:
   consumption across a rebuild or a move (cross-document G5, X10);
 - a combined analysis of delayed allocation-tree records;
 - client-side caches;
-- clock skew across `acceptorSince`, repair age gates and rebuild timestamps (no longer the horizon);
+- (closed 2026-11-16, Todo 6.5) clock skew across `acceptorSince`, repair age gates and rebuild timestamps
+  (cross-document G8): the age gate only paces (a read decides, and an unapplied allocation reads `AllocationPending`),
+  and rebuild's delta walk, whose timestamp filter was unsound, is replaced by a checkpointed list of pending
+  allocations, so `acceptor-since` is rebuild's only clock comparison;
 - the size limits of marker batches;
 - a combined capacity argument covering the ErrorTree, UnackedCommits growth, CRL admission and rebuilds (the CRL
   admission leg stated 2026-11-15, cross-document G10; UnackedCommits growth and rebuilds still open);

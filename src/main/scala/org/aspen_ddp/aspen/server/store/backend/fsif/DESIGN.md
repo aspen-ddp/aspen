@@ -391,7 +391,8 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
 
 - **`fsif-initialized`** (Ruling 23, revised). A marked store is always recovered. For a directory without the marker,
   `FsifBackend.openUnmarked` initializes it only if every FSIF file is absent or zero-length
-  (`FsifRecovery.isBlank`), which keeps creation re-runnable. Otherwise it recovers the store, writes the marker
+  (`FsifRecovery.isBlank`) and it has no `incarnation` file (a blank directory of a store that has served is
+  `StoreLost`, SL X14), which keeps creation re-runnable. Otherwise it recovers the store, writes the marker
   durably and serves it, with a warning; a `StoreLost` propagates and is marked `rebuild-required` like any other.
   A crash part way through a fresh store's `initialize` therefore opens as the empty store or as `StoreLost` (4.6).
 - **onFatal** posts `BackendFailed`. The routes are listed in section 4.2.
@@ -733,7 +734,10 @@ These look like loss but never trigger a rebuild:
   retries. Only a non-ENOSPC error during a retry is fail-stop.
 - **A missing `fsif-initialized` marker.** `FsifBackend.openUnmarked` (:1724-1742) re-initializes the directory
   only if every FSIF file is absent or zero-length (`FsifRecovery.isBlank`): nothing there can hold an object, so
-  nothing is lost. Any other marker-less directory goes through normal recovery. If that succeeds, the marker is
+  nothing is lost. A blank directory that holds the store's `incarnation` file is the exception: that file is
+  written only after a backend has opened (`StoreLoader`) or into a marked rebuild staging copy
+  (`RebuildingStore.finish`), so the store has served and its files were lost (an incomplete restore, a wiped
+  directory). It throws `StoreLost` and is rebuilt instead of being served empty (safety SL X14, 2026-11-16). Any other marker-less directory goes through normal recovery. If that succeeds, the marker is
   written durably and the store served, with a warning, so a bug that loses or fails to carry the marker (a
   transfer, adoption or rebuild path that does not carry the file, or a renamed constant) costs nothing. If it
   throws `StoreLost`, that is L1-L12 and the store is marked like any other. A crash part way through a fresh

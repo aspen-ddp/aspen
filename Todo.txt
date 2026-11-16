@@ -66,7 +66,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.3  SL 4.2 X14 (blank FSIF without its marker) appears fixed by Ruling 23 (revised). Verify and mark it.
 7.4  C1: SL doc cites a stale DeviceDiscovery line, and the Failed marker is now durable. C3: reword Rebuild F14
      and CRL F18 to state the X2 mute plus its fast-clock residual. C4: state once that the status cache is
      late-commit and finalization evidence. C6: narrow Rebuild 8.2's "repair closes the gap" until 2.5/4.5 land.

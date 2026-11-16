@@ -17,6 +17,7 @@ import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, Ob
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.DurableFiles
+import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitError, CommitState, CompletionHandler, Read,
   RepairSlotOccupied, UpdateForm}
 
@@ -1738,8 +1739,9 @@ object FsifBackend:
       openUnmarked(storeId, path, layout, new NioFsifFiles(path), io, tuning, onFatal, () => writeMarker(path))
 
   /** Opens a store directory that lacks the marker:
-    *  - blank (every FSIF file absent or empty): creation never wrote anything, so it is initialized as an empty
-    *    store, then marked;
+    *  - blank (every FSIF file absent or empty) but holding the store's incarnation file: the store has served and
+    *    lost its files, so it throws StoreLost (safety SL X14);
+    *  - blank otherwise: creation never wrote anything, so it is initialized as an empty store, then marked;
     *  - otherwise it is recovered like a marked store and marked once recovery succeeds. A store that cannot be
     *    recovered throws StoreLost, which the host turns into `rebuild-required`. A crash part way through a fresh
     *    store's `initialize` lands here as well: recovery finds its initial state, or the store is lost having never
@@ -1750,7 +1752,12 @@ object FsifBackend:
   private[fsif] def openUnmarked(storeId: StoreId, path: os.Path, layout: FsifLayout, files: FsifFiles,
                                  io: ExecutionContext, tuning: FsifTuning, onFatal: Throwable => Unit,
                                  writeMarker: () => Unit): FsifBackend =
-    if FsifRecovery.isBlank(files) then
+    if FsifRecovery.isBlank(files) && os.exists(path / StoreIncarnationFile.FileName) then
+      // The incarnation file is written only after a backend has opened (StoreLoader) or into a marked rebuild
+      // staging copy (RebuildingStore.finish), so this store has served: its files are lost, not never created
+      throw new FsifRecovery.StoreLost(s"FSIF store $storeId at $path has served (it has an incarnation file) but " +
+        s"its FSIF files are blank and its $InitializedMarkerFile marker is missing")
+    else if FsifRecovery.isBlank(files) then
       scribe.warn(s"FSIF store $storeId at $path was never fully created. Initializing it as an empty store")
       FsifRecovery.initialize(files, layout)
       writeMarker()

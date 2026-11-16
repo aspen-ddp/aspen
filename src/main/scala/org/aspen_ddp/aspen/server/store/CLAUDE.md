@@ -55,6 +55,8 @@
 - Store identity: `StoreIncarnationFile` keeps the store's incarnation UUID in its directory's `incarnation` file (written
   with `DurableFiles.write`). It survives restarts and transfers (the archive is the whole directory) and changes only on
   a rebuild. A backend with no directory (`MapBackend`) gets `StoreIncarnation.default(storeId)` and no file.
+  Its presence also means the store has served: FSIF opens a blank directory that lacks its `fsif-initialized` marker
+  but has this file as `StoreLost`, not as a fresh empty store (safety SL X14). Write it only after a backend open
 - Rebuilt stores: `Frontend.acceptorSince` (from the `acceptor-since` file `RebuildingStore.finish` writes) mutes a
   prepare for an unknown transaction started earlier (`Tx.muted`): proven committed if an object shows its update,
   otherwise forgotten with no promise, vote, accept or CRL save, as if the store were offline. Its old incarnation

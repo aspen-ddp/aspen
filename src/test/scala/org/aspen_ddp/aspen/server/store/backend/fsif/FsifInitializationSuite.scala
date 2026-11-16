@@ -15,6 +15,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Metadata, ObjectId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, Completion, CompletionHandler,
   FsifConfig, Read, UpdateForm}
 
@@ -113,6 +114,17 @@ class FsifInitializationSuite extends FileBasedTests:
       IndexFile.decode(os.read.bytes(dir / FsifRecovery.IndexFiles(0)), layout.segmentCount).map(_._1) shouldBe
         Some(0L)
     finally close(b)
+
+  test("without its marker, a blank directory of a store that has served is lost, not initialized (SL X14)"):
+    val dir = tdir / "store"
+    os.makeDir.all(dir)
+    // A served store whose marker and FSIF files were lost (an incomplete restore): only its incarnation remains
+    StoreIncarnationFile.writeFresh(dir)
+    os.write(dir / FsifRecovery.DataFile, Array[Byte]())
+    FsifRecovery.isBlank(new NioFsifFiles(dir)) shouldBe true
+    an[FsifRecovery.StoreLost] should be thrownBy FsifBackend.open(storeId, dir, layout, io, _ => ())
+    isUnmarked(dir) shouldBe true
+    os.exists(dir / FsifRecovery.IndexFiles(0)) shouldBe false
 
   test("without its marker, a new directory is initialized"):
     val dir = tdir / "fresh"

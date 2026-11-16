@@ -764,8 +764,8 @@ Findings the horizon (paxos-transactions.md 10.10) touches. Every other finding 
 | F14 | unchanged (load larger) | Finalization still waits for the marker, which now also carries an entry per silent voter per transaction (R-N4) | `MissedUpdateFinalizationAction.scala:98-114` |
 | F15 | unchanged | Non-voters still get no entry | `MissedUpdateFinalizationAction.scala:99` |
 | F16 | **closed** (by design, 2026-11-15) | Leader trigger is still `notFinalized`, kept on purpose: it is the fast takeover of a dead remote driver | `Store.scala` `handleTransactionMessage` |
-| F17 | unchanged (open) | Not re-derived | |
-| F18 | **narrowed** | No driver starts while the store's CRL state loads. *2026-11-15 (Todo 4.4):* a recovered vote no longer waits for its first lookup (R-N3) | `Store.driveTransaction`; `Frontend.recoveryPending` |
+| F17 | **closed** 2026-11-16 (Todo 6.8; quarantine leak fixed; residual R-N13) | A missing object is reported, never quarantined; a creation's miss is a fresh state | `Tx.objectLoadFailed`, `Tx.issueCommits`, `Frontend.backendReadComplete` |
+| F18 | **closed** 2026-11-16 (Todo 6.8; was narrowed) | No driver starts while the store's CRL state loads. *2026-11-15 (Todo 4.4):* a recovered vote no longer waits for its first lookup (R-N3). Driver traffic to a loading Tx is held and released in order; tested | `Store.driveTransaction`; `Frontend.recoveryPending`, `holding` |
 
 ### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
 
@@ -1097,6 +1097,23 @@ but combined with F10 can produce duplicate finalizer runs.
 `TxCommitted`, which makes the finalizer mark it. Is a persistent read failure (ObjectNotFound for a store that lost the object) ever
 reconciled by repair for a recovered Tx that is applying a *creation*? Not verified.
 
+> **2026-11-16 (Todo 6.8): CLOSED with tests, one leak FIXED, and R-N13 found.** Re-derived at `d4dac1a7`. A load
+> failure other than `ObjectNotFound` fail-stops the store, or poisons the object on a write-frozen one (Req F6, tested
+> before). `ObjectNotFound` for an object the vote does not allocate means the store applied T and a later committed
+> transaction deleted the object, since T's lock admits nothing else: the object is left out of `objects`, T applies
+> nothing to it and reports it in `TxCommitted`, so the finalizer marks it and repair finds it deleted. Nothing is
+> quarantined: no lock was lost on a copy the store holds. A *creation* never fails to load: a backend miss is a fresh
+> state (`allocationLoaded`), so a recovered allocation with its saved data creates the object. Without its data (the
+> CRL dropped it after the apply), its re-check fails (`MissingObjectUpdate`), and the store quarantined the fresh
+> state. That quarantine could never clear: the object was applied and then deleted, and no read verifies a deleted
+> object, so the transaction's CRL state and admission were held until the next reload, which quarantined it again.
+> *Fix:* `Tx.issueCommits` quarantines no object the backend missed (`allocatedHere`); it is reported instead.
+> Tests: FrontendSuite "a recovered commit vote whose object is not found applies nothing, reports it, and quarantines
+> nothing", "a recovered allocating commit vote whose object the backend misses creates it from its saved data", "a
+> recovered allocating commit vote without its data whose object was deleted reports it and quarantines nothing"
+> (fails before the fix). *Residual:* a recovered allocation that still has its data, whose object was applied and
+> then deleted, re-creates it (R-N13, open).
+
 > **Verification 2026-11-09: OPEN (not verified). Severity: liveness.** Not re-derived; Store.handleTransactionMessage runs drivers while Frontend holds messages (Store.scala:128-193) as the doc says.
 > *Fix sketch:* Add a test.
 
@@ -1108,6 +1125,15 @@ transaction messages, yet `Store.handleTransactionMessage` lets drivers on this 
 (`Store.scala:128-193`) and recovery drivers on the *same* store can start (heartbeat) before the `Tx` has loaded. Since drivers
 only produce messages to peers and the `Tx` holds its own responses until loaded, I did not find a violation, but the
 combination (recovery driver for a transaction whose local `Tx` is still loading) is untested here.
+
+> **2026-11-16 (Todo 6.8): CLOSED, no violation, now tested.** While the CRL state loads no driver starts
+> (`Frontend.recoveryPending`). Once it has loaded, a recovered Tx whose objects are still loading may be driven at
+> heartbeat. Its driver starts above the promise recovered from the CRL, which the Tx knows before its objects load
+> (`Tx.highestProposal`; paxos F5). The Frontend holds all of the store's transaction traffic while `holding`, the
+> driver's own prepare, accept, resolution and finalization included, and releases it in order once the Tx loads.
+> Peers' replies reach the driver, which may decide without this store, and that is ordinary Paxos with one slow
+> acceptor. Test: StoreSuite "a recovery driver started while its recovered Tx loads starts above the recovered
+> promise, and the Tx answers its traffic only once loaded".
 
 ### Re-assessment of replays through entries with no stub (2026-11-14, Todo 2.9)
 
@@ -1478,6 +1504,25 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 > written) or reported its objects in `TxCommitted`, so repair restores it; the stub only stops a replay from
 > applying T there, which the design wants ("must not apply through a replay"). A failed earlier commit also forces
 > every later transaction on the object to vote abort until the store reloads (`BackendCommitFailed`).
+
+> **R-N13 (2026-11-16, Todo 6.8). Verdict: CONFIRMED (store side reproduced). Severity: resurrection.** A recovered
+> commit vote that allocates O treats a backend miss as "not yet applied" (`allocationLoaded`) and creates O from its
+> saved data. The miss is ambiguous: the store may have applied the allocation and then a later committed transaction
+> deleted O. The CRL is meant to tell the two apart, since the Tx drops its object data once its commits persist
+> (`Tx.allObjectCommitsComplete`). But `SimpleCRL.dropTransactionObjectData` only marks the in-memory record. Nothing
+> is written until the record is next rewritten (a copy-forward or another save of T), so a crash recovers T with its
+> data. Sequence: T allocates O and applies it at S; T's finalization is still running (a lagging marker, R-F14); a
+> client reads O through the pool and T2 deletes it, applying at S; S crashes. On reload T is recovered with its data,
+> its driver learns the non-late commit from a peer that still holds T, and S re-creates O at T's revision with
+> refcount 1. Nothing marks O at S, since T's `TxCommitted` reports no error. With a second store that missed T2
+> (marked, but repair reads O through the pool), the two copies reach Replication(3, 2)'s read threshold and the deleted
+> object becomes readable again. Reproduced at the Frontend (a recovered allocation with its data, status committed,
+> backend missing O: O is created); the CRL step is by inspection (`LogContent.Tx.dropTransactionObjectData` sets
+> flags only). *Fix sketch:* make the drop durable before any deletion of O can be applied: on the rare path where a
+> commit deletes an object that an unconcluded Tx at the store allocated, re-save that Tx's state without data and
+> hold the deletion's backend commit until the save is durable (Todo 2.17). A recovered allocation without its data
+> then reports O (F17 fix) instead of creating it. The window after TxFinalized, when T's in-memory Tx is gone but its
+> CRL deletion is not yet durable, needs the same ordering, or an argument that no peer can still answer non-late.
 
 ### 10.1 Mapping to the requested hazard classes
 

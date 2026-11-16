@@ -957,7 +957,11 @@ class Tx( trs: TransactionRecoveryState,
     // lost lock would have made them, until repair shows the store's copy matches a read of the object at least as new
     // as this transaction. That is what repair requires to drop an ErrorTree entry for it, so the store is then as good
     // as one that missed the transaction and was repaired. Only changed objects: a lock-only one has no update to lose.
-    // An object already quarantined is quarantined by this vote too, so its bound covers this transaction
+    // An object already quarantined is quarantined by this vote too, so its bound covers this transaction.
+    // Not an allocation the backend missed (allocatedHere): the store holds no copy of it, so no lock was lost, and
+    // every other transaction on it misses and votes abort. A recovered allocation fails its apply only without its
+    // data, which the CRL drops once the update is applied: the object was applied and later deleted, which a read
+    // can never verify, so a quarantine would never clear (transaction-recovery F17). It is reported instead
     if disposition == TransactionDisposition.VoteCommit then
       if recovered then
         val threw = result.failed -- notApplied
@@ -965,7 +969,7 @@ class Tx( trs: TransactionRecoveryState,
           frontend.failStop(s"Tx $transactionId voted commit but its update of objects $threw threw")
         else
           val invalidated = (result.uncommittable -- alreadyApplied -- notApplied)
-            .filter(oid => changed.contains(oid) && objects.contains(oid))
+            .filter(oid => changed.contains(oid) && objects.contains(oid) && !allocatedHere.contains(oid))
           val toQuarantine = invalidated ++ quarantinedHere
           if toQuarantine.nonEmpty then
             quarantining = toQuarantine

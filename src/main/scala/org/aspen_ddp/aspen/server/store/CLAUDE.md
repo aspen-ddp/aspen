@@ -141,7 +141,9 @@
   (Backlog: correlated declarations)
 - Quarantine (`Frontend.quarantine`, transaction-requirements F5, Todo 2.16): a recovered commit vote whose apply
   re-check fails may have been superseded before the crash (10.5a) or invalidated under its locks, and the store does
-  not tell these apart. Each changed object it could not apply is quarantined: every transaction on it votes abort
+  not tell these apart. Each changed object it could not apply is quarantined, except one the backend missed and the
+  Tx allocates (`allocatedHere`: no copy, no lost lock; one whose data was dropped was applied and then deleted, which
+  no read verifies), which is reported (R-F17). Every transaction on a quarantined object votes abort
   (`ObjectQuarantined`), and committed ones apply nothing to it and report it. Repair is not held off, unlike
   `commitFailed`. The store asks its host to verify the object (`QuarantineVerifier`, Host →
   `RepairService.verifyObject`, bounded by `VerifyDeadline`, 30 s). It clears once `StoreRepairer.verifyObject` reports the copy complete against a

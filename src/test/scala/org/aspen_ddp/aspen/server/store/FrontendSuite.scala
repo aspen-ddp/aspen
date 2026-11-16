@@ -4047,6 +4047,44 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     stops() shouldBe Nil
   }
 
+  // ---- Recovered transactions whose objects fail to load (transaction-recovery R-F17) ----
+
+  test("a recovered commit vote whose object is not found applies nothing, reports it, and quarantines nothing") {
+    // ObjectNotFound for an object the vote does not allocate: before the crash the store applied T and a later
+    // transaction deleted the object (its lock admits nothing else). The finalizer marks the object, and repair finds
+    // it deleted
+    val (frontend, net, stops) = recoveredVote(mkObjectState(oid1), Some(ReadError.ObjectNotFound))
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
+    stops() shouldBe Nil
+    frontend.isQuarantined(oid1) shouldBe false
+  }
+
+  test("a recovered allocating commit vote whose object the backend misses creates it from its saved data") {
+    // The crash came before the allocation's backend commit: the miss is a fresh state, not a load failure
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 34)), poolId, Array[Byte]())
+    val (frontend, net, stops) = recoveredVote(mkObjectState(oid1), txd = allocateData(txid1, newPtr),
+      updates = List(ObjectUpdate(newPtr.id, DataBuffer(Array[Byte](7)))))
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+    stops() shouldBe Nil
+    readData(frontend, net, newPtr) shouldBe Right(List[Byte](7))
+  }
+
+  test("a recovered allocating commit vote without its data whose object was deleted reports it and quarantines " +
+       "nothing") {
+    // The CRL dropped the data once the allocation applied; a later transaction then deleted the object. A quarantine
+    // could never clear: no read verifies a deleted object
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 35)), poolId, Array[Byte]())
+    val (frontend, net, stops) = recoveredVote(mkObjectState(oid1), txd = allocateData(txid1, newPtr), updates = Nil)
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(newPtr.id))
+    stops() shouldBe Nil
+    frontend.isQuarantined(newPtr.id) shouldBe false
+    frontend.testingOnlyQuarantines shouldBe 0
+    readData(frontend, net, newPtr) shouldBe Left(ReadError.ObjectNotFound)
+  }
+
   test("a pinned state counts toward the store's bytes") {
     val (frontend, backend, cache, net) = commitWindowFixture()
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit

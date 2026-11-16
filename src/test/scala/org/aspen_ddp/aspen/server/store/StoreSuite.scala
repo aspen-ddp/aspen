@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
-import org.aspen_ddp.aspen.common.objects.{Delete, KeyValueObjectPointer, KeyValueOperation, ObjectId}
+import org.aspen_ddp.aspen.common.objects.{Delete, KeyValueObjectPointer, KeyValueOperation, ObjectId, ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.DataBuffer
@@ -511,6 +511,86 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.receiveTransactionMessage(TxResolved(storeId, storeId, foundTxid, committed = true, late = false,
       proof = false))
     store.frontend.transactions(foundTxid).status shouldBe TransactionStatus.Committed
+  }
+
+  // ---- Driver traffic while a recovered Tx loads (transaction-recovery R-F18) ----
+
+  /** A MapBackend whose reads complete only on deliver */
+  private class DeferredReadBackend(id: StoreId) extends MapBackend(id):
+    private var deferred: List[ObjectPointer] = Nil
+    override def read(pointer: ObjectPointer): Unit = deferred = deferred :+ pointer
+    def deliver(): Unit =
+      val reads = deferred
+      deferred = Nil
+      reads.foreach(super.read)
+
+  test("a recovery driver started while its recovered Tx loads starts above the recovered promise, and the Tx " +
+       "answers its traffic only once loaded") {
+    val backend = new DeferredReadBackend(storeId)
+    val os = mkObjectState(oid1)
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+    val rtxd = txd
+    val promised = ProposalId(5, 2)
+    val trs = TransactionRecoveryState(storeId, rtxd.serialize(), List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))),
+      TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState(Some(promised), None))
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+    val net = new RecordingNet
+    val finalizer = new StubFinalizer
+    val tasks = new org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriverSuite.ManualTasks(
+      ExecutionContext.parasitic)
+    val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.parasitic, backend,
+      new HostObjectCache(1024 * 1024).forStore(storeId), net, tasks, crl, new TransactionStatusCache(), finalizer,
+      org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver.factory(1.second, 1.second), Duration.Zero, None,
+      loadedAt = FrontendSuite.longLoaded)
+    backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
+
+    // The CRL state has loaded, the recovered Tx's object has not: its idle Tx is driven at heartbeat
+    store.frontend.recoveryPending shouldBe false
+    store.heartbeat()
+    store.hasTransactions shouldBe true
+    tasks.fireAll() // The driver's first send
+    val prepares = net.sentTx.collect { case p: TxPrepare => p }
+    prepares.map(_.to).toSet shouldBe Set(storeId, leader, peer)
+    // Above the promise recovered from the CRL, which the Tx knows before its objects load (paxos F5)
+    prepares.foreach(_.proposalId should be > promised)
+
+    def fromOwnTx: List[TxMessage] = net.sentTx.filter:
+      case r: TxPrepareResponse => r.from == storeId
+      case r: TxAcceptResponse => r.from == storeId
+      case _ => false
+    def deliverOwn(): Unit =
+      val own = net.sentTx.filter(m => m.to == storeId && !fromOwnTx.contains(m))
+      net.sentTx = Nil
+      own.foreach(store.receiveTransactionMessage)
+
+    deliverOwn() // The driver's prepare to its own store: held while the Tx loads
+    // The peers promise with commit votes, which decide commit without this store's vote
+    val p = prepares.head.proposalId
+    for i <- List(1, 2) do
+      store.receiveTransactionMessage(TxPrepareResponse(storeId, StoreId(poolId, i.toByte), txid1,
+        Right(TxPrepareResponse.Promise(None)), p, TransactionDisposition.VoteCommit, Nil))
+    val accepts = net.sentTx.collect { case a: TxAccept => a }
+    accepts.map(_.value).distinct shouldBe List(true)
+    deliverOwn() // Its accept: held too
+    for i <- List(1, 2) do
+      store.receiveTransactionMessage(TxAcceptResponse(storeId, StoreId(poolId, i.toByte), txid1, p,
+        Right(TxAcceptResponse.Accepted(true))))
+    finalizer.created shouldBe 1
+    net.sentTx.collect { case r: TxResolved => r.committed }.distinct shouldBe List(true)
+    deliverOwn() // Its resolution and finalization: held as well
+    fromOwnTx shouldBe Nil
+    backend.get(oid1).get.metadata.revision shouldBe rev0
+
+    // Loaded: the held traffic reaches the Tx in order. It promises with its recovered vote, accepts, and applies
+    backend.deliver()
+    net.sentTx.collect { case r: TxPrepareResponse if r.from == storeId => (r.proposalId, r.disposition, r.response) } shouldBe
+      List((p, TransactionDisposition.VoteCommit, Right(TxPrepareResponse.Promise(None))))
+    net.sentTx.collect { case r: TxAcceptResponse if r.from == storeId => r.response } shouldBe
+      List(Right(TxAcceptResponse.Accepted(true)))
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
+    // The stub finalizer completed at once: the driver's TxFinalized, held with the rest, then concluded the Tx
+    store.frontend.transactions.contains(txid1) shouldBe false
   }
 
   test("a recovered vote whose first lookup finds no entry is driven as usual, without a proof") {

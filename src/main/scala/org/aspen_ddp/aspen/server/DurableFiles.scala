@@ -60,6 +60,17 @@ object DurableFiles extends Logging:
       os.remove(file)
       syncDirectory(file / os.up)
 
+  /** Forces every regular file and directory under `root`, `root` included, to stable storage: files first, then
+   *  each directory below its entries. For a freshly written tree before it is renamed into place. */
+  def syncTree(root: os.Path): Unit =
+    val entries = os.walk(root, includeTarget = false)
+    entries.filter(os.isFile(_, followLinks = false)).foreach: f =>
+      val channel = FileChannel.open(f.toNIO, StandardOpenOption.WRITE)
+      try channel.force(true)
+      finally channel.close()
+    // Deepest first, so a directory is forced after the entries it names
+    (entries.filter(os.isDir(_, followLinks = false)) :+ root).sortBy(-_.segmentCount).foreach(syncDirectory)
+
   /** Forces a directory's entries to stable storage. Opening a directory for READ and forcing it
    *  is how Linux exposes fsync on a directory.
    *

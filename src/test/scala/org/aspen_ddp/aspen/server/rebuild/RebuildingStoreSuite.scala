@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
-import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, DefaultBackendOpener}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, DefaultBackendOpener, StoreCreation}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.BufferedConsistentRocksDB
 
 import java.nio.ByteBuffer
@@ -28,21 +28,25 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
 
   private lazy val backends: BackendOpener = new DefaultBackendOpener(executionContext)
 
-  /** Opens through the default opener, recording each open and its onFatal, or fails it with BackendStateLost while
-   *  `lose` is set */
+  /** Creates and opens through the default opener, recording each create, open and onFatal, or fails opens with
+   *  BackendStateLost while `lose` is set */
   private final class RecordingOpener extends BackendOpener:
-    @volatile var opens: List[(StoreConfig, os.Path, Boolean)] = Nil
+    @volatile var creates: List[(StoreConfig, os.Path)] = Nil
+    @volatile var opens: List[(StoreConfig, os.Path)] = Nil
     @volatile var onFatals: List[Throwable => Unit] = Nil
     @volatile var lose: Boolean = false
 
-    def open(storeCfg: StoreConfig, storePath: os.Path, create: Boolean,
-             onFatal: Throwable => Unit): Future[Backend] =
-      opens = (storeCfg, storePath, create) :: opens
+    def create(storeCfg: StoreConfig, storePath: os.Path, creatingRoot: os.Path): Future[Unit] =
+      creates = (storeCfg, storePath) :: creates
+      backends.create(storeCfg, storePath, creatingRoot)
+
+    def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit): Future[Backend] =
+      opens = (storeCfg, storePath) :: opens
       onFatals = onFatal :: onFatals
       if lose then
         Future.failed(new BackendStateLost("injected lost staging store"))
       else
-        backends.open(storeCfg, storePath, create, onFatal)
+        backends.open(storeCfg, storePath, onFatal)
 
   /** A bare device directory: no StorageDeviceConfig, since nothing here loads it as a device. */
   private def deviceDir(): os.Path =
@@ -438,7 +442,8 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
 
       // Stage a checkpoint by hand with a key at a known rank, as a crashed pass would have left behind.
       staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
-      _ = os.makeDir.all(staging)
+      pstate <- client.getStoragePoolState(storeId.poolId)
+      _ <- backends.create(StoreConfig.forPool(storeId, pstate), staging, dev / StoreCreation.CreatingDirectory)
       allocatedKeys = ids.map(id => Key(id.toBytes))
       sorted = allocatedKeys.sortWith(ByteArrayKeyOrdering.lt)
       _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil, Nil))
@@ -674,7 +679,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       val saved = RebuildState.load(staging).get
       saved.failedObjects should be(Nil)
 
-  atest("the staging store is opened through the BackendOpener with the pool's backend config"):
+  atest("the staging store is created, then opened, through the BackendOpener with the pool's backend config"):
     given ExecutionContext = executionContext
     val dev = deviceDir()
     val opener = new RecordingOpener
@@ -686,8 +691,11 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- rebuild.complete
     yield
       val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
-      opener.opens.map((cfg, path, create) => (cfg.storeId, cfg.backend, path, create)) should be(
-        List((storeId, StoreConfig.storageBackendFor(pstate.backendConfig), staging, false)))
+      val expected = List((storeId, StoreConfig.storageBackendFor(pstate.backendConfig), staging))
+      opener.creates.map((cfg, path) => (cfg.storeId, cfg.backend, path)) should be(expected)
+      opener.opens.map((cfg, path) => (cfg.storeId, cfg.backend, path)) should be(expected)
+      os.exists(dev / StoreCreation.CreatingDirectory) && os.list(dev / StoreCreation.CreatingDirectory).nonEmpty should
+        be(false)
       os.exists(dev / storeId.directoryName) should be(true)
 
   atest("a staging store whose state is lost is discarded, checkpoint and all, and the next rebuild starts over"):

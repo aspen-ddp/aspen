@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.server.store.backend.{DefaultBackendOpener, StoreCreation}
+
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -151,14 +153,13 @@ private class FailingRocksOpener(ec: ExecutionContext) extends DefaultBackendOpe
   @volatile var failing: Boolean = false
   /** The fail-stop callback of each backend opened, most recent first */
   @volatile var onFatals: List[Throwable => Unit] = Nil
-  override def open(storeCfg: StoreConfig, storePath: os.Path, create: Boolean,
-                    onFatal: Throwable => Unit): Future[Backend] =
+  override def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit): Future[Backend] =
     onFatals = onFatal :: onFatals
     storeCfg.backend match
       case _: StoreConfig.RocksDB =>
         Future.fromTry(scala.util.Try(new RocksDBBackend(storePath, storeCfg.storeId, ec):
           override def hasFailed: Boolean = super.hasFailed || FailingRocksOpener.this.failing))
-      case _ => super.open(storeCfg, storePath, create, onFatal)
+      case _ => super.open(storeCfg, storePath, onFatal)
 
 class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
@@ -247,8 +248,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
   private def writeRocksStore(deviceDir: os.Path, sid: StoreId): Future[os.Path] =
     given ExecutionContext = executionContext
     val storeDir = deviceDir / sid.directoryName
-    os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(sid, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
+    DefaultBackendOpener.createStore(StoreConfig(sid, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
+      storeDir / os.up / StoreCreation.CreatingDirectory)
     // Not the suite's serial context: bootstrapAllocate blocks on work it runs there
     val initial = new RocksDBBackend(storeDir, sid, ExecutionContext.global)
     initial.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
@@ -637,9 +638,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
   private def writeStoreDir(deviceDir: os.Path): os.Path =
     val storeDir = deviceDir / storeId.directoryName
-    os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename,
-      StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
+    DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
+      storeDir / os.up / StoreCreation.CreatingDirectory)
     storeDir
 
   /** Gives the device an empty CRL, as one that has run before has */

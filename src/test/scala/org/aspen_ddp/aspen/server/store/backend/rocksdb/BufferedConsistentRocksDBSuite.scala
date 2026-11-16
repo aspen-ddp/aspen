@@ -69,6 +69,7 @@ class BufferedConsistentRocksDBSuite extends FileBasedTests:
 
   private def withDB(fn: (FailableRocksDB, ManualExecutionContext) => Unit): Unit =
     val ec = new ManualExecutionContext
+    RocksDBBackend.initializeStore(tdir / "rocksdb")
     val db = new FailableRocksDB(tdir / "rocksdb")(using ec)
     try
       fn(db, ec)

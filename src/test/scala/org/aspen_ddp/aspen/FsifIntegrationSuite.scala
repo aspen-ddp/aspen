@@ -328,8 +328,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
         StoreConfig.loadStoreConfig(dir / StoreConfig.configFilename).backend should be(
           StoreConfig.Fsif(fsifConfig.segmentPayloadSize, fsifConfig.segmentCount))
         val names = os.list(dir).map(_.last).toSet
-        names should contain allOf(FsifRecovery.DataFile, FsifRecovery.IndexFiles(0), FsifRecovery.JournalFiles(0),
-          FsifBackend.InitializedMarkerFile)
+        names should contain allOf(FsifRecovery.DataFile, FsifRecovery.IndexFiles(0), FsifRecovery.JournalFiles(0))
         val rocks = names.filter: n =>
           rocksDbFiles.contains(n) || n.endsWith(".sst") || n.endsWith(".log") && n != "crl_save.log" ||
             n.startsWith("MANIFEST-") || n.startsWith("OPTIONS-")

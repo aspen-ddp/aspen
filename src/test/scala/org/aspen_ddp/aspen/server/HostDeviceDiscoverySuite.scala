@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.store.backend.{DefaultBackendOpener, StoreCreation}
+
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, fixed_ids}
@@ -1776,9 +1778,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
     val storeDir = deviceDir / storeId.directoryName
-    os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
+    DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
+      storeDir / os.up / StoreCreation.CreatingDirectory)
     os.write.over(storeDir / StoreTransfer.TransferredInMarkerFile, Array.emptyByteArray)
+    val filesBefore = os.list(storeDir).toSet
 
     val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
       net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
@@ -1789,7 +1792,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       host.control.router.offlineStores should contain(storeId)
       host.getStoreIds should not contain storeId
       // Nothing was opened in the copy's directory.
-      os.list(storeDir).length should be(2)
+      os.list(storeDir).toSet should be(filesBefore)
 
   atest("a rebuilt store carrying the rebuild-complete marker is not loaded at startup"):
     // Rebuild F4: a crash between the rebuild's move into place and its flip. The tree still says Rebuilding, so
@@ -1798,9 +1801,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
     val storeDir = deviceDir / storeId.directoryName
-    os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
+    DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
+      storeDir / os.up / StoreCreation.CreatingDirectory)
     os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, Array.emptyByteArray)
+    val filesBefore = os.list(storeDir).toSet
 
     val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
       net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
@@ -1810,7 +1814,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     Future.successful:
       host.control.router.offlineStores should contain(storeId)
       host.getStoreIds should not contain storeId
-      os.list(storeDir).length should be(2)
+      os.list(storeDir).toSet should be(filesBefore)
 
   atest("an Active store still carrying the rebuild-complete marker is loaded; a Rebuilding one is not"):
     val hostRoot = newHostDir()
@@ -1897,8 +1901,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
   private def writeStoreDir(deviceDir: os.Path): os.Path =
     val storeDir = deviceDir / storeId.directoryName
-    os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
+    DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
+      storeDir / os.up / StoreCreation.CreatingDirectory)
     storeDir
 
   atest("a store whose CRL save file is truncated is not served and its load fails"):
@@ -1939,6 +1943,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val storeDir = writeStoreDir(deviceDir)
     os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
+    val filesBefore = os.list(storeDir).toSet
 
     val host = newRealHost(hostRoot)
     host.testingOnlyHandleEvents()
@@ -1947,4 +1952,4 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       host.getStoreIds should not contain storeId
       host.control.router.offlineStores should contain(storeId)
       // Nothing was opened in its directory.
-      os.list(storeDir).length should be(2)
+      os.list(storeDir).toSet should be(filesBefore)

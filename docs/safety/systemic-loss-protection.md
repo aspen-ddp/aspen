@@ -184,18 +184,29 @@ are retained or are a derived copy of data that still exists elsewhere (and the 
 | X11 | Tombstone: device removed from its set and host, ids zeroed; its stores abandoned in favour of rebuilds | `FailedStorageDeviceDurableTask.scala:186-228` | One-way **metadata** change; the old media is not touched but is refused (`DeviceDiscovery.scala:219`) and by design never reintroduced | the physical data on the old device, unusable by the system |
 | X12 | CRL entries removed after a transfer-out's save file is durable | `StoreLoader.scala:514-517` | Recoverable: moved to `crl_save.log` first | the save file |
 | X13 | `UnloadFailedStore`: CRL entries dropped, save file kept | `StoreLoader.scala:405-414` | Recoverable | the save file holds the full state |
-| X14 | Silent empty initialization of a blank FSIF directory that also lacks its marker | `FsifBackend.openUnmarked` | **NARROWED 2026-11-16**, was destructive but not declared (the store "healthy" and empty). A blank directory with the store's `incarnation` file (it has served) is now `StoreLost`, so declared and rebuilt. Residual: a directory that lost its `incarnation` file too; the RocksDB analogue (`setCreateIfMissing`) | nothing; the residual cases trigger no rebuild |
+| X14 | Silent empty initialization of a blank FSIF directory that also lacks its marker (and RocksDB's `setCreateIfMissing` open) | `FsifBackend.open`, `RocksDBBackend.openDatabase` | **FIXED 2026-11-16**, was destructive but not declared (the store "healthy" and empty). Stores are created atomically (`StoreCreation`), so open never creates: a missing or blank backend is `BackendStateLost`, declared and rebuilt | the peers' copies, through the rebuild |
 
 *X14, 2026-11-16 (Todo 7.3).* Not fixed by Ruling 23 (revised), as Todo 7.3 supposed: that ruling is what X14
-describes. It stops a marker-less directory holding FSIF data from being re-initialized, and keeps initializing a
-blank one so that creation stays re-runnable. A store that has served and then lost both its marker and its FSIF
-files (an incomplete restore or mount, SC5, that keeps `store.cfg`) was still served as a healthy empty store with
-nothing marked. Now `FsifBackend.openUnmarked` throws `StoreLost` for a blank directory holding the store's
-`incarnation` file. The file is written only after a backend has opened (`StoreLoader`) or into a rebuild's marked
-staging copy (`RebuildingStore.finish`), so only a fresh store's directory, never one that has served, lacks it, and
-creation stays re-runnable. `FsifInitializationSuite` "without its marker, a blank directory of a store that has
-served is lost, not initialized (SL X14)". Residual: a directory left with nothing but `store.cfg` cannot be told from
-a fresh one locally; and a RocksDB store whose files are gone opens empty (`setCreateIfMissing(true)`), unguarded.
+describes. It stopped a marker-less directory holding FSIF data from being re-initialized, but kept initializing a
+blank one so that an interrupted create could be re-run. RocksDB had the same hole: it opened every store with
+`setCreateIfMissing(true)`. Either way a store that had served and lost its backend files (an incomplete restore or
+mount, SC5, that kept `store.cfg`) was served as a healthy empty store, with nothing marked.
+
+Both holes existed only because store directories were created in place, so an open had to be able to finish a
+create. Now every store is created atomically for every backend (`server.store.backend.StoreCreation`): the backend
+is initialized and closed, and its config written, in a scratch directory under the device's `creating/`. The tree is
+forced and renamed to the store's path, and the parent directory forced. The host's new-store create
+(`StoreRebuilds.createNewStore` through `BackendOpener.create`), a rebuild's first-pass staging store and bootstrap
+all go through it. Rebuilds and transfers already moved complete directories into place. So a store path holds either
+nothing or a complete store, and `open` never creates. FSIF throws `StoreLost` for a missing directory or blank files
+(the `fsif-initialized` marker is gone), and RocksDB throws `RocksDBStateLost` when `CURRENT` is missing. The host
+marks either `rebuild-required`. A crashed create's scratch copy is deleted when the device next loads. Tests:
+`StoreCreationSuite`; `FsifInitializationSuite` "a directory whose FSIF files are all absent or empty is lost, and
+nothing is written (SL X14)" and "a missing directory is lost, and open does not create it";
+`RocksDBBackendResourcesSuite` "a store directory without its database is lost, and open creates nothing (SL X14)";
+`HostFsifLoadSuite` "an FSIF store whose files are gone or empty is marked for rebuild, not served empty (SL X14)",
+"a create that runs out of space leaves nothing at the store path, ..." and "a device load removes what a crashed
+create left in creating/, ...". A store directory that is missing entirely was never loaded and is not affected.
 
 The temporal window to intervene is short: the marker is written, `checkStorageDevice` is requested immediately
 (`StoreRebuilds.scala:368,388,422`), the reconcile flips the entry, and the next reconcile runs X3. On a healthy

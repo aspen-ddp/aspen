@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.network.PendingAllocation
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
-import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, StoreCreation}
 import scribe.Logging
 
 import scala.collection.mutable
@@ -231,8 +231,6 @@ class RebuildingStore(client: AspenClient,
     // resume.
     val resume = RebuildState.load(stagingPath)
 
-    os.makeDir.all(stagingPath)
-
     resume.foreach: st =>
       synchronized:
         lastKey = st.lastRestoredKey
@@ -244,9 +242,9 @@ class RebuildingStore(client: AspenClient,
     for
       pstate <- client.getStoragePoolState(storeId.poolId)
       stagingCfg = StoreConfig.forPool(storeId, pstate)
-      _ = if !os.exists(stagingPath / StoreConfig.configFilename) then
-            // Written up front so the directory is loadable the instant it is moved into place.
-            os.write.over(stagingPath / StoreConfig.configFilename, stagingCfg.yamlConfig)
+      // A first pass (no checkpoint) starts from a fresh staging store, created atomically with its config, so
+      // the directory is loadable the instant it is moved into place. A resume opens the one it checkpointed
+      _ <- if resume.isEmpty then createStaging(stagingCfg) else Future.unit
       opened <- openStaging(stagingCfg)
       _ = synchronized:
             backend = opened
@@ -278,8 +276,17 @@ class RebuildingStore(client: AspenClient,
       _ <- finish()
     yield ()
 
-  /** Opens the staging store through the BackendOpener, which decides where the open runs: initialized on the first
-   *  pass (or if that pass was cut off before writing anything), recovered on a resume. A fail-stop latches the
+  /** Creates an empty staging store for a first pass, through the BackendOpener (StoreCreation: scratch under the
+   *  device's `creating/`, then renamed to the staging path), after discarding whatever a pass that never
+   *  checkpointed left there: without a checkpoint none of it is used. */
+  private def createStaging(cfg: StoreConfig): Future[Unit] =
+    try
+      if os.exists(stagingPath) then os.remove.all(stagingPath)
+      backends.create(cfg, stagingPath, devicePath / StoreCreation.CreatingDirectory)
+    catch case NonFatal(t) => Future.failed(t)
+
+  /** Opens the staging store through the BackendOpener, which decides where the open runs: created just before on
+   *  a first pass (createStaging), recovered on a resume. A fail-stop latches the
    *  abort, so the pass fails with the checkpoint left for the next one. A staging store whose state is lost
    *  (BackendStateLost) is discarded, checkpoint and all, so the next pass starts over rather than failing on it
    *  forever.
@@ -291,7 +298,7 @@ class RebuildingStore(client: AspenClient,
         if abortCause.isEmpty then
           abortCause = Some(err)
     val fopen =
-      try backends.open(cfg, stagingPath, create = false, onFatal)
+      try backends.open(cfg, stagingPath, onFatal)
       catch case NonFatal(t) => Future.failed(t)
     fopen.recoverWith:
       case e: BackendStateLost =>

@@ -74,7 +74,7 @@ Anything else gives `CommitError.InvalidPointer` on commit and `ReadError.Object
 
 ### 2.3 Files and on-disk formats
 
-The store directory holds `data`, `index.a`, `index.b`, `journal.a`, `journal.b` and `fsif-initialized`, plus the
+The store directory holds `data`, `index.a`, `index.b`, `journal.a` and `journal.b`, plus the
 generic files every store has: `aspen-store-config.yaml`, `crl_save.log`, and the transfer and rebuild markers. All
 integers are big-endian, and every CRC is CRC32.
 
@@ -120,11 +120,12 @@ An index is valid only if its size is exact, the magic matches, the CRC matches,
 - **A header is rewritten** (`FsifRecovery.writeJournalHeader`) as truncate(0), force, write header, force. The
   first force means an invalid header on a file longer than 28 bytes can never be a crash artifact.
 
-**`fsif-initialized`** is written durably (`DurableFiles.write`) after `FsifRecovery.initialize` has finished. A
-fresh store is: index.a emptied first if present, index.b and journal.b emptied if present, data emptied,
+**Creation** (`FsifRecovery.initialize`, run by `server.store.backend.StoreCreation` in a scratch directory under
+the device's `creating/`): index.a emptied first if present, index.b and journal.b emptied if present, data emptied,
 journal.a given header seq 0, and index.a written last with seq 0 and an empty map. So a valid index implies the
-rest of the store exists. An `initialize` that fails (ENOSPC, say) truncates every file back to empty before it
-rethrows, best effort, so the retry finds a blank directory (2.13).
+rest of the store exists. The scratch directory, config included, is forced and renamed to the store's path only once
+`initialize` has returned; a failure or crash before that leaves nothing at the path, and the scratch copy is
+discarded. A store path therefore never holds a partly initialized store, and `open` never initializes (2.13).
 
 ### 2.4 Threading model
 
@@ -377,7 +378,8 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
 ### 2.13 Host integration
 
 - **Open and create** (`StoreLoader.startOpen`, `handleBackendOpened`, shared by every backend) run on
-  `FsifOpenEc`. While an open runs, the store is in its device's `loadedStores` and in `opening`, and the router
+  `FsifOpenEc`. A create (`BackendOpener.create`, `StoreCreation`) builds the store in `<device>/creating/` and
+  renames it into place, then opens it as any load does; `open` never creates. While an open runs, the store is in its device's `loadedStores` and in `opening`, and the router
   keeps it silent (`loading`) until it is installed. A `ShutdownStore` that arrives meanwhile is deferred and
   replayed after the store is served.
 - **Outcomes** (`handleBackendOpened`; FsifRecovery.StoreLost is a `BackendStateLost`):
@@ -386,15 +388,12 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
   |---|---|
   | success | `serveOpened` and `LoadStore` |
   | `StoreLost` | mark `rebuild-required`, leave the store offline, `checkStorageDevice` |
-  | out of space | leave offline; `storesAwaitingSpace` retries every device scan with exponential backoff capped at `SpaceRetryCap` (5 min). A failed create is handed to the same retries (no marker, and the failed `initialize` emptied its files, so the retry initializes again) |
+  | out of space | leave offline; `storesAwaitingSpace` retries every device scan with exponential backoff capped at `SpaceRetryCap` (5 min). A failed create left nothing at the path, so it is not retried here: its entry is still Initializing and the next device check creates it again |
   | any other failure | logged; the store is not loaded and not marked |
 
-- **`fsif-initialized`** (Ruling 23, revised). A marked store is always recovered. For a directory without the marker,
-  `FsifBackend.openUnmarked` initializes it only if every FSIF file is absent or zero-length
-  (`FsifRecovery.isBlank`) and it has no `incarnation` file (a blank directory of a store that has served is
-  `StoreLost`, SL X14), which keeps creation re-runnable. Otherwise it recovers the store, writes the marker
-  durably and serves it, with a warning; a `StoreLost` propagates and is marked `rebuild-required` like any other.
-  A crash part way through a fresh store's `initialize` therefore opens as the empty store or as `StoreLost` (4.6).
+- **No create on open** (safety SL X14, 2026-11-16; supersedes Ruling 23's `fsif-initialized` marker). A missing
+  store directory, or one whose FSIF files are all absent or empty (`FsifRecovery.isBlank`), is `StoreLost` (L0):
+  creation is atomic, so such a directory lost its store. Every other directory is recovered.
 - **onFatal** posts `BackendFailed`. The routes are listed in section 4.2.
 - **Frozen close.** `ShutdownStore` logs and closes without waiting for space.
 - **`estimateSize`** is the sum of the data, journal and index file sizes.
@@ -624,7 +623,8 @@ described in 4.5. A plain `IOException` from the open is not a loss (4.6).
 
 | # | Trigger | Where (`store/backend/fsif/FsifRecovery.scala:recover` unless noted) | Why it is believed to mean loss | What a false trigger from a systemic bug looks like |
 |---|---|---|---|---|
-| L1 | Neither index file is valid (size, magic, CRC, or a slot < -1) | :168 | `initialize` writes index.a last and the marker after it, and a checkpoint empties index s only after index s+1 is forced. So a marked store always has one valid index unless something damaged it. An unmarked, non-blank store reaches it after a crash during its own `initialize` (4.6), having never held data | An index size or CRC computation that changes with the code: e.g. a change to `IndexFile.EntrySize` or `sizeFor`, or a `segmentCount` read differently from the pool config. Every store would fail on first open after the upgrade |
+| L0 | The store directory is missing, or every FSIF file is absent or empty | `FsifBackend.open` | A store directory appears at its path only complete, by StoreCreation's rename, so its files were lost (an incomplete restore or mount, a wiped directory) | A code path that makes a store directory outside StoreCreation (a new create path, a test helper copied into production), or a transfer or rebuild that moves a directory before its files are written |
+| L1 | Neither index file is valid (size, magic, CRC, or a slot < -1) | :168 | `initialize` writes index.a last, before the store is renamed into place, and a checkpoint empties index s only after index s+1 is forced. So a store always has one valid index unless something damaged it | An index size or CRC computation that changes with the code: e.g. a change to `IndexFile.EntrySize` or `sizeFor`, or a `segmentCount` read differently from the pool config. Every store would fail on first open after the upgrade |
 | L2 | An index or journal file is larger than `MaxLoadSize` (`Int.MaxValue - 16`) bytes | `load`, :112 | Not reachable from a state the backend produced. The index is at most `IndexFile.sizeFor(MaxSegmentCount)`. The active journal is at most `journalLengthBound` (1 GiB by default), because operations past `journalHardLimit` are held, frozen or not (2.9); a stale journal is one that was active | A bug in admission: a write path that appends without being admitted or covered by headroom, an `appendBound` that undercounts (a new record type or field), or a writer whose batches outgrow their records. The journal would then grow past the limit only on stores that keep taking writes while checkpoints cannot finish, e.g. a long freeze |
 | L3 | A journal with a valid scan has seq > m + 1 | :179 | A journal s+1 header is written only while index s is the newest, so s+2 cannot exist | Seq arithmetic off by one in the checkpoint switch or in step 5's finish; a misread of the header seq |
 | L4 | A journal is `Scan.Corrupt` and is not a stale journal (a valid header with seq < m). Corrupt means: (a) invalid header on a file longer than 28 bytes; (b) a CRC-valid batch whose records do not parse (`parseRecords` / `parseRecord`, `JournalFormat.scala` :121-169); (c) an invalid batch followed later by a CRC-valid batch numbered n+1 (`findLater`, :200) | :182-185; `JournalFormat.scan` | (a) the header rewrite forces after truncate(0); (b) the batch CRC covers the records; (c) batches are written strictly in sequence, so only the last can be torn, and the salt keeps user data from posing as a batch | (b) is the most dangerous: any change to the record encoding (a new record type, a `SegmentHeader` layout or type-byte change, a stricter parse check) makes **every** CRC-valid journal "corrupt" after an upgrade. (c) would fire on every store if the writer reused batch numbers, or if a retry path re-sent a batch at a different offset without truncating first |
@@ -729,22 +729,11 @@ pools and hosts.
 These look like loss but never trigger a rebuild:
 
 - **Out of space at load** (`fsifOpened`, :1104-1123). The store is left offline and retried with backoff. A
-  failed create is retried the same way.
+  failed create leaves nothing at the path and is created again by the next device check.
 - **Out of space at runtime.** ENOSPC or EDQUOT freezes writes (2.10). It is never fail-stop, including during
   retries. Only a non-ENOSPC error during a retry is fail-stop.
-- **A missing `fsif-initialized` marker.** `FsifBackend.openUnmarked` (:1724-1742) re-initializes the directory
-  only if every FSIF file is absent or zero-length (`FsifRecovery.isBlank`): nothing there can hold an object, so
-  nothing is lost. A blank directory that holds the store's `incarnation` file is the exception: that file is
-  written only after a backend has opened (`StoreLoader`) or into a marked rebuild staging copy
-  (`RebuildingStore.finish`), so the store has served and its files were lost (an incomplete restore, a wiped
-  directory). It throws `StoreLost` and is rebuilt instead of being served empty (safety SL X14, 2026-11-16). Any other marker-less directory goes through normal recovery. If that succeeds, the marker is
-  written durably and the store served, with a warning, so a bug that loses or fails to carry the marker (a
-  transfer, adoption or rebuild path that does not carry the file, or a renamed constant) costs nothing. If it
-  throws `StoreLost`, that is L1-L12 and the store is marked like any other. A crash part way through a fresh
-  store's `initialize` (no marker yet) leaves non-blank files once journal.a's header has been written and until
-  index.a is forced; those crash points open as `StoreLost` and the brand-new store, which never held data, is
-  rebuilt. The others open as the empty store (`FsifInitializationSuite` crash sweep: 4 of initialize's 10 crash
-  points, 100 of 320 seeded crashes, are lost).
+- **A crash or failure during creation.** It happens in `creating/`, which the device's next load deletes; nothing
+  reaches the store's path, so nothing is opened or marked.
 - **A torn journal tail.** It is truncated in recovery step 4.
 - **A journal with a stale seq** (< m), whether valid or corrupt with a valid header. It is ignored and emptied.
 - **One invalid index file** while the other is valid (a torn index s+1 falls back to index s).
@@ -774,13 +763,15 @@ Tests for the automatic paths:
 - `FsifIntegrationSuite` "an FSIF store whose recovery finds it lost is rebuilt through the rebuild path".
 
 Tests for the non-cases: `FsifRecoverySuite` "a non-empty journal with seq < m is stale and ignored" and "an
-invalid header no longer than a header is an empty journal"; `FsifInitializationSuite` "without its marker, a store
-holding objects is recovered, not re-initialized, and gains the marker", "without its marker, a directory whose
-FSIF files are all absent or empty is initialized", "a fully initialized store without its marker is recovered as
-the empty store, not re-initialized", "without its marker, a directory with non-empty files and no valid index is
-lost and left untouched" and "a crash at any op of initialize on a fresh directory opens as the empty store or
-StoreLost, nothing else"; `HostFsifLoadSuite` "an FSIF store without its marker whose files hold no valid index is
-marked for rebuild, not emptied"; `FsifFaultSuite` "with data writes frozen, commits past journalHardLimit are
+invalid header no longer than a header is an empty journal"; `FsifInitializationSuite` "a store holding objects is
+recovered on open", "an initialized store is recovered as the empty store, not re-initialized" and "a directory with
+non-empty files and no valid index is lost and left untouched"; `StoreCreationSuite` (a failed create leaves nothing at
+the store path); `HostFsifLoadSuite` "an FSIF store whose files hold no valid index is marked for rebuild, not
+emptied", "a create that runs out of space leaves nothing at the store path, and the next device check serves it" and
+"a device load removes what a crashed create left in creating/, and never loads it". L0: `FsifInitializationSuite` "a
+missing directory is lost, ..." and "a directory whose FSIF files are all absent or empty is lost, ... (SL X14)";
+`HostFsifLoadSuite` "an FSIF store whose files are gone or empty is marked for rebuild, not served empty (SL X14)";
+`FsifFaultSuite` "with data writes frozen, commits past journalHardLimit are
 held, not failed, and complete once it clears" (L2 cannot be reached).
 
 ---

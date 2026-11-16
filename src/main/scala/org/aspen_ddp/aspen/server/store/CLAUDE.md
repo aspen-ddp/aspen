@@ -55,8 +55,6 @@
 - Store identity: `StoreIncarnationFile` keeps the store's incarnation UUID in its directory's `incarnation` file (written
   with `DurableFiles.write`). It survives restarts and transfers (the archive is the whole directory) and changes only on
   a rebuild. A backend with no directory (`MapBackend`) gets `StoreIncarnation.default(storeId)` and no file.
-  Its presence also means the store has served: FSIF opens a blank directory that lacks its `fsif-initialized` marker
-  but has this file as `StoreLost`, not as a fresh empty store (safety SL X14). Write it only after a backend open
 - Rebuilt stores: `Frontend.acceptorSince` (from the `acceptor-since` file `RebuildingStore.finish` writes) mutes a
   prepare for an unknown transaction started earlier (`Tx.muted`): proven committed if an object shows its update,
   otherwise forgotten with no promise, vote, accept or CRL save, as if the store were offline. Its old incarnation
@@ -197,6 +195,11 @@
   (`client/internal/allocation/CLAUDE.md`)
 - Opening is backend-neutral (`BackendOpener`; only `DefaultBackendOpener` names concrete backends): see
   `server/host/CLAUDE.md`
+- Creation is atomic for every backend (`StoreCreation`, safety SL X14): `BackendOpener.create` builds the store,
+  backend initialized and closed plus its config, in a scratch directory under `<device>/creating/`, forces the
+  tree and renames it to the store's path. Open never creates: FSIF throws `StoreLost` for a missing directory or
+  blank files, RocksDB `RocksDBStateLost` when `CURRENT` is missing, so a store that lost its files is rebuilt, never
+  served empty. A new backend must keep both rules: create only in `init`, and treat an absent or empty store as lost
 - `Reconcile` (exact repair install): `server/repair/CLAUDE.md`; `ReconcileResult.changed` is true only when the
   install was applied (every deferred, stale or no-op path reports false)
 - Parked repairs (repair F8): a reconcile whose `RepairSnapshot.awaitSettle` is set, finding its object unsettled (a

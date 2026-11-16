@@ -7,10 +7,11 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDevi
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision,
   ObjectType}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LockstepThreading}
-import org.aspen_ddp.aspen.server.store.backend.DefaultBackendOpener
+import org.aspen_ddp.aspen.server.store.backend.{DefaultBackendOpener, StoreCreation}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.{CommitState, UpdateForm}
@@ -30,6 +31,9 @@ import scala.concurrent.duration.{Duration, SECONDS}
  */
 private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendOpener(execCtx):
   @volatile var outOfSpaceOpens: Int = 0
+  /** Creates to fail with ENOSPC, after StoreCreation has made its scratch copy, as a full device fails one */
+  @volatile var outOfSpaceCreates: Int = 0
+  @volatile var creates: Int = 0
   /** Opens to fail with an error that is neither out of space nor a lost store */
   @volatile var failedOpens: Int = 0
   @volatile var opens: Int = 0
@@ -103,6 +107,16 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
         def force(): Unit = outOfSpace(f.force())
         def close(): Unit = f.close()
 
+  override def create(storeCfg: StoreConfig, storePath: os.Path, creatingRoot: os.Path): Future[Unit] =
+    creates += 1
+    if outOfSpaceCreates > 0 then
+      outOfSpaceCreates -= 1
+      Future.fromTry(scala.util.Try(StoreCreation.createAtomically(storeCfg, storePath, creatingRoot): dir =>
+        os.write(dir / "partial", "x")
+        throw new IOException("No space left on device")))
+    else
+      super.create(storeCfg, storePath, creatingRoot)
+
   override def openFsifBackend(storeId: StoreId, path: os.Path, layout: FsifLayout,
                                onFatal: Throwable => Unit): Backend =
     opens += 1
@@ -114,8 +128,8 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
       failedOpens -= 1
       throw new IOException("injected open failure")
     onFatals = onFatal :: onFatals
-    if !os.exists(path / FsifBackend.InitializedMarkerFile) then
-      super.openFsifBackend(storeId, path, layout, onFatal)
+    if !os.isDir(path) || FsifRecovery.isBlank(new NioFsifFiles(path)) then
+      super.openFsifBackend(storeId, path, layout, onFatal) // StoreLost
     else
       val b = new FsifBackend(storeId, path, layout, new FullableFiles(path), FsifBackend.sharedIo, FsifTuning(),
           onFatal):
@@ -149,12 +163,20 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     fsifSeams.put(host, seams)
     host
 
+  private val fsifStoreCfg = StoreConfig(storeId, StoreConfig.Fsif(layout.segmentPayloadSize, layout.segmentCount),
+    None, org.aspen_ddp.aspen.common.ida.Replication(3, 2))
+
+  /** Creates the empty FSIF store on the device, as the host's create does (StoreCreation) */
   private def writeFsifStoreConfig(deviceDir: os.Path): os.Path =
     val storeDir = deviceDir / storeId.directoryName
+    DefaultBackendOpener.createStore(fsifStoreCfg, storeDir, deviceDir / StoreCreation.CreatingDirectory)
+    storeDir
+
+  /** A store directory holding only its config: a store whose backend files are gone */
+  private def writeConfigOnly(deviceDir: os.Path): os.Path =
+    val storeDir = deviceDir / storeId.directoryName
     os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename,
-      StoreConfig(storeId, StoreConfig.Fsif(layout.segmentPayloadSize, layout.segmentCount), None,
-        org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
+    os.write.over(storeDir / StoreConfig.configFilename, fsifStoreCfg.yamlConfig)
     storeDir
 
   /** Loads the store as tryLoadStore does after a restart, and runs the events that load queues */
@@ -162,29 +184,74 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     host.loadStoreById(deviceA, storeId)
     host.testingOnlyHandleEvents()
 
-  atest("an FSIF store whose creation was cut off before its marker loads as an empty store"):
+  atest("an FSIF store whose files are gone or empty is marked for rebuild, not served empty (SL X14)"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
-    val storeDir = writeFsifStoreConfig(deviceDir)
-    // As a crash early in initialize leaves it: data and journal created but still empty, no index, no marker
+    val storeDir = writeConfigOnly(deviceDir)
+    // As an incomplete restore leaves it: the config, an empty data file, nothing else
     os.write(storeDir / FsifRecovery.DataFile, Array[Byte]())
-    os.write(storeDir / FsifRecovery.JournalFiles(0), Array[Byte]())
     load(host)
 
     Future.successful:
-      host.getStoreIds should contain(storeId)
-      host.control.router.offlineStores should not contain storeId
-      os.exists(storeDir / FsifBackend.InitializedMarkerFile) should be(true)
-      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      host.getStoreIds should not contain storeId
+      host.control.router.offlineStores should contain(storeId)
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      os.exists(storeDir / FsifRecovery.IndexFiles(0)) should be(false)
 
-  atest("an FSIF store without its marker whose files hold no valid index is marked for rebuild, not emptied"):
+  atest("a create that runs out of space leaves nothing at the store path, and the next device check serves it"):
+    given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
-    val storeDir = writeFsifStoreConfig(deviceDir)
+    // A real pool, so createNewStore reads its config
+    val created = StoreId(PoolId.BootstrapPoolId, 0)
+    val storeDir = deviceDir / created.directoryName
+    val initializing = StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing, None)
+    fsif(host).outOfSpaceCreates = 1
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map(created -> initializing)))
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.rebuilds.createNewStore(loadedDevices(host)(deviceA), created)
+      _ <- handleUntil(host)(fsif(host).creates == 1 && host.control.router.offlineStores.contains(created))
+      firstLeft = os.exists(storeDir)
+      scratchLeft = os.list(deviceDir / StoreCreation.CreatingDirectory).nonEmpty
+      _ <- waitForTransactionsToComplete()
+      stillInitializing <- client.getStorageDeviceState(deviceA).map(_.stores(created))
+      // As the next device check does for an Initializing entry
+      _ = host.control.rebuilds.createNewStore(loadedDevices(host)(deviceA), created)
+      _ <- handleUntil(host)(host.getStoreIds.contains(created))
+    yield
+      firstLeft should be(false)
+      scratchLeft should be(false)
+      stillInitializing should be(initializing)
+      fsif(host).creates should be(2)
+      host.getStoreIds should contain(created)
+      os.exists(storeDir / StoreConfig.configFilename) should be(true)
+
+  atest("a device load removes what a crashed create left in creating/, and never loads it"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    // As a crash before the rename leaves it: a complete-looking store, config included, in the scratch area
+    val scratch = deviceDir / StoreCreation.CreatingDirectory / s"${storeId.directoryName}-crashed"
+    os.makeDir.all(scratch)
+    os.write(scratch / StoreConfig.configFilename, fsifStoreCfg.yamlConfig)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    Future.successful:
+      os.exists(deviceDir / StoreCreation.CreatingDirectory) should be(false)
+      host.getStoreIds should not contain storeId
+      fsif(host).opens should be(0)
+
+  atest("an FSIF store whose files hold no valid index is marked for rebuild, not emptied"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeConfigOnly(deviceDir)
     os.write(storeDir / FsifRecovery.DataFile, Array.fill[Byte](10)(1))
     os.write(storeDir / FsifRecovery.JournalFiles(0), Array.fill[Byte](10)(2))
     load(host)
@@ -192,7 +259,6 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     Future.successful:
       host.getStoreIds should not contain storeId
       host.control.router.offlineStores should contain(storeId)
-      os.exists(storeDir / FsifBackend.InitializedMarkerFile) should be(false)
       os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
       os.read.bytes(storeDir / FsifRecovery.DataFile).toList should be(List.fill[Byte](10)(1))
 
@@ -588,8 +654,8 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = deviceDir / storeId.directoryName
-    os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
+    DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
+      storeDir / os.up / StoreCreation.CreatingDirectory)
     os.write.over(storeDir / StoreTransfer.TransferOutMarkerFile, Array.emptyByteArray)
     load(host) // skipped for its marker: offline
     host.control.router.offlineStores should contain(storeId)

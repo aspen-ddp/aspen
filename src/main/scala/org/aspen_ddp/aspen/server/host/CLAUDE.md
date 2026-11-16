@@ -21,6 +21,12 @@
   inline and otherwise posts `BackendOpened`. A rebuild's staging store opens through the same opener (passed by
   `StoreRebuildFactory.createRebuild`). The host and the rebuild see only `Backend.hasFailed`/`isWriteFrozen`,
   `BackendStateLost` and `Backend.isOutOfSpace`; only `DefaultBackendOpener` names concrete backends
+- Store creation is atomic (`BackendOpener.create`, `server.store.backend.StoreCreation`, safety SL X14):
+  `startOpen` with `create` (only `StoreRebuilds.createNewStore`) builds the store in `<device>/creating/` and
+  renames it to its path before opening it, so a store directory exists only complete and `open` never creates.
+  A failed create, out of space included, leaves nothing at the path and is not put in `storesAwaitingSpace`: its
+  entry stays Initializing and the next device check creates it again. `DeviceDiscovery` deletes `creating/` when
+  it loads a device. Bootstrap (`cmdline`) creates its stores the same way (`DefaultBackendOpener.createStore`)
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
   install and after close the backend and directory belong to the control side, which otherwise reads only

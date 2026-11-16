@@ -131,12 +131,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           else
             val storeConfig = StoreConfig.forPool(storeId, pstate)
 
-            os.makeDir.all(storePath)
-            os.write.over(storePath / StoreConfig.configFilename, storeConfig.yamlConfig)
-
-            // Created wherever its backend opens; startOpen records the store in loadedStores now, so a
-            // shutdown of this device waits for the create and then closes the store. Out of space is
-            // handed to the load retries (handleBackendOpened).
+            // Created wherever its backend opens, atomically (BackendOpener.create, StoreCreation): the
+            // directory, config included, appears at storePath only complete, so the os.exists check above
+            // means the store exists. startOpen records the store in loadedStores now, so a shutdown of this
+            // device waits for the create and then closes the store. A create that fails, out of space
+            // included, leaves nothing at storePath, and the next device check tries again.
             val created = Promise[Unit]()
             ctx.loader.startOpen(local, storeConfig, storePath, create = true, Some(created))
             created.future.map(_ => true)

@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.server.Host.{BackendFailed, BackendOpened, LoadStore,
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.{Store, StoreIncarnationFile}
-import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendStateLost}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendStateLost, StoreCreation}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
@@ -150,7 +150,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     sds.loadedStores += storeId
     router.markLoading(storeId)
     val fopen =
-      try openBackend(storeCfg, storePath, create)
+      try openBackend(storeCfg, storePath, create, sds.devicePath / StoreCreation.CreatingDirectory)
       catch case NonFatal(t) => Future.failed(t)
     def opened(result: Try[Backend], inline: Boolean): BackendOpened =
       BackendOpened(sds, storeCfg, storePath, create, previous, result, created, servedCallback, inline)
@@ -220,14 +220,14 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
         created.foreach(_.tryFailure(e))
       case Failure(e) if Backend.isOutOfSpace(e) =>
-        if create then
-          // The next check finds the directory and flips the entry without loading it, so it is handed to the
-          // out-of-space retries: their load initializes it again (no marker, and the failed initialize left its
-          // files empty).
+        if create && !os.exists(storePath) then
+          // The create failed and left nothing at the path (StoreCreation), so the entry is still Initializing and
+          // the next device check creates it again (DeviceReconciler, StoreRebuilds.createNewStore). A create that
+          // succeeded and whose open ran out of space left a complete store, which the next check flips without
+          // loading: it takes the load retries below.
           logger.warn(s"Store $storeId cannot be created: device ${sds.storageDeviceId} is out of space. Leaving " +
-                      s"it offline and retrying every device scan. Error: $e")
+                      s"it offline; the next device check creates it again. Error: $e")
           leaveOffline()
-          storesAwaitingSpace += storeId -> SpaceWait(sds, storePath, 1, 1, onServed)
         else
           val waitScans = previous.map(w => math.min(w.waitScans * 2, spaceRetryCapScans)).getOrElse(1)
           if previous.isDefined then
@@ -266,13 +266,19 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       else if ! ctx.shutdown.isShuttingDown(deviceId) then
         ctx.tryLoadStore(wait.sds, wait.storePath, None)
 
-  /** Opens (or, with `create`, creates) the backend `storeCfg` names at `storePath`, wherever the BackendOpener runs
-   *  it. A backend's fail-stop is posted as BackendFailed. */
-  private def openBackend(storeCfg: StoreConfig, storePath: os.Path, create: Boolean): Future[Backend] =
+  /** Opens the backend `storeCfg` names at `storePath`, wherever the BackendOpener runs it; with `create`, first
+   *  creates it there atomically (BackendOpener.create, scratch under `creatingRoot`). A backend's fail-stop is
+   *  posted as BackendFailed. */
+  private def openBackend(storeCfg: StoreConfig, storePath: os.Path, create: Boolean,
+                          creatingRoot: os.Path): Future[Backend] =
     val ref = new AtomicReference[Backend]()
     // Called once, on a backend thread: it only posts BackendFailed to the control thread, so it never blocks there.
     val onFatal: Throwable => Unit = err => ctx.post(BackendFailed(storeCfg.storeId, ref, err))
-    ctx.backends.open(storeCfg, storePath, create, onFatal).map { backend =>
+    val created =
+      if create then ctx.backends.create(storeCfg, storePath, creatingRoot)
+      else Future.unit
+    // parasitic: a create that completed in the caller (RocksDB) opens in the caller too, so the outcome stays inline
+    created.flatMap(_ => ctx.backends.open(storeCfg, storePath, onFatal))(using ExecutionContext.parasitic).map { backend =>
       ref.set(backend)
       backend
     }(using ExecutionContext.parasitic)

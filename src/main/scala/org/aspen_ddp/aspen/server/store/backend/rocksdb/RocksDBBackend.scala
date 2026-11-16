@@ -148,13 +148,28 @@ object RocksDBBackend extends Logging {
     }
   }
 
-  /** Opens, creating if necessary, a database that uses the host-wide shared resources. The database must be
-    * closed via closeDatabase so that the background thread pools shrink accordingly.
+  /** RocksDB's pointer to the live manifest: present in every database RocksDB has created */
+  val CurrentFile = "CURRENT"
+
+  /** Thrown by an open of a store directory holding no database: a store directory exists only once its backend was
+    * created (StoreCreation), so its database was lost
     */
-  def openDatabase(dbPath: os.Path): RocksDB = {
+  final class RocksDBStateLost(msg: String) extends BackendStateLost(msg)
+
+  /** Creates an empty database in `dbPath`, durably, and closes it. Run inside StoreCreation's scratch directory */
+  def initializeStore(dbPath: os.Path): Unit =
+    closeDatabase(openDatabase(dbPath, createIfMissing = true))
+
+  /** Opens a database that uses the host-wide shared resources. The database must be closed via closeDatabase so
+    * that the background thread pools shrink accordingly. Without `createIfMissing` (every open of a store) a
+    * directory with no database throws RocksDBStateLost and nothing is written; only `initializeStore` creates one.
+    */
+  def openDatabase(dbPath: os.Path, createIfMissing: Boolean = false): RocksDB = {
+    if !createIfMissing && !os.exists(dbPath / CurrentFile) then
+      throw new RocksDBStateLost(s"RocksDB store at $dbPath has no database ($CurrentFile is missing)")
     val (cache, wbm) = getSharedMemory()
     val options = new Options()
-      .setCreateIfMissing(true)
+      .setCreateIfMissing(createIfMissing)
       .setTableFormatConfig(new BlockBasedTableConfig().setBlockCache(cache))
       .setWriteBufferManager(wbm)
 

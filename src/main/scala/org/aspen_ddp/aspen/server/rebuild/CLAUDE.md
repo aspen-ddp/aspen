@@ -36,7 +36,9 @@
   UnknownStore. An adopted store's load clears the mark; `Discard`, a cancel for an entry that left the device, and
   `abandonUnlisted` for a queued one clear it unless a device's `offlineStores` holds it; other outcomes keep it
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
-  `StoreRebuildFactory.createRebuild`)
+  `StoreRebuildFactory.createRebuild`). A first pass (no checkpoint) discards whatever staging holds and creates a
+  fresh staging store atomically (`BackendOpener.create`); a resume only opens it, and one whose backend is lost
+  (missing or blank files included) is discarded, checkpoint and all, so the next pass starts over
 - A promoted bootstrap-pool store may hold stale copies of the bootstrap pool's own ErrorTree/UnackedCommits nodes
   (their writes are untracked, so the rebuild recorded no misses). Its first repair scan after promotion sweeps
   and reconciles every node of both trees (`server/repair/CLAUDE.md`), closing Rebuild F8

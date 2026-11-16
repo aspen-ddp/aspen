@@ -16,8 +16,6 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectType, ReadError}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.server.DurableFiles
-import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitError, CommitState, CompletionHandler, Read,
   RepairSlotOccupied, UpdateForm}
 
@@ -1700,77 +1698,33 @@ object FsifBackend:
       val x = ByteBuffer.wrap(sp).getInt
       if x >= 0 && x < segmentCount then Some(x) else None
 
-  /** Present, and durable, in a store directory once `initializeStore` has completed. With it, the store is
-    * recovered, and a store that cannot be is lost (StoreLost). Without it, `open` initializes the directory only if
-    * it is blank (FsifRecovery.isBlank) and otherwise recovers it, so a lost marker never empties a store (Ruling 23,
-    * revised). It is an ordinary file of the store directory, so a transfer carries it with the rest and a rebuild's
-    * staging directory brings its own.
-    */
-  val InitializedMarkerFile = "fsif-initialized"
-
-  /** Initializes a fresh, empty store in `path` (created if missing), then durably writes the marker. Re-runnable: a
-    * failure part way through leaves the files empty where it can (FsifRecovery.initialize), and a crash leaves no
-    * marker, so the next `open` either initializes the directory again or recovers what the crash left.
+  /** Initializes a fresh, empty store in `path` (created if missing). Runs inside StoreCreation's scratch directory,
+    * which is renamed into place only once this has returned and the tree is forced, so a store path never holds a
+    * partly initialized store. A failure part way through leaves the files empty where it can
+    * (FsifRecovery.initialize), and StoreCreation discards the scratch copy either way.
     */
   def initializeStore(path: os.Path, layout: FsifLayout): Unit =
     os.makeDir.all(path)
     FsifRecovery.initialize(new NioFsifFiles(path), layout)
-    writeMarker(path)
 
-  private def writeMarker(path: os.Path): Unit = DurableFiles.write(path / InitializedMarkerFile, "")
-
-  /** Creates and initializes a new store in `path`, then opens it */
-  def create(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext,
-             onFatal: Throwable => Unit): FsifBackend =
+  /** Initializes a new store in place and opens it. Tests only: the host creates stores through StoreCreation */
+  private[aspen] def create(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext,
+                            onFatal: Throwable => Unit): FsifBackend =
     initializeStore(path, layout)
     new FsifBackend(storeId, path, layout, new NioFsifFiles(path), io, FsifTuning(), onFatal)
 
-  /** Opens the existing store in `path`. A directory without the marker is handled by `openUnmarked`.
+  /** Opens the existing store in `path`. Never creates: a store directory exists only once its store was created
+    * (StoreCreation), so a missing directory, or one whose FSIF files are all absent or empty (FsifRecovery.isBlank),
+    * lost its store and throws StoreLost (safety SL X14), with nothing written.
     *
     * @throws FsifRecovery.StoreLost if the store's acknowledged state cannot be recovered
     * @throws java.io.IOException    on an I/O error, including running out of space (FsifIo.isOutOfSpace)
     */
   def open(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext,
            onFatal: Throwable => Unit, tuning: FsifTuning = FsifTuning()): FsifBackend =
-    if os.exists(path / InitializedMarkerFile) then
-      new FsifBackend(storeId, path, layout, new NioFsifFiles(path), io, tuning, onFatal)
-    else
-      os.makeDir.all(path)
-      openUnmarked(storeId, path, layout, new NioFsifFiles(path), io, tuning, onFatal, () => writeMarker(path))
-
-  /** Opens a store directory that lacks the marker:
-    *  - blank (every FSIF file absent or empty) but holding the store's incarnation file: the store has served and
-    *    lost its files, so it throws StoreLost (safety SL X14);
-    *  - blank otherwise: creation never wrote anything, so it is initialized as an empty store, then marked;
-    *  - otherwise it is recovered like a marked store and marked once recovery succeeds. A store that cannot be
-    *    recovered throws StoreLost, which the host turns into `rebuild-required`. A crash part way through a fresh
-    *    store's `initialize` lands here as well: recovery finds its initial state, or the store is lost having never
-    *    held data.
-    * `writeMarker` writes the marker durably. A backend whose marker cannot be written is closed and the error
-    * rethrown.
-    */
-  private[fsif] def openUnmarked(storeId: StoreId, path: os.Path, layout: FsifLayout, files: FsifFiles,
-                                 io: ExecutionContext, tuning: FsifTuning, onFatal: Throwable => Unit,
-                                 writeMarker: () => Unit): FsifBackend =
-    if FsifRecovery.isBlank(files) && os.exists(path / StoreIncarnationFile.FileName) then
-      // The incarnation file is written only after a backend has opened (StoreLoader) or into a marked rebuild
-      // staging copy (RebuildingStore.finish), so this store has served: its files are lost, not never created
-      throw new FsifRecovery.StoreLost(s"FSIF store $storeId at $path has served (it has an incarnation file) but " +
-        s"its FSIF files are blank and its $InitializedMarkerFile marker is missing")
-    else if FsifRecovery.isBlank(files) then
-      scribe.warn(s"FSIF store $storeId at $path was never fully created. Initializing it as an empty store")
-      FsifRecovery.initialize(files, layout)
-      writeMarker()
-      new FsifBackend(storeId, path, layout, files, io, tuning, onFatal)
-    else
-      scribe.warn(s"FSIF store $storeId at $path has FSIF files but no $InitializedMarkerFile marker. Recovering " +
-        "it instead of initializing it")
-      val b = new FsifBackend(storeId, path, layout, files, io, tuning, onFatal)
-      try writeMarker()
-      catch
-        case NonFatal(t) =>
-          try b.close()
-          catch case NonFatal(e) => t.addSuppressed(e)
-          throw t
-      scribe.warn(s"FSIF store $storeId at $path recovered without its marker; the marker is restored")
-      b
+    if !os.isDir(path) then
+      throw new FsifRecovery.StoreLost(s"FSIF store $storeId: its directory $path is missing")
+    val files = new NioFsifFiles(path)
+    if FsifRecovery.isBlank(files) then
+      throw new FsifRecovery.StoreLost(s"FSIF store $storeId at $path has no FSIF data: its files are absent or empty")
+    new FsifBackend(storeId, path, layout, files, io, tuning, onFatal)

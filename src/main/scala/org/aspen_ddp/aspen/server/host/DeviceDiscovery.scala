@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, Host, StorageDev
   StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlLocked, CrlSizingMismatch}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.server.store.backend.Backend
+import org.aspen_ddp.aspen.server.store.backend.{Backend, StoreCreation}
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
 
@@ -605,6 +605,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         try os.remove.all(staging)
         catch case t: Throwable =>
           logger.warn(s"Failed to remove stale transfer staging directory $staging: $t")
+        // Likewise for store creates: a complete store was already renamed out of it (StoreCreation)
+        val creating = storageDevicePath / StoreCreation.CreatingDirectory
+        try os.remove.all(creating)
+        catch case t: Throwable =>
+          logger.warn(s"Failed to remove stale store-creation directory $creating: $t")
         Try(os.list(storageDevicePath)) match
           case Failure(t) =>
             // Same hazard as the scan in checkForNewDevices: listing can fail with an IO

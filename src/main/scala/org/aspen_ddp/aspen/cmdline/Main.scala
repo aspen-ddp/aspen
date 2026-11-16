@@ -34,7 +34,7 @@ import org.aspen_ddp.aspen.vdisk.{DiskCatalog, DiskHandle, DiskInfo, VDiskError}
 import org.aspen_ddp.aspen.vdisk.tcmu.{LinuxTcmuKernel, TcmuEvent, TcmuNetlink, TcmuService}
 import org.aspen_ddp.aspen.vdisk.tcmu.dbus.{HandlerLogic, TcmuDbusService}
 import org.aspen_ddp.aspen.vdisk.tcmu.sys.{Libc, Linux}
-import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, FsifConfig, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, DefaultBackendOpener, FsifConfig, RocksDBConfig, StoreCreation}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
 import org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver
@@ -1894,11 +1894,10 @@ object Main {
         val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB(None), None, bootstrapIda, AdmissionTier.Bootstrap)
 
         println(s"Creating data store $storeId. Path $storeRoot")
-        os.makeDir.all(storeRoot)
-        os.write(storeRoot / StoreConfig.configFilename, storeConfig.yamlConfig)
+        DefaultBackendOpener.createStore(storeConfig, storeRoot, bootstrapDevDir / StoreCreation.CreatingDirectory)
         new RocksDBBackend(storeRoot, storeId, ec)
 
-    // The initial metadata pool's stores start empty, so their backends are left for the host to open
+    // The initial metadata pool's stores start empty: created here, opened by the host
     val metadataStoreIds =
       for
         poolIndex <- 0 until bootstrapIda.width
@@ -1908,8 +1907,7 @@ object Main {
         val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB(None), None, bootstrapIda, AdmissionTier.Metadata)
 
         println(s"Creating data store $storeId. Path $storeRoot")
-        os.makeDir.all(storeRoot)
-        os.write(storeRoot / StoreConfig.configFilename, storeConfig.yamlConfig)
+        DefaultBackendOpener.createStore(storeConfig, storeRoot, bootstrapDevDir / StoreCreation.CreatingDirectory)
         storeId
 
     val bootstrapStorageDevice = StorageDeviceState(

@@ -44,6 +44,7 @@ class RocksDBBackendResourcesSuite extends AnyFunSuite with Matchers:
     val dir = os.temp.dir()
     try
       val storeId = StoreId(PoolId(new java.util.UUID(0, 1)), 0)
+      RocksDBBackend.initializeStore(dir)
       val backend = new RocksDBBackend(dir, storeId, scala.concurrent.ExecutionContext.global)
       val completed = scala.concurrent.Promise[Completion]()
       backend.setCompletionHandler(new CompletionHandler:
@@ -58,3 +59,14 @@ class RocksDBBackendResourcesSuite extends AnyFunSuite with Matchers:
         case other => fail(s"Expected a Read, got $other")
     finally
       os.remove.all(dir)
+
+  test("a store directory without its database is lost, and open creates nothing (SL X14)"):
+    val dir = os.temp.dir()
+    try
+      // A store whose RocksDB files are gone (an incomplete restore): only its config remains
+      os.write(dir / "aspen-store-config.yaml", "store-id: x")
+      val storeId = StoreId(PoolId(new java.util.UUID(0, 2)), 0)
+      a[org.aspen_ddp.aspen.server.store.backend.BackendStateLost] should be thrownBy
+        new RocksDBBackend(dir, storeId, scala.concurrent.ExecutionContext.global)
+      os.list(dir).map(_.last) should be(Seq("aspen-store-config.yaml"))
+    finally os.remove.all(dir)

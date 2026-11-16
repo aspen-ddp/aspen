@@ -60,8 +60,6 @@ PRIORITY 5: performance and hygiene
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
 
-6.1  G11: replay where a driver's data-less prepare precedes the replayed client prepare. Unit-tested only; add
-     an end-to-end test.                                                                                    [S-M]
 6.2  G1: state the bound on how long a T may stay unresolved against the X2 mute, and add an end-to-end
      blank-acceptor promotion test.                                                                         [S]
 6.3  G3: confirm that transfer-out and relinquish go through Store.close, so no driver or timer survives.   [S]

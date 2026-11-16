@@ -475,6 +475,17 @@ G10. Capacity interaction: ErrorTree growth during long outages (repair 13.3-6) 
     budget, rebuild 6.3) and UnackedCommits growth (Todo 4.7).
 
 G11. Replay ordering: the replay integration tests deliver the leader's copy of the replayed client prepare last (the TestNetwork leader driver does not retransmit), so the ordering where a driver's data-less prepare reaches stores before the replayed client prepare is not exercised end to end. *(Addendum: the headline stub test delivers the pool-B leader's copy before pool A's, because the default order dropped the provers' proofs at a leader with no driver yet (paxos P-N1). Prefer-abort makes a driver-first store withhold everything until the client's prepare arrives, then check it normally, or prove at once (`Tx.awaitingClientPrepare`, `Tx.scala:205-208`); FrontendSuite covers both at unit level, end to end is still untested.)*
+    *2026-11-15 (Todo 6.1): CLOSED, the wait leg tested end to end.* Since the forget floor a replay is refused outright
+    (every ReplayIntegrationSuite replay test checks that no store creates a Tx), so the driver-first order no longer
+    arises in a replay. It arises in a live transaction whose client prepare to a store is slower than the leader
+    driver's data-less prepare. ReplayIntegrationSuite "a store that gets the driver's prepare before the client's
+    withholds its vote, then checks and commits" holds the client's prepares to two non-leader stores of a 5/4 pool,
+    lets a retransmitting leader driver (`TestNetwork.HostOptions.leaderRetransmits`) reach them first, and checks that
+    they create a Tx, send no reply and leave T undecided, then, given the client's prepares, check the requirements
+    and vote commit, so T commits and every store applies it. With the wait disabled the test fails. The proof leg (a
+    driver-first store whose object already shows T) is not reachable end to end: a store shows T's update only by
+    taking part in T, by repair, or by rebuild, and every store that forgot T refuses or ignores its prepares (the
+    floor, or the status cache's finalized entry). It stays covered at unit level (FrontendSuite).
 G13. (addendum) No document or test covers a second driver's handed-off entries across its host's crash (X13), nor a `TxFinalized` delivered after the stores' cache entries expired (X14). *(Final fix wave: X14's delayed `TxFinalized` no longer exists; the unit suites cover D1's prompt finalization with the planned set, its silence afterwards, and the two-scan stub drop. The crash leg of X13 is still untested.)* *(2026-11-14, Todo 2.9: closed. X13 is closed by the horizon, and the state
 the crash leaves, every store with an entry and no stub after forgetting T, is tested end to end: ReplayIntegrationSuite
 "a replay at a pool whose stores hold entries and no stubs applies nothing, inside and past the caches". The

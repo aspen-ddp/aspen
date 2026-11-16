@@ -136,6 +136,9 @@ object TestNetwork {
     * @param recordCrl the stores' CRL is a RecordingCRL, so restartStore recovers their transactions
     * @param recoveryDrivers drivers of transactions a store is not the designated leader of (recovery drivers) are
     *                        SimpleTransactionDrivers on TestNetwork.driverTimers
+    * @param leaderRetransmits with recoveryDrivers, the designated leader's driver is a SimpleTransactionDriver too, as
+    *                          a host's is: it sends data-less prepares of its own, which can reach a store before the
+    *                          client's prepare does. Otherwise it never sends, and relies on the client's prepares
     * @param missingDataWait how long the stores' Txs wait for a client's prepare (Frontend.missingDataWait)
     * @param transactionHorizon the hosts' (Host.transactionHorizon), and the client's too: its transactions give up
     *                           with TransactionOutcomeUnknown past it (HorizonClientDriver)
@@ -143,6 +146,7 @@ object TestNetwork {
   final case class HostOptions(heartbeatPeriod: Duration = Duration(5, SECONDS),
                                recordCrl: Boolean = false,
                                recoveryDrivers: Boolean = false,
+                               leaderRetransmits: Boolean = false,
                                wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None,
                                missingDataWait: Duration = Frontend.MissingDataWait,
                                transactionHorizon: FiniteDuration = TransactionHorizon.Horizon)
@@ -503,7 +507,8 @@ class TestNetwork(executionContext: ExecutionContext,
                    backgroundTasks: BackgroundTaskManager, txd: TransactionDescription,
                    finalizerFactory: TransactionFinalizer.Factory,
                    start: TransactionDriver.Start): TransactionDriver =
-          if txd.designatedLeaderUID == storeId.poolIndex && txd.primaryObject.poolId == storeId.poolId then
+          if !hostOptions.leaderRetransmits && txd.designatedLeaderUID == storeId.poolIndex &&
+              txd.primaryObject.poolId == storeId.poolId then
             TransactionDriver.noErrorRecoveryFactory.create(ec, storeId, messenger, backgroundTasks, txd,
               finalizerFactory, start)
           else

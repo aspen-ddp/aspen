@@ -167,7 +167,8 @@ Per cross-document-review §2, no document yet covers:
 - the size limits of marker batches;
 - a combined capacity argument covering the ErrorTree, UnackedCommits growth, CRL admission and rebuilds (the CRL
   admission leg stated 2026-11-15, cross-document G10; UnackedCommits growth and rebuilds still open);
-- replay where a driver's data-less prepare precedes the replayed client prepare (untested end to end; since the
-  addendum the store waits for the client's prepare or proves, covered at unit level only);
+- (closed 2026-11-15, Todo 6.1) a driver's data-less prepare preceding the client's prepare (cross-document G11):
+  replays are refused by the forget floor, and the live-transaction order is tested end to end (ReplayIntegrationSuite);
+  the proof leg is unreachable end to end and covered at unit level;
 - (closed 2026-11-14, Todo 2.9) a second driver's handed-off entries across its host's crash (cross-document G13;
   X13): closed by the horizon, and the state it leaves is tested end to end.

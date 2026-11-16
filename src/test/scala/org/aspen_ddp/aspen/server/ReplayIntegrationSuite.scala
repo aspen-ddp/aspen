@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.{TestTransactions, Transaction}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
 import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
-import org.aspen_ddp.aspen.common.network.{TxCommitted, TxFinalized, TxMessage, TxPrepare, TxResolved}
+import org.aspen_ddp.aspen.common.network.{TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, Insert, Key, KeyValueObjectPointer, ObjectId,
   ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -41,9 +41,15 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
     */
   private val reDrivenAbortTest = "an aborted data-less transaction re-driven by a recovered commit vote aborts again"
 
+  /** Needs a leader driver that sends prepares of its own (TestNetwork.HostOptions.leaderRetransmits) */
+  private val driverFirstTest =
+    "a store that gets the driver's prepare before the client's withholds its vote, then checks and commits"
+
   override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
     if name == reDrivenAbortTest then
       testHostOptions.copy(missingDataWait = Duration(200, MILLISECONDS))
+    else if name == driverFirstTest then
+      testHostOptions.copy(leaderRetransmits = true)
     else
       testHostOptions
 
@@ -351,6 +357,57 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
     yield
       (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
       yAfter.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))
+
+  // Cross-document G11: a store that gets a driver's data-less prepare before its client's prepare (prefer-abort,
+  // Tx.awaitingClientPrepare). Since the forget floor a replay is refused outright, so this order arises end to end
+  // only in a live transaction, whose client prepare to a store is slower than the leader driver's. Here the leader's
+  // driver retransmits, as a host's does (HostOptions.leaderRetransmits), so its data-less prepares reach stores 3 and 4
+  test(driverFirstTest):
+    val held = Set(3, 4).map(sid)
+    for
+      (x, _) <- allocateXY(Map())
+      xBefore <- client.read(x)
+      tx = client.newTransaction()
+      // The client's prepares to stores 3 and 4 are held back; the leader's driver prepares still reach them. They are
+      // reported offline, so neither leads. Without them only 3 stores vote, below the write threshold of 4
+      isClientPrepareToHeld = (m: TxMessage) => m.transactionId == tx.id && held.contains(m.to) &&
+                                (m match { case p: TxPrepare => p.fromClient; case _ => false })
+      _ = net.offlineStores = held
+      _ = net.dropTxMessage = isClientPrepareToHeld
+      _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id &&
+            ((held.contains(m.to) && m.isInstanceOf[TxPrepare]) ||
+             (held.contains(m.from) && m.isInstanceOf[TxPrepareResponse]))
+      _ = tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+      commit = tx.commit()
+      heldTx = () => held.forall(s => net.smgr.control.router.loaded.get(s).exists(_.frontend.transactions.contains(tx.id)))
+      _ <- eventually("the driver's prepare created a Tx at stores 3 and 4", clock = true)(Future.successful(heldTx()))
+      _ = net.handleEvents()
+      before = net.takeRecordedTxMessages()
+      _ = withClue("stores 3 and 4 got only the driver's data-less prepares, answered none, and T is undecided: "):
+            before.collect { case p: TxPrepare if !p.fromClient => p.to }.toSet shouldBe held
+            before.collect { case p: TxPrepare if !p.fromClient => p.objectUpdates }.flatten shouldBe Nil
+            before.collect { case r: TxPrepareResponse => r } shouldBe Nil
+            commit.isCompleted shouldBe false
+      clientPrepares = before.collect { case p: TxPrepare if p.fromClient => p }
+      _ = withClue("the client's prepares to stores 3 and 4 were held: ")(clientPrepares.map(_.to).toSet shouldBe held)
+      _ = net.dropTxMessage = _ => false
+      _ = clientPrepares.foreach(net.deliverTransactionMessage)
+      _ <- pump(commit, clock = true)
+      _ <- settle(clock = true)
+      after = { net.recordTxMessage = _ => false; net.offlineStores = Set(); net.takeRecordedTxMessages() }
+      xAfter <- client.read(x)
+    yield
+      // The first held store to get the client's prepare checked the requirements, as usual, and answered the leader's
+      // driver with a commit vote, the fourth of the write threshold: the driver's prepare that overtook the client's
+      // did not make it vote abort. The second may answer only after T resolved, with no vote (Undetermined)
+      val votes = after.collect { case r: TxPrepareResponse => r.from -> r.disposition }
+      withClue("the first held store voted commit once the client's prepare arrived, and neither voted abort: "):
+        votes should contain (clientPrepares.head.to -> TransactionDisposition.VoteCommit)
+        votes.map(_._2) should not contain TransactionDisposition.VoteAbort
+      withClue("every store applied T: "):
+        (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(ObjectRevision(tx.id)))
+      xAfter.revision shouldBe ObjectRevision(tx.id)
+      xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](2)
 
   test(reDrivenAbortTest):
     val voter = 1

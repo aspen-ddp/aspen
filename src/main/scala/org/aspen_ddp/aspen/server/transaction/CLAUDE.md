@@ -72,7 +72,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - Driver prepares are prefer-abort (`fromClient == false`): a Tx with no vote and no client prepare never checks
   requirements on one. It proves at once if it can (`appliedBy`), else withholds its whole response until the data, a
   client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes: then it votes abort
-  (`NoClientPrepare`). The 5 s run from the Tx's creation, not a client retransmit (P-N8). A Tx recovered without a
+  (`NoClientPrepare`). The 5 s run from the Tx's creation, not a client retransmit (P-N8). End to end (G11):
+  ReplayIntegrationSuite's driver-first test, whose leader driver retransmits (`TestNetwork.HostOptions.leaderRetransmits`;
+  by default TestNetwork's leader driver never sends prepares). A Tx recovered without a
   vote does not wait for a driver: it votes abort and promises at once (P-N7), but stays undecided after load so a
   client retransmit that arrives first is still checked. This holds for data-less transactions too, so their late
   resolution may take 5 s longer. A vote

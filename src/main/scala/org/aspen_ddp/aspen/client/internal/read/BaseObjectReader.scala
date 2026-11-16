@@ -132,22 +132,14 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
   private def getStoreStates(): (List[StoreStateType], List[StoreStateType]) =
     val allStoreStates = responses.valuesIterator.collect { case Right(ss) => ss }.toList
 
-    // A KeyValue update without a required revision advances a store's timestamp but not its revision, so a store
-    // that missed the latest revision can still share the highest timestamp. The tie goes to the revision more
-    // stores hold: it committed, so it reached a majority. While that is still even, no revision is chosen and no
-    // store is marked behind until more responses arrive.
-    val ranked = allStoreStates.groupBy(_.revision)
-      .map((revision, states) => (states.map(_.timestamp).max, states.size) -> revision)
-      .toList
-      .sortBy(_._1)(using Ordering[(HLCTimestamp, Int)].reverse)
-
-    val mostRecent = ranked match
-      case (rank, _) :: (next, _) :: _ if rank == next => None
-      case (_, revision) :: _ => Some(revision)
-      case Nil => None
-
-    val matchingStoreStates =
-      if mostRecent.isEmpty then Nil else allStoreStates.filter(ss => mostRecent.contains(ss.revision))
+    // Object timestamps are not monotone in commit order: a refcount update, or a KeyValue update without a required
+    // revision, advances a store's timestamp but not its revision, so a store that missed the latest revision can
+    // report the highest timestamp (repair-process F12). The revision is therefore chosen by count alone. Every
+    // consistentRestoreThreshold is a majority, so at most one revision can reach it, and the result is the one the
+    // read returns had the other stores answered later. Until one does, no revision is chosen.
+    val matchingStoreStates = allStoreStates.groupBy(_.revision).valuesIterator
+      .find(_.size >= threshold)
+      .getOrElse(Nil)
 
     (allStoreStates, matchingStoreStates)
 

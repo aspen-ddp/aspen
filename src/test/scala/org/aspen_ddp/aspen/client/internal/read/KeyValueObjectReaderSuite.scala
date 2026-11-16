@@ -211,6 +211,36 @@ class KeyValueObjectReaderSuite extends AnyFunSuite with Matchers {
     }
   }
 
+  test("A majority revision wins over a stale store whose timestamp a later revision-less update raised") {
+    // s0 missed r1 but applied a later revision-less update the others have not applied yet
+    val r = TestReader(ida3)
+    r.ok(0, (r0, t2), Set(), a0)
+    r.ok(1, (r1, t1), Set(), a1)
+    r.result should be (None)
+    r.ok(2, (r1, t1), Set(), a1)
+    r.result should not be (None)
+    r.result.get match {
+      case Left(_) => fail()
+      case Right(os) =>
+        os.revision should be (r1)
+        os.timestamp should be (t1)
+    }
+  }
+
+  test("A key held at one revision by a majority is restored though a minority holds it at a later timestamp") {
+    // Blind writes of a key need not commit in timestamp order: s0 still holds the key at r2/t2, s1 and s2 at r1/t1
+    val r = TestReader(ida3)
+    r.ok(0, v1, Set(), a2)
+    r.ok(1, v1, Set(), a1)
+    r.result should be (None)
+    r.ok(2, v1, Set(), a1)
+    r.result should not be (None)
+    r.result.get match {
+      case Left(_) => fail()
+      case Right(os) => os.asInstanceOf[KeyValueObjectState].contents.get(ka) should be (Some(ValueState(bar, r1, t1)))
+    }
+  }
+
   test("The restored timestamp is the newest among stores holding the revision") {
     val r = TestReader(ida3)
     r.ok(0, (r1, t1), Set(), a1)

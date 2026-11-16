@@ -111,39 +111,28 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
                          segments: List[Segment],
                          debug: Boolean): Option[Restorable] = if (segments.isEmpty) None else {
 
-    //println("HELLO")
-    val highestRevision = segments.foldLeft((HLCTimestamp.Zero, ObjectRevision.Null)) { (h,s) =>
-      if (s.timestamp > h._1)
-        (s.timestamp, s.revision)
-      else h
-    }._2
+    // Blind writes of a key need not commit in timestamp order, so the revision is chosen by count alone: at most one
+    // reaches the threshold, which is a majority (see BaseObjectReader.getStoreStates)
+    val byRevision = segments.groupBy(_.revision)
 
-    val matches = segments.filter(s => s.revision == highestRevision)
+    byRevision.valuesIterator.find(_.size >= threshold) match
+      case Some(matches) =>
+        Some(Restorable(matches.head.revision, matches.head.timestamp, matches.map(s => s.storeID.poolIndex -> s.data)))
 
-    //println(s"Resolving $what. hrev: $highestRevision matches: $matches")
+      case None =>
+        // If we cannot restore even though we have a threshold number of responses, we need to determine whether
+        // the item has been deleted or we need to wait for more responses. It is deleted only if no revision could
+        // still reach the threshold from the stores yet to answer, and no store holds the lock of a transaction that
+        // wrote one of its revisions (an allocation or write in progress)
+        val potential = width - storeStates.size
+        val largest = byRevision.valuesIterator.map(_.size).max
 
-    val matching = matches.size
-    val mismatching = storeStates.size - matching
+        if debug then
+          println(s"Restoring key $key. largest match: $largest thresh: $threshold")
 
-    //println(s"Highest Revision: $highestRevision, matching size ${matching}. Matching: $matches")
-    if (debug)
-      println(s"Restoring key $key. nMatch: ${matching} thresh: $threshold")
-
-    if (matching < threshold) {
-      // If we cannot restore even though we have a threshold number of responses, we need to determine whether
-      // the item has been deleted or we need to wait for more responses. Deletion is determined by ruling out
-      // the possibility of partial allocation. To do this, we check to see if any other store has a locked transaction
-      // matching the revision of the item. If so, the item is most likely in the process of being allocated and we'll
-      // need the allocation to complete before the item can be restored.
-      //
-      val potential = width - matching - mismatching
-
-      if (matching + potential >= threshold || anyStoreHasLocked(highestRevision, storeStates))
-        throw BaseObjectReader.NotRestorable(s"KVObject $key is below threshold")
-      else
-        None // Item deleted
-    } else {
-      Some(Restorable(highestRevision, matches.head.timestamp, matches.map(s => s.storeID.poolIndex -> s.data)))
-    }
+        if largest + potential >= threshold || byRevision.keysIterator.exists(anyStoreHasLocked(_, storeStates)) then
+          throw BaseObjectReader.NotRestorable(s"KVObject $key is below threshold")
+        else
+          None // Item deleted
   }
 }

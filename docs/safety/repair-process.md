@@ -720,17 +720,19 @@ The repair read is an ordinary read; stale peers can only be a minority of match
   deferred and, with `locks.objectLevel`, the data/refcount/object level too).
 - A lagging S itself can be in the read set. If S and `threshold-1` other stale stores are the *only* responders, they
   can only be a matching set if C has no voter among them, contradicting Q3.
-- **Residual risks.** (1) Ranking is by timestamp before count (`BaseObjectReader.scala:146-153`): a refcount update
-  that bumped a stale store's timestamp can make the stale revision rank first; the read then simply fails to reach
-  `threshold` matching and waits for more responders; a store that is down can make that wait indefinite (F12,
-  availability only). (2) E1 depends on A1 and A2. (3) Reads from a store that is itself Rebuilding or has lost its
+- **Residual risks.** (1) Fixed 2026-11-15 (F12): ranking was by timestamp before count, so a refcount update that
+  bumped a stale store's timestamp could make the stale revision rank first and stall the read. The revision held by
+  `threshold` (a majority) responders now wins whatever its timestamp; a read waits only while no revision has a
+  majority among the replies. (2) E1 depends on A1 and A2. (3) Reads from a store that is itself Rebuilding or has lost its
   CRL state are the domain of [rebuild-process.md](rebuild-process.md) and
   [crash-recovery-log.md](crash-recovery-log.md).
 - Per key: `resolve` takes the highest-timestamp revision among segments and requires `threshold` matches or declares the
   key deleted only if no responder could still match and none holds a lock of that revision (`KeyValueObjectReader.scala:
-  135-147`). Keys with blind-write timestamps out of order (Q8) are ranked by timestamp, not commit order: the highest
-  timestamp is the highest *start* timestamp, which may be an older commit. This is a read-path issue shared with
-  all reads (F12), not specific to repair.
+  135-147`). Keys with blind-write timestamps out of order (Q8) were ranked by timestamp, not commit order, so a minority
+  segment at a later start timestamp could hide (or, with no store left to answer, delete) the revision a majority
+  holds. Since 2026-11-15 (F12) a key revision with `threshold` segments wins whatever its timestamp, and a key is
+  declared deleted only when no revision can still reach `threshold` and no store holds the lock of any segment's
+  revision.
 
 ### 12.3 Crash mid-repair
 
@@ -909,7 +911,7 @@ head first".
 | F9 | **FIXED** 2026-11-15. `ScanTimedOut` throws away deferral counts and doubles the interval while a backlog exists | low-medium | medium |
 | F10 | **FIXED** 2026-11-14. Marker overwrite can replace a newer `missedTimestamp` with an older one | low | medium |
 | F11 | **FIXED** 2026-11-14 (stores refuse blind writes). Object-level proof is a `ExclusiveRevisionLock`; blind SetMin/SetMax/SetLeft/SetRight do not move the revision | low | low |
-| F12 | Reader ranks revisions by timestamp before count; timestamp bumps from refcount updates can make a stale revision win the ranking and stall reads | low (availability) | low |
+| F12 | **FIXED** 2026-11-15 (majority revision wins). Reader ranks revisions by timestamp before count; timestamp bumps from refcount updates can make a stale revision win the ranking and stall reads | low (availability) | low |
 | F13 | **FIXED** 2026-11-14. DataObject `read.timestamp < current.timestamp` is a silent skip that counts as complete | low | low |
 | F14 | A zombie slice installed from a pre-deletion read is cleaned only if the delete's own marker is written | low | low |
 | F15 | Entry callbacks that fail repeatedly (InvalidObject read of a deleted object whose allocation entry is slow to disappear) log at error each pass. **FIXED** 2026-11-15 | cosmetic | high |
@@ -1179,6 +1181,20 @@ lower count) or exceed the up-to-date revision's timestamp. With fewer than `thr
 read waits (never returns wrong data), but with an unavailable store it may wait indefinitely, and the stale stores
 are marked `knownBehind` for the wrong revision (triggering an opportunistic rebuild message to an up-to-date store,
 which is then ignored by the revision check). Availability only. Confidence: low.
+
+> **Fixed 2026-11-15 (Todo 5.9).** Reproduced: a store at the stale revision with a raised timestamp kept the read at
+> `None` with every other replying store at the committed revision (and, per key, a minority key segment at a later
+> timestamp made a majority-held key read as deleted). Every `consistentRestoreThreshold` is a majority, so at most one
+> revision can reach it: `BaseObjectReader.getStoreStates` and `KeyValueObjectReader.resolve` now choose that revision
+> whatever its timestamp. Any reply set holding `threshold` replies at one revision was already returned when those
+> replies arrived first, so read semantics are unchanged; only the order dependence is gone. The restored timestamp is
+> still the max over the matching stores (F3). A repair read older than the store with a differing revision stays
+> `stale` (F13). Key deletion now requires that no key revision can still reach `threshold` and that no store holds
+> the lock of any segment's revision. `knownBehind` no longer exists. Residual (inherent): a read waits while no
+> revision has a majority among the replies. Tests: DataObjectReaderSuite "A majority revision wins over a stale store
+> whose timestamp a later refcount update raised", "No revision is chosen while none is held by a majority";
+> KeyValueObjectReaderSuite "A majority revision wins over a stale store whose timestamp a later revision-less update
+> raised", "A key held at one revision by a majority is restored though a minority holds it at a later timestamp".
 
 > **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica (narrow).** Reconcile.planData treats read.timestamp < current.timestamp as complete with no change (Reconcile.scala:151-153). A store that missed data write D but applied a later refcount update R2 that the read quorum has not yet applied has a higher timestamp than the read, so the miss is treated as caught up and the entry is dropped. Needs R2 committed but unapplied at the read quorum.
 > *Fix sketch:* Mark stale when the revision differs but timestamp is newer, and retry.

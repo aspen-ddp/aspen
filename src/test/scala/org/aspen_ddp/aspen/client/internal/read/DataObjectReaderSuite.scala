@@ -229,6 +229,28 @@ class DataObjectReaderSuite extends AnyFunSuite with Matchers {
     r.rstates.nonEmpty should be (true)
   }
 
+  test("A majority revision wins over a stale store whose timestamp a later refcount update raised") {
+    // s0 missed r1 but applied a later refcount update that s1-s3 have not applied yet. s4 never answers
+    val r = TestReader(5,3)
+    r.receiveReadResponse(ok(0, r0, t3))
+    r.receiveReadResponse(ok(1, r1, t1))
+    r.receiveReadResponse(ok(2, r1, t1))
+    r.rstates should be (None)
+    r.receiveReadResponse(ok(3, r1, t1))
+    r.rstates.map(_.map(_.storeId).toSet) should be (Some(Set(s1, s2, s3)))
+  }
+
+  test("No revision is chosen while none is held by a majority") {
+    val r = TestReader(5,3)
+    r.receiveReadResponse(ok(0, r0, t3))
+    r.receiveReadResponse(ok(1, r0, t3))
+    r.receiveReadResponse(ok(2, r1, t1))
+    r.receiveReadResponse(ok(3, r1, t1))
+    r.receiveReadResponse(err(4, ReadError.CorruptedObject))
+    r.rstates should be (None)
+    r.result should be (None)
+  }
+
   test("Rereads override previous state") {
     val r = TestReader(5,3)
     r.receiveReadResponse(ok(0, r0, t0))

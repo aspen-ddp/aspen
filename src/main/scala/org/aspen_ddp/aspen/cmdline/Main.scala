@@ -796,6 +796,23 @@ object Main {
         validate(validateUUID("Target storage device id must be a valid UUID")),
     )
 
+  private def acceptRebuildLossArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      clientConfigArg(p),
+      bootstrapHostOption(p),
+
+      arg[String]("<store-identifier>").text("Data Store Identifier. Format is \"pool-uuid:storeNumber\"").
+        action((x, c) => c.copy(storeName = x)).
+        validate { x =>
+          val arr = x.split(":")
+          if arr.length == 2 && scala.util.Try { UUID.fromString(arr(0)); Integer.parseInt(arr(1)) }.isSuccess then
+            success
+          else
+            failure("Store name must match the format \"pool-uuid:storeNumber\"")
+        },
+    )
+
   private def rebalanceArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
@@ -906,6 +923,7 @@ object Main {
     Command("add-host", "Registers a new host and initializes its root directory", addHostArgs),
     Command("create-storage-device", "Registers a new storage device on a host", createStorageDeviceArgs),
     Command("transfer-store", "Transfers a store to a different storage device", transferStoreArgs),
+    Command("accept-rebuild-loss", "Lets a store's rebuild finish without the objects its pool cannot supply, recording each in the ErrorTree", acceptRebuildLossArgs),
     Command("rebalance", "Rebalances a level-0 storage device set", rebalanceArgs),
     Command("system-rebalance-period", "Displays or sets the automatic rebalancing period", systemRebalancePeriodArgs),
     Command("migrate-pool", "Migrates a storage pool to a different storage device set", migratePoolArgs),
@@ -1071,6 +1089,7 @@ object Main {
                                                                   cfg.hostDirectory, cfg.deviceName,
                                                                   cfg.deviceSetName)
             case "transfer-store" => transfer_store(session, cfg.storeName, cfg.host, cfg.force)
+            case "accept-rebuild-loss" => accept_rebuild_loss(session, cfg.storeName)
             case "rebalance" => rebalance(session, cfg.setId)
             case "system-rebalance-period" =>
               systemRebalancePeriod(session, cfg.rebalancePeriod, cfg.rebalancePeriodUnit)
@@ -2226,6 +2245,28 @@ object Main {
         println("Watch the marks with:")
         println(s"  show-device <client-config-file> $deviceIdStr")
       case Failure(err) => reportError(err)
+  }
+
+  def accept_rebuild_loss(session: ClientSession, storeName: String): Int = {
+
+    configureLogging()
+
+    val (client, network, _) = createAspenClient(session)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val storeId = StoreId(storeName)
+
+    awaitAndReport(client.acceptRebuildLoss(storeId)):
+      case Success(_) =>
+        println(s"Store $storeName may finish its rebuild without the objects its pool cannot supply.")
+        println("Each is recorded in the pool's ErrorTree, so repair restores it if it becomes readable again.")
+      case Failure(_: AspenClient.StoreNotRebuilding) =>
+        println(s"Error: store $storeName is not being rebuilt")
+      case Failure(err) =>
+        println(s"Error accepting the rebuild loss of store $storeName: ${err.getMessage}")
   }
 
   private def changeDeviceStatus(session: ClientSession,

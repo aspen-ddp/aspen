@@ -224,7 +224,7 @@ class MigratePoolToSetDurableTask(
           val inFlightDestinations: Set[StorageDeviceId] = deviceStates.iterator.flatMap: ds =>
             ds.stores.collect:
               case (sid, StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut,
-                                                       Some(dst), _)) if sid.poolId == poolId => dst
+                                                       Some(dst), _, _)) if sid.poolId == poolId => dst
           .toSet
 
           val candidates = remaining.filter: i =>

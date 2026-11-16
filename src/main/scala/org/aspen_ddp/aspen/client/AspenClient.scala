@@ -26,6 +26,7 @@ import scala.concurrent.{ExecutionContext, Future}
 object AspenClient:
   class InvalidDestination extends Exception("Source and destination devices must be different")
   class StoreNotActive(storeId: StoreId) extends Exception(s"Store $storeId is not in the Active state")
+  class StoreNotRebuilding(storeId: StoreId) extends Exception(s"Store $storeId is not being rebuilt")
   class InvalidDeviceSetLevel(childLevel: Int, parentLevel: Int)
     extends Exception(s"Device set level $childLevel must be less than parent level $parentLevel")
   /** A store was about to be written onto a device an operator has declared dead. Terminal:
@@ -466,6 +467,35 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     yield
       poolId
       
+  /** Lets the rebuild of `storeId` finish past objects no peer can supply (Rebuild F15). Sets `acceptLoss` on the
+   *  store's Rebuilding entry on the device its pool names, and nudges that device's host. The rebuild's next pass
+   *  that ends with objects still unreadable records each in the pool's ErrorTree against the store, so repair
+   *  restores it if it ever becomes readable, and finishes. Fails with StoreNotRebuilding unless the entry is
+   *  Rebuilding. The flip that promotes the store clears the flag. Only a collision is retried. */
+  def acceptRebuildLoss(storeId: StoreId): Future[Unit] =
+    given ExecutionContext = this.clientContext
+
+    val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+      given Transaction = tx
+
+      for
+        poolState <- getStoragePoolState(storeId.poolId)
+        deviceId = poolState.stores(storeId.poolIndex).storageDeviceId
+        ptr <- getStorageDevicePointer(deviceId)
+        kvos <- read(ptr)
+        state = StorageDeviceState(kvos)
+      yield
+        state.stores.get(storeId) match
+          case Some(entry) if entry.status == StorageDeviceState.StoreStatus.Rebuilding && !state.isFailed =>
+            val newState = state.copy(stores = state.stores + (storeId -> entry.copy(acceptLoss = true)))
+            tx.update(ptr, None, None,
+              List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
+              List(Insert(StorageDeviceState.StateKey, newState.encode())))
+            CheckStorageDevice(state.hostId, clientId, deviceId)
+          case _ => throw new StoreNotRebuilding(storeId)
+
+    fStaged.map(sendBestEffortHostMessage)
+
   def transferStore(storeId: StoreId, destinationId: StorageDeviceId): Future[Unit] =
     given ExecutionContext = this.clientContext
 
@@ -579,7 +609,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         srcKvos <- read(srcPtr)
         srcState = StorageDeviceState(srcKvos)
         outstanding = srcState.stores.get(storeId).collect:
-          case StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut, Some(dstId), _) => dstId
+          case StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut, Some(dstId), _, _) => dstId
         dstRead <- outstanding match
           case None => Future.successful(None)
           case Some(dstId) =>

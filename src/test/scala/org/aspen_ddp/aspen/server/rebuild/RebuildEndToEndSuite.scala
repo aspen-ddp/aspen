@@ -1,7 +1,10 @@
 package org.aspen_ddp.aspen.server.rebuild
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.Transaction
+import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker
+import org.aspen_ddp.aspen.common.objects.Key
+import org.aspen_ddp.aspen.server.store.backend.DefaultBackendOpener
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.metadata.management.FailedStorageDeviceTestHarness
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -11,12 +14,65 @@ import org.aspen_ddp.aspen.server.host.ControlFixture
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
+import scala.util.Success
 
 /** Both halves against each other: an operator fails a device, the producer moves its stores
  *  onto a live one marked Rebuilding, and the consumer reconstructs them. */
 class RebuildEndToEndSuite extends IntegrationTestSuite
                               with ControlFixture
                               with FailedStorageDeviceTestHarness:
+
+  atest("an accepted loss lets a rebuild finish past an object its pool cannot supply, recorded in the ErrorTree (Rebuild F15)"):
+    given ExecutionContext = executionContext
+    val failedId = StorageDeviceId.BootstrapStorageDeviceId
+    val storeId = StoreId(PoolId.BootstrapPoolId, 0.toByte)
+    val backends = new DefaultBackendOpener(executionContext)
+    val dev = os.temp.dir(prefix = "rebuild-accept-loss")
+
+    def rebuild(failKeys: Set[Key]): RebuildingStore =
+      new RebuildingStore(client, storeId, net.secondDeviceId, dev, backends, testingOnlyFailKeys = failKeys)
+
+    for
+      ids <- Future.sequence((0 until 5).toList.map: i =>
+               client.transactUntilSuccessful: tx =>
+                 given Transaction = tx
+                 tx.replaySafe("test")
+                 client.getStoragePool(PoolId.BootstrapPoolId).flatMap: pool =>
+                   pool.allocator.allocateDataObject(Array[Byte](i.toByte)).map(_.id))
+      _ <- waitForTransactionsToComplete()
+      // The store is Active: there is no rebuild whose loss could be accepted
+      refused <- client.acceptRebuildLoss(storeId).transform(Success(_))
+
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.failStorageDevice(failedId)
+      _ <- waitForTransactionsToComplete()
+      task <- taskForEnrolled(failedId)
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS), "task completion")
+      _ <- waitForTransactionsToComplete()
+
+      doomed = Key(ids.head.toBytes)
+      unaccepted <- rebuild(Set(doomed)).complete.transform(Success(_))
+
+      _ <- client.acceptRebuildLoss(storeId)
+      _ <- waitForTransactionsToComplete()
+      flagged <- client.getStorageDeviceState(net.secondDeviceId)
+      accepted <- rebuild(Set(doomed)).complete.transform(Success(_))
+
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      lostEntry <- pool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ids.head))
+      restoredEntry <- pool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ids(1)))
+    yield
+      refused.failed.get shouldBe a[AspenClient.StoreNotRebuilding]
+      // Without the acceptance the unreadable object keeps the store out of place
+      unaccepted.isFailure should be(true)
+      flagged.stores(storeId).status should be(StorageDeviceState.StoreStatus.Rebuilding)
+      flagged.stores(storeId).acceptLoss should be(true)
+      // With it the rebuild finishes, and the lost object, only that one, is recorded for repair
+      accepted should be(Success(()))
+      os.exists(dev / storeId.directoryName / StoreConfig.configFilename) should be(true)
+      lostEntry should be(defined)
+      restoredEntry should be(None)
 
   atest("a failed device's stores are reconstructed on a live device"):
     given ExecutionContext = executionContext

@@ -423,8 +423,10 @@ the design document predates the ErrorTree.
 * If too few peers are readable, every read fails: `recordFailure` accumulates up to 10,000 ids, then aborts with the
   checkpoint intact (`RebuildingStore.scala:360-381`); for a smaller pool the walk finishes and `retryFailures` fails
   the pass ("incomplete", `:442-452`). In both cases the staging copy and checkpoint stay, the Rebuilding entry stays,
-  and the next device check (hourly) resumes. There is no escalation, no give-up and no operator override that
-  accepts the loss of unreadable objects; the store stays Rebuilding (F15).
+  and the next device check resumes (a backoff re-check since 2026-11-15, F5). Since 2026-11-15 (F15) an operator can
+  accept the loss (`accept-rebuild-loss`, which sets `acceptLoss` on the Rebuilding entry): the next pass that ends
+  with objects still unreadable records each in the ErrorTree against the store and finishes. Without it the store
+  stays Rebuilding.
 * Two stores of one pool rebuilding at once need the *other* stores' reads; with Replication(3,2) they deadlock each
   other (each is the other's missing peer), see scenario FS6.
 * The comment in `RebuildingStore.scala:233-235` records that a read that never returns can stall the walk and hold a
@@ -611,8 +613,9 @@ impossible (and every client start fail). No code mitigates this; it motivates [
 **FS17 Crash while discarding the old directory.** See section 10. Safe: marker first, drop second, rename third.
 Destructive and irreversible (section 4.3).
 
-**FS18 Pool cannot supply the data (permanent loss of an object).** The object stays in the failed list forever; the
-pass ends incomplete on every device check; the store never becomes Active (F15).
+**FS18 Pool cannot supply the data (permanent loss of an object).** The object stays in the failed list and every
+pass ends incomplete until an operator accepts the loss (`accept-rebuild-loss`); the next pass then records it in the
+ErrorTree against the store and finishes (F15, fixed 2026-11-15).
 
 **FS19 Rebuild finishes while a transfer or shutdown is in flight on the device.** The flip writes Offline on a
 shutting-down device (`serviceStatus`) and the store is kept offline behind a marker and an empty save file
@@ -884,6 +887,19 @@ acceptance. See [paxos-transactions.md](paxos-transactions.md) and [transaction-
 **Verification: OPEN (Paxos-level), PLAUSIBLE only under correlated loss.** Rebuilt stores are blank acceptors (`StoreLoader.scala:304-359`). Safe in practice because rebuilds take far longer than the lifetime of any transaction in flight when the state was lost and old prepares vote `TransactionTooOld` (`Frontend.scala:655`); not a proof. *(Refresh: `TransactionTooOld` was removed; the X2 mute is the protection.)*
 
 **F15 (Medium) No way to finish a rebuild past a permanently unreadable object.**
+
+> **FIXED 2026-11-15 (Todo 4.8).** An operator accepts the loss with `accept-rebuild-loss <pool:idx>`
+> (`AspenClient.acceptRebuildLoss`), which sets `acceptLoss` on the store's Rebuilding entry, only a Rebuilding one,
+> and nudges its host. When `retryFailures` ends with objects still unreadable it reads the entry. With the flag, each
+> object still in the AllocationTree is marked in the pool's ErrorTree as missed by this store, at
+> `HLCTimestamp.Zero` so it never displaces a newer mark. The marks are durable before `finish`, and the pass
+> finishes with a `REBUILD ACCEPTED LOSS` error line naming them. Repair restores a slice if its object becomes
+> readable again, and the entry is the record of the loss until then. A failed mark fails the pass. The flip writes a
+> fresh entry, so an acceptance covers one rebuild. The `MaxFailedObjects` abort still holds: an acceptance does not
+> override a pool below its read threshold. Test: RebuildEndToEndSuite "an accepted loss lets a rebuild finish past an
+> object its pool cannot supply, recorded in the ErrorTree (Rebuild F15)". It checks the refusal for an Active store,
+> the failure without the flag, completion with it, and an entry for the lost object only. Residual: the decision is
+> manual, by design.
 `retryFailures` fails the pass while any object is unreadable (`RebuildingStore.scala:442-452`); a stale
 allocation-tree entry for a vanished object, or a genuinely lost object, keeps the store Rebuilding forever and the
 pool permanently one store short. There is no "accept loss" decision, escalation or counter.

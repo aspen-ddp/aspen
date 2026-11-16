@@ -5,7 +5,8 @@ import org.aspen_ddp.aspen.client.internal.CurrentAllocationsQuery
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.tkvl.{KeyValueListNode, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedUpdate
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.ida.IDA
@@ -613,7 +614,7 @@ class RebuildingStore(client: AspenClient,
     synchronized(checkpointTrace += "checkpoint")
 
   /** Retry everything the walk could not read. Anything still failing leaves the store
-   *  Rebuilding for the next device check to pick up. */
+   *  Rebuilding for the next device check to pick up, unless an operator has accepted its loss (recordAcceptedLoss). */
   private def retryFailures(): Future[Unit] =
     val pending = synchronized:
       val f = failed
@@ -641,12 +642,58 @@ class RebuildingStore(client: AspenClient,
         if remaining.isEmpty then
           Future.unit
         else
-          // Best-effort for the same reason the walk path is: a device that fills up here has to
-          // produce the operator alert and the latch, not a generic warning. The pass fails
-          // either way, so the classification is the only thing at stake.
-          checkpointBestEffort("after retries")
-          Future.failed(new Exception(
-            s"Rebuild of $storeId incomplete: ${remaining.size} objects still unreadable"))
+          lossAccepted().flatMap: accepted =>
+            if accepted then
+              recordAcceptedLoss(remaining)
+            else
+              // Best-effort for the same reason the walk path is: a device that fills up here has to
+              // produce the operator alert and the latch, not a generic warning. The pass fails
+              // either way, so the classification is the only thing at stake.
+              checkpointBestEffort("after retries")
+              Future.failed(new Exception(
+                s"Rebuild of $storeId incomplete: ${remaining.size} objects still unreadable. If the pool cannot " +
+                "supply them, `accept-rebuild-loss` lets the rebuild finish without them"))
+
+  /** Whether an operator has accepted the loss of the objects this rebuild cannot read: the store's entry on this
+   *  device is Rebuilding with `acceptLoss` (AspenClient.acceptRebuildLoss). A failed read counts as no. */
+  private def lossAccepted(): Future[Boolean] =
+    client.getStorageDeviceState(storageDeviceId)
+      .map(_.stores.get(storeId).exists(e => e.status == StorageDeviceState.StoreStatus.Rebuilding && e.acceptLoss))
+      .recover:
+        case NonFatal(t) =>
+          logger.warn(s"Rebuild of $storeId: could not read whether its losses are accepted: $t")
+          false
+
+  /** Rebuild F15. Finishes past objects no peer can supply, once an operator has accepted their loss. Each is
+   *  recorded in the pool's ErrorTree as missed by this store (missed at HLCTimestamp.Zero, so it never displaces a
+   *  newer mark), durably before the store is promoted: repair restores it if it ever becomes readable, and the
+   *  entry is the record of the loss until then. An object no longer in the allocation tree was deleted and needs
+   *  none; an entry whose pointer cannot be decoded names nothing to restore and is logged. A failed mark fails the
+   *  pass, which is retried. */
+  private def recordAcceptedLoss(ids: List[ObjectId]): Future[Unit] =
+    val pool = client.getStoragePool(storeId.poolId)
+    val fmarks = Future.sequence(ids.map: objectId =>
+      pool.flatMap(_.allocationTree.get(Key(objectId.toBytes))).map:
+        case None => None
+        case Some(vs) =>
+          scala.util.Try(ObjectPointer(vs.value.bytes)).toOption.filter(_.poolId == storeId.poolId) match
+            case Some(ptr) =>
+              Some(MissedUpdate(storeId, objectId, Some(ptr.objectType), ptr.storePointer, HLCTimestamp.Zero))
+            case None =>
+              logger.error(s"Rebuild of $storeId: the allocation tree entry of lost object $objectId does not " +
+                           "decode to a pointer into this pool. Nothing to record")
+              None)
+    fmarks.flatMap: marks =>
+      client.missedUpdateMarker.mark(marks.flatten).map: _ =>
+        synchronized:
+          failed = Nil
+        logger.error(s"REBUILD ACCEPTED LOSS: store $storeId finishes without ${ids.size} objects its pool could " +
+                     s"not supply, as an operator accepted. ${marks.flatten.size} are recorded in the ErrorTree for " +
+                     s"repair: ${ids.mkString(", ")}")
+    .recoverWith:
+      case NonFatal(t) =>
+        checkpointBestEffort("after a failed loss record")
+        Future.failed(new Exception(s"Rebuild of $storeId: failed to record its accepted losses: $t", t))
 
   /** Flush, close, drop the checkpoint, move into place. */
   private def finish(): Future[Unit] =

@@ -23,6 +23,12 @@
   in rounds (1 s doubling to 30 s): unresolved waits; committed restores, retrying any read failure; no longer listed
   restores, or settles on `InvalidObject.provesDeletion`. It never waits on a finalization, which could need this
   store. A cancel abandons the wait (`CurrentAllocationsQuery.Abandoned`)
+- Unreadable objects (Rebuild F15): `retryFailures` fails the pass while any object is still unreadable, unless the
+  store's Rebuilding entry carries `acceptLoss` (set by `accept-rebuild-loss`). Then each one still in the
+  AllocationTree is marked in the ErrorTree against this store (`MissedUpdateMarker.mark`, missed at
+  `HLCTimestamp.Zero`), durably before `finish`, and the pass finishes with a `REBUILD ACCEPTED LOSS` error line;
+  repair restores the slice if the object becomes readable. A failed mark fails the pass. The `MaxFailedObjects`
+  abort is not lifted by an acceptance
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
   `StoreRebuildFactory.createRebuild`)
 - A promoted bootstrap-pool store may hold stale copies of the bootstrap pool's own ErrorTree/UnackedCommits nodes

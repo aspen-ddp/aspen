@@ -28,7 +28,7 @@ object MissedUpdateMarker:
   /** A store owes a commit it voted on and did not acknowledge, for some of its objects */
   final case class MissedUnackedCommit(store: StoreId, transactionId: TransactionId, entry: UnackedCommitEntry)
 
-  private[transaction] def errorKey(store: StoreId, objectId: ObjectId): Key =
+  private[aspen] def errorKey(store: StoreId, objectId: ObjectId): Key =
     val keyBytes = new Array[Byte](17)
     val bb = ByteBuffer.wrap(keyBytes)
     bb.order(ByteOrder.BIG_ENDIAN)

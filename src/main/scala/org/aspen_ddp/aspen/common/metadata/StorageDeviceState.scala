@@ -45,9 +45,13 @@ object StorageDeviceState:
   /** `transferId` identifies one logical transfer and is shared by the source's TransferringOut
    *  and the destination's TransferringIn entries. It is carried in the on-disk transfer markers
    *  so a copy left behind by an earlier, aborted transfer is never mistaken for this one's. */
+  /** `acceptLoss` is set by an operator, only on a Rebuilding entry (AspenClient.acceptRebuildLoss): the rebuild may
+   *  finish past objects the pool cannot supply, recording each in the ErrorTree (Rebuild F15). Every write of an
+   *  entry by setStoreEntry clears it, so an acceptance covers one rebuild. */
   case class StoreEntry(status: StoreStatus,
                         transferDevice: Option[StorageDeviceId],
-                        transferId: Option[UUID] = None)
+                        transferId: Option[UUID] = None,
+                        acceptLoss: Boolean = false)
 
 
 case class StorageDeviceState(storageDeviceId: StorageDeviceId,

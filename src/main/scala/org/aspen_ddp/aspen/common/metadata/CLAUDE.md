@@ -65,11 +65,13 @@ on changes: administration means writing desired state here, not sending message
 
 #### StorageDeviceState (KV object, `StateKey`)
 - Owning `hostId`, `currentUsage` (self-reported) and `totalSize`, the device's `storageDeviceSet`, and a store map of
-  `StoreEntry(status, transferDevice, transferId)`
+  `StoreEntry(status, transferDevice, transferId, acceptLoss)`
 - `StoreStatus`: Initializing, Active, TransferringIn, TransferringOut, Rebuilding, Offline. A `transferId` is shared
   by a transfer's TransferringOut and TransferringIn entries and carried in the on-disk markers, so a copy left by an
   aborted transfer is never mistaken for the current one. A TransferringIn entry does not own the store: the source
-  does until the transfer completes
+  does until the transfer completes. `acceptLoss` is an operator's acceptance, on a Rebuilding entry only
+  (`AspenClient.acceptRebuildLoss`, `accept-rebuild-loss`), that its rebuild may finish past objects the pool cannot
+  supply (`server/rebuild/CLAUDE.md`). `setStoreEntry` writes a fresh entry, so the promoting flip clears it
 - `DeviceStatus`: Operational; ShuttingDown and Shutdown bracket a planned physical move; Failed is the one-way
   tombstone written by `failStorageDevice`. A failed device stays readable (its store map is the list awaiting
   rebuild) but is in no set or host and is never a destination. `failStorageDevice` is for a physically failed drive

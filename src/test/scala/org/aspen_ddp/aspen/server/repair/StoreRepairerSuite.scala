@@ -1363,6 +1363,60 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       stored(2, dataPtr.id) shouldBe None
       remaining shouldBe empty
 
+  /** Writes the object's allocationTree entry back, standing in for a DeletionFinalizationAction that has yet to run:
+    * the object is deleted, and only its record lingers
+    */
+  private def restoreAllocation(ptr: ObjectPointer): Future[Unit] =
+    val key = Key(ptr.id.toBytes)
+    for
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      tx = TestTransactions.replaySafe(client.newRepairTransaction())
+      _ <- pool.allocationTree.set(key, Value(ptr.toArray))(using tx)
+      _ <- tx.commit()
+      held <- pool.allocationTree.get(key)
+    yield
+      held shouldBe defined
+
+  // Repair F15: a deleted object whose allocation entry has not been removed yet failed its repair read with
+  // InvalidObject on every pass (logged at error) until the entry was gone and 60 s old. A read that proves the
+  // deletion now drops the slice whether or not the allocation tree still lists the object
+  test("an errorTree entry for a deleted object the allocation tree still lists deletes it from the store"):
+    for
+      dataPtr <- sharedDataObject()
+      before <- client.read(dataPtr)
+      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, before.refcount.setCount(0)))
+      marked <- errorEntries(2)
+      _ <- restoreAllocation(dataPtr)
+      _ = withClue("store 2 missed the deletion: "):
+            storeHasObject(2, dataPtr.id) shouldBe true
+            storeHasObject(0, dataPtr.id) shouldBe false
+      result <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState())
+      remaining <- errorEntries(2)
+    yield
+      marked should not be empty
+      storeHasObject(2, dataPtr.id) shouldBe false
+      stored(2, dataPtr.id) shouldBe None
+      remaining shouldBe empty
+      result.repaired shouldBe 1
+
+  test("a UnackedCommits entry for a deleted object the allocation tree still lists deletes it from the store"):
+    for
+      dataPtr <- sharedDataObject()
+      before <- client.read(dataPtr)
+      _ <- missedByCrashedVoter(2, dataPtr)(_.setRefcount(dataPtr, before.refcount, before.refcount.setCount(0)))
+      _ <- dropErrorEntries(2)
+      marked <- unackedEntries(2)
+      _ <- restoreAllocation(dataPtr)
+      _ = withClue("store 2 missed the deletion: "):
+            storeHasObject(2, dataPtr.id) shouldBe true
+      _ <- pass(2, StoreRepairer(client, SeamTarget()), DeferralState())
+      remaining <- unackedEntries(2)
+    yield
+      marked should not be empty
+      storeHasObject(2, dataPtr.id) shouldBe false
+      stored(2, dataPtr.id) shouldBe None
+      remaining shouldBe empty
+
   // Repair F5: an object absent from the allocation tree may be live, its AllocationFinalizationAction late. Before
   // Todo 2.6 an aged entry then dropped the store's live slice; now a read decides, and it is repaired instead
   test("an aged errorTree entry for a live object the allocation tree does not list repairs it, not deletes it"):

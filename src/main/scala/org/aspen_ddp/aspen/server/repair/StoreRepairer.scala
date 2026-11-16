@@ -424,8 +424,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           oAllocation <- pool.allocationTree.get(Key(objectId.toBytes))
           _ <- oAllocation match
             case Some(allocation) =>
-              repairUpdate(storeId, ObjectPointer(allocation.value.bytes), errorEntry.missedTimestamp, entryKey, policy,
-                           deferral, allowProof = true).flatMap(result => completed(result.complete))
+              repairListed(storeId, ObjectPointer(allocation.value.bytes), errorEntry.missedTimestamp, entryKey,
+                           policy, deferral).flatMap(completed)
 
             case None =>
               // Absent from the allocation tree means either the object was deleted or its
@@ -516,8 +516,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                              s"UnackedCommits entry is too recent to treat as a deletion")
                 Future.successful(false)
               case Some(_) =>
-                repairUpdate(storeId, ptr, entry.timestamp, entryKey, policy, deferral, allowProof = true)
-                  .map(result => allComplete && result.complete)
+                repairListed(storeId, ptr, entry.timestamp, entryKey, policy, deferral)
+                  .map(complete => allComplete && complete)
 
       completed.flatMap: allComplete =>
         if allComplete then
@@ -562,6 +562,25 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           logger.warn(s"Object ${ptr.id} on $storeId is live but absent from the allocation tree: repairing it")
           repairUpdate(storeId, ptr, minTimestamp, entryKey, policy, deferral, allowProof = true).map(_.complete)
         case None => Future.successful(false)
+
+  /** Repairs an object of an entry that the allocation tree lists. The listing outlives a deletion until its
+    * DeletionFinalizationAction runs, so the repair's read may find the object deleted (repair F15). A read that
+    * proves it (InvalidObject.provesDeletion) is evidence enough whatever the tree says, as in repairAbsent: the
+    * object is dropped from the store. A read that fails with InvalidObject short of a proof leaves the entry for a
+    * later pass. True when the entry's work on the object is done.
+    */
+  private def repairListed(storeId: StoreId, ptr: ObjectPointer, minTimestamp: HLCTimestamp, entryKey: Key,
+                           policy: RepairPolicy, deferral: DeferralState): Future[Boolean] =
+    repairUpdate(storeId, ptr, minTimestamp, entryKey, policy, deferral, allowProof = true)
+      .map(_.complete)
+      .recoverWith:
+        case e: InvalidObject if e.provesDeletion =>
+          logger.info(s"Object ${ptr.id} on $storeId is deleted but still in the allocation tree: dropping it")
+          repairDeletion(storeId, ptr.id, ptr.storePointer)
+        case e: InvalidObject =>
+          logger.info(s"Deferring repair of ${ptr.id} on $storeId: a read of it neither restores it nor proves it " +
+                      s"deleted: $e")
+          Future.successful(false)
 
   private def readObject(ptr: ObjectPointer): Future[ClientObjectState] = ptr match
     case kp: KeyValueObjectPointer => client.read(kp)

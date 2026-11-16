@@ -559,7 +559,8 @@ positive refcount.
    non-voters get only the ErrorTree entry (transaction-recovery F13/F15, closed by design 2026-11-14).
 2. Scan: the entry is found. `allocationTree.get(objectId)`:
    - **present** (DeletionFinalizationAction not yet run): `client.read` fails with `InvalidObject` (refcount 0,
-     Q7). The callback fails and logs, the entry stays. The next pass retries.
+     Q7). Since 2026-11-15 (F15) a read that proves the deletion drops the slice at once, as for an absent entry,
+     with no age gate; one that fails short of a proof leaves the entry for the next pass.
    - **absent**: if the entry is at least 60 s old, `repairDelete(store, objectId, storePointer)`
      (`Frontend.deleteObjectForRepair`, `:822-828`) evicts the cache and calls `backend.repairDelete`: RocksDB deletes
      the key; FSIF deletes the extent only if its index slot still holds that object id
@@ -911,7 +912,7 @@ head first".
 | F12 | Reader ranks revisions by timestamp before count; timestamp bumps from refcount updates can make a stale revision win the ranking and stall reads | low (availability) | low |
 | F13 | **FIXED** 2026-11-14. DataObject `read.timestamp < current.timestamp` is a silent skip that counts as complete | low | low |
 | F14 | A zombie slice installed from a pre-deletion read is cleaned only if the delete's own marker is written | low | low |
-| F15 | Entry callbacks that fail repeatedly (InvalidObject read of a deleted object whose allocation entry is slow to disappear) log at error each pass | cosmetic | high |
+| F15 | Entry callbacks that fail repeatedly (InvalidObject read of a deleted object whose allocation entry is slow to disappear) log at error each pass. **FIXED** 2026-11-15 | cosmetic | high |
 
 ### 13.2 Details
 
@@ -1201,6 +1202,16 @@ dependency is real but sound. Confidence: low.
 > **Verification 2026-11-09: CONFIRMED. Severity: doc-only.** Cosmetic log. *Fix sketch:* Downgrade the log level.
 **F15.** Entries whose object is deleted but whose AllocationTree entry has not been removed log an error from
 `TierEngine` each pass (`TierEngine.scala:139-142`). No data effect.
+
+> **2026-11-15 (Todo 5.7): FIXED.** Reproduced: the repair read of such an object failed with `InvalidObject`, the
+> entry callback failed (logged at error by `TierEngine.walk`) and the store kept its slice until the allocation entry
+> was gone and the ErrorTree/UnackedCommits entry 60 s old. Both listed paths now go through
+> `StoreRepairer.repairListed`: a read that proves the deletion (`InvalidObject.provesDeletion`, which since Todo 5.5
+> cannot hold for a committed allocation not yet applied) drops the slice with `repairDeletion`, as `repairAbsent`
+> does, and the entry completes; an `InvalidObject` short of a proof defers the entry at info. The zombie slice of
+> 9.3's window is also removed sooner. Tests: StoreRepairerSuite "an errorTree entry for a deleted object the
+> allocation tree still lists deletes it from the store", "a UnackedCommits entry for a deleted object the
+> allocation tree still lists deletes it from the store".
 
 ### 13.3 Other open questions for the reviewer
 

@@ -66,8 +66,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1  P-F1: Architecture.md (~line 153) describes a 1-RTT round-1 commit that the code does not implement. Decide
-     whether to implement it or correct the description; until then, correct the text.
 7.2  README.md lists X8 as FIXED, but cross-document-review narrows it (finalizer types during version skew).
 7.3  SL 4.2 X14 (blank FSIF without its marker) appears fixed by Ruling 23 (revised). Verify and mark it.
 7.4  C1: SL doc cites a stale DeviceDiscovery line, and the Failed marker is now durable. C3: reword Rebuild F14
@@ -76,3 +74,9 @@ PRIORITY 7: documentation corrections
 7.5  P-F13 body: rewrite it as intended (Ruling 10). CRL F14: pick one status for readStoreState vs disk
      recovery. CRL F17: document that MapBackend gives no durability. Req F9 remainder: LocalTimeRequirement
      is per-store clock (test-only).
+
+PRIORITY 8: unimplemented features
+----------------------------------
+
+8.1  P-F1: Architecture.md (~line 153) describes a 1-RTT round-1 commit that the code does not yet implement.
+     Implement it.

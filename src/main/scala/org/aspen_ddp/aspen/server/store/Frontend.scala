@@ -584,6 +584,28 @@ class Frontend(val storeId: StoreId,
     * tests may read hasAppliedStub from their own thread */
   @volatile private var stubs: Map[TransactionId, HLCTimestamp] = Map()
 
+  /** Each stub's expiry (stubExpiresAt) and txid, soonest first, so a heartbeat looks only at the stubs due
+    * (expireStubs). One entry per stub recorded; an entry whose stub is gone, or carries another start, is stale and
+    * skipped when it comes up */
+  private val stubExpiry = scala.collection.mutable.PriorityQueue[(Long, TransactionId)]()(
+    Ordering.by[(Long, TransactionId), Long](_._1).reverse)
+
+  /** Stubs past their expiry that a Tx for their transaction still kept, rechecked at each heartbeat (expireStubs) */
+  private val heldStubs = scala.collection.mutable.HashSet[TransactionId]()
+
+  /** The wall-clock milliseconds past which a stub for a transaction started at `start` may be dropped: the horizon
+    * plus the expiry margin after it (as Tx.pastHorizon) */
+  private def stubExpiresAt(start: HLCTimestamp): Long = start.wallTime + horizon.toMillis + expiryMargin.toMillis
+
+  /** Holds a stub not already held, queued for its expiry. Returns whether it is new */
+  private def addStub(txid: TransactionId, start: HLCTimestamp): Boolean =
+    if stubs.contains(txid) then
+      false
+    else
+      stubs += (txid -> start)
+      stubExpiry.enqueue((stubExpiresAt(start), txid))
+      true
+
   /** What the stubs are charged to the device's admission (CrlAdmission.AppliedStubBytes each), until released */
   private var stubBytesCharged: Long = 0L
 
@@ -605,8 +627,7 @@ class Frontend(val storeId: StoreId,
 
   private def recoverState(state: StoreRecoveryState): Unit =
     // Counted without a check, as recovered transactions are: the CRL already holds them
-    chargeStubs((state.appliedStubs.keySet -- stubs.keySet).size)
-    stubs = state.appliedStubs ++ stubs
+    chargeStubs(state.appliedStubs.count((txid, start) => addStub(txid, start)))
     recoverTransactions(state.transactions)
 
   /** Recreates the transactions in `states`, which the CRL holds for this store, that are not already known.
@@ -697,9 +718,8 @@ class Frontend(val storeId: StoreId,
     require(!txCommits.contains(txid),
       s"Store $storeId: an applied stub cannot replace transaction $txid's CRL state while its backend commits are " +
       s"outstanding or failed")
-    if !stubs.contains(txid) then
+    if addStub(txid, start) then
       chargeStubs(1)
-      stubs += (txid -> start)
     if !keepAdmission then
       admitted.remove(txid).foreach: a =>
         stubReplacedAdmissions(txid) = stubReplacedAdmissions.getOrElse(txid, 0L) + a.bytes
@@ -713,12 +733,15 @@ class Frontend(val storeId: StoreId,
   private[server] def dropAppliedStub(txid: TransactionId): Unit =
     if stubs.contains(txid) then
       stubs -= txid
+      heldStubs -= txid
       releaseStub()
       crl.deleteAppliedStub(storeId, txid)
 
-  /** Drops every applied stub whose transaction is past the horizon plus the expiry margin (Tx.pastHorizon) and for
+  /** Drops every applied stub whose transaction is past the horizon plus the expiry margin (stubExpiresAt) and for
     * which the store holds no Tx, whether live, waiting on a held commit (deferredFinalizations), on its backend
-    * commits (txCommits) or on a quarantine (quarantinedConclusions). Called at heartbeat (expiryHeartbeat).
+    * commits (txCommits) or on a quarantine (quarantinedConclusions). Called at heartbeat (expiryHeartbeat). Only the
+    * stubs due are looked at (stubExpiry), plus those a Tx kept past theirs (heldStubs), so a heartbeat costs
+    * O(k log n) for k stubs due, not a pass over all n.
     *
     * A stub only ever keeps a Tx for its transaction at this store from applying the update again. Past the margin T is
     * below the forget floor, so a prepare for it creates no Tx (receivePrepare: refused, or ignored when the host's
@@ -728,12 +751,19 @@ class Frontend(val storeId: StoreId,
     * Tx is left to apply through it, and the scan's reconcile is exact
     */
   private def expireStubs(now: Long): Unit =
-    if stubs.nonEmpty then
-      stubs.foreach: (txid, start) =>
-        if Tx.pastHorizon(start, now, horizon, expiryMargin) && !transactions.contains(txid) &&
-           !deferredFinalizations.contains(txid) && !txCommits.contains(txid) &&
-           !quarantinedConclusions.contains(txid) then
+    def txHeld(txid: TransactionId): Boolean =
+      transactions.contains(txid) || deferredFinalizations.contains(txid) || txCommits.contains(txid) ||
+        quarantinedConclusions.contains(txid)
+    if heldStubs.nonEmpty then
+      heldStubs.toList.foreach: txid =>
+        if !txHeld(txid) then
           dropAppliedStub(txid)
+    while stubExpiry.nonEmpty && stubExpiry.head._1 < now do
+      val (expiresAt, txid) = stubExpiry.dequeue()
+      stubs.get(txid) match
+        case Some(start) if stubExpiresAt(start) == expiresAt =>
+          if txHeld(txid) then heldStubs += txid else dropAppliedStub(txid)
+        case _ => // Stale: the stub was dropped, or is held again under its own entry
 
   // ---- UnackedCommits lookups of recovered commit votes and held late commits (Tx.awaitsUnackedLookup) ----
 

@@ -159,7 +159,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   a stub may precede its entry. A commit at a store with a stub applies nothing; a non-late one reports its objects in
   `objectCommitErrors`. The store drops a stub itself (`Frontend.expireStubs`, at heartbeat) once T is past the
   horizon plus the expiry margin and it holds no Tx for T (live, deferred, awaiting backend commits or a quarantine):
-  below the floor no prepare creates a Tx for T, so the stub can suppress nothing (Todo 4.6, CRL F22). Stubs are so
+  below the floor no prepare creates a Tx for T, so the stub can suppress nothing (Todo 4.6, CRL F22). A queue
+  ordered by expiry (`stubExpiry`, stale entries skipped) means a heartbeat looks only at the stubs due, and a stub a
+  Tx keeps past its expiry waits in `heldStubs` without blocking the rest. Stubs are so
   bounded by their rate times ~30 s whatever the repair scans do; the scan neither reads nor drops them. An entry with
   no stub is harmless at a store that saw T: it never
   rejoins T, so no replay Tx exists there to apply through it (a second driver's lost TxFinalized included). Residual:

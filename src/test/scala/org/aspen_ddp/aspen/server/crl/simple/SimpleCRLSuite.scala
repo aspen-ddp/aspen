@@ -468,9 +468,13 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val entry2Location = stream.writeEntry(le2, () => ())
 
-    queue.take() // Block till completion handlers are run
-
-    streamWriter.shutdown()
+    // Both entries durable, and the writer stopped, before recovery reads the stream: one take left the second
+    // entry's write in flight while recovery read it
+    queue.take()
+    queue.take()
+    val stopped = new java.util.concurrent.CountDownLatch(1)
+    streamWriter.shutdown(() => stopped.countDown())
+    stopped.await()
 
     val r = Recovery.recover(streams(1))
 

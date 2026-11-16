@@ -809,7 +809,9 @@ back to the case-3 lookup.
 > that point T is below the forget floor, and `receivePrepare` now refuses such a prepare even when the host's status
 > cache holds T resolved but unfinalized (it may have been written by another store's Tx after this store forgot T); a
 > finalized entry has it ignored. So no Tx for T can arise, and the stub can suppress nothing: the R-N10 argument,
-> made to hold for every stub. Stubs are bounded by their write rate times about 30 s, whatever the repair scans do;
+> made to hold for every stub. A queue ordered by expiry makes each heartbeat cost O(k log n) for the k stubs due
+> (a stub a Tx keeps past its expiry is set aside and rechecked, blocking none behind it). Stubs are bounded by their
+> write rate times about 30 s, whatever the repair scans do;
 > the scan no longer touches them (repair RP-N6, RP-N7). Tests: FrontendSuite "an applied stub is dropped once its
 > transaction is past the horizon plus the expiry margin", "an applied stub is kept past expiry while the store holds
 > a Tx for its transaction", "a prepare below the floor with a resolved, unfinalized status-cache entry is refused";

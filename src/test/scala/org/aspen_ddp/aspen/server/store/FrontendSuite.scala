@@ -3279,6 +3279,73 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       crl.stubsDeleted shouldBe Nil
   }
 
+  /** The first wall-clock millisecond at which a stub for a transaction started at `start` may be dropped */
+  private def stubDue(start: HLCTimestamp): Long =
+    start.wallTime + 20_000 + Frontend.DefaultExpiryMargin.toMillis + 1
+
+  test("applied stubs recorded out of start order expire in start order") {
+    withExpiryFrontend: (frontend, _, _, crl, _, clock, _) =>
+      val later = startedAgo(1_000)
+      val earlier = startedAgo(5_000)
+      frontend.recordAppliedStub(txid2, later)(())
+      frontend.recordAppliedStub(txid1, earlier)(())
+
+      clock.now = stubDue(earlier)
+      frontend.expiryHeartbeat()
+      frontend.hasAppliedStub(txid1) shouldBe false
+      frontend.hasAppliedStub(txid2) shouldBe true
+
+      clock.now = stubDue(later) - 1
+      frontend.expiryHeartbeat()
+      frontend.hasAppliedStub(txid2) shouldBe true
+      clock.now = stubDue(later)
+      frontend.expiryHeartbeat()
+      frontend.hasAppliedStub(txid2) shouldBe false
+      crl.stubsDeleted shouldBe List(txid1, txid2)
+  }
+
+  test("a stub a Tx keeps past its expiry blocks no later stub, and is dropped once the Tx is gone") {
+    withExpiryFrontend: (frontend, _, net, crl, lookup, clock, _) =>
+      val txd = expiringTxd(List(overwrite(op1)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      expectVote(net, TransactionDisposition.VoteCommit)
+      frontend.recordAppliedStub(txid1, txd.startTimestamp)(())
+      val later = startedAgo(500)
+      frontend.recordAppliedStub(txid2, later)(())
+
+      clock.now = stubDue(later)
+      frontend.expiryHeartbeat()
+      frontend.hasAppliedStub(txid1) shouldBe true // Its Tx is held
+      frontend.hasAppliedStub(txid2) shouldBe false
+
+      frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, txid1, committed = false, late = false,
+        owed = Set(), startTimestamp = txd.startTimestamp))
+      // Expiring, the commit vote holds the abort until a lookup finds no entry
+      lookup.answer(txid1, lookup.absent)
+      frontend.transactions.contains(txid1) shouldBe false
+      frontend.expiryHeartbeat()
+      frontend.hasAppliedStub(txid1) shouldBe false
+      crl.stubsDeleted shouldBe List(txid2, txid1)
+  }
+
+  test("a stub dropped and recorded again expires by its new start, not its old queue entry") {
+    withExpiryFrontend: (frontend, _, _, crl, _, clock, _) =>
+      val first = startedAgo(5_000)
+      frontend.recordAppliedStub(txid1, first)(())
+      frontend.dropAppliedStub(txid1)
+      val second = startedAgo(1_000)
+      frontend.recordAppliedStub(txid1, second)(())
+
+      clock.now = stubDue(first)
+      frontend.expiryHeartbeat()
+      frontend.hasAppliedStub(txid1) shouldBe true // The old entry is stale
+
+      clock.now = stubDue(second)
+      frontend.expiryHeartbeat()
+      frontend.hasAppliedStub(txid1) shouldBe false
+      crl.stubsDeleted shouldBe List(txid1, txid1)
+  }
+
   test("a late TxFinalized for an unknown transaction is cached as finalized, committed and late") {
     val statusCache = new TransactionStatusCache()
     val (frontend, _, _, _, _) = lateFixture(statusCache)

@@ -212,6 +212,12 @@ class Frontend(val storeId: StoreId,
 
   def belowForgetFloor(startTimestamp: HLCTimestamp): Boolean = startTimestamp.wallTime < forgetFloorMillis
 
+  /** T started before this rebuilt store's acceptor (acceptorSince): its old incarnation may have promised or
+    * accepted in T, and that state was lost without T being decided. For T's expiry the store is then never a
+    * non-holder, whatever it holds now: it may be the only other holder of a chosen value (cross-document review G1)
+    */
+  def mayHaveForgottenUndecided(startTimestamp: HLCTimestamp): Boolean = acceptorSince.exists(startTimestamp < _)
+
   /** T started more than the horizon plus the expiry margin ago: an unresolved Tx for it expires (expiryHeartbeat),
     * and a driver for it with no outcome is stopped once its store holds no Tx (Store.heartbeat)
     */
@@ -909,10 +915,11 @@ class Frontend(val storeId: StoreId,
     round.decided = false
     round.countdown = round.interval
     round.interval = math.min(round.interval * 2, MaxExpiryQueryInterval)
-    // Its own acceptor state: a muted Tx holds none. Never an outcome: one it already knows is what its peers are asked
-    // to confirm or end (ExpiryTally.decide's `known`)
+    // Its own acceptor state: a muted Tx holds none, unless the store's old incarnation may have held it
+    // (mayHaveForgottenUndecided). Never an outcome: one it already knows is what its peers are asked to confirm or end
+    // (ExpiryTally.decide's `known`)
     round.replies = Map(storeId -> Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false,
-      late = false, holdsAcceptorState = !tx.muted)))
+      late = false, holdsAcceptorState = !tx.muted || mayHaveForgottenUndecided(tx.txd.startTimestamp))))
     val txd = tx.txd
     // Every store of the transaction, since any outcome-bearing reply decides; only the primary pool's count otherwise
     (txd.allDataStores - storeId).foreach: to =>
@@ -1300,11 +1307,15 @@ class Frontend(val storeId: StoreId,
   }
 
   /** A store with no Tx answers with a cached outcome, or "unknown" when it can never join the transaction (below its
-    * forget floor, so the answer is permanent). Above the floor it could still create a Tx: no reply
+    * forget floor, so the answer is permanent). Above the floor it could still create a Tx: no reply. A rebuilt store
+    * whose old incarnation may have held T (mayHaveForgottenUndecided) never answers as a non-holder: no reply but a
+    * cached outcome, and that one counted as possibly holding acceptor state
     */
   private def receiveStatusRequestWithoutTx(m: TxStatusRequest): Unit =
+    val amnesiac = mayHaveForgottenUndecided(m.startTimestamp)
     val reply = statusCache.getStatus(m.transactionId).filter(_.status != TransactionStatus.Unresolved) match
-      case Some(e) => Some(TxStatusResponse.TxStatus(e.status, e.finalized, e.late, holdsAcceptorState = false))
+      case Some(e) => Some(TxStatusResponse.TxStatus(e.status, e.finalized, e.late, holdsAcceptorState = amnesiac))
+      case None if amnesiac => return
       case None if belowForgetFloor(m.startTimestamp) => None
       case None => return
     net.sendTransactionMessage(TxStatusResponse(m.from, storeId, m.transactionId, m.requestUUID, reply))

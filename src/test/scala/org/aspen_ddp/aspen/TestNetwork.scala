@@ -292,10 +292,20 @@ class TestNetwork(executionContext: ExecutionContext,
   object FinalizerFactory extends TransactionFinalizer.Factory {
     var client: AspenClient = null
 
-    def create(txd: TransactionDescription, messenger: ServerMessenger): TransactionFinalizer = {
-      val rfa = new RegisteredTransactionFinalizerFactory(client)
-      rfa.create(txd, messenger)
-    }
+    /** Transactions whose finalizers never complete and do nothing, as one whose driver's host crashed before it
+      * finalized: no UnackedCommits entry, ErrorTree mark or TxFinalized */
+    @volatile var stalled: TransactionDescription => Boolean = _ => false
+
+    def create(txd: TransactionDescription, messenger: ServerMessenger): TransactionFinalizer =
+      if stalled(txd) then
+        new TransactionFinalizer:
+          def complete: Future[Unit] = Promise[Unit]().future
+          def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = ()
+          def debugStatus: List[(String, Boolean)] = List("stalled" -> false)
+          def cancel(): Unit = ()
+      else
+        val rfa = new RegisteredTransactionFinalizerFactory(client)
+        rfa.create(txd, messenger)
   }
 
   /** Hosts the client messenger reports offline. Everything is online unless a test says otherwise. */

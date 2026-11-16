@@ -71,10 +71,14 @@
   so every allocation whose AllocationTree entry may still be missing is listed by each store holding it
 - Status query (`TxStatusRequest`, carrying the transaction's `startTimestamp`; horizon design section 2): every
   store answers. A store with a Tx replies with its status, finalized, late and `holdsAcceptorState`, false only for a Tx
-  muted for good (before `acceptorSince`, or below the floor): one muted only for starting too far ahead may yet join. With no
+  muted for good (below the floor): one muted only for starting too far ahead may yet join. With no
   Tx but a non-Unresolved status-cache entry it replies with that entry (`holdsAcceptorState = false`). With neither it
   replies `status = None` ("unknown") only when the start is below its forget floor (`belowForgetFloor(HLCTimestamp)`),
-  which makes the answer permanent; above the floor it stays silent, as it could still join the transaction
+  which makes the answer permanent; above the floor it stays silent, as it could still join the transaction. A rebuilt
+  store, for T started before its `acceptorSince` (`mayHaveForgottenUndecided`), is never a non-holder: its muted Tx and
+  a cached outcome reply `holdsAcceptorState = true`, it is otherwise silent, and its own Tx's expiry round counts
+  itself a holder. Its old incarnation may have accepted T, and counting it out could discard a chosen commit
+  (cross-document G1)
 - Forget floor (`Frontend.forgetFloorMillis`, transaction horizon design section 1): a prepare for a transaction the
   store does not hold (no Tx; a finalized status-cache entry has it ignored instead) whose start is below the floor is
   refused, a resolved but unfinalized cache entry included (Todo 4.6: the host's cache is shared, so another store's Tx

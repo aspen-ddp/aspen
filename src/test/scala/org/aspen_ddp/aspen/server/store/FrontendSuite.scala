@@ -5241,7 +5241,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       net.sentTx shouldBe empty
   }
 
-  test("a muted Tx answers with holdsAcceptorState = false") {
+  // Cross-document review G1: the rebuilt store's old incarnation may have accepted in a transaction started before
+  // its acceptor, and lost that state undecided. Counted as a non-holder, it could make the last holders of a chosen
+  // commit discard it at expiry (HorizonIntegrationSuite "holders of a chosen commit keep it past expiry ...")
+  test("a Tx muted at a rebuilt store answers holdsAcceptorState = true: its old incarnation may have held T") {
     withAcceptorSince(): (frontend, backend, net, _) =>
       // The muted prover of a transaction older than the acceptor whose update the store shows
       appliedKVPrepare(frontend, backend, FiniteDuration(3, SECONDS))
@@ -5249,7 +5252,27 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.transactions(txid1).muted shouldBe true
       frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
 
-      statusResponses(net).map(_.status.map(_.holdsAcceptorState)) shouldBe List(Some(false))
+      statusResponses(net).map(_.status.map(_.holdsAcceptorState)) shouldBe List(Some(true))
+  }
+
+  test("a rebuilt store without a Tx never answers unknown for a transaction older than its acceptor") {
+    withAcceptorSince(): (frontend, _, net, _) =>
+      // Below the store's floor too, where an ordinary store answers unknown
+      val start = ago(FiniteDuration(3, SECONDS))
+      frontend.belowForgetFloor(start) shouldBe true
+      frontend.receiveTransactionMessage(statusRequest(start))
+      net.sentTx shouldBe empty
+  }
+
+  test("a rebuilt store's cached outcome for a transaction older than its acceptor counts as possibly holding it") {
+    val statusCache = new TransactionStatusCache()
+    withAcceptorSince(statusCache): (frontend, _, net, _) =>
+      statusCache.updateStatus(txid1, TransactionStatus.Committed, finalized = false)
+      frontend.receiveTransactionMessage(statusRequest(ago(FiniteDuration(3, SECONDS))))
+
+      statusResponses(net).map(_.status) shouldBe
+        List(Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = false, late = false,
+          holdsAcceptorState = true)))
   }
 
   test("a Tx muted for starting too far ahead answers holdsAcceptorState = true: it may join once forgotten") {

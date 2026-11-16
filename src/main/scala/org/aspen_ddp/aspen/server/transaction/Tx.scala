@@ -1497,15 +1497,17 @@ class Tx( trs: TransactionRecoveryState,
     val ps = acceptor.persistentState
     (ps.promised.toList ++ ps.accepted.map(_._1).toList).maxOption
 
-  /** A muted Tx holds no acceptor state. It is a permanent non-holder only if muted for good: started before the
-    * rebuilt store's acceptor, or below the store's forget floor. One muted for starting too far ahead is forgotten once
-    * its objects load, and a retransmission once the clock catches up then creates an unmuted Tx, so it may yet hold
+  /** A muted Tx holds no acceptor state. It is a permanent non-holder only if muted for good, below the store's forget
+    * floor. One muted for starting too far ahead is forgotten once its objects load, and a retransmission once the clock
+    * catches up then creates an unmuted Tx, so it may yet hold. One muted for starting before a rebuilt store's acceptor
+    * is never a non-holder: the store's old incarnation may have held T, and lost that state with T undecided
+    * (Frontend.mayHaveForgottenUndecided)
     */
   def receiveStatusRequest(m: TxStatusRequest): Unit = {
-    val mutedForGood = frontend.acceptorSince.exists(txd.startTimestamp < _) || frontend.belowForgetFloor(txd)
+    val nonHolder = muted && frontend.belowForgetFloor(txd) && !frontend.mayHaveForgottenUndecided(txd.startTimestamp)
     val r = TxStatusResponse(m.from, storeId, transactionId, m.requestUUID,
       Some(TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = lateOutcome,
-        holdsAcceptorState = !muted || !mutedForGood)))
+        holdsAcceptorState = !nonHolder)))
     net.sendTransactionMessage(r)
   }
 

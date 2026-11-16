@@ -144,7 +144,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - The pure `ExpiryTally.decide` rules, in order: (1) any reply with an outcome is adopted (a commit over an abort): a
   committed one through `TxResolved` (late if finalized or late, so a commit vote looks up its entry), an aborted one
   as a `TxFinalized` abort; (2) otherwise the primary pool's (`txd.primaryObjectIDA`) stores that replied "unknown" or
-  without acceptor state are non-holders, and silent ones possible holders; (3) more than `width - writeThreshold`
+  without acceptor state are non-holders, and silent ones possible holders. A rebuilt store is never a non-holder
+  for T started before its `acceptorSince` (`Frontend.mayHaveForgottenUndecided`, cross-document G1): its old
+  incarnation may have accepted T and lost that state undecided; (3) more than `width - writeThreshold`
   non-holders: `Discard`; (4) else `Hold` and ask again. A Tx that knows its outcome passes it (`known`): rule 1 then
   adopts only a finalized or late commit of a known commit, and an outcome reply without acceptor state (a status
   cache answering) is a non-holder, since re-adopting the known outcome would change nothing
@@ -159,6 +161,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   one does, and its store drives it meanwhile, as it does a recovered one
 - Why discarding is safe: an acceptor forgets T only once T is decided (an abort at resolution, a commit at
   TxFinalized), and a store answers "unknown" only below its forget floor, so a non-holder never becomes a holder.
+  A rebuilt store lost its acceptor state undecided, so it must never count as a non-holder for older T: one false
+  non-holder is enough to discard a chosen commit when `w - t = 1`. Accepted cost: a T whose only quorum needs it
+  holds indefinitely
   More than `w - t` of them rule out a committed, unfinalized T, which a full quorum would still hold. So T aborted,
   or committed and was finalized (its finalizer wrote this store's entry if it was owed), or can never be decided
 - A driver of a transaction past the horizon plus the margin that has no outcome is stopped and removed once its

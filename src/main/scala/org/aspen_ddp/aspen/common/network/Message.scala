@@ -364,7 +364,9 @@ final case class TxStatusResponse(
   override def toString: String = f"TxStatusResponse to $to from $from tx $transactionId request $requestUUID status $status"
 
 object TxStatusResponse {
-  /** `holdsAcceptorState`: the replying store has a Tx for the transaction that takes part in Paxos (not muted).
+  /** `holdsAcceptorState`: the replying store has a Tx for the transaction that takes part in Paxos (not muted), or
+    * may have held acceptor state for it that it lost undecided (a rebuilt store, for a transaction started before its
+    * acceptorSince). False makes the reply a non-holder's (ExpiryTally).
     * A response with no status means: not held, not remembered, and below the store's forget floor, so it can never
     * join the transaction
     */

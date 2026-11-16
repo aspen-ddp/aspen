@@ -64,6 +64,7 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 | CRL F6 | **FIXED** 2026-11-09 for transient errors (was CONFIRMED) | I/O and VM errors are retried on 3 scans before the CRL is declared lost; other failures still declare it lost, by decision |
 | Rebuild F2 | **FIXED** 2026-11-09 (was CONFIRMED) | The old copy and its saved CRL entries stay in `pending-delete/` until the store is Active again |
 | X2 | **FIXED** 2026-11-09 (was PLAUSIBLE) | A rebuilt store mutes prepares for transactions started before its `acceptor-since` time |
+| G1 (X2 x expiry) | **FIXED** 2026-11-15 (Todo 6.2; found while closing the coverage gap, CONFIRMED by test; lost committed data) | Expiry counted a rebuilt store as a non-holder for a transaction started before its acceptor, so with one other store that never heard of T, the last holders of a chosen commit the client had been told of discarded it. The store now never counts as a non-holder for such a T. Residual: a T whose only quorum needs the rebuilt store holds indefinitely (a stall) |
 | X1 / Rebuild F1 | **FIXED** 2026-11-09 (was CONFIRMED) | A Failed device is retired (marker plus unload), never reloaded, its former host nudged, repair scans fenced on the pool entry |
 | CRL F3 | **FIXED** 2026-11-09 (was PLAUSIBLE, reproduced by a torn-write test) | Rotation copy-forward overwrote the stream holding the only copy of live data |
 | CRL F4 | **FIXED** 2026-11-13 for the phantom (was CONFIRMED, reproduced) | A save after a delete in the same unwritten entry left a live, never-written `Tx` that pinned `oldestEntryNeeded`: after the ring wrapped, recovery threw `BrokenEntryChain` (CRL lost, every store on the device rebuilt). Residual: the skipped save is still acknowledged, which no load path reaches |
@@ -167,6 +168,8 @@ Per cross-document-review §2, no document yet covers:
 - the size limits of marker batches;
 - a combined capacity argument covering the ErrorTree, UnackedCommits growth, CRL admission and rebuilds (the CRL
   admission leg stated 2026-11-15, cross-document G10; UnackedCommits growth and rebuilds still open);
+- (closed 2026-11-15, Todo 6.2) how long a transaction may stay unresolved against a rebuilt store's mute (cross-document
+  G1): no bound is assumed; tested end to end, which found and fixed the expiry hole above;
 - (closed 2026-11-15, Todo 6.1) a driver's data-less prepare preceding the client's prepare (cross-document G11):
   replays are refused by the forget floor, and the live-transaction order is tested end to end (ReplayIntegrationSuite);
   the proof leg is unreachable end to end and covered at unit level;

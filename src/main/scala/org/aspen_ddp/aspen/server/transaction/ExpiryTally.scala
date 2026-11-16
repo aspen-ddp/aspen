@@ -25,7 +25,10 @@ object ExpiryTally:
   /** @param replies the replies of one query round, by the store that sent them, the asking store's own included.
     *                A store absent from it was silent, and counts as a possible holder. `None`: "unknown", from a
     *                store with no Tx and no cached outcome, whose forget floor is above T's start, so it can never
-    *                join T. A reply without acceptor state (a muted Tx) counts as a non-holder too
+    *                join T. A reply without acceptor state (a muted Tx) counts as a non-holder too. A rebuilt store
+    *                never replies as a non-holder for T started before its acceptor (Frontend.mayHaveForgottenUndecided):
+    *                rule 3 rests on non-holders having forgotten T only once it was decided, and its old incarnation
+    *                lost its state undecided
     * @param known the outcome the asking Tx already knows (it resolved, and waits for a TxFinalized that may never
     *              come), if any. Re-adopting it would change nothing, so rule 1 adopts only a finalized or late commit
     *              of a known commit (which concludes it), and every other reply is classified by its acceptor state:

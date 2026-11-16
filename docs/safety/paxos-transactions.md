@@ -787,16 +787,20 @@ it concludes, `Unknown` included (`client/internal/transaction/TransactionManage
 **Why rule 3 is safe.** An acceptor forgets T only once T is decided: an abort at resolution, a commit at `TxFinalized`
 (P9). So a committed but unfinalized T is still held by a full quorum (`t`) of the primary pool's acceptors, and more
 than `w - t` non-holders rule it out. A non-holder can never become a holder, because it answered "unknown" only below
-its floor, or holds a `Tx` muted for good, which accepts nothing: one started before the rebuilt store's
-`acceptorSince`, or below the store's floor (`Tx.receiveStatusRequest`). A `Tx` muted only for starting too far ahead
+its floor, or holds a `Tx` muted for good, which accepts nothing: one below the store's floor
+(`Tx.receiveStatusRequest`). A rebuilt store is never a non-holder for T started before its `acceptorSince`
+(`Frontend.mayHaveForgottenUndecided`; 2026-11-15, cross-document G1): its old incarnation may have accepted T and lost
+that state undecided, so it replies only with a cached outcome, counted as possibly holding, and otherwise stays
+silent. A `Tx` muted only for starting too far ahead
 reports itself a possible holder, since once forgotten a retransmission after the clock catches up creates an unmuted
 one. The third kind of non-holder `ExpiryTally` counts is an
 outcome reply without acceptor state (a status-cache answer) when the asking `Tx` already knows its outcome: a cache
 entry exists only for a decided T, so counting it cannot discard an undecided one, and the asking `Tx` concludes the
 outcome it knows rather than discarding (`concludeKnownOutcome`), while a finalized or late commit is adopted by rule 1.
-The argument assumes, as Paxos does throughout (P9; cross-document X2, C3), that no more of the primary pool's commit
-voters lost their acceptor state (a rebuild or a lost CRL) than the pool tolerates: a rebuilt store's `acceptorSince`
-mute counts it as a non-holder, which is correct only within that bound. So T is one of: aborted; committed and finalized, in which
+(Until 2026-11-15 the rebuilt store counted as a non-holder, and this paragraph claimed that was correct within the
+pool's tolerance. It was not: one amnesiac commit voter plus one store that never heard of T is more than `w - t`
+non-holders for any pool with `w - t = 1`, and the last holders discarded a chosen commit. HorizonIntegrationSuite
+"holders of a chosen commit keep it past expiry while a rebuilt store may have accepted it".) So T is one of: aborted; committed and finalized, in which
 case the finalizer wrote this store's UnackedCommits entry before `TxFinalized` if it was owed (the lookup found none,
 so it was not; ErrorTree marks cover a store whose update was not counted); or undecided and undecidable, since no
 quorum can ever form past the horizon. Discarding is correct in all three. Stuck holders short of a quorum report

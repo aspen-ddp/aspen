@@ -125,6 +125,8 @@ Device CRL recovery runs on the host control thread (Related to previous item)
     aspen-host-control at startup and adoption. On HDD that can take seconds, stalling all other device management on
     the host. Move the open off the control thread (as BackendOpener does for FSIF opens) and post the result back.
     Fold into the device I/O isolation item above.
+  - Since 2026-11-15 (Todo 5.6, CRL F16) the open only reads: it no longer re-saves the live set, so what remains
+    on the control thread is recovery's reads of the walked entries.
 
 Operator alerts
   - Today nothing tells an operator anything except log lines. Several designs need to alert one and let them decide

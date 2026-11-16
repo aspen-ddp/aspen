@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrlCorrupt, TransactionRecoveryState}
 import scribe.Logging
@@ -21,9 +22,22 @@ object Recovery extends Logging:
                     initialNextEntryOffset: Long,
                     initialOldestEntryNeeded: Long,
                     initialPreviousEntryLocation: StreamLocation,
-                    trsList: List[TransactionRecoveryState],
+                    txs: List[RecoveredTx],
                     /** Applied stubs: not transactions, recovered apart from them */
-                    appliedStubs: Map[TxId, HLCTimestamp] = Map())
+                    stubs: List[RecoveredStub]):
+    def trsList: List[TransactionRecoveryState] = txs.map(_.state)
+    def appliedStubs: Map[TxId, HLCTimestamp] = stubs.map(s => s.id -> s.start).toMap
+
+  /** A live transaction, with where its data lies and the serial number of the oldest entry holding any of it: its
+    * place in the opened CRL's queue (SimpleCRL writes nothing at open) */
+  case class RecoveredTx(id: TxId,
+                         state: TransactionRecoveryState,
+                         txdLocation: StreamLocation,
+                         updateLocations: Option[List[(ObjectId, StreamLocation)]],
+                         entrySerialNumber: Long)
+
+  /** A live applied stub, with its anchor and the serial number of the newest entry holding it */
+  case class RecoveredStub(id: TxId, start: HLCTimestamp, anchor: StreamLocation, entrySerialNumber: Long)
 
   def recover(files: List[(StreamId, os.Path)]): Result =
     val readers = files.sortBy(_._1.number).map(t => StreamReader(t._1, t._2)).toArray
@@ -45,8 +59,9 @@ object Recovery extends Logging:
       .sortBy(-_._2.entrySerialNumber)
     val newest = byHead.iterator.flatMap((i, _) => readers(i).lastIntactEntry().map(e => (i, e))).nextOption()
 
-    // Entry extents whose checksums the walk verified, by stream: (start of dynamic data, end of dynamic data)
-    var verified: Map[Int, List[(Long, Long)]] = Map()
+    // Entry extents whose checksums the walk verified, by stream: (start of dynamic data, end of dynamic data, entry
+    // serial number)
+    var verified: Map[Int, List[(Long, Long, Long)]] = Map()
 
     newest.foreach: (streamIndex, last) =>
       val (lastOffset, lastEntry) = last
@@ -98,36 +113,43 @@ object Recovery extends Logging:
           throw CrlCorrupt(s"the body of the entry at $previousEntryLocation, serial number " +
                                  s"${h.entrySerialNumber}, fails its checksum")
         val dynamicStart = offset + LogEntry.StaticEntryHeaderSize
+        val dynamicEnd = dynamicStart + h.dynamicDataSize
         verified += reader.streamId.number ->
-          ((dynamicStart, dynamicStart + h.dynamicDataSize) :: verified.getOrElse(reader.streamId.number, Nil))
-        val bb = reader.read(dynamicStart + h.dynamicDataSize, h.staticDataSize.toInt)
-        LogEntry.loadStaticEntryContent(h, bb, rs)
+          ((dynamicStart, dynamicEnd, h.entrySerialNumber) :: verified.getOrElse(reader.streamId.number, Nil))
+        val bb = reader.read(dynamicEnd, h.staticDataSize.toInt)
+        LogEntry.loadStaticEntryContent(h, bb, rs, StreamLocation(reader.streamId, dynamicEnd, 0))
         if h.entrySerialNumber > lastEntry.oldestEntryNeeded then
           loadPrevious(h.previousEntryStreamLocation, h.entrySerialNumber)
 
       loadPrevious(lastEntryLocation, lastEntry.entrySerialNumber + 1)
 
-    /** Data is read only from entries the walk verified, so it is covered by their checksums */
-    def readStreamLocation(loc: StreamLocation): DataBuffer =
-      val inside = verified.getOrElse(loc.streamId.number, Nil).exists((start, end) =>
-        loc.offset >= start && loc.length >= 0 && loc.offset + loc.length <= end)
-      if !inside then
+    /** The serial number of the verified entry whose dynamic data holds `loc`. Data is read only from entries the
+      * walk verified, so it is covered by their checksums */
+    def entryHolding(loc: StreamLocation): Long =
+      verified.getOrElse(loc.streamId.number, Nil).collectFirst:
+        case (start, end, serial) if loc.offset >= start && loc.length >= 0 && loc.offset + loc.length <= end => serial
+      .getOrElse:
         throw BrokenEntryChain(s"a live record names $loc, outside the dynamic data of every entry recovered")
+
+    def readStreamLocation(loc: StreamLocation): DataBuffer =
+      entryHolding(loc)
       DataBuffer(readers(loc.streamId.number).read(loc.offset, loc.length))
 
-    val trsList = rs.txs.valuesIterator.map( ltx =>
+    val txs = rs.txs.valuesIterator.map: ltx =>
       val ous: List[ObjectUpdate] = ltx.updateLocations match
         case None => Nil
         case Some(lst) => lst.map(t => ObjectUpdate(t._1, readStreamLocation(t._2)))
 
-      TransactionRecoveryState(
+      val trs = TransactionRecoveryState(
         ltx.id.storeId,
         readStreamLocation(ltx.txdLocation),
         ous,
         ltx.disposition,
         TransactionStatus.Unresolved,
         ltx.paxosAcceptorState)
-    ).toList
+      val locations = ltx.txdLocation :: ltx.updateLocations.getOrElse(Nil).map(_._2)
+      RecoveredTx(ltx.id, trs, ltx.txdLocation, ltx.updateLocations, locations.map(entryHolding).min)
+    .toList
 
     Result(
       activeStreamId,
@@ -136,5 +158,5 @@ object Recovery extends Logging:
       initialNextEntryOffset,
       initialOldestEntryNeeded,
       initialPreviousEntryLocation,
-      trsList,
-      rs.stubs)
+      txs,
+      rs.stubs.iterator.map((id, s) => RecoveredStub(id, s.start, s.anchor, s.entrySerialNumber)).toList)

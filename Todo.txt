@@ -54,9 +54,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.6  CRL F16: avoid rewriting the full live set on every open, or do it off the control thread. CRL F12: replace
-     dropStore's read-then-delete with a single CRL-thread DropStore request. CRL F11: syncDirectory after
-     creating the stream files.                                                                             [S-M]
 5.7  Repair F15: stop logging an error on every pass for deleted objects that still have an allocation entry. [S]
 5.8  Req F10: log an invariant violation when an apply overrides a commit voter's lock.                     [S]
 5.9  Repair F12 residual: reader ranking can prefer a stale store with a higher timestamp (exact ties are

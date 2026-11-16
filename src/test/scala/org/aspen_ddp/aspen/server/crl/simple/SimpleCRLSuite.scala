@@ -435,7 +435,8 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val i2 = SimpleCRL(tdir, 3, 1024*1024)
 
-    assert(i2.crl.currentEntrySerialNumber == 2)
+    // The open writes nothing: the next entry is the one after the last written (crash-recovery-log F16)
+    assert(i2.crl.currentEntrySerialNumber == 1)
 
     assert(i2.trsList.length == 1)
 
@@ -643,7 +644,7 @@ class SimpleCRLSuite extends FileBasedTests {
     saveAndWait(i.crl, transactionId, trsValidTxd)
     i.crl.shutdown()
 
-    // Each reopen writes the recovered transaction into a new entry, linked to the entries before it
+    // Each reopen recovers it from the entry that wrote it: an open writes nothing
     for n <- 1 to 3 do
       val opened = new LinkedBlockingQueue[SimpleCRL.InitialCRLState]()
       val t = new Thread(() => opened.put(SimpleCRL(tdir, 3, 1024 * 1024)))
@@ -1572,7 +1573,7 @@ class SimpleCRLSuite extends FileBasedTests {
       assert(bytes(10 + 2 * i + 1) == 1.toByte, s"buffer $i")
   }
 
-  test("An entry holding more transactions than IOV_MAX buffers recovers, including the re-save at open") {
+  test("An entry holding more transactions than IOV_MAX buffers recovers, and saves after the reopen survive") {
     val count = 600
     val i1 = SimpleCRL(tdir, 3, 64L * 1024 * 1024)
     val done = new CountDownLatch(count)
@@ -1582,8 +1583,7 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(done.await(30, TimeUnit.SECONDS))
     i1.crl.shutdown()
 
-    // The open re-saves every recovered transaction in one entry, about three buffers each. A torn write of it hides
-    // every entry written after it, so the save acknowledged next must survive the reopen
+    // The save acknowledged after the reopen must survive the next one
     val i2 = SimpleCRL(tdir, 3, 64L * 1024 * 1024)
     assert(i2.trsList.length == count)
     val late = mkTx(count + 1, 2)
@@ -1674,21 +1674,27 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(largestRotation > 1)
   }
 
-  test("An open whose re-save cannot fit in a stream fails, and fails the same way when retried") {
+  test("An open of a CRL whose live set is more than a stream recovers it without writing") {
     val size = 4096L * 4
     def big(n: Int) =
       val t = mkTx(n, 1)
       (t._1, t._2.copy(objectUpdates = List(ObjectUpdate(ObjectId(new UUID(9, n)), DataBuffer(new Array[Byte](10000))))))
     val a = big(1)
     val b = big(2)
-    // Without admission the two live transactions fill more than a stream, so the open's re-save of both cannot fit
+    // Without admission the two live transactions fill more than a stream. The open used to re-save both, which could
+    // not fit, so the device could not open at all. It now only reads; copying them forward at the next rotation is
+    // what cannot fit, Stream.writeEntry's fail-stop backstop, which admission keeps out of reach
     val i1 = SimpleCRL(tdir, 3, size)
     saveAndWait(i1.crl, a._1, a._2)
     saveAndWait(i1.crl, b._1, b._2)
     i1.crl.shutdown()
 
+    val before = (0 until 3).map(n => os.read.bytes(tdir / s"$n.crl"))
     for _ <- 1 to 2 do
-      assertThrows[IllegalArgumentException](SimpleCRL(tdir, 3, size))
+      val r = SimpleCRL(tdir, 3, size)
+      assert(r.trsList.map(_.txd.transactionId).toSet == Set(a._1, b._1))
+      r.crl.shutdown()
+    (0 until 3).foreach(n => assert(java.util.Arrays.equals(os.read.bytes(tdir / s"$n.crl"), before(n)), s"stream $n"))
   }
 
   // ---- Applied stubs ----
@@ -1878,5 +1884,142 @@ class SimpleCRLSuite extends FileBasedTests {
     i2.appliedStubs shouldBe Map()
     readState(i2.crl, storeId2).transactions.size shouldBe 1
     i2.crl.shutdown()
+  }
+
+  // ---- An open writes nothing (crash-recovery-log F16) ----
+
+  private def streamBytes(dir: os.Path, n: Int): IndexedSeq[Array[Byte]] =
+    (0 until n).map(i => os.read.bytes(dir / s"$i.crl"))
+
+  test("An open writes nothing: repeated reopens leave every stream file unchanged and recover the same state") {
+    val size = 1024L * 1024
+    val x = mkTx(1, 2)
+    val y = mkTx(2, 2)
+    val i1 = SimpleCRL(tdir, 3, size)
+    // X's data is written in its first entry and named by its later saves; Y's update data comes after a data-less
+    // first save (a driver's prepare), in a later entry than its txd; a stub stands beside them
+    saveAndWait(i1.crl, x._1, x._2)
+    saveAndWait(i1.crl, y._1, y._2.copy(objectUpdates = Nil))
+    saveAndWait(i1.crl, x._1, x._2.copy(disposition = TransactionDisposition.VoteAbort))
+    saveAndWait(i1.crl, y._1, y._2)
+    stubAndWait(i1.crl, storeId2, transactionId3)
+    settle(i1.crl)
+    val serial = i1.crl.currentEntrySerialNumber
+    val stream = i1.crl.currentStreamNumber
+    i1.crl.shutdown()
+
+    val before = streamBytes(tdir, 3)
+    for n <- 1 to 5 do
+      val r = SimpleCRL(tdir, 3, size)
+      assert(r.crl.currentEntrySerialNumber == serial, s"reopen $n")
+      assert(r.crl.currentStreamNumber == stream, s"reopen $n")
+      val byTx = r.trsList.map(t => t.txd.transactionId -> t).toMap
+      assert(byTx.keySet == Set(x._1, y._1), s"reopen $n")
+      assert(byTx(x._1).disposition == TransactionDisposition.VoteAbort, s"reopen $n")
+      assert(byTx(x._1).objectUpdates == x._2.objectUpdates, s"reopen $n")
+      assert(byTx(y._1).objectUpdates == y._2.objectUpdates, s"reopen $n")
+      assert(r.appliedStubs == Map(TxId(storeId2, transactionId3) -> stubStart), s"reopen $n")
+      r.crl.shutdown()
+      val after = streamBytes(tdir, 3)
+      (0 until 3).foreach(i => assert(java.util.Arrays.equals(after(i), before(i)), s"reopen $n wrote stream $i"))
+  }
+
+  /** X with data spanning sectors, and a stub, recovered by each reopen; Y re-saved to drive the log through
+    * rotations, which must copy X and the stub forward from where the recovery found them */
+  private def rotateRecovered(reopenEvery: Int): Unit =
+    val size = 4096L * 4
+    val x0 = mkTx(1, 1)
+    val x = (x0._1, x0._2.copy(objectUpdates =
+      List(ObjectUpdate(ObjectId(new UUID(9, 100)), DataBuffer(Array.tabulate[Byte](6000)(i => (i % 101).toByte))))))
+    val y = mkTx(2, 2)
+    var crl = SimpleCRL(tdir, 3, size).crl
+    saveAndWait(crl, x._1, x._2)
+    stubAndWait(crl, storeId2, transactionId3)
+    crl.shutdown()
+
+    def check(r: SimpleCRL.InitialCRLState, what: String): Unit =
+      val byTx = r.trsList.map(t => t.txd.transactionId -> t).toMap
+      assert(byTx.get(x._1).map(_.objectUpdates).contains(x._2.objectUpdates), what)
+      assert(r.appliedStubs == Map(TxId(storeId2, transactionId3) -> stubStart), what)
+
+    var rotations = 0
+    var r = SimpleCRL(tdir, 3, size)
+    check(r, "first reopen")
+    crl = r.crl
+    for n <- 1 to 30 do
+      val stream = crl.currentStreamNumber
+      saveAndWait(crl, y._1, y._2)
+      settle(crl)
+      if crl.currentStreamNumber != stream then
+        rotations += 1
+      if n % reopenEvery == 0 then
+        crl.shutdown()
+        r = SimpleCRL(tdir, 3, size)
+        check(r, s"reopen after save $n")
+        crl = r.crl
+    crl.shutdown()
+    // Every stream recycled at least twice: X was copied forward from a recovered location more than once
+    assert(rotations >= 6)
+    val last = SimpleCRL(tdir, 3, size)
+    check(last, "last reopen")
+    last.crl.shutdown()
+
+  test("Records an open recovers are copied forward by later rotations") {
+    rotateRecovered(reopenEvery = 1000)
+  }
+
+  test("Records are copied forward by rotations when the CRL is reopened after every save") {
+    rotateRecovered(reopenEvery = 1)
+  }
+
+  // ---- dropStore is one request (crash-recovery-log F12) ----
+
+  /** Holds the CRL thread until the returned latch is counted down */
+  private def holdCrlThread(crl: SimpleCRL): CountDownLatch =
+    val held = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
+    crl.runOnCrlThread: () =>
+      held.countDown()
+      release.await()
+    assert(held.await(10, TimeUnit.SECONDS))
+    release
+
+  /** Saved before a drop of its store, then saved again after it (the store loaded again) while the CRL thread was
+    * held, so the drop and the later save queue back to back. `writeInFlight`: another store's save is written as
+    * the drop is processed, so the drop's deletion and the later save share the next entry */
+  private def saveAfterDrop(writeInFlight: Boolean): Unit =
+    val v1 = trsValidTxd
+    val v2 = trsValidTxd.copy(objectUpdates = List(ou1), disposition = TransactionDisposition.VoteAbort)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, v1)
+    stubAndWait(i.crl, storeId, transactionId3)
+
+    val release = holdCrlThread(i.crl)
+    val saved = new LinkedBlockingQueue[String]()
+    if writeInFlight then
+      i.crl.save(transactionId2, trsValidTxd2, () => saved.put("other"))
+    val dropped = i.crl.dropStore(storeId)
+    i.crl.save(transactionId, v2, () => saved.put("v2"))
+    i.crl.saveAppliedStub(storeId, transactionId4, stubStart, () => saved.put("stub"))
+    release.countDown()
+
+    Await.result(dropped, 10.seconds)
+    val expected = if writeInFlight then Set("other", "v2", "stub") else Set("v2", "stub")
+    assert((1 to expected.size).map(_ => saved.poll(10, TimeUnit.SECONDS)).toSet == expected)
+    // The drop took v1 and the stub saved before it, and nothing saved after it
+    val after = StoreRecoveryState(List(v2), Map(transactionId4 -> stubStart))
+    readState(i.crl, storeId) shouldBe after
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    readState(i2.crl, storeId) shouldBe after
+    i2.crl.shutdown()
+
+  test("dropStore keeps a same-id save queued after it") {
+    saveAfterDrop(writeInFlight = false)
+  }
+
+  test("dropStore keeps a same-id save that lands in the entry holding its deletion") {
+    saveAfterDrop(writeInFlight = true)
   }
 }

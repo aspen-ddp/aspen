@@ -20,8 +20,9 @@ class LogEntry(val previousEntryLocation: StreamLocation,
   private var txDelSet: Set[TxId] = Set()
   private var stubs: HashMap[TxId, Stub] = new HashMap()
   private var stubDeletions: Set[TxId] = Set()
-  /** Transactions whose deletion in this entry a stub's save made, and nothing else (deleteTxForStub) */
-  private var stubReplaced: Set[TxId] = Set()
+  /** Transactions whose deletion in this entry a later save cancels (deleteTxUnlessResaved): made by a stub's save or
+    * a dropStore, and by no final deletion */
+  private var resavable: Set[TxId] = Set()
 
 
   def isEmpty: Boolean =
@@ -57,11 +58,11 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     // SimpleCRL never creates a record for such a save: it queues only the handler (addCompletionHandler), since a
     // record that is never written would pin oldestEntryNeeded and be reported as live (crash-recovery-log F4).
     //
-    // A deletion made by a stub's save (deleteTxForStub) is not final: the stub replaced the state, and a save after
-    // it is a new state of the transaction, live beside the stub. The save cancels that deletion, so it is written;
-    // recovery takes the newest save
-    if stubReplaced.contains(tx.id) then
-      stubReplaced -= tx.id
+    // A deletion made by a stub's save or a dropStore (deleteTxUnlessResaved) is not final: a save after it is a new
+    // state of the transaction (live beside the stub, or of the store loaded again). The save cancels that deletion,
+    // so it is written; recovery takes the newest save
+    if resavable.contains(tx.id) then
+      resavable -= tx.id
       txDelSet -= tx.id
       txDeletions = txDeletions.filterNot(_ == tx.id)
     if !deletesFinally(tx.id) then
@@ -70,7 +71,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
   /** True when this entry deletes `txid` and a save of it would not cancel the deletion: the save is skipped (addTx) */
   def deletesFinally(txid: TxId): Boolean =
-    txDelSet.contains(txid) && !stubReplaced.contains(txid)
+    txDelSet.contains(txid) && !resavable.contains(txid)
 
   /** Runs `completionHandler` once this entry is durable */
   def addCompletionHandler(completionHandler: () => Unit): Unit =
@@ -79,15 +80,15 @@ class LogEntry(val previousEntryLocation: StreamLocation,
   def deleteTx(txid: TxId): Unit =
     txDeletions = txid :: txDeletions
     txDelSet = txDelSet + txid
-    stubReplaced -= txid
+    resavable -= txid
 
-  /** Deletes the transaction state a stub's save replaces. Unlike deleteTx, a later save of it in this entry cancels
-    * the deletion (addTx) */
-  def deleteTxForStub(txid: TxId): Unit =
+  /** Deletes the transaction state a stub's save replaces, or a dropStore drops. Unlike deleteTx, a later save of it
+    * in this entry cancels the deletion (addTx). A final deletion already made stays final */
+  def deleteTxUnlessResaved(txid: TxId): Unit =
     val alreadyDeleted = txDelSet.contains(txid)
     deleteTx(txid)
     if !alreadyDeleted then
-      stubReplaced += txid
+      resavable += txid
 
   /** Unlike a transaction's save, a stub's save after its deletion in this entry is written: the newer of the two
     * wins, so an entry never holds both for one id */
@@ -232,9 +233,13 @@ object LogEntry:
       base + padTo4k(base)
 
 
+  /** An applied stub found by recovery: its start timestamp, and the anchor and serial number of the newest entry
+    * holding it, which the opened CRL keeps as its own (SimpleCRL writes nothing at open) */
+  case class LoadingStub(start: HLCTimestamp, anchor: StreamLocation, entrySerialNumber: Long)
+
   class RecoveringState(var txs: HashMap[TxId, Tx.LoadingTx],
                         var txDeletions: Set[TxId],
-                        var stubs: HashMap[TxId, HLCTimestamp] = new HashMap(),
+                        var stubs: HashMap[TxId, LoadingStub] = new HashMap(),
                         var stubDeletions: Set[TxId] = Set())
 
 
@@ -255,9 +260,12 @@ object LogEntry:
       staticDataSize, numTransactions, numTxDeletions, numStubs, numStubDeletions, bodyCrc)
 
 
+  /** `stubAnchor`: where createEntryBuffers put the anchor of a stub first written in this entry, the end of its
+    * dynamic data */
   def loadStaticEntryContent(header: EntryHeader,
                              bb: ByteBuffer,
-                             rstate: RecoveringState): Unit =
+                             rstate: RecoveringState,
+                             stubAnchor: StreamLocation): Unit =
 
     // Entries are loaded newest to oldest, so rstate already holds the content of every newer
     // entry. A deletion therefore applies only to saves in this entry (a save is never added
@@ -278,7 +286,7 @@ object LogEntry:
     // (LogEntry.addStub), so only newer deletions can remove one
     stubsHere.foreach: (id, start) =>
       if !rstate.stubDeletions.contains(id) && !stubsDeletedHere.contains(id) && !rstate.stubs.contains(id) then
-        rstate.stubs += (id -> start)
+        rstate.stubs += (id -> LoadingStub(start, stubAnchor, header.entrySerialNumber))
 
     rstate.stubDeletions ++= stubsDeletedHere
 

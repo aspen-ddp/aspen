@@ -21,12 +21,20 @@
   intact entry newer than the last one found exists in that stream or the next. Data is read only from entries
   the walk verified. All-zero regions are not entries
 - A failed open shuts its writer down before throwing, so a retry never runs two writers over the same files
+- An open writes nothing (safety F16): recovery returns each live record with the locations its newest static record
+  names and the serial of the oldest verified entry holding any of them (a stub: its anchor in the newest entry
+  holding it, `Recovery.RecoveredTx`/`RecoveredStub`), and the constructor queues them by that serial as if it had
+  written them. The next rotation copies them forward from there. Do not reintroduce an open-time re-save
 - An open CRL holds an exclusive lock on `crl/lock` (`simple/CrlLock`), from before its files are read until its writer
   has closed them; a second opener, in this process or another, gets `CrlLocked` and touches nothing. Never open
   the lock file elsewhere: closing any descriptor of it drops the process's POSIX lock, which is why in-process
   openers are refused by a registry first. It does not fence shared-storage double mounts (safety SL M9)
 - A transfer out reads a store's state (`readStoreState`, which leaves it live) and removes it with
   `deleteTransactions` only once its `crl_save.log` is durable: entries leave the log only through a written deletion
+- `dropStore` is one CRL-thread request (`DropStore`): it deletes what the store holds when processed, so every
+  earlier save is dropped and no later one (safety F12). Its transaction deletions, like a stub save's, are
+  cancellable (`LogEntry.deleteTxUnlessResaved`): a same-id save later in the same unwritten entry is written. Every
+  other deletion is final within its entry
 - Stream files are preallocated at creation (`SimpleCRL.createStreamsIfNew`, `server.FilePreallocation`): `fallocate`
   through FFM on Linux, zero-fill elsewhere or on `EOPNOTSUPP`. A CRL write never allocates, so a full device cannot
   fail one (safety F7). Each file is written as `<n>.crl.tmp`, renamed, and the directory forced before the writer
@@ -45,8 +53,8 @@
   own, or its entries leave the CRL: records of stores that do not load are copied forward too (safety F8)
 - Deletions are final within an entry: a save of an id the unwritten entry already deletes is skipped, and its
   handler runs once the deletion is durable. It creates no live record (`LogEntry.deletesFinally`): an unwritten one
-  would pin `oldestEntryNeeded` until recovery broke on the wrap. The exception is a deletion a stub's save made,
-  which a later save cancels
+  would pin `oldestEntryNeeded` until recovery broke on the wrap. The exceptions are deletions a stub's save or a
+  `dropStore` made, which a later save cancels
 - Applied stubs (`StoreRecoveryState`, `saveAppliedStub`/`deleteAppliedStub`): a (store, txid) entry meaning the store
   holds that transaction's update, with the transaction's start timestamp (`Stub.StaticSize`: TxId + 8 B), by which the
   store expires it (`Frontend.expireStubs`). A namespace apart from transaction state (own header counts and deletion

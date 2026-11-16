@@ -34,9 +34,12 @@ object SimpleCRL extends Logging:
 
   case class DeleteAppliedStub(storeId: StoreId, transactionId: TransactionId) extends ActionRequest
 
+  /** Drops every entry of the store held when it is processed (CrashRecoveryLog.dropStore) */
+  case class DropStore(storeId: StoreId, completionHandler: () => Unit) extends ActionRequest
+
   case class WriteComplete(serialNumber: Long) extends ActionRequest
 
-  /** Queued when the writer thread dies: the open-time re-save fails with it, and the CRL thread dies of it */
+  /** Queued when the writer thread dies: the CRL thread dies of it */
   case class WriterDied(cause: Throwable) extends ActionRequest
 
   case class Shutdown(completionHandler: () => Unit) extends ActionRequest
@@ -46,6 +49,9 @@ object SimpleCRL extends Logging:
                              ) extends ActionRequest
 
   case class GetStoresWithEntries(completion: Set[StoreId] => Unit) extends ActionRequest
+
+  /** Runs `f` on the CRL thread, in order with the other requests: for tests that hold the thread */
+  case class RunOnCrlThread(f: () => Unit) extends ActionRequest
 
 
   case class InitialCRLState(crl: SimpleCRL,
@@ -199,6 +205,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   // Reported through the CRL thread, which dies of it: the CRL has one death path
   private val writer = StreamWriter(maxSizeInBytes, files, t => ioQueue.put(WriterDied(t)))
   private var currentStream: Int = r.activeStreamId.number
+  // Replaced once the recovered records are queued, with the oldest entry they need
   private var currentLogEntry: LogEntry = new LogEntry(r.initialPreviousEntryLocation,
     r.initialNextEntrySerialNumber, r.initialOldestEntryNeeded)
   private val streams: Array[Stream] = new Array[Stream](files.length)
@@ -211,7 +218,6 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   private var queueHead: Option[Record] = None
   private var queueTail: Option[Record] = None
 
-  private var initializing = true
   private var writeInProgress = false
 
   /** Shuts the writer down, releasing the lock once it has closed the stream files and before `completionHandler` */
@@ -227,24 +233,30 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     else
       streams(tpl._1.number) = new Stream(tpl._1, writer, UUID.randomUUID(), 0)
 
-  // A failed open shuts its writer down: the caller may open the same files again
+  // The open writes nothing (crash-recovery-log F16): each recovered record keeps the locations its newest durable
+  // static record names, queued by the oldest entry holding any of them, as if this instance had written them. The
+  // last durable entry kept the ring's invariant (the stream after the active one holds nothing needed), so the next
+  // rotation's copy-forward finds and moves them as the instance before the crash would have. A failed open shuts
+  // its writer down: the caller may open the same files again
   try
-    // Stubs first: a stub's save replaces a transaction's state of the same id, and both may be live
-    r.appliedStubs.foreach((id, start) => onSaveAppliedStub(id.storeId, id.transactionId, start, () => ()))
-    r.trsList.foreach(trs => onSaveTransaction(trs.txd.transactionId, trs, () => ()))
-
-    if !currentLogEntry.isEmpty then
-      writeCurrentLogEntry()
-      ioQueue.take() match
-        case WriterDied(t) => throw t
-        case event => ioQueue.put(event) // The WriteComplete, for the CRL thread
+    val recoveredTxs = r.txs.map: t =>
+      (new Tx(t.id, t.state, Some(t.txdLocation), t.updateLocations), t.entrySerialNumber)
+    val recoveredStubs = r.stubs.map: s =>
+      val stub = new Stub(s.id, s.start)
+      stub.anchor = Some(s.anchor)
+      (stub, s.entrySerialNumber)
+    (recoveredTxs ++ recoveredStubs).sortBy(_._2).foreach: (record, serial) =>
+      record match
+        case tx: Tx => transactions += (tx.id -> tx)
+        case stub: Stub => stubs += (stub.id -> stub)
+      addToQueueHead(record, serial)
+    currentLogEntry = new LogEntry(r.initialPreviousEntryLocation, r.initialNextEntrySerialNumber,
+      oldestEntryNeeded.max(r.initialOldestEntryNeeded))
   catch case t: Throwable =>
     val closed = new CountDownLatch(1)
     shutdownWriter(() => closed.countDown())
     closed.await()
     throw t
-
-  initializing = false
 
   override val recoveredBytesByStore: Map[StoreId, Long] =
     val byStore = transactions.valuesIterator.map(tx => tx.id.storeId -> CrlAdmission.recoveredBytes(tx.state)) ++
@@ -306,7 +318,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     case Some(lc) => lc.entrySerialNumber
 
   private def startWrite(): Unit =
-    if !initializing && !writeInProgress && !currentLogEntry.isEmpty then
+    if !writeInProgress && !currentLogEntry.isEmpty then
       writeCurrentLogEntry()
 
   private def writeCurrentLogEntry(): Unit =
@@ -353,21 +365,14 @@ class SimpleCRL private (val maxSizeInBytes: Long,
         case DeleteTransaction(storeId, transactionId) => onDeleteTransaction(storeId, transactionId)
 
         case DeleteTransactions(storeId, transactionIds, completionHandler) =>
-          if transactionIds.isEmpty then
-            completionHandler()
-          else
-            // All in the current entry, with the handler, before its write starts: the handler then runs once
-            // every deletion is durable
-            transactionIds.foreach: transactionId =>
-              val txid = TxId(storeId, transactionId)
-              currentLogEntry.deleteTx(txid)
-              transactions.get(txid).foreach(tx => removeFromQueue(tx))
-              transactions -= txid
-              currentLogEntry.deleteStub(txid)
-              stubs.get(txid).foreach(stub => removeFromQueue(stub))
-              stubs -= txid
-            currentLogEntry.addCompletionHandler(completionHandler)
-            startWrite()
+          onDeleteTransactions(storeId, transactionIds, resavable = false, completionHandler)
+
+        case DropStore(storeId, completionHandler) =>
+          // Read and deleted in one step: what any earlier request saved is dropped, nothing a later one saves
+          // (crash-recovery-log F12). A save in this same entry cancels the deletion, as it is the store loaded again
+          val ids = (transactions.keysIterator ++ stubs.keysIterator).filter(_.storeId == storeId)
+            .map(_.transactionId).toList.distinct
+          onDeleteTransactions(storeId, ids, resavable = true, completionHandler)
 
         case SaveAppliedStub(storeId, transactionId, start, completionHandler) =>
           onSaveAppliedStub(storeId, transactionId, start, completionHandler)
@@ -388,9 +393,33 @@ class SimpleCRL private (val maxSizeInBytes: Long,
         case GetStoresWithEntries(completion) =>
           completion((transactions.keysIterator ++ stubs.keysIterator).map(_.storeId).toSet)
 
+        case RunOnCrlThread(f) => f()
+
         case Shutdown(completionHandler) =>
           shutdownWriter(completionHandler)
           return
+
+  /** All in the current entry, with the handler, before its write starts: the handler then runs once every deletion is
+    * durable. `resavable` deletions are cancelled by a save of the same id later in the entry
+    * (LogEntry.deleteTxUnlessResaved) */
+  private def onDeleteTransactions(storeId: StoreId, transactionIds: List[TransactionId], resavable: Boolean,
+                                   completionHandler: () => Unit): Unit =
+    if transactionIds.isEmpty then
+      completionHandler()
+    else
+      transactionIds.foreach: transactionId =>
+        val txid = TxId(storeId, transactionId)
+        if resavable then
+          currentLogEntry.deleteTxUnlessResaved(txid)
+        else
+          currentLogEntry.deleteTx(txid)
+        transactions.get(txid).foreach(tx => removeFromQueue(tx))
+        transactions -= txid
+        currentLogEntry.deleteStub(txid)
+        stubs.get(txid).foreach(stub => removeFromQueue(stub))
+        stubs -= txid
+      currentLogEntry.addCompletionHandler(completionHandler)
+      startWrite()
 
   private def moveToQueueHead(lc: Record): Unit =
     lc.clearDynamicData()
@@ -412,11 +441,12 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     lc.prev = None
     lc.next = None
 
-  private def addToQueueHead(lc: Record): Unit =
+  /** Queued by `entrySerialNumber`, the entry holding its oldest data: the current one, unless recovered */
+  private def addToQueueHead(lc: Record, entrySerialNumber: Long = currentLogEntry.entrySerialNumber): Unit =
     lc.next = None
     lc.prev = queueHead
     queueHead.foreach(_.next = Some(lc))
-    lc.entrySerialNumber = currentLogEntry.entrySerialNumber
+    lc.entrySerialNumber = entrySerialNumber
     queueHead = Some(lc)
     if queueTail.isEmpty then
       queueTail = Some(lc)
@@ -437,7 +467,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     transactions.get(txid).foreach: tx =>
       removeFromQueue(tx)
       transactions -= txid
-      currentLogEntry.deleteTxForStub(txid)
+      currentLogEntry.deleteTxUnlessResaved(txid)
     val stub = stubs.get(txid) match
       case Some(stub) => stub
       case None =>
@@ -528,6 +558,10 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
     tracked(p => GetRecoveryState(storeId, state => p.trySuccess(state)))
 
+  /** One request on the CRL thread, so it drops exactly what was saved before it (crash-recovery-log F12) */
+  override def dropStore(storeId: StoreId): Future[Unit] =
+    tracked(p => DropStore(storeId, () => p.trySuccess(())))
+
   override def storesWithEntries(): Future[Set[StoreId]] =
     tracked(p => GetStoresWithEntries(stores => p.trySuccess(stores)))
 
@@ -541,6 +575,9 @@ class SimpleCRL private (val maxSizeInBytes: Long,
       Future.sequence(state.transactions.map: trs =>
         tracked[Unit](p => SaveTransaction(trs.txd.transactionId, trs, () => p.trySuccess(())))
       ).map(_ => ())
+
+  /** Tests only: runs `f` on the CRL thread once every request queued before it is processed */
+  private[simple] def runOnCrlThread(f: () => Unit): Unit = ioQueue.put(RunOnCrlThread(f))
 
   override def failed: Future[Throwable] = death.future
 

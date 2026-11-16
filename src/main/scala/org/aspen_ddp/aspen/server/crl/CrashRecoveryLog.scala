@@ -187,8 +187,8 @@ trait CrashRecoveryLog {
     * whose state is discarded (it is rebuilt), or no longer on the device: the caller must already have made it
     * unservable (`rebuild-required`) or know it is not here. Only the entries held when it is called are dropped:
     * entries saved after the call, by the store loaded again (transferred back), are kept, however long the drop
-    * takes. The default keeps that by reading through readStoreState, which a CRL must answer in order with its
-    * saves. */
+    * takes. The default reads through readStoreState and then deletes, for CRLs that keep nothing on disk: a same-id
+    * save between the two would be deleted. SimpleCRL drops in one request on its thread (crash-recovery-log F12). */
   def dropStore(storeId: StoreId): Future[Unit] =
     readStoreState(storeId).flatMap(state => deleteTransactions(storeId, state.entryIds))(
       using scala.concurrent.ExecutionContext.parasitic)

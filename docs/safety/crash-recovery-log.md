@@ -242,8 +242,7 @@ is never recovered as a transaction: the Frontend keeps the stub txids as a set 
   `oldestEntryNeeded` back like a long-lived transaction.
 - **Recovery.** Entries are read newest first; a stub is live unless a newer or same-entry stub deletion names it
   (`LogEntry.loadStaticEntryContent`). An entry never holds a stub and its deletion (`addStub`/`deleteStub`). The
-  open-time re-save writes stubs before transactions, so a re-saved stub cannot delete a re-saved transaction of the
-  same id (`SimpleCRL.scala:153`).
+  open keeps each stub's anchor as recovery found it (the newest entry holding it) and writes nothing (F16).
 - **Admission.** Each stub is charged `CrlAdmission.AppliedStubBytes` (33) without a check, and released when dropped;
   a closing store retains the charge (section 6).
 - **Lifetime.** Dropped by the store's repair scan with its UnackedCommits entry, or on the next scan once no entry
@@ -412,11 +411,15 @@ where the "current UUID" of a file is read from its first 16 bytes (`StreamReade
 stream gets a new UUID with its first new entry, which is what makes all older entries in that file unreadable.
 
 (addendum) Applied stubs are recovered apart from transactions (`Recovery.Result.appliedStubs`) with the same
-newest-first rule against stub deletions, and are re-saved first at open (`SimpleCRL.scala:153`).
+newest-first rule against stub deletions, each with the anchor of the newest entry holding it.
 
-After recovery the CRL constructor **re-saves every recovered transaction** into the active stream
-(`SimpleCRL.scala:132-137`), waiting for the write. Every open therefore appends a full copy of the live set (up to
-half a stream), and may itself rotate and recycle. It does not wait for store recovery.
+After recovery the CRL constructor **writes nothing** (since 2026-11-15, F16). Each recovered record keeps the
+locations its newest durable static record names (`Recovery.RecoveredTx` / `RecoveredStub`), and is queued by the
+serial of the oldest verified entry holding any of them, as if this instance had written them. The last durable entry
+kept the ring invariant (the stream after the active one holds nothing needed; a torn rotation leaves the stream
+before it active, where it still holds), so the next rotation's copy-forward finds and moves them as the instance
+before the crash would have. Before the fix, every open appended a full copy of the live set (up to half a stream),
+and could itself rotate.
 
 ### 5.7 Recycling (compaction) strategy, restated as an argument
 
@@ -615,8 +618,8 @@ no wrong state is recovered, assuming A1-A6.
 | 10.9 | Crash during transfer-out, before `crl_save.log` durable | See below | Safe |
 | 10.10 | Crash during transfer-out, after `crl_save.log` durable | See below | Safe |
 | 10.11 | Crash between `dropStore` and directory removal | See below | Safe |
-| 10.12 | Stores sharing a CRL, one rebuilt | See below | Safe except F12 (F8 fixed) |
-| 10.13 | Crash during recovery's re-save | See below | Safe (F3 fixed) |
+| 10.12 | Stores sharing a CRL, one rebuilt | See below | Safe (F8, F12 fixed) |
+| 10.13 | Crash during recovery's re-save | See below | Gone: the open writes nothing (F16 fixed) |
 | 10.14 | CRL files unrecoverable at open | See below | Safe for the CRL; transient errors retried (F6) |
 | 10.15 | Sizing mismatch | See below | Safe for state, destructive (F6) |
 | 10.16 | A completion handler throws | See below | State safe; device stops |
@@ -679,7 +682,7 @@ consistent post-crash CRL, which is what makes adoption possible.
 
 **10.8 Adoption by another host.** The adopter does not open the CRL on its own initiative: `tryAdoptDevice` requires
 `<device>/crl` and a directory for every Offline/Active store, commits an ownership transaction, then loads the device
-(`DeviceDiscovery.scala:314-` and `openDeviceCrl`), which runs the recovery of 5.6 and re-saves the live set. Safe
+(`DeviceDiscovery.scala:314-` and `openDeviceCrl`), which runs the recovery of 5.6 (it writes nothing). Safe
 under A3: there is no fencing and no file lock. A running old host relinquishes the device when it sees the tree name
 another owner (`DeviceShutdown.relinquishDevice`, `DeviceShutdown.scala:242`) but until it does it may still write if
 the drive is reachable by both (not defended, by decision). A device with `transferring-out` and no valid
@@ -709,14 +712,14 @@ before the drop is durable leaves the entries live and the marker present, so th
 
 **10.12 Several stores share a CRL; one is rebuilt.** The rebuilt store's records are deleted through the same ring in
 one entry; the others' records are untouched. A late save for the same StoreId after the drop (store loaded again) is
-kept, by design (C14). The one hazard is a same-txid re-save racing the drop's delete, which removes it (F12). The
+kept, by design (C14), even a same-txid save landing in the drop's own entry: `dropStore` is one CRL-thread request
+whose deletions a later save cancels (F12 fixed 2026-11-15). The
 rebuilt store comes back as a fresh StoreId-identical store with no Paxos memory; whether that is safe is a property of
 the rebuild process (F18).
 
-**10.13 Crash during recovery's re-save.** The constructor appends a full copy of the live set before the CRL accepts
-requests. A torn append is ignored like any torn append (10.1); the old entries are still the recovered prefix. If that
-append does not fit and rotates, the F3 hazard applies to the open itself, and repeated crashes (a crash loop) rotate
-the ring at the rate of the live set size.
+**10.13 Crash during recovery's re-save.** No longer arises (F16 fixed 2026-11-15): the open writes nothing, so a
+crash loop leaves the files as they were. Before the fix the constructor appended a full copy of the live set, and a
+crash loop rotated the ring at the rate of the live set size.
 
 **10.14 CRL files unrecoverable.** `openCRL` throws (`BrokenEntryChain`, `CorruptedEntry`, I/O error, anything).
 Since the F6 fix an I/O or VM error is first retried on the next scans, the device unloaded meanwhile; after
@@ -782,9 +785,9 @@ section 2. Findings it touches:
 | F4 | unchanged (exception added by design) | A save after an ordinary delete in the same entry is still dropped; a save after a *stub-made* deletion cancels it and is written beside the stub (`stubReplaced`, fix round 1 of Task 2) | `LogEntry.scala:48-84` |
 | F5 | unchanged (scope extended) | Stub TxIds are as unchecksummed as everything else; a corrupted TxId would make a store skip one transaction's apply, or keep a stray stub that the scan drops | `LogEntry.scala:223-250` |
 | F8 | **narrowed** | Stubs are charged without a check, so they count toward the live bound; the gaps listed remain for transactions | `Frontend.scala:395-415` |
-| F12 | unchanged | `dropStore` lists stubs through the same `readStoreState` and deletes them with the transactions; the same-txid race applies to a stub saved between the read and the delete | `CrashRecoveryLog.scala:187-190` |
+| F12 | **FIXED** 2026-11-15 | `dropStore` is one CRL-thread request, transactions and stubs alike | `SimpleCRL.scala` |
 | F13 | unchanged | The stub replaces the record at the point the deletion would run; a crash before it is durable recovers the record, as before | `Frontend.scala:668-674` |
-| F16 | unchanged (load larger) | Every open also re-saves every live stub | `SimpleCRL.scala:153` |
+| F16 | **FIXED** 2026-11-15 | The open writes nothing; stubs keep their recovered anchors | `SimpleCRL.scala` |
 
 ### New findings from the addendum refresh (2026-11-10)
 
@@ -1128,6 +1131,15 @@ stores.
 
 ### F12. `dropStore` can delete a same-txid re-save made after it read the list (low confidence; narrow)
 
+> **FIXED (2026-11-15, Todo 5.6).** `SimpleCRL.dropStore` is one CRL-thread request (`DropStore`): it deletes every
+> transaction and stub of the store held when it is processed, so the queue's order makes "held when called" exact.
+> Its transaction deletions are cancellable (`LogEntry.deleteTxUnlessResaved`, formerly the stub-only
+> `deleteTxForStub`): a save of the same id landing in the drop's own unwritten entry (the store loaded again) is
+> written, where a final deletion would have skipped it. Stub deletions were already cancelled by a later stub save.
+> Tests: SimpleCRLSuite "dropStore keeps a same-id save queued after it", "... that lands in the entry holding its
+> deletion" (both fail on the read-then-delete default, the second also with final deletions). The trait default
+> keeps the read-then-delete for CRLs that keep nothing on disk.
+
 **Verification: PLAUSIBLE-low.** `CrashRecoveryLog.dropStore` (`CrashRecoveryLog.scala:159-162`) reads then queues the delete from a parasitic callback on the CRL thread, so any `SaveTransaction` already queued for the same txid lands between them and is deleted. Needs a store of that id loaded and saving during a drop. Fix sketch: a CRL-side `DropStore` request that deletes everything of the store present when it is processed on the CRL thread (atomic with the read).
 
 The default `dropStore` is `readStoreState` followed by `deleteTransactions(ids)` (`CrashRecoveryLog.scala:159-162`).
@@ -1190,6 +1202,17 @@ frees space. The design explicitly decided "No transaction is exempt" (2026-11-0
 argument is not in the spec; it deserves one.
 
 ### F16. Every open rewrites the full live set and every crash loop rotates the ring (medium confidence; amplifies F3 and F8)
+
+> **FIXED (2026-11-15, Todo 5.6).** The open writes nothing. Recovery returns each live record with the locations its
+> newest static record names and the serial of the oldest verified entry holding any of them (a stub: its anchor in
+> the newest entry holding it); the constructor queues them in serial order, as if it had written them, and the next
+> rotation copies them forward from there (5.6). Tests: SimpleCRLSuite "An open writes nothing: repeated reopens
+> leave every stream file unchanged ...", "Records an open recovers are copied forward by later rotations",
+> "... reopened after every save", "An open of a CRL whose live set is more than a stream recovers it without
+> writing" (an over-full live set no longer makes the device unopenable; its next rotation hits the
+> `Stream.writeEntry` backstop, which admission keeps out of reach). **Residual:** recovery still reads the walked
+> entries on the host control thread (Backlog, "Device CRL recovery runs on the host control thread"), but no longer
+> writes there.
 
 **Verification: CONFIRMED (code `SimpleCRL.scala:132-137`), severity amplifier.** It makes F1(a) and F2 apply to every start, not only to rotations.
 

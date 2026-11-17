@@ -2250,6 +2250,46 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         TransactionDisposition.VoteCommit
     }
 
+  // A blind key write passes its apply re-check after it applied, so a recovered one applies again: its Insert, equal
+  // to the entry it wrote, must keep the lock a later recovered vote holds on the key
+  for order <- List("earlier first", "later first") do
+    test(s"a recovered blind insert applied again keeps the later recovered vote's key lock ($order)") {
+      val backend = new MapBackend(storeId)
+      val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+      val revA = ObjectRevision(txid1)
+      val tsA = HLCTimestamp(100L << 16)
+      // txid1, a MayExist insert of k(1), applied and persisted: k(1) carries its revision and timestamp
+      val contents = Map(k(1) -> new ValueState(Value(Array[Byte](1)), revA, tsA, None))
+      val applied = new ObjectState(oid2, Metadata(rev0, ObjectRefcount(1, 1), tsA), ObjectType.KeyValue,
+        KVObjectState.encode(None, None, None, None, contents))
+      backend.bootstrapAllocate(oid2, applied.objectType, applied.metadata, applied.data)
+      cache.insert(applied)
+      def insert(v: Byte) = KeyValueOperation.encode(List(new Insert(k(1), Array[Byte](v))), ida)(0)
+      def checked(txid: TransactionId) = lockTxd(txid, List(KeyValueUpdate(kvPtr, None, None,
+        List(KeyValueUpdate.KeyRevision(k(1), revA)), pinned = true)))
+      val blind = lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.MayExist(k(1))))))
+        .copy(startTimestamp = tsA)
+      def vote(t: TransactionDescription, v: Byte) = TransactionRecoveryState(storeId, t.serialize(),
+        List(ObjectUpdate(oid2, insert(v))), TransactionDisposition.VoteCommit, TransactionStatus.Unresolved,
+        PersistentState.initial)
+      val votes = List(vote(blind, 1), vote(checked(txid2).copy(startTimestamp = HLCTimestamp(200L << 16)), 2))
+      val crl = new TestCrl:
+        override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+          if order == "earlier first" then votes else votes.reverse
+      val lookup = new ManualLookup
+      val net = new TestNet
+      val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
+        unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
+      lookup.frontend = Some(frontend)
+      backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+
+      resolve(frontend, net, txid1, committed = true)
+      cache.get(oid2).get.lockedWriteTransactions shouldBe Set(txid2)
+      val r = prepare(frontend, net, checked(txid3), insert(3))
+      r.disposition shouldBe TransactionDisposition.VoteAbort
+      r.collisions shouldBe List(txid2)
+    }
+
   test("a recovered commit vote answers a driver prepare with its vote") {
     val (frontend, net) = recoveredFrontend(TransactionStatus.Unresolved)
     frontend.receiveTransactionMessage(mkPrepare(lockTxd(txid1, List(overwrite(op1))), fromClient = false))

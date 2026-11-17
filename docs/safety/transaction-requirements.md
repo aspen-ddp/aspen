@@ -109,8 +109,8 @@ branch of `RequirementsChecker.check`:
 `KVWrites.from` decodes each KV update's writes in `Tx.lock` and keeps them in `Tx.lockedWrites`, so `unlock` releases
 exactly what `lock` took even if the data is later dropped. An undecodable update is skipped there (its check already
 failed). Keys compare by content (`common/objects/Key`). `unlock` releases a lock only if this transaction still holds
-it: an applied Insert replaces a key's `ValueState`, dropping any lock on it, and another transaction may have locked
-it since.
+it: an applied Delete removes a key with any lock on it, and another transaction may have locked the key since. An
+applied Insert keeps the lock of the `ValueState` it replaces.
 
 ### 2.3 How a KV update is applied, and what it leaves
 
@@ -587,8 +587,11 @@ device is rebuilt and its votes are lost (systemic-loss-protection.md, rebuild-p
 after A's commit persisted (R9); A's CRL state stays until its `TxFinalized`. Both re-take their locks in load-completion order, which is not controlled (CRL record order
 is no guide either: a re-save of A moves it). Whichever takes a shared slot second displaces the first, which keeps
 its hold (section 3), so A's release at its resolution leaves B locked, whichever order they loaded in. A's re-check
-finds its update already applied (`appliedBy`), so it neither applies nor quarantines, and no Insert of A replaces
-a key's `ValueState` (which would drop a K lock) under B.
+fails where its update was chained (a revision, refcount or checked key requirement): `appliedBy` then finds the
+update applied, so it neither applies nor quarantines. A blind key write (an Insert with `MayExist` or no requirement
+on its key) passes its re-check and applies again: its Insert ties with the entry it wrote (`insertWins`), and the
+`ValueState` it installs keeps the key's lock (`RequirementsApplyer.apply`), so B stays locked. A key Delete is never
+blind, so its re-check fails once applied and it never removes a key under B.
 
 (b) A recovered commit vote whose object data the CRL no longer holds (a re-save after `persistWithoutUpdateOf`) has a
 missing update: `MissingObjectUpdate` at the re-check, and the allocation rule of 8.5 applies.

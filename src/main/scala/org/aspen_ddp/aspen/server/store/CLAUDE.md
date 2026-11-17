@@ -21,7 +21,9 @@
 - Single-holder lock slots (X, content, present key, absent key) are taken by `RequirementsLocker.take`. A holder
   found there (only a recovered commit vote, which locks without a check, can meet one) is kept in
   `ObjectState.displacedLocks`, and `give` hands the slot back to it when the current holder releases, so two
-  recovered votes on one lock both hold it until each releases (transaction-requirements.md 10.5a)
+  recovered votes on one lock both hold it until each releases (transaction-requirements.md 10.5a). An applied
+  Insert keeps the lock of the key entry it replaces, so a recovered blind write applying again does not unlock a
+  later vote on the key
 - Exclusive preference window (`SharedRevisionLock.ExclusivePreferenceWindow`, 250 ms, `ObjectState.exclusiveWaitUntil`):
   a writer that collides with held shared locks makes new shared lockers collide meanwhile, so it gets in on its
   retry. `RequirementsChecker.check` opens it only for a transaction blocked by nothing but shared holders at this

@@ -181,8 +181,8 @@ object RequirementsLocker extends Logging {
 
   /** Releases the locks taken by lock(). Only locks still held by this transaction are released, and a slot it
     * took from another holder goes back to that holder (`give`). A committed transaction is applied regardless of
-    * other transactions' locks, and its Insert replaces a key's ValueState, dropping the lock on it, so another
-    * transaction may since have locked the key.
+    * other transactions' locks, and its Delete removes a key with the lock on it, so another transaction may since
+    * have locked the key. An applied Insert keeps the replaced ValueState's lock (RequirementsApplyer.apply).
     */
   def unlock(transactionId: TransactionId,
              requirements: List[TransactionRequirement],

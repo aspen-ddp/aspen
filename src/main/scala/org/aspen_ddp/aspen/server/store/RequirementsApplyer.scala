@@ -137,9 +137,13 @@ object RequirementsApplyer extends Logging {
                 case _: DeleteLeft => kvs.left = None
                 case _: DeleteRight => kvs.right = None
                 case o: Insert =>
-                  // Last writer wins: an Insert a later write of the key superseded leaves the key alone
-                  if KVObjectState.insertWins(kvs.content.get(o.key), ObjectRevision(transactionId), timestamp) then
-                    val vs = new ValueState(Value(o.value), ObjectRevision(transactionId), timestamp, None)
+                  // Last writer wins: an Insert a later write of the key superseded leaves the key alone. The new
+                  // entry keeps the key's lock: an apply ignores other transactions' locks, and a recovered blind
+                  // write applying again (its re-check passes) must not unlock a later vote on the key
+                  val existing = kvs.content.get(o.key)
+                  if KVObjectState.insertWins(existing, ObjectRevision(transactionId), timestamp) then
+                    val vs = new ValueState(Value(o.value), ObjectRevision(transactionId), timestamp,
+                      existing.flatMap(_.lockedToTransaction))
                     kvs.content += (o.key -> vs)
                 case o: Delete => kvs.content -= o.key
               }

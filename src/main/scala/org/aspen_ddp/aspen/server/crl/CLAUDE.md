@@ -19,6 +19,10 @@
   default changes are harmless. `SimpleCRL.apply` throws `CrlSizingMismatch` for stream files without a readable
   sizing file or of another count or size than recorded. That is damage or a hand edit, never declared a lost CRL:
   the device is refused until repaired (`DeviceDiscovery.openDeviceCrl`)
+- `openCRL`'s `holdsStores` (`SimpleCRL.apply`'s `mustExist`): the device holds stores, so its CRL must exist. With no
+  stream files (only `sizing` or `.crl.tmp` files at most) the open throws `CrlMissing`, writing nothing, and the
+  caller declares the CRL lost instead of creating an empty one under live stores. So anything that creates
+  stores on a device not yet loaded (`Main.bootstrap`) creates its CRL first
 - Each entry header carries CRC32Cs of the header and of the body (`LogEntry`). Recovery drops a torn newest entry
   (only the write in flight at a crash can be torn) and throws `CrlCorrupt` for any other failed checksum, or when an
   intact entry newer than the last one found exists in that stream or the next. Data is read only from entries

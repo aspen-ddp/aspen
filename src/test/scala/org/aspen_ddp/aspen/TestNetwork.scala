@@ -159,7 +159,7 @@ object TestNetwork {
   /** Opens a fresh no-op CRL for each device, creating the crl directory a real one would, so discovery does not
     * take the device's stores to have lost theirs */
   object TestCRL extends CrashRecoveryLogFactory {
-    override def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+    override def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
       os.makeDir.all(CrashRecoveryLog.deviceCrlDir(devicePath))
       new TestCRL()
   }

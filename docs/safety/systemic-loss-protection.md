@@ -153,7 +153,7 @@ store directory and leaves the store offline.
 
 | ID | Trigger | Code | Immediate local effect | False positives |
 |---|---|---|---|---|
-| D1 | `<device>/crl` absent from a device that holds store directories | `DeviceDiscovery.openDeviceCrl` | marker on **every** store directory of the device; fresh empty CRL created | a partial restore or mount; a path or layout change in a release |
+| D1 | `<device>/crl` absent from, or without stream files on (`CrlMissing`), a device that holds store directories | `DeviceDiscovery.openDeviceCrl` | marker on **every** store directory of the device; an existing `crl/` renamed to `crl.lost-<uuid>`; fresh empty CRL created | a partial restore or mount (one that copies directories but not the large stream files included); a path or layout change in a release |
 | D2 | CRL open throws a non-transient error (`CrlCorrupt`, `BrokenEntryChain`, anything not `isTransient`), or a transient one `CrlOpenAttempts` times in a row, on a device that holds stores | `DeviceDiscovery.openDeviceCrl` | as D1, and `crl/` renamed to `crl.lost-<uuid>` | a CRL format or recovery change; a bug in the CRL writer that the next recovery rejects; a persistent I/O condition (EMFILE in a restart storm, a flaky controller) lasting three scans |
 | D3 | `crl_save.log` present but `loadValidStoreState` rejects it (truncated, unparsable, another store's, any `Throwable`) | `StoreLoader.handleLoad` then `StoreRebuilds.crlSaveFileLost`/`retireUnserved` | closed unserved, marked, offline, device checked | a save-file format change: every store whose directory holds a save file. A crash between the save and `deleteTransactions` leaves the same entries in the device CRL, and the discard saves those |
 | D4 | Adoption: an Offline or Active store whose directory has `transferring-out` without a valid save file, or has `rebuild-required` | `DeviceDiscovery.adoptionClass` (`CrlLost`); `DeviceMetadata.adoptDevice` writes the marker in its prepare closure and the entry Rebuilding in the adoption transaction | adopted as Rebuilding | a save-file read path that fails on the adopting host's version; it inherits any false mark the previous host wrote. A marker left by an adoption transaction that does not commit states a fact about the disk and is harmless |
@@ -246,7 +246,8 @@ These are places where one software change or environmental fault produces decla
 * **SC5 Resource exhaustion at start** (file descriptors, memory, threads in a restart storm). The CRL open retries
   `isTransient` errors for three scans (about 20-30 s at the 10 s device scan) and then declares. The save-file load
   (`loadValidStoreState`) declares at once on any `Throwable`.
-* **SC6 Incomplete mount or restored backup.** `crl/` absent while store directories exist is D1, with no retry.
+* **SC6 Incomplete mount or restored backup.** `crl/` absent, or present without stream files, while store
+  directories exist is D1, with no retry.
   Absent FSIF files or a missing RocksDB `CURRENT` is D5.
 * **SC7 Operator error.** `fail-storage-device` on the wrong device, or on two devices of one pool. It is one-way and
   unguarded by design (S10).

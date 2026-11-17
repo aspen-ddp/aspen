@@ -33,13 +33,6 @@ X = cross-document-review (its section 5 lists contradictions between documents)
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.1  CRL directory without stream files opens as an empty CRL: CRL-W3                                    [S]
-     CONFIRMED. DeviceDiscovery.openDeviceCrl treats the CRL as lost only when crl/ is absent. A crl/ that lost
-     its *.crl files (operator clear, fs repair, partial restore) on a device with stores is taken as a new CRL;
-     every store loads with no promises, accepts or votes and serves as an acceptor (silent amnesia, split
-     decisions). Fix: treat crl/ without stream files on a device with store directories as lost. DeviceCrlSuite
-     test.
-
 1.2  Counted commit voter whose UnackedCommits entry has no incarnation never applies: R-W1                [S]
      CONFIRMED. A takeover driver that did not count votes writes incarnation None for stores it never heard
      from; Frontend.unackedLookupComplete treats Found(None) as not owed, so a store that cast a counted commit

@@ -277,12 +277,13 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   marked, every scan retries. A sizing mismatch is logged once; it means damage or a hand edit, never configuration.
   An `IOException`, `UncheckedIOException` or `VirtualMachineError` (`DeviceDiscovery.isTransient`) is rethrown too,
   up to `CrlOpenAttempts` (3) consecutive scans.
-- **Lost.** If `crl/` is absent from a device that holds stores (a child directory with a store `config`), or the open
-  throws anything else, or a transient error a third time in a row: every such store directory gets a durable
+- **Lost.** If `crl/` is absent from a device that holds stores (a child directory with a store `config`), or holds no
+  stream files there (`openCRL` is passed `holdsStores` and throws `CrlMissing` before writing anything: stores exist
+  only on a device whose CRL was opened, so a `crl/` emptied by hand, a file system repair or a partial restore is a
+  lost CRL, never a new one), or the open throws anything else, or a transient error a third time in a row: every such store directory gets a durable
   `rebuild-required` marker, one by one; `crl/` is moved to `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the
   device directory is forced and a fresh CRL is opened. `CrlCorrupt` is logged under its own cause. The reconcile then
-  flips each store to Rebuilding. A device without stores simply has its CRL created. A `crl/` that exists but holds
-  no stream files is opened as a new, empty CRL even when the device holds stores (CRL-W3).
+  flips each store to Rebuilding. A device without stores simply has its CRL created.
 - **Failed.** A CRL whose thread dies (5.10) completes `failed`; `DeviceShutdown.crlFailed` disowns the directory,
   closes the stores, gossips them offline and unloads the device until the host restarts. It is neither reloaded
   before that (a reopen loop would reach `CrlOpenAttempts`) nor marked Failed in the tree.
@@ -696,7 +697,8 @@ systems (A7), where an `ENOSPC` kills the CRL (10.7). Freezing the device's writ
 
 **10.17 Crash during CRL creation.** `sizing` is written durably first; stream files go through `.tmp` and rename, and
 the writer starts only after the directory is forced. A `.tmp` at open restarts the creation; a `sizing` with no
-stream files creates them. No entry was written in either case.
+stream files creates them. No entry was written in either case, and no store can exist on the device yet: on a device
+holding stores either state is a lost CRL (`CrlMissing`, 4).
 
 ---
 
@@ -763,21 +765,6 @@ data) by a fixed fraction of the stream that admission's headroom accounts for, 
 vote abort with a named `RequirementError` instead of admitting; expose the bound to clients (pool or system
 metadata) so `TransactionBuilder` fails early. Add a SimpleCRL test that an oversized save is refused, not fatal.
 Effort: M   Priority: 4
-
-### CRL-W3. A device whose `crl/` lost its stream files opens with an empty CRL (CONFIRMED; split decisions)
-Mechanism: `DeviceDiscovery.openDeviceCrl` treats the CRL as lost only when `crl/` is absent from a device with
-stores. `SimpleCRL.recordedSizing` treats a directory with no stream files as a new CRL (no `sizing`) or a creation
-that crashed before its streams (`sizing` present), and `createStreamsIfNew` creates empty streams; recovery returns
-nothing. No check compares this with the device holding stores, although stores can only exist on a device whose CRL
-has been opened.
-Trigger / scenario: the stream files are removed while the directory survives: an operator clearing `crl/*.crl`, a
-file system repair that drops the directory's entries, a restore that copies directories but not the large files.
-(A partial loss of stream files is caught: `checkSizing` throws `CrlSizingMismatch`.)
-Consequence: every store on the device loads with no Paxos promises, accepts, votes or unapplied commit data and
-serves as an acceptor: silent amnesia, the very case the lost-CRL rule exists to turn into rebuilds.
-Suggested fix: in `openDeviceCrl` (or by passing "device holds stores" to the factory), treat a `crl/` without stream
-files on a device with store directories as lost, like a missing directory. Add a DeviceCrlSuite test.
-Effort: S   Priority: 1
 
 ### CRL-W4. Completion handlers run on the writer thread before the next write is issued (PLAUSIBLE; performance)
 Mechanism: `Stream.writeEntry`'s callback runs `entry.runCompletionHandlers()` and only then queues `WriteComplete`;

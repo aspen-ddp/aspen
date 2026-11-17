@@ -1719,11 +1719,11 @@ object Main {
     // unload is harmless here.
     val openedCrls = AtomicReference[Map[os.Path, CrashRecoveryLog]](Map())
     val crlFactory = new CrashRecoveryLogFactory:
-      def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
         val crl = SimpleCRL.DeviceFactory(t =>
           scribe.error(s"The CRL thread of storage device ${config.storageDeviceId} at $devicePath died. " +
                        s"The device is unloaded until the host restarts", t)
-        ).openCRL(devicePath, config)
+        ).openCRL(devicePath, config, holdsStores)
         openedCrls.updateAndGet(_ + (devicePath -> crl))
         crl
 
@@ -1883,6 +1883,9 @@ object Main {
     os.write(bootstrapDevDir / StorageDeviceConfig.configFilename, storageDevConfig.yamlConfig)
     DeviceMarkers.writeOwningHost(bootstrapDevDir, bootstrapHostId)
     CrashRecoveryLog.createDeviceCrlDir(bootstrapDevDir)
+    // The CRL is created before any store: a device holding stores whose CRL has no stream files has lost it
+    // (CrlMissing)
+    SimpleCRL.DeviceFactory().openCRL(bootstrapDevDir, storageDevConfig, holdsStores = false).shutdown()
 
     val bootstrapStores =
       for

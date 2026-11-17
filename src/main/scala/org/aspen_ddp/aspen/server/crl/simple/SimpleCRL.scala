@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlFailed, CrlLocked,
-  CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
+  CrlMissing, CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
 import scribe.Logging
 
 import java.util.UUID
@@ -65,10 +65,11 @@ object SimpleCRL extends Logging:
    *  sized by the device's config; an existing one keeps the sizing it recorded (SizingFile). `onThreadDeath` is
    *  called if a CRL thread dies: that device's transactions stop. */
   case class DeviceFactory(onThreadDeath: Throwable => Unit = _ => ()) extends CrashRecoveryLogFactory:
-    def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+    def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
       val dir = CrashRecoveryLog.deviceCrlDir(devicePath)
       os.makeDir.all(dir)
-      SimpleCRL(dir, config.crlNumStreams, config.crlFileSizeMb * 1024L * 1024L, onThreadDeath).crl
+      SimpleCRL(dir, config.crlNumStreams, config.crlFileSizeMb * 1024L * 1024L, onThreadDeath,
+        mustExist = holdsStores).crl
 
   /** The CRL's own record of its sizing, written durably when it is created, before any stream file. The sizing is
    *  fixed then: an existing CRL is always opened with the sizing it recorded, whatever it is asked for, so a change
@@ -99,14 +100,20 @@ object SimpleCRL extends Logging:
     *                           than the recorded count of the recorded size each. Recovering with another sizing would
     *                           silently ignore files holding live entries, so the CRL is not opened. Nothing in
     *                           `streamsDir` is written then.
+    * @param mustExist the CRL must already exist (its device holds stores). With no stream files in `streamsDir`
+    *                  (only a SizingFile or unfinished `.crl.tmp` files at most), CrlMissing is thrown instead of a
+    *                  new CRL being created, and nothing in `streamsDir` is written.
     */
   def apply(streamsDir: os.Path,
             numStreams: Int,
             maxSizeInBytes: Long,
-            onThreadDeath: Throwable => Unit = _ => ()): InitialCRLState =
+            onThreadDeath: Throwable => Unit = _ => (),
+            mustExist: Boolean = false): InitialCRLState =
     // Held from before the files are read until the writer has closed them. A failed open releases it
     val lock = CrlLock.acquire(streamsDir)
     try
+      if mustExist && streamFiles(streamsDir).isEmpty then
+        throw CrlMissing(streamsDir)
       val sizing = recordedSizing(streamsDir, Sizing(numStreams, maxSizeInBytes))
       val files: List[(StreamId, os.Path)] = (0 until sizing.numStreams).map(i =>
         (StreamId(i), streamsDir / s"$i.crl")

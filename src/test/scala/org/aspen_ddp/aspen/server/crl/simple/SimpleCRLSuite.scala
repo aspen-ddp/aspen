@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation, Tx}
 import org.aspen_ddp.aspen.server.FilePreallocationSuite
 import org.aspen_ddp.aspen.server.FilePreallocation
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlFailed, CrlLocked, CrlSizingMismatch, StoreRecoveryState,
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlFailed, CrlLocked, CrlMissing, CrlSizingMismatch, StoreRecoveryState,
   TransactionRecoveryState}
 
 import java.nio.ByteBuffer
@@ -705,6 +705,25 @@ class SimpleCRLSuite extends FileBasedTests {
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
     // Refused for its sizing again, not for a lock still held
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+  }
+
+  test("A CRL that must exist but has no stream files is missing, and nothing is written") {
+    // Never created
+    assertThrows[CrlMissing](SimpleCRL(tdir, 3, 1024 * 1024, mustExist = true))
+    assert(os.list(tdir).filter(_.last != "lock").isEmpty)
+    // Its stream files removed, its sizing left
+    SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
+    os.list(tdir).filter(_.ext == "crl").foreach(os.remove(_))
+    val remains = os.list(tdir).map(_.last).toSet
+    assertThrows[CrlMissing](SimpleCRL(tdir, 3, 1024 * 1024, mustExist = true))
+    assert(os.list(tdir).map(_.last).toSet == remains)
+    // Refused for missing again, not for a lock still held
+    assertThrows[CrlMissing](SimpleCRL(tdir, 3, 1024 * 1024, mustExist = true))
+  }
+
+  test("A CRL that must exist and does opens") {
+    SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
+    SimpleCRL(tdir, 3, 1024 * 1024, mustExist = true).crl.shutdown()
   }
 
   test("Creating a CRL records its sizing before any stream file") {

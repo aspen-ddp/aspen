@@ -112,8 +112,8 @@ private class RecordingCrlFactory(completions: ExecutionContext, gate: Option[Co
   private val inner = SimpleCRL.DeviceFactory()
   private var crls: List[RecordedCrl] = Nil
 
-  def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
-    val crl = new RecordedCrl(devicePath, inner.openCRL(devicePath, config), gate, completions)
+  def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
+    val crl = new RecordedCrl(devicePath, inner.openCRL(devicePath, config, holdsStores), gate, completions)
     synchronized { crls = crls :+ crl }
     crl
 
@@ -545,7 +545,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     val unloadedTrs = recoveryState(unloaded, TransactionId(new UUID(9, 5)), new Array[Byte](1000))
     val first = newFactory()
     val crl = first.openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
-      deviceDir / StorageDeviceConfig.configFilename))
+      deviceDir / StorageDeviceConfig.configFilename), holdsStores = false)
     val saved = Promise[Unit]()
     crl.save(txid, loadedTrs, () => ())
     crl.save(unloadedTrs.txd.transactionId, unloadedTrs, () => saved.trySuccess(()))
@@ -645,7 +645,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
   /** Gives the device an empty CRL, as one that has run before has */
   private def createCrl(deviceDir: os.Path): Unit =
     newFactory().openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
-      deviceDir / StorageDeviceConfig.configFilename)).shutdown()
+      deviceDir / StorageDeviceConfig.configFilename), holdsStores = false).shutdown()
 
   private def marker(storeDir: os.Path): os.Path = storeDir / RebuildingStore.RebuildRequiredMarkerFile
 
@@ -661,10 +661,10 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     val inner = newFactory()
     val calls = new AtomicInteger(0)
     val failingFirst = new CrashRecoveryLogFactory:
-      def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
         if calls.incrementAndGet() == 1 then
           throw Recovery.BrokenEntryChain("unrecoverable")
-        inner.openCRL(devicePath, config)
+        inner.openCRL(devicePath, config, holdsStores)
     val host = newCrlHost(hostRoot, failingFirst)
 
     Future.successful:
@@ -686,10 +686,10 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     val inner = newFactory()
     val calls = new AtomicInteger(0)
     val corruptFirst = new CrashRecoveryLogFactory:
-      def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
         if calls.incrementAndGet() == 1 then
           throw CrlCorrupt("corrupt")
-        inner.openCRL(devicePath, config)
+        inner.openCRL(devicePath, config, holdsStores)
     val host = newCrlHost(hostRoot, corruptFirst)
 
     Future.successful:
@@ -707,10 +707,10 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     val inner = newFactory()
     val calls = new AtomicInteger(0)
     val failing = new CrashRecoveryLogFactory:
-      def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog =
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
         if calls.incrementAndGet() <= failures then
           throw new java.io.IOException("transient")
-        inner.openCRL(devicePath, config)
+        inner.openCRL(devicePath, config, holdsStores)
     (deviceDir, storeDir, inner, calls, newCrlHost(hostRoot, failing))
 
   atest("a transient CRL open failure leaves the stores untouched and a later scan loads the device"):
@@ -751,7 +751,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     createCrl(deviceDir)
     // A second writer of the same files: another host process, or a double mount
     val holder = newFactory().openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
-      deviceDir / StorageDeviceConfig.configFilename))
+      deviceDir / StorageDeviceConfig.configFilename), holdsStores = false)
     val factory = newFactory()
     val host = newCrlHost(hostRoot, factory)
 
@@ -785,6 +785,38 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
       os.exists(CrashRecoveryLog.deviceCrlDir(deviceDir) / "0.crl") should be(true)
 
+  /** A device holding a store whose existing CRL directory then has `remove` applied to it: the CRL is lost, its
+   *  remains kept aside, and a fresh CRL opened */
+  private def crlDirLosesFiles(remove: os.Path => Unit): Future[org.scalatest.Assertion] =
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    createCrl(deviceDir)
+    val crlDir = CrashRecoveryLog.deviceCrlDir(deviceDir)
+    remove(crlDir)
+    val remains = os.list(crlDir).map(_.last).toSet
+    val factory = newFactory()
+    val host = newCrlHost(hostRoot, factory)
+
+    Future.successful:
+      os.exists(marker(storeDir)) should be(true)
+      host.control.router.loaded.contains(storeId) should be(false)
+      val lost = os.list(deviceDir).filter(_.last.startsWith("crl.lost-"))
+      lost.size should be(1)
+      os.list(lost.head).map(_.last).toSet should be(remains)
+      os.exists(crlDir / "0.crl") should be(true)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.last
+
+  atest("a device with stores whose crl dir lost its stream files marks them rebuild-required"):
+    crlDirLosesFiles(dir => os.list(dir).filter(_.ext == "crl").foreach(os.remove(_)))
+
+  atest("a device with stores whose crl dir lost its stream files and sizing marks them rebuild-required"):
+    crlDirLosesFiles(dir => os.list(dir).filter(f => f.ext == "crl" || f.last == SimpleCRL.SizingFile)
+      .foreach(os.remove(_)))
+
+  atest("a device with stores whose crl dir holds only unfinished stream files marks them rebuild-required"):
+    crlDirLosesFiles(dir => os.list(dir).filter(_.ext == "crl").foreach(f => os.move(f, dir / s"${f.last}.tmp")))
+
   atest("a new device with no stores just creates its CRL"):
     val hostRoot = newHostDir()
     val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
@@ -817,7 +849,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
    *  them must be shut down first. */
   private def heldOnDisk(deviceDir: os.Path, sid: StoreId): Set[TransactionId] =
     val crl = newFactory().openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
-      deviceDir / StorageDeviceConfig.configFilename))
+      deviceDir / StorageDeviceConfig.configFilename), holdsStores = false)
     try held(crl, sid)
     finally crl.shutdown()
 
@@ -1116,7 +1148,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
   private def heldStubsOnDisk(deviceDir: os.Path, sid: StoreId): Set[TransactionId] =
     val crl = newFactory().openCRL(deviceDir, StorageDeviceConfig.loadStorageDeviceConfig(
-      deviceDir / StorageDeviceConfig.configFilename))
+      deviceDir / StorageDeviceConfig.configFilename), holdsStores = false)
     try crl.getAppliedStubs(sid).keySet
     finally crl.shutdown()
 

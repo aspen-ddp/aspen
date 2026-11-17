@@ -5,7 +5,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
 import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, Host, StorageDeviceConfig, StorageDeviceManager,
   StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlLocked, CrlSizingMismatch}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlLocked, CrlMissing,
+  CrlSizingMismatch}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.{Backend, StoreCreation}
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -516,8 +517,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     else
       None
 
-  /** Opens the device's CRL. It is lost when its directory is absent from a device that holds stores, or when
-   *  opening it throws anything but a transient error (DeviceDiscovery.isTransient) or a transient error
+  /** Opens the device's CRL. It is lost when its directory is absent from a device that holds stores, or holds no
+   *  stream files there (CrlMissing: stores exist only on a device whose CRL was opened), or when opening it throws
+   *  anything but a transient error (DeviceDiscovery.isTransient) or a transient error
    *  CrlOpenAttempts times in a row. The stores' transaction state was in it, so each is marked rebuild-required
    *  (the reconcile pass turns them into rebuilds), the old directory is kept aside as `crl.lost-<uuid>`, and a fresh
    *  CRL is opened. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
@@ -538,7 +540,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         true
       else
         try
-          val crl = ctx.crlFactory.openCRL(devicePath, sdCfg)
+          val crl = ctx.crlFactory.openCRL(devicePath, sdCfg, holdsStores = storeDirs.nonEmpty)
           transientCrlFailures -= devicePath
           return crl
         catch
@@ -570,6 +572,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
               case _: CrlCorrupt =>
                 logger.error(s"The CRL of storage device $devicePath is corrupt: an entry fails its checksums. Its " +
                              s"stores must be rebuilt: $t")
+              case _: CrlMissing =>
+                logger.error(s"Storage device $devicePath holds stores but its CRL directory has no stream files. " +
+                             s"Its stores must be rebuilt")
               case _ =>
                 logger.error(s"Failed to recover the CRL of storage device $devicePath. Its stores must be rebuilt: $t")
             true
@@ -577,7 +582,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     if os.exists(crlDir) then
       os.move(crlDir, devicePath / s"crl.lost-${UUID.randomUUID()}")
     DurableFiles.syncDirectory(devicePath)
-    ctx.crlFactory.openCRL(devicePath, sdCfg)
+    // A fresh CRL: the stores now marked recover nothing from it
+    ctx.crlFactory.openCRL(devicePath, sdCfg, holdsStores = false)
 
   /** The load half of tryLoadDevice, run only once the device is known to be ours. */
   private def loadOwnedDevice(storageDevicePath: os.Path,

@@ -8,9 +8,19 @@ trait CrashRecoveryLogFactory {
   /** Opens the CRL of the device at `devicePath`, recovering its existing files. Throws if they cannot be
    *  recovered (CrlCorrupt when the media returned other than what was written), with CrlLocked if another writer, in
    *  this process or another, has them open, and with CrlSizingMismatch if its files do not match the sizing the CRL
-   *  recorded when it was created. */
-  def openCRL(devicePath: os.Path, config: StorageDeviceConfig): CrashRecoveryLog
+   *  recorded when it was created.
+   *
+   *  @param holdsStores the device holds stores. Stores exist only on a device whose CRL has been opened, so its CRL
+   *                     must exist then: one with no files holding entries (none ever created, or all removed) throws
+   *                     CrlMissing instead of being created empty. */
+  def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog
 }
+
+/** Thrown by openCRL, asked to open the CRL of a device that holds stores, when the CRL has no files that could hold
+ *  entries: they were removed (by hand, a file system repair, a partial restore) or never created. The stores'
+ *  transaction state is gone, so the CRL is lost. Nothing in the CRL directory is written then. */
+class CrlMissing(crlDir: os.Path)
+  extends Exception(s"The CRL in $crlDir has no stream files, but its device holds stores")
 
 /** Thrown by openCRL when another writer, in this process or another, has the device's CRL open. The CRL is in use, not
  *  lost: the opener must leave its files alone and may retry later */

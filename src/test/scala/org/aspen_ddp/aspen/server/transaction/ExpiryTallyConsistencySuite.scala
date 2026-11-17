@@ -14,8 +14,10 @@ import org.scalatest.funsuite.AnyFunSuite
 import java.util.UUID
 
 /** Exhaustive check of ExpiryTally rules A-G over the true final states the protocol can produce: no two observers
-  * of one state decide commit and discard, and no observer commits over a chosen abort. Reported states are final (a
-  * frozen Tx's vote and accepts never change), so observers differ only in which stores are silent to them.
+  * of one state decide commit and discard, no observer commits over a chosen abort, and none commits where a
+  * conflicting transaction may have committed (some pool with fewer than `t` commit votes and `t` stores holding none
+  * of T's locks). Reported states are final (a frozen Tx's vote and accepts never change), so observers differ only
+  * in which stores are silent to them.
   *
   * The model is the true final state of each store: its vote (commit, abort, or none: it never joined T), its latest
   * accept (primary pool only), whether it was rebuilt (amnesiac), and whether it forgot T (it finalized or discarded T
@@ -129,6 +131,12 @@ class ExpiryTallyConsistencySuite extends AnyFunSuite with org.scalatest.Paralle
     private val primaryIda = cfg.txd.primaryObjectIDA
     /** At least a quorum of primary stores truly accepted abort: abort was chosen, and a client may have been told */
     val chosenAbort: Boolean = byPool.head._3.count(_.accepted.contains(false)) >= primaryIda.writeThreshold
+    /** Some pool truly had fewer than `t` commit votes and at least `t` stores that hold none of T's locks (not live
+      * commit voters: they voted abort, never joined, were rebuilt or forgot T), so a conflicting transaction may
+      * have committed there, and T's requirement may have failed */
+    val conflictPossible: Boolean = byPool.exists: (_, ida, sts) =>
+      commits(sts) < ida.writeThreshold &&
+        sts.count(st => !(st.commitVote && !st.amnesiac && !st.forgotten)) >= ida.writeThreshold
     def valid: Boolean =
       val all = byPool.flatMap(_._3)
       val accCommit = all.exists(_.accepted.contains(true))
@@ -199,6 +207,7 @@ class ExpiryTallyConsistencySuite extends AnyFunSuite with org.scalatest.Paralle
                             forgotten: Boolean): Unit = d match
     case Decision.Commit =>
       if w.chosenAbort then fail(s"Committed over a chosen abort: ${w.describe(silent)}")
+      if w.conflictPossible then fail(s"Committed though a conflicting commit was possible: ${w.describe(silent)}")
       if w.commitByAOrB(rs) && !w.commitCertain then
         fail(s"A or B committed with no commit-certain tally: ${w.describe(silent)}")
     case Decision.Discard(false) if w.commitCertain && !forgotten =>
@@ -220,7 +229,7 @@ class ExpiryTallyConsistencySuite extends AnyFunSuite with org.scalatest.Paralle
     for c <- vs.find(_._3 == Decision.Commit); x <- vs.find(_._3.isInstanceOf[Decision.Discard]) do
       fail(s"Split decision: Commit with ${w.describe(c._1)} versus ${x._3} with silent ${x._1}")
 
-  test("no two observers decide commit and discard, and none commits over a chosen abort"):
+  test("no two observers decide commit and discard, and none commits over a chosen abort or a possible conflict"):
     var checked = 0L
     worlds(configs).foreach: w =>
       val vs = views(w, forgotten = false)

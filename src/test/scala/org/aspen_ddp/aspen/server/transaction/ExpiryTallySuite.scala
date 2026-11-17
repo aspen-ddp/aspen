@@ -110,6 +110,27 @@ class ExpiryTallySuite extends AnyFunSuite with Matchers:
       secondary(0) -> holder(), secondary(1) -> holder(), secondary(2) -> holder())) shouldBe
       Decision.Hold(undecidable = true)
 
+  test("a lock-only pool's stale commit vote beside a rebuilt abort voter holds: a conflicting commit was possible"):
+    // T overwrites a Replication(3, 2) primary object and holds ExclusiveRevisionLock(Y) on a Replication(3, 2)
+    // lock-only object. T' updated Y: L1 and L2 voted commit for it, so T' committed, and T got abort votes from L1
+    // and L2 (requirement failed) and a stale commit vote from L0. L1 was rebuilt before its abort reached T's driver.
+    // L has vc + k = 2 >= t, but only one live commit voter, so the two other stores may hold no lock of T: a
+    // conflicting commit needs t = 2 of them. F's conflict argument needs vc > w - t in every referenced pool
+    val lockedSecondary = txdWith(Replication(3, 2), Map(otherPoolId -> Replication(3, 2)),
+      List(ExclusiveRevisionLock(otherPtr, rev0)))
+    ExpiryTally.decide(lockedSecondary, Map(primary(0) -> holder(), primary(1) -> holder(), primary(2) -> holder(),
+      secondary(0) -> holder(), secondary(1) -> amnesiac, secondary(2) -> holder(voted = false))) shouldBe
+      Decision.Hold(undecidable = true)
+
+  test("a lock-only primary's stale commit vote beside a rebuilt store and an abort voter holds"):
+    // The same with T's lock on the primary object: p0 voted commit (stale), p1 was rebuilt, p2 is a frozen abort
+    // voter that accepted nothing. k_p + n_p = 1 < t, but a conflicting commit was possible at p1 and p2
+    val lockedPrimary = txdWith(Replication(3, 2), Map(otherPoolId -> Replication(3, 2)),
+      List(DataUpdate(otherPtr, rev0, DataUpdateOperation.Overwrite)), primaryReq = ExclusiveRevisionLock(op1, rev0))
+    ExpiryTally.decide(lockedPrimary, Map(primary(0) -> holder(), primary(1) -> amnesiac,
+      primary(2) -> holder(voted = false), secondary(0) -> holder(), secondary(1) -> holder(),
+      secondary(2) -> holder())) shouldBe Decision.Hold(undecidable = true)
+
   test("fewer known commit votes than the write threshold with a store silent holds"):
     // Rule G: the silent stores may be commit voters (A) or abort acceptors (C)
     ExpiryTally.decide(txd, Map(primary(0) -> holder(), primary(1) -> holder(), primary(2) -> holder())) shouldBe

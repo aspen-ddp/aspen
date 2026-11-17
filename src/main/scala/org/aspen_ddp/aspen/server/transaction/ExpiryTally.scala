@@ -17,10 +17,11 @@ object ExpiryTally:
       */
     case Adopt(committed: Boolean, finalizedOrLate: Boolean)
     /** Rules A, B and F (decideUnknown): abort was never chosen and never can be (A: every pool has its write
-      * threshold of commit votes; B: an accepted commit; F: every store replied and too few are amnesiac or "unknown"
-      * to hide a chosen abort), and enough commit voters hold T's update to restore each changed object at its read threshold.
-      * T is decided committed here: applied for real and finalized, and the finalization's missed-update marks repair
-      * the stores that never applied it
+      * threshold of commit votes; B: an accepted commit; F: every store replied, too few are amnesiac or "unknown" to
+      * hide a chosen abort, and every pool has more than `w - t` live commit voters, so no conflicting transaction
+      * committed), and enough commit voters hold T's update to restore each changed object at its read threshold. T is
+      * decided committed here: applied for real and finalized, and the finalization's missed-update marks repair the
+      * stores that never applied it
       */
     case Commit
     /** Rules C, D and E (decideUnknown): an accepted abort (C), T's update can never be restored for some changed
@@ -32,7 +33,7 @@ object ExpiryTally:
     case Discard(dataLost: Boolean)
     /** Rule G: some store's state is still unknown (it is silent), or, with every store reported (`undecidable`),
       * at least the primary pool's write threshold of stores are amnesiac or answered "unknown", so they may hide a
-      * chosen abort
+      * chosen abort, or some pool has at most `w - t` commit voters, so a conflicting transaction may have committed
       */
     case Hold(undecidable: Boolean)
 
@@ -112,21 +113,29 @@ object ExpiryTally:
     *  - C. Discard: `aa >= 1`. By L1 no commit was chosen or reported.
     *  - D. Discard: some changed pool has `vc + s < r`, so T's update can never be restored. `dataLost` when a commit
     *    may have been chosen or reported: `ac >= 1`, or every referenced pool has `vc + k + s >= t`.
-    *  - E. Discard: some referenced pool has `vc + k + s < t`. No tally was ever commit-certain, so no commit was chosen
-    *    or reported.
-    *  - F. Commit: no store of T is silent, every referenced pool has `vc + k >= t`, `k_p + n_p < t` (primary) and
-    *    every changed pool has `vc >= r`. B and C did not fire and no store is silent, so every primary store that
-    *    still holds T and is not amnesiac accepted nothing. Only the `k_p` amnesiac and `n_p` "unknown" stores, fewer
-    *    than a quorum, could hide an accepted abort, so no abort was chosen, and no client heard one (a client hears
-    *    abort only through Paxos). (Counting only `k_p` was unsafe, found 2026-11-16: with a lock-only primary object,
-    *    a quorum of one rebuilt store and one that accepted abort, was finalized and forgot T could hide a chosen
-    *    abort. With a changed primary object `n_p` never matters: `vc_p >= r` leaves at most `w - r < t` others.)
+    *  - E. Discard: some referenced pool has `vc + k + s < t`. No tally was ever commit-certain, so no commit was
+    *    chosen or reported.
+    *  - F. Commit: no store of T is silent, every referenced pool has `vc + k >= t` and `vc > w - t`, `k_p + n_p < t`
+    *    (primary) and every changed pool has `vc >= r`. B and C did not fire and no store is silent, so every primary
+    *    store that still holds T and is not amnesiac accepted nothing. Only the `k_p` amnesiac and `n_p` "unknown"
+    *    stores, fewer than a quorum, could hide an accepted abort, so no abort was chosen, and no client heard one (a
+    *    client hears abort only through Paxos). (Counting only `k_p` was unsafe, found 2026-11-16: with a lock-only
+    *    primary object, a quorum of one rebuilt store and one that accepted abort, was finalized and forgot T could
+    *    hide a chosen abort. With a changed primary object `n_p` never matters: `vc_p >= r` leaves at most
+    *    `w - r < t` others.)
     *    Frozen acceptors and muted rebuilt stores accept nothing more, so nothing is chosen later. No conflicting
-    *    transaction committed: it would need `t` commit votes, but T's `vc >= r` voters hold its locks, and `t + r > w`.
-    *  - G. Hold otherwise: some store is silent (transient), or, every store replied, `k_p + n_p >= t`
-    *    (`undecidable`): the amnesiac and "unknown" primary stores may hide a chosen abort, and the amnesiac ones may
-    *    have voted commit with the voters seen, so a client may have been told either outcome. With a changed primary
-    *    object D fires first then (`t + r > w`), so only an unchanged primary object reaches it.
+    *    transaction committed: it would need `t` commit votes in some pool of T, but T's `vc` voters there hold its
+    *    locks and `vc + t > w`. That premise needs `vc > w - t` in every referenced pool, lock-only ones included; a
+    *    changed pool has it from `vc >= r`, since `t + r > w`. (Requiring it only through `vc >= r` was unsafe, found
+    *    2026-11-16: in a lock-only pool of Replication(3, 2), a stale commit vote, a rebuilt abort voter and a frozen
+    *    abort voter give `vc + k >= t`, yet T' may have committed with the two stores holding no lock of T, so T's
+    *    requirement failed.)
+    *  - G. Hold otherwise: some store is silent (transient), or, every store replied (`undecidable`), either
+    *    `k_p + n_p >= t`: the amnesiac and "unknown" primary stores may hide a chosen abort (with a changed primary
+    *    object D fires first then, `t + r > w`, so only an unchanged primary object reaches it); or some lock-only
+    *    pool has `vc <= w - t < t <= vc + k`: a conflicting transaction may have committed with the stores holding no
+    *    lock of T. Either way the amnesiac stores may have voted commit with the voters seen, so a client may have been
+    *    told either outcome.
     *
     * No two observers reach a commit (A, B, F) and a discard (C, D, E). Reported states are final (an unresolved Tx
     * replies only once frozen and its objects are loaded), and a store leaves a count only by deciding, after which
@@ -140,8 +149,8 @@ object ExpiryTally:
     *    reported by a non-amnesiac store, which F's observer would have seen. One divergence remains, and is accepted:
     *    C's observer saw an abort accepted by fewer than a quorum (never chosen), the accepter then discarded or was
     *    finalized and forgot T, and F's observer, later, counts it as "unknown". That is safe for clients: the abort
-    *    was never chosen, so no client was told abort; F's `vc >= r` voters hold T's locks, so no conflicting commit
-    *    exists (`t + r > w`); and the discarding store is repaired by the commit's finalization (its missed-update
+    *    was never chosen, so no client was told abort; F's `vc > w - t` voters hold T's locks, so no conflicting commit
+    *    exists (`vc + t > w`); and the discarding store is repaired by the commit's finalization (its missed-update
     *    marks), as any store that missed T is.
     *  - F against E: F's observer has no silence, so its `vc + k` is the true count, and E's observer counts at least
     *    that much in `vc + k + s`.
@@ -189,7 +198,8 @@ object ExpiryTally:
     else if counts.exists((p, c) => c.vc + c.k + c.s < t(p)) then
       Decision.Discard(dataLost = false) // E
     else if counts.valuesIterator.forall(_.s == 0) && everyPool((p, c) => c.vc + c.k >= t(p)) &&
-      kp + np < primaryIda.writeThreshold && changedRestorable then
+      kp + np < primaryIda.writeThreshold && changedRestorable &&
+      everyPool((p, c) => c.vc > txd.poolIDAMap(p).width - t(p)) then
       Decision.Commit // F
     else
       Decision.Hold(undecidable = replies.size >= txd.allDataStores.size) // G

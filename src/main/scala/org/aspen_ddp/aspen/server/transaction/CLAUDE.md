@@ -9,6 +9,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - The client builds a TransactionDescription and sends it plus object data to the stores
 - The stores check all local state against the TransactionRequirements and determine their Commit/Abort decision
 - The CrashRecoveryLog is used to store this decision and Paxos is then used to arrive at an overall commit/abort decision
+- Each store sends its vote to the originating client (`TransactionVote`) from the handler of the CRL save that holds
+  it, alongside every prepare response (`Tx.sendPrepareResponse`; never for a muted or frozen Tx, nor an Undetermined vote)
 - The client and all stores are informed of the final decision
 - If committed, FinalizationActions are then run. Once complete, the CRL content is dropped and the transaction is forgotten.
 - A Tx's object data is dropped from its CRL state once its commits persist, in memory only (`crl/CLAUDE.md`). A

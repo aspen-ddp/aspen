@@ -5,7 +5,7 @@ import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TransactionVote, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, FullObject, Insert, Key, KeySet, KeyValueOperation, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -56,10 +56,14 @@ object FrontendSuite {
   class TestNet extends Messenger {
 
     var cr: Option[ClientResponse] = None
+    /** Every client response sent, oldest first */
+    val clientResponses = scala.collection.mutable.ListBuffer[ClientResponse]()
     var tx: Option[TxMessage] = None
     var sentTx: List[TxMessage] = Nil
 
-    override def sendClientResponse(msg: ClientResponse): Unit = cr = Some(msg)
+    override def sendClientResponse(msg: ClientResponse): Unit =
+      cr = Some(msg)
+      clientResponses += msg
 
     override def sendTransactionMessage(msg: TxMessage): Unit =
       tx = Some(msg)
@@ -587,6 +591,69 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     withDataless(incarnation = Some(StoreIncarnation(new UUID(7, 7)))): (frontend, backend, net, crl) =>
       frontend.receiveTransactionMessage(clientPrepare(dataUpdateTxd))
       votes(net).map(_.incarnation) shouldBe List(Some(StoreIncarnation(new UUID(7, 7))))
+  }
+
+  // ---- The durable vote sent to the originating client (client 1-RTT commit design 4.1) ----
+
+  private def txVotes(net: TestNet): List[TransactionVote] =
+    net.clientResponses.toList.collect { case v: TransactionVote => v }
+
+  private def voteTxd(txid: TransactionId = txid1) =
+    lockTxd(txid, List(overwrite(op1))).copy(startTimestamp = startedAgo(1_000))
+
+  test("a client prepare's durable vote is sent to the originating client") {
+    val crl = new TestCrl
+    crl.holdTxSaves = true
+    withFloorFrontend(crl = crl): (frontend, _, net, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(voteTxd()))
+      crl.heldTxSaves.size shouldBe 1
+      net.sentTx shouldBe empty
+      txVotes(net) shouldBe Nil
+      crl.completeHeldTxSaves()
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      txVotes(net) shouldBe List(TransactionVote(clientId, storeId, txid1, TransactionDisposition.VoteCommit))
+  }
+
+  test("a retransmitted prepare re-sends the vote") {
+    val crl = new TestCrl
+    crl.holdTxSaves = true
+    withFloorFrontend(crl = crl): (frontend, _, net, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(voteTxd()))
+      crl.completeHeldTxSaves()
+      frontend.receiveTransactionMessage(clientPrepare(voteTxd()))
+      txVotes(net).size shouldBe 1
+      crl.completeHeldTxSaves()
+      txVotes(net) shouldBe List.fill(2)(TransactionVote(clientId, storeId, txid1, TransactionDisposition.VoteCommit))
+  }
+
+  test("an abort vote is sent too") {
+    val txd = lockTxd(txid1, List(DataUpdate(op1, ObjectRevision(txid2), DataUpdateOperation.Overwrite)))
+      .copy(startTimestamp = startedAgo(1_000))
+    withFloorFrontend(): (frontend, _, net, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      txVotes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+  }
+
+  test("a frozen Tx sends no vote") {
+    // Recovered with no vote, past the horizon plus the default margin by the store's clock
+    val txd = voteTxd().copy(startTimestamp = startedAgo(40_000))
+    val trs = TransactionRecoveryState(storeId, txd.serialize(), Nil, TransactionDisposition.Undetermined,
+      TransactionStatus.Unresolved, PersistentState.initial)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+    withFloorFrontend(loadedAt = floorNow, crl = crl): (frontend, _, net, _) =>
+      frontend.transactions(txid1).frozen shouldBe true
+      frontend.receiveTransactionMessage(driverPrepare(txd))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      txVotes(net) shouldBe Nil
+      votes(net) shouldBe Nil
+  }
+
+  test("no originating client, no vote") {
+    withFloorFrontend(): (frontend, _, net, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(voteTxd().copy(originatingClient = None)))
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      txVotes(net) shouldBe Nil
   }
 
   test("a driver's prepare that overtakes the client's data gets no vote until the data arrives") {
@@ -2169,6 +2236,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a commit voter whose state is invalidated under its locks fail-stops rather than hold neither (Req F5)") {
     val (frontend, backend, net, stops) = failStopFixture()
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    net.clientMessage() // txid1's vote to its client
 
     // The cached state can no longer be served while txid1 holds its locks (a failed apply of another transaction, a
     // repair deletion): the committed update cannot be applied, and its locks are dropped

@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.transaction
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
+import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse, TransactionVote}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare, ProposalId}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -757,10 +757,20 @@ class Tx( trs: TransactionRecoveryState,
         disposition, txStatus, acceptor.persistentState)
       saveState(state, () =>
         logger.trace(s"AllObjectsLoaded. CRL Save Complete. Sending PrepareResponse for tx ${transactionId}")
-        net.sendTransactionMessage(r)
+        sendPrepareResponse(r)
       )
     }
   }
+
+  /** Sends the prepare response and, for a commit or abort vote, the vote itself to the originating client. Only
+    * called from the completion handler of the CRL save that holds the vote: a client may act on the vote (1-RTT
+    * commit), so it must be durable first
+    */
+  private def sendPrepareResponse(r: TxPrepareResponse): Unit =
+    net.sendTransactionMessage(r)
+    if r.disposition == TransactionDisposition.VoteCommit || r.disposition == TransactionDisposition.VoteAbort then
+      txd.originatingClient.foreach: client =>
+        net.sendClientResponse(TransactionVote(client, storeId, transactionId, r.disposition))
 
   /** Decides the vote, or withholds it. A muted transaction is proven committed or takes no part, its requirements
     * unchecked. One that has seen no client prepare votes abort, or proves the commit, its requirements unchecked
@@ -1210,7 +1220,7 @@ class Tx( trs: TransactionRecoveryState,
         disposition, txStatus, acceptor.persistentState)
       saveState(state, () =>
         logger.trace(s"CRL Transaction save complete. Sending PrepareResponse: ${m.transactionId}")
-        net.sendTransactionMessage(txr)
+        sendPrepareResponse(txr)
       )
     else
       logger.trace(s"Not all objects loaded. Delaying PrepareResponse: ${m.transactionId}")

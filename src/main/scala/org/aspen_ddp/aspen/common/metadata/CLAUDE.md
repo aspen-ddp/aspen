@@ -68,10 +68,13 @@ on changes: administration means writing desired state here, not sending message
   `StoreEntry(status, transferDevice, transferId, acceptLoss)`
 - `StoreStatus`: Initializing, Active, TransferringIn, TransferringOut, Rebuilding, Offline. A `transferId` is shared
   by a transfer's TransferringOut and TransferringIn entries and carried in the on-disk markers, so a copy left by an
-  aborted transfer is never mistaken for the current one. A TransferringIn entry does not own the store: the source
+  aborted transfer is never mistaken for the current one. On a Rebuilding entry `transferId` is the rebuild episode
+  instead (`rebuildEpisode`), fresh at every transition into Rebuilding (`setRebuilding`;
+  `server/rebuild/CLAUDE.md`). A TransferringIn entry does not own the store: the source
   does until the transfer completes. `acceptLoss` is an operator's acceptance, on a Rebuilding entry only
   (`AspenClient.acceptRebuildLoss`, `accept-rebuild-loss`), that its rebuild may finish past objects the pool cannot
-  supply (`server/rebuild/CLAUDE.md`). `setStoreEntry` writes a fresh entry, so the promoting flip clears it
+  supply (`server/rebuild/CLAUDE.md`); `acceptRebuildLoss` keeps the episode. `setStoreEntry` writes a fresh entry,
+  so the promoting flip clears both
 - `DeviceStatus`: Operational; ShuttingDown and Shutdown bracket a planned physical move; Failed is the one-way
   tombstone written by `failStorageDevice`. A failed device stays readable (its store map is the list awaiting
   rebuild) but is in no set or host and is never a destination. `failStorageDevice` is for a physically failed drive

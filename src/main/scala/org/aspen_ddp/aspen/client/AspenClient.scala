@@ -516,6 +516,8 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     // InvalidDestination (Todo 5.10)
     val retry = StopRetrying.collisionRetry()
     @volatile var staged: List[CheckStorageDevice] = Nil
+    // The new Rebuilding episode, one for every attempt, so a retry recognizes its own commit by it
+    val episode = UUID.randomUUID()
 
     val fStaged: Future[List[CheckStorageDevice]] =
       transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
@@ -543,7 +545,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
           tx.update(srcPtr, None, None,
             List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision)),
             List(Insert(StorageDeviceState.StateKey, srcState.removeStore(storeId).encode())))
-          val newDst = dstState.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
+          val newDst = dstState.setRebuilding(storeId, episode)
           tx.update(dstPtr, None, None,
             List(KeyRevision(StorageDeviceState.StateKey, dstKvos.contents(StorageDeviceState.StateKey).revision)),
             List(Insert(StorageDeviceState.StateKey, newDst.encode())))
@@ -564,7 +566,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
           dstKvos <- read(dstPtr)
           dstState = StorageDeviceState(dstKvos)
           done = retry.mayHaveCommitted && sourceId == destinationId &&
-            dstState.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Rebuilding)
+            dstState.stores.get(storeId).exists(_.rebuildEpisode.contains(episode))
           // Nothing staged when done: the empty transaction succeeds
           nudges <- if done then Future.successful(staged) else replace(poolPtr, poolKvos, poolState, sourceId,
                                                                           dstPtr, dstKvos, dstState)

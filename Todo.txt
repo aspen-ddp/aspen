@@ -39,12 +39,7 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.8  Staging or a finished copy from an earlier Rebuilding episode is resumed or promoted: RB-W3           [M]
-     CONFIRMED mechanism. Nothing ties staging, its checkpoint, or a rebuild-complete directory to the Rebuilding
-     entry; re-place away while the host is down, finish elsewhere, re-place back, restart: the old checkpoint
-     resumes or the old copy flips Active, stale with no entries. Fix: an episode UUID in the Rebuilding
-     StoreEntry (transferId fits), recorded in checkpoint and beside rebuild-complete; discard mismatches. The
-     same episode id lets the Deleted Stores pass tell a lost copy from a completed transfer (helps 3.1 / SL-W1).
+(no open items)
 
 
 PRIORITY 3: systemic loss protection

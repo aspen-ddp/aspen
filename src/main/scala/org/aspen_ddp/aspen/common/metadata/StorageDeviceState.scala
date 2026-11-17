@@ -48,10 +48,16 @@ object StorageDeviceState:
   /** `acceptLoss` is set by an operator, only on a Rebuilding entry (AspenClient.acceptRebuildLoss): the rebuild may
    *  finish past objects the pool cannot supply, recording each in the ErrorTree (Rebuild F15). Every write of an
    *  entry by setStoreEntry clears it, so an acceptance covers one rebuild. */
+  /** On a Rebuilding entry `transferId` is the rebuild episode instead: a fresh UUID written by every transition
+   *  into Rebuilding (setRebuilding). The rebuild records it in its checkpoint and its rebuild-complete marker, so
+   *  staging or a finished copy left by an earlier Rebuilding episode of the store is never resumed or promoted
+   *  (rebuild-process.md 4.5). */
   case class StoreEntry(status: StoreStatus,
                         transferDevice: Option[StorageDeviceId],
                         transferId: Option[UUID] = None,
-                        acceptLoss: Boolean = false)
+                        acceptLoss: Boolean = false):
+    /** The rebuild episode of a Rebuilding entry; None for any other status */
+    def rebuildEpisode: Option[UUID] = if status == StoreStatus.Rebuilding then transferId else None
 
 
 case class StorageDeviceState(storageDeviceId: StorageDeviceId,
@@ -129,6 +135,12 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
                     status: StorageDeviceState.StoreStatus,
                     transferDevice: Option[StorageDeviceId]): StorageDeviceState =
     this.copy(stores=stores + (storeId -> StorageDeviceState.StoreEntry(status, transferDevice)))
+
+  /** Makes `storeId` Rebuilding on this device under a new rebuild episode (StoreEntry.rebuildEpisode). Every
+   *  transition into Rebuilding writes the entry through here, with a fresh `episode` */
+  def setRebuilding(storeId: StoreId, episode: UUID): StorageDeviceState =
+    this.copy(stores=stores + (storeId -> StorageDeviceState.StoreEntry(
+      StorageDeviceState.StoreStatus.Rebuilding, None, Some(episode))))
 
   def removeStore(storeId: StoreId): StorageDeviceState =
     this.copy(stores=stores - storeId)

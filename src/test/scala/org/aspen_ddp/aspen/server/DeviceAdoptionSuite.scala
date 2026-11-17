@@ -264,7 +264,11 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
       st.status should be(DeviceStatus.Operational)
       st.hostId should be(HostId.BootstrapHostId)
-      st.stores(s0) should be(rebuilding)
+      st.stores(s0).status should be(StoreStatus.Rebuilding)
+      // A transition into Rebuilding is a new rebuild episode
+      st.stores(s0).rebuildEpisode should not be(None)
+      // The rebuild runs for that episode
+      rebuilds.created.map(r => r.storeId -> r.episode).toList should be(List(s0 -> st.stores(s0).rebuildEpisode))
       st.stores(s1).status should be(StoreStatus.Active)
       e0.hostId should be(HostId.BootstrapHostId)
       loadedDevices(host).contains(deviceA) should be(true)

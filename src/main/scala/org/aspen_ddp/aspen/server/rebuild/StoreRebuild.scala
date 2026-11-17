@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 
+import java.util.UUID
 import scala.concurrent.Future
 
 /** Reconstruction of one store from the rest of its pool.
@@ -29,7 +30,8 @@ trait StoreRebuildFactory:
                     storeId: StoreId,
                     storageDeviceId: StorageDeviceId,
                     devicePath: os.Path,
-                    backends: BackendOpener): StoreRebuild
+                    backends: BackendOpener,
+                    episode: Option[UUID]): StoreRebuild
 
 object StoreRebuildFactory:
   object Filesystem extends StoreRebuildFactory:
@@ -37,5 +39,6 @@ object StoreRebuildFactory:
                       storeId: StoreId,
                       storageDeviceId: StorageDeviceId,
                       devicePath: os.Path,
-                      backends: BackendOpener): StoreRebuild =
-      new RebuildingStore(client, storeId, storageDeviceId, devicePath, backends)
+                      backends: BackendOpener,
+                      episode: Option[UUID]): StoreRebuild =
+      new RebuildingStore(client, storeId, storageDeviceId, devicePath, backends, episode)

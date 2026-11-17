@@ -139,9 +139,12 @@
   a row up to `RebuildRetryMaxDelay` 30 min, reset when a flip settles; Rebuild F5, F11). Tests drive it with
   `ControlFixture.runRebuildRetries`
 - Re-placement (Rebuild F12): `AspenClient.replaceRebuild` (`transfer-store` on a Rebuilding store) moves a
-  Rebuilding entry to another device and repoints the pool. The reconcile's `StoreRebuilds.abandonUnlisted` cancels a
-  rebuild running for a store no longer Rebuilding on its device (its completion checks the device again), and
-  deletes a `rebuilding/<id>` staging copy only when no rebuild of it is running
+  Rebuilding entry to another device and repoints the pool, under a new rebuild episode
+  (`server/rebuild/CLAUDE.md`). The reconcile's `StoreRebuilds.abandonUnlisted` cancels a rebuild running for a store
+  no longer Rebuilding on its device, or Rebuilding there under another episode (`rebuildEpisodes`; its completion
+  checks the device again), and deletes a `rebuilding/<id>` staging copy only when no rebuild of it is running. A
+  flip of a rebuild whose entry has since moved to another episode is `RebuildOutcome.Superseded`: nothing is
+  written, and its copy, marked for the earlier episode, is retired by the next `startRebuild`
 - Nothing of a lost store is destroyed before its rebuild succeeds: its `pending-delete/` copy (data plus saved CRL
   entries) is deleted by the device's reconcile only once the store is Active again, on this device by its own
   entry, elsewhere by the pool's entry and that device's state; a failed read keeps it. A fail-stopped backend's CRL

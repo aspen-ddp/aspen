@@ -36,7 +36,8 @@ private class CancellableRebuildFactory extends StoreRebuildFactory:
                     storeId: StoreId,
                     storageDeviceId: StorageDeviceId,
                     devicePath: os.Path,
-                    backends: BackendOpener): StoreRebuild = synchronized:
+                    backends: BackendOpener,
+                    episode: Option[UUID]): StoreRebuild = synchronized:
     val r = new CancellableRebuild(storeId)
     created += r
     r

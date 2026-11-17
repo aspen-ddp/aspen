@@ -68,9 +68,9 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
       base.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid, gossipRetransmitter)
     override def readHostStateForEndpoint() = base.readHostStateForEndpoint()
     override def abortLostTransfer(storeId: StoreId) = base.abortLostTransfer(storeId)
-    override def markRebuiltStoreActive(storageDeviceId: StorageDeviceId, storeId: StoreId,
+    override def markRebuiltStoreActive(storageDeviceId: StorageDeviceId, storeId: StoreId, episode: Option[UUID],
                                         gossipStoreOnline: StoreId => Unit) =
-      base.markRebuiltStoreActive(storageDeviceId, storeId, gossipStoreOnline)
+      base.markRebuiltStoreActive(storageDeviceId, storeId, episode, gossipStoreOnline)
     override def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId, devicePath: os.Path,
                              uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
                              crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],

@@ -226,7 +226,7 @@ class CommittedUnknownRetrySuite extends IntegrationTestSuite:
       _ <- setDeviceState(net.secondDeviceId)(_.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Rebuilding, None))
       devPtr <- client.getStorageDevicePointer(net.secondDeviceId)
       _ = net.reportCommitAsUnknown(touches(devPtr))
-      outcome <- net.smgr.control.metadata.markRebuiltStoreActive(net.secondDeviceId, storeId,
+      outcome <- net.smgr.control.metadata.markRebuiltStoreActive(net.secondDeviceId, storeId, None,
                    s => online = s :: online)
       dev <- client.getStorageDeviceState(net.secondDeviceId)
     yield

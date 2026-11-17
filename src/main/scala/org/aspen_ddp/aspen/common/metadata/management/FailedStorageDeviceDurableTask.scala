@@ -540,8 +540,7 @@ class FailedStorageDeviceDurableTask(
 
           case Some(dst) =>
             // Destination: gains a Rebuilding entry. This is the entire message to the consumer.
-            val newDst = dst.state.setStoreEntry(
-              storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
+            val newDst = dst.state.setRebuilding(storeId, UUID.randomUUID())
             tx.update(dst.ptr, None, None,
               List(KeyRevision(StorageDeviceState.StateKey,
                 dst.kvos.contents(StorageDeviceState.StateKey).revision)),

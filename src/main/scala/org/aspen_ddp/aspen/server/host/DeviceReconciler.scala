@@ -355,8 +355,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       //
       remote.stores.filter((_, entry) =>
         entry.status == StorageDeviceState.StoreStatus.Rebuilding
-      ).keys.toList.sortBy(_.poolIndex).foreach: storeId =>
-        ctx.rebuilds.startRebuild(local, storeId)
+      ).toList.sortBy(_._1.poolIndex).foreach: (storeId, entry) =>
+        ctx.rebuilds.startRebuild(local, storeId, entry.rebuildEpisode)
       // Rebuild work for stores no longer Rebuilding here (re-placed elsewhere, Rebuild F12)
       ctx.rebuilds.abandonUnlisted(local, remote)
 

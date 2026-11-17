@@ -220,8 +220,9 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
 
     override def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
                                         storeId: StoreId,
+                                        episode: Option[UUID],
                                         gossipStoreOnline: StoreId => Unit): Future[RebuildOutcome] =
-      base.markRebuiltStoreActive(storageDeviceId, storeId, gossipStoreOnline).map: outcome =>
+      base.markRebuiltStoreActive(storageDeviceId, storeId, episode, gossipStoreOnline).map: outcome =>
         synchronized:
           rebuildFlipSeq += ((storageDeviceId, storeId) -> rebuildEventSeq.incrementAndGet())
           rebuildOutcomes += ((storageDeviceId, storeId) -> outcome)

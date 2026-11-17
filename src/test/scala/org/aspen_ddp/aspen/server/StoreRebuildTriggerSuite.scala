@@ -10,6 +10,7 @@ import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
+import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
 
 import java.util.UUID
@@ -18,7 +19,8 @@ import scala.concurrent.{Future, Promise}
 
 /** A StoreRebuild that does nothing until the test resolves it. */
 private class RecordedRebuild(val storeId: StoreId,
-                              val storageDeviceId: StorageDeviceId) extends StoreRebuild:
+                              val storageDeviceId: StorageDeviceId,
+                              val episode: Option[UUID] = None) extends StoreRebuild:
   val promise: Promise[Unit] = Promise()
   def complete: Future[Unit] = promise.future
   @volatile var cancelled: Boolean = false
@@ -31,8 +33,9 @@ private class RecordingRebuildFactory extends StoreRebuildFactory:
                     storeId: StoreId,
                     storageDeviceId: StorageDeviceId,
                     devicePath: os.Path,
-                    backends: BackendOpener): StoreRebuild =
-    val r = new RecordedRebuild(storeId, storageDeviceId)
+                    backends: BackendOpener,
+                    episode: Option[UUID]): StoreRebuild =
+    val r = new RecordedRebuild(storeId, storageDeviceId, episode)
     synchronized:
       created += r
     r
@@ -346,6 +349,122 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       pending should have size 1
       os.exists(pending.head / "data") should be(true)
       os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+
+  private def rebuildingIn(storeId: StoreId, episode: UUID): (StoreId, StorageDeviceState.StoreEntry) =
+    storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None, Some(episode))
+
+  atest("a rebuild of an earlier Rebuilding episode is cancelled, and the current episode's rebuild started (RB-W3)"):
+    // The store was re-placed away and back between two checks of the device: still Rebuilding here, under a new
+    // episode. The running rebuild's copy may predate updates the store took while it lived elsewhere
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val earlier = UUID.randomUUID()
+    val current = UUID.randomUUID()
+
+    val first = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    first.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), earlier))))
+
+    for
+      _ <- yieldUntil(factory.created.nonEmpty)
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+      // The same episode, checked again: left running
+      same = recorded(host).armLookup(deviceA)
+      _ = host.control.reconciler.checkStorageDevice(deviceA)
+      _ = same.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), earlier))))
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+      keptRunning = !factory.created.head.cancelled
+      replaced = recorded(host).armLookup(deviceA)
+      _ = host.control.reconciler.checkStorageDevice(deviceA)
+      _ = replaced.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), current))))
+      _ <- yieldUntil(factory.created.head.cancelled)
+      _ = recorded(host).armLookup(deviceA).success(deviceState(deviceA, Map(rebuildingIn(storeN(0), current))))
+      _ = factory.created.head.promise.failure(RebuildingStore.RebuildCancelled(storeN(0)))
+      _ <- yieldUntil(factory.created.size == 2)
+    yield
+      keptRunning should be(true)
+      factory.created.map(r => r.storeId -> r.episode).toList should be(
+        List(storeN(0) -> Some(earlier), storeN(0) -> Some(current)))
+      factory.created(1).cancelled should be(false)
+
+  atest("a copy finished for an earlier Rebuilding episode is retired before the rebuild starts (RB-W3)"):
+    // Finished, and awaiting its flip, when the store was re-placed away; back here now under a new episode. It must
+    // not be taken for done: it is kept in pending-delete like any lost copy, and the store rebuilt. A copy of the
+    // current episode stays where it is, for the rebuild to flip
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
+    val current = UUID.randomUUID()
+    def storeDir(n: Int): os.Path = deviceDir / storeN(n).directoryName
+    List(0, 1).foreach(n => os.makeDir.all(storeDir(n)))
+    os.write.over(storeDir(0) / RebuildingStore.RebuildCompleteMarkerFile, UUID.randomUUID().toString)
+    os.write.over(storeDir(1) / RebuildingStore.RebuildCompleteMarkerFile, current.toString)
+
+    val armed = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    armed.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), current), rebuildingIn(storeN(1), current))))
+
+    def pending: List[os.Path] =
+      val dir = deviceDir / RebuildingStore.PendingDeleteDirectory
+      if os.exists(dir) then os.list(dir).toList else Nil
+
+    yieldUntil(factory.created.size == 2).map: _ =>
+      factory.created.map(_.storeId).toSet should be(Set(storeN(0), storeN(1)))
+      os.exists(storeDir(0)) should be(false)
+      pending should have size 1
+      os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      os.read(storeDir(1) / RebuildingStore.RebuildCompleteMarkerFile) should be(current.toString)
+
+  atest("a rebuild that finishes after its entry moved to a new Rebuilding episode is not promoted (RB-W3)"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val rebuilt = StoreId(PoolId.BootstrapPoolId, 0)
+    val earlier = UUID.randomUUID()
+    val current = UUID.randomUUID()
+
+    def setEntry(deviceId: StorageDeviceId, episode: UUID): Future[Unit] =
+      for
+        ptr <- client.getStorageDevicePointer(deviceId)
+        kvos <- client.read(ptr)
+        _ <- client.transactUntilSuccessful: tx =>
+          Future.successful:
+            tx.update(ptr, None, None,
+              List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
+              List(Insert(StorageDeviceState.StateKey, StorageDeviceState(kvos).setRebuilding(rebuilt, episode).encode())))
+        _ <- waitForTransactionsToComplete()
+      yield ()
+
+    for
+      deviceSetId <- client.createStorageDeviceSet("test-set", 0, None)
+      realDeviceId <- client.createStorageDevice(HostId.BootstrapHostId, deviceSetId)
+      _ <- setEntry(realDeviceId, earlier)
+      _ = injectLoadedDevice(host, new LocalStorageDeviceState(
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL()))
+      armed = recorded(host).armLookup(realDeviceId)
+      _ = host.control.reconciler.checkAll()
+      _ = armed.success(deviceState(realDeviceId, Map(rebuildingIn(rebuilt, earlier))))
+      _ <- yieldUntil(factory.created.nonEmpty)
+      // Re-placed away and back before any check of this device saw it
+      _ <- setEntry(realDeviceId, current)
+      storeDir = deviceDir / rebuilt.directoryName
+      _ = os.makeDir.all(storeDir)
+      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, earlier.toString)
+      _ = factory.created.head.promise.success(())
+      _ <- waitForTransactionsToComplete()
+      _ <- yieldUntil(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
+      finalState <- client.getStorageDeviceState(realDeviceId)
+    yield
+      recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Superseded)
+      recorded(host).loadStoreByIdRequests should not contain((realDeviceId, rebuilt))
+      finalState.stores(rebuilt).rebuildEpisode should be(Some(current))
+      // Left for the current episode's rebuild to retire, and silent meanwhile
+      os.read(storeDir / RebuildingStore.RebuildCompleteMarkerFile) should be(earlier.toString)
+      host.control.rebuilds.silencedStores should contain(rebuilt)
 
   /** Pumps transactions until `factory` has created a rebuild. Silent on exhaustion: callers
    *  assert on it. */

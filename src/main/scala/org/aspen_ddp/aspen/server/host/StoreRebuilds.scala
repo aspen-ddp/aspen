@@ -37,6 +37,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private var rebuildingStores: Map[StoreId, StoreRebuild] = Map()
   // The device each one in rebuildingStores runs on
   private var rebuildDevices: Map[StoreId, StorageDeviceId] = Map()
+  // The Rebuilding episode each one in rebuildingStores runs for (StoreEntry.rebuildEpisode)
+  private var rebuildEpisodes: Map[StoreId, Option[UUID]] = Map()
   // Rebuilds cancelled because their entry left their device (abandonUnlisted, Rebuild F12)
   private var abandonedRebuilds: Set[StoreId] = Set()
   // Completed when the rebuild of each store in rebuildingStores has released its slot, its
@@ -195,24 +197,30 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  A slot is taken from the start of a lost store's discard (`droppingCrlState`), not only once its walk runs, and
    *  passes straight from the discard to the rebuild: otherwise one pass would discard every marked store on the
    *  device at once (systemic-loss-protection.md S3).
+   *
+   *  `episode` is the Rebuilding entry's episode (StoreEntry.rebuildEpisode). The rebuild resumes only a checkpoint,
+   *  and takes only a finished copy, of this episode, and its flip commits only while the entry still names it: a
+   *  store re-placed away and back is a new episode, and nothing of the earlier one is resumed or promoted
+   *  (rebuild-process.md 5.1).
    */
-  def startRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+  def startRebuild(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Unit =
     // Silent from the first reconcile that sees the entry, a store queued for a slot included (Rebuild F7)
     if !silenced.contains(storeId) then
       ctx.router.markOffline(storeId)
       silenced += storeId -> local.storageDeviceId
     if !rebuildingStores.contains(storeId) &&
        rebuildingStores.size + droppingCrlState.size < ctx.maxConcurrentRebuilds &&
-       ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId) &&
-       discardLostStore(local, storeId) then
+       ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode) &&
+       discardLostStore(local, storeId, episode) then
       val sr = ctx.storeRebuildFactory.createRebuild(
-        ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends)
+        ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends, episode)
 
       val settled = Promise[Unit]()
 
       def release(): Unit =
         rebuildingStores -= storeId
         rebuildDevices -= storeId
+        rebuildEpisodes -= storeId
         ctx.publishView()
         if rebuildsSettled.get(storeId).exists(_ eq settled) then
           rebuildsSettled -= storeId
@@ -258,6 +266,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
       rebuildingStores += storeId -> sr
       rebuildDevices += storeId -> local.storageDeviceId
+      rebuildEpisodes += storeId -> episode
       rebuildsSettled += storeId -> settled
       ctx.publishView()
 
@@ -271,7 +280,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           // load hands a live copy to a device that markRebuiltStoreActive may be about to
           // decide must not own it (because the device was tombstoned mid-rebuild), and nothing
           // would ever take it back.
-          ctx.metadata.markRebuiltStoreActive(local.storageDeviceId, storeId, ctx.gossipStoreOnline).onComplete:
+          ctx.metadata.markRebuiltStoreActive(local.storageDeviceId, storeId, episode, ctx.gossipStoreOnline).onComplete:
             case Success(RebuildOutcome.Adopt) =>
               try
                 // Loaded only once the marker is gone, or tryLoadStore leaves it offline; a failed removal is
@@ -299,6 +308,18 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 unsilence(storeId, clear = true)
                 ctx.devices.discardStoreDirectory(storeId, local.storageDeviceId,
                   "The tree does not say this device owns a rebuilt store")
+              finally
+                settledOutcome()
+                release()
+                recheckAll()
+
+            case Success(RebuildOutcome.Superseded) =>
+              // The entry is Rebuilding here under a later episode: the store was re-placed away and back while this
+              // rebuild ran. Its copy stays at the store's path, still silent; its rebuild-complete marker names this
+              // episode, so the next rebuild retires it (retireForeignCopy) and starts over
+              try
+                logger.info(s"Rebuild of store $storeId on device ${local.storageDeviceId} finished for an earlier " +
+                            "Rebuilding episode. Not promoting it; the store is rebuilt again")
               finally
                 settledOutcome()
                 release()
@@ -372,19 +393,25 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             scheduleRebuildRetry(local.storageDeviceId, storeId)
 
   /** Rebuild F12. Retires the rebuild work on `local` for stores whose entry on it is no longer Rebuilding: re-placed
-   *  elsewhere by AspenClient.replaceRebuild, or gone for another reason. A rebuild still running for one is
-   *  cancelled; its completion checks the device again. A staging directory for one with no rebuild running is
+   *  elsewhere by AspenClient.replaceRebuild, or gone for another reason. A rebuild still running for one, or for an
+   *  earlier episode of an entry still Rebuilding here (re-placed away and back since it started), is cancelled; its
+   *  completion checks the device again, which starts the current episode. A staging directory for one with no rebuild running is
    *  deleted: nothing will resume it, and a later rebuild of the store here starts over. Called by the reconcile of a
    *  device this host owns and serves. */
   def abandonUnlisted(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     def listed(storeId: StoreId): Boolean =
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Rebuilding)
 
+    def current(storeId: StoreId): Boolean =
+      remote.stores.get(storeId).exists: entry =>
+        entry.status == StorageDeviceState.StoreStatus.Rebuilding &&
+        rebuildEpisodes.get(storeId).contains(entry.rebuildEpisode)
+
     rebuildDevices.foreach: (storeId, deviceId) =>
-      if deviceId == local.storageDeviceId && !listed(storeId) && !abandonedRebuilds.contains(storeId) then
+      if deviceId == local.storageDeviceId && !current(storeId) && !abandonedRebuilds.contains(storeId) then
         rebuildingStores.get(storeId).foreach: sr =>
           logger.info(s"Cancelling the rebuild of store $storeId on device $deviceId: its entry there is no " +
-                      "longer Rebuilding")
+                      "longer Rebuilding for this rebuild's episode")
           abandonedRebuilds += storeId
           sr.cancel()
 
@@ -478,16 +505,17 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         false
 
   /** Rebuild F3. A directory at the path of a store being rebuilt here that carries neither the rebuild-complete
-   *  marker (a finished rebuild awaiting its flip) nor rebuild-required (a lost copy discardLostStore clears) was not
-   *  produced by a rebuild: a leftover of an earlier tenancy of the store on this device (a transferred-away copy
-   *  whose delete failed and whose marker was lost), or a copy put there by hand. Nothing ties it to the store's
+   *  marker of this `episode` (a finished rebuild awaiting its flip) nor rebuild-required (a lost copy
+   *  discardLostStore clears) was not produced by this rebuild: a leftover of an earlier tenancy of the store on this
+   *  device (a transferred-away copy whose delete failed and whose marker was lost, or a copy finished for an earlier
+   *  Rebuilding episode, superseded by a re-placement away and back), or a copy put there by hand. Nothing ties it to the store's
    *  current state, so it is retired as a lost copy: marked rebuild-required, and then kept in pending-delete by
    *  discardLostStore like any other. A served one is first taken out of service as a failed backend is, and its
    *  rebuild waits for a later check. Returns whether the rebuild may go on now. */
-  private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
+  private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
     val storePath = local.devicePath / storeId.directoryName
     if !os.exists(storePath) ||
-       os.exists(storePath / RebuildingStore.RebuildCompleteMarkerFile) ||
+       RebuildingStore.isRebuildCompleteFor(storePath, episode) ||
        os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
       true
     else if ctx.loader.isOpening(storeId) then
@@ -633,19 +661,21 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           // this request's own, so the rebuild is started now rather than at the next periodic check (Todo 5.10).
           // Starting it is idempotent should the entry be another writer's
           val retry = StopRetrying.collisionRetry()
+          // One episode for every attempt, so a retry recognizes its own commit by it
+          val episode = UUID.randomUUID()
           ctx.client.transactUntilSuccessfulWithRecovery(retry.onFailure) { tx =>
             for
               ptr <- ctx.client.getStorageDevicePointer(storageDeviceId)
               kvos <- ctx.client.read(ptr)
               state = StorageDeviceState(kvos)
             yield
-              val status = state.stores.get(storeId).map(_.status)
-              val active = status.contains(StorageDeviceState.StoreStatus.Active)
+              val entry = state.stores.get(storeId)
+              val active = entry.exists(_.status == StorageDeviceState.StoreStatus.Active)
               val ours = !state.isFailed && state.hostId == ctx.hostId
-              if ours && retry.mayHaveCommitted && status.contains(StorageDeviceState.StoreStatus.Rebuilding) then
+              if ours && retry.mayHaveCommitted && entry.exists(_.rebuildEpisode.contains(episode)) then
                 true
               else if ours && active then
-                val newState = state.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
+                val newState = state.setRebuilding(storeId, episode)
                 tx.update(ptr, None, None,
                   List(KeyRevision(StorageDeviceState.StateKey,
                     kvos.contents(StorageDeviceState.StateKey).revision)),
@@ -685,7 +715,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  in which another store's discard could take it. A failure frees the slot and leaves everything in place for a
    *  later check.
    */
-  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
+  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
     val storePath = local.devicePath / storeId.directoryName
     if !os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
       true
@@ -713,7 +743,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               // A device unloaded meanwhile is discarded by whichever load of it comes next
               if ctx.devices.devices.get(local.storageDeviceId).exists(_ eq local) then
                 if moveLostStoreToPendingDelete(local, storeId) then
-                  startRebuild(local, storeId)
+                  startRebuild(local, storeId, episode)
       false
 
   /** Renames a discarded store's directory into pending-delete, durably. Returns whether the path is clear. */

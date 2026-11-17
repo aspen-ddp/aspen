@@ -17,6 +17,7 @@ import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, StoreCreation}
 import scribe.Logging
 
+import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{FiniteDuration, SECONDS}
@@ -42,13 +43,25 @@ object RebuildingStore:
 
   /** In a store directory a rebuild produced, from just before its move into place until its tree entry leaves
    *  Rebuilding. Written durably by finish in staging, so it is at the store's path the moment the directory is.
-   *  It says two things. The directory is this rebuild's output: start() takes a directory at the store's path for
-   *  a finished rebuild only when it carries the marker (any other one is retired as a lost copy by
-   *  StoreRebuilds.startRebuild, Rebuild F3). And the store is not in service yet: StoreLoader.tryLoadStore leaves
-   *  it offline, so a crash between the move and the flip cannot have a restart serve it as a blank acceptor while
+   *  Its content is the rebuild's episode (StoreEntry.rebuildEpisode; empty for None). It says two things. The
+   *  directory is this rebuild's output: start() takes a directory at the store's path for a finished rebuild only
+   *  when it carries the marker of the current episode (any other one, a copy finished for an earlier Rebuilding
+   *  episode included, is retired as a lost copy by StoreRebuilds.startRebuild, Rebuild F3). And the store is not
+   *  in service yet: StoreLoader.tryLoadStore leaves it offline, so a crash between the move and the flip cannot have a restart serve it as a blank acceptor while
    *  the tree still says Rebuilding (Rebuild F4). Removed once the flip commits (StoreRebuilds), or by the
    *  reconcile for an Active entry after a crash between the flip and the removal (DeviceReconciler) */
   val RebuildCompleteMarkerFile = "rebuild-complete"
+
+  /** The content of the rebuild-complete marker of `episode` */
+  def rebuildCompleteContent(episode: Option[UUID]): String = episode.map(_.toString).getOrElse("")
+
+  /** Whether `storePath` carries the rebuild-complete marker of `episode`. An unreadable marker names no episode */
+  def isRebuildCompleteFor(storePath: os.Path, episode: Option[UUID]): Boolean =
+    val marker = storePath / RebuildCompleteMarkerFile
+    try
+      os.exists(marker) && os.read(marker).trim == rebuildCompleteContent(episode)
+    catch
+      case NonFatal(_) => false
 
   /** In a store directory being discarded: the store's device-CRL entries, saved by CrashRecoveryLog.saveStoreState
    *  before they are dropped from the device CRL, which a rebuild onto the same device would otherwise recover */
@@ -143,6 +156,8 @@ class RebuildingStore(client: AspenClient,
                       storageDeviceId: StorageDeviceId,
                       devicePath: os.Path,
                       backends: BackendOpener,
+                      /** The Rebuilding episode this rebuild runs for (StoreEntry.rebuildEpisode) */
+                      episode: Option[UUID] = None,
                       checkpointInterval: Int = RebuildingStore.CheckpointInterval,
                       testingOnlyFailKeys: Set[Key] = Set(),
                       testingOnlyOutOfSpaceKeys: Set[Key] = Set(),
@@ -225,15 +240,16 @@ class RebuildingStore(client: AspenClient,
   private def start(): Unit =
     val f =
       try
-        if os.exists(finalPath / RebuildCompleteMarkerFile) then
+        if isRebuildCompleteFor(finalPath, episode) then
           // A crash between the move and the flip. The store is already whole; there is nothing to
           // rebuild, only the flip left, and that is Host's job on completion.
           logger.info(s"Rebuild of $storeId: store already in place at $finalPath")
           cleanupStaging()
           Future.unit
         else if os.exists(finalPath) then
-          // Not this rebuild's output. StoreRebuilds.startRebuild retires such a directory before it starts a
-          // rebuild, so this is only a defence: the directory is left alone and the rebuild fails
+          // Not this rebuild's output (no marker, or one of an earlier Rebuilding episode). StoreRebuilds.startRebuild
+          // retires such a directory before it starts a rebuild, so this is only a defence: the directory is left
+          // alone and the rebuild fails
           Future.failed(new IllegalStateException(
             s"Rebuild of $storeId: $finalPath holds a store directory that no rebuild finished"))
         else
@@ -271,7 +287,14 @@ class RebuildingStore(client: AspenClient,
     passStartMillis = System.currentTimeMillis()
     // The checkpoint is never deleted on restart -- reading it is what makes a restart a
     // resume.
-    val resume = RebuildState.load(stagingPath)
+    // Only this episode's: a checkpoint left by an earlier Rebuilding episode of the store (re-placed away and
+    // back since) describes a copy that missed everything written while the store lived elsewhere
+    val resume = RebuildState.load(stagingPath).filter: st =>
+      val own = st.episode == episode
+      if !own then
+        logger.warn(s"Rebuild of $storeId: discarding the staging checkpoint of an earlier Rebuilding episode " +
+                    s"(${st.episode}, now $episode); the rebuild starts over")
+      own
 
     resume.foreach: st =>
       synchronized:
@@ -653,7 +676,7 @@ class RebuildingStore(client: AspenClient,
 
   private def saveCheckpoint(): Unit =
     val (k, f, l) = synchronized((lastKey, failed, listedAllocations))
-    RebuildState.save(stagingPath, RebuildState(storeId, k, f, l.values.toList))
+    RebuildState.save(stagingPath, RebuildState(storeId, episode, k, f, l.values.toList))
     synchronized(checkpointTrace += "checkpoint")
 
   /** Retry everything the walk could not read. Anything still failing leaves the store
@@ -701,7 +724,8 @@ class RebuildingStore(client: AspenClient,
    *  device is Rebuilding with `acceptLoss` (AspenClient.acceptRebuildLoss). A failed read counts as no. */
   private def lossAccepted(): Future[Boolean] =
     client.getStorageDeviceState(storageDeviceId)
-      .map(_.stores.get(storeId).exists(e => e.status == StorageDeviceState.StoreStatus.Rebuilding && e.acceptLoss))
+      .map(_.stores.get(storeId).exists(e => e.status == StorageDeviceState.StoreStatus.Rebuilding &&
+                                             e.rebuildEpisode == episode && e.acceptLoss))
       .recover:
         case NonFatal(t) =>
           logger.warn(s"Rebuild of $storeId: could not read whether its losses are accepted: $t")
@@ -758,7 +782,7 @@ class RebuildingStore(client: AspenClient,
       // A new life for the store, replacing any incarnation the staging directory carried
       StoreIncarnationFile.writeFresh(stagingPath)
       // Last before the move: the directory is a finished rebuild, kept out of service until its flip commits
-      DurableFiles.write(stagingPath / RebuildCompleteMarkerFile, "")
+      DurableFiles.write(stagingPath / RebuildCompleteMarkerFile, rebuildCompleteContent(episode))
 
       os.move(stagingPath, finalPath)
       // Durable before the store is reported in place: a device shut down and moved after this

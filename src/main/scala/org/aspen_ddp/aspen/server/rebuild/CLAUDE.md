@@ -9,12 +9,19 @@
   `server/store/CLAUDE.md`)
 - `finish` also writes a fresh `incarnation` file (`StoreIncarnationFile.writeFresh`) into staging, overwriting any
   present, after `acceptor-since` and before the marker: a rebuilt store is a new incarnation
+- Rebuild episode (rebuild-process.md 2.1, B18): every transition into Rebuilding writes a fresh UUID into the
+  entry's `transferId` (`StorageDeviceState.setRebuilding`, `StoreEntry.rebuildEpisode`), and `RebuildingStore`
+  runs for the episode the reconcile read (`StoreRebuildFactory.createRebuild`'s `episode`). The checkpoint carries
+  it (`RebuildState.episode`); `runPass` treats one of another episode as no checkpoint, so staging is discarded
+  and the walk starts over. `lossAccepted` honours `acceptLoss` only on an entry of its episode
 - Completion identity (Rebuild F3, F4): `finish` writes a durable `rebuild-complete` marker in staging just before
-  the move. A store directory carrying it is a finished rebuild awaiting its flip: `start()` takes the final path
-  for done only with the marker, `StoreLoader.tryLoadStore` leaves it offline, and `StoreRebuilds` removes it once
+  the move; its content is the episode (empty for None). A store directory carrying it is a finished rebuild awaiting
+  its flip: `start()` takes the final path for done only with the marker of its own episode
+  (`RebuildingStore.isRebuildCompleteFor`), `StoreLoader.tryLoadStore` leaves it offline, and `StoreRebuilds` removes it once
   the flip commits (before the load, or after the transfer-out pair for `AdoptOffline`); the reconcile's Completed
   Rebuilds pass removes it for an Active entry after a crash. A directory at a Rebuilding store's path with neither
-  this marker nor `rebuild-required` is retired as a lost copy (`StoreRebuilds.retireForeignCopy`: marked, kept in
+  this episode's marker nor `rebuild-required` (a copy finished for an earlier episode included) is retired as a lost
+  copy (`StoreRebuilds.retireForeignCopy`: marked, kept in
   `pending-delete/`, rebuilt)
 - Pending allocations (Rebuild F10): before each pass's walk, `queryPeers` asks the pool's other stores
   (`CurrentAllocationsRequest`) and waits, resending, for `width - writeThreshold + 1` answers. That many answers

@@ -455,7 +455,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     // cleanupStaging rather than about a directory that was never there.
     val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
     os.makeDir.all(staging)
-    RebuildState.save(staging, RebuildState(storeId, Some(Key(Array[Byte](7))), Nil, Nil))
+    RebuildState.save(staging, RebuildState(storeId, None, Some(Key(Array[Byte](7))), Nil, Nil))
 
     for
       _ <- populate(20)
@@ -515,7 +515,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- backends.create(StoreConfig.forPool(storeId, pstate), staging, dev / StoreCreation.CreatingDirectory)
       allocatedKeys = ids.map(id => Key(id.toBytes))
       sorted = allocatedKeys.sortWith(ByteArrayKeyOrdering.lt)
-      _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil, Nil))
+      _ = RebuildState.save(staging, RebuildState(storeId, None, Some(sorted(9)), Nil, Nil))
 
       // The rebuild should resume from that key
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
@@ -533,6 +533,71 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       (restoredBytes intersect allocatedBytes) should be(expectedBytes)
       // The checkpoint key should be in the restored set (inclusive resume)
       restoredBytes should contain(sorted(9).bytes.toList)
+
+  /** A checkpoint at the 10th allocated key, written by a pass of `checkpointEpisode`, resumed by a rebuild of
+   *  `rebuildEpisode`: the allocated keys the rebuild restored, the expected resumed range, and the marker it left */
+  private def resumeAcrossEpisodes(checkpointEpisode: Option[UUID],
+                                   rebuildEpisode: Option[UUID]): Future[(Set[List[Byte]], Set[List[Byte]], Set[List[Byte]], String)] =
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    for
+      ids <- populate(20)
+      _ <- net.waitForTransactionsToComplete()
+      staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+      pstate <- client.getStoragePoolState(storeId.poolId)
+      _ <- backends.create(StoreConfig.forPool(storeId, pstate), staging, dev / StoreCreation.CreatingDirectory)
+      sorted = ids.map(id => Key(id.toBytes)).sortWith(ByteArrayKeyOrdering.lt)
+      _ = RebuildState.save(staging, RebuildState(storeId, checkpointEpisode, Some(sorted(9)), Nil, Nil))
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                    rebuildEpisode, checkpointInterval = 5, testingOnlyTrackRestoredKeys = true)
+      _ <- rebuild.complete
+    yield
+      val allocated = sorted.map(_.bytes.toList).toSet
+      (rebuild.testingOnlyRestoredKeys.map(_.bytes.toList).toSet intersect allocated,
+       sorted.drop(9).map(_.bytes.toList).toSet,
+       allocated,
+       os.read(dev / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile))
+
+  atest("a resume continues a checkpoint of its own Rebuilding episode"):
+    given ExecutionContext = executionContext
+    val episode = UUID.randomUUID()
+    resumeAcrossEpisodes(Some(episode), Some(episode)).map: (restored, resumed, _, marker) =>
+      restored should be(resumed)
+      // The finished copy names the episode that produced it
+      marker should be(episode.toString)
+
+  atest("a checkpoint of an earlier Rebuilding episode is discarded and the walk starts over (RB-W3)"):
+    given ExecutionContext = executionContext
+    // The store was re-placed away and back since the checkpoint: objects before its key may have changed while the
+    // store lived elsewhere, with no ErrorTree entry left for this copy
+    val current = UUID.randomUUID()
+    resumeAcrossEpisodes(Some(UUID.randomUUID()), Some(current)).map: (restored, _, allocated, marker) =>
+      restored should be(allocated)
+      marker should be(current.toString)
+
+  atest("a finished copy of an earlier Rebuilding episode is not taken for this rebuild's output (RB-W3)"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val earlier = UUID.randomUUID()
+    os.makeDir.all(dev / storeId.directoryName)
+    os.write.over(dev / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile, earlier.toString)
+    for
+      _ <- populate(5)
+      _ <- net.waitForTransactionsToComplete()
+      later = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                  Some(UUID.randomUUID()), testingOnlyTrackRestoredKeys = true)
+      refused <- later.complete.transform(scala.util.Success.apply)
+      own = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                Some(earlier), testingOnlyTrackRestoredKeys = true)
+      taken <- own.complete.transform(scala.util.Success.apply)
+    yield
+      // Not promoted, not overwritten: StoreRebuilds retires such a copy before a rebuild starts
+      refused.failed.get shouldBe an[IllegalStateException]
+      later.testingOnlyRestoredKeys should be(Nil)
+      os.read(dev / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile) should be(earlier.toString)
+      // The episode that finished it takes it for done
+      taken should be(scala.util.Success(()))
+      own.testingOnlyRestoredKeys should be(Nil)
 
   atest("the checkpoint is written after the flush, not before"):
     given ExecutionContext = executionContext
@@ -778,7 +843,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // A checkpoint part-way through, as a crashed pass leaves it
       _ = os.makeDir.all(staging)
       sorted = ids.map(id => Key(id.toBytes)).sortWith(ByteArrayKeyOrdering.lt)
-      _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil, Nil))
+      _ = RebuildState.save(staging, RebuildState(storeId, None, Some(sorted(9)), Nil, Nil))
       _ = opener.lose = true
       lost = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener)
       outcome <- lost.complete.transform(scala.util.Success.apply)

@@ -31,7 +31,7 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
 
   test("a state with no progress round-trips"):
     val dir = tmpDir()
-    val state = RebuildState(storeId, None, Nil, Nil)
+    val state = RebuildState(storeId, None, None, Nil, Nil)
     RebuildState.save(dir, state)
     RebuildState.load(dir) should be(Some(state))
 
@@ -40,7 +40,7 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
     // An arbitrary non-UTF8 byte sequence: allocation-tree keys are raw ObjectId bytes, so the
     // encoding has to survive bytes that are not printable characters.
     val key = Key(Array[Byte](0, 1, -1, 127, -128, 42))
-    val state = RebuildState(storeId, Some(key),
+    val state = RebuildState(storeId, None, Some(key),
       List(objectId("22222222-2222-2222-2222-222222222222"),
            objectId("33333333-3333-3333-3333-333333333333")),
       Nil)
@@ -58,7 +58,7 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
     val pending = List(
       PendingAllocation(TransactionId(UUID.fromString("44444444-4444-4444-4444-444444444444")), true, List(data, kv)),
       PendingAllocation(TransactionId(UUID.fromString("77777777-7777-7777-7777-777777777777")), false, Nil))
-    RebuildState.save(dir, RebuildState(storeId, None, Nil, pending))
+    RebuildState.save(dir, RebuildState(storeId, None, None, Nil, pending))
     val loaded = RebuildState.load(dir).get.pendingAllocations
     loaded.map(p => (p.transactionId, p.committed)) should be(pending.map(p => (p.transactionId, p.committed)))
     loaded.map(_.pointers.map(_.toArray.toList)) should be(pending.map(_.pointers.map(_.toArray.toList)))
@@ -73,15 +73,15 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
 
   test("save overwrites an existing checkpoint"):
     val dir = tmpDir()
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](1))), Nil, Nil))
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](2))), Nil, Nil))
+    RebuildState.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](1))), Nil, Nil))
+    RebuildState.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](2))), Nil, Nil))
     RebuildState.load(dir).get.lastRestoredKey.map(_.bytes.toList) should be(Some(List[Byte](2)))
 
   test("save replaces the checkpoint by rename rather than truncating it in place"):
     val dir = tmpDir()
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](1))), Nil, Nil))
+    RebuildState.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](1))), Nil, Nil))
     val first = fileKey(dir / RebuildState.stateFilename)
-    RebuildState.save(dir, RebuildState(storeId, Some(Key(Array[Byte](2))), Nil, Nil))
+    RebuildState.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](2))), Nil, Nil))
     val second = fileKey(dir / RebuildState.stateFilename)
 
     // Aspen is crash-only, so a crash between a truncate and the write that follows it is the

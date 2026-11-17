@@ -23,10 +23,13 @@ import scala.util.control.NonFatal
  *  wedge the walk forever, and they are retried at the end of the pass. `pendingAllocations` are
  *  every allocation the pool's other stores listed as unfinalized at the peer query of any pass so
  *  far (Rebuild F10): a resume sweeps them again, since one finalized meanwhile may have its tree
- *  entry behind `lastRestoredKey`, where no walk looks. Pointers are hex-encoded `ObjectPointer`s.
+ *  entry behind `lastRestoredKey`, where no walk looks. Pointers are hex-encoded `ObjectPointer`s. `episode` is the
+ *  Rebuilding episode that wrote it (StoreEntry.rebuildEpisode, absent for None): a rebuild resumes only its own
+ *  episode's checkpoint, so one left by an earlier Rebuilding episode of the store is discarded.
  *
  *  ```
  *  store-id: 00000000-0000-0000-0000-000000000000:0
+ *  episode: 55555555-5555-5555-5555-555555555555
  *  last-restored-key: '0a1b2c'
  *  failed-objects:
  *    - 22222222-2222-2222-2222-222222222222
@@ -37,6 +40,7 @@ import scala.util.control.NonFatal
  *  ```
  */
 case class RebuildState(storeId: StoreId,
+                        episode: Option[UUID],
                         lastRestoredKey: Option[Key],
                         failedObjects: List[ObjectId],
                         pendingAllocations: List[PendingAllocation]):
@@ -61,7 +65,8 @@ case class RebuildState(storeId: StoreId,
           s"  - transaction-id: ${p.transactionId.uuid}\n    committed: ${p.committed}\n    pointers: [$ptrs]\n"
         .mkString
 
-    s"store-id: $storeId\n" + keyLine + failedLines + pendingLines
+    val episodeLine = episode.map(e => s"episode: $e\n").getOrElse("")
+    s"store-id: $storeId\n" + episodeLine + keyLine + failedLines + pendingLines
 
 
 object RebuildState extends YObject[RebuildState] with Logging:
@@ -80,12 +85,13 @@ object RebuildState extends YObject[RebuildState] with Logging:
   private val hex = HexFormat.of()
 
   val storeId: Required[StoreId] = Required("store-id", StoreId.YStoreId)
+  val episode: Optional[UUID] = Optional("episode", YUUID)
   val lastRestoredKey: Optional[String] = Optional("last-restored-key", YString)
   val failedObjects: Required[List[UUID]] = Required("failed-objects", YList(YUUID))
   // Required: a checkpoint without it does not load, so its pass starts over, walking the whole tree
   val pendingAllocations: Required[List[PendingAllocation]] = Required("pending-allocations", YList(YPending))
 
-  val attrs: List[Attr] = storeId :: lastRestoredKey :: failedObjects :: pendingAllocations :: Nil
+  val attrs: List[Attr] = storeId :: episode :: lastRestoredKey :: failedObjects :: pendingAllocations :: Nil
 
   object YPending extends YObject[PendingAllocation]:
     val transactionId: Required[UUID] = Required("transaction-id", YUUID)
@@ -101,6 +107,7 @@ object RebuildState extends YObject[RebuildState] with Logging:
   def create(o: Object): RebuildState =
     RebuildState(
       storeId.get(o),
+      episode.get(o),
       lastRestoredKey.get(o).map(s => Key(hex.parseHex(s))),
       failedObjects.get(o).map(u => ObjectId(u)),
       pendingAllocations.get(o))

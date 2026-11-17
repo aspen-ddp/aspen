@@ -29,8 +29,9 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
     val backends = new DefaultBackendOpener(executionContext)
     val dev = os.temp.dir(prefix = "rebuild-accept-loss")
 
-    def rebuild(failKeys: Set[Key]): RebuildingStore =
-      new RebuildingStore(client, storeId, net.secondDeviceId, dev, backends, testingOnlyFailKeys = failKeys)
+    def rebuild(failKeys: Set[Key], episode: Option[java.util.UUID]): RebuildingStore =
+      new RebuildingStore(client, storeId, net.secondDeviceId, dev, backends, episode,
+                          testingOnlyFailKeys = failKeys)
 
     for
       ids <- Future.sequence((0 until 5).toList.map: i =>
@@ -52,12 +53,14 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       _ <- waitForTransactionsToComplete()
 
       doomed = Key(ids.head.toBytes)
-      unaccepted <- rebuild(Set(doomed)).complete.transform(Success(_))
+      placed <- client.getStorageDeviceState(net.secondDeviceId)
+      episode = placed.stores(storeId).rebuildEpisode
+      unaccepted <- rebuild(Set(doomed), episode).complete.transform(Success(_))
 
       _ <- client.acceptRebuildLoss(storeId)
       _ <- waitForTransactionsToComplete()
       flagged <- client.getStorageDeviceState(net.secondDeviceId)
-      accepted <- rebuild(Set(doomed)).complete.transform(Success(_))
+      accepted <- rebuild(Set(doomed), episode).complete.transform(Success(_))
 
       pool <- client.getStoragePool(PoolId.BootstrapPoolId)
       lostEntry <- pool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ids.head))
@@ -68,6 +71,9 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       unaccepted.isFailure should be(true)
       flagged.stores(storeId).status should be(StorageDeviceState.StoreStatus.Rebuilding)
       flagged.stores(storeId).acceptLoss should be(true)
+      // The acceptance keeps the entry's episode, so it applies to this rebuild
+      flagged.stores(storeId).rebuildEpisode should be(episode)
+      episode should not be(None)
       // With it the rebuild finishes, and the lost object, only that one, is recorded for repair
       accepted should be(Success(()))
       os.exists(dev / storeId.directoryName / StoreConfig.configFilename) should be(true)
@@ -108,6 +114,65 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       toState.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
       pool.stores(storeId.poolIndex).storageDeviceId should be(to)
       pool.stores(storeId.poolIndex).hostId should be(toState.hostId)
+
+  atest("a rebuild re-placed away and back starts a new episode and does not resume the old one's checkpoint (RB-W3)"):
+    given ExecutionContext = executionContext
+    val failedId = StorageDeviceId.BootstrapStorageDeviceId
+    val storeId = StoreId(PoolId.BootstrapPoolId, 0.toByte)
+    val backends = new DefaultBackendOpener(executionContext)
+    // Stands in for the directory of the device the rebuild first runs on
+    val dev = os.temp.dir(prefix = "rebuild-episode")
+
+    for
+      ids <- Future.sequence((0 until 10).toList.map: i =>
+               client.transactUntilSuccessful: tx =>
+                 given Transaction = tx
+                 tx.replaySafe("test")
+                 client.getStoragePool(PoolId.BootstrapPoolId).flatMap: pool =>
+                   pool.allocator.allocateDataObject(Array[Byte](i.toByte)).map(_.id))
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.failStorageDevice(failedId)
+      _ <- waitForTransactionsToComplete()
+      task <- taskForEnrolled(failedId)
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS), "task completion")
+      _ <- waitForTransactionsToComplete()
+      placed <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      from = placed.stores(storeId.poolIndex).storageDeviceId
+      to = if from == net.secondDeviceId then net.thirdDeviceId else net.secondDeviceId
+      first <- client.getStorageDeviceState(from)
+      earlier = first.stores(storeId).rebuildEpisode
+
+      // The first episode's rebuild walks the whole tree, checkpointing, and is stopped (its host goes down)
+      stopped = new RebuildingStore(client, storeId, from, dev, backends, earlier, checkpointInterval = 1,
+                                    testingOnlyAfterWalk = () => Future.failed(new Exception("host down")))
+      _ <- stopped.complete.transform(Success(_))
+      staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+      checkpoint = RebuildState.load(staging)
+
+      // Re-placed away while its host is down, then back
+      _ <- client.replaceRebuild(storeId, to)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.replaceRebuild(storeId, from)
+      _ <- waitForTransactionsToComplete()
+      back <- client.getStorageDeviceState(from)
+      current = back.stores(storeId).rebuildEpisode
+
+      resumed = new RebuildingStore(client, storeId, from, dev, backends, current,
+                                    testingOnlyTrackRestoredKeys = true)
+      outcome <- resumed.complete.transform(Success(_))
+    yield
+      earlier should not be(None)
+      checkpoint.flatMap(_.episode) should be(earlier)
+      checkpoint.flatMap(_.lastRestoredKey) should be(defined)
+      current should not be(None)
+      current should not be(earlier)
+      outcome should be(Success(()))
+      // Every object restored again, none taken from the earlier episode's copy
+      val restored = resumed.testingOnlyRestoredKeys.map(_.bytes.toList).toSet
+      ids.map(id => Key(id.toBytes).bytes.toList).toSet.subsetOf(restored) should be(true)
+      os.read(dev / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile) should be(current.get.toString)
 
   atest("a failed device's stores are reconstructed on a live device"):
     given ExecutionContext = executionContext

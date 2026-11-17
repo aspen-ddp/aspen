@@ -14,6 +14,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome, TransferOutcome}
 import scribe.Logging
 
+import java.util.UUID
 import scala.concurrent.Future
 
 /** The reads and transactions a Host performs against the storage-device, storage-pool and host metadata. Each
@@ -32,6 +33,7 @@ trait DeviceMetadata:
 
   def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
                              storeId: StoreId,
+                             episode: Option[UUID],
                              gossipStoreOnline: StoreId => Unit): Future[RebuildOutcome]
 
   def adoptDevice(storageDeviceId: StorageDeviceId,
@@ -113,6 +115,11 @@ object DeviceMetadata:
      *  reconcile restarts the rebuild, which finds the store already at its final path and only
      *  flips the entry. */
     case NotOwned
+
+    /** The entry is Rebuilding on this device under another episode than the rebuild's (StoreEntry.rebuildEpisode):
+     *  the store was re-placed away and back while it ran. Nothing was written; the copy, whose rebuild-complete
+     *  marker names the earlier episode, is never promoted, and the current episode's rebuild retires it. */
+    case Superseded
 
   /** What completeDeviceShutdown decided, so shutDownDevice knows whether to unload the device,
    *  go round again, or undo its own on-disk work.
@@ -389,6 +396,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
    */
   def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
                              storeId: StoreId,
+                             episode: Option[UUID],
                              gossipStoreOnline: StoreId => Unit): Future[RebuildOutcome] =
     // An attempt that committed but was reported TransactionOutcomeUnknown leaves the entry Active, and its
     // tx.result, which gossips the store online, failed. The retry gossips it instead (Todo 5.10)
@@ -411,6 +419,11 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
           RebuildOutcome.NotOwned
         else
           state.stores.get(storeId) match
+            case Some(entry) if entry.status == StorageDeviceState.StoreStatus.Rebuilding &&
+                                entry.rebuildEpisode != episode =>
+              // Re-placed away and back since the rebuild began: the copy predates the current episode. No update
+              RebuildOutcome.Superseded
+
             case Some(entry) if entry.status == StorageDeviceState.StoreStatus.Rebuilding =>
               // Offline on a device asked to shut down since the rebuild began; see serviceStatus.
               val status = state.serviceStatus
@@ -572,7 +585,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
                 markRebuildRequired(devicePath / storeId.directoryName)
               val reactivated = state.withOfflineStoresActive.copy(hostId = hostId, status = DeviceStatus.Operational)
               val newState = crlLost.foldLeft(reactivated): (st, storeId) =>
-                st.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
+                st.setRebuilding(storeId, UUID.randomUUID())
               tx.update(devPtr, None, None,
                 List(KeyRevision(StorageDeviceState.StateKey, devKvos.contents(StorageDeviceState.StateKey).revision)),
                 List(Insert(StorageDeviceState.StateKey, newState.encode())))

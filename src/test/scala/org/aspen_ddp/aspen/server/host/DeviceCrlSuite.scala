@@ -133,9 +133,9 @@ private class HookedMetadata(base: DeviceMetadata, beforeComplete: () => Future[
     base.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid, gossipRetransmitter)
   def readHostStateForEndpoint(): Future[HostState] = base.readHostStateForEndpoint()
   def abortLostTransfer(storeId: StoreId): Future[Boolean] = base.abortLostTransfer(storeId)
-  def markRebuiltStoreActive(storageDeviceId: StorageDeviceId, storeId: StoreId,
+  def markRebuiltStoreActive(storageDeviceId: StorageDeviceId, storeId: StoreId, episode: Option[UUID],
                              gossipStoreOnline: StoreId => Unit): Future[RebuildOutcome] =
-    base.markRebuiltStoreActive(storageDeviceId, storeId, gossipStoreOnline)
+    base.markRebuiltStoreActive(storageDeviceId, storeId, episode, gossipStoreOnline)
   def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId, devicePath: os.Path,
                   uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
                   crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],

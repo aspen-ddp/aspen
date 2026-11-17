@@ -205,11 +205,11 @@ reported commit vote may not be durable. paxos-transactions.md is right; the reb
 tolerance (`t - r` lost commit voters), which is the only regime in which the allocation is restorable anyway.
 
 ### 5.4 Re-applied Inserts "are healed by reconcile"
-transaction-recovery.md (invariants, "Forgotten transactions are not replayed") lists "Inserts after a later delete"
-among residual classes "healed by reconcile". transaction-requirements.md Q-W3 shows the re-apply passes its re-check,
-reports success in `TxCommitted`, and leaves no ErrorTree or UnackedCommits entry, so no reconcile runs.
-transaction-requirements.md is right. For a re-allocation at a store that never saw T, healing happens only if the
-deletion's ErrorTree mark for that store is still unconsumed when the zombie appears.
+Resolved. A re-apply (a recovered commit vote, or one applying through its UnackedCommits entry) that would insert a
+key now absent, on an object a later transaction reached, quarantines the object instead of writing the key back
+(transaction-requirements.md 10.5c). transaction-recovery.md section 9 no longer lists Inserts after a later delete
+among the residual classes. A re-allocation at a store that never saw T is still healed only if the deletion's ErrorTree
+mark for that store is unconsumed when the zombie appears.
 
 ### 5.5 "Nothing of a lost store is destroyed before its rebuild succeeds"
 rebuild-process.md (invariant B3 and "the discard of a marked store (nothing destroyed)") states it; so does

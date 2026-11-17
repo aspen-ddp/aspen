@@ -124,7 +124,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   it) apply through the entry (`Tx.unackedCommitFound`; `None` logged at info). Every Tx that looks up holds its own
   commit vote, which may be the counted one the commit relied on: with `t = r` (Replication(3, 2)) skipping it can
   leave T below the read threshold, beyond reconcile. A vote that did not count is a replay's, which passed T's pin,
-  so T is what the store lacks (residual: a blind Insert of T over a later delete, transaction-requirements Q-W3).
+  so T is what the store lacks. An object on which T would insert a key now absent, past T's start, is quarantined
+  instead of applied: the key may have been deleted since (transaction-requirements.md 10.5c).
   `Found` of another incarnation (a rebuilt store, Rebuild N3) logs both at info and calls
   `Tx.unackedCommitNotOwed`: T committed, and nothing is applied through the entry, held
   aborts dropped and never accepted. A recovered or expiring commit vote does as for a matching entry, applying
@@ -235,7 +236,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   no stub is harmless at a store that saw T: it never
   rejoins T, so no replay Tx exists there to apply through it (a second driver's lost TxFinalized included). Residual:
   a store that never saw T (below a quorum): its entry can exist only through the unknown-voters case, which names no
-  incarnation. A replay Tx there that voted commit applies T through it on a late commit (its vote passed T's pin);
+  incarnation. A replay Tx there that voted commit applies T through it on a late commit (its vote passed T's pin; an
+  object whose key T inserts was deleted since is quarantined, not re-inserted);
   otherwise the entry's reconcile installs the committed state, since repair leaves the entry until the store can no
   longer join T
   (`server/repair/CLAUDE.md`; transaction-recovery Todo 2.9 re-assessment)
@@ -248,7 +250,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - A commit voter unlocks before applying (`Tx.doCommit`). An applied object is still ordered by the in-flight
   commit marker, but one it cannot apply would leave its counted vote standing for neither, so the store
   fail-stops (`server/store/CLAUDE.md`, Fail-stop), logging an `INVARIANT VIOLATION` for a live voter (F10). A
-  recovered voter whose re-check fails quarantines the object until repair verifies it (`Tx.quarantining`; `server/store/CLAUDE.md`, Quarantine)
+  recovered voter whose re-check fails quarantines the object until repair verifies it, and so does any re-apply
+  (recovered or through its entry) that would write back a key deleted since (`Tx.quarantining`;
+  `server/store/CLAUDE.md`, Quarantine)
 - A commit decision can overtake the data too. The store holds the commit until the data, a client's prepare, or
   TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
   if the data beat the finalizer's `errorTimeout` (2 s). Stores that miss it are marked in the ErrorTree

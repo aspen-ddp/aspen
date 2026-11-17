@@ -481,7 +481,9 @@ class Frontend(val storeId: StoreId,
   /** Quarantines an object a recovered commit vote could not apply its committed update to (Tx.issueCommits). Before
     * the crash the store may have applied it and a later transaction superseded it, or the state may have been
     * invalidated under the recovered locks: the vote then counts with neither its lock nor its update. The store does
-    * not tell these apart. Every transaction on the object votes abort, as the lock would have made it, and committed
+    * not tell these apart. A re-apply (recovered, or through an UnackedCommits entry) that would insert a key now absent
+    * on an object a later transaction reached is quarantined too, applied nothing: the key may have been deleted since
+    * (RequirementsApplyer.mayReinsertDeletedKeys). Every transaction on the object votes abort, as the lock would have made it, and committed
     * ones apply nothing to it (reported, so their finalizers mark the store for repair), until a verification
     * (QuarantineVerifier) shows the store's copy matches a read of the object no older than `minTimestamp`, the
     * transaction's start: what repair requires before it drops an ErrorTree entry for the transaction. Repair is not
@@ -489,11 +491,11 @@ class Frontend(val storeId: StoreId,
     *
     * In memory only: the quarantining transaction's CRL state, object data included, is kept until the quarantine
     * clears (concludeTransactionState), so a reloaded store recovers it, fails the same re-check, and quarantines the
-    * object again. Nothing is written for this. It replaces the fail-stop a live voter gets, so it declares no lost store
+    * object again. Nothing is written for this. It declares no lost store, unlike the fail-stop a live voter gets
     */
   def quarantine(pointer: ObjectPointer, minTimestamp: HLCTimestamp, txid: TransactionId, reason: String): Unit =
     val oid = pointer.id
-    logger.error(s"Store $storeId quarantines object $oid: recovered commit vote of transaction $txid cannot apply its " +
+    logger.error(s"Store $storeId quarantines object $oid: the commit vote of transaction $txid does not apply its " +
       s"committed update ($reason). Every transaction on it votes abort until repair verifies the store's copy is at " +
       s"least as new as $minTimestamp")
     testingOnlyQuarantines += 1

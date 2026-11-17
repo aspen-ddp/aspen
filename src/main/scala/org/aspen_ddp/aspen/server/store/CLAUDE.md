@@ -39,8 +39,8 @@
   and blind object-level ops (`BlindKeyValueWrite`), and stores refuse them too (`RequirementsChecker.refuseBlindWrites`,
   `BlindWrite`, at vote and apply re-check): unless the transaction allocates the object, a key Delete needs a
   `KeyRevision` on its key, a required revision or a content lock, and a min/max/left/right change a required revision
-  (a content lock does not move the revision a repair proof locks; repair F4, F11). Residual: a late or replayed
-  Insert after a later delete of its key resurrects it, like a `DoesNotExist` ABA (Todo 2.9)
+  (a content lock does not move the revision a repair proof locks; repair F4, F11). A re-apply (a recovered commit
+  vote, or one applying through its UnackedCommits entry) never writes back a key deleted since: see Quarantine
 - Allocations (transaction-requirements F11): an object in `txd.allocatingObjects` is loaded like any other (cache,
   `deleting`, backend read). Only a backend miss gives the fresh `Allocating` state (`Tx.allocationLoaded`). An
   existing state goes into `Tx.allocatedOver`, and every requirement on it fails with `ObjectExists`, at vote and at
@@ -178,7 +178,12 @@
   re-check fails may have been superseded before the crash (10.5a) or invalidated under its locks, and the store does
   not tell these apart. Each changed object it could not apply is quarantined, except one the backend missed and the
   Tx allocates (`allocatedHere`: no copy, no lost lock; one whose data was dropped was applied and then deleted, which
-  no read verifies), which is reported (R-F17). Every transaction on a quarantined object votes abort
+  no read verifies), which is reported (R-F17). Before the apply, a re-apply (recovered, or through an UnackedCommits
+  entry: `Tx.appliesThroughEntry`) also leaves out and quarantines every object on which it would insert a key now
+  absent while the object's timestamp is past T's start (`RequirementsApplyer.mayReinsertDeletedKeys`): T may have
+  inserted it and a later transaction deleted it, and the re-check would pass again (transaction-requirements.md
+  10.5c). The object is never counted as skipped, so a live Tx applying through its entry does not fail-stop. Every
+  transaction on a quarantined object votes abort
   (`ObjectQuarantined`), and committed ones apply nothing to it and report it. Repair is not held off, unlike
   `commitFailed`. The store asks its host to verify the object (`QuarantineVerifier`, Host →
   `RepairService.verifyObject`, bounded by `VerifyDeadline`, 30 s). It clears once `StoreRepairer.verifyObject` reports the copy complete against a

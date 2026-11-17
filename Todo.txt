@@ -39,16 +39,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.3  Recovered DoesNotExist / blind Insert re-applies after a later delete of its key: Q-W3                [M]
-     PLAUSIBLE. A committed Tx's object data stays in the CRL until TxFinalized; a later delete of the key can be
-     applied and finalized first. After a crash or transfer the recovered vote re-checks (DoesNotExist passes
-     again), re-inserts k at that store only, reports success, and nothing is marked: permanent divergence,
-     resurrection on a second event. Fix (recovery path only): quarantine a changed KV object whose timestamp is
-     later than T's start, or record the delete durably (persistWithoutUpdateOf analog). A second path needs no
-     crash: a replay at a store that never saw T applies it late through an UnackedCommits entry naming no
-     incarnation (transaction-recovery.md section 7); a recovery-path-only fix does not cover it. Also fixes
-     contradiction X 5.4 (transaction-recovery.md section 9 overclaims reconcile healing).
-
 2.4  Expiry status replies report a commit vote that may not be durable: P-W1                              [S]
      PLAUSIBLE. Tx.statusForExpiry reports votedCommit from memory before the vote's CRL save completes, and a
      vote decided just before the freeze boundary is never saved. A crash then loses the vote and its lock while
@@ -204,7 +194,7 @@ PRIORITY 7: documentation corrections
 7.1  Contradictions between safety docs (cross-document-review.md section 5)                               [S]
      5.2 a prover is forgotten only on TxFinalized or a late outcome (fix paxos-transactions.md proof section and
      transaction-recovery.md 4.4); 5.3 rebuild-process.md 5.3 "expiry never discards a committed, unfinalized Tx"
-     is false (rule D). 5.1, 5.4, 5.5, 5.7 are fixed with 2.5, 2.3, 3.1, 2.7.
+     is false (rule D). 5.1, 5.5, 5.7 are fixed with 2.5, 3.1, 2.7 (5.4 is resolved).
 
 7.2  Architecture.md contention rules do not match the driver: P-W4                                        [S]
      Abort needs more than w - t abort votes; no-commit-vote does not abort (the tally waits); no timestamps are

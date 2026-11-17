@@ -355,8 +355,9 @@ entry)", charged to `CrlAdmission` and carrying T's start (crash-recovery-log.md
 * **Entries without stubs.** An entry with no stub is harmless at a store that saw T: it never rejoins T, so no Tx
   exists there to apply through it. A store that never saw T can hold a replay's Tx only above its floor; its entry,
   if any, comes from the unknown-voters case and names no incarnation. A replay's commit vote there passed T's pin, so
-  a late commit applies T through the entry, which is the update the store lacks (residual: transaction-requirements
-  Q-W3, a non-pinned key T writes blindly, deleted since). A replay that voted abort applies nothing, and the entry's
+  a late commit applies T through the entry, which is the update the store lacks. A non-pinned key T inserts that a
+  later transaction deleted (absent again, on an object past T's start) is not written back: the object is
+  quarantined until repair verifies it (transaction-requirements.md 10.5c). A replay that voted abort applies nothing, and the entry's
   reconcile installs T; repair leaves the entry until the store can no longer join T
   (`RepairTarget.mayJoinTransaction`).
 
@@ -508,8 +509,9 @@ state, and Paxos, safe with offline acceptors, never chooses abort once commit w
   leaves T at one other store, below the read threshold, so reconcile could never restore it. Every Tx that looks up
   holds its own commit vote, so an unknown entry is applied. If that vote did not count, it is a replay's vote, which
   passed T's pin: the pinned object is before T here, and T's committed update is what the store lacks. A rebuilt store
-  whose `acceptorSince` mute a skewed clock defeated is in the same position. The residual is a non-pinned object of T
-  changed since (a blind Insert of a key deleted later), transaction-requirements Q-W3.
+  whose `acceptorSince` mute a skewed clock defeated is in the same position. A non-pinned object of T changed since
+  is guarded at the apply: an Insert of a key now absent, on an object past T's start, is not applied, and the
+  object is quarantined (`appliesThroughEntry`; transaction-requirements.md 10.5c).
 * **Entry found naming another incarnation** (`Tx.unackedCommitNotOwed`): T committed, but nothing is applied
   through the entry. A recovered or expiring vote resolves committed without writing the cache, drops its held aborts
   unaccepted, releases its locks, proves the commit to its driver, applies nothing (`notOwedHere`, reporting its
@@ -632,8 +634,10 @@ lookup that finds no entry.
 * **Forgotten transactions are not replayed.** A replayed prepare of a committed, forgotten, pinned transaction is
   refused below every floor; inside the window it cannot collect `t` commit votes on its pinned object, and with a
   proof it resolves late and applies only where an entry names the store's own incarnation. A store holding a stub
-  never applies T again. Residual classes (replay-safe transactions, Inserts after a later delete, allocations after a
-  persisted deletion at a store that never saw T) are in transaction-requirements.md and are healed by reconcile.
+  never applies T again. Residual classes (replay-safe transactions, allocations after a persisted deletion at a store
+  that never saw T) are in transaction-requirements.md; a re-allocation is healed by reconcile only while the
+  deletion's ErrorTree mark for that store is unconsumed. A re-apply that would write back a key deleted since
+  quarantines the object instead (transaction-requirements.md 10.5c).
 * **Missed commits are repairable.** A store that does not apply a committed update either has its ErrorTree marks
   and, if owed, its entry, or T is not finalized yet (its finalizer is being retried, alarmed after 60 s).
 * **Apply at most once per store**, given a revision or per-key check on the object; an applied stub covers a replay
@@ -732,8 +736,9 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 * No driver starts while a store's CRL state loads, costing a client retransmit of latency.
 * Duplicate recovery drivers each run the finalization actions once.
 * A store that never saw T, whose entry names no incarnation (the unknown-voters case), applies T through it if a
-  replayed prepare reached it and voted commit; a blind Insert of T can then reinstate a key deleted since, at that
-  store only (transaction-requirements Q-W3).
+  replayed prepare reached it and voted commit. An object on which T would reinstate a key deleted since is
+  quarantined instead, which costs a verification and abort votes on the object until it completes
+  (transaction-requirements.md 10.5c).
 * A transaction undecidable at expiry (too many rebuilt or forgetting primary stores, ExpiryTally rule G) holds its
   locks and CRL state, logged `UNDECIDABLE TRANSACTION`; a repair read of an allocation it holds stalls the scan
   (Backlog.txt, "Repair scan stalls on an allocation held past expiry").

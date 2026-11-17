@@ -298,8 +298,9 @@ object whose backend commit failed, or that is quarantined, gets an abort vote (
 **R6 (apply is idempotent where requirements pin a version).** Applying re-checks the requirements; a failing object
 is skipped and reported in `TxCommitted.objectCommitErrors`, which makes the finalizer mark the store for repair.
 Revision, refcount and checked key requirements make a transaction apply at most once per store and never over a
-later chained write. A blind Insert re-applies harmlessly (last writer wins). Exception: a `DoesNotExist` or blind
-Insert re-applied after a later delete of its key (Q-W3).
+later chained write. A blind Insert re-applies harmlessly (last writer wins). A re-apply (a recovered commit vote, or
+one applying through its UnackedCommits entry) that would insert a key now absent, on an object whose timestamp is
+past T's start, is not applied: the key may have been deleted since, so the object is quarantined (10.5c).
 
 **R7 (no divergence between replicas).** Committed transactions not ordered by R1 either touch disjoint keys and no
 common object-level field (K/N/X locks at the common store), or are blind Inserts of one key (last writer wins), so
@@ -448,7 +449,7 @@ time.
 
 ### 8.5 A commit voter that cannot apply: fail-stop, quarantine, poison
 
-`Tx.issueCommits`, for a commit voter (`disposition == VoteCommit`), after the apply:
+`Tx.issueCommits`, for a commit voter (`disposition == VoteCommit`):
 
 * an apply that threw (`result.failed`) fail-stops the store (`Frontend.failStop`), live or recovered;
 * a **live** voter with any skipped object, other than one that already shows the update (`appliedBy`) or one whose
@@ -456,8 +457,11 @@ time.
   transaction each such object now shows. This test is over every skipped object, lock-only ones included (Q-W1);
 * a **recovered** voter's skipped changed objects, except those already applied and allocations the backend missed
   (`allocatedHere`), are quarantined (`Frontend.quarantine`), and an already quarantined changed object is
-  quarantined by this vote too. Its re-check may fail legitimately (section 10.5a), which the store cannot tell from a
-  state invalidated under recovered locks.
+  quarantined by this vote too. Its re-check may fail legitimately (section 10.5a), which the store cannot tell from
+  a state invalidated under recovered locks;
+* before the apply, a re-apply (recovered, or applying through its UnackedCommits entry) leaves out every object on
+  which it would insert a key now absent while a later transaction has reached the object, and quarantines it
+  (10.5c). The object is never counted as skipped, so a live Tx applying through its entry does not fail-stop.
 
 A fail-stopped store drops every transaction message, read, repair and heartbeat, and `Store.onFailStop` has its host
 mark it rebuild-required and unload it. Every fail-stop is a lost-store declaration (Backlog.txt, "System-level
@@ -504,8 +508,8 @@ through the same `releaseObjects`.
 
 A non-voter that applies a revision-chained update after a later unrelated update raised the object's timestamp
 (a refcount change or blind Insert with a later start) fails `ObjectTimestampError` at the re-check, skips and is
-repaired. The same order at a commit voter is Q-W1. The argument stops at a `DoesNotExist` or blind Insert whose
-store re-applies it after a later delete of its key (Q-W3).
+repaired. The same order at a commit voter is Q-W1. A re-applied `DoesNotExist` or blind Insert whose key a later
+transaction deleted is quarantined rather than applied (10.5c), so it never writes the key back.
 
 ### 9.4 Deletion and allocation
 
@@ -598,8 +602,17 @@ missing update: `MissingObjectUpdate` at the re-check, and the allocation rule o
 
 (c) A recovered commit vote re-applies its update when its outcome is learned. Revision, refcount and `KeyRevision`
 requirements fail on a store that applied a later chained write, which quarantines the object until repair
-verifies it. A blind Insert re-applies harmlessly. A `DoesNotExist` or blind Insert after a later delete of the key
-re-applies: Q-W3.
+verifies it. A blind Insert over a present key re-applies harmlessly (last writer wins). A `DoesNotExist` or blind
+Insert of a key now absent passes its re-check again, yet T may have inserted it before the crash and a later
+transaction deleted it (its object data stays in the CRL until `TxFinalized`, so T2 may be applied and finalized
+first). Re-inserting it would leave one store holding a deleted key with nothing marked. So a re-apply of a
+`KeyValueUpdate` without a required revision that Inserts an absent key, on an object whose timestamp is past T's
+start (some later transaction reached it), applies nothing to that object and quarantines it
+(`RequirementsApplyer.mayReinsertDeletedKeys`, `Tx.issueCommits`); the verification installs the read state,
+whether that holds T's key or its deletion. The same holds for a Tx applying through its UnackedCommits entry
+(`Tx.unackedCommitFound`): a replay at a store that never saw T votes commit on the post-delete state. A live voter
+needs no such test: it has held the key's lock since its own check. The cost is a verification for a recovered
+vote that never applied T on an object that took writes to other keys meanwhile.
 
 (d) A recovered vote whose saved status is resolved (a prepare or accept after the resolution re-saved it) restores the
 resolution, takes no locks (R13) and applies the commit or deletes the abort's state once loaded.
@@ -619,7 +632,8 @@ the stale ones (at most `w - t`) pass. Abort. (b) `DoesNotExist(k)` with an old 
 still holding the key fail, and the commit needs `t` fresh stores: correct. (c) A blind Insert resurrects the key by
 design, on every store alike. (d) A delete's commit reaching a lagging store before the insert it is built on: its
 `KeyRevision` fails there, the store skips and reports it, then applies the insert: repaired. (e) Re-apply of an insert
-from a recovered CRL record after a later delete: Q-W3.
+from a recovered CRL record (or through an UnackedCommits entry) after a later delete: the object is quarantined, not
+re-inserted (10.5c).
 
 ### 10.8 Lock-deferral and holder lifetime
 
@@ -707,40 +721,3 @@ rare `applying`-over-a-lock case, which costs nothing on the hot path). Keep the
 Add a FrontendSuite test for each trigger above (deterministic: deliver T's `TxResolved` to S before U's).
 
 Effort: M   Priority: 3
-
-### Q-W3. A recovered `DoesNotExist` or blind Insert re-applies after a later delete of its key (PLAUSIBLE; resurrection, permanent replica divergence)
-
-Mechanism: `SimpleCRL.dropTransactionObjectData` only flags the in-memory record (`crl/CLAUDE.md`), so a committed
-transaction's object data stays durable until its CRL state is deleted at `TxFinalized`. A later transaction on the
-object may vote and commit once the first's backend commit persisted (R9), before the first is finalized. After a
-crash (or a store transfer, which moves the CRL state with `readStoreState`), the first is recovered as a commit vote
-and, if its peers have not yet finalized it, learns a non-late commit and re-applies through `issueCommits`. Its
-re-check passes where its key requirement is `DoesNotExist(k)` (or there is none) and a later transaction deleted k:
-k is absent again. `insertWins(None, ..)` is true, so the Insert writes k back. `appliedBy` finds no trace (k is gone),
-but nothing consults it because the re-check passed, so the store reports success in `TxCommitted` and nothing is
-marked. `Tx.persistWithoutUpdateOf` closes the same hole for a deleted allocated object, not for a deleted key.
-
-Trigger / scenario: T1 inserts a new key k with the TKVL default (`PutRequirement.Checked` gives `DoesNotExist(k)` for
-an absent key), for example the allocate-and-insert pattern whose `AllocationFinalizationAction` lengthens T1's
-finalization. T2 deletes k (`KeyRevision(k, T1)`) and is applied, persisted and finalized at store S while T1's
-finalization is still running. S crashes, or is transferred, and recovers before T1's `TxFinalized` is sent. T1's
-recovered vote is driven, learns commit from its peers' status caches, and re-inserts k at S only. If T2's state is also
-still in the CRL and re-applies after T1, the stores converge; if T2 was finalized first, they do not. A second path
-needs no crash: a replayed prepare of T1 at a store that never saw it votes commit (k is absent there too) and, given
-a late commit, applies T1 through an UnackedCommits entry naming no incarnation (transaction-recovery.md section 7),
-after repair has already brought that store to T2's state.
-
-Consequence: S alone holds a deleted key, with no ErrorTree or UnackedCommits entry: permanent divergence of one
-replica until a later write of k fails its check at S and gets S marked. Reads use a majority and are unaffected, but
-S's votes on k are wrong (a `DoesNotExist(k)` insert votes abort there), and a second such event at another store
-would make a read return the resurrected key.
-
-Suggested fix: on the recovery path only, have a recovered commit vote whose changed KV object's timestamp is later
-than T's start (some later transaction applied after it, which R9 allows only after T's own commit persisted, or over
-its lock) quarantine the object instead of applying, so repair verifies it; or record durably, when a key Delete is
-applied while an unfinalized Tx's CRL state holds an Insert of that key, that the Insert must not re-apply (the
-`persistWithoutUpdateOf` analog). Add a FrontendSuite test: commit T1 (`DoesNotExist` insert), commit and finalize
-T2 (delete), restart the store with T1's CRL record, resolve T1 committed, expect the key absent or the object
-quarantined.
-
-Effort: M   Priority: 2

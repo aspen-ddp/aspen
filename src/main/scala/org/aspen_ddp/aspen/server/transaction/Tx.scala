@@ -172,6 +172,12 @@ class Tx( trs: TransactionRecoveryState,
     */
   private var foundUnackedEntry = false
 
+  /** This Tx applies its update through its UnackedCommits entry (unackedCommitFound), not having held its locks up
+    * to the commit as a live voter does: its apply is a re-apply, as a recovered vote's is (issueCommits,
+    * RequirementsApplyer.mayReinsertDeletedKeys)
+    */
+  private var appliesThroughEntry = false
+
   /** See foundUnackedEntry */
   def provesCommitToItsDriver: Boolean = foundUnackedEntry && ofinalized.isEmpty
 
@@ -986,7 +992,18 @@ class Tx( trs: TransactionRecoveryState,
       logger.warn(s"Tx $transactionId. Store $storeId does not apply the committed update of object $objectId: it is " +
         s"quarantined until repair verifies it")
     }
-    val notApplied = failedHere ++ quarantinedHere
+    // A re-apply (a recovered vote, or one applying through its UnackedCommits entry) does not take an object on which
+    // it may write back a key a later transaction deleted: it is quarantined below instead
+    val reapply = disposition == TransactionDisposition.VoteCommit && (recovered || appliesThroughEntry)
+    val mayReinsert =
+      if !reapply then Set[ObjectId]()
+      else RequirementsApplyer.mayReinsertDeletedKeys(transactionId, txd.startTimestamp, requirements,
+        objects.filter((oid, _) => !failedHere.contains(oid) && !quarantinedHere.contains(oid)), ou)
+    mayReinsert.foreach { objectId =>
+      logger.warn(s"Tx $transactionId. Store $storeId does not re-apply the committed update of object $objectId: it " +
+        s"inserts a key now absent, on an object a later transaction reached, which may have deleted it")
+    }
+    val notApplied = failedHere ++ quarantinedHere ++ mayReinsert
 
     val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, requirements,
       objects -- notApplied, ou, frontend.maxSliceSize, allocatedOver, txd.allocatingObjects)
@@ -1030,6 +1047,15 @@ class Tx( trs: TransactionRecoveryState,
     // every other transaction on it misses and votes abort. A recovered allocation fails its apply only without its
     // data, which the CRL drops once the update is applied: the object was applied and later deleted, which a read
     // can never verify, so a quarantine would never clear (transaction-recovery F17). It is reported instead
+    //
+    // A re-apply that may write back a key deleted since (mayReinsert) is quarantined too, live or recovered: the
+    // store cannot tell whether it applied the update and a later transaction deleted the key, or never applied it.
+    // Repair's verification installs whichever the object's read shows
+    if mayReinsert.nonEmpty then
+      quarantining ++= mayReinsert
+      mayReinsert.foreach: oid =>
+        frontend.quarantine(pointerOf(oid), txd.startTimestamp, transactionId,
+          "it would insert a key a later transaction may have deleted")
     if disposition == TransactionDisposition.VoteCommit then
       if recovered then
         val threw = result.failed -- notApplied
@@ -1040,7 +1066,7 @@ class Tx( trs: TransactionRecoveryState,
             .filter(oid => changed.contains(oid) && objects.contains(oid) && !allocatedHere.contains(oid))
           val toQuarantine = invalidated ++ quarantinedHere
           if toQuarantine.nonEmpty then
-            quarantining = toQuarantine
+            quarantining ++= toQuarantine
             toQuarantine.foreach: oid =>
               frontend.quarantine(pointerOf(oid), txd.startTimestamp, transactionId,
                 result.skippedReasons.get(oid).map(_.toString).getOrElse("already quarantined"))
@@ -1472,6 +1498,7 @@ class Tx( trs: TransactionRecoveryState,
       // Applied through the entry: the stub replaces the CRL state when the Tx is forgotten (addendum A, case 2). A
       // stub already held means the store has the update, and doCommit applies nothing
       stubDue = true
+      appliesThroughEntry = true
       // Found after an expiry Discard: no quorum holds T, so it committed and was finalized, and no TxFinalized will
       // come. Applied and forgotten as a held late commit is
       val late = lateCommitHeld || expiryDiscardDecided

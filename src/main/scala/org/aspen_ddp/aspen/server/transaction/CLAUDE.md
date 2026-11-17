@@ -47,8 +47,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - Every object is classified (paxos F8): commit-certain (`c >= t`), abort-certain (`w - a < t`) or undecided. Any
   abort-certain object decides abort at once; all commit-certain decides commit. An undecided tally only waits (silence
   may be transient): a driver never proposes abort on it, since a client may learn commit from stores' votes. Expiry
-  ends such a Tx (the expiry rules below; an abort voter means no store's update reaches the read threshold, or no
-  commit accept exists to choose; rebuild F6). A proposed abort (abort-certain tally) is an ordinary Paxos proposal
+  ends such a Tx (the expiry rules A-G below). A proposed abort (abort-certain tally) is an ordinary Paxos proposal
   (paxos-transactions P7a): an accepted value in the quorum still wins
 - Proposer ids are pool indexes, so only the primary pool's stores propose (`TransactionDriver.mayPropose`). A driver on
   any other store is learn-only: it sends prepares and resolves, proves late and finalizes from what it hears, but sets
@@ -155,29 +154,34 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   `votedCommit` (a commit voter holds T's update for its objects) and `amnesiac` (a rebuilt store, for T started
   before its `acceptorSince`, `Frontend.mayHaveForgottenUndecided`: no state, but its old incarnation may have
   accepted T). A silent store counts as possibly having accepted commit and possibly holding the update
-- The pure `ExpiryTally.decide` rules, in order. `w`, `t`: the primary pool's width and write threshold; `r`: each
-  changed object's pool's read threshold, `IDA.consistentRestoreThreshold` (a majority, never `restoreThreshold`).
-  In the primary pool `ac` stores report commit as their latest accept, `k` are amnesiac, `sp` silent; per changed
-  pool `vc` voted commit and `s` are silent.
+- The pure `ExpiryTally.decide` rules, in order (client 1-RTT commit design, section 4.3(b); proofs in
+  `ExpiryTally.decideUnknown`'s scaladoc, checked exhaustively by `ExpiryTallyConsistencySuite`). Two lemmas carry
+  them, both from immutable votes and from drivers proposing abort only on an abort-certain tally: **L1** every
+  accepted abort traces back to an abort-certain tally (so some object never had `t` commit votes: no commit was
+  chosen or reported), **L2** every accepted commit to a commit-certain tally or a proof (commit is T's only outcome).
+  Counts per pool of every referenced object, changed or lock-only, with that pool's write threshold `t`: `vc` replied
+  and voted commit, `k` amnesiac, `s` silent; every other replier is a provable non-commit-voter. Primary pool: `aa` /
+  `ac` report abort / commit as their latest accept, `k_p` its amnesiac stores. Per changed pool `r` is its read
+  threshold, `IDA.consistentRestoreThreshold` (a majority, never `restoreThreshold`).
   (1) **Adopt** any reply with an outcome (a commit over an abort): a committed one through `TxResolved` (late if
   finalized or late, so a commit vote looks up its entry), an aborted one as a `TxFinalized` abort.
-  (2) **Commit** when `ac > w - t` and every changed pool has `vc >= r`. Any quorum that chose abort would include one
-  of the `ac` stores, whose latest accept would then be abort, so abort was never chosen; those stores are frozen and
-  the other `t - 1` cannot form a quorum, so nothing is chosen again; and the update is held at its read threshold.
-  The deciding store sends `TxResolved(commit)` to every store of T, applies it (a commit voter's locks have kept its
-  locked parts unchanged: repair defers to a store's own locks, and a conflicting commit would need a locked voter),
-  and its driver finalizes it (`Frontend.onExpiryCommit` -> `Store.finalizeExpiryCommit`), whose missed-update marks
-  repair the stores that never applied it.
-  (3) **Discard** when some changed pool has `vc + s < r` (the update can never be restored: if `ac + k + sp >= t` a
-  commit may have been chosen, and an error says a committed update may be lost, unless T was finalized), or when
-  `ac + k + sp < t` and `ac + sp <= w - t` (no commit is chosen and unfinalized: its `t` acceptors would still hold
-  it, be amnesiac or be silent; nothing new can be chosen; and no observer can see the commit rule's `ac`).
-  (4) **Hold** otherwise: some store is silent, or, every store reported, more stores lost acceptor state than the
-  pool tolerates (logged `UNDECIDABLE TRANSACTION`, then every `Frontend.UndecidableLogRounds` rounds). The latter
-  needs `k >= 2t - w`, beyond the decision's tolerance, which is never less than the data's (`t - r`), so in practice
-  only pools with no margin above their read threshold, such as Replication(3, 2), reach it.
-  Rules 2 and 3 never both hold, for any observers: frozen states never change, a silent store counts on both sides,
-  and a store leaves a count only by deciding, after which it reports its outcome (rule 1).
+  (A) **Commit** when every referenced pool has `vc >= t` (no tally was abort-certain, so by L1 no abort was accepted;
+  a client may have learned commit from these votes). (B) **Commit** when `ac >= 1` and every changed pool has
+  `vc >= r` (L2). (C) **Discard** when `aa >= 1` (L1). (D) **Discard** when some changed pool has `vc + s < r` (the
+  update can never be restored; `dataLost`, logged as an error, when `ac >= 1` or every pool has `vc + k + s >= t`: a
+  commit may have been chosen or reported). (E) **Discard** when some pool has `vc + k + s < t` (no tally was
+  commit-certain). (F) **Commit** when no store of T is silent, every pool has `vc + k >= t`, `k_p < t` and every
+  changed pool has `vc >= r` (only the amnesiac stores, fewer than a quorum, could hide an accepted abort; a
+  conflicting commit would need a locked voter since `t + r > w`). (G) **Hold** otherwise: some store is silent, or,
+  every store reported, `k_p >= t` (logged `UNDECIDABLE TRANSACTION`, then every `Frontend.UndecidableLogRounds`
+  rounds; with a changed primary object D fires first, so only an unchanged primary object reaches it).
+  On a commit (A, B, F) the deciding store sends `TxResolved(commit)` to every store of T, applies it (a commit
+  voter's locks have kept its locked parts unchanged: repair defers to a store's own locks, and a conflicting commit
+  would need a locked voter), and its driver finalizes it (`Frontend.onExpiryCommit` -> `Store.finalizeExpiryCommit`),
+  whose missed-update marks repair the stores that never applied it.
+  No two observers reach a commit and a discard: reported states are final, so observers differ only in which stores
+  are silent to them, and a store silent to one observer only adds to the other's `vc + s` / `vc + k + s`. With every
+  store replied and none amnesiac (rebuild F6) either A or E fires.
   A Tx that knows its outcome passes it (`known`): rule 1 then adopts only a finalized or late commit of a known
   commit, and otherwise it concludes once more than `w - t` primary stores are non-holders (no acceptor state and not
   amnesiac: a commit is forgotten only at TxFinalized), or holds

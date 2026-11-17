@@ -423,9 +423,9 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
     // store learns it: its leader, store 0, alone on its host, loses its host and its CRL before it finalizes. Store
     // 0 is rebuilt, blank, and promoted at once; store 4 never hears of T. Past the horizon stores 1-3, the only
     // holders left, cannot form a quorum and ask their peers. Counting the rebuilt store as a non-holder would make
-    // them discard a commit the client was told of. Instead three stores report commit as their latest accept, more
-    // than width - writeThreshold, so abort was never chosen; and three commit voters hold the update, its read
-    // threshold. So they decide commit, apply it and finalize it (ExpiryTally.Decision.Commit)
+    // them discard a commit the client was told of. Instead stores report commit as their latest accept, which traces
+    // back to a commit-certain tally (L2), and three commit voters hold the update, its read threshold (rule B). So
+    // they decide commit, apply it and finalize it (ExpiryTally.Decision.Commit)
     val lost = 0
     val absent = sid(4)
     val hostA = net.newHost()

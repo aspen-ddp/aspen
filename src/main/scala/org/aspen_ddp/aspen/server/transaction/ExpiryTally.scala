@@ -6,8 +6,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionStatus}
 
 /** How an unresolved Tx past the transaction horizon decides from its peers' status replies (transaction horizon
-  * design, section 2, decision rules 1-4). Pure: the UnackedCommits check a commit voter makes before it discards is
-  * its caller's (Frontend)
+  * design, section 2, rule 1; client 1-RTT commit design, section 4.3(b), rules A-G). Pure: the UnackedCommits check
+  * a commit voter makes before it discards is its caller's (Frontend)
   */
 object ExpiryTally:
 
@@ -16,25 +16,28 @@ object ExpiryTally:
       * late-commit path (an UnackedCommits lookup for a commit voter)
       */
     case Adopt(committed: Boolean, finalizedOrLate: Boolean)
-    /** Rule 2 (repair): abort was never chosen and never can be, and enough commit voters hold T's update to restore
-      * each changed object at its read threshold. T is decided committed here: applied for real and finalized, and
-      * the finalization's missed-update marks repair the stores that never applied it
+    /** Rules A, B and F (decideUnknown): abort was never chosen and never can be (A: every pool has its write
+      * threshold of commit votes; B: an accepted commit; F: every store replied and too few are amnesiac to hide a
+      * chosen abort), and enough commit voters hold T's update to restore each changed object at its read threshold.
+      * T is decided committed here: applied for real and finalized, and the finalization's missed-update marks repair
+      * the stores that never applied it
       */
     case Commit
-    /** Rule 3: T can never be applied (`dataLost`: too few commit voters hold its update for some changed object, so
-      * any commit of it is lost, as an object below its read threshold is), or no commit of it is chosen and
-      * unfinalized and none ever can be. Discarded here, a commit voter only once its UnackedCommits lookup finds no
-      * entry. A Tx that knows its outcome concludes it instead
+    /** Rules C, D and E (decideUnknown): an accepted abort (C), T's update can never be restored for some changed
+      * object (D; `dataLost`: a commit may have been chosen or reported, so a committed update is lost, as an object
+      * below its read threshold is), or some pool never had its write threshold of commit votes (E). No commit of T is
+      * chosen and unfinalized, and none ever can be. Discarded here, a commit voter only once its UnackedCommits
+      * lookup finds no entry. A Tx that knows its outcome concludes it instead (decideKnown)
       */
     case Discard(dataLost: Boolean)
-    /** Rule 4: some store's state is still unknown (it is silent), or, with every store reported (`undecidable`),
-      * more stores lost their acceptor state than the pool tolerates
+    /** Rule G: some store's state is still unknown (it is silent), or, with every store reported (`undecidable`),
+      * at least the primary pool's write threshold of stores lost their acceptor state, beyond its tolerance
       */
     case Hold(undecidable: Boolean)
 
   /** @param replies the replies of one query round, by the store that sent them, the asking store's own included.
-    *                A store absent from it was silent: its state is unknown, so it counts both as possibly holding a
-    *                commit accept and as possibly voting commit. `None`: "unknown", from a store with no Tx and no
+    *                A store absent from it was silent: its state is unknown, so it counts as possibly having voted
+    *                or accepted anything. `None`: "unknown", from a store with no Tx and no
     *                cached outcome below its forget floor, which neither holds T nor ever can. An unresolved Tx
     *                replies only once frozen (past expiry by its own clock, Tx.frozen), so a reported state is final:
     *                its vote is immutable and it accepts nothing more. A rebuilt store reports `amnesiac` for T started
@@ -76,45 +79,96 @@ object ExpiryTally:
     if nonHolders > ida.width - ida.writeThreshold then Decision.Discard(dataLost = false)
     else Decision.Hold(undecidable = false)
 
-  /** Rules 2-4 for a Tx that does not know the outcome. In the primary pool (width `w`, write threshold `t`):
-    * `ac` stores report commit as their latest accepted value, `k` are amnesiac and `sp` are silent. For each pool of a
-    * changed object (read threshold `r`, IDA.consistentRestoreThreshold): `vc` stores voted commit and hold T's update,
-    * and `s` are silent.
+  /** Rules A-G for a Tx that does not know the outcome (client 1-RTT commit design, section 4.3(b)).
     *
-    * Commit when `ac > w - t` and every changed pool has `vc >= r`. Any quorum that chose abort would include one of
-    * the `ac` stores, whose latest accept would then be abort (Paxos: every proposal above a chosen ballot carries its
-    * value), so abort was never chosen. Those stores are frozen, and the other `t - 1` cannot form a quorum, so
-    * nothing is ever chosen again. And the update is held at its read threshold, so it can be applied and repaired.
+    * Two lemmas carry them. Both follow from votes being immutable and from drivers proposing abort only on an
+    * abort-certain tally (TransactionDriver never aborts an undecided tally past expiry):
+    *  - L1. Every accepted abort traces back to an abort-certain tally: a driver proposes abort only on one, and
+    *    `Proposer.proposalValue` otherwise only re-proposes an accepted value. So if any store holds an accepted abort,
+    *    some object never had `t` commit votes: no commit was ever chosen, and no client was told commit.
+    *  - L2. Every accepted commit traces back to a commit-certain tally (every object had `t` commit votes) or to a
+    *    proof of commit (T's update was already applied, so T committed). Either way commit is T's only outcome.
+    * Abort-certain and commit-certain tallies exclude each other, so accepted aborts and accepted commits never both
+    * exist.
     *
-    * Discard when some changed pool has `vc + s < r` (T's update can never be restored: any commit of it is lost), or
-    * when `ac + k + sp < t` and `ac + sp <= w - t` (no commit is chosen and unfinalized, since its `t` acceptors would
-    * still hold it or be amnesiac, and nothing new can be chosen: no observer can see the commit rule's `ac`).
+    * Counts, per pool of every referenced object (changed or lock-only), with that pool's write threshold `t`: `vc`
+    * stores replied and voted commit, `k` replied amnesiac (they may have voted, or accepted, anything) and `s` are
+    * silent. Every other replier is a provable non-commit-voter: "unknown" (below its floor, it can never join T) or a
+    * frozen Tx that did not vote commit. In the primary pool `aa` / `ac` stores report abort / commit as their latest
+    * accept, and `k_p` / `sp` are its `k` / `s`. Each changed pool has a read threshold `r`
+    * (IDA.consistentRestoreThreshold). In order:
+    *  - A. Commit: every referenced pool has `vc >= t`. No tally was ever abort-certain, so by L1 no abort was
+    *    accepted; and `vc >= t >= r` holders of the update can restore it.
+    *  - B. Commit: `ac >= 1` and every changed pool has `vc >= r`. By L2 commit is the only outcome.
+    *  - C. Discard: `aa >= 1`. By L1 no commit was chosen or reported.
+    *  - D. Discard: some changed pool has `vc + s < r`, so T's update can never be restored. `dataLost` when a commit
+    *    may have been chosen or reported: `ac >= 1`, or every referenced pool has `vc + k + s >= t`.
+    *  - E. Discard: some referenced pool has `vc + k + s < t`. No tally was ever commit-certain, so no commit was chosen
+    *    or reported.
+    *  - F. Commit: no store of T is silent, every referenced pool has `vc + k >= t`, `k_p < t` (primary) and every
+    *    changed pool has `vc >= r`. B and C did not fire and no store is silent, so every non-amnesiac primary store
+    *    accepted nothing. Only the `k_p` amnesiac stores, fewer than a quorum, could hide an accepted abort, so no
+    *    abort was chosen, and no client heard one (a client hears abort only through Paxos). Frozen acceptors and
+    *    muted rebuilt stores accept nothing more, so nothing is chosen later. No conflicting transaction committed: it
+    *    would need `t` commit votes, but T's `vc >= r` voters hold its locks, and `t + r > w`.
+    *  - G. Hold otherwise: some store is silent (transient), or, every store replied, `k_p >= t`, beyond the pool's
+    *    loss tolerance (`undecidable`). With a changed primary object D fires first then (`t + r > w`), so only an
+    *    unchanged primary object reaches it.
     *
-    * The two never both hold, for any observers: a frozen store's vote and accept never change, a silent store counts
-    * on both sides, and a store leaves a count only by deciding, after which it reports its outcome (rule 1). Commit
-    * needs `vc >= r` where discard needs `vc + s < r`, and `ac > w - t` where discard needs `ac + sp <= w - t`.
+    * No two observers reach a commit (A, B, F) and a discard (C, D, E). Reported states are final (an unresolved Tx
+    * replies only once frozen and its objects are loaded), and a store leaves a count only by deciding, after which
+    * it reports its outcome (rule 1), so observers differ only in which stores are silent to them:
+    *  - A or B against C: by L1 and L2, and the exclusion of the two tallies.
+    *  - A or B against E: A's or B's evidence means a tally was commit-certain, so every pool truly has `t` commit
+    *    voters, each still voting commit or amnesiac, and every observer sees `vc + k + s >= t`.
+    *  - A, B or F against D: the commit needs `vc >= r` at its observer, D needs `vc + s < r` at its own, and a store
+    *    silent to one observer can only add to the other's `vc + s`.
+    *  - F against C: F's observer sees every non-amnesiac primary store and finds no accepted abort; C needs one
+    *    reported by a non-amnesiac store, which F's observer would have seen.
+    *  - F against E: F's observer has no silence, so its `vc + k` is the true count, and E's observer counts at least
+    *    that much in `vc + k + s`.
+    * ExpiryTallyConsistencySuite checks this exhaustively over the states the protocol can produce.
+    *
+    * Liveness with every store replied and none amnesiac (rebuild F6): every store is a commit voter or a provable
+    * non-voter, so either every pool has `vc >= t` (A) or some pool has `vc < t = vc + k + s` (E).
     */
   private def decideUnknown(txd: TransactionDescription,
                             replies: Map[StoreId, Option[TxStatusResponse.TxStatus]]): Decision =
-    val ida = txd.primaryObjectIDA
-    val primary = poolStores(txd, txd.primaryObject.poolId).toList
-    val ac = primary.count(st => replies.get(st).flatten.exists(_.accepted.contains(true)))
-    val k = primary.count(st => replies.get(st).flatten.exists(_.amnesiac))
-    val sp = primary.count(st => !replies.contains(st))
-    val changedPools = (txd.allReferencedObjectsSet.filterNot(p => txd.lockOnlyObjects.contains(p.id))
-      .map(_.poolId)).toList
-    // Per changed pool: (commit voters holding the update, silent stores, read threshold)
-    val data = changedPools.map: poolId =>
+    val primaryIda = txd.primaryObjectIDA
+    val primaryPool = txd.primaryObject.poolId
+    def reply(st: StoreId) = replies.get(st).flatten
+    val primary = poolStores(txd, primaryPool).toList
+    val ac = primary.count(st => reply(st).exists(s => !s.amnesiac && s.accepted.contains(true)))
+    val aa = primary.count(st => reply(st).exists(s => !s.amnesiac && s.accepted.contains(false)))
+    /** Per referenced pool: (commit voters, amnesiac stores, silent stores) */
+    final case class Counts(vc: Int, k: Int, s: Int)
+    val counts: Map[PoolId, Counts] = txd.allReferencedObjectsSet.map(_.poolId).iterator.map: poolId =>
       val stores = poolStores(txd, poolId).toList
-      val vc = stores.count(st => replies.get(st).flatten.exists(_.votedCommit))
-      val s = stores.count(st => !replies.contains(st))
-      (vc, s, txd.poolIDAMap(poolId).consistentRestoreThreshold)
-    val margin = ida.width - ida.writeThreshold
-    if ac > margin && data.forall((vc, _, r) => vc >= r) then
-      Decision.Commit
-    else if data.exists((vc, s, r) => vc + s < r) then
-      Decision.Discard(dataLost = ac + k + sp >= ida.writeThreshold)
-    else if ac + k + sp < ida.writeThreshold && ac + sp <= margin then
-      Decision.Discard(dataLost = false)
+      poolId -> Counts(
+        vc = stores.count(st => reply(st).exists(s => !s.amnesiac && s.votedCommit)),
+        k = stores.count(st => reply(st).exists(_.amnesiac)),
+        s = stores.count(st => !replies.contains(st)))
+    .toMap
+    def t(poolId: PoolId) = txd.poolIDAMap(poolId).writeThreshold
+    def r(poolId: PoolId) = txd.poolIDAMap(poolId).consistentRestoreThreshold
+    val changedPools = txd.allReferencedObjectsSet.filterNot(p => txd.lockOnlyObjects.contains(p.id))
+      .map(_.poolId).toList
+    def everyPool(f: (PoolId, Counts) => Boolean) = counts.forall(f.tupled)
+    def changedRestorable = changedPools.forall(p => counts(p).vc >= r(p))
+    val kp = counts.get(primaryPool).map(_.k).getOrElse(0)
+
+    if everyPool((p, c) => c.vc >= t(p)) then
+      Decision.Commit // A
+    else if ac >= 1 && changedRestorable then
+      Decision.Commit // B
+    else if aa >= 1 then
+      Decision.Discard(dataLost = false) // C
+    else if changedPools.exists(p => counts(p).vc + counts(p).s < r(p)) then
+      Decision.Discard(dataLost = ac >= 1 || everyPool((p, c) => c.vc + c.k + c.s >= t(p))) // D
+    else if counts.exists((p, c) => c.vc + c.k + c.s < t(p)) then
+      Decision.Discard(dataLost = false) // E
+    else if counts.valuesIterator.forall(_.s == 0) && everyPool((p, c) => c.vc + c.k >= t(p)) &&
+      kp < primaryIda.writeThreshold && changedRestorable then
+      Decision.Commit // F
     else
-      Decision.Hold(undecidable = replies.size >= txd.allDataStores.size)
+      Decision.Hold(undecidable = replies.size >= txd.allDataStores.size) // G

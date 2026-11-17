@@ -181,7 +181,7 @@ are retained or are a derived copy of data that still exists elsewhere (and the 
 | X8 | Rebuilt or transferred-in copy deleted on `Discard` | `server/host/LocalDevices.scala:51-66`, `StoreRebuilds.scala:245-251` | Derived (rebuilt from peers; or source still holds it) | |
 | X9 | Rebuild staging deleted when staging's backend is `BackendStateLost`, or the final path already exists | `RebuildingStore.scala:224-228,148-152` | Derived | peers |
 | X10 | Transfer receive/staging directories deleted | `server/transfer/StoreTransferManager.scala:263,362,436`; `StoreTransfers.scala:279,407,458,485` | Derived while the source still holds the store | |
-| X11 | Tombstone: device removed from its set and host, ids zeroed; its stores abandoned in favour of rebuilds | `FailedStorageDeviceDurableTask.scala:186-228` | One-way **metadata** change; the old media is not touched but is refused (`DeviceDiscovery.scala:219`) and by design never reintroduced | the physical data on the old device, unusable by the system |
+| X11 | Tombstone: device removed from its set and host, ids zeroed; its stores abandoned in favour of rebuilds | `FailedStorageDeviceDurableTask.scala:186-228` | One-way **metadata** change; the old media is not touched but is refused and by design never reintroduced: the old host's reconcile retires it under a durable `failed` marker (`DeviceShutdown.retireFailedDevice`), an ownership lookup that finds it Failed writes the marker too (`DeviceDiscovery.handleOwnershipResolved`), and `DeviceDiscovery.tryLoadDevice` never loads or claims a device that carries it, whichever host `owning-host` names (rebuild-process F1, fixed 2026-11-09; cross-document C1) | the physical data on the old device, unusable by the system |
 | X12 | CRL entries removed after a transfer-out's save file is durable | `StoreLoader.scala:514-517` | Recoverable: moved to `crl_save.log` first | the save file |
 | X13 | `UnloadFailedStore`: CRL entries dropped, save file kept | `StoreLoader.scala:405-414` | Recoverable | the save file holds the full state |
 | X14 | Silent empty initialization of a blank FSIF directory that also lacks its marker (and RocksDB's `setCreateIfMissing` open) | `FsifBackend.open`, `RocksDBBackend.openDatabase` | **FIXED 2026-11-16**, was destructive but not declared (the store "healthy" and empty). Stores are created atomically (`StoreCreation`), so open never creates: a missing or blank backend is `BackendStateLost`, declared and rebuilt | the peers' copies, through the rebuild |
@@ -245,8 +245,10 @@ These are places where a software change or environmental fault would produce D-
 ## 6. Interaction with the rebuild flaws
 
 * [rebuild-process.md](rebuild-process.md) F2 (destroy first) is what turns every false positive into a loss.
-* F1 (a Failed device's stores are not stopped) means a mistaken `fail-storage-device` is not even cleanly one-way
-  physically; the old replica may keep running beside the new.
+* F1 (a Failed device's stores are not stopped) meant a mistaken `fail-storage-device` was not even cleanly one-way
+  physically; the old replica could keep running beside the new. *Fixed 2026-11-09:* the old host retires the device
+  under a durable `failed` marker and never loads it again (X11). Residual: until its first successful reconcile, a
+  restarted or partition-healed old host may still answer peers holding a stale store-to-host mapping.
 * F15 (no way to complete a rebuild past an unreadable object) means a pool already below threshold leaves its stores
   Rebuilding forever, which consumes the failure budget (rebuild-process section 6.3) indefinitely.
 * F12 (placement may co-locate a pool's stores) increases correlation of later real failures.

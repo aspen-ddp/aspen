@@ -1232,8 +1232,16 @@ CLAUDE.md and not re-verified here.
 
 > **RESOLVED (2026-11-09)** by the X2 fix (cross-document-review.md): the rebuilt store takes no part in any
 > transaction started before its `acceptor-since` time.
+>
+> *Restated 2026-11-16 (cross-document C3, Todo 7.4).* The question below is settled by the mute, not by timing or by
+> the pool's failure tolerance, which gives amnesia none (X2). A rebuilt store neither promises, votes, accepts nor
+> saves in a transaction started before `acceptor-since` (rebuild finish plus 10 s), and answers expiry as
+> `amnesiac`. Every store mutes an unknown transaction starting more than `MaxStartLead` (2 s) ahead of its host's
+> wall clock, so client clocks do not enter (paxos P-N2). Residual (the fast-clock case): an old host whose clock led
+> the rebuilding host's by more than 8 s plus the rebuild's duration could have joined a transaction that starts after
+> `acceptor-since`; and a zombie old copy (cross-document X1) is not muted. See rebuild-process F14.
 
-**Verification: OPEN, not a CRL code defect; PLAUSIBLE only under correlated loss.** Safe in practice by timing: a rebuild takes long enough that every transaction in flight at the loss has been finalized at the other stores, and old prepares vote `TransactionTooOld`. Belongs to the Paxos documents. *(Refresh: `TransactionTooOld` no longer exists; the mute covers it, see the RESOLVED note.)*
+**Verification (superseded by the notes above): OPEN, not a CRL code defect; PLAUSIBLE only under correlated loss.** Safe in practice by timing: a rebuild takes long enough that every transaction in flight at the loss has been finalized at the other stores, and old prepares vote `TransactionTooOld`. Belongs to the Paxos documents. *(Refresh: `TransactionTooOld` no longer exists; the mute covers it, see the RESOLVED note.)*
 
 After a lost CRL the store's directory is discarded and the store rebuilt under the same `StoreId`. A transaction in
 progress at the time had promises and accepts from this acceptor. The rebuild process does not process transactions

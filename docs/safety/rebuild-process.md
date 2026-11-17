@@ -402,6 +402,18 @@ This is the mechanism that closes the "residual staleness" gap described in
 `docs/superpowers/specs/2026-09-01-failed-store-rebuild-design.md` section 5 (which says only repair-on-read heals it);
 the design document predates the ErrorTree.
 
+> *2026-11-16 (cross-document C6, Todo 7.4): the claim holds, with a stated residual.* It rested on repair's own
+> guarantee, which repair-process 13.2 F1, F2, F3, F4 and F13 broke: repair could leave the store stale or declare an
+> entry complete early. Those are now closed. F1 and F2 by deleting the opportunistic and pre-transaction rebuild
+> paths, F4 by stores refusing blind writes (`BlindWrite`), and F13 by treating an older DataObject read with a
+> differing revision as stale (all Todo 2.5, `f55b7afb`). F3 because the completion gate is sound now that timestamps
+> are monotone and copies come from reads (Todo 4.5, `893dfd83`, with F8's settle-wait parking). So an entry for the
+> rebuilt store is deleted only once its copy is complete. What is left is not closed by repair: an object whose copy
+> changes under every install, or never settles, stays stale and is warned about (repair F3/F8 residual). Bootstrap-pool
+> tree writes are swept only once per `scanIntervalCap`, about 15 min (X9 residual, 8.3). And a staleness repair
+> never hears of is not repaired: a miss counts only if the finalizer marked it (8.3, and the ErrorTree mark for every
+> store without `TxCommitted`, repair-process 9.2).
+
 ### 8.3 Known coverage limits
 
 * Tracking is disabled for an ErrorTree write only when that transaction references the pool the entry is about
@@ -493,7 +505,9 @@ Each is a property the code is intended to maintain and is checked by reading; "
 * **B16 Rebuilding survives shutdown, adoption and restart.** Holds (`DeviceShutdown.scala:146`; `adoptDevice` comment
   `:462-468`).
 * **B17 The failed device's stores are not served after the tombstone.** **Does not hold** (F1): the tombstone changes
-  only metadata; a loaded or reloaded device on its old host is not unloaded.
+  only metadata; a loaded or reloaded device on its old host is not unloaded. *Holds since 2026-11-09 (F1 fixed), up
+  to F1's residual: the reconcile retires the device under a durable `failed` marker, and no host loads a device
+  carrying it.*
 * **B18 A rebuild needs a feasibility check against the pool's IDA before the old state is destroyed.** **Does not
   hold** (section 4.3, F2).
 * **B19 Loss declaration is validated against redundancy.** **Does not hold**; see
@@ -575,7 +589,9 @@ the tree (`DeviceDiscovery.scala:474-478`), `tryLoadStore` loads its stores with
 (`StoreLoader.scala:67-97`), and the reconcile for a Failed device only logs (`DeviceReconciler.scala:123-127`). A
 running host is never told to unload it either. The old store therefore serves under the same StoreId while the
 pool names the rebuilt replacement: two live replicas of one acceptor index, and the zombie's repair scans consume
-ErrorTree entries meant for the replacement (F1). Not safe.
+ErrorTree entries meant for the replacement (F1). Not safe. *Safe since 2026-11-09 (F1 fixed, cross-document C1):
+`tryLoadDevice` refuses a device carrying the durable `failed` marker before it reads `owning-host`, and the reconcile
+writes that marker when it reads the device Failed.*
 (ii) *Device carried to another host*: `owning-host` names the old host, so the new host looks the device up
 (`resolveOwnership` `:145-159`) and `handleOwnershipResolved` refuses a Failed device (`:219-220`). Safe.
 (iii) *Rebuild started elsewhere for a non-Failed reason*: not possible; only the operator reassigns.
@@ -925,6 +941,20 @@ device this host did not adopt; its rightful owner then reads them as lost store
 
 > **F14 FIXED (2026-11-09)** with cross-document X2: a rebuilt store mutes prepares for transactions started before
 > its `acceptor-since` time. See cross-document-review.md X2.
+>
+> *Reworded 2026-11-16 (cross-document C3, Todo 7.4).* The body's claim that amnesia "is safe only within the pool's
+> failure tolerance" is wrong and is withdrawn: quorum arithmetic gives amnesia no tolerance at all (X2: in
+> Replication(3,2) one amnesiac acceptor can be the whole `2t - w` intersection that carries a chosen value). Safety
+> rests instead on the mute. A rebuilt store takes no part in any transaction started before its `acceptor-since`
+> time (rebuild finish plus `AcceptorSinceMargin`, 10 s, durable in the store directory): no promise, vote, accept
+> or CRL save, only a proof from an object that shows the update (`Frontend.acceptorSince`, `Tx.muted`), and it
+> answers expiry as `amnesiac`, never as a non-holder (G1). Every store also mutes an unknown transaction whose start
+> leads its host's wall clock by more than `MaxStartLead` (2 s), so the old incarnation joined only transactions
+> started before its host's clock at its stop plus 2 s, whatever the client's clock (paxos P-N2). Residual (the
+> fast-clock case): if the old incarnation's host clock led the rebuilding host's by more than 8 s plus the
+> rebuild's duration, a transaction it joined can start after `acceptor-since`, and the rebuilt store may then
+> promise or accept in it with no memory of its old acceptance. A zombie old copy on a partitioned host (X1, F1
+> residual) is outside the mute too.
 
 **F14 (Low) The rebuilt store is a blank acceptor.**
 Promotion creates a `Frontend` with no transactions (`StoreLoader.scala:304-359`); `TxAccept`/`TxHeartbeat` for
@@ -934,7 +964,7 @@ muted (`Frontend.scala:676`). Paxos acceptor amnesia is safe only within the poo
 failure tolerance; the rebuild path does not check that no in-flight transaction chose a value with this store's
 acceptance. See [paxos-transactions.md](paxos-transactions.md) and [transaction-recovery.md](transaction-recovery.md).
 
-**Verification: OPEN (Paxos-level), PLAUSIBLE only under correlated loss.** Rebuilt stores are blank acceptors (`StoreLoader.scala:304-359`). Safe in practice because rebuilds take far longer than the lifetime of any transaction in flight when the state was lost and old prepares vote `TransactionTooOld` (`Frontend.scala:655`); not a proof. *(Refresh: `TransactionTooOld` was removed; the X2 mute is the protection.)*
+**Verification (superseded by the 2026-11-16 note above): OPEN (Paxos-level), PLAUSIBLE only under correlated loss.** Rebuilt stores are blank acceptors (`StoreLoader.scala:304-359`). Safe in practice because rebuilds take far longer than the lifetime of any transaction in flight when the state was lost and old prepares vote `TransactionTooOld` (`Frontend.scala:655`); not a proof. *(Refresh: `TransactionTooOld` was removed; the X2 mute is the protection.)*
 
 **F15 (Medium) No way to finish a rebuild past a permanently unreadable object.**
 

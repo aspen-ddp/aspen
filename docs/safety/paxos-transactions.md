@@ -237,6 +237,19 @@ refuses. A store answers prepares for transactions found there with
 committed entry is relayed as late (`late = entry.late || entry.finalized`, `TxFinalized(..., late = committed)`,
 `Store.scala:168,180`), which is late-commit evidence (10.5). It is in memory only.
 
+*What the cache is relied on for (stated once, 2026-11-16, cross-document C4, Todo 7.4).* The cache is evidence, not
+only an optimization, and other documents defer to this paragraph. What an entry says is relied on in two ways.
+(1) *Late-commit evidence:* a finalized committed entry is relayed as a late `TxResolved` and a late `TxFinalized`
+(`Store.receiveTransactionMessage`, the finalized relay), so a replay's driver runs no finalization actions and
+stores apply the commit only where it is owed (`TransactionDriver.resolveLate`, 10.5). (2) *Finalization evidence:* a
+finalized entry makes a store ignore a prepare for a transaction it does not hold (`Frontend.receivePrepare`), so no
+fresh Tx takes locks or re-applies a blind write. Both are sound only because an entry becomes finalized only from a
+real `TxFinalized` or a late outcome, and `updateStatus` is monotone (Ruling 30: `finalized`/`late` sticky, Committed
+never replaced by an abort; F9). What the cache is **not** relied on for is retention: an entry that expires, is
+evicted or dies with its host is safe to lose, since its transaction is then below the forget floor (the duration
+bound above, the eviction watermark, the load floor) and a prepare for it is refused. So a wrong entry is a safety
+fault and a missing one is not.
+
 **P18 Client outcome.** The client's future completes with the first `TransactionResolved` or `TransactionFinalized`
 it receives (`ClientTransactionDriver.scala:61-63`, `:37-44`); it never checks that two reports agree. Resolution
 precedes finalization, so a client can see "committed" before FinalizationActions have run and before any store has
@@ -1275,6 +1288,9 @@ as soon as any object cannot reach `t` commits.
 
 ### F9. The host-wide status cache is written by every store and by constructors. Confidence: medium, low impact
 
+> *2026-11-16 (cross-document C4):* "low impact" was the original rating. Finalized entries are late-commit and
+> finalization evidence (P17), so a downgrade was a safety fault (X3); it is fixed (Ruling 30).
+
 > **Refresh (replay pins): NARROWED, impact raised.** `Frontend`'s no-Tx `TxResolved` path now skips a finalized entry
 > (`Frontend.scala:636-637` at `0d08e3c6`), but `Tx.resolved` still writes `(status, finalized = false)` over another store's finalized
 > entry (`Tx.scala:787-788`). Finalized entries are now late-commit evidence (`Store.scala:167-180`): a downgrade makes
@@ -1455,8 +1471,8 @@ Nacks (extra rounds under contention).
 > `wallClockMillis`, not `HLCTimestamp.now`: the HLC is global to the JVM and the host's own client ratchets it from
 > object timestamps, so an HLC bound would creep forward by the lead on every round trip. The old incarnation stopped
 > before the rebuild began, so any T it joined has `start <= wall_old(stop) + 2 s`. That is earlier than
-> `acceptorSince = wall_new(finish) + 10 s` unless the two hosts' clocks differ by more than 8 s less the rebuild's
-> duration. Client clocks no longer enter the argument, so late condition 1 ("a rebuilt one is muted and does not
+> `acceptorSince = wall_new(finish) + 10 s` unless the old host's clock leads the new one's by more than 8 s plus the
+> rebuild's duration. Client clocks no longer enter the argument, so late condition 1 ("a rebuilt one is muted and does not
 > answer", `TransactionDriver.resolveLate`) holds under that host-skew bound. A fast client is delayed rather than
 > refused: its retransmission is answered once the host's clock catches up, and the designated leader does not drive
 > a too-far-ahead T meanwhile (`Store`), so no prefer-abort round aborts it. Since every accepted start, and so every

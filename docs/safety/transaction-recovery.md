@@ -1008,6 +1008,10 @@ written by another store's `Tx` on the same host (`:800`). Effect: a late prepar
 so the late driver re-runs the finalizers instead of finishing (extra work and delay, not unsafe given T7), and prepares are not
 dropped as finalized (`Frontend.scala:639`) so they create a fresh `Tx` that takes no locks.
 
+> *2026-11-16 (cross-document C4, Todo 7.4):* "not unsafe" is withdrawn. The cache is late-commit and finalization
+> evidence (paxos P17 states its role once), so a downgraded entry could have a replay re-apply a blind write (X3). The
+> downgrade is fixed (Ruling 30, F10 above); only the cache's retention is not relied on.
+
 > **Verification 2026-11-09: PLAUSIBLE. Severity: split-decision (benign in practice).** Same as paxos F4: the tally is a pure function of immutable votes, so colliding ids propose the same value.
 > *Fix sketch:* As paxos F4.
 

@@ -243,6 +243,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   bytes per transaction, capped at `DefaultMaxEntries`); a size eviction is logged as an error (at most once per
   `EvictionLogPeriod`, 10 s, with the count) and raises the host's
   eviction watermark. A driver that still learns nothing past the horizon meets refusals, and the Tx ends by expiry
+- The status cache is safety evidence, not only an optimization (paxos P17): a finalized entry is late-commit evidence
+  (the relay reports it late) and finalization evidence (a prepare for a transaction the store does not hold is
+  ignored), so an entry must never be wrong or downgraded. Its retention is not relied on: a lost entry's transaction
+  is below the forget floor
 - `TransactionStatusCache.updateStatus` keeps Committed over an opposite outcome (Ruling 30). Under the horizon an
   opposite outcome should never arise: one that does is logged as an error ("Split decision") and counted
   (`splitDecisions`)

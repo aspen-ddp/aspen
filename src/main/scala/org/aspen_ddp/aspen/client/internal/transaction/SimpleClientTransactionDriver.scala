@@ -26,7 +26,7 @@ object SimpleClientTransactionDriver {
 
 }
 
-/** Retransmits the prepare until the transaction resolves or is past the horizon plus `MaxStartLead` on the client's
+/** Retransmits the prepare until the leader's outcome arrives (a completion from the stores' votes does not stop it) or is past the horizon plus `MaxStartLead` on the client's
   * clock, when it completes with `ClientOutcome.Unknown` instead: the stores no longer join the transaction, so
   * nothing more can change its outcome. A transaction already that late at `begin()` is never sent.
   */
@@ -42,7 +42,6 @@ class SimpleClientTransactionDriver(
   private given ExecutionContext = client.clientContext
 
   private var retries = 0
-  private var complete = false
 
   private def pastGiveUp: Boolean =
     nowMillis() - txd.startTimestamp.wallTime > TransactionHorizon.clientGiveUp(horizon).toMillis
@@ -50,7 +49,7 @@ class SimpleClientTransactionDriver(
   /** One retransmit tick: gives up if past the horizon, else resends. Run by the periodic task; tests call it directly */
   private[transaction] def tick(): Unit = {
     val send = synchronized {
-      if (complete)
+      if (stopped.isCompleted)
         false
       else if (pastGiveUp) {
         giveUp()
@@ -71,10 +70,11 @@ class SimpleClientTransactionDriver(
   private def giveUp(): Unit = {
     logger.warn(s"Client Transaction ${txd.transactionId} is past the transaction horizon: outcome unknown")
     complete(ClientOutcome.Unknown)
+    stop()
   }
 
   override def begin(): Unit =
-    val late = synchronized { !complete && pastGiveUp }
+    val late = synchronized { !stopped.isCompleted && pastGiveUp }
     if late then
       giveUp()
     else
@@ -82,9 +82,11 @@ class SimpleClientTransactionDriver(
 
   override def shutdown(): Unit = task.cancel()
 
-  override protected def complete(outcome: ClientOutcome): Unit = synchronized {
+  override protected def retransmits: Boolean = true
+
+  /** A completion from votes leaves the task running: the leader and the stores still need the prepare */
+  override protected def stop(): Unit = synchronized {
     task.cancel()
-    complete = true
-    super.complete(outcome)
+    super.stop()
   }
 }

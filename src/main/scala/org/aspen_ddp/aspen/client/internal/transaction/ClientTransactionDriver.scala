@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.{TransactionFinalized, TransactionResolved, TransactionVote, TxPrepare}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.TransactionDescription
+import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionDisposition}
 import scribe.Logging
 
 import scala.concurrent.{Future, Promise}
@@ -35,7 +35,20 @@ class ClientTransactionDriver(
 
   protected val promise: Promise[ClientOutcome] = Promise()
 
+  private val stoppedPromise: Promise[Unit] = Promise()
+  private var votes = Map[StoreId, TransactionDisposition.Value]()
+
   def result: Future[ClientOutcome] = promise.future
+
+  /** Completes when the driver needs no more messages: the leader's TransactionResolved/TransactionFinalized arrived,
+    * or it reached Unknown. A completion from votes alone does not complete it when the driver retransmits. This
+    * driver does not retransmit, so it stops together with `result` */
+  def stopped: Future[Unit] = stoppedPromise.future
+
+  /** True when the driver keeps sending after `result` completes from votes (until `stop()`) */
+  protected def retransmits: Boolean = false
+
+  protected def stop(): Unit = synchronized { stoppedPromise.trySuccess(()) }
 
   def begin(): Unit = sendPrepareMessages()
 
@@ -55,16 +68,47 @@ class ClientTransactionDriver(
       HLCTimestamp.update(txd.startTimestamp)
       promise.success(outcome)
     }
+    if (!retransmits)
+      stop()
   }
 
-  def receive(finalized: TransactionFinalized): Unit = complete(ClientOutcome(finalized.committed))
+  def receive(finalized: TransactionFinalized): Unit = synchronized {
+    complete(ClientOutcome(finalized.committed))
+    stop()
+  }
 
-  def receive(vote: TransactionVote): Unit = ()
+  def receive(resolved: TransactionResolved): Unit = synchronized {
+    complete(ClientOutcome(resolved.committed))
+    stop()
+  }
 
-  def receive(resolved: TransactionResolved): Unit = complete(ClientOutcome(resolved.committed))
+  /** Records the store's first vote. Commit is final once every object has `writeThreshold` commit votes; abort votes
+    * never complete the driver (abort comes only from the leader's TransactionResolved/TransactionFinalized) */
+  def receive(vote: TransactionVote): Unit = synchronized {
+    if (vote.disposition != TransactionDisposition.Undetermined)
+      votes.get(vote.fromStore) match
+        case Some(first) =>
+          if (first != vote.disposition)
+            logger.error(s"Store ${vote.fromStore} voted $first, then ${vote.disposition} on transaction ${txd.transactionId}; ignoring the later vote")
+        case None =>
+          votes += vote.fromStore -> vote.disposition
+          if (commitCertain)
+            complete(ClientOutcome.Committed)
+  }
+
+  /** Every referenced object has at least its pool's writeThreshold commit votes */
+  protected def commitCertain: Boolean = synchronized {
+    txd.allReferencedObjectsSet.forall { ptr =>
+      val ida = txd.poolIDAMap(ptr.poolId)
+      val commits = (0 until ida.width).count { i =>
+        votes.get(StoreId(ptr.poolId, i.toByte)).contains(TransactionDisposition.VoteCommit)
+      }
+      commits >= ida.writeThreshold
+    }
+  }
 
   protected def sendPrepareMessages(): Unit = {
-    val isCompleted = synchronized { promise.isCompleted }
+    val isCompleted = stopped.isCompleted
 
     if (!isCompleted) {
       val poolId = txd.primaryObject.poolId

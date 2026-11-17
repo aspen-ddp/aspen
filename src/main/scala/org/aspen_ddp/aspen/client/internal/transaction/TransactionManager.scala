@@ -30,9 +30,9 @@ class TransactionManager(val client: AspenClient,
       transactions += (txd.transactionId -> td)
     }
 
-    // Forgotten however the driver concludes: an outcome it hears (receive), or one it reaches itself, as Unknown once
-    // past the horizon, which no message would ever remove
-    td.result.onComplete(_ => forget(txd.transactionId, td))(using ExecutionContext.parasitic)
+    // Forgotten when the driver needs no more messages: the leader's outcome (receive), or Unknown once past the
+    // horizon, which no message would ever remove. A commit learned from votes keeps the driver for the leader's reply
+    td.stopped.onComplete(_ => forget(txd.transactionId, td))(using ExecutionContext.parasitic)
 
     td.begin()
 

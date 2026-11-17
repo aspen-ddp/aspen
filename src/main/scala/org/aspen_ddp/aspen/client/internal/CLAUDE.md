@@ -27,5 +27,10 @@
   stops retransmitting and completes `Unknown` once the client's clock is past `startTimestamp + horizon + MaxStartLead`
   (`TransactionHorizon.clientGiveUp`), checked at each retransmit tick. A transaction already that late at `begin()`
   fails fast with `Unknown` without sending. `TransactionImpl` maps `Unknown` to `TransactionOutcomeUnknown`.
-  `TransactionManager` forgets a driver however it concludes (an outcome it hears, or `Unknown` it reaches itself,
-  which no message would remove)
+  Commit is also learned from the stores' `TransactionVote`s: `Committed` once every referenced object has
+  `writeThreshold` `VoteCommit`s from its pool's stores (a store's first vote counts; a differing later one is logged
+  and ignored). Abort votes never complete it: `Aborted` comes only from the leader's `TransactionResolved`/
+  `TransactionFinalized`. After a vote-completion `SimpleClientTransactionDriver` keeps retransmitting until the
+  leader's outcome arrives or the give-up point (`result` stays `Committed`). `TransactionManager` forgets a driver on
+  `ClientTransactionDriver.stopped` (leader outcome heard, or `Unknown` reached; with no retransmits it completes with
+  `result`), not on `result`

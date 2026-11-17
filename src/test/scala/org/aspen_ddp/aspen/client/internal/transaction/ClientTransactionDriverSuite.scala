@@ -4,11 +4,12 @@ import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.{ReadDriverClient, TransactionStatusCache}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, HostMessage, TransactionResolved, TxMessage, TxPrepare}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, HostMessage, TransactionResolved, TransactionVote, TxMessage, TxPrepare}
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionHorizon, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionHorizon, TransactionId}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -110,4 +111,114 @@ class ClientTransactionDriverSuite extends AnyFunSuite with Matchers:
       d2.begin()
       d2.receive(TransactionResolved(client0, StoreId(poolId, 1), d2.txd.transactionId, committed = false))
       d2.result.value.get.get should be(ClientOutcome.Aborted)
+    finally f.done()
+
+  private val pool2 = PoolId(UUID.fromString("22222222-2222-2222-2222-222222222222"))
+  private val pointer2 = DataObjectPointer(ObjectId(new UUID(0, 2)), pool2, Array[Byte]())
+  private val ida2 = Replication(5, 3)
+
+  private def mktxd2(startMillis: Long): TransactionDescription =
+    val requirements = RefcountUpdate(pointer, ObjectRefcount(0, 1), ObjectRefcount(1, 2)) ::
+      RefcountUpdate(pointer2, ObjectRefcount(0, 1), ObjectRefcount(1, 2)) :: Nil
+    TransactionDescription(TransactionId(UUID.randomUUID()), HLCTimestamp(startMillis << 16), pointer, 0, requirements,
+      Nil, None, Nil, Nil, ida, Map(poolId -> ida, pool2 -> ida2))
+
+  private def vote(d: ClientTransactionDriver, pool: PoolId, idx: Int,
+                   disp: TransactionDisposition.Value = TransactionDisposition.VoteCommit): Unit =
+    d.receive(TransactionVote(client0, StoreId(pool, idx.toByte), d.txd.transactionId, disp))
+
+  private def resolved(d: ClientTransactionDriver, committed: Boolean): Unit =
+    d.receive(TransactionResolved(client0, StoreId(poolId, 1), d.txd.transactionId, committed))
+
+  test("two commit votes complete Committed; one does not"):
+    val f = new Fixture
+    try
+      val d = f.driver(0.millis)
+      d.begin()
+      vote(d, poolId, 0)
+      d.result.isCompleted shouldBe false
+      vote(d, poolId, 1)
+      d.result.value shouldBe Some(scala.util.Success(ClientOutcome.Committed))
+    finally f.done()
+
+  test("each object needs its own pool's write threshold"):
+    val f = new Fixture
+    try
+      val d = SimpleClientTransactionDriver.factory(1.hour, horizon, () => f.now)(f.client, mktxd2(f.now), Map())
+      d.begin()
+      vote(d, poolId, 0); vote(d, poolId, 1)
+      vote(d, pool2, 0); vote(d, pool2, 1)
+      d.result.isCompleted shouldBe false
+      vote(d, pool2, 2)
+      d.result.value shouldBe Some(scala.util.Success(ClientOutcome.Committed))
+    finally f.done()
+
+  test("abort votes never complete the driver"):
+    val f = new Fixture
+    try
+      val d = f.driver(0.millis)
+      d.begin()
+      (0 until 3).foreach(i => vote(d, poolId, i, TransactionDisposition.VoteAbort))
+      d.result.isCompleted shouldBe false
+      resolved(d, false)
+      d.result.value shouldBe Some(scala.util.Success(ClientOutcome.Aborted))
+    finally f.done()
+
+  test("a duplicate vote counts once"):
+    val f = new Fixture
+    try
+      val d = f.driver(0.millis)
+      d.begin()
+      vote(d, poolId, 0); vote(d, poolId, 0)
+      d.result.isCompleted shouldBe false
+    finally f.done()
+
+  test("Undetermined is no vote"):
+    val f = new Fixture
+    try
+      val d = f.driver(0.millis)
+      d.begin()
+      vote(d, poolId, 0); vote(d, poolId, 1, TransactionDisposition.Undetermined)
+      d.result.isCompleted shouldBe false
+    finally f.done()
+
+  test("after a vote-completion the driver keeps retransmitting until the leader's outcome"):
+    val f = new Fixture
+    try
+      val d = f.driver(0.millis)
+      d.begin()
+      vote(d, poolId, 0); vote(d, poolId, 1)
+      d.result.isCompleted shouldBe true
+      d.stopped.isCompleted shouldBe false
+      val sent = f.msgr.prepares.get
+      d.tick()
+      f.msgr.prepares.get should be > sent
+      resolved(d, true)
+      d.stopped.isCompleted shouldBe true
+      val after = f.msgr.prepares.get
+      d.tick()
+      f.msgr.prepares.get shouldBe after
+    finally f.done()
+
+  test("after a vote-completion the driver stops at the give-up point with its result unchanged"):
+    val f = new Fixture
+    try
+      val d = f.driver(0.millis)
+      d.begin()
+      vote(d, poolId, 0); vote(d, poolId, 1)
+      f.now += giveUp.toMillis + 1
+      d.tick()
+      d.stopped.isCompleted shouldBe true
+      d.result.value shouldBe Some(scala.util.Success(ClientOutcome.Committed))
+    finally f.done()
+
+  test("a leader abort after a vote commit is logged as a split, and the result stays Committed"):
+    val f = new Fixture
+    try
+      val d = f.driver(0.millis)
+      d.begin()
+      vote(d, poolId, 0); vote(d, poolId, 1)
+      resolved(d, false)
+      d.result.value shouldBe Some(scala.util.Success(ClientOutcome.Committed))
+      d.stopped.isCompleted shouldBe true
     finally f.done()

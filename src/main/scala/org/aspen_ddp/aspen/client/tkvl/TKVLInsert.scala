@@ -16,9 +16,10 @@ import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
   * only).
   *
   * With `replaces`, the insert is conditional and checked: given the value the node read holds for `key`, the
-  * predicate says whether this insert replaces it. If not, the insert is dropped from the batch: no write and no
-  * requirement. An absent key is always inserted. Either way a competing write of the key aborts the transaction,
-  * and the retry reads and decides again, so writers that all use the same predicate never move the value backward
+  * function returns the value written in its place (`value` or any other, the held one included: writing it again
+  * moves the key's revision), or `None` to drop the insert from the batch: no write and no requirement. An absent
+  * key is always inserted with `value`. Either way a competing write of the key aborts the transaction, and the
+  * retry reads and decides again, so writers that all use the same function never move the value backward
   * (`MissedUpdateMarker`). It takes none of the other options.
   */
 final case class TKVLInsert(key: Key,
@@ -26,7 +27,7 @@ final case class TKVLInsert(key: Key,
                             requireDoesNotExist: Boolean = false,
                             blind: Boolean = false,
                             requiredRevision: Option[ObjectRevision] = None,
-                            replaces: Option[Value => Boolean] = None):
+                            replaces: Option[Value => Option[Value]] = None):
   require(List(requireDoesNotExist, blind, requiredRevision.isDefined, replaces.isDefined).count(identity) <= 1,
     "A TKVLInsert takes at most one of requireDoesNotExist, blind, requiredRevision and replaces")
 

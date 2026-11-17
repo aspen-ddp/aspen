@@ -46,9 +46,10 @@ object MissedUpdateMarker:
   * makes further commits slower. Entries that arrive during a write wait for the next one, so the writes never overlap
   * and a backlog makes each one larger (up to the cap) rather than adding more of them.
   *
-  * Entries only move forward (repair F10). An ErrorTree mark replaces a held one only if its `missedTimestamp` is
-  * later, and an UnackedCommits entry is written only where none is held (`TKVLInsert.replaces`). Both are checked
-  * puts, so two clients marking the same key at once abort one write, which retries and decides again.
+  * Entries only move forward. An ErrorTree mark replaces a held one only if its `missedTimestamp` is later, and
+  * otherwise writes the held value again; an UnackedCommits entry is written only where none is held
+  * (`TKVLInsert.replaces`). Both are checked puts, so two clients marking the same key at once abort one write, which
+  * retries and decides again.
   */
 class MissedUpdateMarker(client: AspenClient,
                          maxEntriesPerBatch: Int = MissedUpdateMarker.DefaultMaxEntriesPerBatch) extends Logging:
@@ -144,13 +145,19 @@ class MissedUpdateMarker(client: AspenClient,
 
   private def writeBatch(poolId: PoolId, updates: List[MissedUpdate], unacked: List[MissedUnackedCommit]): Future[Unit] =
     // A mark replaces a held one only if it is for a later miss: the repair completion gate waits for the store to
-    // reach the newest miss, so an older one must not overwrite it. A held value that does not decode is replaced
+    // reach the newest miss, so an older one must not overwrite it. A held value that does not decode is replaced.
+    // An older mark still writes the held value again, moving the entry's revision: a transaction can commit after
+    // a later-started one, so a repair whose read predates this miss's commit may be about to delete the entry, and
+    // only a changed revision fails that delete (StoreRepairer.deleteEntryIfUnchanged). The entry's next pass then
+    // reconciles the whole object from a read that follows this commit
     val inserts = updates.map: u =>
-      def replaces(held: Value): Boolean =
-        Try(MissedUpdateFinalizationAction.decodeErrorEntry(held).missedTimestamp < u.missedTimestamp).getOrElse(true)
-      TKVLInsert(errorKey(u.store, u.objectId),
-                 MissedUpdateFinalizationAction.encodeErrorEntry(u.missedTimestamp, u.objectType, u.storePointer),
-                 replaces = Some(replaces))
+      val value = MissedUpdateFinalizationAction.encodeErrorEntry(u.missedTimestamp, u.objectType, u.storePointer)
+      def replaces(held: Value): Option[Value] =
+        val heldIsNewer =
+          Try(MissedUpdateFinalizationAction.decodeErrorEntry(held).missedTimestamp >= u.missedTimestamp)
+            .getOrElse(false)
+        Some(if heldIsNewer then held else value)
+      TKVLInsert(errorKey(u.store, u.objectId), value, replaces = Some(replaces))
 
     // An entry too large for half a node (a transaction changing many objects on one store) is written as chunks,
     // each a complete entry for some of its objects, head first under the entry's own key (UnackedCommitEntry.chunks).
@@ -160,7 +167,7 @@ class MissedUpdateMarker(client: AspenClient,
     // original marker tagged. Harmless: a lookup reads only the head chunk, and repair reads the objects themselves
     def unackedInserts(maxEntrySize: Int): List[TKVLInsert] = unacked.flatMap: t =>
       t.entry.chunks(maxEntrySize).zipWithIndex.map: (chunk, i) =>
-        TKVLInsert(UnackedCommitEntry.key(t.store, t.transactionId, i), Value(chunk.encode), replaces = Some(_ => false))
+        TKVLInsert(UnackedCommitEntry.key(t.store, t.transactionId, i), Value(chunk.encode), replaces = Some(_ => None))
 
     // A TransactionCreationError, or an entry that fits no node (NodeSizeExceeded: a node too small for even one
     // object's chunk), is permanent: the write gives up and fails every entry of the batch, whose finalizers their
@@ -187,7 +194,7 @@ class MissedUpdateMarker(client: AspenClient,
              else maxUnackedEntrySize(pool).flatMap: max =>
                pool.unackedCommitsTree.prepareUpdates(unackedInserts(max), Nil)(using tx)
         _ = MissedUpdateFinalizationAction.limitTracking(poolId, tx)
-        // Every entry already held at least as new: nothing to write
+        // Only UnackedCommits entries, every one already held: nothing to write
         _ <- if tx.isEmpty then Future.unit else commitErrorTreeTransaction(tx)
       yield ()
 

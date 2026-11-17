@@ -39,15 +39,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.6  A declined ErrorTree mark does not invalidate a repair that deletes the held entry: RP-W1             [S]
-     CONFIRMED. MissedUpdateMarker drops a mark whose missedTimestamp is not later than the held entry's, with no
-     write, so a repair that read before the earlier-started, later-committed transaction can still delete the
-     entry (KeyRevision unchanged); the store never gets that update. Also reaches UnackedCommits entries via the
-     phase-A shortcut (Counts.recordCompleted) where a voter forgot T without applying (an entry naming another
-     incarnation). Fix: a
-     declined mark rewrites the held value (moves its revision); record completion only after the phase-A delete
-     commits. StoreRepairerSuite test with testingOnlyBeforeEntryDelete.
-
 2.7  Rebuild copies an update the lost store acknowledged but peers have not applied: RB-W2                [S]
      PLAUSIBLE. The walk's ordinary read ignores write locks; a lost store that applied and sent TxCommitted gets
      no mark, so the rebuilt copy can be stale with no record. Real only for t > r (e.g. Replication(5,4)); the

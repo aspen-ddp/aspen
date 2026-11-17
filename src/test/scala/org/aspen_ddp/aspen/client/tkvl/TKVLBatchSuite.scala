@@ -266,26 +266,39 @@ class TKVLBatchRequirementSuite extends TKVLBatchSuiteSupport:
         assert(stored == Some(value(52).bytes.toList))
 
     /** True if `v`'s last byte is below `b`, as a conditional insert's predicate */
-    def below(b: Int)(v: Value): Boolean = v.bytes.last < b
+    // Replaces a held value below `b` with value(b), the insert's own value in every use
+    def below(b: Int)(held: Value): Option[Value] = Option.when(held.bytes.last < b)(value(b))
 
-    atest(s"$kind: a conditional insert replaces a held value only where its predicate accepts it"):
+    atest(s"$kind: a conditional insert replaces a held value only where its function accepts it"):
       for
         (tree, _) <- newTree(kind)
         _ <- batch(tree, inserts(keys(1 to 3)), Nil)
         _ <- batch(tree, List(TKVLInsert(Key(1), value(11), replaces = Some(below(11))),
                               TKVLInsert(Key(2), value(0), replaces = Some(below(0))),
-                              TKVLInsert(Key(5), value(5), replaces = Some(_ => false))), Nil)
+                              TKVLInsert(Key(5), value(5), replaces = Some(_ => None))), Nil)
         entries <- tree.entries()
       yield
         assert(entries == List(Key(1) -> value(11).bytes.toList, Key(2) -> value(2).bytes.toList,
                                Key(3) -> value(3).bytes.toList, Key(5) -> value(5).bytes.toList))
+
+    atest(s"$kind: a conditional insert writes the value its function chooses for a held key"):
+      for
+        (tree, _) <- newTree(kind)
+        _ <- batch(tree, inserts(keys(1 to 3)), Nil)
+        _ <- batch(tree, List(TKVLInsert(Key(2), value(9), replaces = Some(_ => Some(value(7)))),
+                              TKVLInsert(Key(5), value(5), replaces = Some(_ => Some(value(8))))), Nil)
+        entries <- tree.entries()
+      yield
+        withClue("a held key takes the chosen value, an absent one the insert's own: "):
+          assert(entries == List(Key(1) -> value(1).bytes.toList, Key(2) -> value(7).bytes.toList,
+                                 Key(3) -> value(3).bytes.toList, Key(5) -> value(5).bytes.toList))
 
     atest(s"$kind: a batch whose conditional inserts all decline stages nothing"):
       for
         (tree, _) <- newTree(kind)
         _ <- batch(tree, inserts(keys(1 to 3)), Nil)
         tx = client.newTransaction()
-        _ <- tree.prepareUpdates(List(TKVLInsert(Key(2), value(9), replaces = Some(_ => false))), Nil)(using tx)
+        _ <- tree.prepareUpdates(List(TKVLInsert(Key(2), value(9), replaces = Some(_ => None))), Nil)(using tx)
       yield
         assert(tx.isEmpty)
 
@@ -314,9 +327,9 @@ class TKVLBatchRequirementSuite extends TKVLBatchSuiteSupport:
         assert(stored == Some(value(40).bytes.toList))
 
   test("a conditional insert takes no other requirement"):
-    assertThrows[IllegalArgumentException](TKVLInsert(Key(1), value(1), blind = true, replaces = Some(_ => true)))
+    assertThrows[IllegalArgumentException](TKVLInsert(Key(1), value(1), blind = true, replaces = Some(Some(_))))
     assertThrows[IllegalArgumentException](
-      TKVLInsert(Key(1), value(1), requireDoesNotExist = true, replaces = Some(_ => true)))
+      TKVLInsert(Key(1), value(1), requireDoesNotExist = true, replaces = Some(Some(_))))
 
   atest("KeyValueObjects: a delete at a revision deletes only the key as read, else aborts with KeyNotAtRevision"):
     for

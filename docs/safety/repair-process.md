@@ -149,14 +149,16 @@ Details are in [transaction-recovery.md](transaction-recovery.md); what repair r
 6. `writeBatch` is one `replaySafe` transaction over both trees, retried until it succeeds except on
    `TransactionCreationError` or `NodeSizeExceeded` (then the batch fails and the driver re-runs the finalizer with
    backoff, `TransactionDriver.startFinalizer`). Its puts are conditional (`TKVLInsert.replaces`): an ErrorTree mark
-   replaces a held one only for a later `missedTimestamp`, and otherwise is dropped from the batch with no write and
-   no requirement; an UnackedCommits entry is written only where none is held. A replaced or new key carries a
+   replaces a held one only for a later `missedTimestamp`, and otherwise writes the held value again, which moves
+   its revision; an UnackedCommits entry is written only where none is held (otherwise it is dropped from the batch
+   with no write and no requirement). A replaced or new key carries a
    key requirement, so two markers racing on one key abort one batch, which retries.
 7. The action completes only when the batch commits; T is not finalized (and its stores do not forget it) before.
 
 Properties used later: every entry is written after T committed and at least 2 s after its finalizer started; an
-ErrorTree entry's `missedTimestamp` never moves backward; an UnackedCommits entry is never rewritten in place, so its
-revision changes only by delete and re-create. Section 14 (RP-W1) examines a consequence of the dropped mark.
+ErrorTree entry's `missedTimestamp` never moves backward; every ErrorTree mark moves the entry's revision, even one
+older than the held entry (12.4); an UnackedCommits entry is never rewritten in place, so its revision changes only
+by delete and re-create.
 
 ---
 
@@ -289,8 +291,11 @@ entry of its own; all are skipped while the store holds T.
 The phase-A shortcut: phase A records each object it completed with the entry's `missedTimestamp`
 (`Counts.recordCompleted`); phase B treats an object recorded at or after the UnackedCommits entry's timestamp as
 complete with no allocation-tree read, snapshot or reconcile. A silent voter has both kinds of entry for every
-object, so its UnackedCommits entry then costs only its delete. Section 14 (RP-W1) shows where this argument is weaker
-than it looks.
+object, so its UnackedCommits entry then costs only its delete. Phase A records an object only once the entry's
+delete committed: a mark written after phase A's read (including one for an earlier-started transaction that
+committed after it, 12.4) moves the entry's revision and fails that delete, so the shortcut never stands in for a
+transaction that committed after the read. That matters where S can forget T without applying it (a recovered vote
+whose entry names another incarnation leaves the entry for the repair scan, `Frontend.unackedLookupComplete`).
 
 ### 5.4 Waiting until the store can no longer join the transaction
 
@@ -447,7 +452,11 @@ and a read's timestamp is the maximum over stores that match its revision, so it
 a read reflects the missed transaction, some matching store applied it, so the read's timestamp is at least its start
 and the gate passes. A post-install equality test would be weaker: equality with a read says nothing about whether the
 read includes the miss. The gate does not show that the read reflects every merged miss; that rests on E1 and on the
-read following each miss's commit (section 14, RP-W1).
+read following each miss's commit. Two transactions on one object can commit in the opposite order of their starts
+(Q6: a `RefcountUpdate` and a key-level `KeyValueUpdate` check no object timestamp), so a miss older than the held one
+can commit after the read. Its mark is written after its commit and moves the entry's revision (section 3, step 6),
+so the entry's delete fails (12.4) and the next pass, keyed by the new revision (`errorDeferralKey`), reconciles the
+whole object from a later read.
 
 ### 6.5 A foreign occupant of the slot
 
@@ -474,7 +483,7 @@ is stale, so the entry stays and the next pass installs. A listed occupant is lo
 | M10 | No repair write for an object being deleted on the store; `repairDelete` refused while the object is in use | `Frontend.reconcileForRepair`, `deleteObjectForRepair` | Writing after a deletion; a delete racing a read, commit or transaction |
 | M11 | Skip an UnackedCommits entry while the store holds T (or is loading its CRL) | `Frontend.mayHoldTransaction` | Repair racing the Tx that applies T; deleting an entry a recovered vote still needs to look up |
 | M12 | Leave entries while the store may still join their transaction | `RepairTarget.mayJoinTransaction` | A replay's Tx applying T after the reconcile and the entry being deleted under it |
-| M13 | Compare-and-delete on the entry's revision | `deleteEntryIfUnchanged` | Dropping an entry a newer mark rewrote |
+| M13 | Compare-and-delete on the entry's revision; every mark rewrites the entry | `deleteEntryIfUnchanged`, `MissedUpdateMarker.writeBatch` | Dropping an entry a mark rewrote after the read, older marks included |
 | M14 | Completion requires the read to be at least as new as the entry's timestamp | `repairUpdate` | Dropping an entry when the read cannot reflect the miss |
 | M15 | Proof transactions for persistently locked parts | `RepairProofs` | Waiting forever on a hot lock |
 | M16 | Parking a persistently stale repair until the object settles | `Frontend.parkRepair` | Retrying forever an object always busy at install |
@@ -650,7 +659,8 @@ because their same-revision guard could overwrite blind writes and left `kvState
 Assumptions: (A1) a store reports the locks of every transaction it voted commit on and has not applied, for every
 locking requirement; (A2) it reports them for the whole interval between vote and apply, across restarts (Q9);
 (A3) object timestamps never decrease (Q6); (A4) a store completes a backend commit before it forgets the
-transaction; (A5) every merged miss of an ErrorTree entry committed before the read that completes it (see RP-W1).
+transaction. That every merged miss of a deleted ErrorTree entry committed before the read that completed it is not
+assumed: a later commit's mark moves the entry's revision and fails the delete (5.3, 12.4).
 
 ---
 
@@ -664,7 +674,7 @@ transaction; (A5) every merged miss of an ErrorTree entry committed before the r
 | Snapshot to install | C applies at S | S's key/revision/refcount/object level differs from the snapshot: stale. Safe. |
 | Snapshot to install | S voted C (holds locks), not yet applied | S's own locks defer those parts. Safe. |
 | During the read | C's voter among the responders applied it or holds its locks | Read reflects C or reports its locks. Safe. |
-| Read to install | C commits elsewhere; S has not voted | The install writes the read's state, a state the system had. C's apply at S, or C's mark for S, follows; its requirements then check the repaired state. Safe, but see RP-W1 for the entry. |
+| Read to install | C commits elsewhere; S has not voted | The install writes the read's state, a state the system had. C's apply at S, or C's mark for S, follows; its requirements then check the repaired state. The mark, even one older than the held entry, moves the entry's revision, so the entry survives (12.4). Safe. |
 | At install | A commit's backend write outstanding, or a commit held for its turn | Unsettled: stale or parked. Safe. |
 | After install, before the backend completes | A new transaction arrives | It waits behind the repair write. Safe. |
 | After install | Backend write fails | State discarded and reloaded; promise fails; entry kept. Safe. |
@@ -697,8 +707,10 @@ Delete D (requires `KeyRevision(key, Rv)`) and mark I:
 - D commits before I reads the key: I creates a fresh entry.
 - D and I concurrent and both writing: they collide; one aborts and retries (the marker retries until success; the
   delete costs one more pass).
-- I declined (its `missedTimestamp` is not later than the held one): I writes nothing and requires nothing, so it
-  orders against D in no way. This is safe only if D's completing read followed I's transaction's commit: RP-W1.
+- I older (its `missedTimestamp` is not later than the held one): I writes the held value again, under the key's
+  revision as I read it, so it orders against D exactly as a newer mark does (one of the cases above). A mark for an
+  earlier-started transaction that committed after D's read therefore fails D, though the entry's timestamp does not
+  change; the next pass reads after that commit.
 
 ### 12.5 Entry for an object that has since been deleted
 
@@ -769,40 +781,6 @@ background. Tracked in Backlog.txt (the fix there, timed reads mapped to deferra
 ---
 
 ## 14. Open weaknesses
-
-### RP-W1. A declined ErrorTree mark does not order against the repair that deletes the held entry (CONFIRMED; permanent replica divergence)
-Mechanism: the marker drops an ErrorTree mark whose `missedTimestamp` is not later than the held entry's, with no
-write and no requirement (`MissedUpdateMarker.writeBatch`, `TKVLInsert.replaces`, `BatchOp.Put.appliesTo`). The held
-entry then stands for both misses, and its completion gate (`StoreRepairer.repairUpdate`: `os.timestamp >=
-minTimestamp`) only says the read is at least as new as the held miss's start. Two transactions on one object can
-commit in the opposite order of their starts (Q6: a `RefcountUpdate` and a key-level `KeyValueUpdate` check no object
-timestamp, `RequirementsChecker.checkRefcount`, `checkKVRequirements`). Nothing makes the repair's delete
-(`deleteEntryIfUnchanged`, guarded only by the entry's `KeyRevision`) fail when a declined mark arrived after the
-repair's read.
-Trigger / scenario: store S misses T2 (start t2) on KeyValue object X; entry (S, X)@t2 is written. A repair pass
-snapshots S and reads X at time r. Transaction T (start t1 < t2; it read X before T2 applied and stalled more than
-`errorTimeout` before preparing, or its client's HLC lagged), writing key k1 under `KeyRevision`, prepares after r at
-no read responder, commits, and S misses it (silent, refused admission, or voted abort on its stale k1). After 2 s
-T's finalizer marks (S, X)@t1: the node holds t2 >= t1, so nothing is written. The repair's delete commits after that
-read (its read-to-delete interval exceeded T's commit plus 2 s: proofs, a parked reconcile, a slow fence read, a delete
-transaction retrying collisions). Wider variant: the pass at r deferred only some locked key k0, so the next passes are
-narrowed to `only = {k0}` and never look at k1; T may then commit at any time until the narrowed pass completes, which
-for a hot k0 is many scan periods. The same hole reaches UnackedCommits entries through the phase-A shortcut
-(`Counts.recordCompleted` / `completedAt`): phase A records X complete at t2 from a read that predates T, and phase B
-of the same scan treats T's UnackedCommits entry for X as complete. That matters only where S can forget T without
-applying it (a recovered vote whose entry names another incarnation, which "leaves the entry for the repair scan",
-`Frontend.unackedLookupComplete`).
-Consequence: S's copy of X never receives T's update of k1, and no entry records it. Reads stay correct (quorum), but
-X's redundancy is one store short until something else rewrites k1 at S, S misses a later update of X, or S is rebuilt.
-For a cold object that is permanent.
-Suggested fix: make a declined mark move the held entry's revision: write the held value again (or `max` of the two,
-which equals the held one) instead of dropping the put, so a repair that read before the mark fails its
-`KeyRevision` delete and its next pass, keyed by the new revision, reconciles the whole object. Record
-`Counts.recordCompleted` only after the phase-A delete committed, so a rewritten entry also denies the phase-B
-shortcut. Cost: one extra write per declined mark, rare since the queue merges by key. Test: StoreRepairerSuite with
-`testingOnlyBeforeEntryDelete` holding the delete while a declined mark for an earlier-started, later-committed
-transaction is written; the entry must survive and the next pass must install k1.
-Effort: S   Priority: 2
 
 ### RP-W2. A stale pass resets the lock-deferral count, so a hot object can alternate and never reach a proof (PLAUSIBLE; liveness)
 Mechanism: an unsettled object answers `ReconcileResult(Set(), false, stale = true)` before any locks are computed

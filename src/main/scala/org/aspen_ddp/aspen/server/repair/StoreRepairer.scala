@@ -229,7 +229,9 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     def touchedKeys: Set[Key] = synchronized(touched)
 
     /** The errorTree pass completed the store's work on `id` up to `missedTimestamp`: its copy now matches a read at
-      * least that new, or the object was proven deleted and dropped
+      * least that new, or the object was proven deleted and dropped, and the entry's delete committed. No mark
+      * (including one for an earlier-started transaction) was written after the read, as it would have failed the
+      * delete
       */
     def recordCompleted(id: ObjectId, missedTimestamp: HLCTimestamp): Unit = synchronized:
       if completed.get(id).forall(_ < missedTimestamp) then completed = completed.updated(id, missedTimestamp)
@@ -405,11 +407,15 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
 
         def completed(complete: Boolean): Future[Unit] =
           if complete then
-            // Done whether or not the delete below succeeds: the UnackedCommits pass need not repeat it (RP-N3)
-            counts.recordCompleted(objectId, errorEntry.missedTimestamp)
             deferral.clear(entryKey)
+            // Only a committed delete lets the UnackedCommits pass skip the object. A delete that fails its revision
+            // found the entry rewritten, possibly by a mark for a transaction that committed after this pass's read
             deleteIfStillOwned(storeId, counts, pool.errorTree, value.revision, key).map: deleted =>
-              if deleted then counts.repaired.incrementAndGet() else counts.deferred.incrementAndGet()
+              if deleted then
+                counts.recordCompleted(objectId, errorEntry.missedTimestamp)
+                counts.repaired.incrementAndGet()
+              else
+                counts.deferred.incrementAndGet()
           else
             counts.deferred.incrementAndGet()
             Future.unit
@@ -460,9 +466,10 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * the allocation, and an object absent from the allocation tree meanwhile is live. A younger one is left for a
     * later pass. The entry is deleted once every object is complete.
     *
-    * An object this scan's errorTree pass already completed at a missedTimestamp at or after the entry's is complete
-    * without another read (repair-process RP-N3): the store's copy matched a read that new (the completion gate), or
-    * the object was proven deleted, which is all the entry asks of it. The marker marks every store that sent no
+    * An object this scan's errorTree pass already completed, its entry's delete committed, at a missedTimestamp at or
+    * after the entry's is complete without another read (repair-process 5.3): the store's copy matched a read that
+    * new (the completion gate) and no mark followed that read, or the object was proven deleted, which is all the
+    * entry asks of it. The marker marks every store that sent no
     * TxCommitted, so a silent voter's entry usually costs only its delete.
     */
   private def repairUnackedEntry(pool: StoragePool, storeId: StoreId, policy: RepairPolicy,

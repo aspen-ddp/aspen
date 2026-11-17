@@ -997,6 +997,69 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       storeKeys(2, kvPtr) shouldBe Set(k0, k1, k2)
       remaining shouldBe empty
 
+  /** Store 2 misses T2 (inserting k2), so its entry for the object holds T2's start. A repair pass reads the object,
+    * and before it reconciles, T (inserting k1), started before T2, commits without store 2 and its finalizer marks
+    * the object at T's start, older than the held mark. Returns the object, T's id, a timestamp no later than T's
+    * start, and the repairer, whose reconcile counter for store 2 is `reconciles`
+    */
+  private def markedDuringRepair(reconciles: java.util.concurrent.atomic.AtomicInteger)
+      : Future[(KeyValueObjectPointer, TransactionId, HLCTimestamp, () => Future[Unit], StoreRepairer)] =
+    @volatile var target: Option[ObjectId] = None
+    @volatile var deliverT: Option[() => Future[Unit]] = None
+    val repairer = StoreRepairer(client, SeamTarget(), testingOnlyBeforeReconcile = (s, ptr) =>
+      if s == sid(2) && target.contains(ptr.id) then
+        reconciles.incrementAndGet()
+        deliverT match
+          case Some(deliver) =>
+            deliverT = None
+            deliver()
+          case None => Future.unit
+      else
+        Future.unit)
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
+      beforeT = HLCTimestamp.now
+      (txid, _, deliver) <- heldTx(missing = Set(2))(kvUpdate(kvPtr, List(Insert(k1, Array[Byte](1)))))
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Insert(k2, Array[Byte](2)))))
+      marks <- errorEntries(2)
+      _ = withClue("store 2 missed T2 and holds T2's entry: "):
+            storeKeys(2, kvPtr) shouldBe Set(k0)
+            marks should not be empty
+      _ = target = Some(kvPtr.id)
+    yield (kvPtr, txid, beforeT, () => { deliverT = Some(deliver); Future.unit }, repairer)
+
+  test("a mark for an earlier-started transaction committed during a repair keeps the entry for the next pass (RP-W1)"):
+    val reconciles = java.util.concurrent.atomic.AtomicInteger(0)
+    for
+      (kvPtr, _, _, armT, repairer) <- markedDuringRepair(reconciles)
+      _ <- armT()
+      _ <- pass(2, repairer, DeferralState())
+      afterFirstPass <- errorEntries(2)
+      keysAfterFirstPass = storeKeys(2, kvPtr)
+      _ <- scanUntilQuiet(2, repairer)
+    yield
+      withClue("the first pass installed a read older than T, and T's older mark kept the entry: "):
+        keysAfterFirstPass shouldBe Set(k0, k2)
+        afterFirstPass should not be empty
+      storeKeys(2, kvPtr) shouldBe Set(k0, k1, k2)
+
+  test("an errorTree pass whose entry delete fails does not stand in for a UnackedCommits entry (RP-W1)"):
+    val reconciles = java.util.concurrent.atomic.AtomicInteger(0)
+    for
+      (kvPtr, txid, beforeT, armT, repairer) <- markedDuringRepair(reconciles)
+      // Store 2 owes T as a voter that forgot it without applying
+      entry = MissedUnackedCommit(sid(2), txid, UnackedCommitEntry(beforeT, None, List(kvPtr)))
+      _ <- pump(new MissedUpdateMarker(client).mark(Nil, List(entry)), deadline())
+      _ <- settle()
+      _ <- armT()
+      _ <- pass(2, repairer, DeferralState())
+      entries <- unackedEntries(2)
+    yield
+      withClue("the UnackedCommits entry reconciles the object itself, after T committed: "):
+        reconciles.get shouldBe 2
+        storeKeys(2, kvPtr) shouldBe Set(k0, k1, k2)
+      entries shouldBe empty
+
   test("an entry whose missed transaction started before the store's copied timestamp completes with its content"):
     // Store 2's copy is installed by repair from a read, so its timestamp is copied (as a rebuild's is), and is
     // later than T0's start: T0 started before that read but reaches the other stores only afterwards. The entry for

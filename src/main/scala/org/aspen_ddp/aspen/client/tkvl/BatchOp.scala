@@ -9,14 +9,21 @@ private[tkvl] sealed abstract class BatchOp:
 private[tkvl] object BatchOp:
 
   /** Sets `key` to `value`. `requirement` is as for `NodeEncoding.insert`. With `replaces` (`TKVLInsert.replaces`)
-    * the put is dropped where the node holding the key declines to be replaced (`ListBatch.assign`)
+    * the value held by the node holding the key decides what is written, or that the put is dropped
+    * (`ListBatch.assign`)
     */
   final case class Put(key: Key,
                        value: Value,
                        requirement: PutRequirement,
-                       replaces: Option[Value => Boolean] = None) extends BatchOp:
-    /** False if the put is conditional and `node`, which holds its key's range, holds a value it does not replace */
-    def appliesTo(node: ListNode): Boolean = replaces.forall(r => node.get(key).forall(r))
+                       replaces: Option[Value => Option[Value]] = None) extends BatchOp:
+    /** The put to stage in `node`, which holds its key's range: None if the put is conditional and `node` holds a
+      * value it declines, else this put, with the value `replaces` chose for a held one
+      */
+    def resolve(node: ListNode): Option[Put] = replaces match
+      case None => Some(this)
+      case Some(r) => node.get(key) match
+        case None => Some(this)
+        case Some(held) => r(held).map(v => copy(value = v))
 
   /** Deletes `key`. Nothing is done for a key that is not in the tree, unless `requiredRevision` is given: the key
     * must then be held at that revision, else the batch fails with `KeyNotAtRevision`

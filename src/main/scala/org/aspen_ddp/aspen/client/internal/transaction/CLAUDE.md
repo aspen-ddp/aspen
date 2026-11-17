@@ -42,10 +42,12 @@
   (`encodeErrorEntry`; type 0 Data, 1 KeyValue, 2 unknown). With the tree's pool these rebuild the object's pointer
   (`ErrorEntry.pointer`), which repair needs to read an object the AllocationTree no longer lists (repair F5). The type
   is unknown only for a commit error on an object the transaction does not reference (not reachable today)
-- Marker entries only move forward (repair F10): its puts are conditional checked inserts (`TKVLInsert.replaces`). An
-  ErrorTree mark replaces a held one only for a later `missedTimestamp`; an UnackedCommits entry is written only
-  where none is held, so a re-write never moves its revision under the scan's delete. Two clients marking one key at
-  once abort one batch, which retries; a batch with nothing newer to write commits nothing. Still `replaySafe`
+- Marker entries only move forward: its puts are conditional checked inserts (`TKVLInsert.replaces`). An ErrorTree
+  mark replaces a held one only for a later `missedTimestamp`, and an older one writes the held value again: that
+  moves the entry's revision, so a repair whose read predates the older miss's commit (transactions can commit out of
+  start order) fails its delete and reads again (repair-process 12.4). An UnackedCommits entry is written only where
+  none is held, so a re-write never moves its revision under the scan's delete. Two clients marking one key at once
+  abort one batch, which retries; a batch whose UnackedCommits entries are all held commits nothing. Still `replaySafe`
   ("missed-update marks only move forward"): a replay writes a key only where none is held, which costs one more
   repair pass. An UnackedCommits entry re-created after the scan deleted it is harmless: the scan deletes one only
   while its store holds no Tx for T, and a store never rejoins a transaction it forgot

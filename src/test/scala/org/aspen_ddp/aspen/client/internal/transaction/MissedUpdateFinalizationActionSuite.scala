@@ -697,7 +697,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
 
   // Monotone entries (repair F10): writes by separate markers, as by two clients, a re-run finalizer or a replay
 
-  atest("an older miss marked after a newer one leaves the newer mark"):
+  atest("an older miss marked after a newer one keeps the newer mark and writes it again"):
     val objectId = ObjectId(UUID.randomUUID())
     val older = HLCTimestamp(1000L << 16)
     val newer = HLCTimestamp(2000L << 16)
@@ -710,9 +710,9 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       after <- pool.errorTree.get(buildErrorKey(net.storeId0, objectId))
     yield
       decodeErrorValue(after.get.value) shouldBe ((newer, 0.toByte, Seq[Byte](7)))
-      after.get.revision shouldBe before.get.revision
-      // Nothing left to write: no transaction is committed
-      second.commits shouldBe 0
+      // The rewrite moves the entry's revision, failing a repair's delete that read before the older miss committed
+      after.get.revision should not be before.get.revision
+      second.commits shouldBe 1
 
   atest("a newer miss marked after an older one replaces the older mark"):
     val objectId = ObjectId(UUID.randomUUID())

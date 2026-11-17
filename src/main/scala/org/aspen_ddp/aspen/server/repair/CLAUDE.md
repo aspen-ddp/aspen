@@ -9,9 +9,10 @@
   commit in flight
 - One `StoreRepairer` scan walks the store's ErrorTree range, then its UnackedCommits range (skipping transactions
   the store holds live). Each chunk of a chunked UnackedCommits entry is repaired as an entry of its own. An entry's
-  object that the same scan's ErrorTree pass completed at a `missedTimestamp` at or after the entry's timestamp is
-  complete without another read (`Counts.completedAt`; repair-process RP-N3): a silent voter's entry then costs only
-  its delete. Both kinds
+  object that the same scan's ErrorTree pass completed, with the ErrorTree entry's delete committed, at a
+  `missedTimestamp` at or after the entry's timestamp is complete without another read (`Counts.completedAt`;
+  repair-process 5.3): a silent voter's entry then costs only its delete. A failed delete records nothing: the entry
+  was rewritten, possibly by a mark for a transaction that committed after the read. Both kinds
   of entry are left for a later pass while the store may still join the entry's transaction
   (`RepairTarget.mayJoinTransaction`: T's start, which both carry, at or above the store's forget floor). Otherwise a
   replay's Tx created after the `holdsTransaction` check could apply T after the reconcile, and the entry would be

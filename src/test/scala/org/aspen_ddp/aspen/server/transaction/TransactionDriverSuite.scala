@@ -231,14 +231,12 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, false), (ds1, false), (ds2, false))
   }
 
-  // Rebuild F6: one commit vote, one abort vote and a silent store leave the outcome to the silent store. Expiry never
-  // ends it (both voters hold acceptor state), and a store returning past the horizon refuses the prepare silently
-  test("an undecided tally waits until past expiry, then proposes abort") {
+  // Rebuild F6: one commit vote, one abort vote and a silent store leave the outcome to the silent store. The driver
+  // never proposes abort on it: expiry rule E ends the Tx instead
+  test("an undecided tally never proposes abort") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
-    var past = false
-    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => (),
-      start = TransactionDriver.Start(pastExpiry = () => past))
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
 
     promiseFrom(driver, ds0, TransactionDisposition.VoteCommit)
     promiseFrom(driver, ds1, TransactionDisposition.VoteAbort)
@@ -246,7 +244,17 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     accepts(messenger) shouldBe Nil
 
     // The resent prepares' replies re-run the tally
-    past = true
+    promiseFrom(driver, ds1, TransactionDisposition.VoteAbort)
+    driver.testHaveLocalProposal shouldBe false
+    accepts(messenger) shouldBe Nil
+  }
+
+  test("an abort-certain tally still proposes abort") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+
+    promiseFrom(driver, ds0, TransactionDisposition.VoteAbort)
     promiseFrom(driver, ds1, TransactionDisposition.VoteAbort)
     accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, false), (ds1, false), (ds2, false))
   }
@@ -254,8 +262,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
   test("past expiry, a quorum reporting an accepted commit is proposed, not abort") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
-    val driver = new TTD(ds0, messenger, mkprep(2, 0, 0, txd), new TFinalizer(), _ => (),
-      start = TransactionDriver.Start(pastExpiry = () => true))
+    val driver = new TTD(ds0, messenger, mkprep(2, 0, 0, txd), new TFinalizer(), _ => ())
 
     promiseFrom(driver, ds0, TransactionDisposition.VoteCommit, accepted = Some((ProposalId(1, 1), true)))
     promiseFrom(driver, ds1, TransactionDisposition.VoteAbort)
@@ -266,8 +273,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
   test("past expiry, a driver holding a proof does not propose abort on an undecided tally") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
-    val driver = new TTD(ds0, messenger, mkprep(2, 0, 0, txd), new TFinalizer(), _ => (),
-      start = TransactionDriver.Start(pastExpiry = () => true))
+    val driver = new TTD(ds0, messenger, mkprep(2, 0, 0, txd), new TFinalizer(), _ => ())
 
     driver.receiveTxResolved(TxResolved(ds0, ds0, txd.transactionId, committed = true, late = false, proof = true))
     val round = driver.testProposalId

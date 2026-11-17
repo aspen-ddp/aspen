@@ -45,16 +45,10 @@ object TransactionDriver {
     * @param onSplitDecision called with a conflicting second outcome (paxos F11), to log it as an error and count it.
     *                        A store passes its host status cache's TransactionStatusCache.recordSplitDecision; the
     *                        default only logs
-    * @param pastExpiry      whether the transaction is past the horizon plus the expiry margin on this store's clock
-    *                        (Frontend.pastExpiry). From then on a tally the votes cannot decide proposes abort (paxos
-    *                        F8, rebuild F6): every store that could still join has joined or refused, the client has
-    *                        reported TransactionOutcomeUnknown, and a silent store's vote may never come. The default
-    *                        never expires
     */
   case class Start(initialProposal: Boolean = false,
                    highestSeen: Option[ProposalId] = None,
-                   onSplitDecision: (TransactionId, String) => Unit = logSplitDecision,
-                   pastExpiry: () => Boolean = () => false)
+                   onSplitDecision: (TransactionId, String) => Unit = logSplitDecision)
 
   private def logSplitDecision(txid: TransactionId, detail: String): Unit =
     scribe.error(s"Split decision: transaction $txid: $detail")
@@ -456,17 +450,6 @@ abstract class TransactionDriver(
               // The votes cannot decide yet, but a promise of this round's quorum carries an accepted value, which a
               // proposer may always propose. Without this, stores answering Undetermined (resolved before voting)
               // would stall a round whose quorum already reports the chosen value
-              queueAcceptMessages()
-            } else if (start.pastExpiry()) {
-              // The outcome rests on stores that have not voted. Until expiry they may still: a partition or a
-              // restart heals, and an abort would cost the client a retry. Past it, a store that never joined refuses
-              // for good (forget floor), and expiry cannot discard a Tx whose peers all hold acceptor state, so
-              // waiting could hold the commit voters' locks forever (rebuild F6). Abort is always a valid proposal
-              // (P7): any accepted value in the promise quorum still wins (Proposer.proposalValue)
-              val silent = allDataStores.filter(s => !peerDispositions.get(s).exists(_ != TransactionDisposition.Undetermined))
-              logger.info(s"Tx ${txd.transactionId} on store $storeId: past expiry with undecided votes, proposing " +
-                s"abort. Votes: $peerDispositions. No vote from: ${silent.mkString(",")}")
-              proposer.setLocalProposal(false)
               queueAcceptMessages()
             }
           } else if (mayPropose && !holdsProof && proposer.prepareQuorumReached && !acceptQueuedThisRound) {

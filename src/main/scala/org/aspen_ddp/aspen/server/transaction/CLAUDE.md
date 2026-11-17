@@ -45,11 +45,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   is no vote: it counts neither as a reply nor as an abort. A round whose votes cannot decide proposes an accepted
   value its promise quorum reports (paxos F7)
 - Every object is classified (paxos F8): commit-certain (`c >= t`), abort-certain (`w - a < t`) or undecided. Any
-  abort-certain object decides abort at once; all commit-certain decides commit. An undecided tally waits (silence may
-  be transient) until T is past the horizon plus the expiry margin (`TransactionDriver.Start.pastExpiry`, from
-  `Frontend.pastExpiry`), then proposes abort (rebuild F6). That proposal can no longer succeed at a store past T's
-  expiry, whose acceptor is frozen (below); the expiry tally ends such a T instead (an abort voter means no store's
-  update reaches the read threshold, or no commit accept exists to choose). The abort is an ordinary Paxos proposal
+  abort-certain object decides abort at once; all commit-certain decides commit. An undecided tally only waits (silence
+  may be transient): a driver never proposes abort on it, since a client may learn commit from stores' votes. Expiry
+  ends such a Tx (the expiry rules below; an abort voter means no store's update reaches the read threshold, or no
+  commit accept exists to choose; rebuild F6). A proposed abort (abort-certain tally) is an ordinary Paxos proposal
   (paxos-transactions P7a): an accepted value in the quorum still wins
 - Proposer ids are pool indexes, so only the primary pool's stores propose (`TransactionDriver.mayPropose`). A driver on
   any other store is learn-only: it sends prepares and resolves, proves late and finalizes from what it hears, but sets

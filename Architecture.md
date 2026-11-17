@@ -163,7 +163,8 @@ commits. A transaction whose stores stay unreachable past the transaction horizo
 holding it query every peer and decide from the replies (`ExpiryTally`, rules A-G): commit when the votes or an
 accepted commit prove it, discard when an accepted abort or the missing votes rule commit out, and otherwise hold,
 while a store is silent or too many are lost to tell. They never discard a transaction whose client may have been
-told it committed.
+told it committed, except when its update fell below its read threshold (rule D: the data is lost, and the discard
+is logged as an error).
 
 Recovery and every other store-side driver send prefer-abort prepares: a DataStore that has not yet voted
 never checks the transaction's requirements on such a prepare. It proves the commit at once if an object it hosts

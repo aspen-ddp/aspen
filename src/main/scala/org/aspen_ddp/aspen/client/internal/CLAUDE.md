@@ -31,9 +31,11 @@
   `writeThreshold` `VoteCommit`s from its pool's stores (a store's first vote counts; a differing later one is logged
   and ignored). Abort votes never complete it: `Aborted` comes only from the leader's `TransactionResolved`/
   `TransactionFinalized`. After a vote-completion `SimpleClientTransactionDriver` keeps retransmitting until the
-  leader's outcome arrives or the give-up point (`result` stays `Committed`). `TransactionManager` forgets a driver on
-  `ClientTransactionDriver.stopped` (leader outcome heard, or `Unknown` reached; with no retransmits it completes with
-  `result`), not on `result`
+  leader's outcome arrives or the give-up point (`result` stays `Committed`; it logs no "HUNG" line meanwhile, and at
+  the give-up point logs at info that the leader's outcome never arrived rather than warning "outcome unknown").
+  `TransactionManager` forgets a driver on `ClientTransactionDriver.stopped` (leader outcome heard, or the give-up
+  point; with no retransmits it completes with `result`), not on `result`, so a leader abort after a vote-completion
+  reaches the driver and is logged as a split decision
 - `BaseReadDriver` re-reads a store whose reply holds a lock of a known-committed transaction at once; that `Read`
   carries `awaitCommit` (the known-committed txids among the locks) so the store can park the reply until it applies
   them (`Frontend.parkRead`, `server/store/CLAUDE.md`), so the re-read is answered once with the applied commit

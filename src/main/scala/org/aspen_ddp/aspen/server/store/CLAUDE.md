@@ -73,8 +73,9 @@
   store with a final state answers. A store with a Tx replies with `Tx.statusForExpiry`: status, finalized, late,
   `holdsAcceptorState` (false only for a Tx muted for good below the floor), its latest `accepted` value and
   `votedCommit`. An unresolved Tx answers only once frozen (past expiry by its own clock: it promises and accepts
-  nothing more, `Tx.frozen`) and its objects are loaded (its vote decided), or muted for good, so the state it reports
-  is final; before that, and for a Tx muted only for starting too far ahead (it may yet join), it is silent. With no
+  nothing more, `Tx.frozen`) and its objects are loaded, or muted for good, so the state it reports is final: a frozen
+  Tx decides no vote and sends none (`Tx.determineDisposition`, `Tx.sendDelayedPrepare`), so one still undecided then
+  (waiting on an in-flight commit, a collision or its client's prepare) is a final non-voter; before that, and for a Tx muted only for starting too far ahead (it may yet join), it is silent. With no
   Tx but a non-Unresolved status-cache entry it
   replies with that entry. With neither it replies `status = None` ("unknown") only when the start is below its forget
   floor (`belowForgetFloor(HLCTimestamp)`), which makes the answer permanent; above the floor it stays silent, as it
@@ -216,11 +217,11 @@
 - Parked reads (client 1-RTT commit design section 5): a client read whose `Read.awaitCommit` names a transaction
   holding a write lock on the object's in-memory state (`lockedWriteTransactions`) is parked (`parkRead`, keyed by
   object and `readUUID`: a resent read replaces its entry) instead of answered: the client knows that transaction
-  committed, and the reply would only show its lock again. Every `Tx.unlock` calls `locksReleased(objects)`, which
+  committed, and the reply would only show its lock again. Every `Tx.unlock` calls `answerParkedReads(objects)`, which
   answers each parked read on them none of whose named transactions still holds a lock there; so commit, abort,
   expiry discard (`Tx.expire`) and forget all release them. `doCommit` drops its locks before applying, but calls
-  `locksReleased` only after `issueCommits` applied the update in memory, so the answer shows it. Past
-  `Frontend.ParkedReadWait` (1 s, `expireParkedReads` on the store heartbeat) a parked read is answered with the
+  `answerParkedReads` only after `issueCommits` applied the update in memory, so the answer shows it. Past
+  `Frontend.ParkedReadWait` (1 s; a test seam, `parkedReadWait`; `expireParkedReads` on the store heartbeat) a parked read is answered with the
   state as it is then. At `Frontend.MaxParkedReads` (1024) parked a read is answered at once. A read reaching the
   backend is never parked (an uncached object holds no locks). Fail-stop and close drop parked reads unanswered; the
   client retransmits. Safety is unaffected: a parked read only delays its own answer

@@ -150,8 +150,11 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   acceptor state (a muted Tx holds none)
 - Freeze (`Tx.frozen`, cross-document G1): once T is past expiry by the store's own clock, its Tx promises and
   accepts nothing more, as if offline, which Paxos allows. Derived from the clock, so a reload cannot thaw it. An
-  unresolved Tx answers a status request only once frozen (or muted for good), so every state a tally counts is final:
-  a vote never changes and nothing more is accepted. Before that it is silent
+  unresolved Tx answers a status request only once frozen with its objects loaded (or muted for good), so every state a
+  tally counts is final: a vote never changes and nothing more is accepted. A frozen Tx decides no vote
+  (`determineDisposition` returns at once while T's outcome is unknown here and it is not muted) and sends no delayed
+  prepare response, so a frozen Tx still undecided (an in-flight commit, a collision, a late client prepare) stays a
+  non-voter for good. Before that it is silent
 - A reply (`TxStatusResponse.TxStatus`) carries the outcome if known, plus `accepted` (the latest accepted value),
   `votedCommit` (a commit voter holds T's update for its objects) and `amnesiac` (a rebuilt store, for T started
   before its `acceptorSince`, `Frontend.mayHaveForgottenUndecided`: no state, but its old incarnation may have
@@ -172,13 +175,15 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   `vc >= r` (L2). (C) **Discard** when `aa >= 1` (L1). (D) **Discard** when some changed pool has `vc + s < r` (the
   update can never be restored; `dataLost`, logged as an error, when `ac >= 1` or every pool has `vc + k + s >= t`: a
   commit may have been chosen or reported). (E) **Discard** when some pool has `vc + k + s < t` (no tally was
-  commit-certain). (F) **Commit** when no store of T is silent, every pool has `vc + k >= t`, `k_p + n_p < t` (`n_p`:
-  primary stores replying "unknown") and every changed pool has `vc >= r` (only the amnesiac and "unknown" stores,
-  fewer than a quorum, could hide an accepted abort: a store that accepted, was finalized or discarded T and let its
-  cached outcome expire answers "unknown" too; a conflicting commit would need a locked voter since `t + r > w`).
-  (G) **Hold** otherwise: some store is silent, or, every store reported, `k_p + n_p >= t` (logged `UNDECIDABLE
-  TRANSACTION`, then every `Frontend.UndecidableLogRounds` rounds; with a changed primary object D fires first, so
-  only an unchanged primary object reaches it). Accepted divergence: one store discards by C over an abort accepted
+  commit-certain). (F) **Commit** when no store of T is silent, every pool has `vc + k >= t` and `vc > w - t`,
+  `k_p + n_p < t` (`n_p`: primary stores replying "unknown") and every changed pool has `vc >= r` (only the amnesiac
+  and "unknown" stores, fewer than a quorum, could hide an accepted abort: a store that accepted, was finalized or
+  discarded T and let its cached outcome expire answers "unknown" too; a conflicting commit's `t` votes would overlap
+  T's live voters since `vc + t > w`. A lock-only pool needs `vc > w - t` stated: its amnesiac stores hold no lock,
+  and with only `vc + k >= t` a stale commit vote beside rebuilt abort voters committed T over a failed requirement).
+  (G) **Hold** otherwise: some store is silent, or, every store reported, `k_p + n_p >= t` (with a changed primary
+  object D fires first, so only an unchanged primary object reaches it) or some lock-only pool has `vc <= w - t`
+  (logged `UNDECIDABLE TRANSACTION`, then every `Frontend.UndecidableLogRounds` rounds). Accepted divergence: one store discards by C over an abort accepted
   by fewer than a quorum, the accepter forgets T, and another commits by F: no client heard abort (never chosen),
   F's locked voters exclude a conflicting commit, and the commit's missed-update marks repair the discarder.
   On a commit (A, B, F) the deciding store sends `TxResolved(commit)` to every store of T, applies it (a commit

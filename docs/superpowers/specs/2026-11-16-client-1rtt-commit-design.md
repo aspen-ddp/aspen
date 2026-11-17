@@ -182,6 +182,12 @@ check. Fix, a design call: `Tx.receiveStatusRequest` answers an unresolved, non-
 decided (`allObjectsLoaded`). Until then it is silent, counted as `s`. A Tx whose objects never load therefore holds T,
 which is the accepted cost.
 
+*Amendment 2026-11-16 (final review).* A loaded Tx can still be undecided (waiting on an in-flight commit, a
+collision, or a client prepare that arrives after the freeze), so `allObjectsLoaded` did not mean "vote decided".
+Fix: a frozen Tx never decides a vote (`Tx.determineDisposition` returns at once while T's outcome is unknown there
+and it is not muted) and `sendDelayedPrepare` sends nothing once frozen. "Frozen, loaded and undecided" is then a
+final non-voter, and the gate is correct. A Tx whose objects load only after the freeze is such a non-voter too.
+
 A store with no Tx for T answers "unknown" at this point. Past expiry implies below the forget floor: the floor is at
 least now − horizon, and expiry is start + horizon + margin. So such stores count as non-commit-voters (checked
 against `Frontend.forgetFloorMillis` / `pastExpiry`).
@@ -220,6 +226,19 @@ Rules for an unknown outcome, in order. Rule 1, Adopt, is unchanged. These repla
   C over an abort accepted by fewer than a quorum. The accepter then forgets T, and another observer commits by F.
   No client was told abort, F's locked voters exclude a conflicting commit, and the commit's missed-update marks
   repair the store that discarded. See `docs/safety/paxos-transactions.md` 10.10 and `ExpiryTallyConsistencySuite`.
+
+  *Amendment 2026-11-16 (final review).* F's conflict argument above is unsafe for lock-only pools. "T's `vc >= r`
+  voters hold its locks" covers only changed pools; a lock-only pool needs only `vc + k >= t`, and its amnesiac stores
+  hold no lock. Example: P primary, changed, Replication(3,2); L lock-only Replication(3,2), where T holds
+  `ExclusiveRevisionLock(Y)`. T' updates Y: L1 and L2 vote commit for it and T' commits. T gets abort votes from L1
+  and L2 (requirement failed) and a stale commit vote from L0. L1 is rebuilt before its abort reaches T's driver. At
+  expiry P has `vc = 3`, L has `vc = 1, k = 1, s = 0`: A-E fail and F committed T over its failed requirement. The
+  same happens with a lock-only primary (p0 commit, p1 amnesiac, p2 a frozen abort voter). F now also requires
+  **every referenced pool to have `vc > w - t`**: then a conflicting commit's `t` votes overlap T's live voters there
+  (`vc + t > w`). Changed pools already have it from `vc >= r`, since `t + r > w`. G holds otherwise, logged as
+  undecidable with every store replied: the amnesiac stores may have voted commit with the voters seen, so a client
+  may have been told commit. `ExpiryTallyConsistencySuite` checks that no observer commits where some pool truly had
+  fewer than `t` commit votes and at least `t` stores holding none of T's locks.
 - **G. Hold** otherwise. That happens while some store is silent (transient). With every store replied, it happens only
   when `k_p >= t`, beyond the pool's loss tolerance (`t - r < t`), so data was lost too. Keep the
   `UNDECIDABLE TRANSACTION` log for that case.

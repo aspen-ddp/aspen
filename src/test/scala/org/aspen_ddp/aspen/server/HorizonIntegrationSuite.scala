@@ -4,8 +4,8 @@ import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.{TestTransactions, Transaction, TransactionAborted, TransactionOutcomeUnknown}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
-import org.aspen_ddp.aspen.common.network.{ClientResponse, TransactionFinalized, TransactionResolved, TxFinalized,
-  TxMessage, TxPrepare, TxResolved, TxStatusRequest}
+import org.aspen_ddp.aspen.common.network.{ClientResponse, TransactionFinalized, TransactionResolved, TransactionVote,
+  TxFinalized, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDisposition, TransactionId, TransactionStatus}
@@ -114,9 +114,11 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
   private def isOutcome(txid: TransactionId)(m: TxMessage): Boolean =
     m.transactionId == txid && (m.isInstanceOf[TxResolved] || m.isInstanceOf[TxFinalized])
 
+  /** Everything that tells the client T's outcome: the leader's messages, and the stores' votes */
   private def isClientOutcome(txid: TransactionId)(r: ClientResponse): Boolean = r match
     case m: TransactionResolved => m.transactionId == txid
     case m: TransactionFinalized => m.transactionId == txid
+    case m: TransactionVote => m.transactionId == txid
     case _ => false
 
   private def recordedClientPrepares(txid: TransactionId): List[TxPrepare] =

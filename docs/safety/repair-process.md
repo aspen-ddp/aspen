@@ -1,26 +1,15 @@
 # Missed-Update Repair: ErrorTree, UnackedCommits, Reconcile
 
-Status: derived from the code at commit c3ad5493 (branch main); refreshed 2026-11-09 against `0d08e3c6` (branch
-`pin_refactor`, replay pins: `docs/superpowers/specs/2026-11-09-replay-pins-design.md`). The TracelessCommits tree is now
-the UnackedCommits tree: same schema and scan, but entries are written for every committed transaction's
-unacknowledged counted voters (2.3, 3), an entry means "this store is owed T", and late commits read it (5.3). Line
-numbers in passages the refresh did not touch are for c3ad5493. Refreshed again 2026-11-10 against `c181375b` for the
-replay-pins addendum: each entry may be shadowed by an applied stub in the store's device CRL, which the scan now
-cleans (5.5); passages changed are marked "(addendum)". Every mechanism cites `path:line` relative to
-`src/main/scala/org/aspen_ddp/aspen/` unless the path starts with `docs/`. Claims in `CLAUDE.md` and the two design
-documents (`docs/superpowers/specs/2026-09-02-continual-repair-design.md`,
-`docs/superpowers/specs/2026-11-08-traceless-commits-design.md`) were checked against the code; where the code
-differs, the code is described.
-
-Related documents (written in parallel): [paxos-transactions.md](paxos-transactions.md),
+Paths are relative to `src/main/scala/org/aspen_ddp/aspen/` unless they start with `docs/`. Code is cited as
+`File.scala` plus the symbol. Related documents: [paxos-transactions.md](paxos-transactions.md),
 [crash-recovery-log.md](crash-recovery-log.md), [transaction-requirements.md](transaction-requirements.md),
-[transaction-recovery.md](transaction-recovery.md) (how entries get written by finalization and how a recovered commit
-vote consumes a UnackedCommits entry), [rebuild-process.md](rebuild-process.md) (whole-store rebuild),
+[transaction-recovery.md](transaction-recovery.md) (how a recovered or late commit vote consumes an UnackedCommits
+entry), [rebuild-process.md](rebuild-process.md) (whole-store rebuild),
 [systemic-loss-protection.md](systemic-loss-protection.md).
 
-Contents: 1 Scope and model, 2 Tree schemas, 3 Entry production, 4 Scheduling, 5 Scan state machine, 6 Reconcile,
-7 Race prevention, 8 Deferral and proofs, 9 Deletes, 10 Opportunistic rebuild, 11 Invariants, 12 Failure scenarios,
-13 Suspected flaws and open questions.
+Contents: 1 Scope and model, 2 Tree schemas, 3 Entry production, 4 Scheduling and limits, 5 The scan, 6 Reconcile,
+7 Race prevention, 8 Deferral, parking and proofs, 9 Deletes, 10 Other users of the reconcile path, 11 Invariants,
+12 Failure scenarios, 13 Accepted limitations, 14 Open weaknesses.
 
 ---
 
@@ -28,148 +17,146 @@ Contents: 1 Scope and model, 2 Tree schemas, 3 Entry production, 4 Scheduling, 5
 
 ### 1.1 What repair is for
 
-A transaction commits when a write threshold of the stores hosting its objects voted commit. The remaining stores may
-not hear about the outcome (message loss, host down, slow). Such a store keeps an older copy of the object: this is a
+A transaction commits when a write threshold of the stores hosting each of its objects voted commit. The other stores
+may not hear the outcome (message loss, host down, slow, admission refusal). Such a store keeps an older copy: a
 *missed update*. Repair brings the store's copy back into agreement with what a read of the rest of the system
-returns. It is a background, eventually-consistent process; reads and writes never wait for it. Reads are correct
-without it because they restore from a read threshold of stores. Repair restores redundancy.
+returns. It is a background, eventually consistent process; reads and writes never wait for it. Reads are correct
+without it because they restore from a read threshold (`IDA.consistentRestoreThreshold`, a majority) of agreeing
+stores. Repair restores redundancy.
 
-Repair never decides what a committed state is. It only copies the state a normal read returns, onto one store, under
+Repair never decides what a committed state is. It copies the state a normal read returns onto one store, under
 guards that make the copy safe against concurrent transactions at that store.
 
-### 1.2 Facts the design relies on (verified)
+### 1.2 Facts the design relies on
 
 | # | Fact | Code |
 |---|------|------|
-| Q1 | Replication: read (consistent restore) threshold = `width/2+1`; write threshold is in `[width/2+1, width]`. | `common/ida/IDA.scala:203,243` |
-| Q2 | Reed-Solomon and RandomAccessReedSolomon: restore threshold `k >= width/2+1` (a majority), write threshold in `[k, width]`. | `common/ida/IDA.scala:411-415, 591-595` |
-| Q3 | Hence `readThreshold + writeThreshold > width` for every IDA: any read set intersects the commit-vote set of any committed transaction in at least one store. | derived from Q1, Q2 |
-| Q4 | A store that voted commit holds the transaction's locks until the outcome is applied (or the transaction resolves abort). Locks are reported in read responses: locked keys, absent-key locks, and an object-level flag. | `server/store/ObjectState.scala:59-68`; `server/store/Frontend.scala:1011` (`NetworkRead` reply), `client/internal/read/BaseObjectReader.scala:104` |
-| Q5 | The reader restores from stores sharing the "most recent" revision, ranked by (max timestamp, count). It returns only when at least `threshold` stores match. Read locks are the union over all responders. | `client/internal/read/BaseObjectReader.scala:139-207` |
-| Q6 | A KeyValue key is restored from the stores holding its highest-timestamp revision. If fewer than `threshold` match and the missing ones could still match, or any responder holds a lock of that revision, the read waits (`NotRestorable`). Otherwise the key is deleted. | `client/internal/read/KeyValueObjectReader.scala:109-151` |
-| Q7 | A refcount is the one with the highest `updateSerial` among matching responders. A restored object with `count == 0` is `InvalidObject`, so a client read of a deleted object fails. A store that applied a deletion answers `ObjectNotFound`. | `client/internal/read/BaseObjectReader.scala:176,197`; `server/store/Frontend.scala:1010-1020` |
-| Q8 | Applying a transaction sets the object's timestamp to the transaction's start timestamp unconditionally. Only requirements that name a revision check `state.timestamp > txTimestamp`; refcount updates and KeyValue updates without a required revision do not. So an object's timestamp is *not* monotone in commit order. | `server/store/RequirementsApplyer.scala:105-145`; `server/store/RequirementsChecker.scala:220-226,245`, `:213` |
-| Q9 | A KeyValue update moves the object revision only when it has a required revision. A blind insert or delete changes only the key's revision and the object's timestamp. | `server/store/RequirementsApplyer.scala:105-111` |
+| Q1 | For every IDA the read threshold `r` is a majority and `r <= w <= width` (`w` the write threshold), so `r + w > width`: any read set of `r` stores contains at least one commit voter of any committed transaction. | `common/ida/IDA.scala`; CLAUDE.md |
+| Q2 | A store that voted commit holds the transaction's locks until it applies the outcome or the transaction resolves abort. A read reply reports them: locked keys (present keys locked, plus absent-key locks) and an object-level flag (exclusive object lock, content lock, range locks). A write locks every key it writes, and an object-level write takes the exclusive lock. Shared revision locks are not reported (they never change the object). | `server/store/ObjectState.scala` `lockedKeys`, `objectLevelLocked`; `RequirementsLocker.lock`, `lockWrites`; `Frontend.readForNetwork` |
+| Q3 | The reader picks the revision held by at least `r` replying stores, whatever its timestamp (at most one revision can reach a majority). It returns once one does. Its read locks are the union over every store that replied with a state. Its timestamp is the maximum over the matching stores. | `client/internal/read/BaseObjectReader.scala` `getStoreStates`, `attemptRestore` |
+| Q4 | A KeyValue key is restored from the stores holding a revision of it that `r` segments share. It is declared deleted only when no revision of it can still reach `r` and no store holds the lock of any segment's revision; otherwise the read waits (`NotRestorable`). | `client/internal/read/KeyValueObjectReader.scala` `resolve` |
+| Q5 | A restored object with refcount 0 is `InvalidObject(provesDeletion = true)`. A read fails `InvalidObject` when more than `width - r` stores answered `ObjectNotFound`/`ObjectMismatch`, and `provesDeletion` is set when more than `width - w` did. A store that applied a deletion answers `ObjectNotFound`. | `BaseObjectReader.scala`; `client/ReadError.scala` `InvalidObject` |
+| Q6 | Every apply sets the object's timestamp to the later of its current timestamp and the transaction's start (`later`), so object timestamps never decrease. Only revision-bearing requirements (`checkRevision`, a `KeyValueUpdate` with a required revision) check `state.timestamp > txTimestamp`. A `RefcountUpdate` and a key-level `KeyValueUpdate` do not, so two transactions on one object may commit in the opposite order of their starts. | `server/store/RequirementsApplyer.scala`; `RequirementsChecker.checkRevision`, `checkKVRequirements` |
+| Q7 | A KeyValue update moves the object revision only when it has a required revision. | `RequirementsApplyer.scala` |
+| Q8 | Stores refuse blind writes as `TransactionBuilder` does: a key Delete needs a `KeyRevision` on that key, a required revision or a content lock; a min/max/left/right change needs a required revision (except an allocation's initial content). So every key delete fails at a store lacking the key (and is marked there), and every object-level change moves the revision. | `RequirementsChecker.refuseBlindWrites`; `TransactionBuilder.refuseBlindWrites` |
+| Q9 | A store holding recovered transactions (`Frontend.holding`: CRL still loading, a recovered Tx still loading its objects, or one deciding its vote) drops every client read, as a silent store would. A recovered commit vote retakes its locks before holding ends. | `Frontend.readObjectForNetwork`; `Tx.completeLoad` |
 
-Q3 is the reason an unlocked part of a read reflects every committed transaction. Section 11 states that as E1.
+Q1 with Q2 and Q9 is why an unlocked part of a read reflects every transaction committed before the read began
+(invariant E1, section 11).
 
 ### 1.3 Terms
 
 - **Store**: `StoreId(poolId, poolIndex)`. **Slice**: the store's IDA-encoded part of an object.
-- **Entry**: a record in the ErrorTree or UnackedCommits tree that says "this store may be behind on this object /
-  this transaction".
-- **Snapshot**: the store's copy of an object recorded on its executor before the repair reads (`RepairSnapshot`,
-  `server/store/Reconcile.scala:22`).
+- **Entry**: a record in the ErrorTree ("this store may be behind on this object") or the UnackedCommits tree ("this
+  store cast a commit vote on this transaction and had not acknowledged applying it").
+- **Snapshot**: the store's copy of an object, recorded on its executor before the repair reads (`RepairSnapshot`,
+  `server/store/Reconcile.scala`).
 - **Install**: writing the repaired state into the store's memory and backend (`Frontend.reconcileSettled`).
-- **Deferred**: a part of the object the read reports locked, or the store itself holds locked. It is left alone.
-- **Stale** (result flag): something the repair would have changed differs from the snapshot, or the read could not be
-  used. It is left for a later pass. Not the same as deferred.
+- **Deferred**: a part the read reports locked, or the store itself holds locked. Left alone.
+- **Stale** (result flag): something the repair would change differs from the snapshot, the object is unsettled on
+  the store, or the read cannot be used (or is older than the entry's missed timestamp). Left for a later pass.
 
 ---
 
 ## 2. Tree schemas
 
-Both trees are ordinary Tiered Key Value Lists (`TieredKeyValueList`, `TreeKind.KeyValueObjects`, `ByteArrayKeyOrdering`
-= unsigned lexicographic, `common/objects/KeyOrdering.scala:25-29`). Each is rooted in a key of the pool's
-*pool state* KeyValue object.
+Both trees are Tiered Key Value Lists (`TieredKeyValueList`, KeyValue-object nodes, unsigned lexicographic key
+order) rooted in keys of the pool's state object.
 
 ### 2.1 Where they live
 
 | Item | Value | Code |
 |------|-------|------|
-| Pool state keys | `ConfigKey=0, ErrorTreeKey=1, AllocationTreeKey=2, AllocationStrategyKey=3, AllocationStrategyConfigKey=4, RepairPolicyKey=5, UnackedCommitsTreeKey=6` | `common/metadata/StoragePoolState.scala:14-20` |
-| Pool state object | Always in the bootstrap pool | CLAUDE.md; `client/internal/BaseAspenClient.scala:~527` |
-| Tree handles | `pool.errorTree`, `pool.allocationTree`, `pool.unackedCommitsTree` over `KVObjectRootManager(client, key, poolStatePointer)` | `client/internal/pool/SimpleStoragePool.scala:34-41` |
-| Tree node placement, ordinary pool | Root and later nodes allocated from the pool's *metadata group* (default `aspen-default-storage-pool-metadata`) | `client/internal/BaseAspenClient.scala:~485-505` |
-| Tree node placement, metadata pool | Nodes in the bootstrap pool | `server/store/Bootstrap.scala:~187-199`; `BaseAspenClient.scala:~485` |
-| Tree node placement, bootstrap pool | In the bootstrap pool itself | `server/store/Bootstrap.scala:~167-186` |
-| One tree per pool | Not per store. A store's entries are the key range `[poolIndex, poolIndex+1)`. | `server/repair/StoreRepairer.scala:124-127` |
+| Pool state keys | `ErrorTreeKey=1`, `AllocationTreeKey=2`, `RepairPolicyKey=5`, `UnackedCommitsTreeKey=6` (others: config, allocation strategy) | `common/metadata/StoragePoolState.scala` |
+| Pool state object | Always in the bootstrap pool | CLAUDE.md; `common/metadata/CLAUDE.md` |
+| Tree handles | `pool.errorTree`, `pool.allocationTree`, `pool.unackedCommitsTree` | `client/internal/pool/SimpleStoragePool.scala` |
+| Node placement | Ordinary pool: the pool's metadata group. Metadata pool: the bootstrap pool. Bootstrap pool: itself | `common/metadata/CLAUDE.md`; `server/store/Bootstrap.scala` |
+| One tree per pool | A store's entries are the key range `[poolIndex, poolIndex+1)`; keys compare unsigned, and `poolIndex` is a byte, so `poolIndex+1` never wraps below 255 | `StoreRepairer.scan` |
 
-So repair of pool P reads P's trees from metadata pool M (an unavailable or degraded M stops repair of P, see 12.9).
-Repair of M's stores reads M's trees from the bootstrap pool. Repair of the bootstrap pool reads trees from itself.
+Repair of pool P reads P's trees from a metadata pool M: an unavailable or degraded M stops repair of P (12.7).
+Repair of M reads M's trees from the bootstrap pool. Repair of the bootstrap pool reads its own trees, which are also
+swept node by node (10.1).
 
 ### 2.2 ErrorTree
 
 | Field | Format | Code |
 |-------|--------|------|
-| Key | 17 bytes: `poolIndex` (1 byte), `objectId.msb` (8, big-endian), `objectId.lsb` (8, big-endian). One entry per (store, object). | `client/internal/transaction/MissedUpdateMarker.scala:259-266`; decode `server/repair/StoreRepairer.scala:376-382` |
-| Value | `missedTimestamp` (8 bytes, big-endian `HLCTimestamp.asLong`) then the object's `storePointer` bytes (possibly empty). | `client/internal/transaction/MissedUpdateFinalizationAction.scala:203-217` |
-| Meaning of `missedTimestamp` | The *start timestamp of the newest missed transaction known to the writer*. A store that applies that transaction sets the object's timestamp to this value (Q8), so a read at least this new "has caught up past the miss". The key's own tree timestamp belongs to the transaction that wrote the entry and is not used for this. | same, `:196-202` |
-| Entry's tree-level metadata | The `ValueState.revision` (txid of the writing transaction) and `.timestamp` (its start timestamp). Repair uses the revision as a compare-and-delete token and the timestamp as the entry's age. | `server/repair/StoreRepairer.scala:164,184` |
-| Empty `storePointer` | Means "delete by ObjectId alone" (RocksDB). FSIF needs the pointer. | `Backend.scala:74`; `FsifBackend.scala:1463-1466` |
-
-The `storePointer` in the value is *the only surviving copy* once an object is deleted, because deletion removes the
-AllocationTree entry (`client/internal/allocation/DeletionFinalizationAction.scala:28`).
+| Key | 17 bytes: `poolIndex`, `objectId` (msb, lsb, big-endian). One entry per (store, object). | `MissedUpdateMarker.errorKey`; `StoreRepairer.decodeObjectId` |
+| Value | `missedTimestamp` (8, `HLCTimestamp.asLong`), object type (1: 0 Data, 1 KeyValue, 2 unknown), `storePointer` bytes (possibly empty) | `MissedUpdateFinalizationAction.encodeErrorEntry`, `decodeErrorEntry`, `ErrorEntry.pointer` |
+| `missedTimestamp` | The start timestamp of the newest missed transaction recorded for (store, object). A store that applies it gets at least that object timestamp (Q6), so a read at least that new can reflect the miss (6.4). The key's own tree timestamp belongs to the marker transaction. | same |
+| Tree metadata used | `ValueState.revision` (the marker transaction's id) as the compare-and-delete token and part of the deferral key; `ValueState.timestamp` (its start) as the entry's age | `StoreRepairer.repairErrorEntry` |
+| Type and store pointer | With the tree's pool and the key's id they rebuild the object's pointer, which repair needs to read an object the AllocationTree no longer lists, and to delete its slice (FSIF needs the store pointer; an empty one means "by ObjectId", RocksDB). Deletion removes the AllocationTree entry, so the entry is then the only copy. The type is unknown only for a commit error on an object the transaction does not reference, which `RequirementsChecker` never reports. | `MissedUpdateFinalizationAction.writeMissedUpdates` |
 
 ### 2.3 UnackedCommits tree
 
 | Field | Format | Code |
 |-------|--------|------|
-| Key | 17 bytes: `poolIndex` then `transactionId` (msb, lsb big-endian). One entry per (store, transaction). (2026-11-11) An entry larger than `UnackedCommitEntry.maxEncodedSize` of the tree's leaf node size (half a node less 64 bytes) is written as chunks, each a complete entry (same timestamp, some of the objects): chunk 0 under the 17-byte key, chunk `i` under it plus `i` as 2 big-endian bytes. The lookups name the head only. | `UnackedCommitEntry.key`, `chunks`; `MissedUpdateMarker.writeBatch` |
-| Value | `timestamp` (8) = the transaction's start timestamp; `count` (4); then `count` x (`length` (4), `ObjectPointer` bytes). The pointers keep their store pointers and are the objects of this store that T changes (traced or traceless; see the next row). | `UnackedCommitEntry.scala:16-37` |
-| Which objects | Since the refresh: every object the transaction changes on that store, traced or traceless. Before, only `RefcountUpdate`s and revision-less `KeyValueUpdate`s with `deletesKeys`. | `MissedUpdateFinalizationAction.scala:98-106` |
-| Meaning | The store cast a commit vote the commit may have relied on and had not acknowledged applying T when T was finalized: it is owed T. A recovered commit vote, and any commit voter receiving a late commit, applies T only if its entry exists. (addendum) Unless the store holds an applied stub for T, which says the entry is stale: it then applies nothing. | `Tx.scala:158-160,920-932,997-1041`; addendum `Tx.scala:642-648,984-1007` |
+| Key | 17 bytes: `poolIndex`, `transactionId`. One entry per (store, transaction). An entry larger than `UnackedCommitEntry.maxEncodedSize` (half the leaf node size less 64 bytes) is written as chunks, each a complete entry for some of the objects: chunk 0 under the 17-byte key, chunk `i` under it plus `i` as 2 big-endian bytes. Lookups name the head only. | `UnackedCommitEntry.key`, `chunks`, `isHeadKey` |
+| Value | `timestamp` (8, T's start), `incarnation` (16, the store's `StoreIncarnation` as the driver heard it, the zero UUID meaning unknown), `count` (4), then `count` x (`length` (4), `ObjectPointer` bytes) | `UnackedCommitEntry.encode`, `decode` |
+| Objects | Every object of that store that T changes, traced or traceless | `MissedUpdateFinalizationAction.writeMissedUpdates` (`RequirementsApplyer.changedObjects`) |
+| Meaning | The store cast a commit vote the commit may have relied on and had not acknowledged applying T when T was finalized: it is owed T. A recovered or late commit vote applies T through the entry only when the head names the store's own incarnation (`server/transaction/CLAUDE.md`, UnackedCommits; transaction-recovery.md). Otherwise, or when the store has forgotten T, the entry is left for repair, whose reconcile installs the committed state. | `Frontend.unackedLookupComplete`; `Host.unackedLookup` |
+
+Repair ignores the incarnation: it reconciles the objects themselves, which is right for any incarnation.
 
 ### 2.4 AllocationTree (dependency, not repaired)
 
-Key = `objectId.toBytes`, value = `ObjectPointer.toArray`. Written by `AllocationFinalizationAction`
-(`client/internal/allocation/AllocationFinalizationAction.scala:28`), deleted by `DeletionFinalizationAction`
-(`:28`). Repair uses it as the *oracle for "is this object live"*: present means live (its pointer is used for the
-read), absent means "deleted, or its allocation has not been recorded yet" (section 9).
+Key `objectId.toBytes`, value `ObjectPointer.toArray`. Written by `AllocationFinalizationAction`, which
+`TransactionBuilder.addAllocatingObject` adds for every allocated object; removed by `DeletionFinalizationAction`.
+Repair uses it as a hint: listed means "read it with this pointer"; absent means "deleted, or its allocation not yet
+recorded", and a read decides (section 9).
 
 ### 2.5 Policy records
 
 | Record | Key | Default | Code |
 |--------|-----|---------|------|
-| `RepairPolicy` | pool state `RepairPolicyKey` (5) | floor 30 s, cap 15 min, `minErrorEntryAgeForDeletion` 60 s, `proofAfterDeferrals` 10; absent key or non-positive field gives the default | `server/repair/RepairPolicy.scala:77-127` |
-| `HostRepairLimits` | host state `RepairLimitsKey` | `maxConcurrentStoreScans = 4` | `server/repair/HostRepairLimits.scala:201-225` |
+| `RepairPolicy` | pool state `RepairPolicyKey` | `scanIntervalFloor` 30 s, `scanIntervalCap` 15 min, `minErrorEntryAgeForDeletion` 60 s, `proofAfterDeferrals` 10. An absent key gives the default; a non-positive field gives that field's default | `server/repair/RepairPolicy.scala` |
+| `HostRepairLimits` | host state `RepairLimitsKey` | `maxConcurrentStoreScans` 4; non-positive gives the default | `server/repair/HostRepairLimits.scala` |
 
 ### 2.6 Who writes, who deletes
 
 | Operation | By whom | When |
 |-----------|---------|------|
-| Insert ErrorTree entry | `MissedUpdateMarker.writeBatch`, called from `MissedUpdateFinalizationAction.markMissedUpdates` on the client that finalized the transaction | `errorTimeout` (2 s) after the finalizer started, for each store that did not report a clean commit |
-| Insert UnackedCommits entry | same | same, for each counted commit voter (every store if the voters are unknown) that sent no `TxCommitted` and hosts an object T changes |
-| Overwrite ErrorTree entry | same path; plain insert, no `requireDoesNotExist`, no timestamp comparison | a later miss of the same (store, object) |
-| Delete either kind | `StoreRepairer` only (`deleteEntryIfUnchanged`, `deleteEntry`). No other code deletes entries (grep of `errorTree`/`unackedCommitsTree` over the tree). | after the object is verified or found deleted |
-| Read | `StoreRepairer.scan`; `Host.unackedLookup` (`Host.scala:~210`, point lookup for a recovered commit vote) | |
-| (addendum) Write an applied stub | the store itself, in its device CRL (`Frontend.recordAppliedStub`) | when it forgets T on a `TxFinalized` listing it in `owed`, after applying T through its entry, or after the case-3 lookup finds its entry (transaction-recovery.md 5.4) |
-| (addendum) Drop an applied stub | `StoreRepairer` only, through the store's executor (`RepairTarget.dropAppliedStub`, `StoreRouter.scala:206-211`) | after deleting the entry (S, T) (for a chunked entry, its head: the chunk the lookups name), or when the stub had no entry in the walk and a point lookup finds none (5.5) |
+| Insert or advance an ErrorTree entry | `MissedUpdateMarker.writeBatch`, from the finalizing client's `MissedUpdateFinalizationAction` | `errorTimeout` (2 s) after the action executes, for each store that did not report a clean commit |
+| Insert an UnackedCommits entry | same batch | same, for each counted commit voter that sent no `TxCommitted` (every such store when the voters are unknown) and hosts an object T changes |
+| Delete either kind | `StoreRepairer.deleteEntryIfUnchanged` only | after the object(s) are reconciled completely or proven deleted |
+| Point lookup of an UnackedCommits head | `Host.unackedLookup` (`server/store/UnackedCommitLookup.scala`) | a recovered, expiring or late commit vote |
+| Applied stubs | not repair's: each store writes and expires its own (`Frontend.expireStubs`; `server/transaction/CLAUDE.md`) | |
 
 ---
 
-## 3. Entry production (summary; details in transaction-recovery.md)
+## 3. Entry production
 
-`MissedUpdateFinalizationAction` is added to every transaction unless tracking is disabled
-(`client/internal/transaction/TransactionBuilder.scala:55,122,234`). When the finalizer runs it:
+Details are in [transaction-recovery.md](transaction-recovery.md); what repair relies on:
 
-1. `updateCommitErrors(commitErrors)`: if every data store of the transaction replied and no error names a
-   non-lock-only object, it completes with no marks (`MissedUpdateFinalizationAction.scala:45-54`).
-2. Otherwise `execute()` schedules `markMissedUpdates` after `errorTimeout` = 2 s (`:56-60`, `:138`). Stores that
-   reply in that window are not marked.
-3. `markMissedUpdates` (`:69-107`) builds
-   - `MissedUpdate(store, objectId, txd.startTimestamp, ptr.storePointer)` for every store with no reply (all hosted
-     objects except lock-only ones, `:76`) and for every object a store reported an error on (`:82`);
-   - `MissedUnackedCommit(store, txid, UnackedCommitEntry(txd.startTimestamp, changedObjectsOfStore))` for each
-     store that sent no `TxCommitted`, is in the voter set (or the set is unknown), and hosts an object T changes,
-     traced or not (`:98-106` at `0d08e3c6`). A store outside a known voter set gets no entry.
-   Since 2026-11-15 the marker runs once every other finalization action of T has settled, succeeded or failed
-   (`RegisteredTransactionFinalizerFactory.Finalizer`, Ruling 8 revised; it ran only after they all succeeded before).
-   Lock-only objects (`ExclusiveRevisionLock`/`SharedRevisionLock` without a change) are never marked (`:36-39`).
-4. `MissedUpdateMarker.mark` (`MissedUpdateMarker.scala:302-309`) queues entries per pool. Per pool at most one write
-   is outstanding. Entries arriving meanwhile wait; the queue is a `LinkedHashMap` keyed by (poolIndex, objectId) for
-   updates and (poolIndex, txid) for UnackedCommits entries, so a store missing one object repeatedly produces one write of
-   the newest miss (`:316-327`, higher `missedTimestamp` wins; since 2026-11-14 also against the tree, see step 5). Batches hold at most 256 entries
-   of both kinds with a half-and-half guarantee (`:335-353`).
-5. `writeBatch` (`:369-397`) is one transaction on the pool's ErrorTree and UnackedCommits trees, retried until
-   success except `UnknownStoragePool`/`TransactionCreationError` (`StopRetrying`, `:377-386`). If the transaction
-   references the pool the entry is about, missed-update tracking is disabled for it
-   (`MissedUpdateFinalizationAction.limitTracking`, `:130-132`), preventing a circular write. The FA completes only
-   after the batch commits; the transaction cannot be forgotten before that (`:101-106`).
+1. `TransactionBuilder` adds a `MissedUpdateFinalizationAction` to every transaction unless tracking is disabled
+   (`disableMissedUpdateTracking`; `AspenClient.newRepairTransaction` for repair proofs; `limitTracking` for writes
+   to a pool's own trees, which happens only for the bootstrap pool).
+2. The marker action runs once every other finalization action of T has settled, succeeded or failed
+   (`RegisteredTransactionFinalizerFactory.Finalizer`).
+3. `updateCommitErrors`: when every data store replied and no error names a non-lock-only object, the action completes
+   with no marks. Otherwise `execute` schedules `markMissedUpdates` after `errorTimeout` (2 s); stores replying
+   meanwhile are not marked.
+4. `writeMissedUpdates` builds:
+   - `MissedUpdate(store, objectId, type, storePointer, txd.startTimestamp)` for every object a silent store hosts,
+     except lock-only objects (`TransactionDescription.lockOnlyObjects`), and for every object a store reported a
+     commit error on;
+   - `MissedUnackedCommit(store, txid, UnackedCommitEntry(start, incarnation, changedObjectsOfStore))` for every store
+     that sent no `TxCommitted`, is a counted voter (or the voters are unknown) and hosts an object T changes.
+   Uncounted voters and non-voters are repaired by their ErrorTree marks alone.
+5. `MissedUpdateMarker.mark` queues per pool, at most one write outstanding per pool. The queue merges ErrorTree marks
+   by (poolIndex, objectId), keeping the later `missedTimestamp`, and UnackedCommits entries by (poolIndex, txid).
+   A batch holds at most 256 entries, each kind guaranteed half.
+6. `writeBatch` is one `replaySafe` transaction over both trees, retried until it succeeds except on
+   `TransactionCreationError` or `NodeSizeExceeded` (then the batch fails and the driver re-runs the finalizer with
+   backoff, `TransactionDriver.startFinalizer`). Its puts are conditional (`TKVLInsert.replaces`): an ErrorTree mark
+   replaces a held one only for a later `missedTimestamp`, and otherwise is dropped from the batch with no write and
+   no requirement; an UnackedCommits entry is written only where none is held. A replaced or new key carries a
+   key requirement, so two markers racing on one key abort one batch, which retries.
+7. The action completes only when the batch commits; T is not finalized (and its stores do not forget it) before.
 
-Important properties used later: entries are written *after* the transaction committed and *at least 2 s later*;
-the entry value's timestamp is the miss's start timestamp, not its commit time; an entry write never replaces an
-existing entry with an older `missedTimestamp` (flaw F10, fixed 2026-11-14: conditional checked puts).
+Properties used later: every entry is written after T committed and at least 2 s after its finalizer started; an
+ErrorTree entry's `missedTimestamp` never moves backward; an UnackedCommits entry is never rewritten in place, so its
+revision changes only by delete and re-create. Section 14 (RP-W1) examines a consequence of the dropped mark.
 
 ---
 
@@ -177,298 +164,297 @@ existing entry with an older `missedTimestamp` (flaw F10, fixed 2026-11-14: cond
 
 ### 4.1 RepairService
 
-One `RepairService` per host (`server/Host.scala:304`). Its `sweep()` is a non-concurrent polling task with a fixed
-30 s tick (`RepairService.scala:48-49,219`; `StallAfter` 6 h).
+One `RepairService` per host (`server/Host.scala`). `sweep()` is a non-concurrent polling task with a fixed 30 s
+tick (`RepairService.TickPeriod`; stall report after 6 h).
 
 ```
 sweep():
-  now = clock()
-  refreshLimits()                       -- 15 s deadline, keeps last good on failure          (:148-158)
-  repairable = target.repairableStoreIds   -- served, not offline/rebuilding/transferring-out  (host/HostStoreView.scala:15)
-  due = selectDue(repairable, now)      -- drop states of departed stores; admit new ones      (:166-177)
-  refreshPolicies(pools of due)         -- per-pool RepairPolicy, 15 s deadline, last good     (:133-146)
+  repairable = target.repairableStoreIds   -- served, not offline / rebuilding / transferring out (HostStoreView.of)
+  refreshLimits()                          -- 15 s deadline (MetadataDeadline); keeps the last good value
+  due = selectDue(repairable, now)         -- drops state of departed stores; admits new ones (not due this tick)
+  refreshPolicies(pools of due)            -- per pool, 15 s deadline, last good or default
   runBoundedParallel(due, maxConcurrentStoreScans)(scanOne)
 scanOne(store):
-  result = withDeadline(90 s)(StoreRepairer.scan(store, policy, deferralOf(store)))            (:182-210)
-  on ScanTimedOut: discard store's DeferralState, found = false
-  on any other failure: found = false
+  found = withDeadline(90 s)(StoreRepairer.scan(store, policy, deferralOf(store), control)).foundEntries
+    on ScanTimedOut: control.cancel(); found = control.sawEntries
+    on any other failure: found = false
+  if bootstrap pool: found ||= withDeadline(90 s)(sweepBootstrapTrees(...)).needsAnotherPass  -- failure or timeout: true
   scanStates[store] = ScanState.advance(prev, now, found, policy)
 ```
 
-A newly seen store is admitted at the floor with a random due time inside the first floor interval and is *not due on
-the tick that admits it* (`ScanState.scala:30-32`; `RepairService.scala:172-176`). Because the tick is 30 s, a floor
-below 30 s is rounded up (`:214-219`).
+A newly seen store is admitted at the floor, due at a random time inside the first floor interval. Because the tick
+is 30 s, a floor below 30 s acts as 30 s.
 
-### 4.2 ScanState (pacing)
-
-`ScanState(nextDue, currentInterval)` (`ScanState.scala:12`). After a scan:
+### 4.2 Pacing (`ScanState`)
 
 | Outcome | Next interval |
 |---------|---------------|
-| Any entry seen in either tree (repaired, deferred or skipped), `foundEntries = seen>0 || unackedSeen>0` | floor |
-| Clean scan | `min(2*current, cap)`, at least floor |
-| Failed or timed-out scan (`foundEntries=false`) | treated as clean: doubles toward cap (`ScanState.scala:34-38`) |
+| Any entry seen in either tree (repaired, deferred or skipped), or a bootstrap sweep needing another pass | floor |
+| Clean scan, or a failed one, or one timed out before seeing any entry | `min(2 * current, cap)`, at least floor |
 
-Next due time is `now + interval` jittered by +/-25 % (`:16-24`).
+The next due time is `now + interval` jittered by +/-25 %.
 
 ### 4.3 Bounds
 
-| Bound | Value | Why | Code |
-|-------|-------|-----|------|
-| Concurrent store scans per host | 4 default | host load | `HostRepairLimits.scala:208` |
-| Scan deadline | 90 s | A read of an unavailable object retries forever; without a bound one sick pool wedges the single-flight sweep | `RepairService.scala:235,91-102` |
-| Metadata read deadline | 15 s | policy and limits are advisory | `:241` |
-| Per-entry work | strictly sequential within a store (one `foreachInRange` callback at a time) | bounded memory, no self-collision | `client/tkvl/TierEngine.scala:135-145` |
-| Failure of one entry | logged, walk continues | `TierEngine.visit` | `TierEngine.scala:139-142` |
+| Bound | Value | Code |
+|-------|-------|------|
+| Concurrent store scans per host | 4 by default | `HostRepairLimits` |
+| Scan deadline, bootstrap sweep deadline | 90 s each (`ScanDeadline`, `SweepDeadline`): a read of an unavailable object never fails, so without a bound one sick pool would wedge the single-flight sweep | `RepairService.withDeadline` |
+| Metadata reads (policy, limits) | 15 s | `MetadataDeadline` |
+| Quarantine verification | 30 s | `VerifyDeadline` |
+| Per-entry work | strictly sequential within a store: the walk hands one entry at a time; an UnackedCommits entry's objects go one at a time | `TierEngine.walk`; `StoreRepairer.repairUnackedObjects` |
+| A failing entry callback | logged at error by the walk, which continues | `TierEngine.walk` |
 
-### 4.4 Store departure
+A timed-out scan keeps running in the background (a hung read cannot be interrupted). Its `ScanControl` is
+cancelled, so it starts no further entry (the walk still reads the rest of the range's nodes), skips
+`DeferralState.retain`, and the store keeps its DeferralState for the next scan. A reconcile in flight at the cancel
+still records its result, which can bring a proof one pass early (safe).
 
-`abandoned(storeId)` is checked at the top of every entry callback. If the store is no longer repairable the callback
-returns without touching the entry (`StoreRepairer.scala:142-147,152,213`). `RepairTarget.snapshot/reconcile/
-repairDelete` fail the promise with `StoreNotHosted` for a store that has left (`StoreRouter.scala:184-204`), so the
-caller never treats a departed store as repaired and the entry survives for the new host's sweep.
+### 4.4 Ownership fence and store departure
+
+- **Fence** (`StoreRepairer.OwnershipFence`, `ownedHere`): a scan runs only while the pool's state entry for the store
+  names this host and the device the store is loaded from here (`RepairTarget.localDevice`, from
+  `HostStoreView.storeDevices`). Each entry delete re-checks it, sharing one read for `OwnershipRecheck` (1 s). A
+  failed check leaves that entry and abandons the rest of the scan. So a superseded copy (left on a device declared
+  failed, or on another device of the same host) never consumes entries the current copy needs. The bootstrap sweep
+  checks once at its start; it deletes nothing.
+- **Departure**: every entry callback first checks `abandoned` (cancelled, fence lost, or `!isRepairable`). The
+  `RepairTarget` operations (`snapshot`, `reconcile`, `repairDelete`) fail with `StoreNotHosted` for a store that has
+  left (`StoreRouter.snapshotForRepair` etc.), and with `IllegalStateException` for a fail-stopped store, so a
+  departed store is never treated as repaired and its entries stay for its new host.
 
 ---
 
-## 5. Scan state machine
+## 5. The scan
 
 ### 5.1 Per store
 
 ```
-scan(store, policy, deferral):
-  pool  = client.getStoragePool(store.poolId)
-  range = [Key(poolIndex), Key(poolIndex+1))                                  -- StoreRepairer.scala:124-127
-  stubs = target.appliedStubs(store)       -- (addendum) read before the walks, StoreRepairer.scala:147-148
-  pool.errorTree.foreachInRange(range, repairErrorEntry)                      -- phase A
-  pool.unackedCommitsTree.foreachInRange(range, repairUnackedEntry)       -- phase B (after A completes)
-  dropOrphanStubs(stubs -- txids seen in phase B)  -- (addendum) 5.5
-  deferral.retain(keys touched this scan)      -- forget deferral state of entries not seen (gone or rewritten)
+scan(store, policy, deferral, control):          -- StoreRepairer.scan
+  if !fence.stillOwned(): return empty result (warned)
+  pool = client.getStoragePool(store.poolId)
+  pool.errorTree.foreachInRange([poolIndex], [poolIndex+1], repairErrorEntry)              -- phase A
+  pool.unackedCommitsTree.foreachInRange([poolIndex], [poolIndex+1], repairUnackedEntry)   -- phase B
+  if !control.cancelled: deferral.retain(deferral keys touched this scan)
   return ScanResult(seen, repaired, deferred, unackedSeen)
 ```
 
-The tree walk hands each callback the entries of the node it just read, so the `ValueState.revision` the callback holds
-may be older than the live value. That is why deletions are guarded by revision (5.4). Entries added during the walk
-may or may not be visited. The walk ends at the end of the range.
+The walk hands each callback the entries of the node it just read, so the `ValueState` the callback holds may be
+older than the live value; deletion is therefore guarded by revision (5.5). Entries added during the walk may or may
+not be visited. A join that deletes a node the walk was about to read makes it resume from the last key it visited
+(`TierEngine.walk`, `MaxJoinRaceRestarts`).
 
-### 5.2 ErrorTree entry (phase A), `repairErrorEntry` (`StoreRepairer.scala:149-200`)
-
-```
-repairErrorEntry(node, key, value):
-  if not repairable(store): return
-  seen += 1
-  objectId = decode(key); (missedTs, storePointer) = decodeErrorEntry(value)
-  entryKey = errorDeferralKey(key, value.revision)
-  alloc = allocationTree.get(objectId)
-  if alloc present:
-      r = repairUpdate(store, pointer(alloc), missedTs, entryKey, policy, deferral)       -- section 6
-      if r.complete: deferral.clear(entryKey); deleteEntryIfUnchanged(value.revision)      -- guarded
-      else           deferred += 1                                                        -- entry stays
-  else (absent):
-      if now - value.timestamp >= minErrorEntryAgeForDeletion (60 s):
-          repairDelete(store, objectId, storePointer); deleteEntry(key)                    -- UNguarded
-      else deferred += 1                                                                   -- too young
-```
-
-Any exception inside the callback (including the read failing with `InvalidObject` for an object whose refcount is 0
-but whose allocation entry is not yet removed) leaves the entry untouched; the walk logs and continues.
-
-### 5.3 UnackedCommits entry (phase B), `repairUnackedEntry` (`:210-252`)
+### 5.2 ErrorTree entry (phase A): `repairErrorEntry`
 
 ```
-repairUnackedEntry(node, key, value):
-  txid = decode(key)
-  if target.holdsTransaction(store, txid):            -- live Tx, or store still loading CRL state (awaitingCrl)
-      deferred += 1; return                           -- Tx applies T itself (Tx.needsUnackedCheck, Tx.lateCommit)
-  entry = decode(value)
-  allComplete = true
-  for ptr in entry.objects (sequentially):
-      alloc = allocationTree.get(ptr.id)
-      if absent and entry age >= minAge:  repairDelete(store, ptr.id, ptr.storePointer)
-      elif absent:                        allComplete = false
-      else:  allComplete &= repairUpdate(store, ptr, entry.timestamp, unackedDeferralKey(key, ptr.id), ...).complete
-  if allComplete: clear deferral keys; deleteEntryIfUnchanged(value.revision)
-  else deferred += 1
+if abandoned: return
+seen += 1; decode objectId, (missedTs, type, storePointer); entryKey = errorDeferralKey(key, value.revision)
+if target.mayJoinTransaction(store, missedTs): deferred += 1; return                    -- 5.4
+alloc = pool.allocationTree.get(objectId)
+listed:  done = repairListed(store, pointer(alloc), missedTs, entryKey)                 -- 6, 9.2
+absent:  if age(value.timestamp) >= minErrorEntryAgeForDeletion (60 s):
+             done = repairAbsent(store, entry's pointer, missedTs, entryKey, typeKnown)  -- 9.2
+         else deferred += 1; return
+if done: counts.recordCompleted(objectId, missedTs); deferral.clear(entryKey)
+         deleteIfStillOwned(errorTree, value.revision, key)                              -- 5.5
+else:    deferred += 1
 ```
 
-`holdsTransaction` is `Frontend.mayHoldTransaction = awaitingCrl || transactions.contains(txid)`, a volatile read from
-the scan thread (`server/store/Frontend.scala:96`, `Store.scala:114`, `StoreRouter.scala:279`). Since the refresh a
-recovered vote that finds its entry applies T but stays live until `TxFinalized` (Ruling 9), so the scan keeps skipping;
-a Tx that applied a late commit is forgotten at once. The entry remains either way, and the next scan reconciles (a
-no-op) and removes it (`StoreRepairer.scala:228-268`). Until then the entry still says the store is owed T, so a replay
-of T that resolves late is applied there again (Ruling 17; transaction-recovery R-N1). (addendum) Unless the store holds
-an applied stub for T, which it writes when it forgets T in those cases (5.5); on deleting the entry the scan drops the
-stub (`StoreRepairer.scala:322`).
+Any exception in the callback (a decode failure, a read that fails with something other than `InvalidObject`,
+`StoreNotHosted`, a failed delete) leaves the entry and is logged by the walk.
 
-### 5.4 Entry deletion and its guard
-
-- `deleteEntryIfUnchanged(entryRevision, node, key)`: a repair transaction (`client.newRepairTransaction()`, tracking
-  disabled, `client/AspenClient.scala:~89-100`) that `node.delete(key)` with requirement
-  `KeyValueUpdate.KeyRevision(key, entryRevision)` (`StoreRepairer.scala:351-361`). If any writer replaced the entry
-  since the scan read it, the revision differs, the requirement fails, the transaction aborts, and the next pass sees
-  the new entry. The comment at `:345-350` states this is "the point".
-- `deleteEntry(node, key)` (`:337-343`): same transaction but no requirement. Used only after `repairDelete`.
-- Delete and a concurrent entry insert both lock the key (key requirement vs insert), so they collide at the stores:
-  exactly one orders first. If the delete commits first, the later insert creates a fresh entry. If the insert commits
-  first, the delete fails its `KeyRevision` requirement (`RequirementsChecker.scala:~278-285`).
-
-### 5.5 Applied stub cleanup (addendum)
-
-> **2026-11-15 (Todo 4.6): superseded.** The scan no longer reads or drops applied stubs, and Rulings 6 and 8 no longer
-> apply to it. Each store expires its own stubs at heartbeat once T is past the horizon plus the expiry margin and no
-> Tx for T is held (`Frontend.expireStubs`; crash-recovery-log.md F22). The scan deletes an entry only once the store
-> can no longer join T (`mayJoinTransaction`), no earlier than expiry, so dropping a stub with its entry never removed
-> it sooner than expiry now does. Ruling 8's residual (an entry landing with no stub) is unchanged in kind: an entry
-> with no stub is harmless at a store that saw T. The description below is the code before the change.
-
-A stub (S, T) is usually written after entry (S, T) is durable: a single driver's `owed` lists entries its marker
-wrote before `TxFinalized` was sent (Ruling 2), and the case-3 fallback writes one only after its lookup found the
-entry (transaction-recovery.md 5.4). Since Ruling 7 a second driver, finalized at once by another driver's
-`TxFinalized`, lists the stores its own cancelled mark planned without waiting for that write, so such a stub can
-precede its entry's durability by up to the marker's retry time. The scan removes stubs in two ways:
+### 5.3 UnackedCommits entry (phase B): `repairUnackedEntry`, `repairUnackedObjects`
 
 ```
-on deleting entry (S, T) after a complete repair:  target.dropAppliedStub(S, T)        -- StoreRepairer.scala:322
-stubs = target.appliedStubs(S)                  -- read before both walks, :161
-after phase B (dropOrphanStubs, :187-200), unless the store left this host mid-walk:
-  found = for each txid in stubs -- (txids of entries seen in phase B, held live or not):
-              txid if unackedCommitsTree.get(key(S, txid)) is empty
-  for each txid in deferral.confirmOrphans(found):  target.dropAppliedStub(S, txid)
-      -- confirmOrphans (:95-104) returns found ∩ (the previous successful scan's found), and keeps the rest
+if abandoned: return
+unackedSeen += 1; txid = decodeTransactionId(key)
+if target.holdsTransaction(store, txid): deferred += 1; return     -- live Tx, or the store is still loading its CRL
+entry = decode(value)
+if target.mayJoinTransaction(store, entry.timestamp): deferred += 1; return                  -- 5.4
+for each ptr in entry.objects, one at a time:
+    if counts.completedAt(ptr.id) >= entry.timestamp: complete           -- phase A completed it this scan
+    else alloc = allocationTree.get(ptr.id)
+         absent and value.timestamp old enough: repairAbsent(store, ptr, entry.timestamp, unackedDeferralKey)
+         absent, too young:                     incomplete
+         listed:                                repairListed(store, ptr, entry.timestamp, unackedDeferralKey)
+if all complete: clear deferral keys; deleteIfStillOwned(unackedCommitsTree, value.revision, key)
+else deferred += 1
 ```
 
-Why it is safe (Rulings 6 and 8): an orphan stub is dropped only when two consecutive successful scans of the store
-found it with no entry, so an entry still in flight from a planned set has a whole scan period to land; once it has,
-the stub is no longer found orphaned and the suspicion is dropped. The pre-walk snapshot rule stays: a stub written
-during the walk is not in the snapshot, so that scan neither suspects nor drops it, since its entry may lie behind the
-cursor. The point lookup guards against a walk that misses a live key when the tree is restructured under it, and
-each drop names one exact txid. An entry the scan skips because the store holds T live is still counted as seen, so
-its stub stays. The suspicions are per store, in memory on the repairing host (the store's `DeferralState`, kept by
-`RepairService`): a host restart, or a scan abandoned because the store left the host, starts them again, which only
-delays a drop. A scan that fails part way changes none. The stub therefore lives as long as its entry, and at most two
-scan periods longer. `appliedStubs` of a store that is not loaded is empty, so nothing is dropped for it.
-Residual (Ruling 8): a second driver's marker batch still in flight across two whole successful scans of the same store
-leaves its entry without a stub once it lands (transaction-recovery R-N7).
+`holdsTransaction` is `Frontend.mayHoldTransaction` (`awaitingCrl || transactions.contains(txid)`), read from the scan
+thread through `@volatile` fields (`StoreRouter.holdsTransaction`). While the store holds T, its Tx applies T itself
+(through the entry when it names the store's incarnation). Each chunk of a chunked entry is repaired and deleted as an
+entry of its own; all are skipped while the store holds T.
+
+The phase-A shortcut: phase A records each object it completed with the entry's `missedTimestamp`
+(`Counts.recordCompleted`); phase B treats an object recorded at or after the UnackedCommits entry's timestamp as
+complete with no allocation-tree read, snapshot or reconcile. A silent voter has both kinds of entry for every
+object, so its UnackedCommits entry then costs only its delete. Section 14 (RP-W1) shows where this argument is weaker
+than it looks.
+
+### 5.4 Waiting until the store can no longer join the transaction
+
+Both kinds of entry are left for a later pass while `RepairTarget.mayJoinTransaction(store, start)` holds: the entry's
+transaction started at or above the store's forget floor (`StoreRouter.mayJoinTransaction` =
+`!Frontend.belowForgetFloor(start)`). The floor (`Frontend.forgetFloorMillis`) is the latest of `now - horizon`
+(`TransactionHorizon.Horizon`, 20 s), the store's load floor (`loadFloorMillis`: its load plus `MaxStartLead`, or plus
+`RebuildingStore.AcceptorSinceMargin` soon after an arrival) and the status cache's eviction watermark. At or above
+it, a replayed prepare could still create a Tx for T at the store after the scan's `holdsTransaction` check, apply T
+after the reconcile, and the entry would be deleted under that apply. Below it the store refuses every prepare for a
+transaction it does not hold (`Frontend.receivePrepare`), and a store never rejoins a transaction it forgot. The wait
+is at most the horizon plus `MaxStartLead` (2 s) plus clock skew. For an ErrorTree entry the check uses
+`missedTimestamp`, the newest merged miss; older merged misses started earlier and are below the floor too.
+
+### 5.5 Entry deletion and its guard
+
+`deleteIfStillOwned` re-checks the fence (4.4) and then runs `deleteEntryIfUnchanged`: an ordinary transaction
+(`client.newTransaction()`) that deletes the key through the tree (`TieredKeyValueList.deleteIfPresent`) with the
+requirement `KeyRevision(key, entryRevision)`, the revision the walk saw. The `KeyRevision` is also the transaction's
+pin. Deleting through the tree, not the node, lets an emptied node be joined or removed (the join and tail-removal
+finalization actions), so the trees shrink as repair drains them. The delete is tracked, with
+`MissedUpdateFinalizationAction.limitTracking(entryPool, tx)` disabling tracking only when the delete touches the
+entry's own pool, which is the bootstrap pool's own trees (a store of the metadata pool that misses it gets an entry
+one level closer to the bootstrap pool, so the chain ends there).
+
+If any writer replaced the entry since the walk read it, the requirement fails and the delete aborts; the next pass
+sees the new entry. A delete and a concurrent marker write of the same key collide (both require the key); one
+orders first. A key already gone makes `deleteIfPresent` false and the callback fails (logged), costing nothing.
 
 ---
 
 ## 6. Reconcile: the per-object algorithm
 
-`repairUpdate` (`StoreRepairer.scala:261-299`) runs the three steps; `Reconcile.plan` (`server/store/Reconcile.scala:103`)
-is the pure decision.
+`StoreRepairer.repairUpdate` runs the steps; `Reconcile.plan` is the pure decision; `Frontend.reconcileForRepair` and
+`reconcileSettled` apply it on the store's executor.
 
 ### 6.1 Steps
 
 ```
-repairUpdate(store, ptr, minTimestamp, entryKey, policy, deferral):
-  snap  = target.snapshot(store, ptr)           -- on the store's executor (Frontend.snapshotForRepair, :787)
-  snap  = snap.copy(only = deferral.deferredKeys(entryKey))
-  os    = client.read(ptr)                      -- FULL read: only full reads report locks (:275)
-  first = reconcile(snap, os)                   -- on the store's executor (Frontend.reconcileForRepair, :799)
-          result.stale |= (os.timestamp < minTimestamp)           -- :270
+repairUpdate(store, ptr, minTimestamp, entryKey, policy, deferral, allowProof):
+  snap = target.snapshot(store, ptr)              -- Frontend.snapshotForRepair, on the executor
+  snap = snap.copy(only = deferral.deferredKeys(entryKey)            (only with allowProof),
+                   awaitSettle = staleCount(entryKey) >= ParkAfterStalePasses (3)  (only with allowProof))
+  os   = client.read(ptr)                         -- a full read: only full reads report locks
+  first = reconcile(snap, os); if os.timestamp < minTimestamp: first.stale = true
+          (RepairSlotOccupied: dropOccupant, then stale)                              -- 6.5
   passes = deferral.record(entryKey, first)
-  if passes < policy.proofAfterDeferrals: return first
-  proven = prove(os, first)                     -- RepairProofs (section 8)
-  if proven nonEmpty: second = reconcile(snap.copy(proven = proven), os); deferral.afterProof(entryKey, second); return second
-  return first
+  if allowProof && passes >= policy.proofAfterDeferrals:
+      proven = prove(os, first)                    -- section 8
+      if proven nonEmpty: result = reconcile(snap.copy(proven = proven), os); deferral.afterProof(entryKey, result)
+  if allowProof: deferral.recordStale(entryKey, result)   -- warns every proofAfterDeferrals stale passes in a row
 ```
 
-`snapshotForRepair` returns `RepairSnapshot.of(state)` for a servable state, `missing` for an object being deleted, or
-loads from the backend (`SnapshotRead`) (`Frontend.scala:787-795,1030,1053`). The snapshot is taken on the executor, so
-it is consistent with all in-flight work of that store.
+`snapshotForRepair` gives `RepairSnapshot.of(state)` for a served state, `missing` for an object being deleted, and
+otherwise loads it from the backend (`SnapshotRead`). A snapshot is a fresh copy each pass.
 
 ### 6.2 What the executor does at install
 
-`Frontend.reconcile` (`:888-906`) refuses to write unless the store is quiescent for that object:
+`Frontend.reconcile` refuses to write unless the object is settled:
 
 ```
-unsettled = holding                          -- recovering transactions from the CRL (awaitingCrl, recovering, undecided)
-         || commitInFlight(obj) || commitFailed(obj) || committing.contains(obj) || deleting.contains(obj)
-         || the loaded copy is not the one served or referenced (another in-memory state is the real one)
-if unsettled: return ReconcileResult(Set(), false, stale = true)      -- nothing written
+unsettled = holding || commitInFlight(obj) || commitFailed(obj) || committing.contains(obj) || deleting.contains(obj)
+         || another in-memory state of the object is the one served or referenced
+if unsettled && snapshot.awaitSettle: park (8.2)
+elif unsettled: stale, nothing written
 else reconcileSettled
 ```
 
-`reconcileSettled` (`:908-964`):
+`commitInFlight` covers outstanding transaction commits, repair writes and committed transactions holding their
+commit for their turn (`heldCommits`). `commitFailed` includes objects poisoned by `poisonObject`.
+
+`reconcileSettled`, all in one executor task:
 
 1. `current` = the store's copy now (`RepairSnapshot.of`, or `missing`).
-2. `locks` = the read's reported locks (minus parts `snapshot.proven` covers) UNION the store's own locks
-   (`os.lockedKeys`, `os.objectLevelLocked`). The store adds its own because a store that did not answer the read may
-   hold locks of its own, and a recovering store's locks may not all be taken yet.
+2. `locks` = the read's reported locks, less the parts a proof covered (`snapshot.proven`), plus the store's own
+   (`os.lockedKeys`, `os.objectLevelLocked`): a store that did not answer the read may hold locks of its own.
 3. `plan = Reconcile.plan(snapshot, current, read, storeId, locks)`.
-4. If the plan changes nothing: return its result. Else mutate the in-memory state (`kvs.content`, `min/max/left/right`,
-   `data`, `metadata`), insert it in the object cache, **retain it as an in-flight commit** (`committing`,
-   `txCommitsInFlight`), call `backend.repair(CommitState)` and complete the promise when the backend write finishes.
-   Transactions on the object wait behind the repair write exactly as behind a transaction commit. On a failed write
-   the state is discarded and reloaded (`repairWriteComplete`, `:968-985`); the promise fails so the entry stays.
+4. If the plan changes nothing, return its result. Otherwise mutate the in-memory state (key installs and deletes,
+   min/max/left/right, re-encode, data, metadata), insert it in the object cache, retain it, add it to `committing`
+   and count it in `txCommitsInFlight`, then `backend.repair(CommitState)`. Transactions on the object wait behind the
+   repair write as behind a commit. On completion `repairWriteComplete` releases it and passes the object's turn on
+   (`commitTurnFree`). A failed write discards the in-memory state (the next use reloads the backend's) and fails the
+   promise, so the entry stays; the object is not marked failed, since no transaction relied on the repaired state.
 
-All of step 1-4 runs in one task on the store's executor, so nothing else touches the object between `current` and
-the in-memory mutation.
+A `quarantine`d object is repaired like any other (its verification uses this path, 10.2).
 
 ### 6.3 `Reconcile.plan`
 
-Early exits (`Reconcile.scala:105-109`): wrong pool: stale. `current` missing but `snapshot` was not (deleted since):
-stale ("installing the read would resurrect the slice"). Partial or metadata-only reads, or a poolIndex outside the
-IDA width: stale (`:111-118`). Final rule: a copy is created only together with its refcount; otherwise stale
-(`:119-123`).
+Early exits: the read is of another pool: stale. `current` missing but the snapshot was not (deleted since): stale,
+since installing would resurrect the slice. A partial or metadata-only read, or a `poolIndex` outside the read's IDA
+width: stale. Final rule: a copy is created only together with its refcount; otherwise stale.
 
-**Refcount** (any object type) (`planRefcount`, `:128-136`):
+**Refcount** (`planRefcount`):
 
 ```
 wanted = current.isMissing || read.refcount.updateSerial > current.refcount.updateSerial
-if !wanted: no change
-elif current.refcount != snapshot.refcount: stale (store changed it since the snapshot)
+if !wanted: none
+elif current.refcount != snapshot.refcount: stale
 else: install read.refcount
 ```
 
-The comparison is on `updateSerial` only (so a count can go down when the serial is higher, e.g. a decrement). Repair
-never installs a refcount whose serial is not strictly higher unless the store has no copy.
+The serial decides (a decrement with a higher serial is installed). A refcount whose serial is not strictly higher is
+never installed unless the store has no copy.
 
-**DataObject** (`planData`, `:138-163`):
-
-```
-if current.isMissing && locks.objectLevel: defer object level (cannot create the copy without its refcount)
-refcount = if locks.objectLevel: none else planRefcount
-data = if locks.objectLevel || read.revision == current.revision:  none, NOT stale
-       elif read.timestamp < current.timestamp || current.revision != snapshot.revision:  none, STALE
-       else: Some(read.ida.encode(read.data)(poolIndex))     -- install data, revision, and timestamp = max
-result = ReconcileResult(deferredKeys = {}, objectLevelDeferred = locks.objectLevel, stale = refcountStale || dataStale)
-```
-
-A read older than the store with a differing revision is stale, not a silent skip (F13, fixed 2026-11-14): the store
-may have missed a data write and applied a later refcount update the read's responders have not applied yet. Section
-13 (F3) examines the remaining timestamp assumption of the completion gate.
-
-**KeyValueObject** (`planKeyValue`, `:165-216`):
+**DataObject** (`planData`):
 
 ```
-if current.isMissing && locks.objectLevel: defer everything (keys = locks.keys, objectLevel = true)
-keys = (current.keys ∪ read.keys ∪ snapshot.keys), intersected with snapshot.only if set
-for key in keys, key not in locks.keys:
-    have = current.keyRevisions(key); want = read.contents(key)
-    if have != want.revision:
-        if have != snapshot.keyRevisions(key): stale = true           -- changed since snapshot; leave it
-        elif want is Some: install (IDA slice of the read's value, its revision, its timestamp)
-        else: delete key                                              -- the read lacks it
-wholeObject = snapshot.only.isEmpty
-objectLevelLeft = locks.objectLevel || !wholeObject
-refcount = if objectLevelLeft: none else planRefcount
-objectLevel+revision (min,max,left,right,revision):
-    if objectLevelLeft: none
-    elif equal to read and revision equal and have a copy: none
-    elif current.objectLevel != snapshot.objectLevel || current.revision != snapshot.revision: stale
-    else: install read's (slices of left/right) and read.revision
-timestamp = if wholeObject && read.timestamp > current.timestamp: read.timestamp
+if current.isMissing && locks.objectLevel: objectLevelDeferred (the copy cannot be created without its refcount)
+refcount = locks.objectLevel ? none : planRefcount
+data = locks.objectLevel || read.revision == current.revision:                 none
+       read.timestamp < current.timestamp || current.revision != snapshot.revision: none, stale
+       else: the store's slice of read.data, with read.revision, timestamp max(read, current)
+result = (no keys, objectLevelDeferred = locks.objectLevel, stale = refcountStale || dataStale)
+```
+
+A read older than the store with a differing revision is stale, not caught up: the store may have missed a data
+write and applied a later refcount update the read's responders have yet to apply.
+
+**KeyValueObject** (`planKeyValue`):
+
+```
+if current.isMissing && locks.objectLevel: defer everything (keys = locks.keys, objectLevel)
+keys = (current.keys ∪ read.keys ∪ snapshot.keys) ∩ snapshot.only (when set)
+for each key not in locks.keys:
+    if current.rev(key) != read.rev(key):
+        if current.rev(key) != snapshot.rev(key): stale              -- the store changed it since the snapshot
+        elif read has it: install (slice of the read's value, its revision and timestamp)
+        else: delete it
+wholeObject = snapshot.only.isEmpty; objectLevelLeft = locks.objectLevel || !wholeObject
+refcount = objectLevelLeft ? none : planRefcount
+min/max/left/right + revision: objectLevelLeft: none
+    equal to the read's and the store has a copy: none
+    current differs from snapshot on them or on the revision: stale
+    else install the read's (slices of left/right) and read.revision
+timestamp = wholeObject && read.timestamp > current.timestamp ? read.timestamp : none
 result.deferredKeys = locks.keys (∩ only); objectLevelDeferred = locks.objectLevel && wholeObject
 ```
 
-Notes: keys the read reports locked are never installed or deleted; keys deferred stay in `deferredKeys`; the object
-timestamp is advanced even when keys are deferred (F-note in 13.4).
+A pass narrowed to `only` (the keys an earlier pass deferred) leaves the refcount, object-level parts, timestamp and
+other keys alone: they were reconciled by that earlier pass. A whole-object pass that defers some keys still takes the
+read's object timestamp: a caught-up store would hold it, key requirements check per-key timestamps, and the entry
+stays incomplete until the deferred keys are reconciled. A narrowed pass never touches the timestamp, because its read
+also reflects keys outside its scope.
 
-### 6.4 Result and completion
+### 6.4 Result and the completion gate
 
-`ReconcileResult.complete = deferredKeys.isEmpty && !objectLevelDeferred && !stale` (`Reconcile.scala:63-64`). Only a
-complete result lets the caller delete the entry. Additionally `repairUpdate` marks the result stale if the read's
-timestamp is older than the entry's `missedTimestamp` (`StoreRepairer.scala:270`).
+`ReconcileResult.complete = deferredKeys.isEmpty && !objectLevelDeferred && !stale`. Only a complete result lets the
+caller treat the object as done. `repairUpdate` also marks the result stale when the read's timestamp is older than
+`minTimestamp` (the entry's `missedTimestamp`, or T's start).
+
+The gate is sound in the direction it needs: every object timestamp on a store was set by an apply (`later`, Q6) or
+copied from a read (Reconcile installs `read.timestamp` only when higher; a rebuild copies one into its staging store),
+and a read's timestamp is the maximum over stores that match its revision, so it is one some store really holds. When
+a read reflects the missed transaction, some matching store applied it, so the read's timestamp is at least its start
+and the gate passes. A post-install equality test would be weaker: equality with a read says nothing about whether the
+read includes the miss. The gate does not show that the read reflects every merged miss; that rests on E1 and on the
+read following each miss's commit (section 14, RP-W1).
+
+### 6.5 A foreign occupant of the slot
+
+A repair write that finds another object in the slot (`backend.RepairSlotOccupied`, FSIF slot reuse over a missed
+delete) drops the occupant (`StoreRepairer.dropOccupant`) with an id-checked `repairDelete`, but only when the
+AllocationTree does not list it: the object was just read live, and two live objects never share a slot. The repair
+is stale, so the entry stays and the next pass installs. A listed occupant is logged as an error and left.
 
 ---
 
@@ -476,69 +462,81 @@ timestamp is older than the entry's `missedTimestamp` (`StoreRepairer.scala:270`
 
 | # | Mechanism | Code | Prevents |
 |---|-----------|------|----------|
-| M1 | **Quorum read plus lock reporting.** A committed transaction was voted commit by a write-threshold of stores; any read-threshold set contains one voter, which has applied the transaction (read shows it) or holds its locks (read reports them). | Q3, Q4; `Reconcile.scala:89-97` | Installing a state older than a committed transaction, as long as the part is not reported locked |
-| M2 | **Snapshot before read.** Snapshot is taken, then the read is issued, then install compares. | `StoreRepairer.scala:263-280` | Any change the store applied after the snapshot is detected at install |
-| M3 | **Install only what still matches the snapshot.** Per key revision; object revision; refcount; min/max/left/right. A mismatch gives `stale`. | `Reconcile.scala:128-136,179-189,198-210,152-157` | Overwriting a newer committed change, including one the read did not yet see |
-| M4 | **Install on the executor in one task; refuse while the object has any commit in flight** (`commitInFlight`, `commitFailed`, `committing`, `deleting`, recovery `holding`, state not the served one). | `Frontend.scala:888-906` | Repair write interleaving with a transaction's backend commit (backend writes of one object are unordered) |
-| M5 | **Repair write is itself counted as an in-flight commit**: retained, `committing`, `txCommitsInFlight`. | `Frontend.scala:947-962` | A transaction reading the pre-repair state from the backend while the repair write is outstanding; transactions on the object wait behind it |
-| M6 | **Store's own locks defer parts as read locks do.** | `Frontend.scala:915-916` | A store that did not answer the read, or a recovering store, being repaired over a part its own locked transaction is about to write |
-| M7 | **Refcount: install only with a strictly higher `updateSerial`**, or when the store has no copy. | `Reconcile.scala:128-136` | Lowering a refcount, un-deleting |
-| M8 | **DataObject: install data only when revisions differ, the read's timestamp is not older than the store's, and the store's revision still equals the snapshot's.** | `Reconcile.scala:151-157` | Installing an older revision over a newer one; ABA is excluded because revisions are transaction ids |
-| M9 | **A copy is never created without its refcount; never created while the object-level part is locked; never "re-created" if the store deleted it since the snapshot.** | `Reconcile.scala:107-109,119-123,140-142,167-168` | Resurrecting a slice of a deleted object |
-| M10 | **No repair write for an object being deleted on the store**, and `repairDelete` evicts the cache first. | `Frontend.scala:803-805,822-828` | Writing after the deletion |
-| M11 | **Skip a UnackedCommits entry while the store holds the transaction live (or is loading CRL state).** | `StoreRepairer.scala:219-222`; `Frontend.scala:96` | Two writers (the Tx applying T and repair) racing, and repair acting before a recovered commit vote has had its chance to apply T |
-| M12 | **Entry deletion compare-and-delete on the entry's revision.** | `StoreRepairer.scala:351-361` | Dropping an entry a newer miss has rewritten |
-| M13 | **Completion requires the read to be at least as new as the entry's `missedTimestamp`.** | `StoreRepairer.scala:270` | Dropping an entry when the read does not yet include the missed transaction (belt and braces for M1) |
-| M14 | **Proof transactions** make a persistently locked part safe to reconcile (section 8). | `RepairProofs.scala` | Waiting forever on a hot key |
-| M15 | **Allocation-absence needs an entry older than 60 s** before treating the object as deleted. *2026-11-16 (G8): pacing only.* The read decides (`InvalidObject.provesDeletion`, F5), and a commit voter that has not applied the allocation answers `AllocationPending` (transaction-requirements Q-N5), so a read in that window proves nothing. The gate compares the repairing host's HLC with the marker transaction's start, so skew shifts it by at most the skew plus `MaxStartLead`; safety does not rest on it. StoreRepairerSuite "an entry past the age gate whose allocation has committed but not yet applied is kept, not deleted (G8)" | `StoreRepairer.errorEntryMayBeDeleted`; `Frontend.allocationPending` | Deleting the store's slice (and the entry) of an object whose allocation has not been recorded |
-| M16 | **Store left the host: promises fail with `StoreNotHosted`; callbacks check `abandoned`.** | `StoreRouter.scala:184-204`; `StoreRepairer.scala:142` | Dropping entries for a store now served elsewhere |
-| M17 | **Backend write failure keeps the entry.** | `Frontend.scala:968-985` | Dropping an entry when the install did not reach disk |
-| M18 | **Repair transactions have missed-update tracking disabled.** | `AspenClient.scala:~89-100`; `RepairProofs.scala:276` | Entry feedback loops |
-
-The race analysis at each step is in section 12.1.
+| M1 | Quorum read plus lock reporting (Q1, Q2, Q9) | `BaseObjectReader`; `ObjectState.lockedKeys` | Installing a state older than a committed transaction on a part not reported locked |
+| M2 | Snapshot before read; install compares | `StoreRepairer.repairUpdate` | Overwriting anything the store applied after the snapshot |
+| M3 | Install only what still matches the snapshot: per key revision, object revision, refcount, min/max/left/right; a mismatch is stale | `Reconcile.plan*` | Overwriting a newer committed change, including one the read did not see |
+| M4 | Install on the executor in one task; refuse while the object is unsettled | `Frontend.reconcile` | A repair write interleaving with a commit's backend write (backend writes of one object are unordered) |
+| M5 | The repair write is itself an in-flight commit (retained, `committing`, `txCommitsInFlight`) | `Frontend.reconcileSettled` | A transaction or read seeing the pre-repair backend state while the write is outstanding |
+| M6 | The store's own locks defer parts as the read's do | `Frontend.reconcileSettled` | Repairing over a part the store's own voted transaction is about to write |
+| M7 | Refcount only with a strictly higher `updateSerial`, or when the store has no copy | `Reconcile.planRefcount` | Lowering a refcount; un-deleting |
+| M8 | DataObject data only when revisions differ, the read is not older than the store, and the store's revision still equals the snapshot's | `Reconcile.planData` | Installing an older revision over a newer one (revisions are transaction ids, so no ABA) |
+| M9 | A copy is never created without its refcount, never while the object level is locked, never if the store deleted it after the snapshot | `Reconcile.plan`, `planData`, `planKeyValue` | Resurrecting a deleted slice |
+| M10 | No repair write for an object being deleted on the store; `repairDelete` refused while the object is in use | `Frontend.reconcileForRepair`, `deleteObjectForRepair` | Writing after a deletion; a delete racing a read, commit or transaction |
+| M11 | Skip an UnackedCommits entry while the store holds T (or is loading its CRL) | `Frontend.mayHoldTransaction` | Repair racing the Tx that applies T; deleting an entry a recovered vote still needs to look up |
+| M12 | Leave entries while the store may still join their transaction | `RepairTarget.mayJoinTransaction` | A replay's Tx applying T after the reconcile and the entry being deleted under it |
+| M13 | Compare-and-delete on the entry's revision | `deleteEntryIfUnchanged` | Dropping an entry a newer mark rewrote |
+| M14 | Completion requires the read to be at least as new as the entry's timestamp | `repairUpdate` | Dropping an entry when the read cannot reflect the miss |
+| M15 | Proof transactions for persistently locked parts | `RepairProofs` | Waiting forever on a hot lock |
+| M16 | Parking a persistently stale repair until the object settles | `Frontend.parkRepair` | Retrying forever an object always busy at install |
+| M17 | Absence from the AllocationTree is not a deletion; only `InvalidObject.provesDeletion` drops a slice | `StoreRepairer.repairAbsent`, `repairListed` | Deleting the slice of a live object whose allocation is recorded late |
+| M18 | Ownership fence; `StoreNotHosted`; `abandoned` | `OwnershipFence`; `StoreRouter` | A departed or superseded copy consuming entries |
+| M19 | A failed backend write keeps the entry | `Frontend.repairWriteComplete` | Dropping an entry when the install did not reach disk |
+| M20 | Proofs run untracked and replay-safe; entry deletes run tracked except in the bootstrap pool's own trees | `AspenClient.newRepairTransaction`; `limitTracking` | Entry feedback loops |
 
 ---
 
-## 8. Deferral and proofs
+## 8. Deferral, parking and proofs
 
 ### 8.1 DeferralState
 
-In-memory, per store, kept across scans (`StoreRepairer.scala:45-92`). Keyed by `errorDeferralKey(key, entry revision)`
-(prefix 0) or `unackedDeferralKey(entryKey, objectId)` (prefix 1). `record(entryKey, result)` counts consecutive
-passes that deferred something *by a lock* (`deferredKeys` non-empty or `objectLevelDeferred`). A pass that defers
-nothing by a lock (complete, or only `stale`) removes the entry and returns 0. `only` is set when the previous pass
-deferred only keys; the next pass then reconciles only those keys and leaves refcount/object level/timestamp alone.
-`retain` drops state for entries not seen in a completed scan. A host restart, or a `ScanTimedOut`, forgets everything
-(`RepairService.scala:198-200`); the next pass reconciles the whole object and restarts the count.
+In memory, one per store, kept across scans by `RepairService` and dropped when the store leaves the repairable set
+(`StoreRepairer.DeferralState`). Keys: `errorDeferralKey(key, entry revision)` (prefix 0), `unackedDeferralKey(key,
+objectId)` (prefix 1), `sweepDeferralKey(nodeId)` (prefix 2), `verifyDeferralKey(objectId)` (prefix 3).
 
-### 8.2 When a proof runs
+- `record(entryKey, result)` counts consecutive passes that deferred something by a lock (`deferredKeys` non-empty or
+  `objectLevelDeferred`). A pass that defers nothing by a lock (complete, or only stale) forgets the entry and returns
+  0. When the pass was neither object-level deferred nor stale, `only` is set to the deferred keys, and the next pass
+  reconciles only those.
+- `recordStale` counts consecutive stale passes separately; a non-stale pass resets it.
+- `retain` (a completed scan) forgets entry keys the scan did not touch; sweep and verification keys are kept.
+  `retainSweep` (a complete sweep walk) prunes sweep keys. A host restart forgets everything; the next pass reconciles
+  whole objects and restarts the counts. Because an ErrorTree deferral key includes the entry's revision, a rewritten
+  entry starts over with a whole-object pass.
 
-`passes >= proofAfterDeferrals` (default 10, about 5 minutes at the 30 s floor). `prove(read, result)` (`:304-329`)
-runs, one at a time (parallel proofs of one object would collide):
+### 8.2 Parking (persistently stale objects)
+
+A proof cannot help a stale result (the store's own copy is busy or changed). After `ParkAfterStalePasses` (3) stale
+passes in a row, the repair sets `RepairSnapshot.awaitSettle`. An unsettled store then parks the reconcile
+(`Frontend.parkRepair`; at most one per object, a newer one replacing an older, which answers stale) instead of
+answering stale. `commitTurnFree` runs it first, at the one moment the object is settled, before any waiting
+transaction is told; the end of holding retries every parked repair too. It runs once, through the ordinary
+snapshot-checked reconcile, so a part the completing commit changed still comes back stale. One that never sees its
+object settle answers stale after `Frontend.RepairSettleWait` (1 s), checked on the store heartbeat
+(`expireParkedRepairs`); fail-stop and close fail it. The commit path pays one empty-map check while nothing is parked.
+
+### 8.3 When a proof runs
+
+At `passes >= proofAfterDeferrals` (default 10, about 5 minutes at the 30 s floor), `prove(read, result)` runs proofs
+one at a time (parallel proofs of one object would collide), each a `replaySafe` transaction from
+`client.newRepairTransaction()` (tracking off):
 
 | Deferred part | Proof | Code |
 |---------------|-------|------|
-| each deferred key (KeyValue only) | `update(ptr, None, None, [KeyRevision(key, readRevision)] or [DoesNotExist(key)], Nil)` | `RepairProofs.scala:254-259` |
-| object level, KeyValue | `RefcountUpdate(required=rc, new=rc)` then `exclusiveLockRevision(ptr, read.revision)` | `:265-273`; `StoreRepairer.scala:317-319` |
-| object level, DataObject | `RefcountUpdate(required=rc, new=rc)` | `StoreRepairer.scala:320-321` |
+| each deferred key (KeyValue) | an update with no operations requiring `KeyRevision(key, readRevision)`, or `DoesNotExist(key)` when the read lacked it | `RepairProofs.proveKey` |
+| object level, KeyValue | `RefcountUpdate(required = rc, new = rc)`, then `ExclusiveRevisionLock(read.revision)` | `proveRefcount`, `proveObjectLevel` |
+| object level, DataObject | `RefcountUpdate(required = rc, new = rc)` | `proveRefcount` |
 
-All use `client.newRepairTransaction()` (tracking off) and complete `true` only on commit; an abort or any error is
-`false` and logged at debug/info.
+Each completes true only on commit; an abort or error is false. If any object-level proof fails, the object level is
+unproven. A committed proof means a write threshold of stores agreed with the read on that part at that moment and
+none held a conflicting lock (the requirements take the same locks a real write would). Any other committed write of
+that part needed a vote from a store in the proof's set, which would have collided or mismatched, so the read was
+current on it at proof time. The scan then reconciles from the same read with `snapshot.proven` set: the read's locks
+on proven parts are ignored, the store's own locks still defer, and the snapshot check still applies.
 
-A committed proof means a write-threshold of stores agreed with the read on that part *at that moment* and none held a
-conflicting lock (the proof's requirements take the same locks as a real write). Combined with Q3 (any other committed
-write needed a vote from a store in the proof's set, which would have collided or mismatched), the read was current for
-that part at proof time. The scan then re-runs `reconcile(snap.copy(proven = ...), os)`: the read's locks on proven
-parts are ignored, but the store's own locks still defer (`Frontend.scala:913-916`), and the snapshot check still
-applies. If any proof of a group fails, the object-level group is entirely unproven (`StoreRepairer.scala:326-327`).
-
-### 8.3 What a proof cannot do
-
-- It cannot help a `stale` outcome (`DeferralState` comment, `:36-43`): `stale` means the store's own copy is busy or
-  moved. A persistently `stale` object escalates differently (F8, FIXED 2026-11-15): after
-  `StoreRepairer.ParkAfterStalePasses` (3) stale passes in a row the store parks the reconcile until the object
-  settles (`RepairSnapshot.awaitSettle`).
-- It proves revision equality, not equality of min/max/left/right (F11).
+The object-level proof compares the revision only, which suffices because every min/max/left/right change moves the
+revision (Q8). Every requirement on a refcount-0 or missing object fails `MissingObject`
+(`RequirementsChecker.loaded`), so no proof revives a deleted object: a proof from a pre-deletion read aborts, the entry
+stays, and the next pass's read proves the deletion.
 
 ---
 
@@ -546,808 +544,281 @@ applies. If any proof of a group fails, the object-level group is entirely unpro
 
 ### 9.1 How a deletion reaches a store
 
-An object is deleted by a transaction setting its refcount to 0 (`RefcountUpdate`, traceless) with a
-`DeletionFinalizationAction` that removes the AllocationTree entry afterwards. A store that applies it removes the
-object from its backend, and answers reads `ObjectNotFound` (Q7). A store that missed it keeps the object with a
-positive refcount.
+An object is deleted by a transaction setting its refcount to 0 (a `RefcountUpdate`, traceless), whose
+`DeletionFinalizationAction` later removes the AllocationTree entry. A store that applies it removes the object and
+answers reads `ObjectNotFound`. A store that missed it keeps a positive refcount. A missed deletion is marked like any
+other miss (ErrorTree for silent or erroring stores, UnackedCommits for unacknowledged counted voters).
 
 ### 9.2 How a missed delete is repaired
 
-1. The finalizer records the miss. Every store that sent no `TxCommitted`, or reported the object in its
-   `TxCommitted` errors, gets an ErrorTree entry. A counted commit voter that sent no `TxCommitted` (any silent store,
-   when the voters are unknown) also gets a UnackedCommits entry. Both carry the `storePointer`. Uncounted voters and
-   non-voters get only the ErrorTree entry (transaction-recovery F13/F15, closed by design 2026-11-14).
-2. Scan: the entry is found. `allocationTree.get(objectId)`:
-   - **present** (DeletionFinalizationAction not yet run): `client.read` fails with `InvalidObject` (refcount 0,
-     Q7). Since 2026-11-15 (F15) a read that proves the deletion drops the slice at once, as for an absent entry,
-     with no age gate; one that fails short of a proof leaves the entry for the next pass.
-   - **absent**: if the entry is at least 60 s old, `repairDelete(store, objectId, storePointer)`
-     (`Frontend.deleteObjectForRepair`, `:822-828`) evicts the cache and calls `backend.repairDelete`: RocksDB deletes
-     the key; FSIF deletes the extent only if its index slot still holds that object id
-     (`FsifBackend.scala:1459-1476`). Then the entry is deleted *unguarded* (`StoreRepairer.scala:190-191`).
-3. Younger than 60 s: deferred; retried each pass.
+- **Listed** (`repairListed`): the repair read may find the object deleted (its DeletionFinalizationAction has not run
+  yet). A read failing `InvalidObject.provesDeletion` drops the slice (`repairDeletion`) with no age gate; an
+  `InvalidObject` short of a proof defers the entry.
+- **Absent** (`repairAbsent`): absence may be a late `AllocationFinalizationAction`. Once the entry is at least
+  `minErrorEntryAgeForDeletion` (60 s) old by the repairing host's HLC (`errorEntryMayBeDeleted`; a future-dated entry
+  is ineligible), the object is read through its pool with the entry's pointer. A proven deletion drops the slice; a
+  restored read means the object is live and it is reconciled as if listed (logged); anything else keeps the entry.
+  An ErrorTree entry of unknown type is acted on only for a proven deletion.
+- `provesDeletion` needs more than `width - w` `ObjectNotFound`/`ObjectMismatch` replies, or a majority at refcount 0
+  (Q5). A committed live object is on at least `w` stores, and `w >= r`. A commit voter that has not yet applied an
+  allocation does not answer `ObjectNotFound`: the read parks there until the allocation applies or aborts
+  (`Frontend.parkAllocationRead`, `allocationPending`), so a read inside an allocation's apply window proves nothing,
+  and the 60 s gate only paces. Clock skew moves the gate by at most the skew plus `MaxStartLead`; safety does not rest
+  on it.
+- `repairDeletion` (`Frontend.deleteObjectForRepair`) is refused (`RepairDeleteDeferred`, counted deferred) while the
+  store is holding, or the object has a pending backend read, a commit, a repair write or a deletion in flight, or a
+  transaction references it. Otherwise it evicts the cache, counts the object in `deleting` (reads, snapshots and
+  transactions get `ObjectNotFound`), waits for allocations to be durable (`awaitAllocationsDurable`), then
+  `backend.repairDelete`: RocksDB deletes the key; FSIF deletes the extent only if its slot still holds that id. Both
+  are idempotent.
 
 ### 9.3 Can a store that missed a delete resurrect the object?
 
-By reads: no. A read needs `threshold` matching responders; deleters answer `ObjectNotFound`. With `errors > width -
-threshold` the read is `InvalidObject` (`BaseObjectReader.scala:119-132`). A stale store can contribute at most
-`width - writeThreshold` Right responses, fewer than `threshold` (Q3). Otherwise the read waits. A deleter that has only
-voted holds its object-level lock, which defers repair.
+By reads: no. A stale store is at most `width - w` stores, fewer than `r` (Q1), so it cannot form a matching set, and
+more than `width - r` deleters make the read `InvalidObject`. A deleter that has only voted holds its object lock,
+which defers repair and makes readers wait.
 
-By repair (the store itself is behind):
-- The refcount of the read is the highest serial among matching responders (Q7). A read of a deleted object fails
-  before reconcile runs.
-- A store with no copy never receives one unless the read has a live refcount and no object-level lock
-  (`Reconcile.scala:119-123,140-142,167-168`).
-- **Window**: a store with no copy, whose snapshot is "missing", can install a *pre-deletion* read if the deletion
-  commits after the read and has not yet been voted at any responder at read time, while the store itself does not hold
-  the object. The deletion transaction cannot apply at that store (no object, `MissingObject` error), so the store
-  replies with an error, gets an ErrorTree entry for the object and is cleaned up by the missed-delete path above
-  (S: after the allocation entry is gone and 60 s old, `repairDelete`). The slice is a zombie for at least that
-  long, and the cleanup depends on the marker having been written (see F5/F14).
-- If the store deleted the object after the snapshot, `current.isMissing && !snapshot.isMissing` gives stale
-  (`Reconcile.scala:107-109`), and `Frontend.reconcileForRepair` returns stale for `deleting` objects (`:803-805`).
+By repair: a read of a deleted object fails before reconcile runs. A store with no copy gets one only from a read with
+a live refcount and no object-level lock (M9). If the store deleted the object after the snapshot, the plan is stale,
+and `reconcileForRepair` answers stale for an object being deleted.
+
+Window: a store with no copy can install a pre-deletion read if the deletion commits after the read and had not been
+voted at any responder at read time. The deletion cannot apply at that store (no object: `MissingObject`), so the
+store reports an error, is marked, and the next pass proves the deletion and drops the slice. The slice is a zombie
+until then; reads ignore it (Q4/Q5).
 
 ### 9.4 Can a missed key delete resurrect a key?
 
-On reads: no, by Q6. A key present only at stores that missed the delete is dropped (all responders in, fewer than
-`threshold` match, none locked) or waits (some responders could still make it restorable).
-
-On repair, the store is made to match the read key by key (`Reconcile.scala:179-189`); a key the read lacks is deleted
-at the store provided the store's key revision still equals the snapshot's. The reverse hazard is in F4: a key the
-read has (taken before the delete), that the store lacks, and a delete that the store applies as a no-op between
-snapshot and install; the install then re-creates the key at that store only. It cannot reappear in reads (Q6) but it
-is a zombie slice and can make reads of the object depend on all stores (fewer than `threshold` match, others "could
-still match").
-
-KeyValue deletes with a required revision change the revision and are detected by M3. Only blind key deletes
-(`deletesKeys`, no required revision), the traceless kind, can be silent.
+On reads: no (Q4). On repair: the store is made to match the read key by key; a key the read lacks is deleted at the
+store if its revision still equals the snapshot's. Every key delete carries a `KeyRevision`, a required revision or
+a content lock (Q8), each of which fails at a store lacking the key, so a delete never applies there as an invisible
+no-op that the snapshot check would miss: it is reported and marked instead.
 
 ---
 
-## 10. Opportunistic rebuild
+## 10. Other users of the reconcile path
 
-Opportunistic rebuild is a second, *read-driven* repair path that bypasses the ErrorTree. It is not guarded by
-snapshots.
+### 10.1 Bootstrap tree sweep
 
-### 10.1 Flow
+Writes to the bootstrap pool's own ErrorTree and UnackedCommits nodes run untracked (`limitTracking`), so a bootstrap
+store that misses one gets no entry. `StoreRepairer.sweepBootstrapTrees` heals it: after each entry scan of a
+bootstrap store (success or failure), it reconciles the store's copy of every node of both trees, every tier
+(`TieredKeyValueList.foreachNode`), through `repairUpdate` with no minimum timestamp, no proofs (they would collide
+with marker traffic), never narrowed to deferred keys (a later missed untracked write records nothing), keyed
+`sweepDeferralKey`. A node deleted under the walk, an unreadable node, or one skipped because the store stopped being
+repairable or the sweep was cancelled counts as incomplete. `SweepResult.needsAnotherPass` (anything reconciled or
+incomplete, or a walk that missed nodes) keeps the store at the floor; a clean sweep lets it back off. Its staleness
+window is an accepted limitation (13).
 
-1. A completed full read (not `isPartial`) leaves `rereadCandidates` = stores whose last response was behind the
-   restored state: a revision other than the winning revision, or (KeyValue) a store holding a lower-revision segment
-   for some key (`BaseObjectReader.scala:42,160`; `KeyValueObjectReader.scala:121-124`).
-2. `BaseReadDriver.receiveReadResponse` sends an `OpportunisticRebuild(toStore, pointer, revision, refcount, timestamp,
-   data = os.getRebuildDataForStore(store))` message to each such store, once per read (`BaseReadDriver.scala:139-146,
-   243-246`). `getRebuildDataForStore` encodes the whole object (all keys, min/max/left/right) as that store's slices
-   (`client/ObjectState.scala:~119-139`).
-3. The read driver also calls `opportunisticRebuildManager.markRepairNeeded(os, repairNeeded)`
-   (`BaseReadDriver.scala:231-236`). `SimpleOpportunisticRebuildManager` keeps it for 10 s (`expireAfterWrite`, max 5000
-   entries) (`SimpleOpportunisticRebuildManager.scala:15-22`). When the same client later builds a transaction touching
-   that object, `TransactionBuilder.addUpdate` attaches a `PreTransactionOpportunisticRebuild(objectId, Metadata,
-   data)` for each behind store to that store's `TxPrepare` (`TransactionBuilder.scala:132-153`), built from the
-   *client object cache's* current state (`SimpleOpportunisticRebuildManager.scala:24-39`).
-4. At the store: `Frontend.readObjectForOpportunisticRebuild` (`:766`) loads the object if needed, then
-   `opportunisticRebuild` (`:867-881`):
-   ```
-   if os.revision == op.revision && !commitInFlight(obj):
-        refcount = higher serial of (op.refcount, os.refcount)
-        os.metadata = Metadata(op.revision, refcount, op.timestamp); os.data = op.data
-        commit(os, ..., ordered = true)        -- counted as an in-flight commit
-   ```
-   An object not present on the store is not rebuilt (`:766-777`, and the backend not-found case ignores it,
-   `:1051`). A different revision is ignored. So opportunistic rebuild *only repairs the same revision* (a KeyValue
-   object whose keys differ, or a refcount).
-5. In a prepare, `Tx.completeLoad` applies `preTxRebuilds` the same way when `os.revision == r.requiredMetadata.revision
-   && !os.reloadRequired`, before the transaction determines its disposition (`server/transaction/Tx.scala:381-391`).
-   It calls `frontend.commit(os, cs, txid)` with the defaults (not `ordered`).
+### 10.2 Quarantine verification
 
-### 10.2 Properties
+A store quarantines an object a recovered commit vote could not apply (`Frontend.quarantine`): every transaction on it
+votes abort and committed ones apply nothing to it, until `QuarantineVerifier` (through `RepairService.verifyObject`,
+30 s deadline) shows the store's copy matches a read at least as new as the quarantining transaction's start.
+`StoreRepairer.verifyObject` is `repairUpdate` with that `minTimestamp`, proofs allowed, keyed `verifyDeferralKey`. It
+reads and deletes no entry, so the fence and `mayJoinTransaction` do not apply. A failed or incomplete verification
+is retried at store heartbeat with doubling backoff.
 
-- It is best effort and unrecorded: no entry is written or removed. It never completes an ErrorTree entry; the scan
-  still reconciles.
-- It makes the *same-revision* guard its only race protection (plus `commitInFlight` for the first path). It does not
-  compare timestamps, key revisions, or locks, and does not check that the client's data is not older than the
-  store's current state (flaws F1, F2).
-- `os.data` is replaced but `os.kvState` is not (flaw F1). `Reconcile`'s own install does update `kvs.content` and
-  re-encodes (`Frontend.scala:927-940`).
+### 10.3 No opportunistic rebuild
 
-### 10.3 Not used by `RepairService`
-
-`StoreRepairer` never calls it. The repair read itself is a normal read with opportunistic rebuild enabled; the read
-driver of the repair's `client.read` may therefore *also* send rebuild messages to the very store being repaired,
-concurrently with the snapshot/read/install sequence. The snapshot check at install still detects a change but cannot
-tell an opportunistic rebuild apart from a transaction (both are "changes since snapshot"), so the result is stale
-rather than wrong, except for the issues in F1/F2.
+There is no read-driven repair path: the read-triggered and pre-transaction opportunistic rebuilds were removed
+because their same-revision guard could overwrite blind writes and left `kvState` stale
+(`docs/superpowers/specs/2026-11-14-opportunistic-rebuild-removal-design.md`). Every repair goes through Reconcile.
 
 ---
 
 ## 11. Invariants
 
-Numbered for review; the code that enforces each is in section 7. "Holds" means by the code read here.
+| ID | Invariant | Enforced by |
+|----|-----------|-------------|
+| E1 | An unlocked part of a read reflects every transaction committed before the read began. | Q1, Q2, Q9; a voter that lost its vote state: [crash-recovery-log.md](crash-recovery-log.md) |
+| E2 | Repair writes a store only on its executor, only when the object is settled, and the write is itself an in-flight write. | M4, M5 |
+| E3 | Repair never changes a part of the store's copy that differs from the snapshot taken before the read. | M2, M3, Q8 |
+| E4 | Repair never installs a part the read or the store reports locked (unless a proof covered the read's lock). | M6, `Reconcile.planKeyValue` |
+| E5 | Repair never lowers a refcount's `updateSerial`, and installs no refcount while the object level is locked. | M7 |
+| E6 | Repair never installs an older DataObject revision over a newer one. | M8, Q6 |
+| E7 | Repair never creates a copy without its refcount, while the object level is locked, or after the store deleted it. | M9 |
+| E8 | An entry is removed only after every object it names was reconciled completely (or was completed by phase A of the same scan at a timestamp at least the entry's), or was proven deleted and dropped. | 5.2, 5.3, M17 |
+| E9 | An entry is removed only if it has not been rewritten since the walk read it, and only while the store's pool entry names this host and device. | M13, M18 |
+| E10 | An entry whose repair fails, is deferred or is stale stays. | 5.2, 5.3 |
+| E11 | An UnackedCommits entry is not acted on while the store holds T or is loading its CRL; no entry is acted on while the store may still join its transaction. | M11, M12 |
+| E12 | Repair proofs never create entries; entry deletes create entries only one level closer to the bootstrap pool. | M20 |
+| E13 | A complete result implies a read at least as new as the entry's timestamp. | M14 |
+| E14 | Missing or failed metadata, policy or limits never stops a scan. | `RepairService.refreshPolicies`, `refreshLimits` |
+| E15 | Progress: an entry whose object is readable, not locked at every attempt, and settles within `RepairSettleWait` is removed within a bounded number of passes. | M15, M16; limits in 13 and 14 |
 
-| ID | Invariant | Status |
-|----|-----------|--------|
-| E1 | An unlocked part of a read reflects every transaction committed before the read began. (Quorum intersection Q3 + lock reporting Q4; recovered commit votes retake their locks, and a loading store drops reads.) | Holds (needs the bounds of Q1/Q2; a voter that lost its vote state is covered in [crash-recovery-log.md](crash-recovery-log.md)) |
-| E2 | Repair writes to a store only on its executor, only when the object has no other write in flight, and the write is itself an in-flight write. | Holds (M4, M5) |
-| E3 | Repair never installs a part of an object that differs from the snapshot taken before the read. | Holds, with the exception of changes that leave no trace in the compared fields (F4) |
-| E4 | Repair never installs a part the read or the store reports locked. | Holds (M6, `Reconcile.scala:179`) |
-| E5 | Repair never lowers a refcount's `updateSerial`; it never installs a refcount while an object-level lock is reported. | Holds (M7) |
-| E6 | Repair never installs an older DataObject revision over a newer one the store has applied: data requires `current.revision == snapshot.revision`, `read.revision != current.revision`, `read.timestamp >= current.timestamp`. | Holds if object timestamps order revisions: true for DataObjects, which check `timestamp > txTimestamp` on every revision-bearing update (Q8). An older read with a differing revision is now reported stale (F13), so the entry is never dropped on it |
-| E7 | Repair never creates a copy of an object without installing its refcount, never while the object-level part is locked, never if the store deleted it after the snapshot. | Holds (M9) |
-| E8 | An ErrorTree/UnackedCommits entry is removed only if (a) the object was reconciled completely (`complete`), or (b) the object was absent from the AllocationTree for an entry at least `minErrorEntryAgeForDeletion` old, a read of it proved it deleted (`InvalidObject.provesDeletion`), and `repairDelete` succeeded. | Holds (F5 **FIXED** 2026-11-14: (b) was absence alone) |
-| E9 | An entry is removed only if it has not been rewritten since the scan read it (ErrorTree/UnackedCommits via `deleteEntryIfUnchanged`). | Holds |
-| E10 | An entry whose repair fails (read fails, promise fails, store left, backend write fails, `stale`, any deferral) stays. | Holds |
-| E11 | A UnackedCommits entry is not acted on while the store holds that transaction live or is loading CRL state. | Holds (M11) |
-| E12 | Repair transactions never create new entries. | Holds for proofs and entry deletions; the cost is F7 |
-| E13 | A complete result implies the read was not older than the entry's `missedTimestamp`. | Holds. The converse (a read that reflects the missed transaction passes the gate) holds since object timestamps are monotone (F3, FIXED 2026-11-15) |
-| E14 | Missing/failed metadata, policy, or limits never stops a scan: last-good or defaults are used. | Holds (`RepairService.scala:133-158`) |
-| E15 | Progress: for each entry whose object is reconcilable (no hot lock, no persistent stale), the scan removes it within a bounded number of passes. | Holds since 2026-11-15 (F3, F8, F9 FIXED). Residual: an object whose copy changes under every install, or never settles within `Frontend.RepairSettleWait`, stays stale, now with a warning every `proofAfterDeferrals` passes (F8) |
-
-Assumptions the invariants rest on, to be checked by the reviewer: (A1) the lock set a store reports includes every
-transaction that has voted commit and not yet applied, for every locking requirement; (A2) a store that holds a
-transaction's locks reports them for the whole interval between vote and apply, across restarts; (A3) object timestamps
-of DataObjects are monotone with the revision chain; (A4) a store completes a backend commit before it forgets the
-transaction.
+Assumptions: (A1) a store reports the locks of every transaction it voted commit on and has not applied, for every
+locking requirement; (A2) it reports them for the whole interval between vote and apply, across restarts (Q9);
+(A3) object timestamps never decrease (Q6); (A4) a store completes a backend commit before it forgets the
+transaction; (A5) every merged miss of an ErrorTree entry committed before the read that completes it (see RP-W1).
 
 ---
 
 ## 12. Failure scenarios
 
-For each: outcome, and why it is safe, or "NOT SAFE" with the finding in section 13.
+### 12.1 Repair racing with a commit C at store S
 
-### 12.1 Repair racing with a commit
-
-| Step | Event | Outcome |
+| When | Event | Outcome |
 |------|-------|---------|
-| Before snapshot | Commit applied at S before the snapshot | The snapshot includes it; the read (taken after) reflects it by E1; nothing to change on that part. Safe. |
-| Between snapshot and read | Commit C applies at S | Install sees S's key/revision/refcount != snapshot: stale for that part; entry kept. Safe. |
-| Between snapshot and read | C commits on others, not yet applied at S, S voted (S holds C's locks) | Install adds S's own locks (`Frontend.scala:915`) and defers those parts. Safe. |
-| During the read | C commits; C's voter among the read set applies or holds locks | Read reflects C or reports its locks (E1). Safe. |
-| During the read | C commits entirely **after** the read's responders answered, and S applies C before install | Detected by M3 for revisions/keys/refcount/data. **Not detected** for a no-op effect of C at S (a delete of a key S lacks): F4. |
-| Between read and install | C commits on others, S has not voted | The install writes the read's state, which is older than C. S's version after install is still older than quorum; C's miss is marked for S (S has no vote, or the commit decision reaches S later and S applies it on top of the repair: its requirements now compare against the repaired state). The ErrorTree entry for C (marked by C's finalizer) or C's apply at S keeps the system convergent. Safe, as the installed state is a state the system once had, and E3 covers S's own changes. |
-| Between read and install | C is voted at S (locks taken) after the snapshot | `unsettled` (commit in flight only after apply) does not cover a held lock; install uses `os.lockedKeys` (`Frontend.scala:915-916`) so the keys C locks are deferred; for object-level locks `objectLevelLocked` defers. Safe. |
-| At install | A commit's backend write is outstanding | `unsettled` -> stale, nothing written (M4). Safe. |
-| After install, before backend completes | A new transaction arrives for the object | It waits behind the repair write (M5). Safe. |
-| After install | Backend write fails | State discarded and reloaded from backend; promise fails, entry kept (M17). Safe. |
-| Install of data object | Newer revision applied at S after snapshot | `current.revision != snapshot.revision`: stale. Safe. |
-| Install of a refcount | S's refcount changed since snapshot | stale. Safe. |
+| Before snapshot | C applied at S | Snapshot includes it; the read reflects it (E1). Safe. |
+| Snapshot to install | C applies at S | S's key/revision/refcount/object level differs from the snapshot: stale. Safe. |
+| Snapshot to install | S voted C (holds locks), not yet applied | S's own locks defer those parts. Safe. |
+| During the read | C's voter among the responders applied it or holds its locks | Read reflects C or reports its locks. Safe. |
+| Read to install | C commits elsewhere; S has not voted | The install writes the read's state, a state the system had. C's apply at S, or C's mark for S, follows; its requirements then check the repaired state. Safe, but see RP-W1 for the entry. |
+| At install | A commit's backend write outstanding, or a commit held for its turn | Unsettled: stale or parked. Safe. |
+| After install, before the backend completes | A new transaction arrives | It waits behind the repair write. Safe. |
+| After install | Backend write fails | State discarded and reloaded; promise fails; entry kept. Safe. |
 
-### 12.2 Repair reading from lagging peers (could it install a stale revision?)
+### 12.2 Repair reading from lagging peers
 
-The repair read is an ordinary read; stale peers can only be a minority of matching responders.
-- A read returns when `>= threshold` responders match the most recent revision (ranked by max timestamp, then count).
-  For any committed transaction C at least one responder voted commit (Q3); it either shows C (and then the stale
-  responders are not in the matching set, or are fewer than threshold) or reports C's locks (then C's parts are
-  deferred and, with `locks.objectLevel`, the data/refcount/object level too).
-- A lagging S itself can be in the read set. If S and `threshold-1` other stale stores are the *only* responders, they
-  can only be a matching set if C has no voter among them, contradicting Q3.
-- **Residual risks.** (1) Fixed 2026-11-15 (F12): ranking was by timestamp before count, so a refcount update that
-  bumped a stale store's timestamp could make the stale revision rank first and stall the read. The revision held by
-  `threshold` (a majority) responders now wins whatever its timestamp; a read waits only while no revision has a
-  majority among the replies. (2) E1 depends on A1 and A2. (3) Reads from a store that is itself Rebuilding or has lost its
-  CRL state are the domain of [rebuild-process.md](rebuild-process.md) and
-  [crash-recovery-log.md](crash-recovery-log.md).
-- Per key: `resolve` takes the highest-timestamp revision among segments and requires `threshold` matches or declares the
-  key deleted only if no responder could still match and none holds a lock of that revision (`KeyValueObjectReader.scala:
-  135-147`). Keys with blind-write timestamps out of order (Q8) were ranked by timestamp, not commit order, so a minority
-  segment at a later start timestamp could hide (or, with no store left to answer, delete) the revision a majority
-  holds. Since 2026-11-15 (F12) a key revision with `threshold` segments wins whatever its timestamp, and a key is
-  declared deleted only when no revision can still reach `threshold` and no store holds the lock of any segment's
-  revision.
+Stale peers are a minority of matching responders. A read returns only when `r` responders share a revision (Q3); for
+any committed C at least one of them voted commit (Q1) and either shows C or reports its locks (deferring C's parts).
+S itself may answer the read; a matching set made only of stores that missed C would need `r` stores outside C's
+`w` voters, which do not exist. A read waits while no revision has a majority among the replies. Reads from a store
+that is rebuilding or lost its CRL state are covered by [rebuild-process.md](rebuild-process.md) and
+[crash-recovery-log.md](crash-recovery-log.md).
 
 ### 12.3 Crash mid-repair
 
-| Crash point | State after restart | Safe? |
-|-------------|---------------------|-------|
-| Before install | Nothing changed; entry present | Yes; DeferralState lost, the next pass reconciles the whole object again |
-| After in-memory mutation, before backend completes | The host crashed: memory lost; backend has the old state (or the new, atomically by the backend's commit) | Yes. The repair write is a normal backend commit, and the entry was not deleted. |
-| After backend write, before entry delete | Next pass finds the store in sync; reconcile is a no-op; entry deleted | Yes (idempotent) |
-| During `repairDelete` | The delete is idempotent (`Backend.scala:80`); entry still present | Yes |
-| After `repairDelete`, before `deleteEntry` | Next pass: allocation still absent, repair delete again, then delete the entry | Yes |
-| During entry delete transaction | Transaction either commits or not; the delete is guarded by the revision | Yes |
-| Marker crashes after the transaction committed but before the entry is written | The finalization action is re-run by recovery; entry written later. If the store's repair already happened earlier the entry is found as in sync. | Yes. Entries are only recorded by at-least-once finalization actions. |
-| Host owning the store crashes, store adopted by another host | `StoreNotHosted` failures or the old host's scan dies; the new host's service has fresh `ScanState` and `DeferralState` | Yes. Entries are the only durable state. |
+| Crash point | After restart | Safe? |
+|-------------|---------------|-------|
+| Before install | Nothing changed; entry present; DeferralState lost | Yes: the next pass reconciles the whole object |
+| After the in-memory mutation, before the backend write completes | Memory lost; the backend has the old or the new state (one backend commit) | Yes: the entry was not deleted |
+| After the backend write, before the entry delete | The next pass finds the store in sync; no-op; entry deleted | Yes |
+| During or after `repairDelete`, before the entry delete | The backend delete is idempotent; the next pass proves the deletion again | Yes |
+| During the entry delete | It commits or not; guarded by revision | Yes |
+| The marker crashes after T committed | Finalization re-runs (at-least-once); entries are written later | Yes |
+| The host crashes; the store is adopted elsewhere | The new host's service starts with fresh ScanState and DeferralState; the old copy is fenced (4.4) | Yes: entries are the only durable state |
 
-### 12.4 Entry deleted while a new miss for the same object is written
+### 12.4 Entry deleted while a new mark for the same key is written
 
-Case analysis on the order of the entry-delete transaction D (requires `KeyRevision(key, Rv)`) and the marker insert
-I (blind insert of the same key):
-- I commits before D reads the key: the scan's `value.revision` is older, D fails its requirement, the new entry is
-  repaired on the next pass.
-- D commits before I: I creates a new entry (key absent). A fresh entry always results; D has deleted only the old one.
-- D and I concurrent: both lock the key; one aborts and retries (the marker retries until success; the delete is
-  best-effort, one more pass).
-- The repair that D concluded read a state after the *old* miss. The *new* miss (transaction C2) was committed before
-  I was written (I follows the finalizer by >= 2 s) and so it is covered by E1 for any read started after C2 committed.
-  A read started before C2 committed cannot make D's precondition `complete` with respect to C2's entry since C2's
-  entry is independent. So the interleavings are safe.
-- **Exception:** the unguarded delete `deleteEntry` after `repairDelete` (`StoreRepairer.scala:191`), see section 13.
-  The marker's `missedTimestamp` regression on overwrite (F10) is fixed (2026-11-14).
+Delete D (requires `KeyRevision(key, Rv)`) and mark I:
+- I rewrites the entry before D commits: D fails its requirement; the next pass repairs the new entry.
+- D commits before I reads the key: I creates a fresh entry.
+- D and I concurrent and both writing: they collide; one aborts and retries (the marker retries until success; the
+  delete costs one more pass).
+- I declined (its `missedTimestamp` is not later than the held one): I writes nothing and requires nothing, so it
+  orders against D in no way. This is safe only if D's completing read followed I's transaction's commit: RP-W1.
 
 ### 12.5 Entry for an object that has since been deleted
 
-- Deleted and AllocationTree entry removed: absent, delete path after 60 s (9.2).
-- Deleted but AllocationTree entry still present: the read fails `InvalidObject` each pass; the entry stays until the
-  DeletionFinalizationAction removes the allocation. Noisy (error log per pass per entry) but safe.
-- Deleted, entry younger than 60 s: deferred.
-- Deleted, then the object's allocation never recorded (an allocating transaction whose AllocationFinalizationAction
-  is delayed past 60 s): see F5.
+Listed: the repair read proves the deletion and the slice is dropped, or the entry waits for a proof. Absent: after
+60 s a read proves it and the slice is dropped. An object already below `r` live copies through some other loss reads
+`InvalidObject`; if more than `width - w` stores lack it, that proves "deletion" and the remaining slices are dropped,
+but the object was unreadable already.
 
-### 12.6 Entry whose target store has been rebuilt or transferred
+### 12.6 Entry whose store has been rebuilt or transferred
 
-- Store being rebuilt: not `repairable` while Rebuilding (`HostStoreView.scala:15`); its entries remain. After
-  promotion to Active, the next scan reconciles each entry; since the rebuild read current state they are no-ops
-  and are removed (traceless-commits design, section 4). See [rebuild-process.md](rebuild-process.md) for whether a
-  rebuilt store can answer reads for state it has not yet copied.
-- Store transferred away: `repairable` false; `abandoned` skips callbacks; any in-flight `snapshot/reconcile/
-  repairDelete` fails with `StoreNotHosted` (M16). The entry stays for the new host. Safe.
-- Store rebuilt at the same pool index while a repair is in flight on the old host: the old host's `isRepairable` is
-  false after the store leaves; promises fail. The ErrorTree entry is keyed by pool index, not by store incarnation,
-  so a new store inherits the old store's entries. They are harmless: the new store's copy is fresh, reconcile is a
-  no-op, entries are removed.
-- Rebuild-required directory discarded (`StoreRebuilds.discardLostStore`): entries are unaffected; same argument.
+- Rebuilding: not repairable; entries stay. After promotion the next scan reconciles them (no-ops, since the rebuild
+  copied current state) and removes them. Entries are keyed by pool index, so a rebuilt store inherits them harmlessly.
+- Transferred or adopted: repairable only on the host the pool entry names, on the named device (fence). An in-flight
+  `snapshot`/`reconcile`/`repairDelete` fails with `StoreNotHosted`. The entry stays for the new host.
 
-### 12.7 UnackedCommits entry whose transaction is still live
+### 12.7 Trees unavailable (metadata pool degraded)
 
-`holdsTransaction` true (or `awaitingCrl`): the entry is counted as deferred and skipped; DeferralState is not
-touched. The Tx applies T (recovered commit vote after the lookup finds the entry), stays until `TxFinalized` or its
-driver's late resolution, and the entry is reconciled and removed at a later pass. A Tx that stays live forever (e.g. waiting on a driver) delays the entry
-indefinitely, but the heartbeat gives it a driver (CLAUDE.md "lost TxFinalized"). `awaitingCrl` makes the skip global
-for the store: while loading a `crl_save.log`, every UnackedCommits entry of the store is skipped, the ErrorTree
-phase is unaffected. Safe; a liveness dependency on [transaction-recovery.md](transaction-recovery.md).
+- A tree walk or `allocationTree.get` hangs: the 90 s deadline cancels the scan. A scan that had seen no entry backs
+  off; one cut off while working through entries stays at the floor and keeps its DeferralState.
+- A tree walk fails: logged, treated as clean, the interval doubles toward the cap.
+- A marker write cannot commit: `retryUntilSuccessful`; the transaction stays unfinalized and its stores keep its
+  state (the `FINALIZATION STALLED` alarm after 60 s). A permanent error fails the batch and the finalizer is re-run.
+  No entry is lost.
+- An entry delete fails: one more pass. Policy or limits unreadable: last good or defaults.
 
-Race: the scan checks `holdsTransaction` once at the start of the entry, then reconciles objects one at a time. The
-Tx may be created (recovered) after the check. Reconcile is safe regardless (E2, E3): `holding` makes install
-`stale` while recovery is in progress (`Frontend.scala:895`), and the Tx's later apply goes through the normal commit
-path. Safe.
+### 12.8 An object whose read never completes
 
-### 12.8 ErrorTree unavailable (metadata pool degraded)
+A read of an object below its read threshold, or of a key that stays `NotRestorable`, or of an allocation held
+indefinitely (Backlog.txt "Repair scan stalls on an allocation held past expiry"), never completes. The store's scan
+stops at that entry until the deadline cancels it; the next scan stops at the same entry (the walk always starts at
+the range's head), so later entries of the store are not repaired, and each scan leaves one read retrying in the
+background. Tracked in Backlog.txt (the fix there, timed reads mapped to deferral, covers every cause above).
 
-- The tree walk or an `allocationTree.get` hangs: `withDeadline` fails the scan after 90 s (`ScanTimedOut`). The
-  scan's `ScanControl` is cancelled, so the abandoned walk starts no further entry and prunes nothing. The store keeps
-  its DeferralState. A scan that had seen no entry backs off (interval doubles), as here; one cut off while working
-  through entries stays at the floor (F9, FIXED 2026-11-15).
-- The tree walk fails: logged, scan failed, treated as clean, interval doubles toward the 15 min cap.
-- Entry insert (marker): `retryUntilSuccessful`; the finalization action cannot complete, so the transaction is not
-  forgotten: servers keep its state ("clog up", per CLAUDE.md). No entry is lost. A permanent error
-  (`TransactionCreationError`) fails the action and the driver re-runs the finalizer after a backoff, which marks
-  again (2026-11-11, transaction-recovery F2): still no entry lost.
-- Entry delete fails: best-effort, one more pass.
-- Policy or limits read fails: last-good or defaults (E14).
-- Net effect: no entry is dropped, no state is installed. Repair delay grows until the metadata pool recovers, up to
-  the cap.
-
-### 12.9 A repair proof transaction that aborts repeatedly
-
-`prove` returns `false`; `proven` empty: the scan returns `first` (deferred), the entry stays, and `passes` keeps
-growing. Each later pass re-reads, re-reconciles, and re-attempts every deferred proof (up to one transaction per key
-plus two for object level). Every transaction is an ordinary transaction with the client's normal backoff. No limit
-on the proof attempts exists besides the pass interval (floor 30 s). Safe (nothing is installed), and the cost is bounded
-by one object's deferred set per pass, but a hot key can starve forever (residual risk in the traceless design).
-Escalation, such as switching the proof to a lock-wait, does not exist.
-
-### 12.10 More scenarios
+### 12.9 More scenarios
 
 | Scenario | Outcome |
 |----------|---------|
-| Two scans of one store overlap (a timed-out scan still running when the next starts) | Both are guarded by M3/M4 and M12; duplicated work and read load. Safe. The second scan has a fresh DeferralState (RepairService.scala:198-200). |
-| Repair reads an object whose pointer in the AllocationTree differs from the entry's store pointer | Entry's pointer is used only for deletion; update uses the AllocationTree's. Fine. |
-| Entry key decode throws (malformed) | `Future.unit.flatMap` converts to a failed Future; the walk logs and continues (`StoreRepairer.scala:155-160`). The entry stays forever. |
-| Entry for a (store, object) the store never hosted, e.g. a width change | `poolIndex >= ida.width` -> stale (`Reconcile.scala:112-118`), entry stays forever. No width change exists today. |
-| ErrorTree read returns the repairing store's own entries only | `[poolIndex, poolIndex+1)`; keys `>= 0x80` compare unsigned. MaxWidth 127. `(poolIndex+1).toByte` overflow does not occur below 255. |
-| An FSIF store with no free extent while repair installs | `backend.repair` fails; promise fails; entry stays. FSIF refuses to overwrite a different occupant (`FsifBackend.scala:~1280`). |
-| Read quorum includes the repairing store's own stale answer | Same as any read (12.2). |
-| Clock skew | Entry age uses `HLCTimestamp.now - value.timestamp`; a future-dated entry is ineligible (`:396`). Skew does not affect the reconcile guards, which use revisions and tx ids. |
+| Two scans of one store overlap (a timed-out scan's in-flight entry still running) | They share the store's DeferralState; both are guarded by M3/M4/M13; at most one reconcile parks per object. Duplicated work only. |
+| The AllocationTree's pointer differs from the entry's | The listed pointer is used for the read; the entry's only when absent. |
+| A malformed entry | The callback fails; logged at error each pass; the entry stays forever. |
+| An entry for a pool index beyond the IDA width | Stale every pass; stays forever. Width changes do not exist. |
+| FSIF has no free extent at install | `backend.repair` fails; the entry stays. |
+| A proof aborts every time | `prove` returns nothing; the pass's result stands; each later pass retries every deferred proof. Bounded by one object's deferred set per pass; a lock held at every attempt starves the part. |
+| Clock skew | The age gate uses this host's HLC against the marker's; `mayJoinTransaction` uses this host's wall clock against T's start. The reconcile guards use revisions and transaction ids. |
 
 ---
 
-## 13. Suspected flaws and open questions
-
-Confidence is my confidence that the described behaviour is real and matters, from reading the code alone (no
-experiments run).
-
-### 13.0 Re-assessment for replay pins (2026-11-09, `0d08e3c6`)
-
-The refactor touched entry production (`MissedUpdateFinalizationAction`, `MissedUpdateMarker`), the scan's names and
-entry deletion (`StoreRepairer`), and proofs (`RepairProofs`, now `replaySafe`); reconcile, opportunistic rebuild and the
-completion gate are unchanged.
-
-| Id | Status | Reason | Evidence |
-|---|---|---|---|
-| F1, F2 | unchanged | Opportunistic rebuild paths untouched | `Frontend.scala` rebuild path, `Tx.scala:429-441` |
-| F3 | **narrowed** 2026-11-14 (**FIXED** 2026-11-15, see the note under F3) | Applies take the max object timestamp (requirements F4); the gate still relies on copied timestamps (X7) | `RequirementsApplyer.apply` |
-| F4 | **narrowed** | TKVL deletes now carry `KeyRevision(k, rev)`, so a delete of k at a store where k is absent fails at apply, is reported and marked instead of applying as an invisible no-op; blind deletes unchanged. *2026-11-14:* `TransactionBuilder` refuses blind deletes (`BlindKeyValueWrite`), so the invisible no-op needs a client that bypasses the builder | `KeyValueListNode.scala:505-506`; `RequirementsChecker.scala:141` |
-| F5 | unchanged (**FIXED** 2026-11-14, Todo 2.6, see the note under F5) | Absence heuristic unchanged at the time; the allocation action never skips an entry now (Ruling 28), which does not shorten its delay | `StoreRepairer.scala:249-256` |
-| F6 | unchanged (**FIXED** 2026-11-14, see 13.2) | `deleteObjectForRepair` untouched | |
-| F7 | unchanged | Entry deletions still untracked; `deleteEntry` now pins on `KeyRevision` of the value read | `StoreRepairer.scala` |
-| F8, F9 | unchanged (load larger) (**FIXED** 2026-11-15, see the notes under F8, F9) | More entries per store (R-N4 in transaction-recovery) | |
-| F10 | unchanged (reach widened) | Blind upsert kept (`PutRequirement.Blind`), and the batch is `replaySafe`, so a replayed or re-run batch also regresses entries (transaction-requirements Q-N5) | `MissedUpdateMarker.scala:145-148,165` |
-| F11-F15 | unchanged (F11, F13 **FIXED** 2026-11-14, see 13.2) | Not in the diff | |
-| N1, N2 | unchanged | Not in the diff | |
-
-### 13.0a Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
-
-The addendum adds stub cleanup to the scan (5.5) and `owed`/handed-off completion to the marker's action; reconcile,
-opportunistic rebuild, deletion and the completion gate are unchanged.
-
-| Id | Status | Reason | Evidence |
-|---|---|---|---|
-| RP-N4 | **closed** 2026-11-14 (Todo 2.9; was narrowed: the horizon leaves only never-saw stores, and the forget-floor gate makes their reconcile follow the late apply) | The entry still outlives the store's own late application of T until the scan, but a store that forgot T on a `TxFinalized` listing it, or applied T through the entry, holds an applied stub and applies nothing on a replay's commit. The window stays open only at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) | `Tx.scala:642-648,998-1000`; `StoreRepairer.scala:322` |
-| RP-N3 | **fixed** 2026-11-15 (Todo 4.7; was unchanged, cost added) | The UnackedCommits pass skips objects the same scan's ErrorTree pass completed at or after the entry's timestamp (13.5). Each such entry also keeps a stub in the device CRL until the scan (RP-N6; since 2026-11-15, until T is past the horizon plus the expiry margin) | `Frontend.scala:395-409` |
-| RP-N5 | unchanged (REFUTED stands) | The scan still skips an entry while the store holds T live; the skipped entry now also counts as seen, so its stub is kept | `StoreRepairer.scala:273-278` |
-| F7 | unchanged | Entry deletion is still untracked; the stub drop that follows it is a store-local CRL write | `StoreRepairer.scala:322` |
-| F8, F9 | unchanged (load larger) | One point lookup per orphan candidate per scan (RP-N7); a timed-out scan's background walk still runs its orphan pass against the DeferralState it started with, which `RepairService` has replaced, so it drops only stubs that state already suspected: two successful scans' evidence either way (each drop also checked by a lookup) | `StoreRepairer.scala:187-200`; `RepairService.scala:195-199` |
-| F10 | unchanged | The blind upsert still regresses newer entries; the re-created UnackedCommits entries are now shadowed by stubs when the re-run's `TxFinalized` arrives (transaction-recovery R-N6) | `MissedUpdateMarker.scala:145-148` |
-
-### 13.0b Re-assessment for chunked UnackedCommits entries (2026-11-11)
-
-An UnackedCommits entry naming many objects (a transaction changing many objects on one store) could exceed a tree
-node: with 4096-byte FSIF segments in the metadata pool, about 90 objects. Its insert failed with `NodeSizeExceeded`,
-which the marker retried in place forever, so the transaction never finalized. The marker now writes such an entry as
-chunks (2.3), each sized to half a leaf node less the pair's overhead: with every pair at most half a node, a two-way
-split of a full node always fits, so a chunk never exceeds a node. Each chunk is repaired and deleted as an entry of its
-own; a scan skips them all while the store holds T live (`holdsTransaction` is by txid). Only the head's deletion
-drops the stub: the recovered-vote and late-commit lookups name the head, so a stub dropped while a later chunk
-remains changes nothing they decide, and one kept past the head while a later chunk remains is dropped by the orphan
-pass once the chunks are gone. A `NodeSizeExceeded` that still occurs (a node too small for one object's chunk) is
-permanent: the write gives up and the finalizer failure path retries it with backoff, logged (transaction-recovery F2).
-*2026-11-15 (Todo 4.9): residual accepted.* Such a transaction stays unfinalized by design (finalizing without the
-entry would leave its store unrepaired); its store's `FINALIZATION STALLED` alarm raises it after 60 s.
-Test: StoreRepairerSuite "deleting a later chunk of an UnackedCommits entry keeps the stub; the head's deletion drops
-it"; MissedUpdateFinalizationActionSuite "an entry too large for the tree is written as chunks under consecutive keys,
-head first".
-
-### 13.1 Summary table
-
-| ID | Title | Severity | Confidence |
-|----|-------|----------|------------|
-| F1 | Opportunistic rebuild replaces `os.data` of a KeyValue object but not `os.kvState` | high if real | medium-high |
-| F2 | Opportunistic and pre-transaction rebuild overwrite whole KeyValue content when revisions are equal, regressing blind writes applied since the read | high if real | medium |
-| F3 | **FIXED** 2026-11-15 (timestamps monotone since 2026-11-14; tests). Completion gate `read.timestamp >= missedTimestamp` assumes monotone timestamps; blind KV writes and refcount updates break that | medium (livelock of one entry) | medium |
-| F4 | **FIXED** 2026-11-14 (stores refuse blind writes). A blind key delete applied as a no-op at the store between snapshot and install is invisible to the snapshot check, so repair re-creates the deleted key at that store | medium | medium |
-| F5 | **FIXED** 2026-11-14 (a read decides). `repairDelete` on allocation absence: object live but not yet in the AllocationTree for over 60 s loses the store's slice and the entry (unguarded delete) | medium impact, low probability | low-medium |
-| F6 | **FIXED** 2026-11-14. `repairDelete` has no in-flight/pending-read guard | low | low |
-| F7 | Repair's entry-deletion transaction has tracking disabled unconditionally, so a store missing it is never marked | low | medium |
-| F8 | **FIXED** 2026-11-15 (park until settled). `stale` outcomes never escalate: a hot or perpetually busy object is retried forever | medium (resource), low-medium | medium |
-| F9 | **FIXED** 2026-11-15. `ScanTimedOut` throws away deferral counts and doubles the interval while a backlog exists | low-medium | medium |
-| F10 | **FIXED** 2026-11-14. Marker overwrite can replace a newer `missedTimestamp` with an older one | low | medium |
-| F11 | **FIXED** 2026-11-14 (stores refuse blind writes). Object-level proof is a `ExclusiveRevisionLock`; blind SetMin/SetMax/SetLeft/SetRight do not move the revision | low | low |
-| F12 | **FIXED** 2026-11-15 (majority revision wins). Reader ranks revisions by timestamp before count; timestamp bumps from refcount updates can make a stale revision win the ranking and stall reads | low (availability) | low |
-| F13 | **FIXED** 2026-11-14. DataObject `read.timestamp < current.timestamp` is a silent skip that counts as complete | low | low |
-| F14 | A zombie slice installed from a pre-deletion read is cleaned only if the delete's own marker is written | low | low |
-| F15 | Entry callbacks that fail repeatedly (InvalidObject read of a deleted object whose allocation entry is slow to disappear) log at error each pass. **FIXED** 2026-11-15 | cosmetic | high |
-
-### 13.2 Details
-
-> **Verification 2026-11-09: CONFIRMED (mechanism); doc scenario premise is WRONG. Severity: stale-replica.** ObjectState.kvState is a var initialised once from data (ObjectState.scala:34-37) and no code reassigns it (grep); Frontend.opportunisticRebuild writes os.metadata/os.data only (Frontend.scala:867-881) and the next KV apply does state.data = kvs.encode() from kvState (RequirementsApplyer.scala:133), so the rebuilt content is served and persisted, then silently replaced by stale kvState on the next write; requirement checks and locks also use the stale kvState. Premise error: the client marks a store knownBehind only when its REVISION differs from the chosen one (BaseObjectReader.getStoreStates, :112-130; KeyValueObjectReader.scala:122), while the store applies the rebuild only if its revision EQUALS the read's (Frontend.scala:869). A store that merely missed blind writes (same revision) is never targeted, and a revision-lagging store is skipped; the rebuild fires only when the store caught up between the read and the message. So the 'S missed blind insert of k, then rebuilt' scenario cannot occur as written.
-> *Fix sketch:* After replacing os.data for a KeyValue object rebuild kvState from it (or route through Reconcile and delete the opportunistic path).
-
-**F1. Opportunistic rebuild leaves `kvState` stale. FIXED 2026-11-14 (path deleted).** (`server/store/Frontend.scala:867-881`; `server/store/ObjectState.scala:34-37`; `server/transaction/Tx.scala:381-390`).
-
-> The opportunistic rebuild (read-triggered message and pre-transaction piggyback) and the client object cache were
-> removed; repair is the ErrorTree path only. See docs/superpowers/specs/2026-11-14-opportunistic-rebuild-removal-design.md.
-
-`opportunisticRebuild` and the pre-transaction path assign `os.metadata` and `os.data` and commit. `ObjectState.kvState`
-(the structure requirement checks, locks and the next apply use) is a `var` initialised once from `data` at
-construction; nothing refreshes it (grep: only `reconcileSettled` mutates `kvs` and re-encodes). For a KeyValue object
-the rebuilt `data` is therefore served to reads and written to the backend, but requirement checks still see the old
-content, and the next transaction's apply does `state.data = kvs.encode()` (`RequirementsApplyer.scala:~138`), which
-re-encodes the *old* content plus that transaction's change, silently undoing the rebuild. A requirement such as
-`KeyRevision(k, newRev)` that the rebuilt data satisfies would abort at this store. Scenario: store S missed an
-insert of k (blind). A read triggers an opportunistic rebuild of S (same revision). S's reads now show k; the next
-insert of k2 at S encodes `kvState` (without k) + k2; k is gone again and nothing records it (the transaction replied OK).
-`FrontendSuite` tests (lines 2002-2060) check ordering with the backend write, not the `kvState` content. Confidence:
-medium-high; the fix is to rebuild `kvState` from the new data, or to route through `reconcile`.
-
-> **Verification 2026-11-09: CONFIRMED (mechanism, race trigger). Severity: stale-replica (durable regression of one replica until next write).** Guard is only revision equality (+ !commitInFlight on the message path): os.data = op.data replaces the whole KV content with the read's snapshot and os.metadata.timestamp goes back to op.timestamp (Frontend.scala:867-881). Blind writes applied after the read do not change the revision (RequirementsApplyer.scala:105-112), so they are dropped from data (and persisted that way: crash reloads the regression), although the stale kvState still holds them and re-encodes them on the next write (interplay with F1). Pre-transaction path additionally has no commitInFlight guard and no refcount max (Tx.scala:380-392, requirements F3).
-> *Fix sketch:* Do not replace content on equal revision for KeyValue objects; use Reconcile with snapshot compare.
-
-**F2. Whole-content overwrite when revisions are equal. FIXED 2026-11-14 (path deleted).** (`Frontend.scala:867-881`; `Tx.scala:381-390`;
-`SimpleOpportunisticRebuildManager.scala:24-39`).
-The only guard is `os.metadata.revision == op.revision` (plus `!commitInFlight` for the message path). For KeyValue
-objects, blind writes do not change the revision (Q9), so equality says nothing about keys. `op.data` is the whole
-object as of a read that may be seconds old (the message path), or as of the *client's cached state* (the pre-transaction
-path, whose manager keeps entries 10 s but reads the client object cache with its own lifetime). Scenario: S is behind
-on key a. Read R1 (t0) restores a@r. S then applies blind insert of key b (t1, replied OK). The rebuild message from
-R1 arrives (t2): `os.data = op.data` has no b; `os.metadata.timestamp` goes back to R1's timestamp. S lost a committed
-key (b) that nothing records; durability of b then rests on fewer than the intended number of stores. Even with F1's
-repair, the guard does not compare the store's content or timestamp (`op.timestamp` < `os.timestamp` is accepted).
-Confidence: medium (depends on a blind-write workload and on the timing; the code has no check).
-
-> **Verification 2026-11-09: CONFIRMED (mechanism). Severity: liveness (one repair entry retried forever).** Gate `os.timestamp >= minTimestamp` (StoreRepairer.scala:~262-266); blind KV and refcount updates assign timestamp := txd.startTimestamp with no max (RequirementsApplyer.scala:109-112, 137-139), so two blind writes applied out of start-timestamp order leave a timestamp below the entry's missedTimestamp; every pass is stale.
-> *Fix sketch:* Gate on post-install equality with the read, or apply max() to blind updates.
-
-**F3. Completion gate assumes monotone timestamps** (`StoreRepairer.scala:266-271`; Q8).
-
-> **2026-11-14 (Todo 2.2): source FIXED.** Applies now keep the object timestamp monotone (max of current and
-> transaction, transaction-requirements F4), so the scenario below no longer lowers it. The gate itself is unchanged:
-> it still trusts timestamps that rebuild and Reconcile copy from reads (X7), and Todo 4.5 keeps the post-install
-> equality option.
-
-> **FIXED 2026-11-15 (Todo 4.5).** The gate is kept. Copied timestamps cannot defeat it. Every object timestamp on a
-> store is one a transaction's apply set (the max of the current timestamp and the transaction's start), or one copied
-> from a read: Reconcile installs `read.timestamp` only when it is higher, and a rebuild writes it into a staging store.
-> A read's timestamp is the max over the stores matching its revision (`BaseObjectReader`), so a copied value is one
-> that some store really holds, and no store's timestamp ever decreases. When a read reflects the missed transaction T,
-> some matching store applied T, so the read's timestamp is at least T's start and the gate passes. When the read does
-> not reflect T, the entry rightly stays. Gating on post-install equality would be weaker: equality with a read says
-> nothing about whether the read includes T, and the timestamp is the only link to T. Tests: StoreRepairerSuite "an
-> entry for a blind write applied ahead of an earlier-started one completes in one pass (repair F3)" (fails with the
-> 2.2 max removed), and "an entry whose missed transaction started before the store's copied timestamp completes with
-> its content" (the store's timestamp copied by a repair install, as a rebuild's is). The rebuild path itself rests on
-> the argument: no end-to-end rebuild-then-repair test.
-`stale` is set when `os.timestamp < minTimestamp`, with `os.timestamp` = max over matching stores of the *last applied*
-transaction's start timestamp. Updates without a required revision (blind KeyValue inserts/deletes) never check the
-object timestamp (`RequirementsChecker.scala:220-226` is called only for revision-bearing requirements;
-`checkKVRequirements` only when `requiredRevision` is set), and `RequirementsApplyer` assigns it unconditionally.
-Scenario: blind insert T1 (start 30) and blind insert T0 (start 20, slow client) on different keys; T1 applies first,
-T0 later, on every store; the object's timestamp is 20. Store S missed T1; the entry has `missedTimestamp` 30. S is
-repaired (install ran), but every read says 20 < 30, so `complete` is false forever, until another update with start
->= 30 reaches the object. Cold objects keep an entry, a full read and a reconcile, every 30 s. `stale` does not count
-toward proofs, so nothing ends it. Confidence: medium. Mitigation ideas for the fix stage: make the gate depend on
-the store's post-install equality with the read (all unlocked parts equal), not on a timestamp.
-
-> **Verification 2026-11-09: CONFIRMED (mechanism, narrow race). Severity: resurrection (zombie key on one store).** Reconcile.planKeyValue compares only key revisions (Reconcile.scala:179-190) and snapshot vs current (Reconcile.scala:172-190); a blind Delete(k) applied as a no-op at S (RequirementsApplyer.scala:131 `kvs.content -= key`) changes S's timestamp only, so current == snapshot and the read's k@I is installed, while the lock check (os.lockedKeys at install) misses a delete that already applied and released. Needs the delete to vote and apply between the repair's read and install.
-> *Fix sketch:* Add the store's timestamp (or a change counter) to RepairSnapshot and treat a change as stale.
-
-> **Refresh (replay pins): NARROWED.** Deletes planned by TKVL now require `KeyRevision(k, rev)`
-> (`KeyValueListNode.scala:505-506`); at S, where k is absent, the delete fails its check at apply, is reported in
-> `TxCommitted` and marked, so the next scan repairs S. Unchanged for blind deletes.
-
-> **Fixed 2026-11-14 (Todo 2.5).** Stores refuse blind writes as `TransactionBuilder` does: `RequirementsChecker.refuseBlindWrites` fails a `KeyValueUpdate` with no required revision, no content lock and no allocation of its object that deletes a key it holds no `KeyRevision` on, and any update with no required revision that changes min, max, left or right (`BlindWrite`, at the vote and at the apply re-check; an allocation's initial content is exempt). No current code issued such writes (the builder is the only producer of descriptions). A key Delete now always carries a `KeyRevision` on its key, a required revision or a content lock, each of which fails at a store lacking the key, so the delete is marked there instead of applying as an invisible no-op. A key or object-level change now always moves something the snapshot or the proof compares. Tests: RequirementsCheckerSuite "a key Delete with no KeyRevision on its key, and no required revision or content lock, is refused", "an object-level operation with no required revision or content lock is refused", "deletes and object-level operations pass with a required revision, a content lock, or an allocation".
-
-**F4. No-op blind delete is invisible to the snapshot check** (`Reconcile.scala:179-189`; `RequirementsApplyer.scala:~126`).
-The snapshot compares key revisions. A blind `Delete(k)` applied at S where k is absent changes S's timestamp only.
-Scenario: key k absent at S (S missed insert I). Snapshot at t0. Read at t1 from B, C returns k@I with no locks. A
-delete D of k then votes, commits and applies at B, C and S (a no-op at S) at t2. Install at t3: `have = None ==
-snapshot None`, `want = Some(k@I)`, so k@I is installed at S. Final: B and C lack k, S has k@I; a zombie slice that
-reads ignore (Q6: matching 1 < threshold, none locked, but *a read that includes S and one store from {B,C} only* has
-`matching + potential >= threshold`, so reads of the object wait for the third store; with one store down they hang).
-`DoesNotExist(k)` requirements abort at S and mark S in the ErrorTree, so the next write heals it. The entry for this
-repair was deleted as complete. The same hole exists for a blind object-level change that sets the same value. A fix:
-compare `current.timestamp` (or a store change counter) with the snapshot's in addition to key revisions. Confidence:
-medium (needs the delete inside the read-to-install window, and a blind delete on that key).
-
-> **Verification 2026-11-09: PLAUSIBLE. Severity: data-loss (one replica slice).** Mechanism verified: absence from the AllocationTree + entry value timestamp older than minErrorEntryAgeForDeletion (60 s) => repairDeletion + unguarded deleteEntry (StoreRepairer.scala:182-195, 230-236; Frontend.deleteObjectForRepair :822-828 just discards and deletes). Bootstrap objects are registered in the tree (Bootstrap.scala:128-166), so only an allocation recorded >60 s late (stuck AllocationFinalizationAction, e.g. paired with recovery F2) triggers it.
-> *Fix sketch:* Confirm deletion through the pool (refcount read / deletion log) before removing a slice; keep the entry on doubt.
-
-> **Fixed 2026-11-14 (Todo 2.6).** Absence from the AllocationTree no longer counts as a deletion. Once the entry is
-> older than `minErrorEntryAgeForDeletion`, `StoreRepairer.repairAbsent` reads the object through its pool:
-> - A read whose `InvalidObject.provesDeletion` is set drops the slice and the entry. That needs more than
->   `width - writeThreshold` stores answering `ObjectNotFound`/`ObjectMismatch`, or a consistent majority at refcount
->   0. A committed live object is on at least writeThreshold stores, and every IDA requires writeThreshold ≥
->   consistentRestoreThreshold. A read that ended on `StoreNotFound` replies proves nothing.
-> - A read that restores the object shows it live: it is reconciled like a listed object, so a store that missed the
->   allocation itself gets the slice too.
-> - Anything else (a timeout, `CorruptedObject`) keeps the entry.
->
-> *2026-11-15 (Todo 5.5):* a store that voted for an allocation and has not applied it answers `AllocationPending`
-> rather than `ObjectNotFound`, so `provesDeletion` can no longer fire inside an allocation's apply window, not even
-> without this check's 60 s age gate (transaction-requirements Q-N5).
->
-> ErrorTree values carry the object's type (`[ts:8][type:1][storePointer]`), so the pointer can be rebuilt from the
-> tree's pool, the key's ObjectId and the value. The fix also answers this finding's open question: the reader now
-> tells "proven absent" apart from a read that gave up.
->
-> Residuals:
-> - An object already below writeThreshold live copies, for example through an earlier loss, reads as deleted, and
->   its last slices are dropped. It was unreadable already.
-> - An ErrorTree entry of unknown type (a commit error on an object the transaction does not reference, which
->   RequirementsChecker never reports) is acted on only for a proven deletion. A live one is logged and left.
->
-> Tests: StoreRepairerSuite "an aged errorTree entry for a live object the allocation tree does not list repairs it,
-> not deletes it", "an aged UnackedCommits entry for a live object ...", "an aged entry of unknown type is deleted
-> only on a proof, and a live one is left"; DataObjectReaderSuite "InvalidObject proves a deletion only when ...".
-
-**F5. Allocation-absence heuristic** (`StoreRepairer.scala:184-199,233-239,399-402`).
-Absent from the AllocationTree plus an entry older than 60 s is taken as "deleted". If the allocating transaction's
-`AllocationFinalizationAction` is delayed past 60 s (allocation tree in a degraded metadata pool; a recovered
-finalizer; retry storm), then for an object that S **already holds** (S missed a later update U): `repairDelete`
-removes S's live slice, and `deleteEntry` removes the entry unguarded (`:190-191`), without any record that S is short a
-slice. The slice returns only through a full store rebuild (an opportunistic rebuild ignores an object not present on
-the store, `Frontend.scala:1051`). For a store that missed the *allocation* (no copy), the entry is removed before the
-store is ever given the slice (the comment at `:386-398` acknowledges the cost: "guessing wrong costs a replica").
-Also, the clock the age uses is the entry value's HLC timestamp; the AllocationFinalizationAction timing is
-unbounded. Confidence: low-medium (needs a >60 s allocation recording delay). Open question: should repair confirm the
-deletion through the pool's state (e.g. the object's refcount in a read, which returns `InvalidObject` for a deleted
-object but also for "never allocated")?
-
-> **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (low).** Frontend.deleteObjectForRepair has no commitInFlight/pendingReads guard (Frontend.scala:822-828).
-> *Fix sketch:* Refuse while reads/commits are pending.
-
-> **Fixed 2026-11-14 (Todo 2.5).** `Frontend.deleteObjectForRepair` refuses (`RepairDeleteDeferred`) while the store holds for recovered transactions, or while the object has a pending backend read, a commit, a repair write or a deletion in flight, or a transaction holding it. `StoreRepairer` counts the refusal as deferred and keeps the entry. While the backend removal is outstanding, the object counts in `deleting`, so reads, snapshots and transactions get `ObjectNotFound` and nothing re-caches the old state. Tests: FrontendSuite "a repair deletion is refused while a backend read of the object is pending", "... while a commit of the object is in flight, or a transaction holds it", "a repair write in flight refuses a repair deletion of the object", "while a repair deletion is outstanding the object reads as not found, and is not cached"; StoreRepairerSuite "a deletion the store defers while the object is in use keeps the entry for a later pass".
-
-**F6. `repairDelete` has no in-flight guard** (`Frontend.scala:822-828`).
-`discard(objectId)` then `backend.repairDelete`. It does not check `commitInFlight`, `committing`, or pending reads
-(`pendingReads`), unlike `reconcile`. A read in flight from the backend can return the old object after the delete
-request was issued and re-insert it into the cache. For a truly deleted object the effect is a stale cache entry
-(served until evicted: a store answering reads with a zombie). Confidence: low.
-
-> **Verification 2026-11-09: CONFIRMED (documented trade-off). Severity: stale-replica (low).** AspenClient.newRepairTransaction disables missed-update tracking for every entry deletion (AspenClient.scala:96-99).
-> *Fix sketch:* Use limitTracking for entry deletions as for marker writes.
-
-**F7. Entry deletion never records its own misses** *(FIXED 2026-11-14: deletions use `newTransaction()` plus `limitTracking(entryPool, tx)`, so a miss is recorded; residual: deletions of entries in the bootstrap pool's own trees still run untracked; the bootstrap tree sweep is in place, and cross-document-review X9 records the remaining staleness window)* (`client/AspenClient.scala:~89-100`; `StoreRepairer.scala:337-361`).
-`newRepairTransaction` disables tracking for every entry deletion, although `limitTracking` (used for marker writes)
-is selective by pool. A store of the metadata pool that misses the deletion's commit keeps an ErrorTree node (or
-UnackedCommits node) holding an entry that was removed. Reads are correct (quorum), and the next write to the node
-that has a required revision aborts at the stale store and marks it. A cold node stays stale until the quorum is
-degraded; then a removed entry can reappear and cause extra repairs (harmless). The same applies to the proofs. This
-is the documented trade-off (`AspenClient.scala:89-99`; the continual-repair design). Confidence: medium that it is
-as described; low impact.
-
-> **Verification 2026-11-09: PLAUSIBLE. Severity: liveness.** unsettled/stale paths in Frontend.reconcile (Frontend.scala:~895-905) return stale without escalation; trigger needs a perpetually busy object.
-> *Fix sketch:* Count stale passes toward proofs, add backoff.
-
-> **FIXED 2026-11-15 (Todo 4.5).** A proof cannot help (8.3), so a stale result escalates by waiting instead.
-> `DeferralState.recordStale` counts an entry's consecutive stale passes. From `StoreRepairer.ParkAfterStalePasses`
-> (3) on, the repair sets `RepairSnapshot.awaitSettle`. A store whose object is then unsettled (a commit or repair
-> write in flight or held, a failed commit, a deletion, or holding for recovery) parks the reconcile instead of
-> answering stale. `Frontend.commitTurnFree` runs it first, at the one moment the object is settled: before any
-> waiting transaction is told, so before the next commit can start. The end of holding runs it too. It runs
-> through the ordinary snapshot-checked reconcile, so a part the completing commit changed still comes back stale,
-> and safety is unchanged. It runs once, and a parked repair that never sees its object settle answers stale after
-> `Frontend.RepairSettleWait` (1 s), checked on the store heartbeat. Fail-stop and close fail it. At most one is
-> parked per object. With nothing parked the commit path pays one empty-map check. Every `proofAfterDeferrals`
-> stale passes in a row log a warning naming the object.
-> Residual: an object whose copy changes under every install (a part the completing commit always touches), or one
-> that never settles (a failed commit stays until reload), is still retried every pass, now visibly, and a parked
-> repair holds its scan up to the deadline plus one heartbeat period.
-> Tests: FrontendSuite "a repair asked to wait for its object to settle installs once the in-flight commit
-> completes", "a parked repair over a part the completing commit changed answers stale and writes nothing", "a
-> parked repair whose object never settles answers stale at its deadline", "fail-stop fails a parked repair";
-> StoreRepairerSuite "a repair stale for several passes asks the store to wait for the object to settle, and
-> completes (repair F8)", "a pass that is not stale resets an entry's stale count".
-
-**F8. `stale` never escalates** (`StoreRepairer.scala:36-43,58-61`; `Frontend.scala:888-906`).
-`unsettled` and snapshot mismatches yield `stale`, which neither counts toward `proofAfterDeferrals` nor triggers a
-proof. For a DataObject the store's revision can only change by the store applying the chain, so staleness is
-transient. For a hot KeyValue object, the combination "S is behind on key set A" and "S is continually applying
-other keys" works key by key, so progress is made; but if the object is written often enough that `commitInFlight` or
-a held transaction is present at nearly every install attempt, installs are refused every time. The traceless design
-admits this for keys ("residual risks"). Each pass costs a full object read and a reconcile attempt; no back-off applies
-to the entry (the scan stays at the floor because `foundEntries` is true). Confidence: medium.
-
-> **Verification 2026-11-09: CONFIRMED. Severity: liveness (slower recovery).** ScanTimedOut is recovered as foundEntries=false, which doubles the interval, and DeferralState is dropped (RepairService.scala:189-203, ScanState.advance).
-> *Fix sketch:* Treat a timeout as 'found entries' and keep deferral counts.
-
-> **FIXED 2026-11-15 (Todo 4.5).** Each scan and bootstrap sweep gets a `ScanControl`. On its deadline
-> `RepairService` cancels it: the abandoned scan starts no further entry (or node), and skips `DeferralState.retain`,
-> `retainSweep` and the orphan pass's `confirmOrphans`, which only a scan that ran to its end may do. The store's
-> DeferralState is therefore kept, so lock-deferral counts carry across timed-out scans and an always-locked entry
-> reaches its proof. A timed-out scan that had seen an entry counts as having found entries (the store stays at the
-> floor). One that had seen none, its trees unreadable say, backs off as a failed scan does (12.8). Residual: a
-> reconcile in flight when the cancel lands still records its result, adding at most one pass to an entry's count (a
-> proof may come one pass early, which is safe), and a hung read stays outstanding in the background.
-> Tests: RepairServiceSuite "a scan cut off by its deadline after seeing entries keeps the store at the floor and its
-> deferrals (repair F9)", "a scan cut off by its deadline before seeing any entry backs off", "a sweep cut off by its
-> deadline keeps the store at the floor and keeps its deferrals"; StoreRepairerSuite "a scan cancelled part way
-> starts no further entry and keeps the store's deferral state (repair F9)", "a cancelled scan's orphan pass counts
-> toward no drop (repair F9)".
-
-**F9. Timed-out scans** (`RepairService.scala:194-200,235`; `ScanState.scala:34-38`).
-A scan that exceeds 90 s is counted as "found nothing", doubles the store's interval (toward 15 min), and its
-DeferralState is dropped so proof counts restart. A store with a large backlog (long outage) needs many sequential
-read+install+delete cycles; 90 s may allow only a few hundred. The abandoned scan continues in the background
-(concurrently with the next), and each timeout delays the next scan more. The effect is slower recovery of exactly
-the stores that need it most; an entry with persistent locks never accumulates 10 deferrals across timed-out scans.
-Confidence: medium (depends on backlog size and latency).
-
-> **Verification 2026-11-09: CONFIRMED. Severity: liveness (defence in depth only).** MissedUpdateMarker.writeBatch does a blind TKVLInsert (MissedUpdateMarker.scala:140-146); merging by newest is only within one queue (:97-106), so a later batch with an older timestamp overwrites.
-> *Fix sketch:* Read-modify-write with max(), or use requireRevision.
-
-> **Refresh (replay pins): UNCHANGED, reach widened.** The batch is now `replaySafe` (`MissedUpdateMarker.scala:165`): a
-> replay of an old batch, or the marker re-run by a driver adopting an old accepted commit (Ruling 13), regresses entries
-> the same way and re-creates UnackedCommits entries already deleted (transaction-recovery R-N6).
-
-> **Fix 2026-11-14 (Todo 2.4): FIXED.** `MissedUpdateMarker.writeBatch` writes conditional checked puts
-> (`TKVLInsert.replaces`, dropped in `ListBatch.assign` when declined): an ErrorTree mark replaces a held one only for a
-> later `missedTimestamp` (else no write, no requirement), and its overwrite carries the key's `KeyRevision`, so a
-> concurrent mark aborts one batch and the retry decides again. An UnackedCommits entry is written only where none is
-> held. A replayed or re-run batch therefore writes a key only where none is held: a mark for an already repaired
-> object costs one more pass, and an UnackedCommits entry re-created after the scan deleted it is reconciled as a
-> no-op and deleted again (the scan deletes one only while the store holds no Tx for T, and a store never rejoins a
-> transaction it forgot: `Frontend.receivePrepare` ignores a finalized one and refuses one below the floor).
-> Tests: MissedUpdateFinalizationActionSuite "an older miss marked after a newer one leaves the newer mark", "an
-> UnackedCommits entry written again is kept as it was"; StoreRepairerSuite "a UnackedCommits entry written again after
-> the scan deleted it changes nothing and is deleted again"; TKVLBatchSuite "conditional insert" tests. Cost: two
-> clients marking one key at once now abort one batch.
-
-**F10. Marker overwrite can regress `missedTimestamp`** (`MissedUpdateMarker.scala:316-327,369-376`).
-Within a pool queue the newest `missedTimestamp` wins, but across batches a late-arriving older miss overwrites the
-tree value without comparing. Scenario: transactions T2 (newer) and T1 (older) both missed S for object X; T2's
-finalizer wins the race to the queue and its entry is written; T1's marker (scheduled by its own `errorTimeout`) later
-writes the entry with T1's smaller timestamp. The completion gate M13 is weakened to T1. Given E1 this is
-defence-in-depth only, so it is low impact; but it shows that the entry value is not a monotone max. Confidence:
-medium that it happens; low impact. Also affects which `storePointer` bytes are kept (identical, so no effect).
-
-> **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica (low).** Blind object-level KV ops do not move the revision (RequirementsApplyer.scala:105-112); proof is a ExclusiveRevisionLock.
-> *Fix sketch:* Include a timestamp in the proof's requirements.
-
-> **Fixed 2026-11-14 (Todo 2.5).** An object-level change (min, max, left, right) now needs a required revision, at the store as in `TransactionBuilder` (see F4); a content lock alone no longer suffices, since it does not move the revision. A required revision moves the revision, so every object-level change since the read makes the proof's `ExclusiveRevisionLock(readRevision)` fail. The only exception is an allocation's initial content, which no proof can precede. Test: RequirementsCheckerSuite "an object-level operation with no required revision is refused, even under a content lock".
-
-**F11. Object-level proof compares revision only** (`RepairProofs.scala:261-268`; `RequirementsApplyer.scala:105-111`).
-A blind `SetMin`/`SetMax`/`SetLeft`/`SetRight` (no required revision) changes the object-level parts but not the
-revision. If the read saw the object-level part locked (reason for the deferral) and the lock holder committed between
-the read and the proof, the `ExclusiveRevisionLock(readRevision)` still commits; the scan then reconciles object-level parts
-from the older read (if S is unchanged since the snapshot, F4-style). The same note appears in the continual-repair
-design ("compares the revision but not min, max, left or right"). Whether TKVL/system code issues blind object-level
-writes is for the reviewer; the code permits them. Confidence: low.
-
-> **Verification 2026-11-09: PLAUSIBLE. Severity: liveness (availability).** Reader ranks by (max timestamp, count) (BaseObjectReader.scala:112-130 area).
-> *Fix sketch:* Rank by revision chain where available.
-
-**F12. Revision ranking by timestamp first** (`BaseObjectReader.scala:142-153`).
-A stale store whose timestamp was raised by a later refcount update can outrank (same timestamp, more up-to-date but
-lower count) or exceed the up-to-date revision's timestamp. With fewer than `threshold` stores at that revision the
-read waits (never returns wrong data), but with an unavailable store it may wait indefinitely, and the stale stores
-are marked `knownBehind` for the wrong revision (triggering an opportunistic rebuild message to an up-to-date store,
-which is then ignored by the revision check). Availability only. Confidence: low.
-
-> **Fixed 2026-11-15 (Todo 5.9).** Reproduced: a store at the stale revision with a raised timestamp kept the read at
-> `None` with every other replying store at the committed revision (and, per key, a minority key segment at a later
-> timestamp made a majority-held key read as deleted). Every `consistentRestoreThreshold` is a majority, so at most one
-> revision can reach it: `BaseObjectReader.getStoreStates` and `KeyValueObjectReader.resolve` now choose that revision
-> whatever its timestamp. Any reply set holding `threshold` replies at one revision was already returned when those
-> replies arrived first, so read semantics are unchanged; only the order dependence is gone. The restored timestamp is
-> still the max over the matching stores (F3). A repair read older than the store with a differing revision stays
-> `stale` (F13). Key deletion now requires that no key revision can still reach `threshold` and that no store holds
-> the lock of any segment's revision. `knownBehind` no longer exists. Residual (inherent): a read waits while no
-> revision has a majority among the replies. Tests: DataObjectReaderSuite "A majority revision wins over a stale store
-> whose timestamp a later refcount update raised", "No revision is chosen while none is held by a majority";
-> KeyValueObjectReaderSuite "A majority revision wins over a stale store whose timestamp a later revision-less update
-> raised", "A key held at one revision by a majority is restored though a minority holds it at a later timestamp".
-
-> **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica (narrow).** Reconcile.planData treats read.timestamp < current.timestamp as complete with no change (Reconcile.scala:151-153). A store that missed data write D but applied a later refcount update R2 that the read quorum has not yet applied has a higher timestamp than the read, so the miss is treated as caught up and the entry is dropped. Needs R2 committed but unapplied at the read quorum.
-> *Fix sketch:* Mark stale when the revision differs but timestamp is newer, and retry.
-
-> **Fixed 2026-11-14 (Todo 2.5).** `Reconcile.planData` reports a read older than the store with a differing revision as `stale`. The entry stays, and a later pass reads once the read quorum has applied the later refcount update. If the quorum still holds that update's locks, the read reports the object locked and it is deferred. Same revision still changes nothing. Test: ReconcileSuite "a DataObject's data is installed when its revision differs and the read is not older". A stale result that persists escalates since 2026-11-15 (F8).
-
-**F13. DataObject silent skip** (`Reconcile.scala:151-153`).
-`read.timestamp < current.timestamp` skips the data without marking stale, so the result is `complete` and the entry is
-dropped. I argued above (E6) that this cannot drop a needed repair for DataObjects, because DataUpdate/VersionBump check
-timestamps and refcount updates form a causal chain. The argument depends on A1-A3 and on `timestamp` being the max
-over matching stores; it should be confirmed or the branch should mark `stale`. Confidence: low.
-
-> **Verification 2026-11-09: REFUTED as a flaw. Severity: doc-only.** S errors on a refcount update of an absent object, so a marker is produced, as the item itself concludes; no unsound step found.
-> *Fix sketch:* None.
-
-**F14. Zombie slice from a pre-deletion read** (9.3). The slice is cleaned up only if the deleting transaction wrote a
-marker for S; the marker is written from `commitErrors`/silence. If S replied OK to the delete (it cannot: no object)
-it would not be marked. S always errors on a refcount update of an absent object, so a marker is produced. The
-dependency is real but sound. Confidence: low.
-
-> **Verification 2026-11-09: CONFIRMED. Severity: doc-only.** Cosmetic log. *Fix sketch:* Downgrade the log level.
-**F15.** Entries whose object is deleted but whose AllocationTree entry has not been removed log an error from
-`TierEngine` each pass (`TierEngine.scala:139-142`). No data effect.
-
-> **2026-11-15 (Todo 5.7): FIXED.** Reproduced: the repair read of such an object failed with `InvalidObject`, the
-> entry callback failed (logged at error by `TierEngine.walk`) and the store kept its slice until the allocation entry
-> was gone and the ErrorTree/UnackedCommits entry 60 s old. Both listed paths now go through
-> `StoreRepairer.repairListed`: a read that proves the deletion (`InvalidObject.provesDeletion`, which since Todo 5.5
-> cannot hold for a committed allocation not yet applied) drops the slice with `repairDeletion`, as `repairAbsent`
-> does, and the entry completes; an `InvalidObject` short of a proof defers the entry at info. The zombie slice of
-> 9.3's window is also removed sooner. Tests: StoreRepairerSuite "an errorTree entry for a deleted object the
-> allocation tree still lists deletes it from the store", "a UnackedCommits entry for a deleted object the
-> allocation tree still lists deletes it from the store".
-
-### 13.3 Other open questions for the reviewer
-
-> **2026-11-16 (Todo 6.9): all answered.** Questions 1, 2, 4 and 5 are closed, 3 is closed by design with a test
-> pinning it, 6 is folded into the capacity argument (cross-document G10), and 7 was fixed as N2. Each has a note below.
-
-1. **Recovered commit votes and E1.** Section 11 relies on a recovered `VoteCommit` Tx retaking its locks before the
-   store answers reads (`Frontend.holding`). Confirm in [crash-recovery-log.md](crash-recovery-log.md) that no window
-   exists where a store answers a read between CRL recovery and lock retake.
-   > *2026-11-16: CLOSED, no window.* While `Frontend.holding` is true (`awaitingCrl`, a recovered Tx still loading
-   > its objects, or one waiting to decide its vote), `readObjectForNetwork` drops every client read. A dropped read
-   > looks the same as a silent store. `reconcile` treats the object as unsettled, so repair installs nothing either.
-   > `awaitingCrl` is cleared only after `recoverState` has registered every recovered Tx, and each recovered Tx leaves
-   > `recoveringTransactions` only through `recoveredTransactionLoaded`. A Tx with a persisted vote takes its
-   > commit-vote locks there (`completeLoad`). Tests: FrontendSuite "a read of a recovered commit vote's object,
-   > arriving before the vote has locked, is not answered unlocked" and "a repair does not reconcile a store while it
-   > holds for recovered transactions".
-2. **Object timestamp semantics.** Whether the system intends object timestamps to be monotone (the design says "HLC
-   timestamps are per transaction, so a read no older than the store reflects every transaction the store applied",
-   `Reconcile.scala:147-150`). Q8 says it is not for blind writes and refcount updates. F3 and F13 follow.
-   > *2026-11-16: CLOSED by F3.* Object timestamps are monotone: every apply takes the later of the object's timestamp
-   > and the transaction's (`RequirementsApplyer`, the `later(...)` calls on every requirement kind). Stores refuse blind
-   > writes (F4), and a copied timestamp (Reconcile, rebuild) is a read's, the max over the stores that match its
-   > revision.
-3. **Timestamp advance with deferred keys.** `planKeyValue` sets the object timestamp to the read's even if keys were
-   deferred (`:212`). The only readers of the store's timestamp for KeyValue objects are the reader's revision ranking
-   and `checkRevision`, so this has no visible effect today; if a future change uses the store's timestamp as a
-   "caught up" indicator it would be wrong.
-   > *2026-11-16: CLOSED by design, kept as is.* Since F3, the store's KeyValue object timestamp is also read by
-   > `checkKVRequirements` (`ObjectTimestampError` for a transaction that requires the revision and starts before the
-   > object's timestamp). Advancing it on a whole-object pass that defers some keys is still correct. The read's
-   > timestamp is the max over stores that applied every update the read reflects, so a fully caught-up store would
-   > hold the same timestamp and reject the same transactions. The deferred keys' own updates all carry timestamps no
-   > later than the read's, and key requirements check per-key timestamps (`ValueState.timestamp`), not the object's.
-   > Nothing reads the store's object timestamp as "caught up": the completion gate uses the read's timestamp, and an
-   > entry with a deferred key is incomplete until a later pass reconciles that key. Not advancing it would be worse.
-   > A narrowed pass (`only`) never touches the timestamp, because its read also reflects keys outside its scope. So the
-   > store would stay behind until its next write. Test: ReconcileSuite "a whole-object pass that defers a locked key
-   > still advances the object timestamp, and is incomplete".
-4. **Proof on a refcount-0 or deleted object.** A proof of a refcount for an object that a concurrent delete has set
-   to zero aborts on the required refcount. Fine, but not exercised in tests I saw.
-   > *2026-11-16: CLOSED, tested.* Every requirement on a refcount-0 or missing object fails with `MissingObject`
-   > (`RequirementsChecker.loaded`), so each proof aborts and none revives the object. That covers a key proof
-   > (`KeyRevision`, and `DoesNotExist` for a key the read saw absent), the object-level `ExclusiveRevisionLock`, and a
-   > refcount proof at either the read's refcount or the deleted one. A store that missed the deletion (a zombie) is at
-   > most `width - writeThreshold` stores, short of a write threshold (cross-document G7). The aborted proof leaves the
-   > entry, and the next pass's read proves the deletion (`repairListed`, F15). Test: RepairProofsSuite "every proof from
-   > a read taken before the object's deletion aborts, and the object stays deleted".
-5. **`maxConcurrentStoreScans` applies to metadata reads too** (`RepairService.scala:134`). Harmless.
-   > *2026-11-16: CLOSED, harmless (no change).* `refreshPolicies` reuses the bound for its policy reads
-   > (`RepairService.scala:163`). Those reads finish, or hit `metadataDeadline`, before `sweep` starts the tick's scans,
-   > so they never compete with scans for slots, and a failed read keeps the cached policy.
-6. **ErrorTree growth during a long outage.** One entry per (store, object), plus, since the refresh, one
-   UnackedCommits entry per (store, transaction) for every committed transaction with that store as a silent voter
-   (transaction-recovery R-N4). A store down for days across a workload that touches many objects makes a large tree; the 256-entry
-   batch cap and TKVL splitting keep individual writes bounded, but the scan is sequential and F9 limits progress per
-   scan.
-   > *2026-11-16: drain answered; capacity folded into G10.* The drain is no longer capped per scan: since F9, a scan
-   > cut off by its deadline after seeing entries keeps the store at `scanIntervalFloor` and keeps its DeferralState.
-   > Each pass therefore resumes the backlog, and E15 bounds the passes per reconcilable entry. Since RP-N3, an
-   > UnackedCommits entry whose object the same scan's ErrorTree pass completed costs only its delete. The scan is
-   > still sequential per store, so a large backlog drains at one entry's read, install and delete at a time. That is
-   > slow but bounded, in keeping with simple handling of a rare failure. What stays open is the space: ErrorTree and
-   > UnackedCommits entries occupy metadata-pool backend space, not CRL bytes (G10, the CRL admission leg). No document
-   > bounds that space against a long outage. Residual: cross-document G10 (UnackedCommits growth and rebuild legs).
-7. **Interaction of repair's own read with opportunistic rebuild.** The repair's `client.read` is an ordinary read and
-   may trigger rebuild messages to the store being repaired (10.3), which F1/F2 make unsafe; confirm whether the read
-   in `repairUpdate` should disable opportunistic rebuild (`disableOpportunisticRebuild`).
-   > *2026-11-14: CLOSED as N2 (13.4). The opportunistic rebuild path was deleted.*
-
-### 13.4 New findings from the adversarial verification (2026-11-09)
-
-* **N1 (stale-replica, doc correction for F1/F2). FIXED 2026-11-14 (path deleted).** The opportunistic rebuild is nearly dead code for the store it targets: the client flags a store `knownBehind` only when its revision differs from the chosen revision (`BaseObjectReader.scala` getStoreStates, `KeyValueObjectReader.scala:122`), while `Frontend.opportunisticRebuild` applies only when the store's revision EQUALS the read's (`Frontend.scala:869`). It fires only when the store caught up between the read and the message arriving, and then it replaces content with the read's older snapshot (F2) leaving `kvState` stale (F1). Real repair of a revision-lagging or same-revision-lagging store is left entirely to the ErrorTree path. Fix: delete the path or turn it into a Reconcile call.
-* **N2 (stale-replica). FIXED 2026-11-14 (path deleted).** The client-side read that feeds repair (`repairUpdate`'s `client.read`) is an ordinary read and may itself send `OpportunisticRebuild` to the store under repair (open question 7): with F1/F2 this can overwrite the very install the repair just made. `disableOpportunisticRebuild` exists on the read manager (`ReadManager.scala:113`) but `repairUpdate` does not set it.
-
-### 13.5 New findings from the replay-pins refresh (2026-11-09)
-
-* **RP-N3 (capacity; CONFIRMED).** Every UnackedCommits entry is reconciled object by object
-  (`StoreRepairer.scala:246-261`) even when the same (store, object) also has an ErrorTree entry, as it does for a silent
-  store: twice the snapshots, reads and installs per missed object. See transaction-recovery R-N4 for growth.
-  *2026-11-15 (Todo 4.7): FIXED.* A scan records each object its ErrorTree pass completes (a reconcile passing the
-  completion gate, or a proven deletion) with the entry's `missedTimestamp`. The UnackedCommits pass treats an object
-  recorded at or after the entry's timestamp as complete, with no allocation-tree read, snapshot or reconcile
-  (`StoreRepairer.repairUnackedObjects`). This is sound because that completion means the store's copy matched a read
-  at least that new, or the object is gone, which is all the entry needs of it; object timestamps never decrease. The
-  entry's own `holdsTransaction` and `mayJoinTransaction` checks still run first, and a mark left deferred, or one
-  for an older miss, does not stand in. A silent voter's entry now costs its delete only (the entry count is
-  transaction-recovery R-N4's residual).
-* **RP-N4 (resurrection window; PLAUSIBLE).** An entry outlives the store's own late application of T until the scan
-  deletes it (`deleteEntryIfUnchanged`, `StoreRepairer.scala:262-266`). Meanwhile a late commit of a replay applies T's
-  writes in pools where T has no pin of its own there again: blind or `replaySafe` writes, ABA `DoesNotExist` inserts,
-  allocations in another pool (Ruling 17 as corrected by Ruling 32; transaction-recovery R-N1). When the whole pool
-  acknowledged late this reaches a quorum and the scans' reconcile follows it. Faster scans shrink the window; nothing
-  closes it.
-  *Refresh (addendum): NARROWED.* Applied stubs close it at every store that forgot T on a `TxFinalized` listing it in
-  `owed`, or that applied T through the entry (`Tx.scala:642-648,998-1000`); the stub is dropped with the entry. What
-  remains is a store holding an entry and no stub (transaction-recovery R-N7 to R-N9).
-  *2026-11-14 (Todo 2.9): CLOSED.* Under the horizon only a store that never saw T can hold a replay's Tx, and its
-  late apply is what it is owed. The scan now leaves an UnackedCommits entry or ErrorTree mark while the store may
-  still join its transaction (`RepairTarget.mayJoinTransaction`, T's start at or above the store's forget floor), so
-  the entry's reconcile always follows such an apply, and the entry no longer outlives it unrepaired
-  (transaction-recovery, re-assessment "replays through entries with no stub", 2026-11-14, Todo 2.9).
-* **RP-N5 (REFUTED).** Deleting an entry while a recovered vote still needs it: the scan skips while
-  `mayHoldTransaction` (`awaitingCrl || transactions.contains`, `Frontend.scala:96`), and a found entry's Tx stays live
-  until `TxFinalized` (Ruling 9), so a recovered vote has looked its entry up before the scan can delete it.
-
-### 13.6 New findings from the addendum refresh (2026-11-10, `c181375b`)
-
-* **RP-N6 (capacity; FIXED 2026-11-15, Todo 4.6).** Stubs live as long as their entries plus two scans (5.5, Ruling 8), so a stalled scan (metadata
-  group unreadable, scans timing out, the store not repairable) lets them accumulate one per entry, in the device CRL
-  and charged to its admission (crash-recovery-log.md F22). Liveness only; bounded by the same entry growth as RP-N3 and
-  transaction-recovery R-N4. *Fixed:* each store now expires its stubs once T is past the horizon plus the expiry
-  margin, independent of the scans (crash-recovery-log.md F22).
-* **RP-N7 (performance; CLOSED 2026-11-15, Todo 4.6 and 5.1: the scan no longer handles stubs).** Each orphan candidate gets its own point lookup of the UnackedCommits tree, run
-  one after another (`StoreRepairer.scala:192-196`), so a scan after a stall that deleted many entries some other way
-  pays one tree read per stub, and since Ruling 8 each orphan pays it on two scans (deferred Task 5 minor).
-  Correctness is unaffected: a failed lookup fails the scan before any drop or change of suspicion.
-* **RP-N8 (REFUTED for stub holders; moot since 2026-11-15, the scan drops no stub).** A scan deleting entry (S, T) and then dropping S's stub, racing a replay's late
-  commit at S: while the stub is held, `lateCommit` applies nothing without a lookup (`Tx.scala:998-1000`), and the
-  stub is dropped only after the deletion committed, so a lookup started after the drop finds nothing. A held late
-  commit whose stub appears during its lookup also applies nothing (`:1087-1088`). For a store with an entry and no
-  stub the pre-existing race stands (a lookup that read the entry before a concurrent deletion, answered after the
-  scan's reconcile; transaction-recovery R-N9).
+## 13. Accepted limitations
+
+- **Bootstrap tree sweep staleness window** (Backlog.txt): a bootstrap store whose scans come back clean backs off to
+  the 15 min cap, so a missed untracked write to the bootstrap pool's own trees can stay unhealed that long.
+- **Head-of-line blocking on an unreadable object** (Backlog.txt "Repair scan stalls on an allocation held past
+  expiry"; 12.8).
+- **Traceless follow-ups** (Backlog.txt "Traceless commits follow-ups"): UnackedCommits entries are per transaction,
+  so a voter that keeps missing `errorTimeout` grows the tree.
+- **Large UnackedCommits entries**: a `NodeSizeExceeded` for a node too small for one object's chunk is permanent; the
+  transaction stays unfinalized by design (finalizing without the entry would leave its store unrepaired), raised by
+  `FINALIZATION STALLED`.
+- **Tree space during a long outage**: one ErrorTree entry per (store, object) and one UnackedCommits entry per
+  (store, transaction) accumulate in metadata-pool backend space; no bound against a long outage is argued (see
+  [systemic-loss-protection.md](systemic-loss-protection.md) and the cross-document capacity argument). The drain is
+  sequential per store: one entry's read, install and delete at a time.
+- **Proof starvation**: a part locked at every proof attempt is never proven (12.9).
+- **Persistently stale objects**: an object whose copy changes under every install, or never settles within
+  `RepairSettleWait`, stays stale, warned every `proofAfterDeferrals` stale passes; a parked repair holds its scan up
+  to the wait plus one heartbeat.
+
+---
+
+## 14. Open weaknesses
+
+### RP-W1. A declined ErrorTree mark does not order against the repair that deletes the held entry (CONFIRMED; permanent replica divergence)
+Mechanism: the marker drops an ErrorTree mark whose `missedTimestamp` is not later than the held entry's, with no
+write and no requirement (`MissedUpdateMarker.writeBatch`, `TKVLInsert.replaces`, `BatchOp.Put.appliesTo`). The held
+entry then stands for both misses, and its completion gate (`StoreRepairer.repairUpdate`: `os.timestamp >=
+minTimestamp`) only says the read is at least as new as the held miss's start. Two transactions on one object can
+commit in the opposite order of their starts (Q6: a `RefcountUpdate` and a key-level `KeyValueUpdate` check no object
+timestamp, `RequirementsChecker.checkRefcount`, `checkKVRequirements`). Nothing makes the repair's delete
+(`deleteEntryIfUnchanged`, guarded only by the entry's `KeyRevision`) fail when a declined mark arrived after the
+repair's read.
+Trigger / scenario: store S misses T2 (start t2) on KeyValue object X; entry (S, X)@t2 is written. A repair pass
+snapshots S and reads X at time r. Transaction T (start t1 < t2; it read X before T2 applied and stalled more than
+`errorTimeout` before preparing, or its client's HLC lagged), writing key k1 under `KeyRevision`, prepares after r at
+no read responder, commits, and S misses it (silent, refused admission, or voted abort on its stale k1). After 2 s
+T's finalizer marks (S, X)@t1: the node holds t2 >= t1, so nothing is written. The repair's delete commits after that
+read (its read-to-delete interval exceeded T's commit plus 2 s: proofs, a parked reconcile, a slow fence read, a delete
+transaction retrying collisions). Wider variant: the pass at r deferred only some locked key k0, so the next passes are
+narrowed to `only = {k0}` and never look at k1; T may then commit at any time until the narrowed pass completes, which
+for a hot k0 is many scan periods. The same hole reaches UnackedCommits entries through the phase-A shortcut
+(`Counts.recordCompleted` / `completedAt`): phase A records X complete at t2 from a read that predates T, and phase B
+of the same scan treats T's UnackedCommits entry for X as complete. That matters only where S can forget T without
+applying it (a recovered vote whose entry names another incarnation or none, which "leaves the entry for the repair
+scan", `Frontend.unackedLookupComplete`).
+Consequence: S's copy of X never receives T's update of k1, and no entry records it. Reads stay correct (quorum), but
+X's redundancy is one store short until something else rewrites k1 at S, S misses a later update of X, or S is rebuilt.
+For a cold object that is permanent.
+Suggested fix: make a declined mark move the held entry's revision: write the held value again (or `max` of the two,
+which equals the held one) instead of dropping the put, so a repair that read before the mark fails its
+`KeyRevision` delete and its next pass, keyed by the new revision, reconciles the whole object. Record
+`Counts.recordCompleted` only after the phase-A delete committed, so a rewritten entry also denies the phase-B
+shortcut. Cost: one extra write per declined mark, rare since the queue merges by key. Test: StoreRepairerSuite with
+`testingOnlyBeforeEntryDelete` holding the delete while a declined mark for an earlier-started, later-committed
+transaction is written; the entry must survive and the next pass must install k1.
+Effort: S   Priority: 2
+
+### RP-W2. A stale pass resets the lock-deferral count, so a hot object can alternate and never reach a proof (PLAUSIBLE; liveness)
+Mechanism: an unsettled object answers `ReconcileResult(Set(), false, stale = true)` before any locks are computed
+(`Frontend.reconcile`), and `DeferralState.record` forgets the entry on any result without lock deferral, resetting the
+proof count to 0. `recordStale` resets the stale count on any non-stale pass. Parking (`awaitSettle`, after 3 stale
+passes) produces a settled reconcile, which on a hot object usually reports locks (count 1) and resets the stale count;
+the next pass, not parked, meets a commit in flight again and resets the lock count.
+Trigger / scenario: S is behind on a KeyValue object written continuously (a hot TKVL node, a counter): each pass meets
+either a commit in flight at install (stale) or a key or object lock in the read (deferred). Sequence: stale, stale,
+stale, parked -> locked (1), stale (0), stale, stale, parked -> locked (1), ... `proofAfterDeferrals` (10) consecutive
+lock-deferred passes never occur.
+Consequence: the entry is never removed while the object stays hot. Parked passes do install unlocked parts, so S's
+copy converges except for parts locked at those instants, but the entry costs a full read and a reconcile at the
+30 s floor indefinitely, and parts locked at every parked pass stay behind.
+Suggested fix: do not reset the lock-deferral count on a stale pass, only on a complete or lock-free settled pass;
+or, once parking has started for an entry, keep parking (do not reset `awaitSettle`) until a pass is complete. Test:
+FrontendSuite/StoreRepairerSuite driving an object with a commit in flight on alternate passes and a lock on the rest;
+the entry must reach a proof.
+Effort: S   Priority: 4

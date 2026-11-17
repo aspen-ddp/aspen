@@ -1,1114 +1,764 @@
 # Transaction Requirements, Locking and the Commit Window
 
-Status: derived from the code at commit `c3ad5493` (2026-11-09); refreshed 2026-11-09 against `0d08e3c6` (branch
-`pin_refactor`, replay pins: `docs/superpowers/specs/2026-11-09-replay-pins-design.md`). New since then: the client
-pin rule (2.5), derived per-write checks on TKVL puts and deletes (2.5, 9.3), refcount-0 objects failing every
-requirement, and the UnackedCommits tree replacing UnackedCommits (2.3). Line numbers in passages the refresh did not
-touch are for `c3ad5493`. Refreshed again 2026-11-10 against `c181375b` (replay-pins addendum: prefer-abort driver
-prepares and applied stubs; marked "(addendum)"). Every mechanism below was read in the source; line
-numbers are `path:line` relative to `src/main/scala/org/aspen_ddp/aspen/`. Where `CLAUDE.md` or a scaladoc disagrees
-with the code, the code is described and the disagreement is called out.
+This document specifies how a store checks a transaction's requirements, which locks a commit vote takes and how
+long it holds them, how votes are tallied against each pool's thresholds, and how commits of one object are ordered
+at a store. Code paths are relative to `src/main/scala/org/aspen_ddp/aspen/` and cite the class and symbol.
 
-Sibling specifications (not repeated here): [paxos-transactions.md](paxos-transactions.md),
-[crash-recovery-log.md](crash-recovery-log.md), [transaction-recovery.md](transaction-recovery.md),
+Sibling specifications (not repeated here): [paxos-transactions.md](paxos-transactions.md) (Paxos roles, proofs,
+late commits, the transaction horizon), [crash-recovery-log.md](crash-recovery-log.md),
+[transaction-recovery.md](transaction-recovery.md) (driver and participant recovery, UnackedCommits, expiry),
 [repair-process.md](repair-process.md), [rebuild-process.md](rebuild-process.md),
 [systemic-loss-protection.md](systemic-loss-protection.md).
 
 ## 1. Scope and model
 
-A transaction (`TransactionDescription`, `common/transaction/TransactionDescription.scala:21`) carries a list of
-`TransactionRequirement`s, one data blob per updated object per store (`ObjectUpdate`), and the Paxos metadata. Each store
-that hosts at least one referenced object receives the whole description and acts only on the objects it hosts
-(`Tx.scala:59-61`: object requirements are filtered to `pointersById`, non-object requirements are kept). The store:
+A transaction (`common/transaction/TransactionDescription`) carries a list of `TransactionRequirement`s, the Paxos
+metadata (primary object, designated leader, `primaryObjectIDA`, `poolIDAMap`), the objects it allocates
+(`allocatingObjects`), the `replaySafe` flag, and finalization actions. Object data travels separately, one
+`ObjectUpdate` per updated object per store, in the client's prepare (`TxPrepare.objectUpdates`, `fromClient = true`).
+A driver's prepare carries no data.
 
-1. checks the requirements against its in-memory `ObjectState` (`RequirementsChecker.check`);
-2. if all pass, takes locks (`RequirementsLocker.lock`) and persists a **commit vote** in its CRL before the vote is sent
-   (`Tx.scala:244-249`, `Tx.scala:420-431`, `Tx.scala:739-745`);
-3. holds the locks until the transaction resolves, then (on commit) re-checks the requirements without locks
-   (`applying = true`), applies the update in memory (`RequirementsApplyer.apply`), releases the locks, and issues the
-   backend commit (`Tx.scala:527-602`).
+Every store of every referenced pool receives the whole description and acts only on the objects it hosts:
+`Tx.requirements` keeps the object requirements whose pointer is in `TransactionDescription.allHostedObjects(storeId)`
+(same pool, index below the pool's width) plus every non-object requirement. The store:
 
-The transaction driver tallies votes per object, per pool, against the pool's write threshold
-(`server/transaction/TransactionDriver.scala:254-306`) and runs Paxos over the primary object's pool.
+1. checks the description itself (`DescriptionValidator`, section 2.5), then the requirements against its in-memory
+   `ObjectState`s (`RequirementsChecker.check`);
+2. if everything passes, votes commit and takes locks (`Tx.lock`, `RequirementsLocker.lock`) in the same executor
+   step, then persists the vote in its device CRL; the prepare response, and the `TransactionVote` to the client, are
+   sent only from the completion handler of that save (`Tx.sendPrepareResponse`);
+3. holds the locks until the transaction resolves. On commit, `Tx.doCommit` releases them, re-checks the requirements
+   with `applying = true` (no lock is enforced), applies the update in memory (`RequirementsApplyer.apply`) and issues
+   one backend commit per changed object (`Frontend.commit`), ordered per object by the in-flight rule (section 8).
 
-The whole safety argument of this document is a quorum-intersection argument plus a lock argument:
+The driver (and, for commits, the client) tallies votes per object against that object's pool's write threshold
+(section 7). The safety argument is a quorum-intersection argument plus a lock argument:
 
-* **Quorum.** Every pool IDA satisfies `2 * writeThreshold > width` (section 7). A commit decision needs at least
-  `writeThreshold` commit votes for every referenced object. Two transactions that conflict on an object therefore share
-  at least one voting store for that object.
-* **Lock.** A store that voted commit for a transaction never votes commit for a conflicting transaction until the first
-  one is resolved and applied (or aborted). The lock lives in memory but is re-created from the CRL after a crash
-  (section 9.5).
+* **Quorum.** Every IDA satisfies `2 * writeThreshold > width` (section 7). A commit needs at least `writeThreshold`
+  commit votes for every referenced object, so two transactions that conflict on an object share at least one voting
+  store for it.
+* **Lock.** A store that voted commit for a transaction votes commit for no conflicting transaction until the first
+  one is resolved and applied (or aborted). Locks live in memory and are re-taken from the CRL after a crash
+  (section 10.4).
 
-Anything that weakens either leg is listed in section 11.
-
-Vocabulary: "vote" is a store's `TransactionDisposition` (`VoteCommit` / `VoteAbort`), fixed once given
-(`Tx.scala:717-719` only decides while `Undetermined`). "Voter" is a store, "holder" is a transaction holding a lock.
+Vocabulary: a "vote" is a store's `TransactionDisposition` (`VoteCommit` / `VoteAbort`; `Undetermined` is no vote),
+fixed once decided. "Voter" is a store, "holder" a transaction holding a lock. `t`, `w` and `r` are a pool's write
+threshold, width and read threshold (`IDA.consistentRestoreThreshold`).
 
 ## 2. Requirements and operations
 
-Every `TransactionRequirement` subclass (sealed, `common/transaction/TransactionRequirement.scala:48`) and every update
-operation. "Changes object" means it is in `RequirementsApplyer.changedObjects` (`RequirementsApplyer.scala:32-42`): such
-objects get a backend commit and take part in the in-flight rule (section 8).
+`TransactionRequirement` is sealed (`common/transaction/TransactionRequirement`). "Changes object" means the
+requirement is in `RequirementsApplyer.changedObjects` (an exhaustive match with no wildcard, so a new requirement
+must be classified): such objects get a backend commit and take part in the in-flight rule (section 8). "Trace" is what
+`RequirementsApplyer.appliedBy` accepts as proof that a store already holds the update (paxos-transactions.md, proofs).
 
 ### 2.1 Object requirements
 
-| Requirement | Check semantics (`RequirementsChecker.scala`) | Lock taken (`RequirementsLocker.scala`) | Applied by (`RequirementsApplyer.scala`) | Changes object | Proof of commit (`appliedBy`) |
+| Requirement | Check (`RequirementsChecker.check`) | Lock (`RequirementsLocker.lock`) | Apply (`RequirementsApplyer.apply`) | Changes object | Trace |
 |---|---|---|---|---|---|
-| `DataUpdate(ptr, rev, Overwrite)` | `getState` (exclusive, whole object), `checkRevision`: revision equals `rev` and object timestamp <= tx timestamp (`:97-99`, `:220-226`); the object's data must be in the transaction (`MissingObjectUpdate`, `:100-101`); slice-size limit unless shrinking (`:113-121`) | object exclusive lock `lockedToTransaction` (`:47`, `lockExclusive` `:15-21`) | revision := txid, timestamp := tx timestamp, data := update (`:89-96`) | yes | object revision == txid (`:57`) |
-| `DataUpdate(.., Append)` and `DataUpdate(.., WriteRange)` | as Overwrite, plus the encoded `EncodedAppendDelta` must match the store's current slice (expected length; trailer for encoding index k-1) else `AppendMismatch` (`:103-111`); size check uses the delta's `newSliceLength` (`:115-120`) | same exclusive lock | revision, timestamp as above; `data := delta.applyTo(data)` XOR (`:98-99`) | yes | revision == txid |
-| `RefcountUpdate(ptr, required, new)` | `getState` (exclusive), `checkRefcount`: refcount (count and updateSerial) equals `required` (`:160`, `:228-231`). No revision or timestamp check | object exclusive lock (`:54`) | refcount := new, timestamp := tx timestamp, revision unchanged (`:135-139`). A count of 0 makes `Frontend.commit` a deletion (`Frontend.scala:507-511`) | yes | none (traceless) |
-| `VersionBump(ptr, rev)` | `getState`, `checkRevision` (`:162`) | exclusive (`:56`) | revision := txid, timestamp (`:141-145`) | yes | revision == txid |
-| `ExclusiveRevisionLock(ptr, rev)` | `getState`, `checkRevision` (`:164`) | exclusive (`:58`) | nothing (`:147`) | no | none |
-| `SharedRevisionLock(ptr, rev)` | `getSharedState` (shared): collides with exclusive object locks, content lock, any part lock, and refuses while the exclusive-preference window is open (`:78-87`); then `checkRevision` (`:166-167`) | adds txid to `sharedLocks` (`:60`) | nothing (`:149`) | no | none |
-| `KeyValueUpdate(ptr, requiredRevision, contentLock, requirements, deletesKeys)` | see 2.2 | see 2.2 | see 2.3 | yes | see 2.3 |
+| `DataUpdate(ptr, rev, Overwrite)` | `getState` (whole object), `checkRevision`: revision == `rev` and object timestamp <= tx timestamp (`RevisionMismatch`, `ObjectTimestampError`); the object's data must be in the transaction (`MissingObjectUpdate`); `checkSliceSize` unless the update does not grow the slice | X | revision := txid, timestamp := max(current, tx), data := update | yes | revision == txid |
+| `DataUpdate(.., Append \| WriteRange)` | as Overwrite, plus the `EncodedAppendDelta` must match the current slice (`AppendMismatch`; an undecodable delta is a mismatch); the size check uses the delta's `newSliceLength` | X | as Overwrite, data := `delta.applyTo(data)` | yes | revision == txid |
+| `RefcountUpdate(ptr, required, new)` | `getState`, `checkRefcount`: refcount (count and update serial) == `required`. No revision or timestamp check | X | refcount := new, timestamp := max(current, tx), revision unchanged. A count of 0 makes `Frontend.commit` a deletion | yes (also when `new == required`) | none |
+| `VersionBump(ptr, rev)` | `getState`, `checkRevision` | X | revision := txid, timestamp := max | yes | revision == txid |
+| `ExclusiveRevisionLock(ptr, rev)` | `getState`, `checkRevision` | X | nothing | no | none |
+| `SharedRevisionLock(ptr, rev)` | `getSharedState`: collides with X, C, any part lock (K, N, R) and refuses while the exclusive-preference window is open; then `checkRevision` | S | nothing | no | none |
+| `KeyValueUpdate(ptr, requiredRevision, contentLock, requirements, deletesKeys, pinned)` | section 2.2 | section 2.2 | section 2.3 | yes | section 2.3 |
 
-### 2.2 `KeyValueUpdate` key requirements and what a KV update locks
+Every object requirement first goes through `loaded`: an object the store could not load fails `MissingObject`; an
+allocated object whose load found an existing state fails `ObjectExists` (section 9.4); a refcount-0 object fails
+`MissingObject` on every backend (MapBackend keeps refcount-0 states); a discarded state (`reloadRequired`) fails
+`StaleObjectState`. An exception inside a check is recorded as `RequirementCheckFailure` against the requirement's
+object (never as a non-object error, which `apply` would ignore), so it is an abort vote, never a silent pass.
 
-A `KeyValueUpdate` is checked as one requirement (`RequirementsChecker.scala:123-158`). Decoded operations are examined
-first: a key `Delete` without `deletesKeys` fails `UnflaggedDelete` (`:127-128`). The check is "whole object"
-(`wholeObject = true`) when any of: `requiredRevision` defined, `contentLock` defined, a `KeyObjectRevision` requirement,
-or an object-level operation (`:132-134`). Otherwise it is "key level".
+`checkRevision` also enforces `object timestamp <= tx timestamp`, so a transaction never moves an object's revision
+"back in time" relative to its HLC. Note that this check applies to lock-only requirements too, at vote and at the
+apply re-check (see Q-W1).
+
+### 2.2 `KeyValueUpdate`: key requirements and what a KV update locks
+
+The update's operations are decoded from its object data (`KeyValueOperation.decode`). Order of checks in the KV
+branch of `RequirementsChecker.check`:
+
+1. a key `Delete` without `deletesKeys` fails `UnflaggedDelete`;
+2. a `pinned` flag that the operations do not justify (`Pins.writesCheckedKey`) fails `FalsePin`;
+3. `refuseBlindWrites` (section 2.5) fails `BlindWrite`;
+4. the update is "whole object" when it has a `requiredRevision`, a `contentLock`, a `KeyObjectRevision`, or any
+   object-level operation (`KVWrites.objectLevel`); `getState(oid, wholeObject)` then checks object locks (and part
+   locks when whole-object) and notes a held shared lock;
+5. `checkKVRequirements` (with `ignoreLocks = applying`);
+6. `MissingObjectUpdate` if the data is absent, so a KV update never votes commit without its operations;
+7. unless applying, every key an operation writes is checked like a key lock: the present key's holder, or else the
+   absent-key holder, must be none or this transaction;
+8. `checkSliceSize` against `KVObjectState.encodedSizeAfter`, which uses the same last-writer-wins rule as apply.
 
 | Item | Check | Lock taken | Notes |
 |---|---|---|---|
-| `requiredRevision = Some(r)` | revision == r, object timestamp <= tx timestamp (`:241-247`) | object exclusive (`lockKV` `:74`) | The only way a KV update moves the object revision (`Applyer:109-112`) |
-| `contentLock = Some(FullContentLock)` | set of (key, revision) equals the object's content (`ContentMismatch`), no other holder on the content or any value (`:271-281`) | `kvs.contentLocked` (single holder, `:80`) | |
-| `KeyRevision(k, rev)` | key exists (`KeyExistenceError`), no other lock on it, revision == rev, key timestamp <= tx timestamp (`:285-293`) | present-key lock `ValueState.lockedToTransaction` (`:87-89`) | exclusive per key |
-| `KeyObjectRevision(k, rev)` | object revision == rev, no timestamp check (`:295-297`) | object exclusive (`:91`) | whole-object |
-| `WithinRange(k, ordering)` | k within `[min, max]` (`:299-307`) | adds txid to `kvs.rangeLocks` (`:85`), a **set**: many holders | Does not check key locks or other range locks |
-| `Exists(k)` | key present, not locked by another (`:309-312`) | present-key lock (`:93-95`) | |
-| `MayExist(k)` | present: not locked; absent: no absent-key lock by another (`:314-319`) | present-key lock, or `absentKeyLocks(k)` if absent (`lockKey` `:118-121`) | |
-| `DoesNotExist(k)` | absent and no absent-key lock by another (`:321-326`) | `absentKeyLocks(k) = tx` (`:99`) | |
-| `TimestampEquals(k, ts)` | present, key timestamp == ts, not locked (`:328-334`) | present-key lock | |
-| `TimestampLessThan(k, ts)` | present, key timestamp < ts, not locked (`RequirementsChecker` `TimestampLessThan` case) | present-key lock | Not used by any non-test, non-codec code (F9, fixed) |
-| `TimestampGreaterThan(k, ts)` | present, key timestamp > ts, not locked (`RequirementsChecker` `TimestampGreaterThan` case) | present-key lock | Not used by any non-test, non-codec code (F9, fixed) |
-| Operation `Insert(k, v)` | after requirements, every key an operation writes is checked like a key lock: present key's lock holder, else `absentKeyLocks` holder, must be none or this tx (`:145-152`, not when `applying`) | `lockWrites`: present-key lock or absent-key lock (`:131-134`, `lockKey`) | A blind insert (no requirement on `k`) still locks `k` |
-| Operation `Delete(k)` | same as Insert; requires `deletesKeys` | same as Insert | Leaves no trace (see `appliedBy`) |
-| Operation `SetMin/SetMax/SetLeft/SetRight/DeleteMin/DeleteMax/DeleteLeft/DeleteRight` | `KVWrites.objectLevel = true` (`KVWrites.scala:22-28`), so the update is whole-object (`Checker:134`) | `lockWrites`: object exclusive (`Locker:131-133`) | Do not set `deletesKeys` |
+| `requiredRevision = Some(r)` | revision == r, object timestamp <= tx timestamp | X | the only way a KV update moves the object revision |
+| `contentLock = Some(FullContentLock(keys))` | set of (key, revision) equals the object's content (`ContentMismatch`); no other holder of C or of any present key | C (`kvs.contentLocked`) | does not lock each value; other value writers collide through C |
+| `KeyRevision(k, rev)` | key present (`KeyExistenceError`), no other K on it and no other C, revision == rev, key timestamp <= tx timestamp (`KeyTimestampError`) | K on k | |
+| `KeyObjectRevision(k, rev)` | object revision == rev; no timestamp check | X | whole-object |
+| `WithinRange(k, ordering)` | k within `[min, max]` (`WithinRangeError`) | R (`kvs.rangeLocks`, a set: many holders) | checks no key lock |
+| `Exists(k)` | key present, no other K, no other C | K | |
+| `MayExist(k)` | present: no other K or C; absent: no other N | K if present, else N | |
+| `DoesNotExist(k)` | absent (`KeyExistenceError` if present), no other N | N (`absentKeyLocks(k)`) | |
+| `TimestampEquals/LessThan/GreaterThan(k, ts)` | present, key timestamp ==, <, > ts, no other K or C | K | no production caller |
+| `Insert(k, v)` | written-key lock check (step 7) | `lockWrites`: K if present, else N | a blind insert (no requirement on k) still locks k |
+| `Delete(k)` | as Insert; needs `deletesKeys` and a `KeyRevision(k, _)`, a required revision or a content lock (step 3) | as Insert | leaves no trace |
+| `SetMin/SetMax/SetLeft/SetRight`, `DeleteMin/Max/Left/Right` | `objectLevel`, so whole-object; needs a required revision (step 3) | X (`lockWrites`) | |
 
-`KVWrites` (`server/store/KVWrites.scala:15`) is computed from the decoded operations in `Tx.lock()` (`Tx.scala:248`) and
-stored in `lockedWrites` so `unlock` releases exactly what `lock` took even if the data is later dropped (`:84-85`,
-`:335-340`). Keys are compared by content (`common/objects/Key.scala:12-16`).
+`KVWrites.from` decodes each KV update's writes in `Tx.lock` and keeps them in `Tx.lockedWrites`, so `unlock` releases
+exactly what `lock` took even if the data is later dropped. An undecodable update is skipped there (its check already
+failed). Keys compare by content (`common/objects/Key`). `unlock` releases a lock only if this transaction still holds
+it: an applied Insert replaces a key's `ValueState`, dropping any lock on it, and another transaction may have locked
+it since.
 
-The check order inside the KV branch matters: `getState` first (object-level collisions, then part-level if whole-object),
-then `checkKVRequirements`, then `MissingObjectUpdate` if the update's data is absent (`:139-140`, so a KV requirement
-without its operations never votes commit), then the per-key write locks.
+### 2.3 How a KV update is applied, and what it leaves
 
-### 2.3 How a KV update is applied, and what it leaves behind
+`RequirementsApplyer.apply`: object timestamp := max(current, tx timestamp) for every KV update; revision := txid only
+with a `requiredRevision`. Operations apply in order: `Insert` replaces the key's `ValueState` (revision txid,
+timestamp tx, unlocked) only when it wins `KVObjectState.insertWins` (later transaction timestamp, ties broken by
+revision UUID; equal is the same transaction re-applying), otherwise it is a no-op, not a skip; `Delete` removes the key;
+the eight object-level operations set or clear `min/max/left/right`. Then `state.data := kvs.encode()`.
 
-`RequirementsApplyer.apply` (`:102-133`): timestamp := tx timestamp for every KV update; revision := txid only when
-`requiredRevision` is defined. Operations are applied in order: `Insert` replaces the `ValueState` with a new one
-(revision = txid, timestamp = tx timestamp, lock cleared); `Delete` removes it; the eight object-level operations set or
-clear `min/max/left/right`. `state.data := kvs.encode()` afterwards.
+Last-writer-wins makes sequential blind Inserts of one key converge whatever order a store applies them in. A checked
+Insert (`KeyRevision`, `DoesNotExist`, a required revision) always wins in practice: its check rejects a key written
+later, and the client's HLC places it after the state it read. Deletes and object-level fields carry no timestamp, so
+they cannot be ordered this way; that is why blind ones are refused (section 2.5).
 
-`appliedBy` (`:50-63`) proves a commit for: `DataUpdate`, `VersionBump`, `KeyValueUpdate` with a required revision (object
-revision == txid), and `KeyValueUpdate` without one when any key currently carries revision txid. `RefcountUpdate`, lock
-requirements and a KV update whose effect left no key with that revision (delete-only, object-level-only, or inserts
-since overwritten) are traceless. Since the refresh the fallback (`UnackedCommitEntry`) is recorded for every commit
-voter that had not acknowledged T, whatever its change (`MissedUpdateFinalizationAction.scala:98-106`), so F8 is
-fixed. A refcount-0 object fails every requirement as `MissingObject` on every backend (`RequirementsChecker.scala:57-58`,
-Ruling 24).
+Traces (`appliedBy`): object revision == txid for `DataUpdate`, `VersionBump` and a KV update with a required
+revision; for a KV update without one, any current key carrying revision txid; an allocated object (`allocatedOver`)
+at revision txid. Traceless: `RefcountUpdate`, the locks, a KV update that only deletes or changes object-level
+fields, and one whose Inserts were all superseded. The UnackedCommits fallback does not depend on traces: the
+finalizer writes an entry for every counted commit voter that did not acknowledge, whatever its change
+(`client/internal/transaction/MissedUpdateFinalizationAction`). `TransactionDescription.tracelessObjects` still exists
+but no code calls it.
 
-### 2.4 Non-object requirements
+`apply` itself runs `check(applying = true)` first and skips every object with an error (`Result.skippedReasons`).
+An exception while applying an object marks it `failed`: the caller discards its in-memory state (`Frontend.discard`)
+and commits nothing for it.
 
-`LocalTimeRequirement(timestamp, Equals|LessThan|GreaterThan)` is the only non-object requirement
-(`TransactionRequirement.scala:50`). It is checked by every store hosting any object of the transaction against that
-store's `HLCTimestamp.now` (`RequirementsChecker.checkLocalTime`). It takes no lock and applies nothing
-(`Locker:45`, `Applyer:41`). Semantics (F9, fixed): it holds when the store's local time `now` equals, is less than, or is
-greater than `ts` (`Equals`, `LessThan`, `GreaterThan`), as named. `RequirementsCheckerSuite` "Localtime comparisons hold
-exactly as named against the local time" covers each case. No code outside tests constructs it (grep: only codec, checker, locker,
-applyer), and there is no `TransactionBuilder` method for it. Because each store reads its own clock at its own time, the
-votes of different stores need not agree, which is harmless to safety (only commit votes counted per object matter) but
-makes the requirement non-deterministic; a non-object failure aborts the store's vote for all of its objects
-(`Tx.scala:489`).
+### 2.4 The non-object requirement
 
-### 2.5 Client-side structure that the store relies on
+`LocalTimeRequirement(timestamp, Equals | LessThan | GreaterThan)` holds when the checking store's `HLCTimestamp.now`
+equals, is less than, or is greater than `timestamp` (`RequirementsChecker.checkLocalTime`). It takes no lock and
+applies nothing. Every store hosting any object of the transaction checks it against its own clock, so stores may
+disagree; a failure is a non-object error, an abort vote for all of that store's objects. It is test-only: no
+production code constructs it and `TransactionBuilder` has no method for it. Shared decisions should use HLC object
+timestamps instead.
 
-The client builder rejects (`client/internal/transaction/TransactionBuilder.scala`): two updates to one object
-(`MultipleDataUpdatesToObject`, `:246-249`, `:273`, `:287`, `:307`, `:336`), a lock combined with an update or a
-shared/exclusive lock mix on one object (`ConflictingRequirements`, `:346-358`), two refcount updates (`:319`). A
-`RefcountUpdate` may accompany a data or KV update of the same object (allocation does this, `:96-107`). *2026-11-15
-(Todo 2.14):* stores enforce these too (`DescriptionValidator`, see F7); before that they enforced none of it.
+### 2.5 Structural rules: builder and store
 
-Since the refresh the builder also enforces the **pin rule** (`TransactionBuilder.scala:140-141`, `Pins.scala:18-33`):
-a transaction must carry a write that invalidates its own requirement once applied (a `DataUpdate` at a non-allocating
-revision, a `VersionBump`, a KV update with a required revision, a `KeyRevision` on a key the same update inserts or
-deletes, or a refcount change), or be marked `replaySafe(reason)`. Allocations, locks, `DoesNotExist`/`Exists`/
-`MayExist`, `WithinRange`, timestamp requirements and identity refcount updates are not pins. *2026-11-15:* stores
-check it too (Q-N4), from the description: `TransactionDescription.replaySafe` and `KeyValueUpdate.pinned`. TKVL planners now derive **per-write checks** (`KeyValueListNode.putRequirements`/`deleteRequirements`,
-`client/tkvl/KeyValueListNode.scala:489-510`): a put gets `KeyRevision(k, rev)` for a key the node read holds and
-`DoesNotExist(k)` otherwise (`PutRequirement.Checked`, the default); a delete gets `KeyRevision(k, rev)`.
-`PutRequirement.Blind` opts out and is used only by `MissedUpdateMarker` (`MissedUpdateMarker.scala:145-148`).
+The client builder (`client/internal/transaction/TransactionBuilder`) refuses: a second content update of an object
+(`MultipleDataUpdatesToObject`), a second refcount update (`MultipleRefcountUpdatesToObject`), a lock on an updated
+object or a shared/exclusive mix (`ConflictingRequirements`), a blind KV Delete or object-level change
+(`refuseBlindWrites`, `BlindKeyValueWrite`, even when replay-safe), and an unpinned transaction not marked
+`replaySafe(reason)` (`UnpinnedTransaction`). A `RefcountUpdate` may accompany a content update of the same object
+(allocation does this).
+
+**Pin rule** (`common/transaction/Pins`): a transaction must carry a write that invalidates its own requirement once
+applied: a `DataUpdate` at a required revision other than `Allocating`, a `VersionBump`, a KV update with a required
+revision, a `KeyRevision(k, _)` on a key the same update Inserts or Deletes, or a `RefcountUpdate` whose new refcount
+differs from the required one. The builder records the key pin in the description as `KeyValueUpdate.pinned`
+(`Pins.writesCheckedKey`) and the client's claim as `TransactionDescription.replaySafe`.
+
+**Store-side validation.** Stores do not trust the builder. Before checking requirements, a client-prepared Tx runs
+`DescriptionValidator.validate` once (`Tx.invalidDescription`, lazily, at vote only); a refusal is the non-object error
+`InvalidDescription` (whole vote abort, never waited out) and is logged at warn:
+
+* the store's own pool entry in `poolIDAMap` must equal its pool's IDA (`StoreConfig.ida`, passed as
+  `Frontend.poolIDA`; `None` skips this, tests only), and every referenced pool must have an entry. Each pool's stores
+  check their own entry, so a lowered `writeThreshold` for any pool draws abort votes from every honest store of
+  that pool and cannot commit;
+* `primaryObjectIDA` is the primary pool's entry, the primary object is referenced, no referenced pool tolerates more
+  failures than the primary's (the builder picks the most tolerant), and the designated leader index is below the
+  primary pool's width;
+* per object at most one content update and one `RefcountUpdate`, no lock beside an update, no shared lock beside
+  another lock (duplicate `ExclusiveRevisionLock`s, harmless, are allowed as the builder allows them);
+* the pin rule from the description alone (`Pins.declared`, taking `pinned` as the key pin), unless `replaySafe`.
+
+The stores that hold a `pinned` object check the claim against the operations (`FalsePin`); a store that does not hold
+the object relies on the flag, which is sound because a false flag draws abort votes on that object from every honest
+store of its pool. The blind-write rule is enforced at every check, vote and apply re-check (`refuseBlindWrites`):
+outside an allocated object's initial content, a key Delete needs a `KeyRevision` on that key, a required revision or
+a content lock, and an object-level change needs a required revision (a content lock does not move the revision that a
+repair proof's `ExclusiveRevisionLock` locks).
+
+The validation runs at vote only. It depends on the description and the store's pool alone, so a committed
+transaction passed it at a write threshold of every pool's stores. The `replaySafe` bit is the one claim stores must
+trust: no store can prove a replay harmless. A malicious client is outside the trust model.
+
+TKVL planners derive per-write checks (`client/tkvl/KeyValueListNode.putRequirements` / `deleteRequirements`): a put
+gets `KeyRevision(k, rev)` for a key the node read holds and `DoesNotExist(k)` otherwise (`PutRequirement.Checked`, the
+default), or exactly `DoesNotExist` (`MustNotExist`) or `KeyRevision(k, rev)` (`AtRevision`); a delete gets the key's
+`KeyRevision`. `PutRequirement.Blind` (`TKVLInsert.blind`) has no production caller. `MissedUpdateMarker` writes
+conditional checked inserts (`TKVLInsert.replaces`).
 
 ## 3. Lock classes
 
-`ObjectState` (`server/store/ObjectState.scala`) and `KVObjectState` (`:20-22`) hold six kinds of lock:
+`ObjectState` (`server/store/ObjectState`) and `KVObjectState` hold six kinds of lock:
 
 | Class | Field | Holders | Taken by |
 |---|---|---|---|
-| X | `ObjectState.lockedToTransaction` (`:17`) | one (a second writer logs an error and overwrites, `Locker:15-21`) | DataUpdate, RefcountUpdate, VersionBump, ExclusiveRevisionLock, KV with `requiredRevision`, `KeyObjectRevision`, object-level KV operation |
-| S | `ObjectState.sharedLocks` (`:26`) | many | SharedRevisionLock |
+| X | `ObjectState.lockedToTransaction` | one | DataUpdate, RefcountUpdate, VersionBump, ExclusiveRevisionLock, KV with `requiredRevision`, `KeyObjectRevision`, an object-level KV operation |
+| S | `ObjectState.sharedLocks` | many | SharedRevisionLock |
 | C | `KVObjectState.contentLocked` | one | `FullContentLock` |
 | R | `KVObjectState.rangeLocks` | many | `WithinRange` |
-| K | `ValueState.lockedToTransaction` | one per present key | key requirements, Insert/Delete of a present key |
-| N | `KVObjectState.absentKeyLocks` | one per absent key | `DoesNotExist`, `MayExist` and Insert/Delete of an absent key |
+| K | `ValueState.lockedToTransaction` | one per present key | key requirements on a present key; Insert/Delete of a present key |
+| N | `KVObjectState.absentKeyLocks` | one per absent key | `DoesNotExist`, `MayExist` on an absent key; Insert/Delete of an absent key |
 
-`ObjectState.lockedWriteTransactions` (`:42-54`) is the union of X, K, N, C, R (not S). It is what a whole-object
-requirement tests (`checkPartLocks`, `Checker:49-50`) and what readers are told about.
+`ObjectState.lockedWriteTransactions` is the union of X, K, N, C and R (not S); whole-object checks test it
+(`checkPartLocks`), and parked reads wait on it. `lockHolders` adds S.
 
-Locks are attached to the single `ObjectState` instance for the object. `Frontend.referenced` (`Frontend.scala:223`)
-guarantees every transaction uses that instance while any references it, and a discarded instance is marked
-`reloadRequired` rather than replaced, so checks against it fail with `StaleObjectState` (`Checker:52-58`,
-`Frontend.scala:578-598`).
+A single-holder lock is set unconditionally by `RequirementsLocker` (`lockExclusive` logs an error when another
+transaction holds X, then overwrites; K, N and C are overwritten silently). For a live commit vote the preceding
+check guarantees no other holder. Only recovered commit votes, which re-take locks without a check, can overwrite one
+(section 10.5, Q-W2).
+
+Locks are attached to the one `ObjectState` instance transactions use while any references it (`Frontend.referenced`,
+`retain`, `stateForTransaction`). A discarded state still holding locks stays the referenced one, marked
+`reloadRequired`, so its locks keep being honoured while every check against it fails `StaleObjectState`.
 
 ## 4. Lock-compatibility matrix
 
-Row = the request being checked, column = a lock already held by a different transaction. `x` = collision
-(`TransactionCollision`, abort vote unless awaited, section 8.4); `-` = compatible. "same k" / "other k" refer to the key.
-Only non-`applying` checks are shown; `applying = true` takes no locks and enforces none (`Checker:67`, `:81`, `:146`,
-`checkKVRequirements(ignoreLocks)` `:250-251`).
+Row = the request being checked, column = a lock already held by another transaction. `x` = collision
+(`TransactionCollision`, an abort vote unless waited out, section 8.4), `-` = compatible. Only non-`applying` checks
+are shown: `applying = true` enforces no lock and no window.
 
 | Request \ Held | X | S | C | R | K (same k) | K (other k) | N (same k) | N (other k) |
 |---|---|---|---|---|---|---|---|---|
-| Whole-object exclusive (DataUpdate, RefcountUpdate, VersionBump, ExclusiveRevisionLock, KV with `requiredRevision`/`contentLock`/`KeyObjectRevision`/object-level op) | x | x | x | x | x | x | x | x |
+| Whole-object (DataUpdate, RefcountUpdate, VersionBump, ExclusiveRevisionLock, KV with `requiredRevision`/`contentLock`/`KeyObjectRevision`/object-level op) | x | x | x | x | x | x | x | x |
 | `SharedRevisionLock` | x | - | x | x | x | x | x | x |
-| Key-level KV (key requirements, Insert, Delete on key k) | x | x | x | - | x | - | - | - |
-| Key-level on an absent key k | x | x | x | - | - | - | x | - |
+| Key-level KV (key requirement, Insert, Delete of present k) | x | x | x | - | x | - | - | - |
+| Key-level KV on absent k | x | x | x | - | - | - | x | - |
 | `WithinRange` only | x | x | x | - | - | - | - | - |
-| Applying a committed tx | - | - | - | - | - | - | - | - |
 
 Additional rules:
 
-* `getState` sets `exclusiveWaitUntil = now + 250 ms` whenever an exclusive-style request meets a held S lock
-  (`Checker:69-72`). While it is open, new `SharedRevisionLock` requests collide with the transaction's own id
-  (`:83-86`), so a writer cannot be starved. Any exclusive collision opens it, even if that writer later aborts (documented
-  at `TransactionRequirement.scala:85-91`).
-* A key-level KV update that holds no `requiredRevision` does not change the revision yet still collides with S
-  (`getState` tests `sharedLocks` for every non-shared request). This is conservative.
-* `WithinRange` and the object-level KV operations (`SetMin` ...) are the only pair that conflict through R, because the
-  operations make the update whole-object and so test `lockedWriteTransactions`, which contains R.
-* Holders of the same class on the same key/object by the same transaction never collide with themselves
-  (`collide` skips `transactionId`, `Checker:38-41`; `otherLock` `:250-251`).
+* **Exclusive-preference window** (`SharedRevisionLock.ExclusivePreferenceWindow`, 250 ms,
+  `ObjectState.exclusiveWaitUntil`). A non-shared request that meets a held S lock records the collision
+  (`sharedCollision`) and raises it only after the requirement's own checks pass, so a requirement that also fails
+  otherwise reports that error. After the requirement loop the window opens on every such object only if the
+  transaction's only errors are those shared collisions and it has no non-object error (`onlySharedBlocked`). While it
+  is open, new shared requests collide with their own transaction id: the waiting writer is not tracked, and a
+  self-id never looks like a completed holder to the driver. Residual: a writer that opens the window and then aborts
+  for reasons at other stores, or never retries, still makes shared lockers collide for up to 250 ms.
+* A key-level KV update without a required revision does not change the revision yet collides with S (every non-shared
+  request tests `sharedLocks`). Conservative.
+* `WithinRange` conflicts only with whole-object requests (through R).
+* A transaction never collides with itself (`collide` skips its own id; `otherLock` likewise).
 
-## 5. Per-operation conflict table (summary)
+## 5. Per-operation conflict summary
 
-| Operation | Takes | Collides with held | Conflicts only through |
+| Operation | Takes | Collides with held | Ordering of committed writes |
 |---|---|---|---|
-| DataUpdate / VersionBump / RefcountUpdate / ExclusiveRevisionLock | X | anything on the object (row 1 above) | |
-| `ExclusiveRevisionLock` | X | same as above; applies nothing | |
-| `SharedRevisionLock` | S | X, C, R, K, N, exclusive preference window | |
-| KV update with `requiredRevision` | X (+ C/K/N/R for its other items) | anything on the object | |
-| KV update with only key items | K/N on named and written keys | X, S, C, K/N on the same keys | |
-| KV blind `Insert`/`Delete` | K or N on the key | X, S, C, same-key K/N | **Ordering of two sequential blind writes is not constrained** (F1) |
-| `FullContentLock` | C + K on every value | X, S, any K/N/R/C | |
-| `WithinRange` | R | X, S, C | |
-| `Append` / `WriteRange` | X | anything on the object | revision chain orders them |
+| DataUpdate / VersionBump | X | anything on the object | revision chain |
+| RefcountUpdate | X | anything on the object | refcount (count, serial) chain |
+| ExclusiveRevisionLock | X | anything on the object | applies nothing |
+| SharedRevisionLock | S | X, C, R, K, N, an open preference window | applies nothing |
+| KV with `requiredRevision` | X, plus C/K/N/R for its items | anything on the object | revision chain |
+| KV with key items only | K/N on named and written keys, R | X, S, C, same-key K/N | key requirement chain |
+| Blind `Insert` | K or N on the key | X, S, C, same-key K/N | last writer wins on (timestamp, revision) |
+| `FullContentLock` | C | X, S, C, any K/N/R | content set |
+| `WithinRange` | R | X, S, C | none needed |
+| Append / WriteRange | X | anything on the object | revision chain |
 
 ## 6. Invariants
 
-Numbered so a reviewer can attack them individually. "Holds" means holds in the code as read, assuming the quorum
-property of section 7; exceptions are cross-referenced to flaws in section 11.
+"Holds" means holds in the code at HEAD assuming the quorum property of section 7; exceptions name the weakness.
 
-**R1 (per-object serializability).** Two transactions that both change the revision of an object (`DataUpdate`,
-`VersionBump`, `KeyValueUpdate` with required revision) and both reach commit must be ordered by the revision chain: the
-later one requires the earlier one's revision. Reason: each requires the revision it read; a store accepts a revision
-requirement only against the revision it holds and only when no other transaction holds X. With R3 this yields at most
-one commit per revision.
+**R1 (per-object serializability).** Two committed transactions that both move an object's revision are ordered by the
+revision chain: each requires the revision it read, a store accepts a revision requirement only against the revision
+it holds and only when no other transaction holds a conflicting lock (R4), and with R2 at most one transaction commits
+per required revision. Refcount updates are chained the same way by (count, serial); checked key writes by their
+key's revision or absence.
 
-**R2 (quorum overlap).** For every object `o` in pool `P`, a commit decision implies at least `P.writeThreshold` commit
-votes from `P`'s stores (`TransactionDriver.scala:259-296`, `countedCommitVoters` `:464-470`), and
-`2 * writeThreshold > width` (`IDA.scala:203`, `:408-415`, `:586-596`). Two commit decisions on the same object share a
-store.
+**R2 (quorum overlap).** A commit decision implies, for every referenced object, at least its pool's `writeThreshold`
+commit votes from that pool's stores (driver tally and client `ClientTransactionDriver.commitCertain`, section 7), and
+every IDA has `2 * writeThreshold > width`. Two commits on one object share a voting store.
 
-**R3 (vote implies lock until resolution).** A store that persists a commit vote holds the locks of that vote in memory
-from before the vote leaves the store (`Tx.scala:468-478` then `lock()`; the response is sent only after `crl.save`
-completes, `:739-745`) until the transaction resolves and, for a commit, until it is applied or its turn arrives
-(`doCommit` `:527-530`, `releaseObjects` `:640-645`). The lock is re-created after a restart before any other message is
-handled (`Frontend.scala:279-312`, `Tx.scala:403`).
+**R3 (vote implies lock until resolution).** A store that decides a commit vote takes its locks in the same executor
+step (`determineDisposition` then `lock()`, in `completeLoad`, `endCollisionWait` and `answerPrepare`) and sends the
+vote only after the CRL save holding it completes. It holds them until the transaction resolves: on abort until
+`resolvedAndAllObjectsLoaded`, on commit until `doCommit` (or, for a commit held for its turn, until it is issued).
+After a restart the locks of recovered commit votes are re-taken before any message is handled (section 10.4).
+Exception: Q-W2 (two recovered votes on one lock).
 
-**R4 (conflicting requests are refused while a lock is held).** While a lock of class L is held by T, another transaction
-requesting a conflicting class (section 4) gets `TransactionCollision` and the store votes abort, or withholds its vote
-under R12. The check and the lock are performed in one executor step (`Tx.scala:468-478` followed by `lock()`).
+**R4 (conflicting requests are refused while a lock is held).** While T holds a lock, a request of a conflicting class
+(section 4) by another transaction gets `TransactionCollision`, and the store votes abort or withholds its vote
+(section 8.4). Check and lock happen in one executor step, and a Tx touches state only on its store's executor.
 
-**R5 (no commit on stale state).** A commit vote is cast only against the current in-memory state, after every earlier
-commit of the same object has been persisted by the backend or has failed (section 8). A failed commit makes the store
-vote abort for the object forever (`BackendCommitFailed`, `Tx.scala:450-453`).
+**R5 (no vote on stale local state).** A vote is decided only when no commit of any of the transaction's hosted
+objects is in flight or held (section 8), so it is checked against exactly the state a recovery would produce. An
+object whose backend commit failed, or that is quarantined, gets an abort vote (`BackendCommitFailed`,
+`ObjectQuarantined`).
 
-**R6 (apply is idempotent where requirements pin a version).** Applying a committed transaction re-checks the
-requirements against the store's state (`Applyer:73-74`); an object that fails is skipped and reported in `TxCommitted`
-for repair (`Tx.scala:561-568`, `:611`). Because `DataUpdate`, `VersionBump`, `RefcountUpdate` and KV updates with a
-required revision pin revision or refcount, they apply at most once per store and never out of order. **Blind KV writes
-do not pin anything** (F1, F2).
+**R6 (apply is idempotent where requirements pin a version).** Applying re-checks the requirements; a failing object
+is skipped and reported in `TxCommitted.objectCommitErrors`, which makes the finalizer mark the store for repair.
+Revision, refcount and checked key requirements make a transaction apply at most once per store and never over a
+later chained write. A blind Insert re-applies harmlessly (last writer wins). Exception: a `DoesNotExist` or blind
+Insert re-applied after a later delete of its key (Q-W3).
 
-**R7 (no divergence between replicas).** Two committed transactions that are not ordered by R1 touch disjoint keys of a
-KV object (K/N locks, sections 2.2 and 4) and no common object-level field, so their application order does not matter,
-except for the object timestamp (F4). Sequential blind writes of the same key are *not* covered by the lock argument
-(F1).
+**R7 (no divergence between replicas).** Committed transactions not ordered by R1 either touch disjoint keys and no
+common object-level field (K/N/X locks at the common store), or are blind Inserts of one key (last writer wins), so
+their application order does not change the result. The object timestamp is the max of every applied transaction's,
+so it is order-independent too. A store that applies them in an order its re-check rejects skips and reports, and
+repair restores it.
 
-**R8 (lock lifetime).** Locks are released exactly when: (a) the Tx resolves abort (`Tx.scala:627-631`); (b) the Tx
-resolves commit and its commit is not held (`doCommit` calls `unlock()` before applying, `:530`); (c) the held commit is
-finally issued (`:615-632`, `releaseHeldCommit` `:167-171`); (d) the Tx is released without resolution
-(`releaseObjects`, called from `TxFinalized` handling `Frontend.scala:616-622`). Locks are **not** held across the backend
-write: ordering of followers is done by the in-flight marker (R9).
+**R8 (lock lifetime).** Locks are released when: the Tx resolves abort; the Tx resolves commit and its commit is not
+held (`doCommit` releases them before applying); a held commit is finally issued; the Tx expires (`Tx.expire`) or is
+forgotten without resolution (`releaseObjects`). They are not held across the backend write: followers are ordered
+by the in-flight marker (R9). Every release answers the reads parked on the objects (`Frontend.answerParkedReads`),
+after the update is applied in memory.
 
-**R9 (one in-flight commit per object).** A transaction touching an object with a transaction commit in flight, or with a
-held commit queued, does not vote (and holds no locks) until the commit persists. A committed transaction does not issue
-its commit while an earlier commit of any object it changes is in flight or queued ahead of it
-(`Frontend.scala:131`, `:150-176`; `Tx.scala:178-188`).
+**R9 (one in-flight commit per object).** A transaction touching an object with a transaction or repair commit in
+flight, or a held commit queued, decides no vote and holds no locks until it persists. A committed transaction does
+not issue its commit while an earlier commit of any object it changes is in flight or queued ahead of it.
 
-**R10 (a failed backend commit poisons the object).** After a backend commit failure, `failedCommits` contains the object
-until the store is reloaded; later transactions on it vote abort and later committed transactions do not apply to it
-(`Frontend.scala:684-688`, `Tx.scala:441`, `:536-541`).
+**R10 (a failed backend commit poisons the object).** After a backend commit failure (or `poisonObject`), the object is
+in `failedCommits` until the store reloads: every later transaction on it votes abort, and committed transactions do
+not apply to it and report it.
 
-**R11 (votes are final).** A disposition once set is never changed; a recovered Tx keeps the persisted vote
-(`Tx.scala:394-401`).
+**R11 (votes are final).** A disposition is decided only while `Undetermined`; a recovered Tx keeps its persisted
+vote (`completeLoad` decides only when it has none).
 
-**R12 (waiting is safe).** A Tx waiting for a lock holder, or for in-flight commits, holds no locks and gives no vote, so
-waits cannot form a cycle and cannot make two transactions both commit (`Tx.scala:262-281`, `:301-320`, `:440-478`).
+**R12 (waiting is safe).** A Tx waiting for a lock holder or for in-flight commits holds no locks and gives no vote,
+so waits form no cycle and cannot make two transactions both commit.
 
-**R13 (a resolved transaction needs no lock).** `lock()` is skipped when the outcome is already known
-(`Tx.scala:245-246`, `:254`).
+**R13 (no locks once the outcome is known).** `lock()` is skipped when the outcome is known (`outcomeKnown`, a
+resolution restored from the CRL, or `txStatus` resolved).
+
+**R14 (a commit voter that cannot apply stops counting).** A commit voter has dropped its locks before it applies,
+so one that cannot hold the update it voted for must not keep serving as if it had: a live voter fail-stops the store,
+a recovered one quarantines the object (section 8.5). Exception: the live fail-stop also fires when no invariant was
+violated (Q-W1).
 
 ## 7. Vote tallying against the IDA threshold
 
-`TransactionDriver.receiveTxPrepareResponse` (`:230-312`), per prepare quorum on the primary pool:
+**Driver** (`TransactionDriver.receiveTxPrepareResponse`). Only a driver that may propose (primary-pool store,
+`mayPropose`) and holds no proof tallies, and only once its current round has a prepare quorum. Replies to another
+round are ignored; `nextRound` clears `peerDispositions` and stores resend their fixed dispositions. Per referenced
+object, over its own pool's `width` indexes (`txd.poolIDAMap(ptr.poolId)`): `VoteCommit` counts as commit,
+`Undetermined` as nothing, any other disposition as abort. Then:
 
-For each referenced object pointer, over the pool's `width` indexes (`txd.poolIDAMap(ptr.poolId)`, `:267-279`):
-count replies, commit votes and abort votes (any non-`VoteCommit` is an abort vote). Then:
+* **abort-certain** if `width - nAbort < writeThreshold` for any object: the driver proposes abort at once;
+* **commit** if every object has `nCommit >= writeThreshold`;
+* otherwise **undecided**: the driver waits. It never proposes abort on an undecided tally (a client may learn commit
+  from the votes), but it may propose an accepted value its promise quorum reports. Expiry ends a Tx that stays
+  undecided (transaction-recovery.md).
 
-* `nReplies < writeThreshold` -> cannot attempt, wait (`:281-284`).
-* `nReplies != width && nCommitVotes < writeThreshold && width - nAbortVotes >= writeThreshold` -> still undecided, wait
-  (`:286-289`).
-* `width - nAbortVotes < writeThreshold` -> this object cannot commit (`:291-292`).
-* The transaction commits only if every object can commit (`:295`).
+A later round skips the tally: its local proposal is sticky, since votes never change. A store's vote is one bit for
+the whole transaction, so a failure on one of its objects is an abort vote for all of them (conservative). One
+object's votes come only from its own pool, so another pool's abort votes never lower its count.
 
-Net effect, per object: commit iff `nCommitVotes >= T`; abort iff `nAbortVotes > width - T`; otherwise wait. Because the
-objects are tallied from their own pool's stores, one object's abort votes do not lower another pool's count, but the
-transaction as a whole aborts if any object aborts. A store's vote is one bit for the whole transaction, so a failure on
-one hosted object is an abort vote for all of that store's objects (conservative). Votes are collected for the current
-proposal only; `nextRound` clears `peerDispositions` (`:402-406`), and stores resend their fixed dispositions.
+**Client** (`ClientTransactionDriver.receive(TransactionVote)`, the 1-RTT commit). The client records each store's
+first vote and completes `Committed` once every referenced object has its pool's `writeThreshold` commit votes
+(`commitCertain`). Abort is learned only from the leader's resolution. The vote reaches the client only after the CRL
+save that holds it.
 
-IDA thresholds (all checked at construction):
+IDA constraints, checked by every IDA constructor (`common/ida/IDA`) and so by every decoder, which builds IDAs
+through them:
 
 | IDA | Constraint | Consequence |
 |---|---|---|
-| `Replication(width, T)` | `T >= width/2 + 1` (`IDA.scala:203-204`) | `2T > width` |
-| `ReedSolomon(width, k, T)` | `k >= width/2 + 1`, `T >= k` (`:408-415`) | `2T >= 2k > width` |
-| `RandomAccessReedSolomon(width, k, T, ..)` | same (`:586-596`) | same |
+| `Replication(width, t)` | `t >= width/2 + 1` | `2t > width` |
+| `ReedSolomon(width, k, t)` | `k >= width/2 + 1`, `t >= k` | `2t > width` |
+| `RandomAccessReedSolomon(width, k, t, ..)` | same | same |
 
-Edge cases (see also section 10):
+Edge cases:
 
-* **Exactly the threshold.** `nCommit == T`, `nAbort = width - T` (all replied) -> commit. A store that has not replied
-  is not counted; the decision is made on the replies present. The unreplied stores may later vote anything, which cannot
-  matter: `T` commit votes have been persisted.
-* **One store lagging.** With `nReplies == T` and all commit -> commit; with `nReplies == T`, `nCommit == T-1` -> wait
-  (`:286`); with one lagging store out of `width = 3, T = 2`: two commit replies decide commit, one commit plus one abort
-  waits for the third.
-* **`2T > width` is the only protection against two commit decisions.** The driver never verifies that a pool's IDA in
-  the description equals the real pool's (`txd.poolIDAMap` is supplied by the client; `TransactionDriver.scala:267`).
+* **Exactly the threshold.** `t` commit votes decide commit whatever the unreplied stores later say: those `t` votes
+  are durable and their stores hold the locks.
+* **One store lagging** (`w = 3, t = 2`): two commit replies decide commit; one commit and one abort wait for the
+  third.
+* **Mixed pools.** Each pool needs its own threshold; one pool with too many aborts aborts the transaction.
+* **Replies beyond the width** are ignored (the loop is over `0 until width`).
+* **Thresholds come from the description.** Stores refuse a description that misstates their own pool's IDA (2.5), so
+  a lowered threshold cannot gather a commit.
 
 ## 8. The commit window
 
 ### 8.1 What the window is
 
-From a commit decision at a store until `backend.commit` reports completion, the store has applied the update in memory,
-released the locks (`Tx.doCommit` `:527-530`) and handed the state to the backend (`Frontend.commit`
-`Frontend.scala:506-535`). Without further rules, a following transaction would see no lock and the new in-memory state
-and could commit while the CRL held an older uncommitted change of the same object. The design
-(`docs/superpowers/specs/2026-11-07-per-device-crl-and-commit-ordering-design.md`) therefore enforces a total order of
-backend commits per object.
+From a commit decision at a store until the backend reports the commit done, the store has applied the update in
+memory, released its locks (`Tx.doCommit`) and handed the state to the backend (`Frontend.commit`). Without further
+rules a following transaction would see no lock and the new in-memory state, and could vote while the backend still
+lacked the earlier change. The store therefore keeps a total order of backend commits per object: one in-flight
+commit per object.
 
-### 8.2 State
+### 8.2 State (`Frontend`)
 
-* `txCommitsInFlight: ObjectId -> count` of counted commits (transaction commits and `ordered` rebuild writes;
-  reconcile writes too), `Frontend.scala:119`, incremented in `commit` (`:529`) and `reconcileSettled` (`:952`).
-* `heldCommits: ObjectId -> List[Tx]` committed transactions waiting their turn, oldest first (`:122`).
-* `commitWaiters: ObjectId -> List[Tx]` transactions withholding their vote (`:125`).
-* `commitInFlight(oid) = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)` (`:131`).
-* `failedCommits` (`:128`), never cleared.
+* `txCommitsInFlight: ObjectId -> count`: outstanding backend commits of transactions (deletions included) and repair
+  writes (`reconcileSettled`).
+* `heldCommits: ObjectId -> List[Tx]`: committed transactions waiting their turn, oldest first.
+* `commitWaiters: ObjectId -> List[Tx]`: transactions withholding their vote.
+* `commitInFlight(oid) = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)`.
+* `failedCommits`: never cleared; the store reloads with a new Frontend.
+* `quarantined`: section 8.5.
 
 ### 8.3 Behaviour
 
-1. **Vote path** (`Tx.determineDisposition` `:440-478`): objects with `commitFailed` -> abort vote `BackendCommitFailed`;
-   else if any of the transaction's hosted objects has `commitInFlight` and the outcome is unknown -> `awaitingCommits`,
-   registered with `awaitCommitPersisted`; no timer, no locks; the vote is decided when `commitPersisted(oid)` has been
-   received for each (`:304-311`, `endCollisionWait` `:325-333`). Otherwise the requirements are checked and locks are taken.
-   Objects that the transaction only locks (`ExclusiveRevisionLock`, `SharedRevisionLock`) never have a commit in flight unless
-   another transaction changes them (`changedObjects`); the check is on `commitInFlight`, whatever the requirement.
-2. **Commit path** (`resolvedAndAllObjectsLoaded` `:615-632`): if the commit decision arrived before the object data
-   (`commitAwaitsData`, `Tx.scala:239` at `c181375b`), the commit is held without locks (a commit vote requires the data, so only a transaction
-   that voted abort can be here). Else if `holdForTurn()` (`:178-188`): some changed object has a commit in flight or held,
-   the Tx joins every changed object's queue in one `holdCommit` call (`Frontend.scala:150-151`) and keeps its locks. Queues are appended
-   to atomically, so the oldest held commit heads every queue it is in and held commits cannot wait on each other in a
-   cycle (`Frontend.scala:146-149`).
-3. **Issue** (`doCommit`): `unlock()`, apply, then one `frontend.commit` per changed object; `heldCommitIssued` removes the Tx
-   from the queues and `commitTurnFree` wakes the next (`Frontend.scala:160-176`, `Tx.scala:590-596`).
-4. **Complete** (`backendOperationComplete` `Frontend.scala:671-718`): on success the count drops; when it reaches zero
-   `commitTurnFree` is called last (so a synchronous backend completes inside the next transaction's commit safely).
-   On failure the object is added to `failedCommits`, the state stays pinned and served (the store may have voted at the
-   write threshold and must not lose it nor revert), and the counter still drops so followers wake and then vote abort.
-5. **Followers see persisted state.** Because the voter waits for the persisted state, it checks against exactly the state
-   the next recovery would produce.
+1. **Vote path** (`Tx.determineDisposition`, in this order): a frozen, unresolved Tx (past expiry) decides nothing; a
+   muted Tx votes abort without checking (it proves the commit if an object shows it); a Tx that has seen no client
+   prepare votes abort with `NoClientPrepare` without checking (prefer-abort; it is called only once the wait for the
+   client's prepare is over or the outcome is known); an invalid description votes `InvalidDescription`; a failed or
+   quarantined hosted object votes abort; a hosted object with `commitInFlight` and an unknown outcome makes the Tx
+   wait (`awaitingCommits`, `Frontend.awaitCommitPersisted`), no timer and no locks, until `commitPersisted` has
+   arrived for each; otherwise the requirements are checked, and a collision may be waited out (8.4). The in-flight
+   test covers every hosted object, lock-only ones included; a lock-only object has a commit in flight only when another
+   transaction changes it.
+2. **Commit path** (`Tx.resolvedAndAllObjectsLoaded`): if the commit decision arrived before the object data
+   (`commitAwaitsData`: no client prepare and data missing, or adopted data not yet saved to the CRL), the commit is
+   held, without locks, since a commit vote requires the data. Else if `holdForTurn()` finds a changed object in
+   flight or held, the Tx joins every changed object's queue in one `holdCommit` call and keeps its locks and
+   references. Queues are appended to together, so the oldest held commit heads every queue it is in, and held commits
+   cannot wait on each other in a cycle.
+3. **Issue** (`doCommit`): release the locks, apply (`issueCommits`), answer parked reads, one `Frontend.commit` per
+   changed object that applied, then `heldCommitIssued` removes the Tx from the queues and `commitTurnFree` wakes the
+   next. A store holding an applied stub for the transaction, or owed nothing through its UnackedCommits entry
+   (`notOwedHere`), applies nothing and reports its changed objects (transaction-recovery.md).
+4. **Complete** (`Frontend.backendOperationComplete`): the count drops; at zero `commitTurnFree` runs last, so a
+   synchronous backend completes inside the next transaction's commit safely. It first retries a parked repair (the
+   one settled moment), then tells the head held commit, or else every waiting voter. On failure the object enters
+   `failedCommits`; the state stays pinned and served (the store may have voted at the threshold and must neither lose
+   nor revert it), a deletion keeps answering `ObjectNotFound`, the transaction's CRL state is kept, and the counter
+   still drops so followers wake and vote abort.
+5. **Followers see persisted state.** A voter waits for the persisted state, so it checks exactly what a recovery
+   would produce.
 
-### 8.4 `CollisionWait`: waiting out a holder you are built on
+A wait for in-flight commits has no timer: a backend commit always completes or fails. A hung device stalls every
+transaction on its objects at that store (other stores still vote); this is tracked in Backlog.txt ("Isolate every
+device's I/O, and detect and handle hung devices", including why there is no per-commit watchdog).
 
-A transaction whose requirement check fails only with collisions against holders that it is **built on** (it requires the
-revision that the holder writes: `DataUpdate`, `VersionBump`, `ExclusiveRevisionLock`, `SharedRevisionLock`, or a KV update's
-`requiredRevision`, `Tx.scala:284-292`) and that still hold locks on this store (`frontend.holdsLocks`) does not vote
-abort. It registers with each holder (`awaitLocksReleased`, `Frontend.scala:98-100`), holds no locks, and votes when the
-holder releases (`locksReleased`, called at the end of `releaseObjects`, after the commit was issued so the follower then
-sees the commit in flight, `Tx.scala:640-645`) or after `Tx.CollisionWait` = 500 ms, checked at the 1 s store heartbeat
-(`Store.scala:71`, `Tx.scala:316-320`), so a wait lasts up to roughly 1.5 s. On expiry the requirements are checked again
-and the collision, if still there, is an ordinary abort vote. A recovered Tx never waits (`:275`). A collision with a holder
-that the transaction does not build on is an immediate abort vote. `objectErrors` keeps one error per object
-(`Checker:170`), so a later error for the same object masks an earlier one; the wait then re-checks, which only
-costs time.
+### 8.4 `CollisionWait`: waiting out a holder the transaction is built on
+
+A transaction whose check fails only with collisions against holders it is **built on** (`Tx.buildsOn`: one of its
+`DataUpdate`, `VersionBump`, `ExclusiveRevisionLock`, `SharedRevisionLock` or KV `requiredRevision` requirements on that
+object requires the revision the holder writes) and that still hold locks here (`Frontend.holdsLocks`) does not vote
+(`Tx.awaitableHolders`). It registers with each holder (`awaitLocksReleased`), holds no locks, and decides when the
+holders release (`locksReleased`, called at the end of `releaseObjects`, after the commit was issued, so the waiter
+then sees the commit in flight and waits for it to persist) or after `Tx.CollisionWait` (500 ms), checked at the 1 s
+store heartbeat (`Store.heartbeat` -> `Tx.checkCollisionWait`), so a wait lasts up to about 1.5 s. On expiry the check
+runs once more and a remaining collision is an ordinary abort vote. Recovered Txs, and any non-object error, never
+wait. A collision with a holder the transaction does not build on is an immediate abort vote. `objectErrors` keeps
+one error per object, so a later error for an object masks an earlier one; the re-check after the wait only costs
+time.
+
+### 8.5 A commit voter that cannot apply: fail-stop, quarantine, poison
+
+`Tx.issueCommits`, for a commit voter (`disposition == VoteCommit`), after the apply:
+
+* an apply that threw (`result.failed`) fail-stops the store (`Frontend.failStop`), live or recovered;
+* a **live** voter with any skipped object, other than one that already shows the update (`appliedBy`) or one whose
+  earlier backend commit failed or that is quarantined, fail-stops the store with an `INVARIANT VIOLATION` naming the
+  transaction each such object now shows. This test is over every skipped object, lock-only ones included (Q-W1);
+* a **recovered** voter's skipped changed objects, except those already applied and allocations the backend missed
+  (`allocatedHere`), are quarantined (`Frontend.quarantine`), and an already quarantined changed object is
+  quarantined by this vote too. Its re-check may fail legitimately (section 10.5a), which the store cannot tell from a
+  state invalidated under recovered locks.
+
+A fail-stopped store drops every transaction message, read, repair and heartbeat, and `Store.onFailStop` has its host
+mark it rebuild-required and unload it. Every fail-stop is a lost-store declaration (Backlog.txt, "System-level
+protection against correlated lost store declarations"; Backlog 5.8 on whether a whole-store fail-stop is overkill).
+
+A quarantined object votes abort for every transaction (`ObjectQuarantined`); committed transactions apply nothing to
+it and report it. The store has its host verify it (`QuarantineVerifier` -> `RepairService.verifyObject` ->
+`StoreRepairer.verifyObject`, bounded by `VerifyDeadline`), and it clears once the store's copy is complete against a
+read at least as new as the quarantining transaction's start: what repair requires before dropping an ErrorTree entry
+for it. Retries back off from 1 to `MaxQuarantineRetryInterval` (60) heartbeats. The quarantine is in memory only;
+the quarantining Tx's CRL state, object data included, is kept until it clears (`concludeTransactionState` defers a
+finalization or stub to `verificationComplete`), so a reloaded store quarantines again.
+
+A recovered commit vote whose object fails to load with anything but `ObjectNotFound` fail-stops the store
+(`Tx.objectLoadFailed`), because a later load could succeed and find no lock. On a write-frozen store
+(`Backend.isWriteFrozen`, a full FSIF device) it poisons the object instead (`Frontend.poisonObject`, the R10 rule):
+out of space must never lead to a rebuild. `ObjectNotFound` is permanent (the object is gone or being deleted).
 
 ## 9. Behaviour in specific situations
 
 ### 9.1 How each pool checks only its objects
 
-`Tx.requirements` is `txd.requirements` filtered to object requirements for pointers in `allHostedObjects(storeId)`
-(`TransactionDescription.scala:108-113`: same pool and index below the pool width) plus all non-object requirements
-(`Tx.scala:59-61`). A store therefore never locks or votes for another pool's objects. Each pool's votes are tallied
-only against that pool's width and threshold (section 7).
+`Tx.requirements` keeps only hosted objects' requirements plus non-object ones, so a store never locks or votes for
+another pool's objects, and each pool's votes are tallied only against that pool's width and threshold. The
+description checks (2.5) are per store too: each pool guards its own entry.
 
 ### 9.2 When locks are released
 
-See R8. Also: a commit held for its turn keeps the locks and the references (`releaseObjects` is a no-op while
-`commitHeld`, `Tx.scala:640`); a recovered commit vote whose objects did not load holds no lock for them
-(`Locker:41-42`, F6); a `TxFinalized` for a Tx that has not loaded all objects releases through the same function.
+See R8. A commit held for its turn keeps its locks and references (`releaseObjects` is a no-op while `commitHeld`). A
+recovered commit vote whose object did not load takes no lock on it (`RequirementsLocker.lock` skips unloaded objects),
+which is why such a load failure fail-stops the store (8.5). A Tx forgotten before all its objects loaded releases
+through the same `releaseObjects`.
 
-### 9.3 Why stores that apply in different orders cannot diverge (and where the argument stops)
+### 9.3 Why stores that apply in different orders converge
 
-1. Different-object updates trivially commute.
-2. Same-object updates that change the revision are ordered by the revision chain. A store that receives the later
-   transaction's resolution first re-checks the revision requirement at apply time and skips the object (`Applyer:73-82`,
-   `Tx.scala:561-568`); the store reports the object in `TxCommitted`, the finalizer records the miss and repair
-   installs the state (see [repair-process.md](repair-process.md)).
-3. KV updates on the same object that both hold only key-level locks must have disjoint key sets, otherwise the second
-   check would have collided with the first one at the common store (R2, R4). Key operations on disjoint keys and the
-   four object-level fields commute.
-4. **Gap.** (3) argues about transactions concurrent at some store. Two *sequential* blind writes of the same key (the
-   second voted after the first's locks were released at its quorum) can still be applied in the opposite order at a lagging
-   store, because `apply` never compares the existing key's revision or timestamp with the incoming one and ignores locks
-   (F1). Since the refresh the gap is closed for per-write checked writes (every TKVL put and delete by default): the
-   older write's `KeyRevision`/`DoesNotExist` fails at apply on the store that already applied the newer one, so it is
-   skipped, reported in `TxCommitted` and marked. It remains for `Blind` and raw revision-less writes, and for a
-   `DoesNotExist` insert re-applied after a later delete (ABA).
+1. Different-object updates commute.
+2. Same-object revision-, refcount- or key-chained updates: a store that receives the later transaction's commit
+   first re-checks at apply and skips it, reports it in `TxCommitted.objectCommitErrors`, and the finalizer marks it;
+   repair installs the state (repair-process.md).
+3. Concurrent key-level KV updates of one object hold disjoint key sets, or they would have collided at the common
+   store (R2, R4).
+4. Sequential blind Inserts of one key apply last-writer-wins, so a lagging store or a crash re-apply converges.
+5. Object timestamps are the max of all applied updates, so they agree once the same set is applied.
 
-### 9.4 Deleted object, later transaction on the same id
+A non-voter that applies a revision-chained update after a later unrelated update raised the object's timestamp
+(a refcount change or blind Insert with a later start) fails `ObjectTimestampError` at the re-check, skips and is
+repaired. The same order at a commit voter is Q-W1. The argument stops at a `DoesNotExist` or blind Insert whose
+store re-applies it after a later delete of its key (Q-W3).
 
-Deletion is `RefcountUpdate(.., count 0)`: `Frontend.commit` sees `deletes`, calls `discard` (marks the referenced state
-`reloadRequired`, drops it from the cache), records `deleting(oid)` and later reads answer `ObjectNotFound`
-(`Frontend.scala:507-511`, `:521-522`, `:829-851`, `:982-985`). Transactions that referenced the old state fail with
-`StaleObjectState` (`Checker:56-57`); transactions that load later fail to load and get `MissingObject`. A transaction
-that built on the deleting one waits for the in-flight deletion (R9) then fails to load. A failed deletion commit keeps
-`deleting` set, so the object keeps answering `ObjectNotFound` while the store is loaded.
-A stale `DataUpdate`/`KeyValueUpdate` with an old required revision on a store that missed the deletion is an
-ordinary stale-state vote (section 10.3): fewer than `T` such stores exist.
-Object ids are UUIDs and are never reallocated by design. An allocation reads the store first: it refuses an object
-the store holds, or is deleting (`ObjectExists`, `MissingObject`). It cannot see one whose deletion has persisted,
-since no backend keeps tombstones (F11).
+### 9.4 Deletion and allocation
+
+Deletion is a `RefcountUpdate` to count 0. `Frontend.commit` sees the deletion, calls `discard` (the referenced state is
+marked `reloadRequired`, the cache entry dropped) and counts it in `deleting`; reads, snapshots and transaction loads
+answer `ObjectNotFound` meanwhile. Transactions referencing the old state fail `StaleObjectState`, later ones
+`MissingObject`, and a transaction built on the deletion waits for it in flight (R9) and then fails to load. A failed
+deletion keeps answering `ObjectNotFound` while the store is loaded. A deletion's backend commit waits until no
+allocation's CRL state durably holds the object's update (`awaitAllocationsDurable`, `Tx.persistWithoutUpdateOf`):
+otherwise a recovered allocating vote would recreate it (transaction-recovery.md).
+
+An allocation is read like any other object (`Frontend.readObjectForTransaction`): the in-memory state, `ObjectNotFound`
+while a deletion is in flight, else the backend. Only a backend miss gives the fresh `Allocating` state
+(`Tx.allocationLoaded`), retained unshared, so only its Tx sees it. An existing state goes into `Tx.allocatedOver` and
+every requirement on that object fails `ObjectExists`, at vote and at the apply re-check, so a replayed allocation
+never overwrites a live object. (The requirements alone would not catch it: a KV allocation is a revision-less
+`KeyValueUpdate` plus `RefcountUpdate(Allocating -> ..)`.) `appliedBy` counts an allocated object at the transaction's
+own revision as applied, which covers a recovered allocating vote whose commit persisted before the crash. Each
+allocation costs one backend read per store. No backend keeps tombstones, so an id whose deletion has persisted can be
+allocated again by a replay that reaches a store at all; the transaction horizon keeps replays to stores that never saw
+the transaction (paxos-transactions.md, horizon).
+
+While a store holds a commit vote on an allocation it has not applied (`Tx.allocationUnapplied`), a client read that
+misses in the backend is parked and answered once the allocation applies or aborts, or `AllocationPending` at
+`ParkedReadWait` (`Frontend.allocationPending`, `parkAllocationRead`), never `ObjectNotFound`. So a read straight after
+an allocation commits cannot prove the object deleted: at most `w - t` stores answer `ObjectNotFound`.
 
 ## 10. Failure scenarios
 
-For each scenario: outcome, then why it is safe, or "NOT SAFE" with the flaw id.
-
 ### 10.1 Concurrent conflicting transactions
 
-*Setup:* A and B both require revision R of object o (exclusive). *Outcome:* on every store the first to be checked takes
-X; the second gets `TransactionCollision` (or, if it is built on the holder, waits). Because votes require `T` stores and
-`2T > width`, at most one of A, B can collect `T` commit votes; the other is aborted when abort votes exceed `width - T`
-or when it times out into a retry. A store that votes abort for the winner (it saw the loser first) still applies the
-winner when it commits, ignoring the loser's lock (`applying`), after which the loser, if still unresolved there, fails
-its revision check. Safe by R1, R2, R4.
+A and B both require revision R of object o. At every store the first checked takes X; the second collides (or, if
+built on the first, waits). With `2t > w` at most one can gather `t` commit votes; the other aborts when its abort
+votes exceed `w - t`, or expires. A store that voted abort for the winner (it saw the loser first) still applies the
+winner, ignoring the loser's lock, and the loser then fails its revision check there. Safe by R1, R2, R4.
 
-*Variants.* A: exclusive vs shared: S holders block the writer (`getState`), the writer opens the 250 ms window and
-new shared lockers back off. B: two key-level writers on different keys: both commit (no common lock); on the same key:
-collide. C: `WithinRange` holders vs a `SetMin` writer: collide through R. D: `FullContentLock` vs any value writer:
-collide through C/K. E: `DoesNotExist(k)` vs `Insert(k)`: collide through N. All safe by R4.
+Variants: exclusive vs shared (S holders block the writer, which opens the preference window); two key-level writers on
+different keys (both commit) or the same key (collide); `WithinRange` vs `SetMin` (collide through R);
+`FullContentLock` vs a value writer (collide through C or K); `DoesNotExist(k)` vs `Insert(k)` (collide through N).
 
 ### 10.2 Partial vote arrival
 
-The driver acts on the votes in hand (section 7). Abort needs `> width - T` abort votes, commit needs `T` commit votes.
-Missing votes can only postpone a decision. A store that withholds its vote (waiting for data, collision, or in-flight
-commits) is simply a missing reply; Paxos allows no reply, and the driver retransmits. (addendum) A Tx that has seen
-no client prepare withholds its promise and vote, data or not, and votes abort with `NoClientPrepare` after
-`Frontend.MissingDataWait` = 5 s without checking its requirements (prefer-abort, `Tx.scala:205-208,537-542`;
-paxos-transactions.md 6.2). Safe; liveness depends on retransmission.
+The driver and the client act on the votes in hand (section 7). Missing votes only postpone a decision. A store that
+withholds its vote (waiting for data, a client prepare, a collision or in-flight commits) is a missing reply; Paxos
+allows no reply and drivers retransmit. A Tx that has seen only driver prepares withholds its promise and vote until a
+client prepare arrives, and after `Frontend.MissingDataWait` (5 s from its creation) votes abort with `NoClientPrepare`
+without checking (paxos-transactions.md, prefer-abort). An abort vote is always sound: R2 and the lock argument rest
+on checked commit votes only.
 
-### 10.3 Stale stores voting on requirements
+### 10.3 Stale stores voting
 
-*Behind on a previous commit.* A committed; store S has not applied A.
-(a) S voted commit for A: it holds A's locks, so B collides; if B is built on A, B waits up to 1.5 s for A's resolution
-and then checks the post-A state (`awaitableHolders`). (b) S voted abort for A or never saw A: S's state is pre-A. B,
-built on A, requires A's revision: `RevisionMismatch`, abort vote. B, built on the pre-A revision (a stale client): S
-votes commit, but at least `T` stores hold A's commit votes, those stores either hold A's locks (collision) or have
-applied A (revision mismatch), leaving at most `width - T < T` stale stores. B cannot commit. Safe by R2.
+*Behind on a previous commit A.* (a) S voted commit for A: it holds A's locks, so B collides; B built on A waits up to
+about 1.5 s and then checks the post-A state. (b) S voted abort for A or never saw it: its state is pre-A. B built on A
+fails `RevisionMismatch`. B built on the pre-A revision (a stale client) may get S's commit vote, but at least `t`
+stores voted for A and either hold A's locks or applied it, leaving at most `w - t < t` stale stores. B cannot commit.
 
-*Blind requirements.* A requirement that does not name the previous value (blind insert, `MayExist`, a delete, `WithinRange`)
-passes on stale and fresh stores alike; its safety is the application's. See F1.
+*Blind requirements.* A requirement that does not name the previous value (a blind Insert, `MayExist`, `WithinRange`)
+passes on stale and fresh stores alike; its meaning is the application's.
 
-*Missing an update awaiting repair* (ErrorTree entry exists): S is stale in the same sense. Repair installs only what the
-store still shows as at the snapshot, deferring locked keys and objects with a commit in flight, and skips transactions the
-store holds live ([repair-process.md](repair-process.md)). A store with a pending repair is just a stale store here.
-Because it votes on its stale state, its commit votes are always sound only when the argument above holds; and its abort
-votes are always sound.
+*An update awaiting repair.* A store with a pending ErrorTree entry is stale in the same sense. Repair installs only
+what the store still shows as at the snapshot, deferring locked keys and objects with a commit in flight
+(repair-process.md).
 
 ### 10.4 Store crashes while holding locks
 
-Locks are in memory, the commit vote is in the device CRL (`Tx.scala:739-745`). After restart the Frontend recreates each
-recovered Tx **before** handling any new message (`Frontend.scala:279-312`, messages held while `holding`, `:600-603`),
-and a recovered commit vote takes its locks without re-checking (`Tx.scala:394-403`, `Locker:41-65`). Recovered
-transactions without a persisted vote decide only after all recovered commit votes have taken their locks
-(`Frontend.scala:302-312`). Reads are dropped meanwhile (`Frontend.scala:730`). A crash before the CRL save completes
-loses the lock but also loses the vote (never sent). Safe if the CRL is intact; if it is lost, every store of the device
-is rebuilt and the votes are lost: see [systemic-loss-protection.md](systemic-loss-protection.md) and F5.
+Locks are in memory, the commit vote is in the device CRL. A crash before the CRL save completes loses both the lock
+and the vote, which was never sent. After a restart, transaction messages are held (`Frontend.holding`: CRL not yet
+read, recovered transactions still loading, or undecided recovered ones not yet completed), and client reads are
+dropped meanwhile. Recovered transactions are registered before any read starts (`recoverTransactions`). Each with a
+persisted vote completes its load as soon as its objects load, re-taking a commit vote's locks without a check
+(`completeLoad` -> `lock()`); recovered transactions without a vote complete only after every recovered vote has
+(`recoveredTransactionLoaded`). A recovered commit vote whose outcome is unknown looks up its UnackedCommits entry and
+holds any abort until a later lookup finds none (transaction-recovery.md). If the device CRL is lost, every store of the
+device is rebuilt and its votes are lost (systemic-loss-protection.md, rebuild-process.md).
 
 ### 10.5 Recovered transactions re-acquiring locks
 
-(a) Two recovered commit votes that conflict can exist when A committed and was applied and persisted, B built on it voted
-afterwards, and both are still in the CRL. `lock()` re-locks both; the second exclusive lock logs an error and overwrites
-the first (`Locker:15-21`). This is harmless because A's outcome is committed; A's apply is a no-op (revision mismatch) and
-is reported via `TxCommitted` as a missed object for repair, which reconciles exactly. (b) A recovered commit vote on a
-KV update that has no required revision and whose data was already dropped from the CRL after the backend commit is
-skipped with `MissingObjectUpdate` (data missing) rather than replayed (`Tx.scala:604-613`). (c) If the data was not yet
-dropped, a blind write is replayed: F2. (d) A recovered object that fails to load holds no lock on it: F6, fixed by a fail-stop (2026-11-14).
+(a) Two recovered commit votes that conflict can coexist: A committed, applied and persisted; B, built on A, voted
+after A's commit persisted (R9); A's CRL state stays until its `TxFinalized`. Both re-take their locks, the second
+overwriting the first's (section 3). A's re-check finds its update already applied (`appliedBy`), so it neither
+applies nor quarantines. If A's lock is the one kept, A's release at resolution clears it and leaves B unlocked (Q-W2).
+
+(b) A recovered commit vote whose object data the CRL no longer holds (a re-save after `persistWithoutUpdateOf`) has a
+missing update: `MissingObjectUpdate` at the re-check, and the allocation rule of 8.5 applies.
+
+(c) A recovered commit vote re-applies its update when its outcome is learned. Revision, refcount and `KeyRevision`
+requirements fail on a store that applied a later chained write, which quarantines the object until repair
+verifies it. A blind Insert re-applies harmlessly. A `DoesNotExist` or blind Insert after a later delete of the key
+re-applies: Q-W3.
+
+(d) A recovered vote whose saved status is resolved (a prepare or accept after the resolution re-saved it) restores the
+resolution, takes no locks (R13) and applies the commit or deletes the abort's state once loaded.
 
 ### 10.6 Failed backend commit
 
-The state stays in memory and is served, the CRL entry is kept (`Frontend.scala:209-215`, `:684-698`), `failedCommits`
-poisons the object (R10): every later transaction on it votes abort; committed transactions skip it and report it in
-`TxCommitted` (`Tx.scala:536-541`), which makes the finalizer mark a missed update. The store may have been counted among
-the `T` commit voters, so the committed state exists in memory (and in the CRL) but not in the backend until reload; on
-reload the Tx is recovered from the CRL and replays. Safe for new votes (abort). While the store is loaded it serves the
-committed state (no revert). A failed *deletion* leaves the object answering `ObjectNotFound`. Not covered: a repair or
-`ordered` rebuild write that fails does not enter `failedCommits` (`Frontend.scala:965-971`).
-
-### 10.7 Deleted object followed by a transaction on the same id
-
-See 9.4. Outcome: abort (`MissingObject` or `StaleObjectState`). The ordering is by R9: a Tx touching a deleting object
-waits for the deletion to persist. An allocation transaction for the same id votes abort while the deletion is in
-flight. Once it has persisted, the allocation creates a fresh state (F11 residual).
-
-### 10.8 Key deleted, then a stale insert
-
-(a) The insert carries `KeyRevision(k, r)` or `Exists(k)`: `KeyExistenceError` on stores that applied the delete; stale
-stores pass; at most `width - T` of them. Abort. (b) `DoesNotExist(k)` (the allocate-and-insert pattern,
-`TKVLInsert.requireDoesNotExist`) with an old view: the stores that applied the delete pass, the stale stores that still
-have the key fail, so commit needs the `T` fresh stores; correct. (c) A **blind** insert resurrects the key by design,
-on every store alike. (d) A delete's `TxResolved` reaching a lagging store after a later blind insert of the same key: that
-store ends up without the key while the others have it: the mirror of F1. (e) Replay of an old blind insert from a
-recovered CRL entry: F2.
-
-### 10.9 Lock-deferral timeout
-
-`Tx.CollisionWait` (8.4): on expiry `collisionWaitExpired = true` and the check is run once more; a still-held lock is
-`TransactionCollision` -> abort vote, and the client retries. No lock is ever force-broken. A holder that never resolves
-(dead client, dead driver) is taken over by a recovery driver when the Tx has been idle for `Host.txHeartbeatTimeout`
-= 5 heartbeats (`Store.scala:75`, `Host.scala:60`), so locks are bounded by that plus recovery time. The `repair` side has
-its own deferral count (`RepairPolicy.proofAfterDeferrals`, [repair-process.md](repair-process.md)).
-
-### 10.10 IDA threshold edge cases
-
-* **Exactly the threshold** commit votes, rest unknown: commit; the `T` voters hold locks, so a conflicting transaction
-  needs `T` commit votes from at most `width - T` unlocked stores: impossible.
-* **One store lagging, rest voted:** `width=3, T=2`: two commit votes suffice. If the third store is stale/behind it either
-  votes abort on A (then applies A when resolved, ignoring locks) or votes late. No divergence for revision-chained updates;
-  F1 for blind KV.
-* **Mixed pools:** transaction on a `width=3,T=2` pool and a `width=5,T=3` pool: each pool needs its own threshold; one
-  pool missing `T` replies blocks the decision (`:281-284`), one pool with `> width - T` abort votes aborts it.
-* **RS pools:** `T >= k > width/2`, stronger than replication.
-* **Replies exceeding width** are ignored: the loop is over `0 until width` (`:269`).
-
-### 10.11 Other situations covered by the code
-
-* **Commit decision before the data:** the store waits for the client's prepare or `TxFinalized` and then applies, sending
-  `TxCommitted` only afterwards (`Tx.scala:160-171`).
-* **Commit arrives while another commit on the object is in flight:** held and queued (R9). A `TxFinalized` for a held
-  commit is deferred until the commit is issued (`Tx.scala:790-800`).
-* **Prepare arriving after finalization:** ignored, answered from the status cache (`Frontend.scala:638-652`).
-* **Prepare for an unknown transaction, any age:** a client prepare is checked normally (the horizon and
-  `TransactionTooOld` are gone). (addendum) A driver's prepare is not: the requirements are checked only once a client
-  prepare arrives, and without one the store votes abort after the wait (prefer-abort). On the abort path a memoryless
-  acceptor whose object shows the update sends a proof instead of a vote (`Tx.scala:584-586`, `:621-630`); see
-  paxos-transactions.md 10.5.
-* **(addendum) A commit of a transaction the store holds an applied stub for:** nothing is applied, and the changed
-  objects are reported in `TxCommitted.objectCommitErrors` (`Tx.scala:642-648`); see transaction-recovery.md 5.4.
-* **An object that fails to load** (`CorruptedObject` etc.) is absent from `objects`: `MissingObject` abort for a fresh vote
-  (`Checker:52-55`).
-
-## 11. Suspected flaws and open questions
-
-Confidence is my confidence that the issue exists as described (High = the code path is plainly there; Medium = plausible
-under reordering/crash; Low = needs an unusual precondition or a trust-model violation). "Impact" is what can go wrong.
-
-### Re-assessment for replay pins (2026-11-09, `0d08e3c6`)
-
-| Id | Status | Reason | Evidence |
-|---|---|---|---|
-| F1 | **narrowed** (FIXED for blind Inserts 2026-11-14) | Per-write checked writes (every TKVL put and delete by default) fail their key check at apply on a store that applied a newer write, and are skipped, reported and marked. *2026-11-14:* blind Inserts apply last-writer-wins; blind deletes and object-level ops are refused by the builder; residual: resurrection after a later delete | `KeyValueListNode.scala:501-518`; `RequirementsChecker.scala:141`; `KVObjectState.insertWins` |
-| F2 | **narrowed** (FIXED for blind Inserts 2026-11-14) | Same re-check for the crash re-apply. *2026-11-14:* a re-applied older blind Insert is a no-op; blind and `DoesNotExist` inserts after a later delete still re-apply | as F1 |
-| F3 | unchanged | Pre-transaction rebuild untouched | `Tx.scala:429-441` |
-| F4 | **FIXED** 2026-11-14 | Object timestamps are the max of current and transaction timestamps at every apply | `RequirementsApplyer.apply` |
-| F5 | unchanged | `doCommit` still unlocks before applying | `Tx.scala:602` |
-| F6 | unchanged | `RequirementsLocker.lock` untouched | not in the diff |
-| F7 | unchanged (extended) | Stores also do not check the pin rule (Q-N4) | `TransactionBuilder.scala:140-141` |
-| F8 | **fixed** | UnackedCommits entries are written for every unacknowledged counted voter, traced or not | `MissedUpdateFinalizationAction.scala:98-106` |
-| F9 | unchanged | Not in the diff | |
-| F10 | unchanged | Apply still ignores locks | `RequirementsChecker.scala:71,84,141` |
-| F11 | **narrowed** | A replayed allocation can no longer commit through fresh votes: its transaction's pin fails. It still applies where a late commit finds a leftover entry (transaction-recovery R-N1) or where a recovering acceptor gives a non-late commit (paxos P-N3) | `Pins.scala:18-33`; `Tx.scala:926-930` |
-| F12 | unchanged | `awaitingCommits` still has no timer | `Tx.scala:511-517` |
-| F13 | unchanged | Not in the diff | |
-| F11 (2026-11-14) | **FIXED** for live objects | An allocation reads the cache and backend. An existing state fails every requirement on the object with `ObjectExists`, at vote and at the apply re-check. Residual: an id whose deletion has persisted | `Frontend.readObjectForTransaction`; `RequirementsChecker.check(allocatedOver)` |
-| N1, N2 | unchanged | Not in the diff | |
-
-### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
-
-| Id | Status | Reason | Evidence |
-|---|---|---|---|
-| F2 | unchanged | The crash re-apply runs before any stub exists: a stub replaces the record only once it would be deleted, and a crash before that recovers the record | `Frontend.scala:668-674`; crash-recovery-log 3.6 |
-| F5 | unchanged | A stub holder applies nothing on commit, but it holds the update already (or was never a commit voter of T), and it reports its objects, so the finalizer marks it | `Tx.scala:642-648` |
-| F7 | unchanged | Stores still trust the description; prefer-abort keys on `TxPrepare.fromClient`, which a driver sets false (`TransactionDriver.scala:415,434`) and a client sets true: a forged `fromClient = true` from a store-side component would re-open P-N4's paths, within the same trust model. *2026-11-13:* no longer for a forgotten T: the forget floor refuses any prepare, client or driver, for a transaction a store may have forgotten (paxos 10.10) | `Tx.scala:808-811` |
-| F11 | **narrowed** (2026-11-14, Todo 2.9: under the horizon a replay reaches only stores that never saw T, and an allocation whose object was deleted leaves an orphan slice there, which repair drops) | A replayed allocation reaching a late or non-late commit is no longer applied at a store holding an applied stub for T. It still applies at stores with an entry and no stub (transaction-recovery R-N7 to R-N9) and at stores that acknowledged in time on a non-late commit (paxos P-N3, P-N10) | `Tx.scala:642-648,998-1000` |
-| Q-N5 | **narrowed** (marker site) | A re-run marker's re-created UnackedCommits entries now come with a `TxFinalized` listing them, so stores write stubs for them (transaction-recovery R-N6); the ErrorTree regression is unchanged. *2026-11-14:* the regression is FIXED (Todo 2.4), and a re-created entry is harmless under the horizon (Todo 2.9). *2026-11-15:* the allocation action's orphan entry and the split action's early "gone" are FIXED (Todo 5.5): stores answer `AllocationPending` for an allocation they voted for but have not applied, and both actions act only on `provesDeletion` | `Frontend.scala` (`allocationPending`), `AllocationFinalizationAction.scala`, `SplitFinalizationAction.scala` |
-
-### Re-assessment for commit-voter fail-stop (2026-11-14)
-
-| Id | Status | Reason | Evidence |
-|---|---|---|---|
-| F5 | **fixed** | A commit voter whose apply throws, or a live commit voter whose apply re-check fails, fail-stops the store | `Tx.issueCommits`; `Frontend.failStop`; `StoreRebuilds.handleFailStopped` |
-| F6 | **fixed** | A recovered commit vote whose object fails to load with anything but `ObjectNotFound` fail-stops the store; a write-frozen store poisons the object instead | `Tx.objectLoadFailed`; `Frontend.poisonObject` |
-| F10 | **closed** (2026-11-15, Todo 5.8) | An apply still ignores locks, by design; when it invalidates a commit voter's update that also commits, the voter fail-stops with an `INVARIANT VIOLATION` naming the overriding transaction (live) or quarantines the object (recovered) | FrontendSuite "a commit held behind an in-flight commit ..." needed a non-conflicting fence write |
-
-### F1. Sequential blind KV writes of one key (or object-level field) can be applied in opposite orders by a lagging store; permanent divergence with no repair entry. Confidence: Medium.
-
-> **FIXED 2026-11-14 for blind Inserts (Todo 2.2).** Stores apply every key `Insert` last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`, `RequirementsApplyer`): an Insert that a later write of the key superseded is a no-op, not a skip, so it is neither reported nor a fail-stop, and a lagging store or a crash re-apply converges with the others. `TransactionBuilder` refuses (`BlindKeyValueWrite`) a key `Delete` with no `KeyRevision` on that key, an `Exists`-guarded one included, and an object-level operation, in an update with neither a required revision nor a content lock, outside an allocation's initial content: a delete leaves no tombstone to order by. No production caller issued either. *Residual:* a late or replayed blind Insert that arrives after a later checked delete of its key resurrects the key, the same as the `DoesNotExist` ABA. There is no per-key generation for now; Todo 2.9 re-assesses it. The refusal is enforced by the client only (Todo 2.14). Tests: RequirementsApplyerSuite "two
-> blind inserts of a key applied in opposite orders converge to the later one (Req F1)"; FrontendSuite "a store
-> applying two blind inserts of a key in opposite order keeps the later one (Req F1)"; TransactionBuilderSuite
-> "a blind Delete is refused even when replay-safe".
-
-> **Refresh (replay pins): NARROWED.** TKVL puts now carry `KeyRevision`/`DoesNotExist` and deletes `KeyRevision`
-> (`KeyValueListNode.scala:489-506`); the apply re-check enforces them (`RequirementsChecker.scala:141`), so a lagging
-> store skips the older write and reports it in `TxCommitted.objectCommitErrors` (`Tx.scala:640-652`), which the finalizer
-> marks. Unchanged for `PutRequirement.Blind` (the ErrorTree batch), raw `tx.update` with no key requirement, and
-> object-level fields.
-
-> **Verification 2026-11-09: CONFIRMED (mechanism). Severity: stale-replica (permanent divergence of one replica until rewritten).** Blind KeyValueUpdate has no state-dependent requirement and applying ignores locks (RequirementsChecker.scala:123-158, `ignoreLocks = applying`), so RequirementsApplyer.scala:126-133 overwrites the key with whatever transaction applies last; nothing compares ValueState revision/timestamp. Order inversion trigger on a lagging store S: A's commit is held by commitAwaitsData (Tx.scala:~120, data lost/dropped, e.g. CrlAdmission drop or QUIC budget drop) or A's TxResolved is delayed, while B (issued after the client saw A commit) votes, commits and applies at S; A's data/resolution then arrives (client retransmit) and applies over B. If S's TxCommitted for A reaches the finalizer within errorTimeout (2 s) no ErrorTree entry is written, so repair never runs. B's per-store commit queue only orders transactions present at that store (Frontend.holdCommit), A's held commit is not in it.
-> *Fix sketch:* Make blind KV apply last-writer-wins on (ValueState.timestamp, revision) with tombstones for deletes, or forbid blind writes to keys without a revision/lock.
-
-
-*Scenario.* A = `KeyValueUpdate(o, None, None, Nil)` with `Insert(k, v1)` and B = the same with `Insert(k, v2)`, no
-requirements on `k`. A commits with `T` stores; they apply and release the key lock. B is checked by those stores (no
-collision), reaches `T` commit votes and commits. Store S3 voted abort on A (or had A's prepare, but A's resolution is
-delayed or dropped; e.g. a message dropped over budget, or S3's thread behind). S3 receives B's resolution first and
-applies B (`Applyer:126-128`, locks ignored, `Checker:146`). A's resolution (or `TxFinalized`, which also calls
-`resolved`, `Tx.scala:790-792`) arrives later and `apply` overwrites `k` with `v1`, revision A. Nothing compares the existing
-key's revision/timestamp with the incoming one. If S3 answered A's `TxCommitted` within `errorTimeout` (2 s) there is no
-ErrorTree entry, no repair, and the object diverges until the key is next rewritten. For `Delete` the mirror is a resurrected key.
-*Why the claimed protection does not apply:* `KVWrites` only prevents **concurrent** conflicts at a common store; ordering
-of sequential blind writes is whatever order each store receives resolutions in. *Code:* `RequirementsApplyer.scala:126-129`,
-`RequirementsChecker.scala:146-152`, `Tx.scala:527-543`, `Frontend.scala:157-176` (the queue orders only transactions
-already present at this store). *Possible direction:* last-writer-wins on `(ValueState.timestamp, revision)` at apply
-time for blind writes, with tombstones for deletes, or forbid blind writes.
-
-### F2. A blind KV write can be replayed over newer state after a crash between "backend commit persisted" and "CRL object data dropped". Confidence: Low-Medium.
-
-> **FIXED 2026-11-14 for blind Inserts (Todo 2.2).** The crash re-apply of an older blind Insert over a newer write of
-> its key is a no-op (last writer wins, see F1), and a re-apply of the same Insert writes the same value. Blind
-> deletes are refused by the builder. *Residual:* a late or replayed blind Insert that arrives after a later checked delete of its key resurrects the key, the same as the `DoesNotExist` ABA. There is no per-key generation for now; Todo 2.9 re-assesses it. The refusal is enforced by the client only (Todo 2.14). Test: RequirementsApplyerSuite "a re-applied older blind insert
-> does not regress a newer one; the same insert re-applies idempotently (Req F2)".
-
-> **Refresh (replay pins): NARROWED.** As F1 for checked writes. A derived `DoesNotExist(k)` insert is not ABA-free: if
-> k was deleted after A, A's re-apply passes and resurrects k.
-
-> **Verification 2026-11-09: CONFIRMED (mechanism, narrow window). Severity: stale-replica.** SimpleCRL.dropTransactionObjectData only flips in-memory state (SimpleCRL.scala:296-299, LogContent.scala:206-209); the on-disk log entry keeps the data until the entry is deleted at TxFinalized. A crash after A persisted and B (blind, same key) overwrote it, before A's finalization, recovers A with its data; on resolution doCommit re-checks with applying=true and a blind Insert passes (RequirementsChecker.scala:123-158), so k := v1 over v2 on this store only. Needs a crash within the finalization window (ms to ~2 s).
-> *Fix sketch:* Make the data drop durable before B's commit may proceed (or re-check ValueState timestamp/revision on apply).
-
-
-*Scenario.* A (blind `Insert(k, v1)`) commits and persists; B (blind `Insert(k, v2)`) is checked only after A's commit
-persisted (R9), commits and persists. The CRL's drop of A's object data (`crl.dropTransactionObjectData`,
-`Tx.scala:604-613`) is not part of R9's ordering. If the store crashes before that drop is durable and before A is
-finalized, A is recovered with its data, receives the resolution, and `doCommit` re-applies it: the check passes (no
-requirement, no timestamp check for blind KV) and `k := v1` over `v2`. *Code:* `Tx.scala:604-613`,
-`RequirementsChecker.scala:123-158`, `RequirementsApplyer.scala:102-133`. Also needs A's finalization to be pending, which
-is the normal state of a just-committed transaction.
-
-### F3. The pre-transaction opportunistic rebuild bypasses the checks that the live opportunistic rebuild has. Confidence: Low-Medium.
-
-> **FIXED 2026-11-14 (path deleted).** The opportunistic rebuild (read-triggered message and pre-transaction piggyback) and the client object cache were removed; repair is the ErrorTree path only. See docs/superpowers/specs/2026-11-14-opportunistic-rebuild-removal-design.md.
-
-> **Verification 2026-11-09: CONFIRMED (mechanism). Severity: stale-replica.** Tx.completeLoad assigns os.metadata = r.requiredMetadata and os.data = r.data when only revision equals and !reloadRequired (Tx.scala:380-392): no commitInFlight guard, no refcount-serial max, no lock check, `frontend.commit(os, cs, txid)` not ordered. KeyValue objects do reach it (KeyValueObjectState.getRebuildDataForStore exists, client ObjectState.scala:~295). The client cache can lag blind KV writes/refcount changes (neither moves the revision), so the store's newer content/serial/timestamp is overwritten and persisted. Gated only by the client's 10 s repairCache (SimpleOpportunisticRebuildManager.scala:14-16) and by the object being flagged knownBehind (revision-based).
-> *Fix sketch:* Route both rebuild paths through one guarded implementation (commitInFlight, refcount max, content compare) or through Reconcile.
-
-
-`Tx.completeLoad` (`:380-392`) assigns `os.metadata := r.requiredMetadata` (the **client's cached** revision, refcount and
-timestamp) and `os.data := r.data` whenever the revision matches, under any locks other transactions hold, without the
-`commitInFlight` guard and without the refcount-serial max that `Frontend.opportunisticRebuild` applies (`Frontend.scala:869-882`),
-and not counted as in-flight. A refcount change or a key-level KV update does not change the revision, so a stale client
-cache can lower the store's refcount serial, timestamp or (for KV) data below the store's committed state, then persist it
-(`frontend.commit`). It is gated by the client's 10 s repair cache and by `getRebuildDataForStore`, so exposure is
-limited; I did not trace whether KV objects can reach it.
-
-### F4. The object timestamp is last-applied-wins, not monotone, and differs by apply order. Confidence: Medium (certain behaviour, uncertain impact).
-
-> **FIXED 2026-11-14 (Todo 2.2).** Every apply sets the object timestamp to the later of its current value and the
-> transaction's (`RequirementsApplyer.apply`, `later`). Revision-moving updates were already guarded by
-> `ObjectTimestampError`, so only blind KeyValue and `RefcountUpdate` applies change. Replicas that applied the same
-> set of updates in different orders now hold the same object timestamp. Test: RequirementsApplyerSuite "the object
-> timestamp never goes backwards for blind KeyValue and Refcount updates (Req F4)".
-
-> **Verification 2026-11-09: CONFIRMED. Severity: liveness (repair livelock) / stale metadata.** RequirementsApplyer sets timestamp := txd.startTimestamp unconditionally for blind KV and RefcountUpdate (RequirementsApplyer.scala:109-112, 137-139), without max. See repair F3 for the consequence.
-> *Fix sketch:* Use max(existing, tx) timestamp for blind updates.
-
-
-`RequirementsApplyer` sets `timestamp := tx timestamp` unconditionally for `RefcountUpdate` (`:137-139`), blind KV
-updates (`:109-112`, they hold no revision requirement and so no `ObjectTimestampError` guard), and, via the revision
-chain, DataUpdates (guarded). Two committed transactions with different start timestamps applied in different orders on
-two stores leave different timestamps; a late transaction with an earlier timestamp lowers it. Consequences: spurious
-`ObjectTimestampError` aborts on the store with the higher value; repair's caught-up test compares a read timestamp to an
-entry timestamp (`server/repair/StoreRepairer.scala:270`) and can loop or terminate early; `Reconcile` raises the timestamp
-only when the read is higher (`Reconcile.scala:162`, `:212`). Safety of data is not affected, but replicas' metadata
-diverges by design.
-
-### F5. A commit voter that does not apply the committed update drops its lock and becomes, effectively, a lost commit vote that still counts toward `T`. Confidence: Low.
-
-> **Residual closed 2026-11-15: quarantine (Todo 2.16).** A recovered commit vote whose apply re-check fails no
-> longer only logs. `Tx.issueCommits` quarantines each changed object it could not apply (`Frontend.quarantine`).
-> The store does not try to tell a superseded update (10.5a) from a state invalidated under the recovered locks.
-> While the object is quarantined, every transaction on it votes abort (`ObjectQuarantined`), which restores the
-> effect of the lost lock: no conflicting transaction gets a commit vote here. Committed transactions apply nothing to
-> it and report it in `objectCommitErrors`, so their finalizers mark the store. The store has its host's repair
-> service verify the object (`QuarantineVerifier` → `RepairService.verifyObject` → `StoreRepairer.verifyObject`, which
-> is `repairUpdate` with `minTimestamp` = T's start, with proofs after lock deferrals). A `complete` result means the
-> store's copy matches a pool read no older than T. That is the condition repair already requires before dropping an
-> ErrorTree entry for T, so the store is then as good as one that missed T and was repaired. Incomplete and failed
-> verifications retry at heartbeat, backing off from 1 to 60 heartbeats. The quarantine is in memory only and costs
-> no write: the quarantining Tx's CRL state, object data included, is kept until it clears
-> (`Frontend.concludeTransactionState` defers a finalization or stub). A reloaded store therefore recovers T, fails the
-> same re-check and quarantines again. An apply that throws still fail-stops. Costs fall only on this rare path: one
-> store votes abort on the object until repair completes, the CRL space stays held, and each verification attempt
-> costs one pool read. An alternative was rejected: a durable "applied" mark plus a gate would have added a CRL write
-> to every commit. Tests: FrontendSuite "a recovered commit vote whose apply re-check fails quarantines the object ...",
-> "a quarantine clears once repair verifies the object ...", "a transaction committed by other stores' votes applies
-> nothing to a quarantined object ...", "an object whose requirements fail on the UnackedCommits local apply is
-> quarantined ..."; StoreRepairerSuite "verifying a quarantined object ..."; UnackedCommitsIntegrationSuite "a
-> recovered commit vote superseded before its crash quarantines the object until repair verifies it".
-
-> **Fixed 2026-11-14: fail-stop.** Keeping the lock would not help, because the store never gets the update. Instead
-> `Tx.issueCommits` fail-stops the store (`Frontend.failStop`: it drops every message, read and repair from then on,
-> and its host marks it rebuild-required and unloads it, `Host.StoreFailStopped`) when a commit voter's apply throws
-> (`result.failed`), or when a **live** commit voter's apply re-check fails for an object it neither applied nor
-> already shows (`appliedBy`) and whose earlier backend commit did not fail (R10 covers those). Applied objects need
-> no lock after the apply: the in-flight commit marker makes every later transaction on them wait until they persist,
-> and a failed backend commit poisons them. *Residual:* a recovered commit vote's failed re-check is still only
-> logged. A later transaction built on it may have superseded its update before the crash (10.5a), and that cannot
-> be told apart from an invalidated state. A fail-stop is a lost-store declaration, so a bug that trips it on many
-> stores at once is a systemic risk (Backlog: "System-level protection against correlated lost store declarations").
-> Test: FrontendSuite "a commit voter whose state is invalidated under its locks fail-stops rather than hold neither
-> (Req F5)".
-
-> **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica.** doCommit unlocks before applying (Tx.scala:527-533) and a failed apply re-check is only logged (Tx.scala:549-575); needs a state change between vote and apply (F3 or repair/rebuild writes can cause it).
-> *Fix sketch:* Keep the lock until the apply succeeded, or abort the store (rebuild-required) on a failed apply of a voted-commit.
-
-
-`doCommit` unlocks first (`Tx.scala:530`) and then applies. If the apply is skipped for the voting store (the re-check
-fails; `RequirementsApplyer` throws and `frontend.discard` forces a reload from a backend that lacks the update
-`Tx.scala:549-552`; the state was marked `reloadRequired`, `Checker:52-58`), the store no longer has the lock **and** does not
-hold the update. A conflicting transaction can then vote commit on the pre-update state at this store. Only the
-`failedCommits` case is closed (that store votes abort for every transaction, R10). If enough committed voters are in this
-state, a conflicting transaction can collect `T` commit votes from the stores that did not apply. The same shape applies to
-a lost device CRL (rebuild) as treated in [systemic-loss-protection.md](systemic-loss-protection.md). Needs an exception
-during apply or a state invalidation between vote and apply on several stores.
-
-### F6. A recovered commit vote whose object fails to load takes no lock on it; a later load can succeed. Confidence: Low.
-
-> **Fixed 2026-11-14: fail-stop.** `Tx.objectLoadFailed` fail-stops the store when a recovered commit vote's object
-> fails to load with anything but `ObjectNotFound`, which is permanent (the object is gone or being deleted, so no
-> later load succeeds). *Exception:* a store whose writes are frozen (`Backend.isWriteFrozen`, a full FSIF device)
-> poisons the object instead (`Frontend.poisonObject`, the failed-backend-commit rule R10), because out of space must
-> never lead to a rebuild: every later transaction on the object votes abort, and repair leaves it alone, until the
-> store reloads. Tests: FrontendSuite "a recovered commit vote whose object fails to load fail-stops the store (Req
-> F6)", "... on a write-frozen store poisons it instead of fail-stopping".
-
-> **Verification 2026-11-09: PLAUSIBLE. Severity: stale-replica (low).** RequirementsLocker.lock skips objects that are not loaded; transient read errors are not distinguished.
-> *Fix sketch:* Retry loads of a recovered vote's objects; never serve until all loaded.
-
-
-`RequirementsLocker.lock` skips unloaded objects "there is nothing to lock on it" (`Locker:41-42`, `:141-143`). A failure
-other than `ObjectNotFound` (`CorruptedObject`, `StoreNotFound`, `ObjectMismatch`) can be transient. After a later
-successful load, a conflicting transaction B finds no lock and may vote commit while the recovered A's persisted commit
-vote also stands. Needs a transient read error on the recovery read and success on a later one, both within A's
-unresolved lifetime.
-
-### F7. The stores trust the client's description. Confidence: Low (trust model).
-
-> **Verification 2026-11-09: CONFIRMED. Severity: doc-only (trust model).** Invariants enforced only in TransactionBuilder; stores take thresholds from the description (TransactionDriver.scala:88-90, 259-262).
-> *Fix sketch:* Validate txd against pool state at the store.
-
-> **Narrowed 2026-11-14 (Todo 2.5, repair F4/F11).** Stores now enforce the builder's blind-write rule
-> (`RequirementsChecker.refuseBlindWrites`, `BlindWrite`): a key Delete without a `KeyRevision` on its key, a required
-> revision or a content lock, and an object-level change without a required revision, fail at every store unless the
-> transaction allocates the object. The rest of (a)-(c), and the pin rule (Q-N4), remain client-side (Todo 2.14).
-
-> **FIXED 2026-11-15 (Todo 2.14), within the trust model.** Before voting, every store checks the description
-> (`server/store/DescriptionValidator.scala`, called from `Tx.determineDisposition`; a refusal is the non-object error
-> `InvalidDescription`, so the store's whole vote is abort):
-> (b) the store's own pool entry in `poolIDAMap` must equal its pool's IDA (`StoreConfig.ida`, persisted at store
-> creation, passed as `Frontend.poolIDA`), and every referenced pool must have an entry. Each referenced pool's stores
-> check their own entry, so a lowered `writeThreshold` for any pool gets abort votes from every honest store of that pool
-> and cannot reach commit. (c) `primaryObjectIDA` must be the primary pool's entry, the primary object must be referenced,
-> its pool must tolerate no fewer failures than any other (the builder's `maxBy`), and the designated leader must be one
-> of its stores. (a) Per object, at most one content update (`DataUpdate`/`KeyValueUpdate`/`VersionBump`) and one
-> `RefcountUpdate`, no lock on an updated object, no shared lock beside another lock. The builder allows a duplicate
-> `ExclusiveRevisionLock`, which is harmless, so stores allow it too.
-> The check runs at vote only: it depends on the description and the store's pool alone, so a committed transaction
-> passed it at a write threshold of every pool's stores. Tests: `DescriptionValidatorSuite`, FrontendSuite "The store
-> validates the description before voting". Residual: the trust model is unchanged. A malicious client is out of scope,
-> and the `replaySafe` claim is trusted (Q-N4).
-
-
-(a) The "one update per object" and "lock xor update" rules are enforced only in `TransactionBuilder`; a hand-built
-description with two `KeyValueUpdate`s on one object has `KVWrites.from` keep only the last (`toMap`,
-`KVWrites.scala:37-47`), so the first update's keys are not locked; with `SharedRevisionLock` plus an update on one object
-the shared lock is subsumed. (b) The driver uses the description's `poolIDAMap` for thresholds and `width`
-(`TransactionDriver.scala:267`); a description with a smaller `writeThreshold` breaks R2 for that transaction. (c)
-`primaryObject` defines the Paxos acceptors; a description that names the wrong primary object picks an arbitrary acceptor set.
-
-### F8. Traceless coverage is narrower than "KV with required revision"/"delete" suggests. Confidence: Medium-Low.
-
-> **Refresh (replay pins): FIXED.** The UnackedCommits entry no longer depends on `tracelessObjects`: every
-> unacknowledged counted voter gets one (`MissedUpdateFinalizationAction.scala:98-106`). `appliedBy` still cannot prove
-> such changes, so the proof path still misses them (paxos P-N1/F2). *2026-11-13:* that no longer costs a false abort:
-> paxos F2 and P-N1 are closed by the transaction horizon (paxos-transactions.md 10.10).
-
-> **Verification 2026-11-09: CONFIRMED. Severity: stale-replica (repair coverage).** TransactionDescription.tracelessObjects only covers RefcountUpdate and revision-less KV with deletesKeys (TransactionDescription.scala:93-98).
-> *Fix sketch:* Treat all revision-less KV updates as traceless, or write UnackedCommits for them.
-
-
-`tracelessObjects` (`TransactionDescription.scala:94-98`) covers `RefcountUpdate` and no-revision KV updates with
-`deletesKeys`. A no-revision KV update that only sets or deletes `min/max/left/right`, and one whose inserts have since been
-overwritten or deleted by later transactions, also leave no revision trace (`Applyer:60-61` looks for the txid on a
-current key). The scaladoc on `deletesKeys` admits this for `DeleteMin/Max/Left/Right` (`TransactionRequirement.scala:104-107`).
-The effect: a forgotten, committed transaction cannot be proved by `appliedBy` and has no UnackedCommits entry, so
-a recovered commit vote for it relies on the recovery driver (see [transaction-recovery.md](transaction-recovery.md)).
-
-### F9. `LocalTimeRequirement` and the `Timestamp*` key requirements have inverted or ambiguous semantics and no non-test callers. Confidence: High (code reading), low impact.
-
-> **Verification 2026-11-09: CONFIRMED. Severity: doc-only.** RequirementsChecker.checkLocalTime throws on Equals when equal and inverts LessThan/GreaterThan (RequirementsChecker.scala:~203-217); no non-test callers (grep).
-> *Fix sketch:* Fix or delete.
->
-> **Status 2026-11-11: FIXED (semantics).** Every comparison now holds as named: `LocalTimeRequirement` compares the
-> store's `now` to `ts` (`Equals` holds when equal, `LessThan` when `now < ts`, `GreaterThan` when `now > ts`), and
-> `TimestampLessThan/GreaterThan(k, ts)` hold when the key's timestamp is `<` / `>` `ts`. The definitions carry scaladoc
-> and `RequirementsCheckerSuite` tests each direction. Remaining by design: `LocalTimeRequirement` is checked by each
-> store against its own clock, so stores can disagree (documented on the class); it is still unused outside tests.
->
-> **CLOSED 2026-11-16 (Todo 7.5).** The remainder is documented: the class scaladoc says each store checks it against
-> its own clock, that it is test-only (no production constructor, no `TransactionBuilder` method), and that shared
-> decisions should use HLC object timestamps instead. Nothing else remains.
-
-
-`Equals` throws when equal (`Checker:207-209`), the other two compare `now` to `ts` in the opposite direction from the
-names. `TimestampLessThan/GreaterThan` pass when `key.timestamp >= ts` / `<= ts`. `LocalTimeRequirement` is evaluated by
-every store against its own clock, so two stores can disagree and the commit decision depends on which stores' replies
-arrive first. Dead code today; a hazard if wired up.
-
-### F10. Applying a committed transaction ignores locks held by transactions that already persisted commit votes. Confidence: Low (argued safe under R2, listed for review).
-
-> **Status 2026-11-15: CLOSED (Todo 5.8).** No apply-time report: an apply overriding a commit voter's lock is
-> normal. The holder B usually lost at other stores and keeps its lock here until it learns its abort, and locks are
-> coarser than requirements, so both may commit legitimately (FrontendSuite "a commit held behind an in-flight commit
-> ..." overwrites an object the other locks only by refcount). The violation is B committing too with its requirements
-> broken, and B's apply re-check catches it (`Tx.issueCommits`). A live voter fail-stops the store with an
-> `INVARIANT VIOLATION` error that names, per object, the transaction whose update it now shows. A recovered voter
-> quarantines the object, since its failed re-check may be legitimate (10.5a). The silent overwrite the finding
-> describes is therefore no longer silent at a commit voter. *Residuals:* B's re-check is only what its requirements
-> check, so an override that leaves them holding is not reported (no conflict either); a store that did not vote for B
-> applies nothing and reports the skip, as before. Fail-stopping the whole store for one object is probably overkill
-> (Backlog 5.8). Test: FrontendSuite "a committed apply over a commit voter's lock is not reported, but that voter
-> committing too fail-stops (Req F10)".
-
-> **Verification 2026-11-09: PLAUSIBLE. Severity: doc-only (argued safe under R2).** Applying ignores locks (ignoreLocks = applying).
-> *Fix sketch:* Log an invariant violation when an apply overrides a commit-voter's lock.
-
-
-`Checker:67-82`, `:146` skip all lock checks when `applying`. The argument that a lock holder `B` then cannot commit relies on
-R2. If R2 is violated (F5, F7(b), or a systemic loss), both A and B can commit and the lock-ignoring apply turns the
-violation into a silent overwrite instead of a detected conflict, since the loser's apply re-check is just a revision check
-(and none for blind KV, F1). There is no store-side detection of "B holds a commit vote conflicting with a committed A".
-Open question: should an apply that overrides a held lock of a *commit* voter be logged as an invariant violation?
-
-### F11. An allocating object has no existence check, so a replayed allocation can overwrite a live or deleted object. Confidence: Low.
-
-> **Status 2026-11-14: FIXED for live objects; residual for deleted ones.** `Frontend.readObjectForTransaction` treats
-> an allocating object like any other. It takes the in-memory state, answers `ObjectNotFound` while a deletion is in
-> flight, and otherwise reads the backend. Only a backend miss gives the fresh `Allocating` state
-> (`Tx.allocationLoaded`). An existing state goes into `Tx.allocatedOver`, and every requirement on that object fails
-> with `ObjectExists` (`RequirementsChecker.check`). This holds at the vote and at the apply re-check, so the replay
-> votes abort. A commit that still reaches the store (late or non-late, X11 step 3, P-N3) applies nothing there. A
-> non-late commit reports the object in `TxCommitted`, and the finalizer marks the store. A late one leaves the
-> existing entry for the scan. The requirements alone could not catch this: a KV allocation is a `KeyValueUpdate`
-> with no required revision and `RefcountUpdate(Allocating -> (0,1))`, so it passes on a KV object that only blind
-> updates touched since. `RequirementsApplyer.appliedBy` counts an allocated object at T's own revision as already
-> applied, which covers a recovered commit vote whose backend commit persisted before the crash.
-> *Residuals:* (1) No backend keeps tombstones. A replay of an allocation whose object was deleted, and whose deletion
-> has persisted, still creates it again at a stubless store: an unreferenced orphan slice (a leak, not an overwrite;
-> Todo 2.9). (2) An empty KV allocation leaves no revision or key trace. A recovered one that already persisted is
-> reported as missed, and repair reconciles it with no effect. (3) Every allocation now costs one backend read per
-> store. That is a point lookup on a miss in RocksDB, and an in-memory index check in FSIF.
-> Tests: `FrontendSuite` "Replayed allocations"; `RequirementsCheckerSuite`.
-
-> **Refresh (replay pins): NARROWED.** The horizon is gone, but allocations are never pins, so an allocating transaction
-> carries another pin, which a replay fails (`Pins.scala:18-33`). The fresh `Allocating` state still passes, so the
-> replayed allocation is applied wherever the replay reaches the commit anyway: a store with a leftover UnackedCommits
-> entry (transaction-recovery R-N1) or a non-late commit adopted from a recovering acceptor (paxos P-N3). It then
-> overwrites the live object at those stores (cross-document X11).
->
-> **Refresh (addendum): NARROWED.** A store that holds an applied stub for the allocating transaction applies nothing on
-> any later commit of it (`Tx.scala:642-648`, `:998-1000`), which covers every store that forgot T on a `TxFinalized`
-> listing it. The overwrite remains at stores with an entry and no stub (transaction-recovery R-N7, R-N9) and on a
-> non-late commit at stores that acknowledged in time (paxos P-N3, P-N10). The fresh `Allocating` state is unchanged.
-
-> **Verification 2026-11-09: PLAUSIBLE. Severity: resurrection (needs horizon failure).** Frontend.readObjectForTransaction builds a fresh Allocating ObjectState for allocatingObjects without consulting backend/cache (Frontend.scala:834-845); protection is the cache/horizon only (see paxos F2/F3).
-> *Fix sketch:* Have the backend reject allocating over an existing object.
-
-
-`readObjectForTransaction` creates a fresh `ObjectState` with `ObjectRevision.Allocating`/`ObjectRefcount.Allocating` for
-every object in `allocatingObjects` without consulting the backend or the cache (`Frontend.scala:833-843`), so the
-`RefcountUpdate(Allocating -> Default)` and `DataUpdate(Allocating, Overwrite)` requirements always pass. The only guards
-against a forgotten, already-committed allocation being voted and applied again are the status cache and
-`Frontend.horizon` (`Tx.scala:444-449`), which depend on synchronized HLC clocks and on the cache not evicting early.
-A retransmitted allocation of an object that was since modified or deleted, arriving within the horizon on a store without a
-cache entry, would vote commit and, if resolved by a recovery driver, overwrite the object. The horizon is protected by an
-early-eviction warning (`Host.scala:192-193`) but not enforced.
-
-### F12. A hung backend commit stalls every transaction on the object indefinitely. Confidence: High (by design), liveness only.
-
-> **Deferred 2026-11-15 (Todo 4.2 moved to the Backlog).** No per-commit watchdog. The hang is tolerated: other stores still vote, and past the horizon plus the expiry margin expiry decides the waiting Txs by rules A-G (2026-11-16: an undecided driver no longer proposes abort, paxos P7a). No timeout fits every backend (compaction can make a commit legitimately slow), and `BackendCommitFailed` is sticky until reload, so a false positive would poison the object. The shared cause is device health. It is handled by the Backlog items "Isolate every device's I/O, and detect and handle hung devices" (per-device latency monitoring) and "Operator alerts" (alert the operator, no automatic action).
-
-> **Verification 2026-11-09: CONFIRMED (by design). Severity: liveness.** awaitingCommits has no timer (Tx.scala checkCollisionWait comment; Frontend.commitInFlight/awaitCommitPersisted). Concrete trigger: an FSIF store frozen by ENOSPC never completes held commits 'with an error or otherwise' (FsifBackend.scala:621-651), so every later transaction on the object at that store withholds its vote; other stores still vote, so quorum is unaffected unless many stores freeze.
-> *Fix sketch:* Add a long watchdog that votes abort (BackendCommitFailed) for a store whose commit has been in flight longer than a bound.
-
-
-`awaitingCommits` has no timer (`Tx.scala:454-460`, `Frontend.scala:172-176`) and `txCommitsInFlight` is cleared only by
-the backend's completion. A backend that never completes (stuck I/O, a lost completion) leaves the object in flight and
-every later transaction on it silently withholds its vote; the driver sees missing replies and the client retries
-forever. The deliberate design; recorded because a lost completion has no recovery path.
-
-### F13. Exclusive-preference window can abort unrelated shared lockers. Confidence: High, liveness only.
-
-> **Verification 2026-11-09: PLAUSIBLE (not re-derived). Severity: liveness.** Accepted as documented behaviour; not re-derived.
-> *Fix sketch:* Only set exclusiveWaitUntil when the colliding exclusive transaction survives.
-
-
-`exclusiveWaitUntil` is set by any exclusive collision with an S holder, including one by a transaction that then aborts,
-and it makes new `SharedRevisionLock`s collide for 250 ms (`Checker:69-72`, `:83-86`). The collision names the requester
-itself (`:86`), so the driver never treats it as a stale race. Under repeated aborted writers on a fence object (vdisk) this
-can starve shared lockers. Documented behaviour.
-
-> **FIXED 2026-11-15 (Todo 4.10); residual stated.** The window exists so that a writer which lost only to shared
-> holders gets in on its retry, a new transaction, so it cannot be tied to the colliding Tx's lifetime. Instead
-> `RequirementsChecker.check` now opens it only for a transaction blocked by nothing but held shared locks at this
-> store: `getState` records the shared collision and raises it only after the requirement's own checks pass, so a
-> requirement that also fails (a stale revision, say) reports that error, and the window is set after the requirement
-> loop only if there are no non-object errors and every object error is such a shared collision. Residual: a writer
-> that opens the window and then aborts for reasons at other stores, or never retries, still makes shared lockers
-> collide for 250 ms. Tests: RequirementsCheckerSuite "a writer at a stale revision ...", "a writer that fails on
-> another object ...", "a writer that fails a non-object requirement ... opens no exclusive preference window".
-
-### New findings from the replay-pins refresh (2026-11-09)
-
-#### Q-N3. Derived per-write checks turn blind wins into aborts. Confidence: high
-
-> **Verdict: CONFIRMED (by design). Severity: liveness.** Two concurrent puts of one key now both require the key's
-> state as read (`KeyValueListNode.scala:489-500`); the loser fails `KeyRevision`/`DoesNotExist` and its transaction
-> aborts and retries (`transactUntilSuccessful`, TKVL retry loops), where before both committed in some order. The
-> checks are per key, so no node-level serialization is added. A stale tier-0 read (a cached node) costs an extra abort.
-> Safety: the checks are evaluated by stores at vote and again at apply; `ignoreLocks` is the only relaxation at apply.
->
-> **CLOSED 2026-11-15 by design (Todo 4.10).** No change: the loser retries under the retry strategy's randomized
-> exponential backoff.
-
-#### Q-N4. The pin rule is enforced only by the client. Confidence: high
-
-> **Verdict: CONFIRMED (trust model, by design). Severity: resurrection if violated.** `UnpinnedTransaction` is thrown
-> in `TransactionBuilder.buildTranaction` (`TransactionBuilder.scala:140-141`); descriptions carry no pin marker and
-> stores accept any description (F7). A client built without the check (an older version, a tool or test building
-> `TransactionDescription` directly) sends replayable transactions, which the store-side late-commit rule does not
-> catch (a pinless replay gets fresh commit votes and commits normally).
->
-> **FIXED 2026-11-15 (Todo 2.14); residual: the `replaySafe` claim.** The description now carries what a store needs
-> to check the rule without the other stores' operations. `KeyValueUpdate.pinned` claims that the update writes a key it
-> carries a `KeyRevision` on (the builder sets it, `Pins.writesCheckedKey`), and `TransactionDescription.replaySafe`
-> records `Transaction.replaySafe`. Every store refuses a description with neither a pin by `Pins.declared` (which takes
-> `pinned` as the key pin) nor `replaySafe` (`DescriptionValidator`, `InvalidDescription`). The stores holding a
-> `pinned` object check the claim against their operations (`RequirementsChecker`, `FalsePin`, next to
-> `UnflaggedDelete`). A store that does not hold the object relies on the flag: a false one gets abort votes on its
-> object from every honest store of that pool, so the transaction cannot commit. A replay of a truly pinned
-> transaction fails the pin's requirement at those same stores. The `replaySafe` bit remains a trusted client claim,
-> since no store can prove a replay harmless. It is the same trust `Transaction.replaySafe(reason)` already carried,
-> now one visible bit in the description.
-
-#### Q-N5. `replaySafe` claims at the four product sites. Confidence: medium
-
-> **Verdict: mixed; see per site.**
-> * `RepairProofs` ("repair proof changes nothing", `server/repair/RepairProofs.scala:61`): **REFUTED** as a weakness.
->   A proof is locks only; a replay changes nothing (it can only abort a concurrent writer once).
-> * `SplitFinalizationAction.insertIntoExistingTier` ("cannot re-add once the node is gone",
->   `client/tkvl/SplitFinalizationAction.scala:61`): the claim **holds**: a deleted node fails the revision lock
->   (`RequirementsChecker.scala:57-58`), and a node whose revision moved fails it too. Separate weakness, **PLAUSIBLE
->   (performance)**: the read-first "gone" (`:76-77`) is also taken when the read precedes the stores applying the
->   split (the reason Ruling 28 changed the allocation action), so the new node is never indexed in the tier above;
->   lookups still reach it by following links. Its later join path was not traced. *FIXED 2026-11-15 (Todo 5.5),
->   see the allocation bullet's fix note:* only a proven deletion means "gone", and the read in that window now
->   proves nothing, so the action retries.
-> * `AllocationFinalizationAction` ("never drops an entry; ... can leave an orphan entry",
->   `client/internal/allocation/AllocationFinalizationAction.scala:45-57`): the claim is **honest**; the orphan is
->   **PLAUSIBLE (stale-replica, leak)** and less rare than "doubly rare": any second run after a quick deletion leaves
->   one, including the ordinary case of a leader and a recovery driver both finalizing in the live window. An orphan
->   makes repair treat the deleted object as live (no `repairDeletion` for a store that missed the delete) and the
->   rebuild walk read a missing object.
->
->   **Fix 2026-11-15 (Todo 5.5): FIXED for both actions; residual stated.** Root cause, common to the split action's
->   early "gone": the finalizer starts at resolution, and a commit voter's fresh `Allocating` state is known only to
->   its Tx (`retain(shared = false)`), so until the store applies the commit a client read missed it and got
->   `ObjectNotFound`. Read in that window, a live object was proven deleted (`provesDeletion`). Now a store with a
->   commit vote on the allocation, not yet applied (`Tx.allocationUnapplied`), answers the new `ReadError.AllocationPending`
->   on a backend miss (`Frontend.allocationPending`, a scan on misses only). `BaseObjectReader` counts it as an error
->   but not as an absence. A committed allocation has at least writeThreshold voters, so at most width −
->   writeThreshold stores answer `ObjectNotFound` and the read cannot prove the deletion. Once the object is deleted,
->   the deletion's writeThreshold voters held it applied, so the proof is reachable again (writes are majority quorums).
->   Both actions now read with an explicit three-way outcome: a live object → checked insert under its revision lock,
->   a proven deletion → no transaction, anything else → the attempt fails and is retried. The lockless insert is
->   gone, so every entry write carries the lock and a replay or a later run after the deletion leaves no orphan.
->   Residual: an object already below writeThreshold live copies reads as deleted and gets no entry or index; it was
->   unreadable already (repair-process F5's residual). Tests: FrontendSuite "a read of an allocation voted for but not
->   applied answers AllocationPending", "a read of an aborted allocation answers ObjectNotFound";
->   DataObjectReaderSuite (pending replies prove nothing); AllocationFinalizationActionSuite "the action retries until
->   the stores apply the allocation, then records the entry under a lock", "a run after the object's deletion records
->   no entry"; SplitFinalizationActionSuite "a split FA that reads its node before the stores apply it waits, then
->   indexes it". Both window tests fail without the store change.
->   *2026-11-16 (client 1-RTT commit):* a client that learns its allocation committed from the votes reads the new
->   object before any store applied it, and a threshold of `AllocationPending` replies ended the read `InvalidObject`
->   (no proof, but a failed read of the client's own object; ThreadedHostSuite). `BaseReadDriver` now re-reads a store
->   that answers `AllocationPending` instead of delivering the reply, and the store parks that read until no held Tx
->   has the allocation pending (`Frontend.parkAllocationRead`; answered `AllocationPending` at `ParkedReadWait`). A
->   read of such an object therefore waits for the allocation's outcome: the object once it applies, a proof-capable
->   `ObjectNotFound` once it aborts. The proof argument above is unchanged. The actions' and repair's "retry" cases now
->   wait inside the read. Tests: FastCommitIntegrationSuite "a read of an object whose allocation the client learned
->   committed from the votes waits for it to apply"; FrontendSuite "a read of an allocation voted for but not applied
->   is answered once it applies" (renamed from "... answers AllocationPending"), "a parked read of an allocation is
->   answered ObjectNotFound when the allocation aborts", "a parked read of an unapplied allocation is answered
->   AllocationPending at ParkedReadWait"; BaseReadDriverSuite "an AllocationPending reply re-reads that store at once
->   and never ends the read"; StoreRepairerSuite G8 (the scan's read waits, then finds the object live).
->   The same regression exposed an older window: a client read's backend load in flight when the allocation's commit
->   applied in memory completed with a miss after `allocationPending` had turned false, and was answered
->   `ObjectNotFound`, so two such stores proved a live object deleted. A miss for a client read now serves the state
->   committed meanwhile (`Frontend.backendReadComplete`). Test: FrontendSuite "a backend miss for a read that
->   completes after the allocation applied serves the committed state".
-> * `MissedUpdateMarker.writeBatch` ("missed-update marks are idempotent", `MissedUpdateMarker.scala:165`): **PLAUSIBLE
->   (stale-replica, narrow)**. Re-writing one batch is idempotent, but a replayed or late batch's blind upsert replaces a
->   newer entry's `missedTimestamp` with an older one (repair F10) and re-creates UnackedCommits entries the repair
->   scan already deleted, which re-arms transaction-recovery R-N1 for that store.
->
->   **Refresh (addendum):** the re-armed R-N1 half is closed where the re-run's `TxFinalized`, which lists the re-created
->   entries in `owed`, reaches the store (it writes a stub, transaction-recovery R-N6); the regression half stands.
->
->   **Fix 2026-11-14 (Todo 2.4): FIXED for regression; re-creation harmless.** The batch's puts are conditional
->   checked inserts (`TKVLInsert.replaces`): a mark replaces a held one only for a later `missedTimestamp` and carries
->   its `KeyRevision` (a pin for that key), and an UnackedCommits entry is written only where none is held. The batch
->   stays `replaySafe` ("missed-update marks only move forward"): a new key carries only `DoesNotExist`, so a replay
->   writes a key only where none is held. A re-created UnackedCommits entry changes nothing: the scan deletes one only
->   while the store holds no Tx for T, and a store never rejoins a transaction it forgot (finalized cache entry
->   inside the window, forget floor past it), so a late commit finds no commit vote to apply through it. A store that
->   never held T joining through a replayed client prepare inside the window is the same exposure the original entry
->   gave (P-N3, R-N9; Todo 2.9). Evidence as repair-process F10.
-
-#### Q-N6. Liveness costs of the converted sites. Confidence: medium
-
-> **Verdict: CONFIRMED (liveness).** `AllocationFinalizationAction` takes an exclusive `ExclusiveRevisionLock` on the freshly
-> allocated object (`AllocationFinalizationAction.scala:53`, section 12), which collides with the allocator's own
-> follow-up writes to it; one side aborts and retries. `SimpleTaskExecutor.allocateTask` now collides on the executor
-> revision under bursts or several mounts (O(n^2) attempts). Neither affects safety.
->
-> **FIXED 2026-11-15 (Todo 4.10); residuals stated.** `AllocationFinalizationAction` takes a `SharedRevisionLock`: it
-> fails on a deleted or changed object as the exclusive lock did, so the replay guard is unchanged, and the two runs of
-> one allocation's action (a leader's and a recovery driver's finalizer) no longer collide on it. It still collides
-> with the allocator's own follow-up writes, as any lock must. `SimpleTaskExecutor.allocateTask` already retried with
-> randomized exponential backoff; the cost was one executor starting concurrent allocations that all used the same
-> cached revision. Its allocations now run one at a time, each starting after the previous one committed and moved
-> the cached revision. Residual: executors in different processes on the same executor object still collide (backoff
-> only). Tests: AllocationFinalizationActionSuite (the lock is shared), SimpleTaskExecutorSuite "concurrent task
-> allocations at one executor each commit on their first attempt" (4 attempts, 9 before).
-
-### New findings from the addendum refresh (2026-11-10, `c181375b`)
-
-#### Q-N7. The stub check in `doCommit` covers every commit of the transaction, not only an apply through an entry. Confidence: high
-
-> **Verdict: REFUTED as a weakness (mechanism CONFIRMED).** `doCommit` applies nothing for any txid the store holds a
-> stub for (`Tx.scala:642-648`), including a non-late commit of a replay at a store that was named in `owed` but never
-> saw T, which then claims nothing it lacks: since Task 4's fix round it reports T's changed objects in
-> `objectCommitErrors`, so a non-late finalizer marks the store and repair restores it (Task 4 concern 2). A recovered
-> non-late commit vote with a stub resolves committed through the same check and stays until `TxFinalized` (Ruling 5).
-
-#### Q-N8. Prefer-abort and the requirement check. Confidence: high
-
-> **Verdict: REFUTED (no requirement is weakened).** A driver-only Tx votes abort without checking (`Tx.scala:537-542`):
-> an abort vote is always sound (R2 and the lock argument rest on checked commit votes only). Its commit vote, if
-> any, comes from
-> `RequirementsChecker.check` on a client prepare (`:543-570`), with its locks (`lock()` after the decision, `:482`,
-> `:847`). Proof-first is preserved: `decideDisposition` proves on the abort path before recording the abort
-> (`:584-586`). Lock-only transactions (`SharedRevisionLock`) prepared only by drivers now wait for the client's
-> prepare too (FrontendSuite "a lock-only transaction prepared only by a driver waits for the client's prepare").
-
-### Open questions
-
-1. Is the `2T > width` property enforced anywhere other than IDA construction (e.g. when a pool is created from a
-   deserialized IDA, or in a description arriving over the network)? *Answered 2026-11-15 (Todo 2.14):* it does not
-   need to be. Every IDA is a case class whose constructor requires it (`Replication`: `writeThreshold >= width/2+1`;
-   `ReedSolomon` and `RandomAccessReedSolomon`: a majority `restoreThreshold <= writeThreshold`, `common/ida/IDA.scala`),
-   and every decoder builds IDAs through those constructors (`Codec.decode(codec.IDA)`, `IDA.deserializeIDAType`,
-   `BootstrapConfig.IDAOptions`). A deserialized pool or description IDA therefore satisfies it, or fails to decode.
-   Stores also refuse a description that names another IDA for their pool (F7).
-2. Should the apply path detect a committed transaction overriding a held commit-voter lock and report it (F10)? *Answered
-   2026-11-15 (Todo 5.8):* not at the apply, where the override is normal; at the holder's own apply re-check, which
-   fail-stops a live voter with an `INVARIANT VIOLATION` naming the overriding transaction (F10).
-3. Should `Frontend.opportunisticRebuild` and `Tx.completeLoad`'s pre-transaction rebuild share one guarded implementation (F3)?
-4. Should object-level KV operations without a required revision be flagged like `deletesKeys` for the traceless path (F8)?
-5. Should the key `ValueState.timestamp` take part in apply (F1, F2), so that blind writes become last-writer-wins by
-   transaction timestamp? *Answered 2026-11-14:* yes for Inserts, on (timestamp, revision); blind deletes and
-   object-level operations are refused instead, since nothing records a deleted key's timestamp.
-
-## 12. Todo question: is `RevisionLock` exclusive?
-
-**Verdict: yes, `RevisionLock` is exclusive, and it is a pure lock (it changes nothing).** The old name did not say
-"exclusive", and `SharedRevisionLock` is the non-exclusive sibling. **Fixed (2026-11-10):** renamed to
-`ExclusiveRevisionLock` (the protobuf message and its `TransactionRequirement` field too); the references below use the
-new name.
-
-Evidence:
-
-* Check: `ExclusiveRevisionLock` goes through `getState(oid)` with `wholeObject = true` (`RequirementsChecker.scala:164`), the same
-  path as `DataUpdate`, `VersionBump` and `RefcountUpdate`. That path collides with any other holder of X
-  (`checkObjectLocks`, `:44-46`), with any other holder of S (`:69-72`), and with every part lock including key, absent-key,
-  content and range locks (`:73-74`, `ObjectState.lockedWriteTransactions` `:42-54`).
-* Lock: it calls `lockExclusive` on the object (`RequirementsLocker.scala:58`), the same as `DataUpdate`; released by
-  `release` (`:185`).
-* Not a write: `RequirementsApplyer` has an empty case (`:147`) and `changedObjects` excludes it (`:39`), so it never starts a
-  backend commit and never appears in the in-flight machinery.
-* Builder: `exclusiveLockRevision` throws if the object is also updated or shared-locked in the same transaction
-  (`TransactionBuilder.scala:346-347`), and updates throw if the object is revision-locked (`:246-249` etc.).
-* Other code states it: `server/repair/RepairProofs.scala:36` ("It takes the exclusive object lock, which collides with
-  every lock a ..."), and the tests `RequirementsCheckerSuite` "ExclusiveRevisionLock failure on tx collision" (`:365`).
-* Contrast `SharedRevisionLock`: `getSharedState` (`:78-87`), `sharedLocks += txid` (`Locker:60`), compatible with other
-  shared locks (test "two SharedRevisionLocks on one object both pass", `RequirementsCheckerSuite.scala:237`).
-* One difference from `VersionBump`: a `ExclusiveRevisionLock` leaves the revision unchanged, so a later transaction can still
-  require the same revision; a `VersionBump` invalidates it.
-
-### New findings from the adversarial verification (2026-11-09)
-
-* **N1. FIXED 2026-11-14 (path deleted).** An opportunistic rebuild that survives its revision check can replace a KeyValue object's content with an older snapshot and leaves `kvState` unchanged; see repair-process.md F1, F2 and N1. This enlarges F3 here: the pre-transaction path is the same bug without the `commitInFlight` guard.
-* **N2.** A replayed (already applied) `RefcountUpdate` or `DataUpdate` after a crash is skipped by its revision or refcount check and then reported in `TxCommitted.objectCommitErrors`, producing a spurious but harmless ErrorTree mark (see transaction-recovery.md F4).
+See 8.3 step 4 and R10. The store may be one of the `t` commit voters, so the committed state exists in memory and in
+the CRL but not in the backend until reload; on reload the Tx is recovered from the CRL and re-applies. New votes on
+the object are aborts and it keeps serving the committed state, so it neither reverts nor lets a conflicting commit in.
+A repair write that fails discards the in-memory state (`repairWriteComplete`), so it is reloaded from the backend;
+repair writes are not votes and do not enter `failedCommits`.
+
+### 10.7 Key deleted, then a stale insert
+
+(a) The insert carries `KeyRevision(k, r)` or `Exists(k)`: stores that applied the delete fail it (`KeyExistenceError`),
+the stale ones (at most `w - t`) pass. Abort. (b) `DoesNotExist(k)` with an old view: the fresh stores pass, stores
+still holding the key fail, and the commit needs `t` fresh stores: correct. (c) A blind Insert resurrects the key by
+design, on every store alike. (d) A delete's commit reaching a lagging store before the insert it is built on: its
+`KeyRevision` fails there, the store skips and reports it, then applies the insert: repaired. (e) Re-apply of an insert
+from a recovered CRL record after a later delete: Q-W3.
+
+### 10.8 Lock-deferral and holder lifetime
+
+On `CollisionWait` expiry a still-held lock is an abort vote and the client retries. No lock is ever force-broken. A
+holder that never resolves (dead client, dead driver) is taken over by a recovery driver once its Tx has been idle for
+`txHeartbeatTimeout` (5 heartbeats, `Store.heartbeat`), and ends by expiry past the horizon plus the expiry margin
+(transaction-recovery.md), which releases its locks (`Tx.expire`). Repair has its own lock deferrals
+(repair-process.md).
+
+### 10.9 Other situations
+
+* **Commit decision before the data:** the store holds the commit until the data, a client prepare, or `TxFinalized`
+  arrives, then applies and sends `TxCommitted` (`commitAwaitsData`). Adopted data is saved to the CRL first.
+* **Commit while another commit of the object is in flight:** held and queued (R9). A `TxFinalized` for a held commit
+  defers concluding the CRL state until the commit is issued (`finalizeDeferred`, `Frontend.finalizationDeferred`).
+* **Prepare after finalization:** ignored when the host's status cache holds T finalized.
+* **Prepare for a transaction the store does not hold:** refused outright below the forget floor (no Tx, no reply);
+  above it a Tx is created, muted if T started before a rebuilt store's `acceptorSince` or too far ahead of the
+  host's clock. A cached resolved outcome makes the new Tx take no locks (`outcomeDecided`). See
+  paxos-transactions.md (horizon) and `server/store/CLAUDE.md`.
+* **Proofs:** a memoryless Tx whose objects already show the update sends a proof instead of an abort vote
+  (`Tx.proveCommitted`, paxos-transactions.md).
+* **An object that fails to load** is absent from `objects`: a fresh vote fails `MissingObject`.
+* **A frozen Tx** (past expiry by the store's clock) decides no vote and sends no delayed prepare response.
+
+## 11. Answer: `ExclusiveRevisionLock` is exclusive
+
+It goes through `getState(oid)` (whole object), the same path as `DataUpdate`, `VersionBump` and `RefcountUpdate`:
+it collides with any other X holder, any S holder, and every part lock (K, N, C, R). It takes X
+(`lockExclusive`). It applies nothing and is not in `changedObjects`, so it never starts a backend commit. The builder
+throws if the object is also updated or shared-locked. Unlike `VersionBump` it leaves the revision unchanged, so a
+later transaction can still require that revision. `SharedRevisionLock` is the non-exclusive sibling. Repair's
+object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.proveObjectLevel`).
+
+## 12. Accepted limitations
+
+* Exclusive-preference window residual (section 4): a writer that aborts elsewhere still makes shared lockers collide
+  for up to 250 ms.
+* Per-write TKVL checks turn concurrent puts of one key into an abort and retry (randomized exponential backoff), and
+  a stale cached node costs an extra abort.
+* A hung backend commit stalls the object's transactions at that store (Backlog.txt, hung devices).
+* Every allocation costs one backend read per store (9.4).
+* A deleted id can be re-allocated by a replay at a store that never saw the transaction; no backend keeps
+  tombstones (9.4).
+* A `TxPrepare.fromClient` or `replaySafe` claim forged by a non-client component is outside the trust model.
+
+## Open weaknesses
+
+### Q-W1. A live commit voter fail-stops when a later, non-conflicting commit is applied first (CONFIRMED; systemic loss, spurious lost-store declaration)
+
+Mechanism: `Tx.issueCommits` fail-stops the store with `INVARIANT VIOLATION` whenever a live commit voter's apply
+re-check skips any object (`unapplied = result.skipped -- alreadyApplied -- notApplied`), over every skipped object,
+lock-only ones included (unlike the recovered branch, which filters to `changed`). The re-check
+(`RequirementsChecker.check(applying = true)`) re-evaluates the voter's requirements against the store's current
+state, including `checkRevision`'s object-timestamp test. A committed transaction applies over other transactions'
+locks (`applying` ignores them) and is not held behind an unresolved lock holder (`Tx.holdForTurn` looks only at
+`commitInFlight`). So a later transaction T, committed by other stores after an earlier transaction U committed and
+released its locks there, can be applied at a store S that still holds U's locks (U's resolution not yet received),
+and U's re-check then fails at S although no invariant was violated: T was voted on post-U state elsewhere and does
+not depend on U.
+
+Trigger / scenario (`w = 3, t = 2`, stores S, A, B): U holds a lock on object O at S and A (for example a vdisk block
+commit's `SharedRevisionLock` on the fence, `vdisk/BlockCommitter`; an `AllocationFinalizationAction`'s
+`SharedRevisionLock` on the new object; a repair proof's `ExclusiveRevisionLock`; or a `DataUpdate` while T is a
+`RefcountUpdate`). U commits; A applies U and releases. T, which does not build on U (a fence takeover bumping the
+fence at the same revision; the allocator's follow-up `DataUpdate` at the allocation revision; a writer after a repair
+proof; a refcount change), votes commit at A and B. At S it collides with U's lock and votes abort (`buildsOn` is false,
+so no wait). T commits. U's `TxResolved` to S is delayed or lost (S learns U's outcome later from `TxFinalized` or a
+recovery driver), while T's arrives: S applies T (revision or object timestamp moves past U's). U's commit then reaches
+S: its `SharedRevisionLock`/`ExclusiveRevisionLock`/`DataUpdate` re-check fails `RevisionMismatch` or
+`ObjectTimestampError`, and S fail-stops. A deletion T (refcount 0) gives `MissingObject` the same way. The cases are
+common precisely when a store is slow or partitioned: vdisk takeover after a writer's network trouble, and repair,
+which runs because a store missed messages.
+
+Consequence: a healthy store is declared lost and rebuilt. Up to `w - t` stores of a pool can be hit by one (U, T)
+pair (the stores holding U's lock that voted abort on T), which for `w = 5, t = 3` leaves the pool at its write
+threshold during the rebuilds. The final state needs no fail-stop: for a lock-only object there is nothing to apply; a
+changed object would only need repair. (FrontendSuite "a commit held behind an in-flight commit ..." had to switch
+to a non-conflicting fence write when the fail-stop was introduced, which suggests the same shape.)
+
+Suggested fix: never fail-stop on a lock-only object (it has no update to lose; skip it as the recovered branch does).
+For a changed object of a live voter, quarantine it as for a recovered voter (8.5) instead of fail-stopping, at least
+when the object was applied over this voter's lock while it held it (record the overriding txid at apply time in the
+rare `applying`-over-a-lock case, which costs nothing on the hot path). Keep the fail-stop for an apply that throws.
+Add a FrontendSuite test for each trigger above (deterministic: deliver T's `TxResolved` to S before U's).
+
+Effort: M   Priority: 3
+
+### Q-W2. Two recovered commit votes on one lock: the earlier transaction's release unlocks the later vote (PLAUSIBLE; overwritten update)
+
+Mechanism: after a crash, recovered commit votes re-take their locks without a check (`Tx.completeLoad` -> `lock()` ->
+`RequirementsLocker.lock`). Single-holder locks are overwritten (`lockExclusive` logs an error and sets
+`lockedToTransaction`; `lockKV`/`lockKey` set K, N and C unconditionally). Release clears a lock only if the releaser
+holds it (`release`, `releaseValue`, `releaseKey`). Section 10.5a shows two recovered commit votes A (committed, applied,
+persisted, not yet finalized) and B (built on A) can share a lock. Recovered votes take their locks in load-completion
+order (`recoveredTransactionLoaded`); for a single shared object `Frontend.pendingReads` lists the later-registered
+transaction first, so which one keeps the lock depends on CRL record order and is not controlled. If A's lock is the one
+kept, A's resolution (it is driven at once and learns commit from its peers) releases it in `doCommit`, and B, still an
+unresolved counted commit vote, holds no lock at S.
+
+Trigger / scenario: S voted commit for B and crashed before A's `TxFinalized` was processed. After recovery A overwrites
+B's X lock, then resolves and clears it. A transaction C conflicting with B (also requiring A's revision) reaches S
+before B resolves there and votes commit (no lock, revision A matches). C also gets commit votes from stores that
+applied A but never saw B's prepare (B was decided on `t` votes including S's). With `w + 1 >= 2t` (`w = 3, t = 2`;
+`w = 5, t = 3`) C can reach `t` commit votes: B and C both commit over revision A.
+
+Consequence: two conflicting transactions commit (a lost update; replicas diverge, and the later applies fail-stop or
+quarantine stores). Requires a crash inside A's finalization window, the unlucky lock order, and a concurrent
+conflicting transaction in the short window before B resolves at S.
+
+Suggested fix: let recovered locks coexist instead of overwriting: hold a list of holders for X, K, N and C (populated
+only on the recovery path, where a check was skipped), so a release removes only its own entry; or take recovered
+locks in CRL vote order with the later vote winning and the earlier release a no-op. Either is rare-path only. Add a
+FrontendSuite recovery test with A and B recovered in both orders, then a conflicting C.
+
+Effort: M   Priority: 2
+
+### Q-W3. A recovered `DoesNotExist` or blind Insert re-applies after a later delete of its key (PLAUSIBLE; resurrection, permanent replica divergence)
+
+Mechanism: `SimpleCRL.dropTransactionObjectData` only flags the in-memory record (`crl/CLAUDE.md`), so a committed
+transaction's object data stays durable until its CRL state is deleted at `TxFinalized`. A later transaction on the
+object may vote and commit once the first's backend commit persisted (R9), before the first is finalized. After a
+crash (or a store transfer, which moves the CRL state with `readStoreState`), the first is recovered as a commit vote
+and, if its peers have not yet finalized it, learns a non-late commit and re-applies through `issueCommits`. Its
+re-check passes where its key requirement is `DoesNotExist(k)` (or there is none) and a later transaction deleted k:
+k is absent again. `insertWins(None, ..)` is true, so the Insert writes k back. `appliedBy` finds no trace (k is gone),
+but nothing consults it because the re-check passed, so the store reports success in `TxCommitted` and nothing is
+marked. `Tx.persistWithoutUpdateOf` closes the same hole for a deleted allocated object, not for a deleted key.
+
+Trigger / scenario: T1 inserts a new key k with the TKVL default (`PutRequirement.Checked` gives `DoesNotExist(k)` for
+an absent key), for example the allocate-and-insert pattern whose `AllocationFinalizationAction` lengthens T1's
+finalization. T2 deletes k (`KeyRevision(k, T1)`) and is applied, persisted and finalized at store S while T1's
+finalization is still running. S crashes, or is transferred, and recovers before T1's `TxFinalized` is sent. T1's
+recovered vote is driven, learns commit from its peers' status caches, and re-inserts k at S only. If T2's state is also
+still in the CRL and re-applies after T1, the stores converge; if T2 was finalized first, they do not.
+
+Consequence: S alone holds a deleted key, with no ErrorTree or UnackedCommits entry: permanent divergence of one
+replica until a later write of k fails its check at S and gets S marked. Reads use a majority and are unaffected, but
+S's votes on k are wrong (a `DoesNotExist(k)` insert votes abort there), and a second such event at another store
+would make a read return the resurrected key.
+
+Suggested fix: on the recovery path only, have a recovered commit vote whose changed KV object's timestamp is later
+than T's start (some later transaction applied after it, which R9 allows only after T's own commit persisted, or over
+its lock) quarantine the object instead of applying, so repair verifies it; or record durably, when a key Delete is
+applied while an unfinalized Tx's CRL state holds an Insert of that key, that the Insert must not re-apply (the
+`persistWithoutUpdateOf` analog). Add a FrontendSuite test: commit T1 (`DoesNotExist` insert), commit and finalize
+T2 (delete), restart the store with T1's CRL record, resolve T1 committed, expect the key absent or the object
+quarantined.
+
+Effort: M   Priority: 2

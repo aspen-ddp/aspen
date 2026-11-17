@@ -1,72 +1,272 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, built 2026-11-11 against fcb50a85)
------------------------------------------------------------------------
+Safety work list (from docs/safety/*, second pass, built 2026-11-17 against 3a7fdaf5)
+-------------------------------------------------------------------------------------
 
-Every open finding (not FIXED, REFUTED or CLOSED) in docs/safety/* is listed below once, grouped where one change
-addresses several ids. Completed items are removed; their record is in the docs and git history. Item numbers are
-stable (other documents cite them), so gaps are expected. Each item's mechanism was spot-checked at HEAD and is still
-present unless noted. Priority is by the worst plausible consequence, then likelihood, then cost. A cheap fix with a
-large payoff moves up within its tier.
+Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
+once, grouped where one change addresses several ids. Completed items are removed; their record is in git history.
+Item numbers are stable (other documents may cite them), so gaps are expected. Priority is by the worst plausible
+consequence, then likelihood, then cost. A cheap fix with a large payoff moves up within its tier. All findings in
+this pass were derived by reading the code; none has a reproducing test yet. CONFIRMED = mechanism traced end to end;
+PLAUSIBLE = mechanism real, trigger uncertain.
 
 Ordering of consequence: lost committed data or a split decision > systemic loss of many stores > resurrection,
 overwritten update or permanent replica divergence > liveness (hangs, stalls) > performance > analysis/docs.
 
 Working rule for every item:
-  1. Re-read the finding and the code. Line citations in the docs have drifted.
-  2. Reproduce it with a test (deterministic, LockstepThreading where possible). If it cannot be reproduced, say why in
-     the doc's verdict.
-  3. Fix it, then update the finding's status (dated note), the README ranked row, and the module CLAUDE.md.
-  4. If the fix narrows a finding rather than closing it, state the residual explicitly.
+  1. Re-read the finding and the code.
+  2. Reproduce it with a test (deterministic, LockstepThreading where possible). If it cannot be reproduced, record
+     why in the finding and remove or downgrade it.
+  3. Fix it, then remove the finding from the doc's Open weaknesses, fold the guard into the design text (present
+     tense, no history), and update the module CLAUDE.md.
+  4. If the fix narrows a finding rather than closing it, state the residual explicitly in the finding.
 
 As items are completed, remove them from this document but keep the numbers the same for remaining items.
 
 Effort: S = hours, M = a day or two, L = a design plus several days.
-Doc keys: CRL = crash-recovery-log, P = paxos-transactions, R = transaction-recovery, Q/Req = transaction-requirements,
-RP/Repair = repair-process, Rebuild = rebuild-process, X/G/C = cross-document-review, SL = systemic-loss-protection.
+Doc keys (weakness-id prefixes): CRL = crash-recovery-log, P = paxos-transactions, R = transaction-recovery,
+Q = transaction-requirements, RP = repair-process, RB = rebuild-process, SL = systemic-loss-protection,
+X = cross-document-review (its section 5 lists contradictions between documents).
 
 
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-(no open items)
+1.1  CRL directory without stream files opens as an empty CRL: CRL-W3                                    [S]
+     CONFIRMED. DeviceDiscovery.openDeviceCrl treats the CRL as lost only when crl/ is absent. A crl/ that lost
+     its *.crl files (operator clear, fs repair, partial restore) on a device with stores is taken as a new CRL;
+     every store loads with no promises, accepts or votes and serves as an acceptor (silent amnesia, split
+     decisions). Fix: treat crl/ without stream files on a device with store directories as lost. DeviceCrlSuite
+     test.
+
+1.2  Counted commit voter whose UnackedCommits entry has no incarnation never applies: R-W1                [S]
+     CONFIRMED. A takeover driver that did not count votes writes incarnation None for stores it never heard
+     from; Frontend.unackedLookupComplete treats Found(None) as not owed, so a store that cast a counted commit
+     vote applies nothing and relies on reconcile, which cannot restore T once holders are fewer than r (t = r,
+     e.g. Replication(3,2)). Committed data lost after crash-restarts plus one lost message. Fix: treat
+     Found(None) as owed for a recovered Tx holding its own commit vote; decide the live-expiring-voter case
+     (apply on None, or have the takeover marker record "voters unknown"). Shared root with 2.5 and RP-W1's
+     phase-B leg (2.6): fix this first. Also correct the "reads mask it" reasoning in
+     docs/superpowers/specs/2026-11-14-store-incarnation-design.md and server/transaction/CLAUDE.md. TestNetwork
+     test with Replication(3,2).
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-(no open items)
+2.1  Rebuilt lock-only commit voter admits a conflicting commit before T commits: X-W2                     [M]
+     PLAUSIBLE. A rebuilt store holds none of its old incarnation's locks and copies state from reads that ignore
+     locks, but its pre-loss vote still counts (driver round, client 1-RTT, expiry rule B). For lock-only objects
+     2t - w = 1 for Replication(3,2)/(5,3), so one lost voter lets T' commit over T's lock (e.g. a vdisk fence).
+     Fix: rebuild records objects whose restoring read reported write locks (shared revision locks must start
+     being reported) and votes abort on them until clear; or require > w - t live voters per lock-only pool in
+     rule B and the tally. Shares the "rebuild ignores reported locks" signal with 2.7. Caution: today the live
+     voter fail-stop in Tx.issueCommits is the only (accidental) detector; see 3.2.
+
+2.2  Two recovered commit votes on one lock; the earlier's release unlocks the later: Q-W2                 [M]
+     PLAUSIBLE. Recovered votes re-take single-holder locks unconditionally (overwrite); release clears only the
+     holder's own lock. If A's lock wins and A resolves, B (unresolved counted commit vote) holds no lock and a
+     conflicting C can commit. Fix: let recovered locks coexist (holder list on the recovery path only) or take
+     them in CRL vote order. FrontendSuite recovery test in both orders.
+
+2.3  Recovered DoesNotExist / blind Insert re-applies after a later delete of its key: Q-W3                [M]
+     PLAUSIBLE. A committed Tx's object data stays in the CRL until TxFinalized; a later delete of the key can be
+     applied and finalized first. After a crash or transfer the recovered vote re-checks (DoesNotExist passes
+     again), re-inserts k at that store only, reports success, and nothing is marked: permanent divergence,
+     resurrection on a second event. Fix (recovery path only): quarantine a changed KV object whose timestamp is
+     later than T's start, or record the delete durably (persistWithoutUpdateOf analog). Also fixes contradiction
+     X 5.4 (transaction-recovery.md section 9 overclaims reconcile healing).
+
+2.4  Expiry status replies report a commit vote that may not be durable: P-W1                              [S]
+     PLAUSIBLE. Tx.statusForExpiry reports votedCommit from memory before the vote's CRL save completes, and a
+     vote decided just before the freeze boundary is never saved. A crash then loses the vote and its lock while
+     rule A/F already counted it: conflicting commits. Fix: report votedCommit only once the save is durable
+     (voteDurable flag); stay silent while a vote save is in flight; always save a vote decided before the freeze.
+     Shares the per-store-clock expiry root with 2.5: one skewed-wallClockMillis test harness serves both.
+
+2.5  Late condition 1 after an expiry commit cancels the expiry finalizer: P-W2                            [S]
+     PLAUSIBLE. An expiry commit bypasses Paxos, so holders not yet frozen by their own (slower) clocks answer
+     memoryless promises; a proof plus that quorum makes a driver resolve late and its TxFinalized cancels the
+     expiry finalizer before its marks/entries are written. Stores never marked are never repaired. Fix: no late
+     condition 1 past the horizon by the driver's clock (or expiry-resolved Txs answer no prepare). Also fixes
+     contradiction X 5.1 (the "acceptor forgot T implies finalized" statements in transaction-recovery.md and
+     paxos-transactions.md).
+
+2.6  A declined ErrorTree mark does not invalidate a repair that deletes the held entry: RP-W1             [S]
+     CONFIRMED. MissedUpdateMarker drops a mark whose missedTimestamp is not later than the held entry's, with no
+     write, so a repair that read before the earlier-started, later-committed transaction can still delete the
+     entry (KeyRevision unchanged); the store never gets that update. Also reaches UnackedCommits entries via the
+     phase-A shortcut (Counts.recordCompleted) where a voter forgot T without applying (1.2's path). Fix: a
+     declined mark rewrites the held value (moves its revision); record completion only after the phase-A delete
+     commits. StoreRepairerSuite test with testingOnlyBeforeEntryDelete.
+
+2.7  Rebuild copies an update the lost store acknowledged but peers have not applied: RB-W2                [S]
+     PLAUSIBLE. The walk's ordinary read ignores write locks; a lost store that applied and sent TxCommitted gets
+     no mark, so the rebuilt copy can be stale with no record. Real only for t > r (e.g. Replication(5,4)); the
+     doc's Replication(3,2) example is beyond tolerance (contradiction X 5.7, correct the example). Fix: mark in
+     the ErrorTree any restored object whose replies carried write locks (same signal as 2.1).
+
+2.8  Staging or a finished copy from an earlier Rebuilding episode is resumed or promoted: RB-W3           [M]
+     CONFIRMED mechanism. Nothing ties staging, its checkpoint, or a rebuild-complete directory to the Rebuilding
+     entry; re-place away while the host is down, finish elsewhere, re-place back, restart: the old checkpoint
+     resumes or the old copy flips Active, stale with no entries. Fix: an episode UUID in the Rebuilding
+     StoreEntry (transferId fits), recorded in checkpoint and beside rebuild-complete; discard mismatches. The
+     same episode id lets the Deleted Stores pass tell a lost copy from a completed transfer (helps 3.1 / SL-W1).
 
 
-PRIORITY 3: systemic loss protection (design track; SL doc has no solution yet)
--------------------------------------------------------------------------------
+PRIORITY 3: systemic loss protection
+------------------------------------
 
-(Single item moved to Backlog.txt. This item will require substantial design and will be addressed later)
+(The correlated false "store lost" design item remains in Backlog.txt. The items below are independent S/M fixes.)
+
+3.1  Retention gaps: lost-store copies deleted before a rebuild succeeds: SL-W1, SL-W2, SL-W3, SL-W4       [S each]
+     All CONFIRMED. Contradict server/host/CLAUDE.md "nothing of a lost store is destroyed before its rebuild
+     succeeds" (contradiction X 5.5; also rebuild-process.md B3/4.3).
+     - SL-W1: re-placing a queued rebuild (replaceRebuild) lets the Deleted Stores pass os.remove.all the source
+       copy and dropLeftoverCrlState drop its CRL entries. Fix: route a rebuild-required directory through
+       discardLostStore into pending-delete/ (or use 2.8's episode id).
+     - SL-W2: accept-rebuild-loss, then clearPendingDeletes deletes the copy that may hold the accepted-lost
+       objects. Fix: keep the copy until explicit release when the rebuild accepted any loss; warn in the CLI.
+     - SL-W3: StoreRebuilds.failedOnClose removes crl_save.log, the only copy of the store's transaction state.
+       Fix: rename it to lost-crl-state.log durably.
+     - SL-W4: clearPendingDeletes deletes a copy whose store.cfg fails to parse. Fix: rename-first deletes
+       (deleting- prefix) and delete unparsed only with that prefix; shares the fix with 5.2 (RB-W5).
+
+3.2  Live-voter apply fail-stop fires without a real violation: Q-W1, X-W1 (and Backlog 5.8)               [M]
+     Q-W1 CONFIRMED: Tx.issueCommits fail-stops whenever a live commit voter's re-check skips any object,
+     lock-only ones included; a later non-conflicting commit applied first (fence takeover, allocator follow-up,
+     repair proofs incl. RepairProofs.proveRefcount, refcount changes) triggers it, possibly at w - t stores of a
+     pool at once. X-W1 PLAUSIBLE: a failed backend repair write discards the referenced ObjectState a live voter
+     holds locked; the voter's apply throws StaleObjectState and the store fail-stops. Fix together: quarantine
+     the object instead of fail-stopping (covers Backlog 5.8), never fail-stop on a lock-only object, and on a
+     failed repair write restore the pre-repair state instead of discard. Must not hide 2.1 (X-W2): keep logging
+     lock-only re-check failures, or land 2.1 first. Correct server/store/CLAUDE.md and server/transaction/
+     CLAUDE.md ("where two conflicting commits surface").
+
+3.3  CRL recovery accepts forged entries from object payloads: CRL-W1                                      [S]
+     PLAUSIBLE. StreamReader.newerIntactEntry probes 4 KiB boundaries of old-cycle data, which holds raw object
+     bytes; a crafted (or nested-Aspen) entry with a high serial makes recovery throw CrlCorrupt and the device's
+     CRL is declared lost (every store rebuilt). Tenant-triggerable against every device holding its replicas.
+     Fix: random CRL id in crl/sizing, included in every header (or seeding the CRCs); readHeader rejects others.
 
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-(no open items)
+4.1  One oversized transaction kills the CRL of every device it touches, repeatedly: CRL-W2               [M]
+     CONFIRMED. Nothing bounds a transaction's CRL bytes per store against the stream size; Stream.writeEntry's
+     require throws on the CRL thread; crlFailed unloads the device; the client's retransmit repeats it after a
+     restart. Fix: bound per-store CRL bytes of a transaction (fraction of the stream), vote abort with a named
+     RequirementError, expose the bound so TransactionBuilder fails early.
+
+4.2  Rebuild's pending-allocation sweep waits forever on a transaction held by its own silence: RB-W1     [S]
+     CONFIRMED. sweepPending waits on any listed unresolved allocation with no bound; rule G holds T while a store
+     of T is silent, and the rebuilding store is silent until the sweep finishes. Fix: stop waiting once T's
+     start is past horizon + expiry margin (the rebuilt store is muted for T and will be marked), and skip Txs
+     started after the rebuild began. Not covered by the bounded read of 4.3 (it is a query).
+
+4.3  Reads with no timeout stall the rebuild walk/sweep and the repair scan: RB-W4 + Backlog item         [M]
+     CONFIRMED. A never-completing client.read holds a rebuild slot and cancel cannot end it; healthy pools'
+     rebuilds stall behind it. Same root and fix as Backlog.txt "Repair scan stalls on an allocation held past
+     expiry" (bounded read; a timed-out read is a failed object). The repair agent notes the Backlog item is
+     broader than stated: any object below its read threshold or a key that stays NotRestorable stalls the scan
+     the same way; update the Backlog text. Do the bounded read once for both consumers.
+
+4.4  A finalization action that retries forever keeps the missed-update marker from running: R-W2          [S]
+     CONFIRMED. The marker runs only once every other action settles; allocation/deletion/split/join/tail-removal
+     actions retryUntilSuccessful, so an unrelated outage blocks repair marks for its duration. Fix: run the
+     marker once the others settle or after a bound (FinalizationStallAfter), whichever first. Correct the
+     "failing action" wording in server/transaction/CLAUDE.md and the MissedUpdateFinalizationAction.execute
+     scaladoc.
+
+4.5  A stale repair pass resets the lock-deferral count; a hot object never reaches a proof: RP-W2         [S]
+     PLAUSIBLE. DeferralState.record forgets on any non-lock result, and parking resets the stale count, so
+     stale/parked/locked alternation never reaches proofAfterDeferrals. Fix: do not reset the lock count on a
+     stale pass (or keep parking once started until a complete pass).
 
 
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-(no open items)
+5.1  Driver ignoring an abort TxFinalized is dropped from the store's driver map: P-W3                     [S]
+     CONFIRMED (also raised by transaction-recovery). Only after a split decision. Fix: remove only if the
+     driver concluded after receiveTxFinalized.
+
+5.2  Markerless leftover directory at a store path is loaded and served: RB-W5                             [S]
+     PLAUSIBLE. In-place os.remove.all can remove a marker and fail before config.yaml; tryLoadStore then loads
+     an old incarnation. Fix: rename-first deletes (shared with SL-W4 in 3.1), and have the reconcile close a
+     loaded store whose device entry is absent.
+
+5.3  CRL completion handlers run on the writer thread before the next write: CRL-W4                        [S]
+     PLAUSIBLE. Network sends in handlers serialize on the device's one writer thread under group commit. Fix:
+     ordered completion executor; queue WriteComplete at once. Measure first.
+
+5.4  CRL shutdown() leaves pending Futures uncompleted: CRL-W5                                             [S]
+     CONFIRMED mechanism. droppingCrlState / crlDropsRunning keep a store until process restart. Fix: fail
+     every pending and later call with CrlClosed.
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
 
-(no open items)
+6.1  Open questions left by the review                                                                      [S-M]
+     - X-W2 (2.1): does a returning muted store or leader retransmit force a new round that discards the stale
+       vote? If always, only the rule-B leg remains.
+     - X-W1 (3.2): is any non-fatal FSIF repair failure (other than RepairSlotOccupied) reachable for an object
+       held in memory? If not, X-W1 is latent (priority 5).
+     - A Tx created from a resolved cache entry (outcomeDecided) votes without locks and reports Unresolved
+       (contradiction X 5.6): harmless for safety; check the liveness cost (adopt turned into hold).
+     - RARS objects built by appends/ranged writes: verify the rebuild's ida.encode of the full restored data
+       yields the backend's per-store slice layout.
+     - RebuildState.removeAll calls os.remove on possibly missing files: confirm it cannot throw.
+     - A store transferred back onto a device: can leftover CRL entries of its earlier incarnation survive and be
+       recovered as its own? (crash-recovery-log open question 1.)
+     - Safe manual reinstatement procedure for a falsely declared store (systemic-loss open question 2).
 
 
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-(no open items)
+7.1  Contradictions between safety docs (cross-document-review.md section 5)                               [S]
+     5.2 a prover is forgotten only on TxFinalized or a late outcome (fix paxos-transactions.md proof section and
+     transaction-recovery.md 4.4); 5.3 rebuild-process.md 5.3 "expiry never discards a committed, unfinalized Tx"
+     is false (rule D). 5.1, 5.4, 5.5, 5.7 are fixed with 2.5, 2.3, 3.1, 2.7.
+
+7.2  Architecture.md contention rules do not match the driver: P-W4                                        [S]
+     Abort needs more than w - t abort votes; no-commit-vote does not abort (the tally waits); no timestamps are
+     compared. Replace with the abort-certain / commit-certain / undecided classification and the collision wait.
+
+7.3  Stale finding ids and inaccuracies in module CLAUDE.md files: P-W5 and agent reports                  [S]
+     Old safety-doc ids (F*, Q-N*, R-N*, X*, G*, Todo n.m) cited in server/transaction/CLAUDE.md,
+     server/store/CLAUDE.md, server/crl/CLAUDE.md, server/repair/CLAUDE.md, client/internal/transaction/
+     CLAUDE.md, and in scaladoc (SimpleCRL, CrlAdmission, StreamWriter, FilePreallocation, LogEntry, Tx,
+     Frontend): replace with document + section topic. server/store/CLAUDE.md: lane argument is now
+     cross-document-review.md section 3; RepairSlotOccupied and amnesiac reply are section 2. Also:
+     - client/internal/transaction/CLAUDE.md says there is no time horizon (wrong: 20 s horizon, forget floor);
+       it also says a silent store is marked for every hosted object (lock-only objects are excluded).
+     - server/repair/CLAUDE.md ScanTimedOut bullet mentions an orphan pass / confirmOrphans (gone).
+     - server/crl/CLAUDE.md: say readStoreState serves loads, transfers and drops from memory.
+     - server/host/CLAUDE.md retention sentence: fixed with 3.1.
+
+7.4  Stale scaladoc and code comments                                                                      [S]
+     TransactionDriver.resolveLate (entry durable only after other actions: stale); MissedUpdateFinalizationAction
+     .execute ("complete" -> "settle"); MissedUpdateMarker.writeBatch (head chunk may itself be None);
+     UnackedCommitEntry (lists every changed object, not only traceless ones); RepairPolicy
+     .minErrorEntryAgeForDeletion (age paces a read; only InvalidObject.provesDeletion deletes); RebuildingStore
+     class doc (repair-on-read no longer exists; writes during rebuild are marked and repaired by scans);
+     CrashRecoveryLog trait (saveAppliedStub / whenDurable handlers run on the writer thread);
+     TransactionDescription.tracelessObjects has no caller (remove).
+
+7.5  Stale text in server/store/backend/fsif/DESIGN.md and Backlog.txt                                     [S]
+     fsif/DESIGN.md 4.5 step 3 and 4.2: discarded/ is gone; discardLostStore saves to lost-crl-state.log, drops
+     (closeUnloaded dropDurably = false), moves to pending-delete/, deleted only once the store is Active;
+     failedOnClose rationale. Backlog.txt: the systemic-loss item's discard description and its SL row ids
+     (old X2/X3/X5/X6/X7 -> new destructive rows X3, X4, X5, X6); "Why there is no per-commit watchdog" (an
+     undecided driver never proposes abort; waiting Txs end by expiry rules A-G); the out-of-space sub-item about
+     a late prepare after cache expiry is obsolete (receivePrepare refuses below the forget floor); the repair
+     stall item's scope (see 4.3).
+
 
 PRIORITY 8: unimplemented features
 ----------------------------------

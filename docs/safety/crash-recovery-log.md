@@ -1,137 +1,138 @@
 # Crash Recovery Log (CRL): interface contract, SimpleCRL, and failure analysis
 
-Status: derived from the code on `main` (commit c3ad5493), not from CLAUDE.md. Refreshed 2026-11-09 against `0d08e3c6`
-(branch `pin_refactor`, replay pins): the CRL code (`server/crl/`) is unchanged by that work; what changed is how
-recovered state is used (section 11, "Re-assessment for replay pins"). Refreshed again 2026-11-10 against `c181375b`
-for the replay-pins addendum, which **does** change the CRL: it adds applied stubs, a second record kind (section 3.6;
-"Re-assessment for the replay-pins addendum" in section 11). Passages it changed are marked
-"(addendum)". Where CLAUDE.md or a design doc
-disagrees with the code, the code is reported and the disagreement is listed in section 11. Three of the flaws in
-section 11 were reproduced by running the real `SimpleCRL` from a scratch program outside the repository; those are
-marked "reproduced". No source file was modified.
-
-Path shorthand used for citations: `S` = `src/main/scala/org/aspen_ddp/aspen/server`. `S/crl` is the CRL package.
-`file:N` is a line number in that file.
+Derived from the code. Path shorthand: `S` = `src/main/scala/org/aspen_ddp/aspen/server`; `S/crl` is the CRL package.
+Code is cited as file plus symbol.
 
 Sibling documents (not duplicated here): [paxos-transactions.md](paxos-transactions.md),
 [transaction-requirements.md](transaction-requirements.md), [transaction-recovery.md](transaction-recovery.md),
 [repair-process.md](repair-process.md), [rebuild-process.md](rebuild-process.md),
-[systemic-loss-protection.md](systemic-loss-protection.md).
+[systemic-loss-protection.md](systemic-loss-protection.md), [cross-document-review.md](cross-document-review.md).
 
 ---
 
 ## 1. Purpose and fault model
 
 A store is a Paxos acceptor for every transaction that touches one of its objects, and a participant that must be able
-to apply a committed update it has voted for. Both facts live in memory. The CRL is the only place they are made
-durable before the store speaks. If a store forgets a promise or an accepted value it can later promise or accept
-something that contradicts what the other acceptors believe (a split decision). If it forgets the object data of a
-commit vote, a decided commit can no longer be applied by that store.
+to apply a committed update it voted for. Both facts live in memory. The CRL is the only place they are made durable
+before the store speaks. If a store forgets a promise or an accepted value it can later promise or accept something
+that contradicts what the other acceptors believe (a split decision). If it forgets the object data of a commit vote,
+a decided commit can no longer be applied by that store.
 
-The CRL therefore has one job: **make a store's per-transaction Paxos state, vote, transaction description and object
-data durable before any message that depends on them is sent, and give them back after a crash.**
+The CRL has one job: **make a store's per-transaction Paxos state, vote, transaction description and object data
+durable before any message that depends on them is sent, and give them back after a crash.** It also holds applied
+stubs (section 3.6), a second, much smaller kind of record.
 
 ### 1.1 Assumptions the guarantees rest on
 
-These are not enforced by code. Violating one voids the guarantees.
-
 | Id | Assumption | Where it matters |
 |----|------------|------------------|
-| A1 | A write to a file opened with `DSYNC` (`O_DSYNC`) that returns normally is on stable storage, including after power loss. Disk write caches either honour flush/FUA or are disabled. | All of section 5.5 |
-| A2 | A failed or never-returning `write` means the data is not relied on. Writes are never retried. | `S/crl/simple/StreamWriter.scala:56-62` |
-| A3 | Exactly one `CrashRecoveryLog` instance has the device's `crl/` files open at a time, in exactly one process. Nothing enforces this with a file lock. | adoption, duplicate mounts |
-| A4 | Backend commit completion means the object update is durable in the backend (RocksDB uses `setSync(true)`, `S/store/backend/rocksdb/BufferedConsistentRocksDB.scala:111`; FSIF journal force). The CRL entry of a committed transaction is deleted only after that. | section 3.4 |
-| A5 | The CRL and the stores it serves are on the same device and move together (today). | sections 7-9 |
-| A6 | One thread (the store's executor) calls `save`/`delete` for a given store; the CRL thread serialises everything else. | section 5.3 |
+| A1 | A `write` to a file opened with `DSYNC` that returns normally is on stable storage, including after power loss. Disk write caches honour flush/FUA or are disabled. | All of section 5.6 |
+| A2 | A failed or never-returning `write` means the data is not relied on. Writes are never retried; the CRL dies instead (5.10). | `S/crl/simple/StreamWriter` |
+| A3 | Only one CRL instance writes a device's `crl/` files. Enforced by `CrlLock` for every opener on the same file system (5.1); not enforced for two hosts mounting one shared device. | adoption, double mounts |
+| A4 | Backend commit completion means the object update is durable in the backend (RocksDB writes with `setSync(true)`, FSIF completes once its journal batch is forced). The CRL record of a committed transaction is deleted only after that. `MapBackend` gives no durability and is for tests only. | section 3.4 |
+| A5 | The CRL and the stores it serves are on the same device and move together. | sections 7-9 |
+| A6 | A store's `save`/`delete*` calls come from its own executor; the CRL thread serialises everything. | section 5.3 |
+| A7 | The file system overwrites in place. On copy-on-write file systems (btrfs, ZFS) every CRL write allocates and can fail with `ENOSPC`; the open warns once. | 5.1, 10.17 |
 
 ---
 
 ## 2. The CRL interface and its contract
 
-Interface: `S/crl/CrashRecoveryLog.scala:117-171` (trait), factory `S/crl/CrashRecoveryLogFactory.scala:8-11`,
-persisted unit `S/crl/TransactionRecoveryState.scala:8-14`.
+Interface: the `CrashRecoveryLog` trait (`S/crl/CrashRecoveryLog.scala`), factory `CrashRecoveryLogFactory.openCRL`
+(`S/crl/CrashRecoveryLogFactory.scala`), records `TransactionRecoveryState` and `StoreRecoveryState`.
 
 `TransactionRecoveryState(storeId, serializedTxd, objectUpdates, disposition, status, paxosAcceptorState)` is the record
 for one (store, transaction). `paxosAcceptorState` is `PersistentState(promised: Option[ProposalId],
-accepted: Option[(ProposalId, Boolean)])`.
+accepted: Option[(ProposalId, Boolean)])`. `StoreRecoveryState(transactions, appliedStubs)` is everything held for one
+store; an applied stub is a `TransactionId` with its transaction's start `HLCTimestamp`.
 
 | Method | Meaning |
 |--------|---------|
-| `save(txid, state, onDurable)` | Make `state` durable. `onDurable` runs once it is. Saves for one (store, txid) replace one another; the newest wins. |
-| `deleteTransaction(store, txid)` | Best-effort, lazy, **no acknowledgement**. A crash before the deletion is written leaves the transaction recoverable. |
-| `deleteTransactions(store, txids): Future` | As above, but the Future completes only when the deletion is durable. |
-| `dropTransactionObjectData(store, txid)` | Stop carrying the object data of this transaction in future entries. Memory-only; not durable by itself. |
-| `readStoreState(store): Future[StoreRecoveryState]` | (addendum) The store's live transactions **and applied stubs**. Leaves them live. Ordered with saves (FIFO on the CRL thread). |
-| `getFullRecoveryState(store)` / `getAppliedStubs(store)` | Blocking variants (`S/crl/CrashRecoveryLog.scala:121-130`); the undeferred, test-only Frontend path reads through `readStoreState` (`S/store/Frontend.scala:305`). |
-| `loadStore(store, state)` | Default: save each stub, then each transaction, complete when all are durable (`CrashRecoveryLog.scala:136-155`). Used to load a `crl_save.log`. |
-| `saveAppliedStub(store, txid, onDurable)` (addendum) | Save a stub for (store, txid), replacing any transaction state held for it in the **same** entry; `onDurable` once durable. Not subject to admission checks (`CrashRecoveryLog.scala:164-167`). |
-| `deleteAppliedStub(store, txid)` (addendum) | Lazy, unacknowledged deletion of the stub only; transaction state for the id stays. `deleteTransaction` likewise never removes a stub. |
-| `deleteTransactions(store, txids): Future` | (addendum) Deletes transaction state *and* stubs of each id. |
-| `dropStore(store): Future` | Delete every entry the store holds *at the time of the call*, stubs included, durably. |
-| `storesWithEntries(): Future[Set[StoreId]]` | Which stores have live entries, stub-only stores included. |
-| `shutdown()` | Blocks until the CRL threads stop. Idempotent in SimpleCRL. |
-| `admissionLimitBytes` | How many live bytes the CRL admits (section 6). |
-| `openCRL(devicePath, config)` (factory) | Recover and open. **Throws** if the files cannot be recovered. |
+| `save(txid, state, onDurable)` | Make `state` durable; `onDurable` runs once it is. Saves for one (store, txid) replace one another; the newest wins. |
+| `deleteTransaction(store, txid)` | Lazy, unacknowledged deletion of the transaction state. A crash before it is written leaves the transaction recoverable. An applied stub of the id stays. |
+| `deleteTransactions(store, txids): Future` | Deletes transaction state **and** applied stubs of each id, in one entry; completes once that entry is durable. An empty list completes at once. |
+| `dropTransactionObjectData(store, txid)` | Memory only: the next rewrite of the record (a save, a copy-forward) leaves the object data out. Nothing is written. |
+| `whenDurable(store, handler)` | Runs `handler` once every request queued before it is durable. Orders a write outside the CRL (a backend deletion) after a deletion, which has no completion of its own. |
+| `readStoreState(store): Future[StoreRecoveryState]` | The store's live transactions and stubs, answered in queue order with every earlier request. Leaves them live. Returns the in-memory state, so a transaction whose data was dropped is still returned with its data. |
+| `getFullRecoveryState` / `getAppliedStubs` | Blocking variants of `readStoreState` (SimpleCRL awaits it). Only the undeferred, test-only Frontend path blocks. |
+| `loadStore(store, state): Future` | Saves a `crl_save.log`'s state: every stub first, then (once those are durable) every transaction. SimpleCRL tracks every save so a CRL death fails the Future. |
+| `saveAppliedStub(store, txid, start, onDurable)` | Saves a stub, replacing any transaction state of the id in the same entry. Never subject to admission checks. |
+| `deleteAppliedStub(store, txid)` | Lazy, unacknowledged deletion of the stub only. Writes nothing if no stub is held. |
+| `dropStore(store): Future` | Deletes every transaction and stub of the store held when the request is processed, durably. In SimpleCRL its transaction deletions are cancellable by a later save of the same id in the same entry (5.8). |
+| `storesWithEntries(): Future[Set[StoreId]]` | Stores with live entries, stub-only stores included. |
+| `recoveredBytesByStore` | What the open recovered for each store, as admission counts it (section 6). |
+| `failed: Future[Throwable]` | Completes, with the cause, if the CRL dies (5.10). |
+| `shutdown()` | Blocks until the CRL's threads have stopped and its files are closed. Idempotent. |
+| `admissionLimitBytes` | The device's admission limit (section 6): half a stream in SimpleCRL. |
+| `openCRL(devicePath, config)` | Recover and open. Throws `CrlLocked`, `CrlSizingMismatch`, `CrlCorrupt`, `BrokenEntryChain`, or whatever reading the files threw. |
+
+The trait's defaults (read through `getFullRecoveryState`, `dropStore` as read-then-delete, `whenDurable` at once,
+no failure) are for CRLs that keep nothing on disk, such as test CRLs. `loadStore`'s default runs its callbacks on the
+global pool; SimpleCRL overrides it.
 
 ### 2.1 Numbered contract
 
-Items marked **(intended)** are what the design requires; section 11 lists where SimpleCRL does not meet them.
-
 **Durability and ordering**
 
-- **C1 (save-before-send).** `onDurable` of `save(t, s, h)` runs only after a log entry containing a record of `t` at
-  least as new as `s` has been written with `DSYNC` and the write returned. A caller must send nothing that depends on
-  `s` before `onDurable`.
-- **C2 (entry order).** Entries are written one at a time, in serial-number order. Entry N+1 is not issued until entry
-  N's write returned and its handlers ran (`writeInProgress`, `S/crl/simple/SimpleCRL.scala:166-168, 216-220`). So when a
-  handler of entry N runs, every earlier entry is durable. Handlers of one entry run in unspecified order, on the
-  writer thread.
-- **C3 (single run).** Each handler runs at most once, and only if the entry's write returned normally. If the CRL
-  thread dies, handlers never run (A2).
-- **C4 (newest wins).** After recovery, each live transaction has the state of its newest durable record. Records in
-  older entries never override newer ones (`LogEntry.loadStaticEntryContent`, `S/crl/simple/LogEntry.scala:169-185`).
-- **C5 (what "live" means).** A record is live from its first durable save until a durable deletion of the same
-  (store, txid) newer than it, or a `dropStore` covering it.
+- **C1 (save before send).** `onDurable` of `save(t, s, h)` runs only after the entry holding `h` has been written
+  with `DSYNC` and the write returned. A caller sends nothing that depends on `s` before `onDurable`. Exception, by
+  design: a save of an id that the same unwritten entry already deletes finally is skipped and still acknowledged
+  (C9). A deletion is the store's decision to forget the transaction, which already makes every earlier state of it
+  forgettable.
+- **C2 (entry order).** Entries are written one at a time, in serial order. Entry N+1 is not issued until entry N's
+  write returned and every handler of N ran (`writeInProgress`; the writer queues `WriteComplete` only after the
+  handlers). So when a handler of entry N runs, every earlier entry is durable. Handlers run on the **writer thread**,
+  newest first within an entry (`LogEntry.completionHandlers` is prepended and run in list order). Callers that touch
+  store state post to the store's executor (`Frontend.post`); `Tx`'s prepare and accept handlers only send messages.
+- **C3 (single run).** Each handler runs at most once, and only if its entry's write returned normally. A CRL that
+  dies runs no handler of an entry not yet written.
+- **C4 (newest wins).** After recovery, each live record has the state of its newest durable record
+  (`LogEntry.loadStaticEntryContent`, applied newest entry first).
+- **C5 (live).** A record is live from its first durable save until a durable deletion of the same (store, txid) in
+  the same or a newer entry, or a `dropStore` or `deleteTransactions` covering it.
 
 **Atomicity and corruption**
 
-- **C6 (entry atomicity, intended).** A log entry is recovered whole or not at all. SimpleCRL approximates this with a
-  stream UUID in the header and again as the last 16 bytes of the static region (`LogEntry.scala:21-31,109`,
-  `StreamReader.scala:47-74`). It detects a write that stopped early at an aligned boundary; it does **not** detect
-  reordered sectors or a silently truncated gather write (F1, F5).
-- **C7 (prefix, intended).** Recovery returns the state as of a prefix of the entry sequence: the first unreadable
-  entry ends the log (`StreamReader.findHighestEntry`, `StreamReader.scala:40-44`). Anything lost this way must never
-  have been acknowledged. F1 and F2 are the cases where acknowledged entries fall outside the recovered prefix.
-- **C8 (broken chain is fatal).** If an entry needed for recovery is unreadable, `openCRL` throws
-  (`Recovery.BrokenEntryChain`, `Recovery.scala:16, 65-83`). It never returns a partial state silently.
+- **C6 (entry atomicity).** An entry is taken whole or not at all. Its header carries a CRC32C of the header
+  (`header_crc`) and one of the body through the trailing UUID (`body_crc`), and the stream UUID appears in the header
+  and as the last 16 bytes of the static region (`LogEntry.createEntryBuffers`, `StreamReader.readHeader`,
+  `StreamReader.bodyIntact`).
+- **C7 (only the in-flight write may be torn).** Recovery drops the newest entry if its body fails its checksum: that
+  can only be the write in flight at a crash, which no handler acknowledged. Any other failed checksum, and any
+  intact entry newer than the newest one found, throws `CrlCorrupt` (5.7).
+- **C8 (broken chain is fatal).** If an entry needed for recovery cannot be read, or data a live record names lies
+  outside the dynamic data of every verified entry, `openCRL` throws (`Recovery.BrokenEntryChain`, `CrlCorrupt`). It
+  never returns a partial state.
 
 **Deletion**
 
-- **C9 (deletion finality in an entry).** A delete of (store, txid) applies to that txid's saves in the same entry and in
-  all older entries (`LogEntry.scala:40-58, 169-185`). A save of the same txid queued after the delete into the same
-  unwritten entry is dropped but its handler still fires (F4).
-- **C10 (delete durability).** `deleteTransactions`/`dropStore` complete only after the entry carrying the deletion is
-  durable. A delete with no durable record may be undone by a crash.
+- **C9 (deletion finality in an entry).** A deletion of (store, txid) applies to that txid's saves in the same entry
+  and in all older ones. A save of the same txid queued after a final deletion into the same unwritten entry is
+  skipped and acknowledged once the deletion is durable, and creates no in-memory record (`LogEntry.deletesFinally`,
+  `SimpleCRL.onSaveTransaction`). Deletions made by a stub's save or by `dropStore` are cancellable: a later save of
+  the id in the same entry removes the deletion and is written (`LogEntry.deleteTxUnlessResaved`, `LogEntry.addTx`).
+- **C10 (deletion durability).** `deleteTransactions` and `dropStore` complete only after the entry carrying the
+  deletion is durable. `deleteTransaction` and `deleteAppliedStub` have no completion; `whenDurable` orders later
+  work after them.
 
 **Capacity**
 
-- **C11 (live bound, intended).** The live data of a CRL never exceeds half a stream, so copying the live content of a
-  recycled stream forward always fits (`SimpleCRL.scala:104-107`). Enforced only by prepare admission, which has
-  gaps (F8). `Stream.writeEntry`'s `require` is the fail-stop backstop (`Stream.scala:28`).
-- **C12 (sizing is fixed).** The count and file size of the streams are fixed at creation. Opening with another sizing
-  throws `SizingMismatch` (`SimpleCRL.scala:84-93`). *2026-11-14:* the sizing is recorded in `crl/sizing` at creation
-  and an existing CRL always opens with it; only files disagreeing with that record throw (`CrlSizingMismatch`).
+- **C11 (live bound).** The live data of a CRL must stay below one stream minus the entry pending at a rotation, so a
+  rotation's copy-forward always fits. Admission keeps live bytes near half a stream (section 6). `Stream.writeEntry`'s
+  `require` is the fail-stop backstop: a write that does not fit kills the CRL (5.10). Admission does not bound a
+  single transaction (see CRL-W2).
+- **C12 (sizing is fixed).** Stream count and size are fixed when a CRL is created and recorded in `crl/sizing`; an
+  existing CRL always opens with them, whatever the device config says.
 
 **Ownership**
 
-- **C13 (one CRL per device).** Every store on a device saves to, recovers from and deletes from the one CRL in
-  `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`, `CrashRecoveryLog.scala:15`).
-- **C14 (readStoreState is ordered).** `readStoreState` is answered in order with the saves and deletes issued before
-  it, so it sees every save whose call preceded it. `dropStore` relies on this to delete only what existed when called
-  (`CrashRecoveryLog.scala:155-162`).
-- **C15 (recovered status).** Disk recovery and `readStoreState` return the same status: the one last saved. The
-  static record stores it in bits 3-4 of the Paxos mask byte (`LogContent` `Tx.writeStaticEntry`/`loadTx`), so the
-  record's size is unchanged (F14, fixed 2026-11-16).
+- **C13 (one CRL per device).** Every store on a device saves to, recovers from and deletes from the CRL in
+  `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`).
+- **C14 (queue order).** Every request is processed in the order it was queued. `readStoreState` sees every save queued
+  before it, and `dropStore` drops exactly what was saved before it.
+- **C15 (recovered status).** Disk recovery and `readStoreState` return the same status: the one last saved. It is
+  stored in bits 3-4 of the static record's Paxos mask byte (`Tx.writeStaticEntry`, `Tx.loadTx`), and a recovered Tx
+  restores a saved resolution from it (`Tx.oresolution`, transaction-recovery.md).
 
 ---
 
@@ -139,161 +140,199 @@ Items marked **(intended)** are what the design requires; section 11 lists where
 
 ### 3.1 What is saved, and what each completion gates
 
-All `crl.save` call sites are in `S/transaction/Tx.scala`. The state saved is always
-`TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, txStatus, acceptor.persistentState)`.
+All `crl.save` calls go through `Tx.saveState` (`S/transaction/Tx.scala`). The state saved is always
+`TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, txStatus, acceptor.persistentState)`,
+where `trsObjectUpdates` leaves out the data once the commits have persisted (`saveObjectUpdates`) and any update
+removed by `persistWithoutUpdateOf`.
 
-| Event at the store | Save site | What `onDurable` sends | What it protects |
-|--------------------|-----------|------------------------|------------------|
-| Prepare handled, all objects loaded | `Tx.scala:742` (`respondToPrepare`) | `TxPrepareResponse` (Promise or Nack, vote, collisions) | Promise (Paxos), vote disposition, txd, object data |
-| Prepare answered before objects loaded (response delayed) | `Tx.scala:427` (`sendDelayedPrepare`) | the delayed `TxPrepareResponse` | same; the disposition is decided at this moment |
-| Accept handled | `Tx.scala:762` (`receiveAccept`) | `TxAcceptResponse` (Accepted or Nack) | Accepted proposal and value |
-| Backend commits of this transaction complete | `Tx.scala:610` | nothing; `dropTransactionObjectData` | stop carrying object data |
-| TxFinalized (all commits succeeded) | `Frontend.scala:481` via `Frontend.scala:537` | nothing; `deleteTransaction` | end of the record |
-| (addendum) Same point, when an UnackedCommits entry may name the store (`owed`, or applied through the entry) | `Frontend.concludeTransactionState`, `Frontend.scala:668-674` -> `recordAppliedStub` `:395-409` | nothing; releases the transaction's admission once durable | the record is replaced by an applied stub (3.6) |
+| Event at the store | Save site | What `onDurable` does | What it protects |
+|--------------------|-----------|-----------------------|------------------|
+| Prepare answered, objects loaded | `Tx.answerPrepareAsAcceptor` | sends `TxPrepareResponse` (Promise or Nack, vote, collisions) and the vote to the client | promise, vote, txd, object data |
+| Prepare answered before the objects loaded | `Tx.sendDelayedPrepare` | sends the delayed `TxPrepareResponse` | as above; the disposition is decided now |
+| Accept | `Tx.receiveAccept` | sends `TxAcceptResponse` | accepted proposal and value |
+| Object data adopted from a later prepare | `Tx.saveAdoptedData` | posts: releases a commit held for the data (`adoptedDataUnsaved`) | the data a commit will apply |
+| Object this transaction allocated is being deleted | `Tx.persistWithoutUpdateOf` | posts: lets the backend deletion proceed | a restart must not allocate it again (transaction-recovery.md) |
+| Backend commits of the transaction complete | `Tx.allObjectCommitsComplete` | `dropTransactionObjectData`, nothing written | stop carrying object data |
+| Finalized (or aborted, expired, forgotten) | `Frontend.concludeTransactionState`, `Frontend.deleteTransactionState` | `deleteTransaction` | end of the record |
+| Finalized, and an UnackedCommits entry may name the store | `Frontend.recordAppliedStub` | `saveAppliedStub`; posts: releases the transaction's admission | the record is replaced by an applied stub (3.6) |
 
 Consequences:
 
-- **The vote and the promise travel together.** The first prepare response carries both the promise and the commit/abort
-  vote, and both are in the state saved at `Tx.scala:742` before it is sent. This is what makes the 1-RTT commit safe
-  across a crash. The Paxos side is described in [paxos-transactions.md](paxos-transactions.md).
-- **Nacks are saved too.** The state is saved before a Nack is sent (no state change, but the same path).
-- **No decision record.** No save is made because a transaction resolved. But every save writes the Tx's current
+- **The vote and the promise travel together.** The first prepare response carries both, and both are in the state
+  saved before it is sent. This is what makes the 1-RTT commit safe across a crash ([paxos-transactions.md](paxos-transactions.md)).
+- **Nacks are saved too**, through the same path.
+- **No decision record.** No save is made because a transaction resolved, but every save writes the Tx's current
   status, so a prepare or accept handled after the resolution persists `Committed` or `Aborted`, and recovery restores
-  it (`Tx.oresolution`, transaction-recovery F6, fixed 2026-11-14): the commit is applied, or the abort's state deleted,
-  once the objects load. Any other recovered transaction is `Unresolved` and is resolved again by Paxos and the status
-  caches ([transaction-recovery.md](transaction-recovery.md)).
-- **No vote is sent for a transaction the CRL has not accepted.** A dead CRL thread therefore stops every vote of every
-  store on the device while the stores otherwise keep running (F9).
+  it: the commit is applied, or the abort's state deleted, once the objects load. Any other recovered transaction is
+  `Unresolved` and is resolved again ([transaction-recovery.md](transaction-recovery.md)).
+- **No vote is sent for a transaction the CRL has not made durable.** A dead CRL therefore stops every vote of every
+  store on the device; the host then unloads the device (5.10).
 
 ### 3.2 What data the record must contain
 
-A commit vote requires the store to hold the object data it will apply (`Tx.scala` `missingObjectData`, checked as
-`MissingObjectUpdate`; (addendum) and since prefer-abort a commit vote requires a client prepare at all, the carrier of
-the data: `awaitingClientPrepare`, `Tx.scala:205-208`). So every
-commit vote that reaches `onDurable` has its object data in the same record. Data that arrives *after* a vote
-(`Tx.adoptObjectUpdates`) is persisted only by the next save of that transaction; a store that voted abort for lack of
-data and later applies a commit with late data has that data only in memory. That store did not count towards the
-commit's write threshold; if it crashes before its backend commit, the miss is handled by repair
-([repair-process.md](repair-process.md)).
+A commit vote requires a client prepare (prefer-abort, `Tx.awaitingClientPrepare`) and the object data it will apply
+(`MissingObjectUpdate`), so every commit vote that reaches `onDurable` has its object data in the same record. Data
+that arrives after the first save (a driver's data-less prepare, then the client's, `Tx.adoptObjectUpdates`) is saved
+again by `saveAdoptedData`, and a commit decided meanwhile is held until that save is durable (`commitAwaitsData`): a
+commit applied first and then lost to a crash before its backend commit completed would recover the Tx without the
+data. A save that changes the update count makes SimpleCRL write the updates again, keeping the txd's location
+(`SimpleCRL.onSaveTransaction`).
 
 ### 3.3 Loading and recovery of a store
 
-1. The device's CRL is opened before any of its stores (`S/host/DeviceDiscovery.scala:498-520, 563-567`).
-2. `StoreLoader.handleLoad` (`S/host/StoreLoader.scala:269-`) builds the `Store` with `deferRecovery = true`. If the
-   store directory has a `crl_save.log` it is read first (`StoreLoader.scala:282`); an unusable one makes the store
-   permanently unservable (`crlSaveFileLost`, `S/host/StoreRebuilds.scala:344`). Otherwise the store recovers from the
-   device CRL.
-3. `StoreRouter.readAndRecover` (`S/host/StoreRouter.scala:222-250`) runs on the store's executor and calls
-   `readStoreState`. It never blocks: the Future completes on the CRL thread and a task is posted back to the executor.
-   The store holds all transaction messages until `Frontend.recover` has recreated its transactions
-   (`Frontend.scala:271-340`), so it saves nothing in between. A throw while reading or recovering fail-stops the store
-   (`Host.StoreRecoveryFailed`).
-4. For a `crl_save.log`: `store.crl.loadStore` re-saves every record into the device CRL, then `crlLoaded` removes the
-   file durably (`DurableFiles.remove`) and only then recovers (`StoreRouter.scala:257-263`). A crash between "records
-   durable in the device CRL" and "file removed" loads the same records again under the same ids, which is harmless
-   because the store served nothing in between.
-5. Each recovered transaction is counted into the device's `CrlAdmission` without a limit check
-   (`Frontend.admitRecovered`, `Frontend.scala:458`).
+1. The device's CRL is opened before any of its stores are offered for loading (`DeviceDiscovery.loadOwnedDevice`,
+   `openDeviceCrl`), on the control thread.
+2. `StoreLoader.handleLoad` reads the store's `crl_save.log`, if any, before the `Store` exists. An unusable
+   one (`loadValidStoreState` returns `Left` for anything thrown, including transient errors) makes the store
+   permanently unservable (`StoreRebuilds.crlSaveFileLost`).
+3. With no save file, `StoreRouter.recoverDeferred` -> `readAndRecover` runs on the store's executor and calls
+   `readStoreState`. It does not block: the Future completes on the CRL thread and recovery is routed back to the
+   executor. The store holds its transaction messages until `Frontend.recover` has recreated its transactions, so it
+   saves nothing in between. A throw while reading or recovering fail-stops the store (`Host.StoreFailStopped`).
+4. With a save file: `crl.loadStore` saves every record into the device CRL, then `StoreRouter.crlLoaded` removes the
+   file durably (`DurableFiles.remove`) and only then recovers. A crash between "records durable in the device CRL"
+   and "file removed" loads the same records again under the same ids, which is harmless: the store served nothing in
+   between. A failed `loadStore` unloads the store (`handleUnloadFailed`), which drops whatever reached the CRL
+   (`closeUnloaded(dropDurably = true)`): the file is still the whole state.
+5. Recovered transactions are counted into the device's admission without a limit check (`Frontend.admitRecovered`),
+   as are recovered stubs (`chargeStubs`), replacing the share the device's open retained for the store (section 6).
 
 ### 3.4 Deletion is gated on the backend
 
-`Frontend.transactionFinalized` (`Frontend.scala:537`) deletes the CRL record at TxFinalized, except that a committed
-transaction with outstanding or failed backend commits keeps it: `TxCommits` (`Frontend.scala:209-210, 527`). A failed
-backend commit keeps the record, with its object data, for the life of the loaded store. A reload recovers the
-transaction from it. This is the rule behind A4.
+A committed transaction's record is deleted at finalization only once its backend commits have succeeded:
+`Frontend.transactionFinalized` defers to `txCommits` while commits are outstanding or failed, and
+`transactionCommitComplete` concludes it when the last one succeeds. A failed backend commit keeps the record, with
+its object data, for the life of the loaded store; a reload recovers the transaction from it. A recovered commit vote
+that quarantines objects keeps its record, data included, until the quarantine clears (`quarantinedConclusions`).
+This is the rule behind A4.
+
+A backend deletion of an object that a transaction allocated recently waits until no CRL state durably holds that
+allocation's update (`Frontend.awaitAllocationsDurable`): an unconcluded transaction's state is saved again without
+the update (`Tx.persistWithoutUpdateOf`), and a concluded one's deletion or stub only has to be durable
+(`whenDurable`).
 
 ### 3.5 Transfer out, drop, rebuild
 
 | Operation | CRL calls | Source |
 |-----------|-----------|--------|
-| Planned device shutdown | stores close with `extractCrl = false`: records stay live in the device CRL; then `crl.shutdown()` | `DeviceShutdown.scala:215-232, 333-348` |
-| Network transfer out, store open | `readStoreState` on the executor, `saveStoreState` to `crl_save.log` (tmp, fsync, rename, directory fsync), then `deleteTransactions` | `StoreLoader.scala:477-535` |
-| Network transfer out, store closed | same sequence from `extractUnloaded`; fails if the store was opened meanwhile | `S/host/StoreTransfers.scala:91-113` |
-| Rebuild of a store with lost state | marker `rebuild-required` durable, then `dropStore`, then the directory renamed and removed | `StoreRebuilds.scala:499-540` |
-| Store removed from the device by other means | `dropLeftoverCrlState` finds entries of stores with no tree entry, directory, or load, and drops them | `S/host/DeviceReconciler.scala:76-110` |
-| Store whose `crl_save.log` load failed | `closeUnloaded(dropDurably = true)` | `StoreLoader.scala:405-414` |
+| Planned device shutdown | stores close with `extractCrl = false`, records stay live; then `crl.shutdown()` | `DeviceShutdown.closeForShutdown`, `shutDownCrl` |
+| Transfer out, store open | on the executor after `closing`: `readStoreState`; `saveStoreState` to `crl_save.log` (tmp, fsync, rename, directory fsync); `store.close()`; then `deleteTransactions(state.entryIds)` and the retained admission released | `StoreLoader.handleClose(extractCrl = true)` |
+| Transfer out, store closed | `readStoreState`, merged over any earlier save file (`StoreRecoveryState.supersededBy`), saved, then `deleteTransactions`; fails if the store was opened during the read (`opensStarted`) | `StoreTransfers.extractUnloaded` |
+| Rebuild of a store with lost state | marker `rebuild-required` durable; `readStoreState` saved to `lost-crl-state.log` (unless already there); `dropStore`; directory renamed into pending-delete | `StoreRebuilds.discardLostStore` |
+| Store no longer on the device | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory and no drop running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
+| Store whose `crl_save.log` load failed | `dropStore` | `StoreLoader.closeUnloaded(dropDurably = true)` |
 
-The rule that makes this safe: **an entry leaves the device CRL only after another durable copy exists, or after the
-store has been made unservable on disk.** The transfer deletes after the save file is durable; the rebuild drops after
-the marker is durable. (addendum) Every operation in the table carries applied stubs with the transactions: the save
-file holds both kinds of entry (`codec.StoreCRLEntry.applied_stub`, `CrashRecoveryLog.scala:26-51`), an unloaded
-store's extraction merges them (`StoreRecoveryState.supersededBy`, `S/host/StoreTransfers.scala:107-112`), the
-deletions name `state.entryIds`, and `discardLostStore` saves them into `lost-crl-state.log`
-(`StoreRebuilds.scala:511`).
+The rule that makes this safe: **entries leave the device CRL only through a written deletion, and only after another
+durable copy exists or the store has been made unservable on disk.** The transfer deletes after the save file is
+durable; the rebuild drops after the marker (and the `lost-crl-state.log` copy) is durable. Every operation carries
+applied stubs with the transactions: the save file holds both kinds of entry (`codec.StoreCRLEntry.applied_stub`,
+with the start timestamp), and the deletions name `state.entryIds`.
 
-### 3.6 Applied stubs (addendum)
+The leftover drop is safe against a store landing on the device meanwhile: the directory and loaded checks run in the
+control task that issues the `DropStore`, a store that lands has its directory before anything saves for it, and the
+CRL processes requests in queue order, so the drop is processed before any save of the new store, and a save landing
+in the drop's own entry cancels the drop's deletion of that id (C9).
+
+### 3.6 Applied stubs
 
 An applied stub (store S, transaction T) means "S already holds T's update, so an UnackedCommits entry naming S for T
-is stale" (`S/crl/StoreRecoveryState.scala`). It carries no description, object data, Paxos state or requirements, and
-is never recovered as a transaction: the Frontend keeps the stub txids as a set (`Frontend.recoverState`,
-`Frontend.scala:307-311`) and consults it before applying T (transaction-recovery.md 5.4).
+is stale" (`S/crl/StoreRecoveryState.scala`). It carries T's start timestamp and nothing else: no description, data,
+Paxos state or requirements. It is never recovered as a transaction: the Frontend keeps the stub txids
+(`Frontend.recoverState`) and consults them before applying T (transaction-recovery.md).
 
-- **Namespace.** Stubs are separate entries under the same TxId: a stub's save replaces the transaction state of the
-  id **in the same log entry** (`LogEntry.deleteTxForStub`, `SimpleCRL.onSaveAppliedStub`, `SimpleCRL.scala:320-335`),
-  so the deletion and the stub are durable together; a later save of the transaction (a replay's Tx) lives beside the
-  stub, and in the same entry it cancels the stub-made deletion (`LogEntry.addTx`, `stubReplaced`). Only
-  `deleteAppliedStub`, `deleteTransactions` and `dropStore` remove a stub.
+- **Namespace.** Stubs are separate records under the same TxId. A stub's save replaces the transaction state of the
+  id in the same entry (`SimpleCRL.onSaveAppliedStub`, a cancellable deletion), so the deletion and the stub are
+  durable together. A later save of the transaction lives beside the stub; in the same entry it cancels the stub-made
+  deletion. Only `deleteAppliedStub`, `deleteTransactions` and `dropStore` remove a stub; `deleteTransaction` never
+  does.
 - **Write point.** Only where the transaction's record would be deleted (after its backend commits succeeded), never
-  while they are outstanding or failed: `recordAppliedStub` requires it (`Frontend.scala:395-399`), because the record
-  (object data included) is what a reloaded store recovers a failed commit from.
+  while they are outstanding or failed: `recordAppliedStub` requires it.
 - **Crash between "commits durable" and "stub durable".** The record is still live, so the store recovers T as a
-  commit vote; if its entry is found it applies T again through the normal path (transaction-recovery F4, unchanged).
-- **Copy-forward.** A stub has a zero-length `anchor` location in the entry that first wrote it, so rotation copies it
-  forward exactly as it copies a transaction's data (`Stub.closeStream`, `SimpleCRL.scala:211-220`). It keeps
-  `oldestEntryNeeded` back like a long-lived transaction.
-- **Recovery.** Entries are read newest first; a stub is live unless a newer or same-entry stub deletion names it
-  (`LogEntry.loadStaticEntryContent`). An entry never holds a stub and its deletion (`addStub`/`deleteStub`). The
-  open keeps each stub's anchor as recovery found it (the newest entry holding it) and writes nothing (F16).
-- **Admission.** Each stub is charged `CrlAdmission.AppliedStubBytes` (33) without a check, and released when dropped;
-  a closing store retains the charge (section 6).
-- **Lifetime.** Dropped by the store's repair scan with its UnackedCommits entry, or on the next scan once no entry
-  needs it (repair-process.md 5.5). A rebuilt store has none (its entries are dropped with `dropStore`); it is muted
-  for older transactions instead (rebuild-process.md N3).
+  commit vote and resolves it as any recovered transaction.
+- **Copy-forward.** A stub has a zero-length `anchor` location at the end of the dynamic data of the entry that first
+  wrote it, so a rotation copies it forward exactly as it does a transaction's data (`Stub.closeStream`).
+- **Recovery.** A stub is live unless a newer or same-entry stub deletion names it; an entry never holds both a stub
+  and its deletion (`LogEntry.addStub`/`deleteStub`). The open keeps each stub's anchor in the newest entry holding it.
+- **Admission.** Each stub is charged `CrlAdmission.AppliedStubBytes` (41: TxId 33, timestamp 8) without a check,
+  and released when dropped; a closing store retains the charge (section 6).
+- **Lifetime.** The store drops a stub at heartbeat once T is past the horizon plus the expiry margin and the store
+  holds no Tx for T (`Frontend.expireStubs`). Past that point a prepare for T creates no Tx (`Frontend.receivePrepare`
+  refuses it below the forget floor), so the stub can suppress nothing. Stubs are therefore bounded by their write
+  rate times about 30 s, whatever the repair scans do. A rebuilt store has none (its entries are dropped); it is
+  muted for older transactions instead (rebuild-process.md).
 
 ---
 
-## 4. Per-device CRL: lifecycle
+## 4. Per-device CRL lifecycle
 
-- Created: `StorageDeviceManager` writes the config, `owning-host`, and `createDeviceCrlDir` (which forces the device
-  directory) (`S/StorageDeviceManager.scala:112`, `CrashRecoveryLog.scala:19-22`). A device that holds stores but has no
-  `crl/` is considered to have lost it.
-- Opened: `openDeviceCrl` (`DeviceDiscovery.scala:498-520`). On the control thread, blocking (known; Backlog.txt).
-- Lost: if the directory is absent from a device that holds stores, **or `openCRL` throws anything** (`catch case t:
-  Throwable`, `DeviceDiscovery.scala:512-515`), every store directory with a `config` file gets a durable
-  `rebuild-required` marker, `crl/` is moved to `crl.lost-<uuid>` (kept deliberately, Backlog.txt) and a fresh CRL is
-  opened. The reconcile pass later flips each store to Rebuilding. Nothing distinguishes "the files are damaged" from
-  "the process hit an out-of-memory error while reading them" (F6).
-- Unloaded: `shutDownCrl` runs `crl.shutdown()` on a cached pool and records the path in `closingCrls`, so the device is
-  not loaded again over open files (`DeviceShutdown.scala:342-348`, `LocalDevices.scala:37`). That protects only against
-  a second open in the same process (A3).
-- Sizing: `crl-num-streams` (default 3) and `crl-max-file-size-mb` (default 300) come from the device's yaml
-  (`S/StorageDeviceConfig.scala:30-31`). The config travels with the device. Editing it on an existing device makes
-  `SizingMismatch` and therefore a lost CRL (F6). *2026-11-14:* no longer. The keys are required and size only a new
-  CRL; an existing one keeps its recorded sizing (10.15).
+- **Created.** `StorageDeviceManager` writes the device config and `owning-host` and calls
+  `CrashRecoveryLog.createDeviceCrlDir` (makes `crl/`, forces the device directory). The stream files are created at
+  the first open (5.1).
+- **Opened.** `DeviceDiscovery.openDeviceCrl`, on the control thread, blocking (Backlog.txt, "Device CRL recovery
+  currently runs on the host control thread"). Recovery reads the walked entries and the CRC of each; it writes
+  nothing. Then `loadOwnedDevice` creates the device's `CrlAdmission` with `admissionLimitBytes`, charges
+  `recoveredBytesByStore` retained per store, and subscribes `DeviceShutdown.crlFailed` to `crl.failed`.
+- **Refused, retried.** `CrlLocked` (another writer holds `crl/lock`) and `CrlSizingMismatch` (stream files without a
+  readable `sizing` file, or not of the recorded count and size) are rethrown: the device stays unloaded, nothing is
+  marked, every scan retries. A sizing mismatch is logged once; it means damage or a hand edit, never configuration.
+  An `IOException`, `UncheckedIOException` or `VirtualMachineError` (`DeviceDiscovery.isTransient`) is rethrown too,
+  up to `CrlOpenAttempts` (3) consecutive scans.
+- **Lost.** If `crl/` is absent from a device that holds stores (a child directory with a store `config`), or the open
+  throws anything else, or a transient error a third time in a row: every such store directory gets a durable
+  `rebuild-required` marker, one by one; `crl/` is moved to `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the
+  device directory is forced and a fresh CRL is opened. `CrlCorrupt` is logged under its own cause. The reconcile then
+  flips each store to Rebuilding. A device without stores simply has its CRL created. A `crl/` that exists but holds
+  no stream files is opened as a new, empty CRL even when the device holds stores (CRL-W3).
+- **Failed.** A CRL whose thread dies (5.10) completes `failed`; `DeviceShutdown.crlFailed` disowns the directory,
+  closes the stores, gossips them offline and unloads the device until the host restarts. It is neither reloaded
+  before that (a reopen loop would reach `CrlOpenAttempts`) nor marked Failed in the tree.
+- **Unloaded.** `DeviceShutdown.shutDownCrl` runs `crl.shutdown()` on `CrlShutdownEc` and records the path in
+  `LocalDevices.closingCrls` until it returns, so the device is not loaded again over open files.
+- **Sizing.** `crl-num-streams` and `crl-max-file-size-mb` are required keys of the device yaml
+  (`StorageDeviceConfig`; `aspen` writes 3 and 300 by default). They size only a new CRL; an existing one keeps the
+  sizing in `crl/sizing` and logs a warning if the config differs.
 
 ---
 
 ## 5. SimpleCRL, the reference implementation
 
-Code: `S/crl/simple/`. 1 417 lines in total.
+Code: `S/crl/simple/`.
 
-### 5.1 Files and streams
+### 5.1 Files, creation and the lock
 
-A CRL is `numStreams` files `0.crl ... N-1.crl` in `<device>/crl`, each exactly `maxSizeInBytes` long. They are opened
-with `CREATE | DSYNC | WRITE` (`StreamWriter.scala:38-41`). A file shorter than `maxSizeInBytes` is extended by seeking
-to the last byte and writing one byte (`StreamWriter.scala:43-47`). This makes **sparse** files: no block is reserved
-(F7). `SimpleCRL.checkSizing` rejects any directory that has some `*.crl` files but not exactly the expected set at the
-expected size (`SimpleCRL.scala:84-93`).
+A CRL is `crl/sizing`, `crl/lock`, and `numStreams` files `0.crl ... N-1.crl`, each exactly `maxSizeInBytes` long.
 
-The streams form a ring. Exactly one is **active** and written append-only. When an entry does not fit, the writer
-advances to the next stream, **recycles** it (new random stream UUID, write offset 0), and continues there
-(`SimpleCRL.scala:170-183`, `Stream.scala:14-21`). Recycling is in memory only: the old bytes stay on disk until the
-new entry is written over them.
+`SimpleCRL.apply`:
+
+1. `CrlLock.acquire` takes an exclusive POSIX lock on `crl/lock` before anything is read. A second opener in another
+   process gets `CrlLocked` from `tryLock`. A second opener in this process is refused by a registry keyed by the
+   lock file's identity before it opens any descriptor: closing any descriptor of the file would drop the process's
+   lock. The lock is released once the writer has closed the stream files (shutdown, a failed open, or death). It does
+   not fence two hosts mounting one shared device.
+2. `recordedSizing`: an existing `sizing` file gives the sizing (at least 2 streams, else `CrlSizingMismatch`). With
+   no `sizing` file, stream files mean `CrlSizingMismatch`; no stream files mean a new CRL, whose requested sizing is
+   written durably (`DurableFiles.write`) before any stream file. A `sizing` file with no stream files is a creation
+   that crashed before them, and its sizing stands.
+3. `createStreamsIfNew`: a leftover `*.crl.tmp` means a creation that never finished: it and any stream files are
+   removed and creation starts over. With no stream files, each is preallocated as `<n>.crl.tmp`
+   (`FilePreallocation.preallocate`: `fallocate(2)` mode 0 through FFM on Linux, zero-fill elsewhere or on
+   `EOPNOTSUPP`; forced), renamed into place, and the directory forced. Only then does the writer start, so a `.tmp`
+   at open always means a creation that wrote no entry.
+4. `checkSizing`: the stream files must be exactly the expected set, each of the recorded size.
+5. `Recovery.recover` (5.7), then the constructor (5.7). A constructor that fails shuts its writer down and waits for
+   it before rethrowing, so a retry never runs two writers over the same files.
+
+`StreamWriter` opens existing files only, with `DSYNC | WRITE`, and refuses one of the wrong size. Because the files
+are preallocated and the file system overwrites in place (A7), a CRL write never allocates, and a full device cannot
+fail it with `ENOSPC`.
+
+The streams form a ring. One is **active** and written append-only. When an entry does not fit, the writer advances
+to the next stream, **recycles** it (new random stream UUID, write offset 0; in memory only) and writes there
+(`SimpleCRL.writeCurrentLogEntry`, `Stream.recycleStream`).
 
 ### 5.2 Entry format
 
-Header (`LogEntry.scala:124-141`), 70 bytes, big-endian; (addendum) 78 bytes since applied stubs, with two more
-4-byte counts (`StaticEntryHeaderSize`, `LogEntry.scala:168`):
+Header (`LogEntry`, `StaticEntryHeaderSize` = 86 bytes, big-endian):
 
 | Field | Bytes |
 |-------|-------|
@@ -303,207 +342,208 @@ Header (`LogEntry.scala:124-141`), 70 bytes, big-endian; (addendum) 78 bytes sin
 | previous entry location (stream 2, offset 8, length 4) | 14 |
 | dynamic data size | 8 |
 | static data size | 8 |
-| number of transactions | 4 |
-| number of deletions | 4 |
-| (addendum) number of applied stubs | 4 |
-| (addendum) number of applied-stub deletions | 4 |
+| number of transactions, transaction deletions, applied stubs, stub deletions | 4 x 4 |
+| body_crc: CRC32C of dynamic and static data through the trailing UUID | 4 |
+| header_crc: CRC32C of the header bytes before it | 4 |
 
-Then, in order: **dynamic data** (serialized transaction descriptions and object-update payloads, written only the
-first time a transaction appears in a stream, `LogEntry.scala:90-100`), **static data** (one fixed record per
-transaction in the entry, then (addendum) one 33-byte TxId per applied stub, then 33-byte TxIds of transaction
-deletions, then (addendum) of stub deletions, then the 16-byte stream UUID again), then zero padding to a 4 KiB
-multiple (`padTo4k`, `LogEntry.scala:187-195`). A stub has no dynamic data.
+Then **dynamic data** (serialized txds and object-update payloads of records with no current location, raw), then
+**static data**: one record per transaction in the entry, one 41-byte record per stub (TxId, start timestamp), 33-byte
+TxIds of transaction deletions, then of stub deletions, then the stream UUID again. Then zero padding to a 4 KiB
+multiple (`LogEntry.padTo4k`), so entries start on 4 KiB boundaries.
 
-The static record of a transaction (`LogContent.scala:116-132`): TxId 33 (pool UUID 16, store index 1, tx UUID 16),
-txd location 14, disposition 1 (0/1/2), Paxos mask byte 1 + promised (int + byte) 5 + accepted (int + byte) 5, object
-update count 4, then `count x (object UUID 16 + data location 14)`. That is 63 bytes plus 30 per object update. The
-Paxos mask has bit 0 = promise present, bit 1 = accepted present, bit 2 = accepted value (`LogContent.scala:149-173`).
+A transaction's static record (`Tx.writeStaticEntry`): TxId 33 (pool UUID 16, store index 1, tx UUID 16), txd
+location 14, disposition 1, Paxos mask 1 + promised 5 + accepted 5, update count 4, then per update object UUID 16 +
+location 14: 63 bytes plus 30 per update (`CrlAdmission.TxOverheadBytes`, `ObjectUpdateOverheadBytes`). The mask has
+bit 0 promise present, bit 1 accepted present, bit 2 accepted value, bits 3-4 status (0 Unresolved, 1 Committed,
+2 Aborted). After `dropTransactionObjectData` the record is written with count 0.
 
-So a save of an existing transaction costs only its static record (no data is rewritten), but every entry is at least
-4 KiB and every write is a `DSYNC` (section 5.5).
+A save of an existing transaction costs only its static record; its txd and data are written once and referenced by
+location from every later record. Every entry is at least 4 KiB and every write is a `DSYNC`.
 
 ### 5.3 In-memory structures and threads
 
 Two threads per CRL:
 
-- the **CRL thread** (`ioThread`) takes `ActionRequest`s from `ioQueue` and owns all mutable state: the `transactions`
-  map, the age-ordered queue of `Tx` (`queueHead`/`queueTail`), `currentLogEntry`, the stream write offsets;
-- the **writer thread** (`StreamWriter`) takes `Write` commands, does `channel.position(offset); channel.write(buffers)`,
-  and then runs `onWriteComplete`, which runs the entry's handlers and queues `WriteComplete` back to the CRL thread
-  (`StreamWriter.scala:67-80`, `Stream.scala:35-38`).
+- the **CRL thread** takes `ActionRequest`s from `ioQueue` and owns all mutable state: `transactions` and `stubs`
+  (maps of `Record`s), the age-ordered queue (`queueHead`/`queueTail`), `currentLogEntry`, the streams' offsets, and
+  `afterInFlight` barriers;
+- the **writer thread** (`StreamWriter`) takes `Write` commands, positions the channel and writes every buffer
+  (`writeFully` loops, since a gathering write takes at most `IOV_MAX` buffers per call), then runs the entry's
+  completion handlers and queues `WriteComplete` to the CRL thread (`Stream.writeEntry`).
 
-Handlers therefore run on the writer thread. An exception in a handler propagates out of `writeThreadLoop` and kills
-the writer (F9).
-
-`transactions: Map[TxId, Tx]` holds the full `TransactionRecoveryState` of every live record, **including object data**,
-in memory. `Tx` (`LogContent.scala:93-`) also records where its txd and object data currently are on disk
-(`txdLocation`, `objectUpdateLocations`), a `keepObjectUpdates` flag, and its place in the queue
-(`entrySerialNumber` = the serial of the entry where it entered the queue).
+`transactions` holds the full `TransactionRecoveryState` of every live record, object data included, even after
+`dropTransactionObjectData` (which only clears the record's flag and locations). A `Tx` record also knows where its
+txd and data currently are (`txdLocation`, `objectUpdateLocations`) and its queue position (`entrySerialNumber`, the
+entry holding its oldest data). A `Stub` record has its `anchor`.
 
 ### 5.4 Write path
 
-`save` is a message to the CRL thread. `onSaveTransaction` (`SimpleCRL.scala:267-289`):
+`save` queues `SaveTransaction`. `onSaveTransaction`:
 
-1. Look up the `Tx`. If absent, create it, put it at the queue head with the *current entry's* serial, and register it.
-2. If the number of object updates changed, forget the old data locations so the new data is written
-   (`SimpleCRL.scala:281-283`).
-3. Set `tx.state = state`, add the tx and the handler to `currentLogEntry`, call `startWrite`.
+1. If the current entry deletes the id finally (C9), queue only the handler and return.
+2. Look up the record; if absent, create it with no locations, put it at the queue head with the current entry's
+   serial, and register it.
+3. If the update count changed, forget the update locations so the data is written again.
+4. Set the state, add the record and the handler to `currentLogEntry`, `startWrite`.
 
-`startWrite` writes `currentLogEntry` only if no write is in progress (`SimpleCRL.scala:166-168`). While a write is in
-flight, further saves accumulate in the next entry: this is group commit, and the only batching mechanism. After a
-write, `currentLogEntry = new LogEntry(location, serial + 1, oldestEntryNeeded)` (`SimpleCRL.scala:190-191`).
+`startWrite` writes `currentLogEntry` only if it is not empty and no write is in progress. While a write is in
+flight, further requests accumulate in the next entry: group commit, the only batching. `LogEntry.isEmpty` counts
+records and deletions, not handlers. After a write is issued, the next entry is created with the location of the one
+just issued as its previous entry and `oldestEntryNeeded` as of that moment (a stale value is only older, which is
+safe: recovery walks further back over entries the ring has not recycled).
 
-`writeCurrentLogEntry` (`SimpleCRL.scala:170-191`):
+`Stream.writeEntry` builds the buffers (`LogEntry.createEntryBuffers`): header, then the txd and update buffers of
+records with no location (which are assigned their new locations), stub anchors, the static region, the checksums,
+padding. The buffers are built on the CRL thread when the write is issued; the writer only writes them.
 
-1. If the entry does not fit the current stream, advance `currentStream`, `recycleStream()` it, and for every live `Tx`
-   whose txd or object data lies in the stream *after* the recycled one (since the F3 fix; data still in the recycled
-   stream itself would break the invariant and is logged and copied too) (`Tx.closeStream`, `LogContent.scala:185-204`) clear its
-   locations, move it to the queue head and add it to the entry being written. Then set the entry's
-   `oldestEntryNeeded` to the queue tail's serial. (addendum) Applied stubs are walked the same way: a stub whose
-   zero-length `anchor` lies in either stream is moved to the queue head and re-added (`copyForward`,
-   `SimpleCRL.scala:211-220`).
-2. `Stream.writeEntry` builds the buffers (`LogEntry.createEntryBuffers`, `LogEntry.scala:59-121`): header, then the
-   txd and update buffers of transactions that have no location, then the static region, then padding. It issues one
-   gathering write.
+### 5.5 Rotation (compaction)
 
-The completion callback is attached to the write; all handlers of the entry fire after it returns.
+When the current entry does not fit the active stream, `writeCurrentLogEntry` advances to stream *k*, recycles it, and
+for every live record with data in *k* or in *k+1* (`Record.closeStream`) clears its locations, moves it to the queue
+head and adds it to the entry. It then sets the entry's `oldestEntryNeeded` to the queue tail's serial.
 
-`oldestEntryNeeded` is the serial of the oldest entry any live transaction's *first* appearance (or last move) is in.
-Because a transaction's txd and data are written once and referenced by location from every later record, the oldest
-entry needed is the one holding the oldest live transaction's data (`SimpleCRL.scala:162-164`).
+**Invariant: the stream after the active one holds no needed entry.** The rotation into *k* copies forward the live
+data of *k+1*, the next stream to be recycled, so *k* itself was cleared by the previous rotation. Whatever part of a
+torn rotation write persists, it overwrites only entries no recovery needs. After the moves every record whose data
+was in *k+1* is in the new entry, so the new entry's `oldestEntryNeeded` lies in *k-1* or *k*, never in *k+1*. With
+two streams the copy is the whole live set. A record found with data still in the recycled stream itself would break
+the invariant; it is logged as an error and copied too. No path produces one: a record's txd is never newer than its
+data, and data is written only into the active stream, so a record's oldest data is always reached as "next" before it
+is recycled.
 
-### 5.5 fsync behaviour
+The rotation entry holds the pending entry plus the copy-forward. Admission keeps that within one stream for ordinary
+loads (section 6).
 
-- Every stream file is opened `DSYNC`: each `write` returns only after data and the metadata needed to read it are on
-  stable storage (A1). There is no separate `force`, no `fdatasync` call, no `O_DIRECT`.
-- Each entry is one `write(ByteBuffer[])`, padded to a 4 KiB multiple. Exactly one write is in flight per CRL.
-- Throughput is therefore `entries/s = 1 / write latency`, and batching comes only from saves arriving while a write
-  is in flight. A slow `DSYNC` delays every vote of every store on the device.
-- The first pass over a freshly created sparse file additionally forces block allocation and journal commits, so the
-  first cycle (300 MB by default) is slower than steady state.
-- `DurableFiles` (`S/DurableFiles.scala`) is *not* used by SimpleCRL's log. It is used for `crl_save.log`, the
-  `rebuild-required`, `transferring-out` and `owning-host` markers: write a temp file, `force(true)`, atomic rename,
-  fsync the directory (`DurableFiles.scala:35-56`). Directory fsync is a no-op on Windows and not `F_FULLFSYNC` on
-  macOS (`DurableFiles.scala:69-77`); Linux is the only supported platform.
-- Neither the creation of the stream files nor the `crl/` directory entry is followed by a directory fsync
-  (F11).
+### 5.6 Durability
 
-### 5.6 Recovery
+- Every stream file is opened `DSYNC`: each `write` returns only after its data and the metadata needed to read it are
+  on stable storage (A1). No separate `force`, no `O_DIRECT`.
+- One write in flight per CRL; throughput is `entries/s = 1 / (write latency + handler time)`, since the next entry is
+  issued only after the previous one's handlers ran (C2).
+- Preallocation with `fallocate` leaves unwritten extents; the first write to each converts it, a metadata change
+  `DSYNC` commits with the write.
+- `DurableFiles` (tmp, `force`, atomic rename, directory fsync) is used for `sizing`, the stream files' creation, and
+  outside the log for `crl_save.log`, `lost-crl-state.log` and the store markers. Directory fsync is a no-op on Windows
+  and not `F_FULLFSYNC` on macOS; Linux is the supported platform.
 
-`SimpleCRL.apply` (`SimpleCRL.scala:62-80`) checks the sizing, runs `Recovery.recover`, and constructs the CRL.
+### 5.7 Recovery
 
-`Recovery.recover` (`Recovery.scala:30-111`):
+`Recovery.recover`:
 
-1. For each stream, read the **head entry** (offset 0) and keep the stream whose head has the highest serial. That is
-   the active stream.
-2. Walk the active stream from offset 0 with `findHighestEntry`, stopping at the first entry that fails
-   `StreamReader.readEntry`. The last good entry gives the next write offset, next serial and the
-   `oldestEntryNeeded`.
-3. From the last entry, follow the `previous entry` links backwards, loading each entry's static region into a
-   `RecoveringState`, **until reaching the entry whose serial equals `oldestEntryNeeded`**. Each step must reach a
-   strictly older serial and a readable entry, or `BrokenEntryChain` is thrown (`Recovery.scala:65-83`).
-4. Entries are applied newest to oldest. A transaction already present is not replaced; one named in a deletion of
-   the same or a newer entry is skipped (`LogEntry.scala:169-185`). That implements C4 and C9.
-5. Each surviving transaction's txd and object data are read from their recorded locations (`readStreamLocation`,
-   `Recovery.scala:87-89`). **There is no checksum on any of it.**
+1. **Newest entry.** Streams are ordered by the serial of their head entry (offset 0) and the first with a wholly
+   intact entry wins (`StreamReader.lastIntactEntry`). Within a stream, entries are followed from the head while their
+   headers are intact, carry the stream's current UUID (read from offset 0) and have rising serials; only the last
+   one's body is checked. A torn last entry is dropped with a warning and the entry before it is the last. A stream
+   whose only entry is a torn head (a rotation write in flight at a crash) yields to the stream before it.
+2. **Nothing newer.** `newerIntactEntry` scans the active stream past the last entry, and all of the next stream, for
+   an intact entry of any cycle with a higher serial, hopping intact headers by their size and anything else by
+   4 KiB. A hit throws `CrlCorrupt`: a corrupt entry hides a newer one (mid-stream rot, or a rotted head hiding the
+   real active stream).
+3. **Walk.** From the last entry, follow `previous entry` links, loading each entry's static region into a
+   `RecoveringState`, until reaching the last entry's `oldestEntryNeeded`. Each step must reach an entry of its
+   stream's current cycle with a lower serial and an intact header and body, or `BrokenEntryChain`/`CrlCorrupt` is
+   thrown. The extents of each verified entry's dynamic data are recorded.
+4. **Apply.** Entries are applied newest first: a record already present is not replaced; one named by a deletion of
+   the same or a newer entry is skipped (C4, C9). Stubs follow the same rule against stub deletions.
+5. **Data.** Each surviving transaction's txd and data are read from their locations, which must lie within the
+   dynamic data of a verified entry (`Recovery.entryHolding`), so they are covered by its checksum. Its queue serial
+   is the oldest such entry.
 
-`StreamReader.readEntry` accepts an entry iff the header UUID and the trailing UUID both equal the file's current UUID,
-where the "current UUID" of a file is read from its first 16 bytes (`StreamReader.scala:15-19, 47-74`). A recycled
-stream gets a new UUID with its first new entry, which is what makes all older entries in that file unreadable.
+The result also sets the active stream (with the **last entry's** UUID, so new entries remain readable from that
+stream), the next offset and serial, and the previous-entry link (to the last entry itself).
 
-(addendum) Applied stubs are recovered apart from transactions (`Recovery.Result.appliedStubs`) with the same
-newest-first rule against stub deletions, each with the anchor of the newest entry holding it.
+**The open writes nothing.** The constructor queues each recovered record by its serial with the locations its
+newest static record names (a stub by its anchor in the newest entry holding it), as if this instance had written
+them, and starts the first entry with `oldestEntryNeeded` = max(queue tail, the last entry's value). The last durable
+entry kept the ring invariant (a torn rotation leaves the stream before it active, where it still holds), so the next
+rotation's copy-forward finds and moves them as the instance before the crash would have. A live set larger than a
+stream therefore still opens; its next rotation hits the `Stream.writeEntry` backstop.
 
-After recovery the CRL constructor **writes nothing** (since 2026-11-15, F16). Each recovered record keeps the
-locations its newest durable static record names (`Recovery.RecoveredTx` / `RecoveredStub`), and is queued by the
-serial of the oldest verified entry holding any of them, as if this instance had written them. The last durable entry
-kept the ring invariant (the stream after the active one holds nothing needed; a torn rotation leaves the stream
-before it active, where it still holds), so the next rotation's copy-forward finds and moves them as the instance
-before the crash would have. Before the fix, every open appended a full copy of the live set (up to half a stream),
-and could itself rotate.
+After a torn newest entry is dropped, the next entry reuses its serial and offset and overwrites it. If the torn entry
+was a rotation head in the next stream, both that head and the new entry carry the same serial until the next
+rotation overwrites the head; recovery ignores the head because its body fails.
 
-### 5.7 Recycling (compaction) strategy, restated as an argument
-
-The design invariant is: **before a stream is overwritten, everything live in it has been re-emitted**. Live data is
-bounded by half a stream, so the re-emission always fits. The mechanics are in 5.4(1). Why it is sufficient for the
-chain walk: after the moves, every live transaction's queue position is in the new entry, so the new entry's
-`oldestEntryNeeded` is at least the new entry's own serial or the serial of the oldest *unmoved* transaction, which by
-the ring order is in a stream younger than the recycled one. So no entry in the recycled stream is needed afterwards.
-
-What the argument did **not** cover was the instant of the overwrite itself: the re-emission was written *into the same
-stream whose old contents it replaced*, starting at offset 0 (F3). Since the F3 fix the rotation into stream *k*
-re-emits the live data of stream *k+1* instead, so *k* holds nothing needed when it is overwritten: the stream after
-the active one never holds a needed entry.
+Zero-filled regions are not entries: a zero header fails `header_crc`, and a zero stream UUID is rejected
+(`StreamReader.readHeader`), so a never-written CRL opens empty at stream 0, offset 0.
 
 ### 5.8 Deletion
 
-`deleteTransaction` queues `DeleteTransaction`; the CRL thread records the TxId in the current entry's deletions, removes
-the `Tx` from the map and the queue, and calls `startWrite` (`SimpleCRL.scala:291-296`). Deleting therefore causes an
-entry write (not coalesced with anything unless a write is already in flight). `deleteTransactions` does the same for a
-list, atomically in one entry, and attaches its handler to that entry (`SimpleCRL.scala:202-214`); an empty list
-completes at once, with no write. A deleted `Tx` that is already in the *current* entry's `txs` stays there and is
-filtered at recovery by the deletion list. (addendum) `deleteTransactions` also writes a stub deletion for every id
-it is given (33 bytes each), and deletes a held stub. `deleteAppliedStub` writes a stub deletion only for a stub held
-in memory (`SimpleCRL.scala:337-343`).
+`deleteTransaction` records the TxId in the current entry's deletions, removes the record from the map and the queue,
+and starts a write. `deleteTransactions` and `dropStore` (`onDeleteTransactions`) put all their deletions in one entry
+with the handler: each id gets a transaction deletion and a stub deletion (66 bytes per id), and the record and stub
+are removed from memory. `dropStore`'s ids are those of the store held when the request is processed, and its
+transaction deletions are cancellable. `deleteAppliedStub` writes a stub deletion only for a stub held in memory. A
+deleted record already in the current entry stays there and is filtered at recovery by the deletion in the same entry.
 
-### 5.9 Shutdown and thread death
+### 5.9 Barriers
 
-`shutdown()` queues `Shutdown` behind earlier requests; the writer drains earlier writes, closes the channels and
-signals (`SimpleCRL.scala:343-346`, `StreamWriter.scala:76-80`). A pending, unwritten `currentLogEntry` is discarded.
-That is safe: none of its handlers has run (C3).
+`whenDurable` queues a `Barrier`: if the current entry is non-empty its handler is added to it (run on the writer
+thread); else if a write is in flight it waits in `afterInFlight` and runs on the CRL thread at `WriteComplete`; else
+it runs at once. Every request queued before the barrier is in the current entry, in the entry being written, or
+already durable, so this is exact.
 
-If the CRL thread or the writer thread dies, the `Shutdown` is completed by the dying thread, channels are closed, and
-`onThreadDeath(t)` is called (`SimpleCRL.scala:145-155`, `StreamWriter.scala:55-65`). The host's `onThreadDeath` only
-logs (`S/../cmdline/Main.scala:1700-1707`).
+### 5.10 Shutdown and death
+
+`shutdown()` queues `Shutdown` behind earlier requests; the CRL thread passes it to the writer, which drains the
+write in flight, closes the channels, releases the lock and signals. The pending, unwritten `currentLogEntry` is
+discarded; none of its handlers has run (C3). Futures of requests not yet written are never completed (CRL-W5).
+
+The CRL has one death path. A writer that throws (an I/O error, a completion handler that throws) closes its channels
+and queues `WriterDied`; the CRL thread throws it. Any throw on the CRL thread (including `Stream.writeEntry`'s
+`require`) marks the CRL dead, fails every pending tracked Future (`readStoreState`, `deleteTransactions`, `dropStore`,
+`storesWithEntries`, `loadStore`'s saves) with `CrlFailed`, shuts the writer down (releasing the lock), completes
+`failed` and calls `onThreadDeath` once. Every later tracked call fails with `CrlFailed`. Handler-style completions
+(`save`, `saveAppliedStub`, `whenDurable`) never run for an unwritten entry, so no vote follows. An entry whose write
+was already in flight when the CRL thread died is still written and its handlers run. The files hold what was
+written, so a restart recovers them as after a crash.
 
 ---
 
 ## 6. Admission and backpressure
 
-`CrlAdmission` (`S/crl/CrlAdmission.scala:27-66`) is one atomic byte counter per device, created at device load with
-limit `crl.admissionLimitBytes` = half a stream (`DeviceDiscovery.scala:567`, `SimpleCRL.scala:107`).
+`CrlAdmission` (`S/crl/CrlAdmission.scala`) is one atomic byte counter per device, with limit
+`crl.admissionLimitBytes` = half a stream (150 MB by default).
 
-- A store admits a prepare for a transaction it has not seen only while `total < limit` and adds the transaction's
-  description, object data and static record (`63 + 30 per update`) (`Frontend.admitPrepare`, `Frontend.scala:426-448`).
-  Otherwise it drops the prepare silently (`Store.scala:120-125`).
-- Everything else is handled: known transactions, their later prepares, accepts, resolutions, heartbeats, finalization.
-  Late object data is charged without a check; recovered transactions are charged without a check
-  (`Frontend.scala:458-469`). One admission may cross the limit.
-- Bytes are released when the record is deleted, or when the Tx is forgotten without ever reaching the CRL
-  (`Frontend.deleteTransactionState`, `releaseAdmission`). A closing store keeps its bytes **retained** until its
-  entries leave the CRL or the store reloads (`CrlAdmission.scala:50-64`, `Frontend.close`, `Frontend.scala:493`).
-- Admission does **not** cover: records of stores that are not loaded since process start (F8), the duplication caused
-  by rewriting object data when the update count changes, or deletions queued in an entry.
-- (addendum) Applied stubs are charged `AppliedStubBytes` (33) each without a check, by the Frontend: on
-  `recordAppliedStub`, and for those recovered (`Frontend.scala:307-311,395-409`). The transaction's own admission is
-  taken out of `admitted` at once and released once the stub is durable, so a prepare in between is admitted afresh;
-  a later Tx of the same id that shares the record keeps it (`keepAdmission`, `:668-674,676-685`). `dropAppliedStub`
-  releases a stub's charge; `close` retains the stubs' charge with the transactions' bytes
-  (`Frontend.scala:600-608`). Stubs therefore never stall, but new prepares feel them.
+- **New transactions.** `Frontend.admitPrepare` admits a prepare for a transaction it has not seen only while the
+  total is below its store's tier ceiling (`AdmissionTier`, the store's pool's, persisted in its StoreConfig): 3/4 of
+  the limit for data pools, 7/8 for metadata pools, the whole limit for the bootstrap pool. A data transaction's
+  finalization writes trees in a metadata pool, and a metadata transaction's in the bootstrap pool, so lower-tier load
+  never takes the headroom a higher tier's finalization needs (cross-document-review.md). It charges the description,
+  object data and static record (`63 + 30 per update` + data). Otherwise the prepare is dropped silently
+  (`Store.receiveTransactionMessage`) and the client retransmits.
+- **Charged without a check:** known and admitted transactions' later data (`chargeData`), recovered transactions
+  (`admitRecovered`), stubs (`chargeStubs`), and at device open everything the CRL holds, per store
+  (`recoveredBytesByStore`, `chargeRetained`). The check is against the total before the admission, so one admission
+  may cross the ceiling by its own size, which nothing bounds (CRL-W2).
+- **Released** when the record is deleted (`deleteTransactionState`, `concludeTransactionState`), when a Tx is
+  forgotten without reaching the CRL, or, for a transaction replaced by a stub, once the stub is durable. A stub's
+  charge is released when it expires (`dropAppliedStub`).
+- **Retained.** A closing store keeps its bytes counted for it (`CrlAdmission.retain`) until its entries leave the CRL
+  (`releaseRetained` after an extraction's deletion, a `dropStore`, a leftover drop) or it loads again and counts its
+  own. Records of stores that never load on this run are therefore counted from the open while they are copied forward.
+- **Not counted:** static records rewritten by later saves (not live), deletions queued in an entry, and the second
+  copy of data rewritten when the update count changes.
 
-Admission is a liveness tool and the only thing that maintains C11. A failure of C11 is not a data-loss event by
-itself: it kills the CRL thread (`Stream.scala:28`), which stops the device (F9) and leaves the CRL recoverable on
-restart.
+Admission is a liveness tool and the only thing that maintains C11. A failure of C11 kills the CRL (5.10), which
+unloads the device until restart and leaves the files recoverable.
 
 ---
 
 ## 7. Sharing one CRL among a device's stores
 
-All stores on a device share one ring, one writer thread and one admission counter. Consequences, all verified in code:
+All stores on a device share one ring, one writer thread and one admission counter.
 
-- **Ordering across stores.** Entries interleave records of different stores. Recovery returns each store's records by
-  filtering on `StoreId` (`SimpleCRL.scala:261-265`).
-- **Deleting one store does not touch another.** `dropStore` lists the store's TxIds with `readStoreState` and then
-  `deleteTransactions` them; other stores' records stay live and keep being copied forward.
-- **A store being rebuilt.** Its records stay live in the shared ring until `discardLostStore` has made the
-  `rebuild-required` marker durable and then `dropStore` completes (`StoreRebuilds.scala:499-522`). Until then they are
-  copied forward, uncounted by admission after a restart (F8). After the drop, the directory is renamed and removed. The
-  rebuild starts only when the path is clear.
-- **A store that fails.** A backend fail-stop at close marks the store `rebuild-required`; its entries are not dropped
-  until the rebuild discards it. A store whose `crl_save.log` is unusable is marked the same way.
-- **A shared stall.** A slow `DSYNC` or a full ring affects every store on the device, including metadata or bootstrap
-  stores if they are on it. There is no per-store allocation by design (Todo/anti-goals of the 2026-11-07 spec).
-- **Fate sharing.** A lost or unrecoverable CRL marks **all** stores on the device `rebuild-required`.
+- **Ordering across stores.** Entries interleave records of different stores; `readStoreState` filters by `StoreId`.
+- **Deleting one store does not touch another.** `dropStore` names only that store's ids; others' records stay live
+  and keep being copied forward.
+- **A store being rebuilt.** Its records stay live until `discardLostStore` has saved them to `lost-crl-state.log`
+  and `dropStore` completes; they are counted by admission from the open. Then the directory moves to pending-delete
+  and the rebuild starts.
+- **A store that fails.** A backend fail-stop at close marks it `rebuild-required`; its entries are dropped when the
+  rebuild discards it. A store whose `crl_save.log` is unusable is marked the same way.
+- **A shared stall.** A slow `DSYNC`, a full admission lane or a dead CRL affects every store on the device. There is
+  no per-store allocation by design.
+- **Fate sharing.** A lost CRL marks every store on the device `rebuild-required`; a failed CRL unloads every store.
 
 ---
 
@@ -513,816 +553,258 @@ This is the only layout implemented (`CrashRecoveryLog.deviceCrlDir(devicePath) 
 
 ### 8.1 Benefits
 
-- **One failure domain and one unit of movement.** The device carries every store's data *and* its transaction state.
-  A drive pulled from a crashed or running host is in exactly the state a crash would leave it in, so another host can
-  adopt it without any cooperation from the old host (`DeviceDiscovery.tryAdoptDevice`, `DeviceDiscovery.scala:314-`;
-  design 2026-11-08). No state travels by network or by a shutdown step.
-- **No cross-device ordering problem.** "Backend commit durable, then delete CRL record" (A4) is within one device. The
-  CRL and the data cannot get out of step by one surviving without the other.
-- **Simple recovery.** A restart finds one self-describing directory. A missing or unreadable `crl/` on a device with
-  stores has a single, uniform treatment (section 4).
+- **One failure domain and one unit of movement.** The device carries every store's data and its transaction state. A
+  drive pulled from a crashed or running host is in exactly the state a crash would leave, so another host can adopt
+  it without cooperation from the old host (`DeviceDiscovery.tryAdoptDevice`).
+- **No cross-device ordering problem.** "Backend commit durable, then delete CRL record" (A4) is within one device.
+- **Simple recovery.** A restart finds one self-describing directory.
 - **Sequential, append-only access.** SimpleCRL writes ascending offsets within one file at a time.
 
 ### 8.2 Drawbacks
 
-- **The IO is doubled, and the bandwidth halved.** Every byte of transaction object data is written once to the CRL
-  and again to the backend (RocksDB WAL and SST, or the FSIF journal and segment). Copy-forward writes live data a
-  third time, and every open writes the whole live set again (section 5.6). Each entry is padded to 4 KiB and written
-  with `DSYNC`. On a device that is also serving the stores, CRL traffic competes with store traffic for the same
-  bandwidth and the same flush queue.
+- **IO doubled.** Every byte of object data is written to the CRL and again to the backend (RocksDB WAL and SST, or
+  the FSIF journal and segment). Copy-forward writes live data a third time. Each entry is padded to 4 KiB and written
+  with `DSYNC`. CRL traffic competes with store traffic for the same bandwidth and flush queue.
 - **Flushes couple the workloads.** On a journaling file system an `O_DSYNC` write forces a journal commit and a
-  device cache flush. A flush issued for CRL durability also drains the store's own pending writes, and the other
-  way round. A busy backend therefore raises CRL latency, and CRL latency is on the critical path of every vote.
-- **Wear.** On flash the CRL ring is rewritten continuously (up to `numStreams x size`, 900 MB default, plus
-  padding), adding write amplification to the device that holds the data.
-- **Rotating disks are hit hardest.** Each CRL commit is a synchronous write with a rotational delay (about 4 ms
-  average on 7200 rpm) and, because the CRL files are far from the backend's files, a seek. Interleaved with the
-  backend's own writes (RocksDB WAL appends and compactions, FSIF journal and segment writes) the head moves between
-  regions several times per transaction, and the single-outstanding-write rule means the seek is on the vote's
-  critical path. Group commit hides some of this, but the first-cycle sparse allocation, the fsync coupling above and
-  the 4 KiB padding all work against a spinning disk. The result is that an HDD-backed store pays most of its
-  latency in the CRL while also halving the bandwidth left for data.
-- **Capacity is taken from the data.** 900 MB by default per device, not reclaimable by the store; `crl.lost-*`
-  directories add more (kept deliberately).
-- **Single-device failure is total.** If the device dies, state and data die together. This is by design (the stores
-  are rebuilt from peers), but it is also why a damaged CRL turns into a rebuild of every store on the device.
+  device cache flush, which also drains the store's own pending writes, and the other way round. A busy backend
+  raises CRL latency, which is on the critical path of every vote.
+- **Wear.** On flash the ring (900 MB by default) is rewritten continuously.
+- **Rotating disks are hit hardest.** Each CRL commit is a synchronous write with a rotational delay and, because the
+  CRL files are far from the backend's, a seek on the vote's critical path. Group commit hides some of it.
+- **Capacity.** 900 MB per device by default, not reclaimable by the stores; `crl.lost-*` directories add more.
+- **Single-device failure is total.** State and data die together (stores are rebuilt from peers), and a damaged CRL
+  turns into a rebuild of every store on the device.
 
 ---
 
 ## 9. Planned (not implemented) off-device CRLs
 
-Backlog.txt describes placing the CRL of an HDD on an NVMe device. Nothing in the code reads a per-device CRL
-location today; `deviceCrlDir` is the only definition and the factory takes only `devicePath` and the config. The
-analysis below is therefore about the proposal, and about what the code already assumes.
+Backlog.txt ("Off-device CRLs") describes placing the CRL of an HDD on an NVMe device. Nothing in the code reads a
+per-device CRL location; `deviceCrlDir` is the only definition.
 
-### 9.1 What it buys
-
-- **Faster votes on slow media.** CRL appends go to flash: no seek, a cheap `DSYNC`, group commit that works. The HDD
-  then sees one write of the data, not two, and its heads stay with the data.
-- **Less interference.** The flush coupling of section 8.2 disappears for the store's device; admission can use a larger
-  ring without taking HDD capacity.
-- **Isolation of a slow disk's CRL stalls** (partly: a shared NVMe CRL device becomes a new shared resource).
-
-### 9.2 What it costs
-
-- **Failure modes span two devices.** The records of an HDD's stores now live on a different physical device with a
-  different lifetime.
-  - Loss of the CRL device loses the Paxos and vote state of **every** device that used it. Under the current rule
-    (lost CRL means every store on the device is `rebuild-required`) this is a simultaneous rebuild of many drives,
-    and the stores lost together are likely to belong to the same pools. That is the correlated-loss pattern in
-    [systemic-loss-protection.md](systemic-loss-protection.md), now triggered by one SSD.
-  - Loss of the data device leaves orphaned records on the CRL device; `dropLeftoverCrlState` handles stores that are
-    gone from the tree.
-  - The two devices can disagree after a partial failure (data device restored, or rolled back by its own write
-    cache, while the CRL says the transaction was finalized and deleted). Nothing in the design cross-checks them.
-- **A device cannot be moved by simply pulling it.** Its transaction state is not on it. The proposal is a clean
-  shutdown that copies the CRL state onto the device as the last step, before `shutdown.state`
-  (Backlog.txt, "Off-device CRLs"). Consequences:
-  - A crash, a power loss, or a drive pulled early cannot be adopted elsewhere; the adopter refuses a device with
-    stores and no `<device>/crl` (`DeviceDiscovery.scala:324-328`) until it returns to the host that holds the CRL.
-    This removes the benefit that the unclean-adoption design was written for.
-  - The copy step becomes part of the durability story: temporary directory, `force`, directory fsync, atomic rename,
-    then the owner marker. A pulled drive in the middle of it has neither a valid old nor a valid new copy.
-  - The lost-CRL rule must consult the configured location; two live copies must never exist; a stale `crl/` on the
-    device must be removed durably once the CRL lives elsewhere.
-- **A cross-device barrier is needed for A4.** The delete of a record on the CRL device must follow backend durability
-  on the data device. That already holds (fsync per device); it becomes a property to test rather than free.
-- **Sizing and recovery location.** Sizing still travels with the device config; recovery time and memory are those of
-  a host-level CRL again (up to the sum over devices).
-- **Operational blast radius.** More failure surface: the CRL device's own space, health and mount, and a host that
-  must also back up or restore it consistently.
-
-### 9.3 Practical reading
-
-Off-device CRLs improve latency and throughput on slow media and give up two things the current design has:
-adoption without cooperation, and independent failure domains. They are reasonable for a host-bound deployment of
-HDD pools with a mirrored, monitored CRL device, and a poor fit where drives move or hosts are replaced by pulling
-disks. Whatever is built must keep "CRL lost means rebuild" from firing on a bulk event.
+- **Buys:** faster votes on slow media, one write of the data on the HDD, no flush coupling.
+- **Costs:** failure modes span two devices. Losing the CRL device loses the Paxos state of every device that used it:
+  under the current rule a simultaneous rebuild of many drives, likely of the same pools, the correlated-loss pattern
+  of [systemic-loss-protection.md](systemic-loss-protection.md). The two devices can disagree after a partial failure,
+  and nothing cross-checks them. A device can no longer be moved by pulling it: the proposal copies the CRL onto the
+  device at shutdown, so a crash or early pull leaves a device the adopter refuses (`tryAdoptDevice` requires
+  `<device>/crl` when it holds stores). The lost-CRL rule must consult the configured location, and "CRL lost means
+  rebuild" must not fire on a bulk event.
 
 ---
 
 ## 10. Failure scenarios
 
-Each scenario states what the code does, whether it is safe, and why. "Safe" means no acknowledged state is lost and
-no wrong state is recovered, assuming A1-A6.
+"Safe" means no acknowledged state is lost and no wrong state is recovered, assuming A1-A7.
 
-| # | Scenario | Outcome | Safe? |
-|---|----------|---------|-------|
-| 10.1 | Crash mid-write of an appended entry | See below | Yes (a rotation write since the F3 fix) |
-| 10.2 | Torn or corrupted entry | See below | No, partially (F1, F5) |
-| 10.3 | Power loss with write caching | See below | Yes if A1; no if the drive lies |
-| 10.4 | A full stream | See below | Yes (F3 fixed) |
-| 10.5 | A slow fsync | See below | Safe; liveness only |
-| 10.6 | A dead CRL thread | See below | Safe; the device is unloaded until restart (F9 fixed) |
-| 10.7 | The device is pulled | See below | Safe |
-| 10.8 | Adoption by another host | See below | Safe under A3 |
-| 10.9 | Crash during transfer-out, before `crl_save.log` durable | See below | Safe |
-| 10.10 | Crash during transfer-out, after `crl_save.log` durable | See below | Safe |
-| 10.11 | Crash between `dropStore` and directory removal | See below | Safe |
-| 10.12 | Stores sharing a CRL, one rebuilt | See below | Safe (F8, F12 fixed) |
-| 10.13 | Crash during recovery's re-save | See below | Gone: the open writes nothing (F16 fixed) |
-| 10.14 | CRL files unrecoverable at open | See below | Safe for the CRL; transient errors retried (F6) |
-| 10.15 | Sizing mismatch | See below | Safe for state, destructive (F6) |
-| 10.16 | A completion handler throws | See below | State safe; device stops |
-| 10.17 | Device full | See below | Safe except on copy-on-write file systems (F7 fixed) |
+| # | Scenario | Safe? |
+|---|----------|-------|
+| 10.1 | Crash mid-write of an appended entry | Yes |
+| 10.2 | Crash mid-write of a rotation entry | Yes |
+| 10.3 | Corruption of a durable entry | Detected; the CRL is lost if a needed or hiding entry is hit |
+| 10.4 | Power loss with a lying write cache | No (A1) |
+| 10.5 | Live set or entry larger than a stream | Safe; the device is unloaded until restart |
+| 10.6 | A slow or hung `DSYNC` | Safe; liveness only |
+| 10.7 | A dead CRL thread or writer | Safe; the device is unloaded until restart |
+| 10.8 | The device is pulled | Safe |
+| 10.9 | Adoption by another host | Safe under A3 |
+| 10.10 | Crash during transfer-out, before `crl_save.log` is durable | Safe |
+| 10.11 | Crash during transfer-out, after `crl_save.log` is durable | Safe |
+| 10.12 | Crash during `discardLostStore` | Safe |
+| 10.13 | Stores sharing a CRL, one dropped while it is loaded again | Safe |
+| 10.14 | CRL files unrecoverable at open | Safe for the CRL; every store rebuilt |
+| 10.15 | Sizing mismatch, or another opener holds the lock | Safe; the device is refused |
+| 10.16 | Device full | Safe except on copy-on-write file systems |
+| 10.17 | Crash during CRL creation | Safe |
 
-**10.1 Crash mid-write.** An appended entry is written after the last valid one in the active stream. A crash leaves
-either nothing, a prefix of the new bytes, or (without ordering guarantees from the disk) an arbitrary subset of its
-sectors. None of its handlers has run, so no message depended on it. Recovery stops at the previous entry
-(`findHighestEntry`): the tail UUID is the last thing written, and sectors beyond the previous entry carry the stream's
-older cycle (different UUID) or zeros, so the partial entry is rejected. The next entry is written over it. Safe for
-appended entries *provided every sector of the new entry either fully persisted or the header/tail check catches it*
-(see 10.2). A rotation write is different: it overwrites live data, and its failure can destroy state that was
-acknowledged (F3).
+**10.1 Crash mid-write of an appended entry.** None of the entry's handlers has run, so nothing depended on it. If
+its header did not persist, the walk from the head stops at the previous entry. If the header persisted but not the
+whole body, `body_crc` fails and the entry is dropped (C7). The next entry is written over it.
 
-**10.2 Torn or corrupted entry.** Detection is two 16-byte UUIDs. Cases:
+**10.2 Crash mid-write of a rotation entry.** The rotation into *k* overwrites only entries no recovery needs (5.5).
+If the head's header did not persist, *k* keeps its old UUID and is not the newest stream; if it persisted with a
+torn body, the head is dropped and *k* yields to *k-1*. Either way *k-1* is active and the records still in *k+1* are
+recovered from there. Tested by tearing every rotation of a three-lap run at each sector prefix (SimpleCRLSuite).
 
-- Prefix persisted, tail not: detected (tail UUID mismatch). Entry ignored, its successors invisible.
-- Header persisted, tail persisted, a middle sector not (sector reordering): **not detected**. The decoder reads old
-  bytes of an earlier cycle where the dynamic or static data should be. `Tx.loadTx` validates only the disposition
-  byte (`LogContent.scala:60-64`); promise and accept numbers, locations and counts are unvalidated. Since the entry is
-  the last one, nothing was acknowledged from it, but its garbage becomes a recovered transaction state or throws
-  `CorruptedEntry`/`BufferUnderflow` (then the CRL is declared lost, F6). If it is *not* the last entry, the entries
-  after it are acknowledged and now reachable only through it (F5).
-- A write that silently stops short: **not detected** and **acknowledged**. The gathering write is limited to 1 024
-  buffers per call and the return value is ignored, so a large entry completes its handlers while missing its
-  tail. Reproduced (F1).
-- Corruption of an already-durable entry later (bit rot): a bad UUID ends the log at that entry (C7), or, if a needed
-  older entry is hit, `BrokenEntryChain` makes the CRL unrecoverable (C8). Bad data bytes are not detected at all (no
-  checksum).
+**10.3 Corruption of a durable entry.** A bad checksum in any entry the walk visits, or in the newest entry's header
+when a newer entry follows, throws `CrlCorrupt`; data is read only from verified entries. Rot exactly in the newest
+acknowledged entry is indistinguishable from a torn write: that entry is dropped and its promises, votes or data are
+lost, as with a lying cache. Rot in an entry recovery no longer needs still makes the CRL lost when it hides a newer
+entry or lies in the walk. Both are accepted: the outcome is a rebuild, simple rather than optimized.
 
-**10.3 Power loss with write caching.** `DSYNC` on Linux sends flush/FUA when the device reports a volatile cache.
-With a drive that acknowledges flushes it did not perform, an acknowledged entry can be lost together with later ones
-(recovery then returns a shorter prefix). That is Paxos amnesia: a promise or accept may be forgotten after being
-sent. The CRL cannot detect it. The same drive failure would break the backends too; it is an operational
-requirement (A1), not a software property.
+**10.4 Power loss with write caching.** `DSYNC` sends flush/FUA when the device reports a volatile cache. A drive that
+acknowledges flushes it did not perform can lose acknowledged entries (Paxos amnesia); if it loses an entry that a
+newer surviving one follows, recovery throws `CrlCorrupt`, otherwise it returns a shorter prefix silently. The same
+drive breaks the backends too; it is an operational requirement (A1).
 
-**10.4 A full stream.** `canWriteEntry` fails, the next stream is recycled, live content with data in it is re-emitted
-into the same file from offset 0 (5.4, 5.7). If the entry still does not fit (live set larger than a stream because of
-F8 or a large pending entry), `Stream.writeEntry`'s `require` throws on the CRL thread: the CRL thread dies, the device
-stops (10.6). *2026-11-14:* F8 is fixed, so only an entry larger than half a stream gets here, and the device is then
-unloaded until restart (10.6). The files are unchanged by the failed attempt (the recycle is in memory), so a restart recovers. The
-overwrite itself is not crash-safe (F3).
+**10.5 An entry that does not fit.** `Stream.writeEntry`'s `require` throws on the CRL thread, which dies (10.7). The
+recycle was in memory only, so the files are unchanged and a restart recovers. Admission keeps ordinary loads below
+this; a single transaction larger than about a stream minus the live set reaches it (CRL-W2).
 
-**10.5 A slow fsync.** Entries are strictly serial, so every vote on the device waits. The pending entry grows with the
-saves that arrive; it is bounded only by admission (for new transactions) and the live set. Admission drops new prepares
-at half a stream, so clients retransmit and the cluster slows. Long waits push transactions past
-`Tx.CollisionWait`/heartbeat timeouts, so other stores drive them or abort. No state is lost. A `DSYNC` that never
-returns blocks the writer thread and the device indefinitely; there is no timeout or detection (Backlog.txt).
+**10.6 A slow or hung `DSYNC`.** Entries are strictly serial, so every vote on the device waits. The pending entry
+grows with arriving saves, bounded by admission for new transactions. Clients retransmit; transactions past their
+timeouts are driven or aborted by others. No state is lost. A `DSYNC` that never returns blocks the device
+indefinitely and `crl.shutdown()` with it (Backlog.txt, "Isolate every device's I/O").
 
-**10.6 A dead CRL thread.** *Revised 2026-11-14 (F9 fixed):* every pending and later Future fails with `CrlFailed`,
-and the host unloads the device until it restarts. No safety loss. *Was:* `onThreadDeath` logs. `save` calls are queued and never answered, so no vote, accept or
-promise is sent: **no safety loss**. But also `readStoreState`, `deleteTransactions`, `dropStore` and
-`storesWithEntries` are served by the same thread and never complete: store loads, transfers, rebuilds and reconciles
-that wait on them hang. The stores stay installed and keep serving reads while they cannot vote (F9).
+**10.7 A dead CRL thread or writer.** Every pending and later Future fails with `CrlFailed`, no save completion runs,
+and `DeviceShutdown.crlFailed` unloads the device until restart (5.10, section 4). Rebuilds and transfers on the device
+fail their CRL calls and are resumed by the restart. No safety loss.
 
-**10.7 The device is pulled.** Writes fail with an I/O error: the writer thread dies, and the host unloads the device
-(10.6). Whatever was acknowledged
-before is on the device. The host's device handling then takes over (not CRL logic). The pulled drive contains a
-consistent post-crash CRL, which is what makes adoption possible.
+**10.8 The device is pulled.** Writes fail with an I/O error; the writer dies (10.7). Whatever was acknowledged is on
+the device, which holds a consistent post-crash CRL: that is what makes adoption possible.
 
-**10.8 Adoption by another host.** The adopter does not open the CRL on its own initiative: `tryAdoptDevice` requires
-`<device>/crl` and a directory for every Offline/Active store, commits an ownership transaction, then loads the device
-(`DeviceDiscovery.scala:314-` and `openDeviceCrl`), which runs the recovery of 5.6 (it writes nothing). Safe
-under A3: there is no fencing and no file lock. A running old host relinquishes the device when it sees the tree name
-another owner (`DeviceShutdown.relinquishDevice`, `DeviceShutdown.scala:242`) but until it does it may still write if
-the drive is reachable by both (not defended, by decision). A device with `transferring-out` and no valid
-`crl_save.log` is adopted as lost (`DeviceDiscovery.adoptionClass`, `DeviceDiscovery.scala:286-`). A device with a
-`rebuild-required` store is adopted with that store Rebuilding.
+**10.9 Adoption by another host.** `tryAdoptDevice` requires `<device>/crl` and a directory for every store the tree
+lists, commits an ownership transaction, then loads the device, which recovers the CRL (it writes nothing). The lock
+keeps a second process on the same host or file system out. A running old host relinquishes the device when it sees
+the tree name another owner (`DeviceShutdown.relinquishDevice`); on shared storage it may write until then (not
+defended, by decision). A store with `transferring-out` and no valid `crl_save.log` is adopted as lost
+(`DeviceDiscovery.adoptionClass`); one with `rebuild-required` is adopted Rebuilding.
 
-**10.9 Transfer-out, crash before `crl_save.log` is durable.** The state is still in the device CRL: `extractCrl` reads
-it with `readStoreState` (leaves it live) and deletes only after `saveStoreState` returned (tmp, fsync, atomic rename,
-directory fsync) (`StoreLoader.scala:497-523`). The `transferring-out` marker is written only after the close completes.
-A restart finds no marker, loads the store normally and recovers from the device CRL (a stray temp file is ignored).
-Safe.
+**10.10 Transfer-out, crash before `crl_save.log` is durable.** The state is still in the device CRL: `readStoreState`
+left it live, and the deletion follows only the durable save. The `transferring-out` marker is written only after the
+close completes. A restart loads the store normally and recovers from the device CRL. Safe.
 
-**10.10 Transfer-out, crash after `crl_save.log` durable, before the CRL delete is durable.** The records are in both
-places. The restart finds a valid `crl_save.log` and loads from it: `loadStore` re-saves under the same ids, the file
-is removed durably, then the store recovers (`StoreRouter.crlLoaded`). The device CRL record may be older or equal;
-the re-save makes the file's state the newest. Safe because the store served nothing between the extraction and the
-reload, so the two copies are identical. If the delete became durable first and the file did too, the save file is the
-only copy and is what the destination validates before promotion (`StoreTransfers.scala:480`). If the file is later
-lost or truncated, `loadValidStoreState` rejects it and the store is `rebuild-required`; the source retries until the
-staged copy validates, since the source still holds the state.
+**10.11 Transfer-out, crash after `crl_save.log` is durable, before the deletion is durable.** The records are in both
+places, identical, because the store served nothing in between. The restart finds the save file and loads from it:
+`loadStore` re-saves under the same ids, the file is removed durably, then the store recovers. If the deletion became
+durable first, the save file is the only copy; the destination validates the staged copy before promotion
+(`loadValidStoreState`, while the source still holds the state).
 
-**10.11 Crash between `dropStore` and the directory removal.** The `rebuild-required` marker is durable before the
-drop, so the store can never be served; the drop completes only when its entry is durable
-(`StoreRebuilds.scala:499-522`). On restart the marker is still there, `discardLostStore` runs again, `dropStore` finds
-no entries (`DeleteTransactions` with an empty list completes without a write) and the directory is removed. A crash
-before the drop is durable leaves the entries live and the marker present, so the next attempt drops them. Safe.
+**10.12 Crash during `discardLostStore`.** The `rebuild-required` marker is durable before anything else, so the
+store is never served. A crash before `lost-crl-state.log` or before the drop is durable leaves the entries live; the
+next attempt saves (unless the file exists) and drops again. A crash after the drop and before the move finds no
+entries (an empty deletion completes without a write) and moves the directory.
 
-**10.12 Several stores share a CRL; one is rebuilt.** The rebuilt store's records are deleted through the same ring in
-one entry; the others' records are untouched. A late save for the same StoreId after the drop (store loaded again) is
-kept, by design (C14), even a same-txid save landing in the drop's own entry: `dropStore` is one CRL-thread request
-whose deletions a later save cancels (F12 fixed 2026-11-15). The
-rebuilt store comes back as a fresh StoreId-identical store with no Paxos memory; whether that is safe is a property of
-the rebuild process (F18).
+**10.13 One store dropped while it is loaded again.** `dropStore` drops exactly what was held when processed (C14); a
+same-id save in the drop's own entry cancels that deletion (C9). Other stores' records are untouched. The rebuilt
+store comes back with no Paxos memory; it is muted for every transaction started before its `acceptor-since`
+(rebuild-process.md).
 
-**10.13 Crash during recovery's re-save.** No longer arises (F16 fixed 2026-11-15): the open writes nothing, so a
-crash loop leaves the files as they were. Before the fix the constructor appended a full copy of the live set, and a
-crash loop rotated the ring at the rate of the live set size.
+**10.14 CRL files unrecoverable.** `openCRL` throws `BrokenEntryChain`, `CrlCorrupt`, a decode error, or an I/O or VM
+error three scans in a row: `openDeviceCrl` marks every store `rebuild-required` (durably, one by one), moves `crl/`
+aside, and opens a fresh one. A crash between the markers and the move leaves markers and the old `crl/`: the next
+open may succeed, but the marked stores stay unservable. The decision is irreversible and made from local evidence
+only (Backlog.txt, "System-level protection against correlated lost store declarations": S13 covers transient,
+configuration and version conditions).
 
-**10.14 CRL files unrecoverable.** `openCRL` throws (`BrokenEntryChain`, `CorruptedEntry`, I/O error, anything).
-Since the F6 fix an I/O or VM error is first retried on the next scans, the device unloaded meanwhile; after
-`CrlOpenAttempts` (3) in a row, or at once for any other error, `openDeviceCrl` marks every store with a config file `rebuild-required` (durably, one by one), moves `crl/` aside, opens
-a fresh one (`DeviceDiscovery.scala:512-520`). A crash between the markers and the move leaves markers and the old
-`crl/`: the next open may succeed (e.g. transient error) but the stores stay unservable behind their markers. The
-decision is irreversible and made from local evidence only (F6).
+**10.15 Sizing mismatch or lock held.** Thrown before any stream file is read; the device stays unloaded with its
+files and stores untouched and each scan retries. Not a lost CRL.
 
-**10.15 Sizing mismatch.** *Revised 2026-11-14 (Todo 1.7b):* the CRL writes its sizing durably to `crl/sizing`
-before creating any stream file, and opens an existing CRL with that sizing whatever the config asks. A
-`CrlSizingMismatch` (stream files without a readable sizing file, or disagreeing with it) is thrown before any stream
-file is read, and refuses the device: it stays unloaded with its files and stores untouched, an error is logged, and
-each scan retries; 10.14 does not follow. A crash after the sizing file and before or during the stream files' creation
-opens as a new CRL at the recorded sizing. *Was:* the handling in 10.14 followed and every store was rebuilt.
+**10.16 Device full.** The stream files are preallocated, so a CRL write never allocates, except on copy-on-write file
+systems (A7), where an `ENOSPC` kills the CRL (10.7). Freezing the device's writes instead is tracked in Backlog.txt
+("Full storage devices").
 
-**10.16 A completion handler throws.** *2026-11-14:* handled as any writer death (10.6, F9 fixed).
-`runCompletionHandlers` is called inside the writer loop
-(`StreamWriter.scala:74-75`, `Stream.scala:35-38`): the exception escapes the loop, the writer thread dies, remaining
-handlers of that entry never run, and the device stops (10.6). No state is lost.
-
-**10.17 Device full.** *Revised 2026-11-14 (F7 fixed):* the stream files are preallocated, so a CRL write never
-allocates and a full device cannot fail it, except on copy-on-write file systems. *Was:* The stream files are sparse: block allocation happens on first write to each region. On a full
-device (or a copy-on-write file system, where an overwrite also allocates) a CRL write can fail with `ENOSPC`; the
-writer dies. Since freeing space requires transactions (deletes, refcount changes), the device can be unable to
-recover without operator action (F7). FSIF freezes its own writes and keeps serving; the CRL has no equivalent.
+**10.17 Crash during CRL creation.** `sizing` is written durably first; stream files go through `.tmp` and rename, and
+the writer starts only after the directory is forced. A `.tmp` at open restarts the creation; a `sizing` with no
+stream files creates them. No entry was written in either case.
 
 ---
 
-## 11. Suspected flaws and open questions
-
-Each item carries a **Verification** paragraph from an independent adversarial pass (re-derived from the code; scratch
-programs in `/tmp/claude-1000/-home-rakis-devel-aspen/ae495a5c-bf93-422a-9982-f278ed6d3ddf/scratchpad/{exp,iov,verify-crl}`).
-Verdicts: CONFIRMED, PLAUSIBLE, REFUTED.
-
-Confidence is my confidence that the described behaviour exists in the code as written. "Reproduced" means I ran
-the real `SimpleCRL` from a scratch program (outside the repository) and observed the failure. Severity is stated
-separately where it matters.
-
-### Re-assessment for replay pins (2026-11-09, `0d08e3c6`)
-
-`git diff db789ab0..0d08e3c6 -- src/main/scala/org/aspen_ddp/aspen/server/crl` is empty, so every CRL mechanism is as
-described. Only findings whose *consequence* runs through the transaction layer change.
-
-| Id | Status | Reason | Evidence |
-|---|---|---|---|
-| F1-F12, F14-F17, F19-F21 | unchanged (earlier FIXED marks stand) | CRL code not in the diff | `server/crl/` |
-| F13 | **narrowed** | The re-apply after a crash now meets per-write checks for TKVL writes and is skipped; blind writes, `DoesNotExist` inserts after a later delete, and a recovered acceptor's non-late commit remain. *2026-11-14:* a re-applied blind Insert over a newer write is a no-op, `Exists`-guarded deletes are refused, refcount ABA refuted; remaining: inserts after a later delete. *2026-11-14 (Todo 2.9):* only at stores that never saw T (fewer than a quorum), and healed by their entry's reconcile | `KeyValueListNode.scala:501-518`; `KVObjectState.insertWins`; paxos P-N3 |
-| F18 | unchanged (still RESOLVED by the X2 mute) | Its reasoning no longer rests on `TransactionTooOld`; the late-commit rule now also relies on the mute (paxos P-N2) | `Frontend.scala:676` |
-
-New, CRL-facing: every recovered unresolved commit vote now waits for its UnackedCommits lookup before its store drives
-it (transaction-recovery R-N3; since 2026-11-15, Todo 4.4, it is driven at once), and a prover saves an abort vote with a memoryless promise to the CRL on each later
-prepare (Ruling 10, `Tx.scala:786-788,817-836`): one extra record per prover, within admission.
-
-### Re-assessment for the replay-pins addendum (2026-11-10, `c181375b`)
-
-`git diff ab2500a4..c181375b -- src/main/scala/org/aspen_ddp/aspen/server/crl` adds applied stubs (3.6): a second record
-kind in `LogEntry`, `Stub` beside `Tx` (`LogContent.scala:93-133`), `StoreRecoveryState`, and the interface methods of
-section 2. Findings it touches:
-
-| Id | Status | Reason | Evidence |
-|---|---|---|---|
-| F3 | unchanged (FIXED stands, extended) | Stubs are copied forward from the stream after the active one by the same rule, through their zero-length anchor | `SimpleCRL.scala:211-220`; `LogContent.scala:124-128` |
-| F4 | unchanged (exception added by design) | A save after an ordinary delete in the same entry is still dropped; a save after a *stub-made* deletion cancels it and is written beside the stub (`stubReplaced`, fix round 1 of Task 2) | `LogEntry.scala:48-84` |
-| F5 | unchanged (scope extended) | Stub TxIds are as unchecksummed as everything else; a corrupted TxId would make a store skip one transaction's apply, or keep a stray stub that the scan drops | `LogEntry.scala:223-250` |
-| F8 | **narrowed** | Stubs are charged without a check, so they count toward the live bound; the gaps listed remain for transactions | `Frontend.scala:395-415` |
-| F12 | **FIXED** 2026-11-15 | `dropStore` is one CRL-thread request, transactions and stubs alike | `SimpleCRL.scala` |
-| F13 | unchanged | The stub replaces the record at the point the deletion would run; a crash before it is durable recovers the record, as before | `Frontend.scala:668-674` |
-| F16 | **FIXED** 2026-11-15 | The open writes nothing; stubs keep their recovered anchors | `SimpleCRL.scala` |
-
-### New findings from the addendum refresh (2026-11-10)
-
-#### F22 (new). Stubs grow with UnackedCommits entries when repair scans stall (PLAUSIBLE; liveness)
-
-**Verdict: PLAUSIBLE. Severity: liveness (device-wide prepare drops).** A stub lives until the store's scan deletes its
-entry or two consecutive scans find it gone (repair-process.md 5.5, Ruling 8), and every forget of a late-acknowledged transaction writes one. While
-scans do not run for a store (metadata group unreadable, scans timing out, F9 of repair), stubs accumulate one per
-entry. Each is charged 33 bytes to the device's admission without a check (`Frontend.chargeStubs`,
-`Frontend.scala:294-297`), and admission drops new prepares of unseen transactions past half a stream (150 MB by
-default): about 4.5 million stubs per device. A store acknowledging late under sustained load (10 k transactions/s)
-writes that many in about 8 minutes of stalled scans. Before the limit is reached the tree growth of the same entries
-(transaction-recovery R-N4) is the larger cost, and copy-forward stays inside the bound. Not a safety issue: the stubs
-are durable and the admission limit keeps C11. *Fix sketch:* none needed beyond R-N4's; or cap stubs per store and fall
-back to the case-3 lookup.
-
-> **2026-11-15 (Todo 4.6): FIXED.** A cap was rejected: a stub skipped at the cap lets a replay apply T again at that
-> store, and a non-late commit has no lookup to fall back on. Instead a stub carries T's start timestamp (`Stub`, TxId
-> plus 8 B: `AppliedStubBytes` 41; `TxFinalized.startTimestamp` for the no-Tx owed path; `crl_save.log` carries it),
-> and its store drops it at heartbeat (`Frontend.expireStubs`) once T is past the horizon plus the expiry margin and the
-> store holds no Tx for T (live, deferred behind a held commit, awaiting backend commits, or kept by a quarantine). Past
-> that point T is below the forget floor, and `receivePrepare` now refuses such a prepare even when the host's status
-> cache holds T resolved but unfinalized (it may have been written by another store's Tx after this store forgot T); a
-> finalized entry has it ignored. So no Tx for T can arise, and the stub can suppress nothing: the R-N10 argument,
-> made to hold for every stub. A queue ordered by expiry makes each heartbeat cost O(k log n) for the k stubs due
-> (a stub a Tx keeps past its expiry is set aside and rechecked, blocking none behind it). Stubs are bounded by their
-> write rate times about 30 s, whatever the repair scans do;
-> the scan no longer touches them (repair RP-N6, RP-N7). Tests: FrontendSuite "an applied stub is dropped once its
-> transaction is past the horizon plus the expiry margin", "an applied stub is kept past expiry while the store holds
-> a Tx for its transaction", "a prepare below the floor with a resolved, unfinalized status-cache entry is refused";
-> SimpleCRLSuite's stub tests compare the recovered start timestamps across rotation and reopen.
-
-#### F23 (new). Stub durability across rotation, transfer, adoption and rebuild (REFUTED except rebuild)
-
-**Verdict: REFUTED for rotation, transfer and adoption; see rebuild-process.md N3 for rebuild.** Rotation: copy-forward
-by anchor (`SimpleCRL.scala:211-220`); Task 2's SimpleCRLSuite runs more than six rotations and two reopens. Transfer
-out of an open store: the stubs' saves precede `Frontend.close` on the executor, and `readStoreState` is answered in
-order with them (C14), so the extraction carries every stub the store wrote; out of an unloaded store:
-`saved.supersededBy(state)` merges stubs as it merges transactions (`StoreTransfers.scala:111`); transfer in:
-`loadStore` saves stubs first and the Frontend recovers them (`Frontend.scala:307-311`). Adoption: the device CRL moves
-with the device, and `storesWithEntries` counts stub-only stores so `dropLeftoverCrlState` cleans a transferred-away
-store's stubs. Rebuild and CRL loss: the stubs are dropped (`dropStore`) or lost with the CRL; the rebuilt store relies
-on its mute instead.
-
-#### F24 (new). A stub and a transaction state of one id in the same entry (REFUTED)
-
-**Verdict: REFUTED.** The candidates were a stub's save silently dropping a later save of the same id (fixed in Task 2,
-fix round 1: `stubReplaced` lets the later save cancel the stub's deletion), the open-time re-save of a stub deleting
-the re-saved transaction of the same id (stubs are re-saved first, before any transaction is in memory,
-`SimpleCRL.scala:153`), and an entry holding both a stub and its deletion (`addStub` removes a pending deletion,
-`deleteStub` removes a pending stub, `LogEntry.scala:86-93`). Task 2's deferred minor, an admission undercount if a
-prepare reused the replaced record across the stub's callback, was closed by Task 4: the record leaves `admitted` at
-once and a prepare in the window is admitted afresh (`Frontend.scala:401-409`).
-
-### F1. Large entries are silently truncated; acknowledged saves are lost (reproduced, high confidence, severe)
-
-> **FIXED (2026-11-09).** `StreamWriter.writeFully` loops the gathering write until every buffer is written. Covered by
-> the SimpleCRLSuite tests "StreamWriter writes every buffer of a write with more buffers than IOV_MAX" and "An entry
-> holding more transactions than IOV_MAX buffers recovers, including the re-save at open".
-
-**Verification (adversarial pass): CONFIRMED, severity data-loss.** Re-ran `iov/T.java` (1025 buffers wrote 10240 of 10250; 3000 wrote 10240 of 30000) and `Exp` E1 (1 of 501 recovered). `StreamWriter.scala:74` indeed discards the return value and `Stream.writeEntry` always hands over one array. Buffer count per entry is 1 header + (1 txd + 1 per update with data) per transaction + 1 static + at most 1 pad (`LogEntry.scala:84-121`), so about 340 two-update or about 510 one-update transactions overflow IOV_MAX. Triggers that need no slow disk: (a) the open-time re-save `SimpleCRL.scala:132-136` puts every recovered transaction into one entry (`initializing` suppresses `startWrite`), so a device recovering more than about 340-510 live transactions writes an unreadable entry on every start, and every entry written after it is lost with it (`findHighestEntry` stops at it); (b) a rotation that copy-forwards that many (`SimpleCRL.scala:178-182`); (c) batching behind a slow DSYNC (E1 forces this by blocking the writer in a completion handler, so (c) is the least likely). The F1 text above is otherwise accurate. Fix sketch: loop `while buffers.exists(_.hasRemaining)` (or coalesce into chunks of at most 1024 buffers and check the return value), and assert the byte count equals the entry size.
-
-`Stream.writeEntry` builds one buffer per transaction description, one per object update, a header, a static region and
-padding, and `StreamWriter` calls `channel.write(w.buffers)` with that array and **ignores the return value**
-(`S/crl/simple/StreamWriter.scala:74`, `LogEntry.scala:59-121`). `FileChannel.write(ByteBuffer[])` writes at most
-`IOV_MAX` = 1 024 buffers per call and returns the bytes written; it does not loop. Confirmed with a standalone Java
-program on this host (JDK 25): 1 025 buffers wrote 10 240 of 10 250 bytes, 3 000 buffers wrote 10 240 of 30 000.
-
-An entry with more than about 1 020 buffers (for example 340 new transactions with a description and two updates each
-batched during a slow `DSYNC`, or a rotation that re-emits more than ~500 live transactions, or a recovery re-save of
-the same) is written without its static region and trailing UUID. The write "completes", handlers run, votes and
-promises are sent, and the entry is unreadable on recovery. Because `findHighestEntry` stops at the first unreadable
-entry, **every later entry is lost too**.
-
-Reproduction: `SimpleCRL` over a temp directory, first save gated, 500 further saves with two updates each queued
-behind it, gate released, all 500 completions fired, CRL shut down and reopened: **1 transaction recovered of 501
-acknowledged**. Scratch program: `/tmp/claude-1000/-home-rakis-devel-aspen/ae495a5c-bf93-422a-9982-f278ed6d3ddf/scratchpad/exp/Exp.scala` (E1).
-
-Effect: forgotten promises and accepts (split-decision risk) and lost object data of commit votes, silently, exactly
-under load. The tests use few transactions per entry and did not hit it.
-
-### F2. After recovery spanning two streams, the active stream gets the wrong UUID; later acknowledged entries are lost (reproduced, high confidence, severe)
-
-> **FIXED (2026-11-09).** `Recovery.recover` takes the active stream's UUID from the newest entry and the walk over
-> older entries no longer changes it. This also fixes F20. Covered by the SimpleCRLSuite test "Saves acknowledged after
-> a recovery that spanned two streams survive the next recoveries".
-
-**Verification: CONFIRMED, severity data-loss, and it escalates (new experiment `verify-crl/Exp3.scala`).** Re-ran E2 (Z lost). `Recovery.scala:81` assigns the UUID for each visited entry and the last assignment is the oldest visited entry's, returned at `:106` and given to the active stream at `SimpleCRL.scala:126-128`. The open-time re-save (`:132-136`) is itself written with the wrong UUID when the walk crossed a stream, so even with no new traffic the first entry of every such run is unreadable. Escalation: after the restart, keep saving until the ring rotates into the next stream (fresh random UUID, readable), shut down and reopen. The walk from the newest entry follows its previous-entry link into the wrong-UUID entries, `readEntry` returns None, and recovery throws `BrokenEntryChain` (Exp3 output: `no entry can be read at StreamLocation(StreamId(1),8192,4096)`). `openDeviceCrl` then marks every store on the device rebuild-required (F6). So F2 is not only lost acknowledged saves: one ordinary restart in the state "oldest needed entry in an earlier stream" followed by a rotation and a second restart destroys the device. Fix sketch: return `readers(activeStreamId.number).currentUUID` as the active stream's UUID; add a regression test that restarts twice across a stream boundary.
-
-`Recovery.recover` sets `currentStreamUUID = h.streamUUID` for every entry it visits while walking back
-(`Recovery.scala:81`) and returns the **last** value (`Recovery.scala:106`), which is the UUID of the *oldest* visited
-entry. `SimpleCRL` hands that value to the *active* stream as its UUID (`SimpleCRL.scala:126-128`). When the walk crosses
-a stream boundary (the usual case once a transaction lives longer than one stream), the active stream writes new entries
-with another stream's UUID. `StreamReader.readEntry` compares an entry's UUID to the UUID at the start of its own file
-(`StreamReader.scala:15-19, 69`), so the next recovery stops at the first entry written after the previous recovery.
-
-Reproduction: 3 streams of 12 KiB; transaction X saved, then Y saved three times so the log crosses into stream 1; shut
-down and reopen (2 transactions recovered); save Z and wait for its completion; shut down and reopen: **2 transactions
-recovered, Z (acknowledged) lost**. Scratch program `Exp.scala` (E2).
-
-Effect: every restart that begins with a long-lived transaction spread over two streams loses every record
-acknowledged after that restart until the next rotation. Forgotten Paxos promises/accepts and vote records.
-
-### F3. Rotation overwrites, in place, the stream that holds the only copy of live data (high confidence in the mechanism; not executed)
-
-> **FIXED (2026-11-09).** A rotation now copies forward the live data of the stream *after* the one it recycles
-> (`SimpleCRL.writeCurrentLogEntry`). Invariant: the stream after the active one holds no needed entry, so the stream
-> a rotation overwrites is never needed, whatever part of the write persists. With two streams the copy is the whole
-> live set, still at most half a stream. `SimpleCRL.apply` requires at least 2 streams. Covered by the SimpleCRLSuite
-> test "A rotation write torn at any sector leaves every earlier acknowledged save recoverable", which tears every
-> rotation of a three-lap run at each sector prefix and with only its first sector old; before the fix it threw
-> `BrokenEntryChain`.
-
-**Verification: PLAUSIBLE (mechanism confirmed by reading, not executed), severity data-loss.** `Stream.recycleStream` (`Stream.scala:14-17`) resets the offset to 0 and picks a new UUID; `writeCurrentLogEntry` (`SimpleCRL.scala:170-191`) then writes the copy-forward entry over the same file in one `write`. The last durable entry's `oldestEntryNeeded` is the only thing that tells recovery which older entries matter, and it still points into the stream being overwritten until the new entry is durable. A crash that tears this write (power loss or kernel crash; a plain process kill does not tear a `write` syscall) can leave old sector 0 replaced (new file UUID, so every old entry in the file is unreadable: `BrokenEntryChain`) or old header with foreign tails. No test covers a torn rotation. Trigger needs power loss inside a single-entry write window, repeated on every rotation, so rare but not negligible on a fleet. Fix sketch: write copy-forward into a stream that holds no needed data (reserve one spare stream, or require `oldestEntryNeeded` to have advanced past the stream first), and only then recycle.
-
-On a rotation the live transactions with data in stream *k+1* are re-emitted into the entry that is then written at
-offset 0 of the same file (`SimpleCRL.scala:171-189`, `Stream.scala:14-21,24-40`). The old copies and the static
-records in that stream are still needed by the chain until the new entry is durable (the last durable entry's
-`oldestEntryNeeded` points into that stream). A crash or I/O error during this write, or a partial persistence of its
-sectors, can:
-
-- change the file's first-16-byte UUID (header sector persisted) and so make every old entry in the file unreadable:
-  the walk throws `BrokenEntryChain` and the whole device's stores become `rebuild-required` (F6); or
-- leave the old entry 0 header intact while overwriting later sectors: old record locations then point at foreign bytes
-  and `readStreamLocation` returns them without validation: wrong transaction descriptions and object data presented
-  as recovered state; or
-- (with F1) leave an acknowledged but truncated copy and no old copy.
-
-The window is one multi-megabyte write per rotation, repeated on every restart that rotates (5.6) and in crash loops.
-A safe design needs the copy to be durable before the old stream is touched, e.g. a spare stream in the ring. Note
-that sibling rotation tests (`SimpleCRLSuite` "Recycle Streams", "Recovery after stream recycling...") only exercise a
-clean shutdown.
-
-### F4. A save after a delete in the same unwritten entry is acknowledged but never written, and leaves a phantom live transaction (reproduced, high confidence for the phantom; medium for real-world reachability)
-
-> **FIXED (2026-11-13) for the phantom; the unwritten acknowledgement is an accepted residual.**
-> `SimpleCRL.onSaveTransaction` now asks `LogEntry.deletesFinally` first: when the unwritten entry already deletes the
-> id (a deletion a stub's save made is excluded, since a later save cancels it), the save queues only its completion
-> handler. No `Tx` is created, queued or registered, so nothing pins `oldestEntryNeeded`, `readStoreState` and
-> `getFullRecoveryState` report nothing for the id, and the ring wraps cleanly. Covered by the SimpleCRLSuite tests
-> "Save after a delete in the same unwritten entry is skipped but reports success" (now also asserts the live state
-> and that `oldestEntryNeeded` advances) and "A save skipped after a delete in the same entry does not pin the log
-> across a full wrap" (14 saves over three streams, then reopen; it threw the `BrokenEntryChain` above before the
-> fix). Residual (consequence 1): the skipped save still reports success once the deletion is durable. That is
-> harmless on the abort/finalization path, where the deletion is the intended end state. For `loadStore` it would lose
-> the loaded state only if a deletion of the same (store, txid) landed in the same unwritten entry just before the
-> load. No path issues that sequence: `dropStore` deletes the entries of a store already made unservable, and a
-> transfer back in loads into a fresh store whose entries the drop does not cover (its scaladoc). Accepted.
-
-**Verification: mechanism CONFIRMED (E3, E4 re-run), real-world trigger PLAUSIBLE-low, severity liveness/data-loss when it fires.** In the host's normal flow the phantom is healed: an aborted transaction deletes its CRL record on resolution (`Tx.scala:627`), a late accept/prepare can re-save it (`Tx.scala:751-762`), but `TxFinalized` deletes again (`Tx.scala:790-799` comment: "a prepare after an abort ... may have saved this Tx again"; `Frontend.transactionFinalized` `:537-540`), and `SimpleCRL.onDeleteTransaction` (`:291-296`) removes whatever is in `transactions`, phantom included. After the final delete the Tx is removed from the Frontend (`Frontend.scala:619-623`) and prepares for it are ignored via the status cache (`:639`), so no permanent phantom path was found in the Frontend. What remains: the phantom lives until the finalization delete (briefly holds `oldestEntryNeeded`, shows up in `readStoreState`), and the load/transfer paths (`loadStore`, `crl_save.log` re-save) where no later delete is guaranteed. The "ack without durability" aspect is harmless on the abort path. Fix sketch: in `onSaveTransaction`, if `currentLogEntry` already deletes the id, do not create or queue a `Tx` (just add the completion handler).
-
-`LogEntry.addTx` skips a transaction whose id is in `txDelSet` but still records its handler (`LogEntry.scala:40-53`).
-`onSaveTransaction` has already created a `Tx`, put it at the queue head and registered it in `transactions`
-(`SimpleCRL.scala:270-279`). Consequences:
-
-1. The save reported success without being durable. In the transfer-out/load paths the caller may delete its only other
-   copy next (`crlLoaded` removes `crl_save.log` once `loadStore`'s saves report success, `StoreRouter.scala:257-263`;
-   `loadStore` is `CrashRecoveryLog.scala:127-139`). A delete issued for the same ids just before the load, landing in
-   the same unwritten entry, loses the state permanently. Needs an unlikely interleaving (delete then reload within
-   one entry), so low likelihood.
-2. The phantom `Tx` has no data locations, so `closeStream` never moves it, but it sits in the queue with the old
-   serial and holds `oldestEntryNeeded` back forever. After the ring wraps, the newest entries claim an oldest needed
-   entry that has been overwritten, and recovery throws `BrokenEntryChain`: the CRL is declared lost and every store on
-   the device is rebuilt. Reproduced: save, delete, late save in one entry, then 14 further saves through all three
-   streams; reopen: `BrokenEntryChain: no entry can be read at StreamLocation(StreamId(2),8192,4096)`. Scratch program
-   `Exp2.scala` (E3, E4).
-3. `getFullRecoveryState`/`readStoreState` return the phantom: a transfer-out would write a long-finalized
-   transaction's state into `crl_save.log`, and the destination would resurrect it (E3 shows the CRL reporting the
-   phantom).
-
-The existing test "Save after a delete in the same unwritten entry is skipped but reports success"
-(`SimpleCRLSuite.scala:1039`) asserts only the recovered list, not the live in-memory state. The comment in the code
-calls this "a timing artifact", so it is expected to occur.
-
-### F5. No checksum anywhere; sector reordering is undetected, and garbage becomes state (medium confidence, severe if reachable)
-
-> **FIXED (2026-11-14).** Each entry header carries two CRC32C values (`LogEntry`): `header_crc` over the header
-> fields and `body_crc` over the dynamic and static data through the trailing UUID. `Recovery.recover` takes nothing
-> from an entry that fails them:
-> - The newest entry is the last one in the highest-head stream whose header is intact. If its body fails, it was the
->   write in flight at a crash: it is dropped with a warning and the entry before it is the last. A stream whose only
->   entry is a torn head (a rotation write in flight) yields to the stream before it.
-> - No intact entry may be newer than the last one found. Recovery scans its stream past it and all of the next
->   stream (hopping intact headers by size, other regions by 4 KiB). A hit means a corrupt entry hid newer ones (mid-
->   stream rot, or a rotted head hiding the real active stream).
-> - Every entry the backward walk visits must pass both checksums, and object data and txds are read only from the
->   dynamic data of entries it verified.
->
-> Failures throw `CrlCorrupt` (a corrupt header or body, or a newer intact entry). Links that end, or lead to another
-> cycle or to a newer entry, stay `BrokenEntryChain`, and so does data outside the verified entries. Decided with the
-> owner: `DeviceDiscovery.openDeviceCrl` handles `CrlCorrupt` like any other failed recovery (stores rebuild-required,
-> `crl.lost-<uuid>` kept), but logs the cause as corruption so systemic-loss work (Todo 3.1) can count it.
-> Tests: SimpleCRLSuite "A flipped byte in a needed entry's txd, object data or static record fails the open with
-> CrlCorrupt", "A torn newest entry is dropped and the state before it recovers", "A corrupt entry followed by
-> valid newer ones fails the open…", "A corrupt head of the active stream fails the open…"; DeviceCrlSuite "a device
-> whose CRL fails its checksums marks its stores rebuild-required". The torn-rotation test passes unchanged.
-> **Residuals:**
-> - A torn write and rot can't be told apart in the newest entry. Rot that hits exactly the newest acknowledged entry
->   loses that entry (its promise, vote or data), as a torn write would.
-> - Rot in an entry recovery no longer needs still makes the CRL lost when it hides a newer entry, or sits in an
->   entry the walk reads. That is simple rather than optimized: a rebuild.
-
-**Verification: CONFIRMED as a design gap (no CRC/checksum anywhere under `server/crl`; grep empty), severity data-loss only if the device reorders or corrupts sectors.** Not triggerable by software alone. Fix sketch: a CRC32C per entry header and per entry body, checked in `readEntry` and `readStreamLocation`.
-
-The only integrity checks are two UUIDs and a 3-valued disposition byte (`StreamReader.scala:47-74`,
-`LogContent.scala:60-64`). Promised/accepted proposal numbers, locations, counts and all payload bytes are taken as
-read. A torn write with reordered sectors (allowed for a multi-sector `write` on most devices), an old-cycle sector
-surviving inside a new entry, or media bit rot returns a transaction with an arbitrary promise or accept, an arbitrary
-txd, or object data of another transaction. It can lower a promise (allowing a conflicting accept), or apply foreign
-bytes to an object. Whether it requires power loss or a device misbehaving is the same A1 question as 10.3, but a
-checksum would convert silent corruption into C8 (a loud failure).
-
-### F6. Any exception from `openCRL` irreversibly turns every store on the device into a rebuild (high confidence the behaviour exists; severity systemic)
-
-> **FIXED (2026-11-09), as scoped by the owner.** A CRL that cannot be loaded does mean its stores must be rebuilt;
-> only transient errors are now suppressed. `openDeviceCrl` rethrows an I/O or VM error (`DeviceDiscovery.isTransient`),
-> leaving the device unloaded and its stores untouched for the next scan, and declares the CRL lost only after
-> `CrlOpenAttempts` (3) such failures in a row. Everything else (`BrokenEntryChain`, `CorruptedEntry`,
-> decode errors, bugs) is lost at once, as before. *2026-11-14:* a sizing mismatch is no longer among them: it refuses
-> the device and is never lost (10.15). Protection against fleet-wide declarations belongs at a higher
-> level (systemic-loss-protection.md). Covered by the DeviceCrlSuite tests "a transient CRL open failure leaves the
-> stores untouched and a later scan loads the device" and "a CRL open failing transiently CrlOpenAttempts times in a
-> row is treated as lost".
-
-**Verification: CONFIRMED, severity systemic (data-loss class).** `DeviceDiscovery.scala:498-520`: the `catch case t: Throwable` at `:510-515` covers `SizingMismatch`, `BrokenEntryChain`, OOM and I/O errors alike, then `markRebuildRequired` on every store dir and the `os.move` to `crl.lost-<uuid>` (nothing reads that directory: grep finds only the move and tests). F2 (verified above) and F4 give in-product ways to reach it. Note also: when the first `openCRL` fails after `StreamWriter` was constructed (for example the `require` in the open-time re-save), the writer thread and file handles are not shut down before the second `openCRL`, so two writers can briefly exist over the same files. Fix sketch: catch only `BrokenEntryChain`/`CorruptedEntry`; rethrow `SizingMismatch`, `Error` and I/O errors so the device stays unloaded and alarms; shut down a half-built CRL.
-
-`openDeviceCrl` catches `Throwable` (including `OutOfMemoryError`, `InterruptedException`), marks every store durable
-`rebuild-required`, and moves `crl/` aside (`DeviceDiscovery.scala:507-520`). Causes that are not "the files are
-damaged": a hand-edit of `crl-num-streams`/`crl-max-file-size-mb` (`SizingMismatch`), an out-of-memory during
-recovery (the recovered set, with object data, is held on the heap), `EMFILE`, a transient I/O error, a read-only
-remount, and every software bug in this section that makes recovery throw (F3, F4, F5). One mistaken change of version
-or configuration across a fleet rebuilds every device at once. This is the correlated loss that
-[systemic-loss-protection.md](systemic-loss-protection.md) says is unsolved. Concrete CRL-side mitigations: distinguish
-`SizingMismatch` and I/O errors (do not mark), never mark on `Error`, retry before declaring loss, and do not flip
-more than one device at a time.
-
-### F7. Sparse stream files: a full device kills the CRL, and the CRL is needed to free space (medium confidence)
-
-> **FIXED (2026-11-14, Todo 1.8) except on copy-on-write file systems.** A new CRL's stream files are created
-> preallocated at their full size (`SimpleCRL.createStreamsIfNew`, `server.FilePreallocation`): on Linux with
-> `fallocate(2)` mode 0 through FFM (O(extents), nothing written; ext4 reserves clusters for the first-write
-> conversion of the unwritten extents), elsewhere or on `EOPNOTSUPP` by writing zeros. Each is written as
-> `<n>.crl.tmp`, renamed, and the directory forced before the writer starts, so a `.tmp` left at open marks a
-> creation that wrote nothing and is restarted. `StreamWriter` opens existing files only and refuses one of the wrong
-> size. A CRL write therefore never allocates a block, so a full device cannot fail it with ENOSPC, and freezing the
-> CRL's writes is not needed. Residual: btrfs and ZFS allocate on every overwrite; the open warns, and the CRL needs a
-> file system that overwrites in place (or `chattr +C`). A write that fails all the same kills the CRL, which is then
-> handled as in F9. Tests: `FilePreallocationSuite`; `SimpleCRLSuite` "A new CRL's stream files are fully allocated,
-> and an interrupted creation starts over".
-
-**Verification: PLAUSIBLE, severity liveness.** Confirmed by reading `StreamWriter.scala:40-47`: files are extended by a one-byte write at the end, giving sparse files; ENOSPC on a first write to a hole kills the writer thread (F9 then applies). Not executed. Fix sketch: `fallocate`-style preallocation (write zeros or `FileChannel.truncate` plus a real allocation) at creation.
-
-`StreamWriter` extends the files by writing the last byte (`StreamWriter.scala:43-47`) and never reserves blocks. The
-first write to each unallocated region (and every overwrite on a copy-on-write file system) can fail with `ENOSPC`.
-The writer thread dies (`StreamWriter.scala:55-65`) and the device cannot process any transaction; deleting data,
-the usual remedy, is itself a transaction. No `fallocate`, no free-space check at open.
-
-### F8. Admission undercounts live CRL bytes, so C11 can fail and kill the CRL (medium confidence)
-
-> **FIXED (2026-11-14, Todo 1.8).** When the device loads, its admission is charged for everything the CRL holds,
-> store by store (`CrashRecoveryLog.recoveredBytesByStore`, by the formula `CrlAdmission.recoveredBytes` that
-> `Frontend.admitRecovered` also uses), each store's share retained for it (`CrlAdmission.chargeRetained`) before any
-> store loads. The paths that already release retained bytes then settle it: a store that loads replaces the share
-> with its own count (`StoreLoader`), and a drop, extraction or leftover drop releases it. Records of stores that do
-> not load are counted while they are copied forward. `Stream.writeEntry`'s `require` stays as the backstop, and a
-> failure there is handled as in F9. Test: `DeviceCrlSuite` "a device's admission counts, from its open, what its CRL
-> holds for every store, loaded or not".
-
-**Verification: PLAUSIBLE, severity liveness.** `new CrlAdmission(...)` starts at zero (`DeviceDiscovery.scala:566-567`); recovered records of stores that do not load are not admitted, yet the open-time re-save and every rotation copy them. If live bytes exceed the stream, `require(canWriteEntry)` (`Stream.scala:28`) throws on the CRL thread and the CRL dies (F9). Trigger needs a large live set held for non-loading stores. Fix sketch: at open, charge admission for every recovered record whatever its store, release on drop/transfer.
-
-`CrlAdmission` starts at zero when a device loads (`DeviceDiscovery.scala:566-567`). The CRL then already holds the
-recovered records of every store, but only the records of *stores that load* are counted (`admitRecovered`,
-`Frontend.scala:458`). Records of stores that never load on this run (Offline, `rebuild-required`, awaiting drop,
-`transferring-out`, a Shutdown-to-restart gap) are live, copied forward at every rotation, and uncounted;
-`DeviceReconciler.dropLeftoverCrlState`'s own comment names the same problem for stores without a directory
-(`DeviceReconciler.scala:66-72`). Late object data, recovered transactions and the per-update duplication are charged
-without a check. If live bytes exceed the stream during a rotation, `require(canWriteEntry)` throws
-(`Stream.scala:28`) and the device stops. Recovery on restart can reproduce it (the re-save in 5.6 emits the live set
-once more).
-
-### F9. Thread death is silent for the stores, and several callers hang (medium-high confidence)
-
-> **FIXED (2026-11-14, Todo 1.8).** A CRL has one death path: a writer death is queued to the CRL thread, which dies
-> of it. On death, every Future the CRL returned and has not answered (`readStoreState`, `deleteTransactions`,
-> `storesWithEntries`, `dropStore`, and `loadStore`, now overridden so each of its saves is tracked) fails with
-> `CrlFailed`, and so does every later call. `CrashRecoveryLog.failed` completes, and `onThreadDeath` runs once.
-> Handler-style save completions never run, as before, so no vote follows. The host
-> (`DeviceShutdown.crlFailed`, through `failed`) disowns the device directory, closes its stores, gossips them offline
-> and unloads the device. Nothing is written, so a restart recovers the files as after a crash. Deliberately not done:
-> no reload before the restart (a reopen loop would reach `CrlOpenAttempts` and declare the CRL lost) and no Failed
-> mark in the tree (that would rebuild every store, Todo 3.1). Rebuilds and transfers on the device are not
-> cancelled: their CRL calls and loads fail, and a restart resumes them. Tests: `SimpleCRLSuite` "A CRL whose writer
-> thread died fails every call ..." and "A CRL whose own thread died ..."; `DeviceCrlSuite` "a device whose CRL fails
-> is unloaded ...".
-
-**Verification: CONFIRMED, severity liveness.** `Main.scala:1702` only logs. After death nothing drains `ioQueue` (`SimpleCRL.scala:145-155`), so `save` completions never fire (stores never vote) and `readStoreState`/`dropStore`/`deleteTransactions`/`storesWithEntries` futures never complete. Nothing in the host detects the dead CRL or takes the device out of service. Fix sketch: on thread death mark the device failed (unload stores, stop answering as acceptors, raise an operator alarm) rather than leaving zombie stores.
-
-`onThreadDeath` only logs (`Main.scala:1700-1707`). After a death the stores stay installed and keep serving reads while
-they can no longer vote; peers will mark them as missed updates and repair later. `readStoreState`, `dropStore`,
-`deleteTransactions`, `storesWithEntries` and `loadStore` complete through the CRL thread and therefore never
-complete: a store load (`awaitCrlLoad`), a transfer extraction and a rebuild drop all wait forever with no timeout.
-CLAUDE.md's "reads keep working" is true only for object reads. The writer thread can also be killed by an exception
-from any completion handler (10.16). Whether a stale-reading zombie store is acceptable to clients is a question for
-the read path, not answered here.
-
-### F10. No exclusion of a second opener of the same CRL files (medium confidence; high severity if it happens)
-
-> **FIXED (2026-11-14) for openers that share the lock; double mounts of shared storage are a residual.**
-> `SimpleCRL.apply` takes an exclusive lock on `crl/lock` (`CrlLock`) before it reads the stream files, and holds it
-> until the writer has closed them (shutdown, a failed open, or the CRL thread's death). A second opener, in this
-> process or another, gets `CrlLocked` and reads or writes nothing. `DeviceDiscovery.openDeviceCrl` treats it as
-> "in use", never as lost or transient: the device stays unloaded, no store is marked, and every scan retries.
-> In-process openers are refused by a registry keyed by the lock file's identity before any descriptor is opened,
-> because closing any descriptor of a file drops the process's POSIX locks on it (checked on OpenJDK 25).
-> Tests: SimpleCRLSuite "A second open of a CRL that is open fails with CrlLocked and leaves the first working",
-> "A failed open releases the CRL lock", the two dead-thread lock tests; DeviceCrlSuite "a device whose CRL another
-> opener holds is left unloaded, never lost, and loads once it is released".
-> **Residual:** the lock fences only writers that take it on the same file system. Two hosts mounting one shared
-> device (SAN, network file systems with unreliable lock semantics) still need real fencing (systemic-loss M9).
-
-**Verification: CONFIRMED (no `FileLock`/`tryLock` anywhere in `src/main`), severity data-loss only with a double mount, which the adoption design declines to fence.** Fix sketch: take an exclusive `FileChannel.tryLock` on `crl/lock` while open.
-
-Nothing takes a `FileLock` on the stream files (searched: no `FileLock`/`tryLock` in the tree). `closingCrls` guards
-only an in-process reopen. A device mounted twice (a duplicate mount, a mistaken second host process, a SAN device
-adopted while the old host is still writing) yields two CRLs writing the same files with independent serial numbers
-and offsets: interleaved or overwritten entries, lost acknowledged state. The unclean-adoption design explicitly
-declines fencing; this is the record of what that decision depends on.
-
-### F11. Stream file creation and the `crl/` directory entries are not made durable (low confidence of harm)
-
-> **FIXED (2026-11-14, Todo 1.8)** with F7: the stream files are renamed into place and `crl/` is forced before the
-> writer starts.
-
-**Verification: PLAUSIBLE-low, severity liveness (spurious F6).** Not executed; on journaling filesystems the DSYNC write of the size-extension byte normally persists the new directory entry, but POSIX does not require it. Fix sketch: `DurableFiles.syncDirectory(crlDir)` after creating the files.
-
-New stream files are created and extended with a `DSYNC` write, but their directory is never fsynced
-(`StreamWriter.scala:38-47`, `SimpleCRL.scala:48-50`). On the common journaling file systems the file's own sync
-carries the directory entry, but POSIX does not promise it. After a crash right after the first saves, a stream
-file could be missing, and `checkSizing` would throw (`SimpleCRL.scala:88`), producing F6 on a device that now holds
-stores.
-
-### F12. `dropStore` can delete a same-txid re-save made after it read the list (low confidence; narrow)
-
-> **FIXED (2026-11-15, Todo 5.6).** `SimpleCRL.dropStore` is one CRL-thread request (`DropStore`): it deletes every
-> transaction and stub of the store held when it is processed, so the queue's order makes "held when called" exact.
-> Its transaction deletions are cancellable (`LogEntry.deleteTxUnlessResaved`, formerly the stub-only
-> `deleteTxForStub`): a save of the same id landing in the drop's own unwritten entry (the store loaded again) is
-> written, where a final deletion would have skipped it. Stub deletions were already cancelled by a later stub save.
-> Tests: SimpleCRLSuite "dropStore keeps a same-id save queued after it", "... that lands in the entry holding its
-> deletion" (both fail on the read-then-delete default, the second also with final deletions). The trait default
-> keeps the read-then-delete for CRLs that keep nothing on disk.
-
-**Verification: PLAUSIBLE-low.** `CrashRecoveryLog.dropStore` (`CrashRecoveryLog.scala:159-162`) reads then queues the delete from a parasitic callback on the CRL thread, so any `SaveTransaction` already queued for the same txid lands between them and is deleted. Needs a store of that id loaded and saving during a drop. Fix sketch: a CRL-side `DropStore` request that deletes everything of the store present when it is processed on the CRL thread (atomic with the read).
-
-The default `dropStore` is `readStoreState` followed by `deleteTransactions(ids)` (`CrashRecoveryLog.scala:159-162`).
-Only entries *present at the read* are named, but a transaction re-saved with the same id between the read and the
-delete is removed by it. Reachable only if a store of that id is loaded again during a drop (transferred back).
-`dropLeftoverCrlState` and `discardLostStore` guard with `crlDropsRunning`/`droppingCrlState` and directory checks;
-no equivalent guard in the transfer-in path was verified.
-
-### F13. `dropTransactionObjectData` is memory-only; the durable record can point into recycled space (low confidence)
-
-> **2026-11-14 (Todo 2.2): NARROWED further.** The re-apply cases listed below: (1) a blind KV Insert is now a no-op
-> over a newer write of its key (last writer wins on (timestamp, revision), transaction-requirements F1/F2); (2) an
-> `Exists`-guarded Delete is refused by `TransactionBuilder` (`BlindKeyValueWrite`), and had no caller; (3) the
-> refcount ABA cannot occur: `checkRefcount` compares the whole `ObjectRefcount` including `updateSerial`, and every
-> count change bumps the serial, so T1's replay does not match after T2 (transaction-recovery F4 already refuted it).
-> Residual: a blind or `DoesNotExist` Insert re-applied after a later delete of its key resurrects it (Todo 2.9).
-> The second half (a durable record pointing into recycled space) is unchanged.
-
-> **Refresh (replay pins): NARROWED.** Unchanged CRL mechanism. The re-apply it enables is now skipped for per-write
-> checked writes: TKVL puts carry `KeyRevision`/`DoesNotExist` and deletes `KeyRevision` (`KeyValueListNode.scala:489-506`),
-> re-checked at apply (`RequirementsChecker.scala:141`). Still re-applied: blind writes, an `Exists`-guarded raw delete, and
-> a derived `DoesNotExist` insert whose key was deleted since. The recovered Tx learns commit either from its UnackedCommits
-> entry (only if it had not acknowledged), or non-late from its own driver adopting its accepted value (paxos P-N3); a
-> late commit with no entry applies nothing.
-
-**Verification: CONFIRMED mechanism; trigger needs a narrow window; severity data-loss (value regression). Detailed answer to the priority question.** `dropTransactionObjectData` (`SimpleCRL.scala:298-299`) is memory-only; the CRL record of a committed transaction is deleted only at finalization (`Frontend.transactionFinalized` `:537-540`, after outstanding commits). A crash between the backend commit persisting and that delete recovers the record with disposition VoteCommit, its object data and Paxos state (`Recovery.scala:90-102`). A recovered commit vote keeps its vote and is not re-checked (`Tx.scala:394-401`); when the outcome arrives as committed (TxResolved/TxFinalized from peers, or `unackedCommitFound`), `doCommit` calls `RequirementsApplyer.apply`, whose only protection is `RequirementsChecker.check(applying = true)`. That check rejects a replay when the transaction carries a revision requirement (DataUpdate, VersionBump, KV update with `requiredRevision`: object revision has moved on, and the `ObjectTimestampError` check also fires), a `KeyRevision`/`DoesNotExist` key requirement, or a `RefcountUpdate` whose required refcount no longer matches. It does NOT reject: (1) a blind KV Insert (no required revision, no key requirement, or only `MayExist`/`Exists`): `RequirementsApplyer.scala:107-110` overwrites the key with the older value, regressing a newer committed blind write T2 that persisted before the crash; (2) a KV `Delete` guarded only by `Exists`, after the key was re-inserted by T2; (3) a `RefcountUpdate` whose required refcount equals the current one again (ABA: T1 takes 1 to 2, T2 takes 2 back to 1, T1's replay matches and sets 2). Nothing else stops it: the host status cache is in memory and empty after a crash; the horizon (`Tx.tooOld`) applies only to transactions the store does not know, not to recovered ones; `alreadyApplied` (`Tx.scala:526-533`) only affects logging/`TxCommitted` errors, and for a blind Insert it is false anyway once T2 replaced the key's revision. The same replay applies to the traceless-commit lookup path. Window: T1 backend-committed on this store, T2 (blind on the same key/object) committed and persisted, crash before T1's finalization delete (T1's finalization normally lags by at least `errorTimeout`, 2 s). TKVL nodes mostly use revision/key requirements, so exposure is limited to callers using `tx.update(..., requiredRevision = None, ...)` with blind inserts or Exists-guarded deletes. Fix sketch: make `dropTransactionObjectData` durable (write a tombstone record so a recovered commit vote with dropped data is not re-applied), or have `doCommit` skip a recovered transaction whose objects show a revision/timestamp newer than the transaction's start timestamp.
-
-After `dropTransactionObjectData`, the last durable record of the transaction still lists its update locations. If
-those lie in a stream that is recycled before the transaction is saved or moved again (possible when the update data
-was written in a later entry than the txd, i.e. after a data-less first prepare), a crash recovers the transaction with
-foreign bytes as object data, undetected (F5). Such a transaction has already applied its commit (data is dropped only
-after the backend commit, `Tx.scala:608-610`), so a re-application is normally excluded by the revision check
-(`alreadyApplied`); whether every update form is idempotent in this way is not established here
-([transaction-recovery.md](transaction-recovery.md)).
-
-### F14. `readStoreState` and disk recovery return different statuses (low confidence of harm)
-
-> **FIXED 2026-11-16 (Todo 7.5).** One status: the one last saved. The static record now persists it (bits 3-4 of
-> the Paxos mask byte; size and `CrlAdmission.TxOverheadBytes` unchanged) and `Recovery` restores it instead of
-> `Unresolved`. Reproduced first: a crash recovered saved `Committed` and `Aborted` records as `Unresolved`. This
-> mattered more than the finding said: transaction-recovery F6's fix restores a recovered Tx's resolution from its
-> saved status, and was tested only through `TestCrl`, so after a real crash of a SimpleCRL it never applied (the
-> Tx fell back to the unresolved path: lookup and driver). Test: SimpleCRLSuite "A crash recovers each record's
-> saved status, as readStoreState returns it (CRL F14)"; "Tx Static Save & Load with ObjectUpdate data" checks the
-> encoding.
-
-**Verification: CONFIRMED (code), severity doc-only.** `Recovery.scala:100` sets Unresolved; `SimpleCRL.scala:265` returns the live state. Fix sketch: pick one and document it.
-
-Disk recovery sets `TransactionStatus.Unresolved` (`Recovery.scala:100`); `readStoreState` returns `tx.state` as last
-saved (`SimpleCRL.scala:265`). A record saved after resolution (`Tx.txStatus` is saved as it stands) keeps its
-Committed/Aborted status in a transfer's `crl_save.log` but loses it after a crash. Consumers
-([transaction-recovery.md](transaction-recovery.md)) must treat both as equivalent or this is an inconsistency.
-
-### F15. Admission has no exemption, so cross-device back-pressure can stall finalization (low-medium confidence; liveness only)
-
-**Verification: PLAUSIBLE (design-level), severity liveness.** Admission rule re-read (`CrlAdmission`, `Frontend.admitPrepare`); no exemption exists. Not demonstrated. Fix sketch: exempt finalization-action transactions or reserve a share of the mark for them.
-
-> **2026-11-15 (Todo 4.3): FIXED (narrowed).** Admission has lanes by the store's pool (`AdmissionTier`): data
-> pools admit below 3/4 of the limit, metadata pools below 7/8, the bootstrap pool up to the limit. The marker
-> batches that finalization waits for are always one tier above the transaction they finalize, so lower-tier load no
-> longer blocks them (cross-document-review X5 for the details and tests, G10 for the capacity argument).
-> Residual: finalizers in the transaction's own tier (TKVL split, join, tail removal) still compete with that tier's
-> traffic.
-
-The record of a committed transaction stays live until its finalization actions (further transactions) complete. Those
-transactions are new to every store that must vote on them and are dropped when the store's device CRL is above the
-mark. If every device in the relevant pools is above the mark because of records waiting for finalization, nothing
-frees space. The design explicitly decided "No transaction is exempt" (2026-11-07 spec, section 4). The liveness
-argument is not in the spec; it deserves one.
-
-### F16. Every open rewrites the full live set and every crash loop rotates the ring (medium confidence; amplifies F3 and F8)
-
-> **FIXED (2026-11-15, Todo 5.6).** The open writes nothing. Recovery returns each live record with the locations its
-> newest static record names and the serial of the oldest verified entry holding any of them (a stub: its anchor in
-> the newest entry holding it); the constructor queues them in serial order, as if it had written them, and the next
-> rotation copies them forward from there (5.6). Tests: SimpleCRLSuite "An open writes nothing: repeated reopens
-> leave every stream file unchanged ...", "Records an open recovers are copied forward by later rotations",
-> "... reopened after every save", "An open of a CRL whose live set is more than a stream recovers it without
-> writing" (an over-full live set no longer makes the device unopenable; its next rotation hits the
-> `Stream.writeEntry` backstop, which admission keeps out of reach). **Residual:** recovery still reads the walked
-> entries on the host control thread (Backlog, "Device CRL recovery runs on the host control thread"), but no longer
-> writes there.
-
-**Verification: CONFIRMED (code `SimpleCRL.scala:132-137`), severity amplifier.** It makes F1(a) and F2 apply to every start, not only to rotations.
-
-`SimpleCRL.scala:132-137`. Size is up to half a stream and the open blocks the host control thread (Backlog.txt).
-Combined with F3 each restart is a rotation-class risk.
-
-### F17. Durable backend assumption (A4) for backends other than RocksDB/FSIF (not verified)
-
-> **CLOSED 2026-11-16 (Todo 7.5), documented.** `MapBackend`'s scaladoc and `server/store/CLAUDE.md` (Backends) now
-> state that it gives no durability, is for tests only (no `BackendOpener` constructs it), and that any backend used
-> outside tests must complete a commit only once it is durable.
-
-**Verification: REFUTED for RocksDB and FSIF, doc-only for MapBackend.** RocksDB writes with `setSync(true)` (`BufferedConsistentRocksDB.scala:110-112`); FSIF's commit completes when the journal batch is forced (`FsifBackend.scala` header, durable-before-map). `MapBackend` is memory only, so it loses its data on a crash regardless of the CRL.
-
-The CRL delete of a committed transaction is gated by backend commit completion (`Frontend.scala:209-210`). The
-in-memory `MapBackend` and any future backend must make "complete" mean durable, or a power loss destroys both the data
-and its CRL record. Verified only for `BufferedConsistentRocksDB.scala:111`; FSIF's journal force is described in
-CLAUDE.md and not re-verified here.
-
-### F18. A rebuilt store has no memory of the Paxos state it lost (open question; low confidence)
-
-> **RESOLVED (2026-11-09)** by the X2 fix (cross-document-review.md): the rebuilt store takes no part in any
-> transaction started before its `acceptor-since` time.
->
-> *Restated 2026-11-16 (cross-document C3, Todo 7.4).* The question below is settled by the mute, not by timing or by
-> the pool's failure tolerance, which gives amnesia none (X2). A rebuilt store neither promises, votes, accepts nor
-> saves in a transaction started before `acceptor-since` (rebuild finish plus 10 s), and answers expiry as
-> `amnesiac`. Every store mutes an unknown transaction starting more than `MaxStartLead` (2 s) ahead of its host's
-> wall clock, so client clocks do not enter (paxos P-N2). Residual (the fast-clock case): an old host whose clock led
-> the rebuilding host's by more than 8 s plus the rebuild's duration could have joined a transaction that starts after
-> `acceptor-since`; and a zombie old copy (cross-document X1) is not muted. See rebuild-process F14.
-
-**Verification (superseded by the notes above): OPEN, not a CRL code defect; PLAUSIBLE only under correlated loss.** Safe in practice by timing: a rebuild takes long enough that every transaction in flight at the loss has been finalized at the other stores, and old prepares vote `TransactionTooOld`. Belongs to the Paxos documents. *(Refresh: `TransactionTooOld` no longer exists; the mute covers it, see the RESOLVED note.)*
-
-After a lost CRL the store's directory is discarded and the store rebuilt under the same `StoreId`. A transaction in
-progress at the time had promises and accepts from this acceptor. The rebuild process does not process transactions
-while rebuilding (Todo.txt) and (before the refresh) the horizon made old prepares vote abort
-(`TransactionTooOld`, since removed), but a transaction decided by an accept
-quorum that included the lost store, whose other accepted members then fail, can be decided differently by a later
-proposer that reaches the amnesiac store. Whether the rebuilt store is blocked from Paxos participation for any
-transaction older than its rebuild, and whether the quorum structure makes the case impossible, is for
-[rebuild-process.md](rebuild-process.md) and [paxos-transactions.md](paxos-transactions.md) to settle.
-
-### F19. Zero-filled regions parse as valid empty entries (low confidence; derived by reading, not executed)
-
-> **FIXED (2026-11-14)** with F5. A zero header fails `header_crc`, and a zero stream UUID is rejected outright
-> (`StreamReader.readHeader`). A never-written or zero-filled CRL now opens empty at stream 0, offset 0, instead of at
-> the file end with a rotation on its first write (SimpleCRLSuite "Zero-filled stream files open as an empty CRL that
-> writes from the start of stream 0").
-
-**Verification: CONFIRMED by derivation (header size 70; an all-zero file parses as 4096-byte empty entries), severity doc-only.** Harmless today because ties in `highestHead` keep stream 0 and serial numbers start at 0.
-
-A never-written stream file has UUID (0,0) at offset 0 and `readEntry` accepts an all-zero header (header UUID 0 equals
-the file's current UUID 0; the tail at byte 50 is also 0), as an empty entry of 4 096 bytes, repeating to the end of
-the file. A reopened but never-written CRL therefore picks stream 0 as active with its write offset at the end of the
-file and rotates on the first write, and a zero-filled stream looks "valid" to the previous-entry link of a later entry
-(`Recovery.scala:38-44, 65-83`). Probably harmless today; it makes the "head entry with the highest serial" rule
-depend on serial numbers starting at 0.
-
-
-### F20 (new). F2 turns a routine restart into a device-wide rebuild (see F2; Exp3)
-
-> **FIXED (2026-11-09)** with F2.
-
-Not a separate bug but a separate consequence worth tracking: with F2 a second restart after a rotation throws
-`BrokenEntryChain`, F6 converts that into `rebuild-required` on every store of the device, and the reconcile then
-discards them (systemic-loss-protection.md D2/X3). Reproduced with `verify-crl/Exp3.scala`.
-
-### F21 (new). `openDeviceCrl` retry after a failed first open does not stop the first attempt's threads
-
-> **FIXED (2026-11-09).** A `SimpleCRL` constructor that fails after building its writer shuts the writer down and
-> waits for it before rethrowing. A writer thread that dies during the open-time re-save now wakes the constructor
-> (`WriterDied`), which previously waited forever for the write. Covered by the SimpleCRLSuite test "An open whose
-> re-save cannot fit in a stream fails, and fails the same way when retried".
-
-If `SimpleCRL`'s constructor fails after `StreamWriter` was built (for example `Stream.writeEntry`'s `require` during
-the open-time re-save, `SimpleCRL.scala:132-136`), the writer thread and channels are left running while
-`openDeviceCrl` moves `crl/` aside and opens a new CRL (`DeviceDiscovery.scala:510-520`). Confidence: medium (read,
-not executed). Fix sketch: close the writer in a constructor failure path.
-
-### 11.1 Corrections to CLAUDE.md
-
-| CLAUDE.md claim | Code |
-|-----------------|------|
-| "a dead CRL thread stalls that device ... reads keep working" (`S/crl/CLAUDE.md`) | `readStoreState`, `dropStore`, `deleteTransactions` and `storesWithEntries` all need the CRL thread; they hang. Object reads of the stores continue. *Corrected 2026-11-14:* they fail with `CrlFailed`, and the host unloads the device (F9). |
-| "The sizing is fixed ... the CRL is treated as lost" | True, and it happens for any configuration edit, not only a disk fault (F6). |
-| Stream recycling "the oldest live data is copied to the head of the buffer whenever it is about to overwrite that live data" | The copy was written *over* the stream being recycled (F3). Fixed: the copy is now one stream ahead; crl/CLAUDE.md updated. |
-| "Only read at application startup" | Also read by `readStoreState` for every store load, transfer and drop. |
-| Admission "so a recycled stream's live copy-forward always fits" | Only for the bytes admission counts (F8). *Fixed 2026-11-14:* admission now counts every record at open. |
-
-### 11.2 Reproducing the experiments
-
-The scratch programs are outside the repository and were compiled against `target/aspen-classpath` (`dotty.tools.dotc.Main`
-from the cached 3.7.3 compiler) and run with `java -cp exp/out:$(cat target/aspen-classpath) Exp` and `Exp2`. The
-Java program for the `IOV_MAX` behaviour is `.../scratchpad/iov/T.java`. Outputs observed:
-
-```
-E2 after second restart: 2 txs (expected 3 incl. acked Z)
-E1 recovered 1 txs of 501 acked
-E3 getFullRecoveryState holds 2 txs (U, and deleted P?)
-E4 recovery threw: ...BrokenEntryChain: CRL entry chain is broken: no entry can be read at StreamLocation(StreamId(2),8192,4096)
-1025 buffers: wrote 10240 of 10250
-```
+## 11. Known limitations (accepted)
+
+- Recovery runs on the host control thread and reads up to the whole ring, checksumming every walked entry (Backlog.txt,
+  "Device CRL recovery currently runs on the host control thread").
+- A hung device hangs its CRL and the host's shutdown of it (Backlog.txt, "Isolate every device's I/O").
+- A lost CRL rebuilds every store on the device from local evidence, including after three transient open failures;
+  `crl.lost-*` is kept but never used (Backlog.txt, "System-level protection against correlated lost store
+  declarations", S13, S7/Q1). `loadValidStoreState` likewise treats any throw, transient or not, as a lost
+  `crl_save.log` (`crlSaveFileLost`), under the same Backlog item.
+- An `ENOSPC` on a copy-on-write file system kills the CRL rather than freezing writes (Backlog.txt, "Full storage
+  devices").
+- `CrlLock` does not fence two hosts mounting shared storage (systemic-loss-protection.md).
+- Rot in the newest acknowledged entry is indistinguishable from a torn write (10.3).
+- Admission lanes reserve a quarter of the limit on devices with only data stores (Backlog.txt, "CRL admission lanes
+  waste headroom on data-only devices"); same-tier finalizers (TKVL split, join, tail removal) still compete with
+  their tier's traffic.
+
+---
+
+## Open weaknesses
+
+### CRL-W1. Recovery takes object data for evidence of corruption (PLAUSIBLE; systemic loss)
+Mechanism: `Recovery.recover` calls `StreamReader.newerIntactEntry` on the active stream from the next write offset
+and on the whole next stream. In regions that are not intact headers it probes every 4 KiB boundary with
+`readHeader`, which accepts any bytes whose `header_crc` matches, whose stream UUID is non-zero and equals the UUID
+16 bytes before the claimed body end, and whose sizes fit; `bodyIntact` then checks a CRC over bytes the header
+itself describes. None of this is secret or tied to this CRL: `newerIntactEntry` deliberately ignores the stream's
+cycle UUID. Those probed regions are the previous cycle's (or the torn in-flight entry's) dynamic data, which holds
+raw object payloads written by `LogEntry.createEntryBuffers` (`allocate(ou.data.asReadOnlyBuffer())`). A payload
+containing a well-formed entry with a high serial at a 4 KiB file boundary makes the scan throw `CrlCorrupt`.
+Trigger / scenario: (a) a client writes objects whose content is a crafted CRL entry (header, matching trailing UUID,
+both CRCs, serial 2^62), repeated at many phases or over many writes so one lands 4 KiB-aligned in a CRL file;
+(b) innocently, a VDisk or object holding an image of another Aspen device's CRL (a nested Aspen, a backup of
+`crl.lost-*`), whose inner entries are 4 KiB aligned. On the next restart, if the aligned copy lies past the last
+entry of the active stream (inside the old cycle's partial entry that the scan steps through) or past the end of the
+next stream's last cycle, recovery throws.
+Consequence: the device's CRL is declared lost (`openDeviceCrl`): every store on it is marked `rebuild-required` and
+rebuilt. Repeatable by a tenant against every device holding its replicas, so it can push pools toward the
+correlated-loss pattern.
+Suggested fix: make entries unforgeable by content: record a random CRL id in `crl/sizing` at creation and include
+it in every header (or seed both CRCs with it), and have `readHeader` reject headers without it. Add a test that
+writes object data containing a valid foreign entry and reopens.
+Effort: S   Priority: 3
+
+### CRL-W2. One large transaction kills the CRL of every device it touches (CONFIRMED; liveness)
+Mechanism: `Frontend.admitPrepare` checks only that the device total is below the tier ceiling before admitting, and
+`chargeData` adds later data without a check; nothing compares a transaction's own CRL bytes with the stream size
+(no check in `DescriptionValidator`, `Store`, or the client's `TransactionBuilder` beyond per-object
+`maxSliceSize`, which may be unlimited and does not bound the number of objects). `SimpleCRL.writeCurrentLogEntry`
+rotates and `Stream.writeEntry`'s `require(canWriteEntry)` throws on the CRL thread when the entry (pending saves plus
+copy-forward) exceeds a stream.
+Trigger / scenario: a client prepares a transaction whose updates to one store total more than about
+`crl-max-file-size-mb` minus the live data of the next stream (with defaults, roughly 150-300 MB; much less on
+devices configured with small CRLs), e.g. five 64 MB objects. Each replica store's save makes an entry that cannot
+fit; the CRL dies; `crlFailed` unloads the device. After the host restarts (the open recovers fine: nothing was
+written), the client's driver retransmits, the prepare is admitted again and the device dies again.
+Consequence: every device holding a store of the transaction is unloaded, repeatedly, by one client request; all
+other stores on those devices go offline with it.
+Suggested fix: bound a transaction's CRL bytes per store (`CrlAdmission.recoveredBytes` of its prepare, plus late
+data) by a fixed fraction of the stream that admission's headroom accounts for, e.g. a quarter of the limit, and
+vote abort with a named `RequirementError` instead of admitting; expose the bound to clients (pool or system
+metadata) so `TransactionBuilder` fails early. Add a SimpleCRL test that an oversized save is refused, not fatal.
+Effort: M   Priority: 4
+
+### CRL-W3. A device whose `crl/` lost its stream files opens with an empty CRL (CONFIRMED; split decisions)
+Mechanism: `DeviceDiscovery.openDeviceCrl` treats the CRL as lost only when `crl/` is absent from a device with
+stores. `SimpleCRL.recordedSizing` treats a directory with no stream files as a new CRL (no `sizing`) or a creation
+that crashed before its streams (`sizing` present), and `createStreamsIfNew` creates empty streams; recovery returns
+nothing. No check compares this with the device holding stores, although stores can only exist on a device whose CRL
+has been opened.
+Trigger / scenario: the stream files are removed while the directory survives: an operator clearing `crl/*.crl`, a
+file system repair that drops the directory's entries, a restore that copies directories but not the large files.
+(A partial loss of stream files is caught: `checkSizing` throws `CrlSizingMismatch`.)
+Consequence: every store on the device loads with no Paxos promises, accepts, votes or unapplied commit data and
+serves as an acceptor: silent amnesia, the very case the lost-CRL rule exists to turn into rebuilds.
+Suggested fix: in `openDeviceCrl` (or by passing "device holds stores" to the factory), treat a `crl/` without stream
+files on a device with store directories as lost, like a missing directory. Add a DeviceCrlSuite test.
+Effort: S   Priority: 1
+
+### CRL-W4. Completion handlers run on the writer thread before the next write is issued (PLAUSIBLE; performance)
+Mechanism: `Stream.writeEntry`'s callback runs `entry.runCompletionHandlers()` and only then queues `WriteComplete`;
+the writer thread runs the callback before taking its next command, and the CRL thread issues the next entry only on
+`WriteComplete`. The handlers of `Tx.answerPrepareAsAcceptor`, `sendDelayedPrepare` and `receiveAccept` send network
+messages inline (`net.sendTransactionMessage`, `sendClientResponse`: QUIC lookup, encode and submit per message).
+Trigger / scenario: group commit under load: an entry carrying thousands of saves runs thousands of sends serially on
+the one writer thread of the device, adding their time to every entry's cycle. On NVMe, where a `DSYNC` takes tens
+of microseconds, the handler time can exceed the write time.
+Consequence: device CRL throughput, and so every vote on the device, is bounded by single-threaded message encoding
+as well as by the write.
+Suggested fix: hand an entry's handlers to a dedicated, ordered completion executor (or post each to its store's
+executor) and queue `WriteComplete` at once; C2's guarantee (every earlier entry durable when a handler runs) is
+unaffected. Measure with `BackendTiming`-style timing first.
+Effort: S   Priority: 5
+
+### CRL-W5. `shutdown()` leaves pending Futures uncompleted forever (CONFIRMED mechanism; PLAUSIBLE trigger; liveness)
+Mechanism: `SimpleCRL`'s `Shutdown` case shuts the writer down and returns; only the death path calls `failPending`,
+and `dead` stays false, so every tracked Future not yet answered (`readStoreState`, `deleteTransactions`,
+`dropStore`, `storesWithEntries`, `loadStore`) and every later call never completes; `whenDurable` handlers in the
+discarded entry never run.
+Trigger / scenario: a device is unloaded (`DeviceShutdown.unloadDevice`) while a `discardLostStore` drop, a leftover
+drop or an extraction is pending on its CRL. Their `onComplete` never runs, so `StoreRebuilds.droppingCrlState` and
+`DeviceReconciler.crlDropsRunning` keep the store until the process restarts.
+Consequence: callbacks and promises leak; if the same device is loaded again in the process, that store's discard
+(and so its rebuild) never starts until a restart. Today a device unloaded in-process is normally reloaded only after
+a restart, which limits the effect.
+Suggested fix: on `Shutdown`, fail every pending tracked promise (and every later call) with a `CrlClosed` error,
+as death does with `CrlFailed`.
+Effort: S   Priority: 5

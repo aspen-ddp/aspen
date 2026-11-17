@@ -163,6 +163,8 @@ class Frontend(val storeId: StoreId,
                val joinCeiling: JoinCeiling = JoinCeiling.Unbounded,
                /** How long past the horizon an unresolved Tx starts its status queries (Frontend.expiryMargin) */
                val expiryMargin: FiniteDuration = Frontend.DefaultExpiryMargin,
+               /** How long a parked re-read waits for the commit it names (parkRead). A test seam */
+               val parkedReadWait: FiniteDuration = Frontend.ParkedReadWait,
                /** Called once, on the store's executor, when the store fail-stops (failStop): its host takes it
                  * offline and rebuilds it. The default only logs, for tests
                  */
@@ -537,7 +539,7 @@ class Frontend(val storeId: StoreId,
                                  val awaitCommit: Set[TransactionId], val until: Long)
 
   /** By object, then read: a resent read replaces its entry. Declared before the constructor's recovery, whose Txs
-    * release locks (locksReleased)
+    * release locks (answerParkedReads)
     */
   private val parkedReads = scala.collection.mutable.HashMap[ObjectId, scala.collection.mutable.HashMap[UUID, ParkedRead]]()
   private var parkedReadCount: Int = 0
@@ -1632,7 +1634,7 @@ class Frontend(val storeId: StoreId,
   /** Parks a re-read whose client knows a transaction committed that still holds a write lock on the object here
     * (Read.awaitCommit): answered now, it would only show the lock again, and the client would re-read until this
     * store applies the commit. It is answered once none of the named transactions holds a lock on the object
-    * (locksReleased), or at ParkedReadWait with the state as it is then (expireParkedReads). Never past
+    * (answerParkedReads), or at parkedReadWait with the state as it is then (expireParkedReads). Never past
     * MaxParkedReads. Only an in-memory state can hold locks, so a read that would reach the backend is not parked.
     * Safety is unaffected: a parked read only delays its own answer
     */
@@ -1643,7 +1645,7 @@ class Frontend(val storeId: StoreId,
     if waits && parkedReadCount < Frontend.MaxParkedReads then
       logger.trace(s"Store $storeId: read $readUUID of $objectId waits for the commit of $awaitCommit to apply")
       parkedReads.getOrElseUpdate(objectId, scala.collection.mutable.HashMap())(readUUID) =
-        ParkedRead(clientId, pointer, readType, awaitCommit, wallClockMillis() + Frontend.ParkedReadWait.toMillis)
+        ParkedRead(clientId, pointer, readType, awaitCommit, wallClockMillis() + parkedReadWait.toMillis)
       parkedReadCount += 1
       true
     else
@@ -1659,7 +1661,7 @@ class Frontend(val storeId: StoreId,
   /** Answers the parked reads (parkRead) of `objectIds` none of whose named transactions still holds a lock there.
     * Called by every Tx that releases its locks (Tx.unlock), after a commit's update is applied in memory
     */
-  def locksReleased(objectIds: Iterable[ObjectId]): Unit =
+  def answerParkedReads(objectIds: Iterable[ObjectId]): Unit =
     if parkedReadCount > 0 then
       objectIds.foreach: objectId =>
         parkedReads.get(objectId).foreach: reads =>

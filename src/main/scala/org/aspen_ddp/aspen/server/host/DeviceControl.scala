@@ -83,6 +83,8 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val quarantineVerifier: QuarantineVerifier = QuarantineVerifier.Never,
                           /** How long the stores' Txs wait for a client's prepare (Frontend.missingDataWait) */
                           val missingDataWait: Duration = Frontend.MissingDataWait,
+                          /** How long the stores' parked re-reads wait (Frontend.parkedReadWait). A test seam */
+                          val parkedReadWait: FiniteDuration = Frontend.ParkedReadWait,
                           /** How long after its start the stores join a transaction (Frontend.horizon) */
                           val transactionHorizon: FiniteDuration = TransactionHorizon.Horizon,
                           /** The load time a store being loaded records (Frontend.loadedAt), by store. None: now. A

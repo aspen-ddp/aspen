@@ -610,10 +610,10 @@ class Tx( trs: TransactionRecoveryState,
         pendingCollisionPrepare = None
         answerPrepare(m)
 
-  /** Releases the locks and answers the reads parked on them (Frontend.locksReleased) */
+  /** Releases the locks and answers the reads parked on them (Frontend.answerParkedReads) */
   private def unlock(): Unit = if locked then
     releaseLocks()
-    frontend.locksReleased(objects.keys)
+    frontend.answerParkedReads(objects.keys)
 
   private def releaseLocks(): Unit =
     locked = false
@@ -944,7 +944,7 @@ class Tx( trs: TransactionRecoveryState,
       objectCommitErrors = changedHere.toList
     else
       issueCommits()
-    if wasLocked then frontend.locksReleased(objects.keys)
+    if wasLocked then frontend.answerParkedReads(objects.keys)
 
     // After the commits are issued, so that they are what the next transactions on these objects wait for
     if commitQueued then

@@ -156,6 +156,9 @@ object Host:
                          /** How long the stores' Txs wait for a client's prepare (Frontend.missingDataWait), for
                           *  tests that would otherwise wait the full default in real time */
                          missingDataWait: Duration = Frontend.MissingDataWait,
+                         /** How long the stores' parked re-reads wait for the commit they name
+                          *  (Frontend.parkedReadWait), for tests that need a load-independent wait */
+                         parkedReadWait: FiniteDuration = Frontend.ParkedReadWait,
                          /** The load time each store loaded records (Frontend.loadedAt), for tests whose stores are
                           *  new, with nothing they could have forgotten: None, now */
                          storeLoadedAt: StoreId => Option[Long] = _ => None,
@@ -305,6 +308,7 @@ class Host(val client: AspenClient,
     unackedLookup = seams.wrapUnackedLookup.fold(unackedLookup)(wrap => wrap(unackedLookup)),
     quarantineVerifier = quarantineVerifier,
     missingDataWait = seams.missingDataWait,
+    parkedReadWait = seams.parkedReadWait,
     storeLoadedAt = seams.storeLoadedAt,
     transactionHorizon = transactionHorizon,
     joinCeiling = joinCeiling)

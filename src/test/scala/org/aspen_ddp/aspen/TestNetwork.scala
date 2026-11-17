@@ -140,6 +140,7 @@ object TestNetwork {
     *                          a host's is: it sends data-less prepares of its own, which can reach a store before the
     *                          client's prepare does. Otherwise it never sends, and relies on the client's prepares
     * @param missingDataWait how long the stores' Txs wait for a client's prepare (Frontend.missingDataWait)
+    * @param parkedReadWait how long the stores' parked re-reads wait for the commit they name (Frontend.parkedReadWait)
     * @param transactionHorizon the hosts' (Host.transactionHorizon), and the client's too: its transactions give up
     *                           with TransactionOutcomeUnknown past it (HorizonClientDriver)
     */
@@ -149,6 +150,7 @@ object TestNetwork {
                                leaderRetransmits: Boolean = false,
                                wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None,
                                missingDataWait: Duration = Frontend.MissingDataWait,
+                               parkedReadWait: FiniteDuration = Frontend.ParkedReadWait,
                                transactionHorizon: FiniteDuration = TransactionHorizon.Horizon,
                                /** The client records its transactions' outcomes, as a production client does
                                  * (SimpleAspenClient), so its reads know its own commits. Default: NoCache */
@@ -599,7 +601,7 @@ class TestNetwork(executionContext: ExecutionContext,
     Duration(60, SECONDS),
     // Its stores are loaded directly (below), onto a device it never loads
     seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
-      missingDataWait = hostOptions.missingDataWait, storeLoadedAt = storeLoadedAt, joinCeiling = Some(smgrCeiling),
+      missingDataWait = hostOptions.missingDataWait, parkedReadWait = hostOptions.parkedReadWait, storeLoadedAt = storeLoadedAt, joinCeiling = Some(smgrCeiling),
       joinCeilingStep = CeilingStep),
     transactionHorizon = hostOptions.transactionHorizon)
 
@@ -661,7 +663,7 @@ class TestNetwork(executionContext: ExecutionContext,
       new LockstepThreading(executionContext), objectCacheFactory, this, BackgroundTaskManager.NoBackgroundTaskManager,
       TestCRL, FinalizerFactory, txDriverFactory, hostOptions.heartbeatPeriod, Duration(60, SECONDS),
       seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
-        missingDataWait = hostOptions.missingDataWait, storeLoadedAt = storeLoadedAt, joinCeiling = Some(ceiling),
+        missingDataWait = hostOptions.missingDataWait, parkedReadWait = hostOptions.parkedReadWait, storeLoadedAt = storeLoadedAt, joinCeiling = Some(ceiling),
         joinCeilingStep = CeilingStep),
       transactionHorizon = hostOptions.transactionHorizon)
     synchronized:

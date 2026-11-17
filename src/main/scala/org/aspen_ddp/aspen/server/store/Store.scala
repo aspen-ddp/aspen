@@ -51,6 +51,8 @@ class Store(val storageDeviceId: StorageDeviceId,
             deferRecovery: Boolean = false,
             /** How long a Tx waits for its client's prepare (Frontend.missingDataWait). A test seam */
             missingDataWait: Duration = Frontend.MissingDataWait,
+            /** How long a parked re-read waits for the commit it names (Frontend.parkedReadWait). A test seam */
+            parkedReadWait: FiniteDuration = Frontend.ParkedReadWait,
             /** How long after its start a transaction may be joined (Frontend.horizon) */
             horizon: FiniteDuration = TransactionHorizon.Horizon,
             /** When the store was loaded (Frontend.loadedAt). None: now. A test seam */
@@ -91,7 +93,7 @@ class Store(val storageDeviceId: StorageDeviceId,
 
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
-    missingDataWait = missingDataWait, admission = admission, unackedLookup = unackedLookup,
+    missingDataWait = missingDataWait, parkedReadWait = parkedReadWait, admission = admission, unackedLookup = unackedLookup,
     quarantineVerifier = quarantineVerifier,
     // A reload installs a new Store under the same id: a task of this one's is dropped then
     post = postToStore match

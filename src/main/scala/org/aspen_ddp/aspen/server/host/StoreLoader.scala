@@ -370,6 +370,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 // their objects once it is installed (awaitCrlLoad)
                 deferRecovery = true,
                 missingDataWait = ctx.missingDataWait,
+                parkedReadWait = ctx.parkedReadWait,
                 horizon = ctx.transactionHorizon,
                 loadedAt = if isNew then Some(0L) else ctx.storeLoadedAt(storeId),
                 arrivedAt = if isNew then None else StoreLoader.readArrivedAt(backend.path),

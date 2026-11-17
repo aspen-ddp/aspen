@@ -73,7 +73,7 @@
   store with a final state answers. A store with a Tx replies with `Tx.statusForExpiry`: status, finalized, late,
   `holdsAcceptorState` (false only for a Tx muted for good below the floor), its latest `accepted` value and
   `votedCommit`. An unresolved Tx answers only once frozen (past expiry by its own clock: it promises and accepts
-  nothing more, `Tx.frozen`) or muted for good, so the state it reports is final; before that, and for a Tx muted only
+  nothing more, `Tx.frozen`) and its objects are loaded (its vote decided), or muted for good, so the state it reports is final; before that, and for a Tx muted only
   for starting too far ahead (it may yet join), it is silent. With no Tx but a non-Unresolved status-cache entry it
   replies with that entry. With neither it replies `status = None` ("unknown") only when the start is below its forget
   floor (`belowForgetFloor(HLCTimestamp)`), which makes the answer permanent; above the floor it stays silent, as it

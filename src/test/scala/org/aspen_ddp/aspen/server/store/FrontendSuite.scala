@@ -5486,6 +5486,32 @@ class FrontendSuite extends AnyFunSuite with Matchers {
             holdsAcceptorState = true, accepted = Some(true), votedCommit = true))))
   }
 
+  test("a frozen Tx whose objects have not loaded is silent to status requests until they load") {
+    // Its vote is undecided until the objects load, so a reply would report votedCommit = false and the vote could
+    // still become commit: an expiry tally counting that reply as final would be wrong
+    val clock = new TestClock(floorNow)
+    val backend = new DeferredCommitBackend
+    backend.deferReads = true
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net,
+      new TestCrl, new TransactionStatusCache(wallClockMillis = () => clock.now), wallClockMillis = () => clock.now,
+      horizon = FiniteDuration(20, SECONDS), loadedAt = Some(floorNow - 60_000))
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    val txd = expiringTxd(List(overwrite(op1)))
+    frontend.receiveTransactionMessage(clientPrepare(txd))
+    passHorizon(clock)
+    frontend.transactions(txid1).frozen shouldBe true
+    net.sentTx = Nil
+
+    frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
+    statusResponses(net) shouldBe Nil
+
+    backend.deliverReads()
+    frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
+    statusResponses(net).map(_.status.map(_.votedCommit)) shouldBe List(Some(true))
+  }
+
   // Cross-document review G1. Replication(3, 2): read threshold 2, width - writeThreshold 1
   test("an expiring commit voter whose peers accepted commit decides commit, applies it and has it finalized") {
     var finalizing: List[TransactionId] = Nil

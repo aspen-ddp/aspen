@@ -1540,11 +1540,11 @@ class Tx( trs: TransactionRecoveryState,
     * (Frontend.mayHaveForgottenUndecided)
     */
   def receiveStatusRequest(m: TxStatusRequest): Unit =
-    // An unresolved Tx answers only once its reported state is final (ExpiryTally): frozen, or muted for good (amnesiac,
-    // or below the floor). Silent until then, as a store whose state is unknown: one muted only for starting too far
+    // An unresolved Tx answers only once its reported state is final (ExpiryTally): frozen with its vote decided (its
+    // objects loaded: until then it may yet vote commit), or muted for good (amnesiac, or below the floor). Silent until then, as a store whose state is unknown: one muted only for starting too far
     // ahead may yet join. Its own clock passes T's expiry within the hosts' skew
     val mutedForGood = muted && (frontend.mayHaveForgottenUndecided(txd.startTimestamp) || frontend.belowForgetFloor(txd))
-    if oresolution.nonEmpty || frozen || mutedForGood then
+    if oresolution.nonEmpty || (frozen && allObjectsLoaded) || mutedForGood then
       net.sendTransactionMessage(TxStatusResponse(m.from, storeId, transactionId, m.requestUUID, Some(statusForExpiry)))
 
   /** This Tx's state as a status reply reports it, and as its own expiry round counts it */

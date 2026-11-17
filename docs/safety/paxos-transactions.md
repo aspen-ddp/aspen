@@ -800,14 +800,20 @@ not rejoin a transaction it forgot".
 
 **Status query.** `TxStatusRequest` carries `startTimestamp`. A store with a Tx answers with `Tx.statusForExpiry`, but
 an unresolved Tx answers only once its reported state is final: frozen with its objects loaded, or muted for good
-(amnesiac, or below the floor). A resolved Tx answers at once. A store without a Tx answers from a non-`Unresolved`
+(amnesiac, or below the floor). A commit vote is final only once durable: `votedCommit` is reported, and a Tx's own
+expiry round counts its own vote, only after a CRL save holding the vote completed (`Tx.voteDurable`; a recovered vote
+is durable), and an unresolved commit voter whose save is still in flight is silent until it completes. Rules A and F
+count each `votedCommit` as a voter holding T's locks, so the vote and its locks must survive a crash. A resolved Tx
+answers at once. A store without a Tx answers from a non-`Unresolved`
 cache entry; a rebuilt store for T before its `acceptorSince` answers `amnesiac` (with any cached outcome); otherwise it
 answers `None` ("unknown") only if T is below its floor, which makes the answer permanent, and stays silent above it
 (`Frontend.receiveStatusRequestWithoutTx`). A store still loading its CRL holds the request with every other message.
 
 **Freeze.** A Tx past T's expiry by its own store's clock (`Tx.frozen` = `Frontend.pastExpiry`) promises and accepts
 nothing more, as if offline, which Paxos allows. A frozen Tx decides no vote and sends no delayed prepare response, so
-one still undecided then (an in-flight commit, a collision, a client prepare arriving late) is a final non-voter.
+one still undecided then (an in-flight commit, a collision, a client prepare arriving late) is a final non-voter. A
+vote decided just before the freeze whose response is then dropped is still saved (`Tx.saveUndurableVote`), so its
+status reply reports it once durable instead of staying silent.
 Derived from the clock, so a reload cannot thaw it.
 
 **Expiry.** A Tx still unfinalized past the horizon plus the expiry margin (`Tx.mayExpire`: not finalized, loaded, no
@@ -954,8 +960,8 @@ on each object `o`; each store has one vote, so `a_o <= w - c_o <= w - t`.
 `TxResolved(false)` and `TransactionResolved(false)` are sent only by a driver whose `Learner` saw a quorum accept abort,
 or as a relay of one (P10). The client never completes `Aborted` on votes. The one divergence the expiry rules admit
 (C-then-F over an unchosen abort) involves no abort a client was told or Paxos chose. On the commit side, F commits only
-where every pool has more than `w - t` live commit voters holding T's locks. (Open weaknesses, P-W1, qualifies
-"live": a reported vote may not yet be durable.)
+where every pool has more than `w - t` live commit voters holding T's locks; a reported commit vote is durable, so
+its locks survive a crash of its store.
 
 ---
 
@@ -1064,30 +1070,6 @@ transaction eventually resolves without operator action given a healthy quorum.
 ---
 
 ## Open weaknesses
-
-### P-W1. Expiry status replies report a commit vote that may not be durable (PLAUSIBLE; overwritten update)
-Mechanism: `Tx.statusForExpiry` reports `votedCommit = !muted && disposition == VoteCommit` from memory, and
-`Tx.receiveStatusRequest` replies as soon as the Tx is frozen with its objects loaded. The disposition is set in
-`Tx.determineDisposition` before the CRL save that holds it is issued (`answerPrepareAsAcceptor`,
-`sendDelayedPrepare`), and nothing tracks whether that save completed. Worse, `determineDisposition` checks
-`undecidedFrozen` only on entry: a vote decided just before the freeze boundary is followed by `sendDelayedPrepare` or
-`answerPrepareAsAcceptor`, which, frozen by then, drop the response without saving, so that `VoteCommit` is never saved
-at all, yet it is reported to every expiry query and its locks are held only in memory. The driver path never counts
-such a vote (`TxPrepareResponse` and `TransactionVote` go out only from the save's handler), but `ExpiryTally` does.
-Trigger / scenario: Replication(3,2). Store S1 decides `VoteCommit` for T at the moment its in-flight-commit or
-collision wait ends, just before T's expiry; its save is still in flight (or was dropped at the freeze boundary). S0
-holds a durable commit vote; S2 voted abort. S0's expiry round gets S1's reply (`votedCommit = true`): `vc = 2 >= t`,
-rule A commits. S1 crashes before its save is durable and restarts with no record: T is below its load floor, so it
-has no Tx and no lock. A transaction T' conflicting with T on that object, started after the restart, gets commit votes
-from S1 and S2 (neither holds T's lock) and commits, while S0's expiry commit applies T.
-Consequence: both T and T' commit with conflicting requirements on one object (an overwritten update or a broken lock
-requirement), and rule A's premise "`vc` voters hold T's locks" is false. The same applies to rule F. The window needs a
-crash between the reply and the durable save, or a vote decided within microseconds of the freeze, so it is rare.
-Suggested fix: report `votedCommit` (and count the Tx's own vote) only once the save holding the vote is durable, for
-example a `voteDurable` flag set in the save handler; have an unresolved Tx with a vote save in flight stay silent to
-status requests until it completes; and make a vote decided before the freeze always save, even if the response is
-then not sent. A FrontendSuite test with a CRL whose save never completes can show the reply is withheld.
-Effort: S   Priority: 2
 
 ### P-W2. Late condition 1 after an expiry commit cancels the expiry finalizer (PLAUSIBLE; permanent replica divergence)
 Mechanism: `TransactionDriver.resolveLate` on a proof plus a memoryless post-proof quorum

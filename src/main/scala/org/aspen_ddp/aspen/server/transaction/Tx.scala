@@ -100,9 +100,31 @@ class Tx( trs: TransactionRecoveryState,
   /** The CRL holds, or will hold, a state of this transaction: it was recovered or has saved one */
   private var savedToCrl: Boolean = recovered
 
+  /** A save holding the decided vote was issued (saveState), and one has completed. Only a durable commit vote is
+    * reported to expiry queries (statusForExpiry): ExpiryTally's rules A and F count it as a voter holding T's locks,
+    * which must survive a crash. A recovered vote is durable. Every save after the vote carries it, so any completed
+    * one makes it durable
+    */
+  private var voteSaveIssued: Boolean = recovered && trs.disposition != TransactionDisposition.Undetermined
+  private var voteDurable: Boolean = voteSaveIssued
+
   private def saveState(state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
     savedToCrl = true
-    crl.save(txd.transactionId, state, completionHandler)
+    if state.disposition != TransactionDisposition.Undetermined && !voteDurable then
+      voteSaveIssued = true
+      crl.save(txd.transactionId, state, () =>
+        frontend.post(() => voteDurable = true)
+        completionHandler())
+    else
+      crl.save(txd.transactionId, state, completionHandler)
+
+  /** Saves a decided vote no save holds yet, sending nothing: a frozen Tx drops the response a vote decided just before
+    * the freeze would have gone out with, yet its status reply will report the vote once durable
+    */
+  private def saveUndurableVote(): Unit =
+    if !muted && disposition != TransactionDisposition.Undetermined && !voteSaveIssued && allObjectsLoaded then
+      saveState(TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, txStatus,
+        acceptor.persistentState), () => ())
 
   /** Durably removes `objectId`'s update from this transaction's CRL state, then runs `onDurable` on the store's
     * executor. The store is deleting the object, which this transaction allocated: a restart must not find the update
@@ -768,6 +790,7 @@ class Tx( trs: TransactionRecoveryState,
       if delayedPrepare.nonEmpty then
         logger.trace(s"Tx $transactionId on store $storeId is frozen past expiry: dropping its delayed prepare response")
       delayedPrepare = None
+      saveUndurableVote()
     else delayedPrepare.foreach { response =>
       logger.trace(s"AllObjectsLoaded. Saving to CRL before sending PrepareResponse for tx ${transactionId}")
       val r = response.copy(disposition=disposition, collisions=collisions)
@@ -1259,6 +1282,7 @@ class Tx( trs: TransactionRecoveryState,
 
   private def answerPrepareAsAcceptor(m: TxPrepare): Unit = if frozen then
     logger.trace(s"Tx $transactionId on store $storeId is frozen past expiry: no promise to ${m.from}")
+    saveUndurableVote()
   else {
     val result = acceptor.receivePrepare(Prepare(m.proposalId)) match {
       case Right(p) => Right(TxPrepareResponse.Promise(p.lastAccepted))
@@ -1610,18 +1634,24 @@ class Tx( trs: TransactionRecoveryState,
     // vote (determineDisposition) and sends none (sendDelayedPrepare), so one still undecided then, waiting on an
     // in-flight commit, a collision or its client's prepare, is a final non-voter. Silent until then, as a store
     // whose state is unknown: one muted only for starting too far ahead may yet join. Its own clock passes T's expiry
-    // within the hosts' skew
+    // within the hosts' skew. A commit vote is final only once durable (voteDurable): until its save completes the Tx
+    // is silent, and the requester's next round gets the reply
     val mutedForGood = muted && (frontend.mayHaveForgottenUndecided(txd.startTimestamp) || frontend.belowForgetFloor(txd))
-    if oresolution.nonEmpty || (frozen && allObjectsLoaded) || mutedForGood then
+    if oresolution.isEmpty && frozen then
+      saveUndurableVote()
+    val commitVoteSaving = !muted && disposition == TransactionDisposition.VoteCommit && !voteDurable
+    if oresolution.nonEmpty || (frozen && allObjectsLoaded && !commitVoteSaving) || mutedForGood then
       net.sendTransactionMessage(TxStatusResponse(m.from, storeId, transactionId, m.requestUUID, Some(statusForExpiry)))
 
-  /** This Tx's state as a status reply reports it, and as its own expiry round counts it */
+  /** This Tx's state as a status reply reports it, and as its own expiry round counts it. A commit vote counts only
+    * once durable (voteDurable): an expiry commit counting it relies on its lock surviving a crash
+    */
   def statusForExpiry: TxStatusResponse.TxStatus =
     val amnesiac = muted && frontend.mayHaveForgottenUndecided(txd.startTimestamp)
     val nonHolder = muted && frontend.belowForgetFloor(txd) && !amnesiac
     TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = lateOutcome, holdsAcceptorState = !nonHolder,
       accepted = if muted then None else acceptor.persistentState.accepted.map(_._2),
-      votedCommit = !muted && disposition == TransactionDisposition.VoteCommit,
+      votedCommit = !muted && disposition == TransactionDisposition.VoteCommit && voteDurable,
       amnesiac = amnesiac)
 
   /** T is past expiry by this store's clock (Frontend.pastExpiry): this Tx's acceptor promises and accepts nothing

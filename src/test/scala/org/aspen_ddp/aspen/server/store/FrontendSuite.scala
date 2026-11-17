@@ -5908,6 +5908,38 @@ class FrontendSuite extends AnyFunSuite with Matchers {
             holdsAcceptorState = true, accepted = Some(true), votedCommit = true))))
   }
 
+  test("a frozen commit voter whose vote save is not durable is silent to status requests until it is") {
+    // A reported commit vote counts toward ExpiryTally's rules A and F: it must survive a crash, with its lock
+    withExpiryFrontend: (frontend, _, net, crl, _, clock, _) =>
+      crl.holdTxSaves = true
+      val txd = expiringTxd(List(overwrite(op1)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.transactions(txid1).vote shouldBe TransactionDisposition.VoteCommit
+      passHorizon(clock)
+      statusOf(frontend, net, txd) shouldBe Nil
+
+      crl.completeHeldTxSaves()
+      statusOf(frontend, net, txd) shouldBe List(Some(true))
+  }
+
+  test("an expiring commit voter does not count its own vote before it is durable") {
+    withExpiryFrontend: (frontend, _, net, crl, _, clock, _) =>
+      crl.holdTxSaves = true
+      val txd = expiringTxd(List(overwrite(op1)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      // With its own vote counted this would be rule A: two commit votes, the write threshold of Replication(3, 2)
+      reply(frontend, net, peer1, acceptedCommit)
+      net.sentTx.collect { case r: TxResolved => r } shouldBe Nil
+
+      crl.completeHeldTxSaves()
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, acceptedCommit)
+      net.sentTx.collect { case r: TxResolved => (r.to, r.committed) }.toSet shouldBe
+        Set((peer1, true), (peer2, true))
+  }
+
   test("a frozen Tx whose objects have not loaded is silent to status requests until they load") {
     // Its vote is undecided until the objects load. Expectation changed in the final review (2026-11-16): a frozen Tx
     // now decides no vote, since a vote decided after a status reply could contradict that reply, so once its objects

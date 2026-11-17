@@ -388,7 +388,8 @@ object TxStatusResponse {
     * join the transaction
     */
   /** `accepted`: the replying Tx's latest accepted Paxos value (true: commit), None if it accepted nothing.
-    * `votedCommit`: the replying Tx voted commit, so it holds T's update for its objects and applies it on a commit.
+    * `votedCommit`: the replying Tx holds a durable commit vote (Tx.statusForExpiry), so it keeps T's update for its
+    * objects and its locks across a crash, and applies it on a commit.
     * `amnesiac`: the replying store was rebuilt after T started (Frontend.mayHaveForgottenUndecided): it holds no
     * acceptor state, but its old incarnation may have. An unresolved Tx replies only once it is past expiry by its own
     * clock, when it promises and accepts nothing more (Tx.frozen), so the state it reports is final (ExpiryTally)

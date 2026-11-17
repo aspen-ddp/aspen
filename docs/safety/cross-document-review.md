@@ -171,7 +171,7 @@ Every clock comparison that crosses subsystems, and what bounds it:
 | Forget floor time leg (`now - horizon`) | the store's own wall clock against T's start | same host only; a backward step of more than about 8 s reopens the window (paxos-transactions.md) |
 | `MaxStartLead` mute and the join ceiling | host wall clock | caps every accepted start, and so every object timestamp and client HLC, at the fastest host plus 2 s |
 | Arrival margin, rebuilt store's `acceptor-since` | old host against new host | inter-host skew below 8 s |
-| Expiry (`Frontend.pastExpiry`, freeze) | each store's own clock | stores freeze at different moments under skew (P-W1, P-W2) |
+| Expiry (`Frontend.pastExpiry`, freeze) | each store's own clock | stores freeze at different moments under skew (P-W2) |
 | Repair age gate (60 s) | repairing host's HLC against the marker's start | paces only; the read decides a deletion |
 | Repair `mayJoinTransaction` | the store's own floor | same host |
 | Repair completion gate | object timestamps, no clock | object timestamps never decrease |
@@ -200,8 +200,8 @@ transaction-recovery.md (how a driver learns the outcome) say. The latter statem
 
 ### 5.3 "Expiry never discards a committed, unfinalized Tx"
 rebuild-process.md (pending allocations) rests the `w - t + 1` coverage argument on this. paxos-transactions.md rule D
-discards a T that may have committed when a changed pool has `vc + s < r` (logged `dataLost`), and P-W1 shows a
-reported commit vote may not be durable. paxos-transactions.md is right; the rebuild argument holds within the data
+discards a T that may have committed when a changed pool has `vc + s < r` (logged `dataLost`). paxos-transactions.md
+is right; the rebuild argument holds within the data
 tolerance (`t - r` lost commit voters), which is the only regime in which the allocation is restorable anyway.
 
 ### 5.4 Re-applied Inserts "are healed by reconcile"
@@ -225,7 +225,6 @@ live commit voters holding T's locks. A Tx created from a resolved, unfinalized 
 fixed abort voters of an abort-certain object, so it cannot lift an aborted T to a commit count (L1), and counting it
 for a T that really committed commits what was committed. But the statement is not literally true, and such a Tx
 hides its host's cached outcome from status queries (the reply is `Unresolved`, so other observers do not adopt it).
-P-W1 qualifies "live" in the same rule from another side.
 
 ### 5.7 RB-W2's example lies outside the tolerance it assumes
 rebuild-process.md RB-W2 uses Replication(3,2). There `t = r`, so losing one of T's two holders (S0) before S1 applies

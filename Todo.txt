@@ -39,13 +39,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.4  Expiry status replies report a commit vote that may not be durable: P-W1                              [S]
-     PLAUSIBLE. Tx.statusForExpiry reports votedCommit from memory before the vote's CRL save completes, and a
-     vote decided just before the freeze boundary is never saved. A crash then loses the vote and its lock while
-     rule A/F already counted it: conflicting commits. Fix: report votedCommit only once the save is durable
-     (voteDurable flag); stay silent while a vote save is in flight; always save a vote decided before the freeze.
-     Shares the per-store-clock expiry root with 2.5: one skewed-wallClockMillis test harness serves both.
-
 2.5  Late condition 1 after an expiry commit cancels the expiry finalizer: P-W2                            [S]
      PLAUSIBLE. An expiry commit bypasses Paxos, so holders not yet frozen by their own (slower) clocks answer
      memoryless promises; a proof plus that quorum makes a driver resolve late and its TxFinalized cancels the

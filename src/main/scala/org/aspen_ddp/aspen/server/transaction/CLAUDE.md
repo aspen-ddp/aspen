@@ -161,7 +161,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   prepare response, so a frozen Tx still undecided (an in-flight commit, a collision, a late client prepare) stays a
   non-voter for good. Before that it is silent
 - A reply (`TxStatusResponse.TxStatus`) carries the outcome if known, plus `accepted` (the latest accepted value),
-  `votedCommit` (a commit voter holds T's update for its objects) and `amnesiac` (a rebuilt store, for T started
+  `votedCommit` (a commit voter holds T's update for its objects; reported, and counted in a Tx's own round, only
+  once a CRL save holding the vote is durable, `Tx.voteDurable`: rules A and F rely on the vote's locks surviving a
+  crash. An unresolved commit voter whose save is in flight is silent; a vote decided just before the freeze whose
+  response is dropped is still saved, `Tx.saveUndurableVote`) and `amnesiac` (a rebuilt store, for T started
   before its `acceptorSince`, `Frontend.mayHaveForgottenUndecided`: no state, but its old incarnation may have
   accepted T). A silent store counts as possibly having accepted commit and possibly holding the update
 - The pure `ExpiryTally.decide` rules, in order (client 1-RTT commit design, section 4.3(b); proofs in

@@ -527,7 +527,7 @@ class Tx( trs: TransactionRecoveryState,
       disposition == TransactionDisposition.VoteCommit then
       locked = true
       lockedWrites = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
-      RequirementsLocker.lock(transactionId, requirements, objects, lockedWrites)
+      RequirementsLocker.lock(transactionId, requirements, objects, lockedWrites, recovered)
 
   /** The transaction is known to be resolved, though this Tx has not been told the outcome: its prepare arrived
     * after the resolution did. Its vote cannot affect the outcome, so it takes no locks.

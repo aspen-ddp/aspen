@@ -88,8 +88,8 @@ The premises other subsystems take from this:
 ### 2.3 Locks across crashes and copies
 
 * Recovered commit votes re-take their locks before the store handles any transaction message or client read
-  (`Frontend.holding`; transaction-requirements.md, store crashes). Exception: two recovered votes on one lock
-  (transaction-requirements.md, Q-W2).
+  (`Frontend.holding`; transaction-requirements.md, store crashes). Two recovered votes on one single-holder lock
+  both hold it until each releases (`ObjectState.displacedLocks`; transaction-requirements.md, lock classes).
 * Reads report the write locks of every voted, unapplied transaction (shared revision locks excepted); repair defers
   locked parts, and a read that needs a voted, unapplied allocation parks rather than answering `ObjectNotFound`
   (`Frontend.parkAllocationRead`), so no read in an allocation's apply window proves a deletion.

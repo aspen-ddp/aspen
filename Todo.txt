@@ -39,12 +39,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.2  Two recovered commit votes on one lock; the earlier's release unlocks the later: Q-W2                 [M]
-     PLAUSIBLE. Recovered votes re-take single-holder locks unconditionally (overwrite); release clears only the
-     holder's own lock. If A's lock wins and A resolves, B (unresolved counted commit vote) holds no lock and a
-     conflicting C can commit. Fix: let recovered locks coexist (holder list on the recovery path only) or take
-     them in CRL vote order. FrontendSuite recovery test in both orders.
-
 2.3  Recovered DoesNotExist / blind Insert re-applies after a later delete of its key: Q-W3                [M]
      PLAUSIBLE. A committed Tx's object data stays in the CRL until TxFinalized; a later delete of the key can be
      applied and finalized first. After a crash or transfer the recovered vote re-checks (DoesNotExist passes

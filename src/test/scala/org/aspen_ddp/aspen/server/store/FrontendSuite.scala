@@ -2216,6 +2216,40 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     prepare(frontend, net, lockTxd(txid3, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
   }
 
+  // Two recovered commit votes on one exclusive lock (transaction-requirements.md 10.5a): txid1 committed, applied
+  // and persisted but not finalized; txid2, built on it, voted after. Whichever loads last takes the lock, and
+  // txid1's resolution must leave txid2 holding it
+  for order <- List("earlier first", "later first") do
+    test(s"two recovered commit votes on one lock: the earlier's release leaves the later locked ($order)") {
+      val backend = new MapBackend(storeId)
+      val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+      val applied = mkObjectState(oid1)
+      applied.metadata = applied.metadata.copy(revision = ObjectRevision(txid1))
+      backend.bootstrapAllocate(oid1, applied.objectType, applied.metadata, applied.data)
+      // Cached, so the recovered transactions load in CRL order inside the Frontend's construction
+      cache.insert(applied)
+      val votes = List(commitVote(txid1, List(overwrite(op1))), commitVote(txid2, List(overwriteAfter(txid1))))
+      val crl = new TestCrl:
+        override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+          if order == "earlier first" then votes else votes.reverse
+      val lookup = new ManualLookup
+      val net = new TestNet
+      val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
+        unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
+      lookup.frontend = Some(frontend)
+      backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+
+      resolve(frontend, net, txid1, committed = true)
+      val r = prepare(frontend, net, lockTxd(txid3, List(overwriteAfter(txid1))))
+      r.disposition shouldBe TransactionDisposition.VoteAbort
+      r.collisions shouldBe List(txid2)
+
+      resolve(frontend, net, txid2, committed = true)
+      val txid4 = TransactionId(new UUID(0, 12))
+      prepare(frontend, net, lockTxd(txid4, List(overwriteAfter(txid2)))).disposition shouldBe
+        TransactionDisposition.VoteCommit
+    }
+
   test("a recovered commit vote answers a driver prepare with its vote") {
     val (frontend, net) = recoveredFrontend(TransactionStatus.Unresolved)
     frontend.receiveTransactionMessage(mkPrepare(lockTxd(txid1, List(overwrite(op1))), fromClient = false))

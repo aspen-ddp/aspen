@@ -209,10 +209,13 @@ conditional checked inserts (`TKVLInsert.replaces`).
 `ObjectState.lockedWriteTransactions` is the union of X, K, N, C and R (not S); whole-object checks test it
 (`checkPartLocks`), and parked reads wait on it. `lockHolders` adds S.
 
-A single-holder lock is set unconditionally by `RequirementsLocker` (`lockExclusive` logs an error when another
-transaction holds X, then overwrites; K, N and C are overwritten silently). For a live commit vote the preceding
-check guarantees no other holder. Only recovered commit votes, which re-take locks without a check, can overwrite one
-(section 10.5, Q-W2).
+A single-holder lock is taken by `RequirementsLocker.take`. For a live commit vote the preceding check guarantees no
+other holder (finding one on X is logged as an error). Only recovered commit votes, which re-take locks without a
+check, can find one (section 10.5). The holder found is not dropped: it is kept in `ObjectState.displacedLocks`
+(slot X, C, K(k) or N(k), plus txid), which is empty outside recovery. A release by the slot's current holder
+(`RequirementsLocker.give`) passes the slot to the newest holder it displaced; a release by a displaced holder only
+removes its entry. So a slot stays locked until every holder has released it, whatever order the holders took and
+release it in. `lockedWriteTransactions`, `lockedKeys` and `objectLevelLocked` count displaced holders.
 
 Locks are attached to the one `ObjectState` instance transactions use while any references it (`Frontend.referenced`,
 `retain`, `stateForTransaction`). A discarded state still holding locks stays the referenced one, marked
@@ -280,8 +283,8 @@ every IDA has `2 * writeThreshold > width`. Two commits on one object share a vo
 step (`determineDisposition` then `lock()`, in `completeLoad`, `endCollisionWait` and `answerPrepare`) and sends the
 vote only after the CRL save holding it completes. It holds them until the transaction resolves: on abort until
 `resolvedAndAllObjectsLoaded`, on commit until `doCommit` (or, for a commit held for its turn, until it is issued).
-After a restart the locks of recovered commit votes are re-taken before any message is handled (section 10.4).
-Exception: Q-W2 (two recovered votes on one lock).
+After a restart the locks of recovered commit votes are re-taken before any message is handled (section 10.4), and two
+recovered votes on one lock both hold it (section 3, displaced holders).
 
 **R4 (conflicting requests are refused while a lock is held).** While T holds a lock, a request of a conflicting class
 (section 4) by another transaction gets `TransactionCollision`, and the store votes abort or withholds its vote
@@ -581,9 +584,11 @@ device is rebuilt and its votes are lost (systemic-loss-protection.md, rebuild-p
 ### 10.5 Recovered transactions re-acquiring locks
 
 (a) Two recovered commit votes that conflict can coexist: A committed, applied and persisted; B, built on A, voted
-after A's commit persisted (R9); A's CRL state stays until its `TxFinalized`. Both re-take their locks, the second
-overwriting the first's (section 3). A's re-check finds its update already applied (`appliedBy`), so it neither
-applies nor quarantines. If A's lock is the one kept, A's release at resolution clears it and leaves B unlocked (Q-W2).
+after A's commit persisted (R9); A's CRL state stays until its `TxFinalized`. Both re-take their locks in load-completion order, which is not controlled (CRL record order
+is no guide either: a re-save of A moves it). Whichever takes a shared slot second displaces the first, which keeps
+its hold (section 3), so A's release at its resolution leaves B locked, whichever order they loaded in. A's re-check
+finds its update already applied (`appliedBy`), so it neither applies nor quarantines, and no Insert of A replaces
+a key's `ValueState` (which would drop a K lock) under B.
 
 (b) A recovered commit vote whose object data the CRL no longer holds (a re-save after `persistWithoutUpdateOf`) has a
 missing update: `MissingObjectUpdate` at the re-check, and the allocation rule of 8.5 applies.
@@ -699,35 +704,6 @@ rare `applying`-over-a-lock case, which costs nothing on the hot path). Keep the
 Add a FrontendSuite test for each trigger above (deterministic: deliver T's `TxResolved` to S before U's).
 
 Effort: M   Priority: 3
-
-### Q-W2. Two recovered commit votes on one lock: the earlier transaction's release unlocks the later vote (PLAUSIBLE; overwritten update)
-
-Mechanism: after a crash, recovered commit votes re-take their locks without a check (`Tx.completeLoad` -> `lock()` ->
-`RequirementsLocker.lock`). Single-holder locks are overwritten (`lockExclusive` logs an error and sets
-`lockedToTransaction`; `lockKV`/`lockKey` set K, N and C unconditionally). Release clears a lock only if the releaser
-holds it (`release`, `releaseValue`, `releaseKey`). Section 10.5a shows two recovered commit votes A (committed, applied,
-persisted, not yet finalized) and B (built on A) can share a lock. Recovered votes take their locks in load-completion
-order (`recoveredTransactionLoaded`); for a single shared object `Frontend.pendingReads` lists the later-registered
-transaction first, so which one keeps the lock depends on CRL record order and is not controlled. If A's lock is the one
-kept, A's resolution (it is driven at once and learns commit from its peers) releases it in `doCommit`, and B, still an
-unresolved counted commit vote, holds no lock at S.
-
-Trigger / scenario: S voted commit for B and crashed before A's `TxFinalized` was processed. After recovery A overwrites
-B's X lock, then resolves and clears it. A transaction C conflicting with B (also requiring A's revision) reaches S
-before B resolves there and votes commit (no lock, revision A matches). C also gets commit votes from stores that
-applied A but never saw B's prepare (B was decided on `t` votes including S's). With `w + 1 >= 2t` (`w = 3, t = 2`;
-`w = 5, t = 3`) C can reach `t` commit votes: B and C both commit over revision A.
-
-Consequence: two conflicting transactions commit (a lost update; replicas diverge, and the later applies fail-stop or
-quarantine stores). Requires a crash inside A's finalization window, the unlucky lock order, and a concurrent
-conflicting transaction in the short window before B resolves at S.
-
-Suggested fix: let recovered locks coexist instead of overwriting: hold a list of holders for X, K, N and C (populated
-only on the recovery path, where a check was skipped), so a release removes only its own entry; or take recovered
-locks in CRL vote order with the later vote winning and the earlier release a no-op. Either is rare-path only. Add a
-FrontendSuite recovery test with A and B recovered in both orders, then a conflicting C.
-
-Effort: M   Priority: 2
 
 ### Q-W3. A recovered `DoesNotExist` or blind Insert re-applies after a later delete of its key (PLAUSIBLE; resurrection, permanent replica divergence)
 

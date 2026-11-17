@@ -8,17 +8,53 @@ import scribe.Logging
 
 object RequirementsLocker extends Logging {
 
-  /** Takes the object's exclusive lock. A passing check means no other transaction holds it, and single-writer
-    * guarantees such as the vdisk fence depend on that, so finding one is logged as an error. The lock is still
-    * taken
-    */
-  private def lockExclusive(state: ObjectState, transactionId: TransactionId): Unit = {
-    state.lockedToTransaction.foreach { other =>
-      if (other != transactionId)
-        logger.error(s"Transaction $transactionId takes the exclusive lock on object ${state.objectId} held by $other")
+  /** The current holder of a single-holder lock slot. A Key slot of an absent key has none */
+  private def holder(state: ObjectState, slot: LockSlot): Option[TransactionId] = slot match
+    case LockSlot.Object => state.lockedToTransaction
+    case LockSlot.Content => state.kvState.flatMap(_.contentLocked)
+    case LockSlot.Key(k) => state.kvState.flatMap(_.content.get(k)).flatMap(_.lockedToTransaction)
+    case LockSlot.AbsentKey(k) => state.kvState.flatMap(_.absentKeyLocks.get(k))
+
+  private def setHolder(state: ObjectState, slot: LockSlot, h: Option[TransactionId]): Unit = slot match
+    case LockSlot.Object => state.lockedToTransaction = h
+    case LockSlot.Content => state.kvState.foreach(_.contentLocked = h)
+    case LockSlot.Key(k) => state.kvState.flatMap(_.content.get(k)).foreach(_.lockedToTransaction = h)
+    case LockSlot.AbsentKey(k) => state.kvState.foreach { kvs =>
+      h match
+        case Some(t) => kvs.absentKeyLocks += (k -> t)
+        case None => kvs.absentKeyLocks -= k
     }
-    state.lockedToTransaction = Some(transactionId)
-  }
+
+  /** Takes a single-holder lock slot. For a live commit vote the preceding check guarantees no other holder, and
+    * single-writer guarantees such as the vdisk fence depend on that, so finding one on the exclusive lock is logged
+    * as an error. A recovered commit vote takes its locks without a check, and two recovered votes may share a slot
+    * (transaction-requirements.md, recovered transactions re-acquiring locks). Either way the other holder is kept in
+    * `ObjectState.displacedLocks` and gets the slot back when this transaction releases it (`give`), so the slot
+    * stays locked until every holder has released it
+    */
+  private def take(state: ObjectState, slot: LockSlot, transactionId: TransactionId, recovered: Boolean): Unit =
+    holder(state, slot).foreach { other =>
+      if other != transactionId then
+        if slot == LockSlot.Object && !recovered then
+          logger.error(s"Transaction $transactionId takes the exclusive lock on object ${state.objectId} held by $other")
+        else
+          logger.info(s"Transaction $transactionId takes lock $slot on object ${state.objectId} also held by $other")
+        state.displacedLocks = (slot, other) :: state.displacedLocks
+    }
+    setHolder(state, slot, Some(transactionId))
+
+  /** Releases this transaction's hold on a single-holder slot. The current holder passes the slot to the newest
+    * holder it displaced (`take`), if any; a displaced holder only drops its entry
+    */
+  private def give(state: ObjectState, slot: LockSlot, transactionId: TransactionId): Unit =
+    if holder(state, slot).contains(transactionId) then
+      state.displacedLocks.find(_._1 == slot) match
+        case Some(entry @ (_, next)) =>
+          state.displacedLocks = state.displacedLocks.diff(List(entry))
+          setHolder(state, slot, Some(next))
+        case None => setHolder(state, slot, None)
+    else if state.displacedLocks.nonEmpty then
+      state.displacedLocks = state.displacedLocks.filterNot(_ == (slot, transactionId))
 
   /** Locks all objects hosted by this store to the transaction. This method may be
     * called ONLY after a call to RequirementsChecker.check returns ZERO errors
@@ -29,7 +65,11 @@ object RequirementsLocker extends Logging {
   def lock(transactionId: TransactionId,
            requirements: List[TransactionRequirement],
            objects: Map[ObjectId, ObjectState],
-           kvWrites: Map[ObjectId, KVWrites]): Unit = {
+           kvWrites: Map[ObjectId, KVWrites],
+           recovered: Boolean = false): Unit = {
+
+    def lockExclusive(state: ObjectState, transactionId: TransactionId): Unit =
+      take(state, LockSlot.Object, transactionId, recovered)
 
     def getState(oid: ObjectId): ObjectState = {
       objects.get(oid) match {
@@ -48,8 +88,8 @@ object RequirementsLocker extends Logging {
 
           case r: KeyValueUpdate =>
             val state = getState(r.objectPointer.id)
-            lockKV(state, transactionId, r.requiredRevision, r.contentLock, r.requirements)
-            kvWrites.get(r.objectPointer.id).foreach(lockWrites(state, transactionId, _))
+            lockKV(state, transactionId, r.requiredRevision, r.contentLock, r.requirements, recovered)
+            kvWrites.get(r.objectPointer.id).foreach(lockWrites(state, transactionId, _, recovered))
 
           case r: RefcountUpdate => lockExclusive(getState(r.objectPointer.id), transactionId)
 
@@ -69,90 +109,80 @@ object RequirementsLocker extends Logging {
              transactionId: TransactionId,
              requiredRevision: Option[ObjectRevision],
              contentLock: Option[FullContentLock],
-             keyRequirements: List[KeyValueUpdate.KeyRequirement]): Unit = {
+             keyRequirements: List[KeyValueUpdate.KeyRequirement],
+             recovered: Boolean = false): Unit = {
 
-    requiredRevision.foreach { _ => lockExclusive(state, transactionId) }
+    def takeSlot(slot: LockSlot): Unit = take(state, slot, transactionId, recovered)
+
+    requiredRevision.foreach { _ => takeSlot(LockSlot.Object) }
 
     state.kvState match {
       case None => throw ObjectErr(state.objectId, ObjectTypeError())
       case Some(kvs) =>
 
-        contentLock.foreach { _ => kvs.contentLocked = Some(transactionId) }
+        contentLock.foreach { _ => takeSlot(LockSlot.Content) }
 
         for (req <- keyRequirements) {
           req match {
 
             case _: KeyValueUpdate.WithinRange => kvs.rangeLocks += transactionId
 
-            case r: KeyValueUpdate.KeyRevision => kvs.content.get(r.key).foreach { vs =>
-              vs.lockedToTransaction = Some(transactionId)
-            }
+            // A Key slot of an absent key has no holder to take: nothing is locked, as for any present-key requirement
+            case r: KeyValueUpdate.KeyRevision => takeSlot(LockSlot.Key(r.key))
 
-            case r: KeyValueUpdate.KeyObjectRevision => state.lockedToTransaction = Some(transactionId)
+            case r: KeyValueUpdate.KeyObjectRevision => takeSlot(LockSlot.Object)
 
-            case r: KeyValueUpdate.Exists => kvs.content.get(r.key).foreach { vs =>
-              vs.lockedToTransaction = Some(transactionId)
-            }
+            case r: KeyValueUpdate.Exists => takeSlot(LockSlot.Key(r.key))
 
-            case r: KeyValueUpdate.MayExist => lockKey(kvs, r.key, transactionId)
+            case r: KeyValueUpdate.MayExist => lockKey(state, r.key, transactionId, recovered)
 
-            case r: KeyValueUpdate.DoesNotExist => kvs.absentKeyLocks += (r.key -> transactionId)
+            case r: KeyValueUpdate.DoesNotExist => takeSlot(LockSlot.AbsentKey(r.key))
 
-            case r: KeyValueUpdate.TimestampEquals => kvs.content.get(r.key).foreach { vs =>
-              vs.lockedToTransaction = Some(transactionId)
-            }
+            case r: KeyValueUpdate.TimestampEquals => takeSlot(LockSlot.Key(r.key))
 
-            case r: KeyValueUpdate.TimestampLessThan => kvs.content.get(r.key).foreach { vs =>
-              vs.lockedToTransaction = Some(transactionId)
-            }
+            case r: KeyValueUpdate.TimestampLessThan => takeSlot(LockSlot.Key(r.key))
 
-            case r: KeyValueUpdate.TimestampGreaterThan => kvs.content.get(r.key).foreach { vs =>
-              vs.lockedToTransaction = Some(transactionId)
-            }
+            case r: KeyValueUpdate.TimestampGreaterThan => takeSlot(LockSlot.Key(r.key))
           }
         }
     }
   }
 
   /** Locks an existing key's value, or an absent key's absence */
-  private def lockKey(kvs: KVObjectState, key: Key, transactionId: TransactionId): Unit =
-    kvs.content.get(key) match
-      case Some(vs) => vs.lockedToTransaction = Some(transactionId)
-      case None => kvs.absentKeyLocks += (key -> transactionId)
+  private def lockKey(state: ObjectState, key: Key, transactionId: TransactionId, recovered: Boolean): Unit =
+    state.kvState.foreach { kvs =>
+      val slot = if kvs.content.contains(key) then LockSlot.Key(key) else LockSlot.AbsentKey(key)
+      take(state, slot, transactionId, recovered)
+    }
 
   /** Releases this transaction's lock on a key, whether the key was present or absent when it was locked: applying
     * the transaction may have inserted or deleted it since
     */
-  private def releaseKey(kvs: KVObjectState, key: Key, transactionId: TransactionId): Unit =
-    kvs.content.get(key).foreach(vs => releaseValue(vs, transactionId))
-    if kvs.absentKeyLocks.get(key).contains(transactionId) then
-      kvs.absentKeyLocks -= key
+  private def releaseKey(state: ObjectState, key: Key, transactionId: TransactionId): Unit =
+    give(state, LockSlot.Key(key), transactionId)
+    give(state, LockSlot.AbsentKey(key), transactionId)
 
-  private def lockWrites(state: ObjectState, transactionId: TransactionId, writes: KVWrites): Unit =
+  private def lockWrites(state: ObjectState, transactionId: TransactionId, writes: KVWrites, recovered: Boolean): Unit =
     if writes.objectLevel then
-      lockExclusive(state, transactionId)
-    state.kvState.foreach(kvs => writes.keys.foreach(lockKey(kvs, _, transactionId)))
+      take(state, LockSlot.Object, transactionId, recovered)
+    writes.keys.foreach(lockKey(state, _, transactionId, recovered))
 
   private def unlockWrites(state: ObjectState, transactionId: TransactionId, writes: KVWrites): Unit =
     if writes.objectLevel then
       release(state, transactionId)
-    state.kvState.foreach(kvs => writes.keys.foreach(releaseKey(kvs, _, transactionId)))
+    writes.keys.foreach(releaseKey(state, _, transactionId))
 
   private def isLoaded(req: TransactionRequirement, objects: Map[ObjectId, ObjectState]): Boolean = req match
     case r: TransactionObjectRequirement => objects.contains(r.objectPointer.id)
     case _ => true
 
   private def release(os: ObjectState, transactionId: TransactionId): Unit =
-    if os.lockedToTransaction.contains(transactionId) then
-      os.lockedToTransaction = None
+    give(os, LockSlot.Object, transactionId)
 
-  private def releaseValue(vs: ValueState, transactionId: TransactionId): Unit =
-    if vs.lockedToTransaction.contains(transactionId) then
-      vs.lockedToTransaction = None
-
-  /** Releases the locks taken by lock(). Only locks still held by this transaction are released. A committed
-    * transaction is applied regardless of other transactions' locks, and its Insert replaces a key's ValueState,
-    * dropping the lock on it, so another transaction may since have locked the key.
+  /** Releases the locks taken by lock(). Only locks still held by this transaction are released, and a slot it
+    * took from another holder goes back to that holder (`give`). A committed transaction is applied regardless of
+    * other transactions' locks, and its Insert replaces a key's ValueState, dropping the lock on it, so another
+    * transaction may since have locked the key.
     */
   def unlock(transactionId: TransactionId,
              requirements: List[TransactionRequirement],
@@ -204,31 +234,29 @@ object RequirementsLocker extends Logging {
       case None => throw ObjectErr(state.objectId, ObjectTypeError())
       case Some(kvs) =>
 
-        if contentLock.nonEmpty && kvs.contentLocked.contains(transactionId) then
-          kvs.contentLocked = None
+        if contentLock.nonEmpty then
+          give(state, LockSlot.Content, transactionId)
 
         for (req <- keyRequirements) {
           req match {
 
             case _: KeyValueUpdate.WithinRange => kvs.rangeLocks -= transactionId
 
-            case r: KeyValueUpdate.KeyRevision => kvs.content.get(r.key).foreach(vs => releaseValue(vs, transactionId))
+            case r: KeyValueUpdate.KeyRevision => give(state, LockSlot.Key(r.key), transactionId)
 
             case r: KeyValueUpdate.KeyObjectRevision => release(state, transactionId)
 
-            case r: KeyValueUpdate.Exists => kvs.content.get(r.key).foreach(vs => releaseValue(vs, transactionId))
+            case r: KeyValueUpdate.Exists => give(state, LockSlot.Key(r.key), transactionId)
 
-            case r: KeyValueUpdate.MayExist => releaseKey(kvs, r.key, transactionId)
+            case r: KeyValueUpdate.MayExist => releaseKey(state, r.key, transactionId)
 
-            case r: KeyValueUpdate.DoesNotExist =>
-              if kvs.absentKeyLocks.get(r.key).contains(transactionId) then
-                kvs.absentKeyLocks -= r.key
+            case r: KeyValueUpdate.DoesNotExist => give(state, LockSlot.AbsentKey(r.key), transactionId)
 
-            case r: KeyValueUpdate.TimestampEquals => kvs.content.get(r.key).foreach(vs => releaseValue(vs, transactionId))
+            case r: KeyValueUpdate.TimestampEquals => give(state, LockSlot.Key(r.key), transactionId)
 
-            case r: KeyValueUpdate.TimestampLessThan => kvs.content.get(r.key).foreach(vs => releaseValue(vs, transactionId))
+            case r: KeyValueUpdate.TimestampLessThan => give(state, LockSlot.Key(r.key), transactionId)
 
-            case r: KeyValueUpdate.TimestampGreaterThan => kvs.content.get(r.key).foreach(vs => releaseValue(vs, transactionId))
+            case r: KeyValueUpdate.TimestampGreaterThan => give(state, LockSlot.Key(r.key), transactionId)
           }
         }
     }

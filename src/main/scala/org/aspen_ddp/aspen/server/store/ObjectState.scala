@@ -16,6 +16,13 @@ class ObjectState(val objectId: ObjectId,
 
   var lockedToTransaction: Option[TransactionId] = None
 
+  /** Holders of a single-holder lock slot that another transaction took over without a check: only recovered commit
+    * votes do, as two of them may legitimately share a slot (transaction-requirements.md, recovered transactions
+    * re-acquiring locks). The newest entry of a slot is restored when the slot's current holder releases it, so every
+    * holder keeps the slot locked until it releases (RequirementsLocker). Empty outside recovery
+    */
+  var displacedLocks: List[(LockSlot, TransactionId)] = Nil
+
   /** This in-memory state is no longer served: the object was deleted, or its state may differ from the backend's.
     * Requirement checks fail on it. It is kept only while transactions that hold locks on it reference it. See
     * Frontend.referenced
@@ -52,6 +59,7 @@ class ObjectState(val objectId: ObjectId,
       kvs.contentLocked.foreach { t => s += t }
       s ++= kvs.rangeLocks
     }
+    displacedLocks.foreach((_, t) => s += t)
     s
   }
 
@@ -61,12 +69,26 @@ class ObjectState(val objectId: ObjectId,
       case None => Set()
       case Some(kvs) =>
         kvs.content.iterator.collect { case (k, vs) if vs.lockedToTransaction.nonEmpty => k }.toSet ++
-          kvs.absentKeyLocks.keySet
+          kvs.absentKeyLocks.keySet ++
+          displacedLocks.iterator.collect {
+            case (LockSlot.Key(k), _) => k
+            case (LockSlot.AbsentKey(k), _) => k
+          }
 
   /** True when a write lock covers the whole object */
   def objectLevelLocked: Boolean =
-    lockedToTransaction.nonEmpty || kvState.exists(kvs => kvs.contentLocked.nonEmpty || kvs.rangeLocks.nonEmpty)
+    lockedToTransaction.nonEmpty || kvState.exists(kvs => kvs.contentLocked.nonEmpty || kvs.rangeLocks.nonEmpty) ||
+      displacedLocks.exists((slot, _) => slot == LockSlot.Object || slot == LockSlot.Content)
 
   /** Every transaction holding any lock on this object, shared locks included */
   def lockHolders: Set[TransactionId] = lockedWriteTransactions ++ sharedLocks
 }
+
+/** A single-holder lock slot of an object: its exclusive lock (X), a KeyValue object's content lock (C), a present
+  * key's lock (K) or an absent key's lock (N)
+  */
+enum LockSlot:
+  case Object
+  case Content
+  case Key(key: org.aspen_ddp.aspen.common.objects.Key)
+  case AbsentKey(key: org.aspen_ddp.aspen.common.objects.Key)

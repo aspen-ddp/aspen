@@ -786,7 +786,8 @@ object Codec extends Logging:
       length = length,
       keys = keys,
       rangeOffsets = ranges.map(_._1),
-      rangeLengths = ranges.map(_._2)
+      rangeLengths = ranges.map(_._2),
+      awaitCommit = o.awaitCommit.toList.map(t => encodeUUID(t.uuid))
     )
 
   def decode(m: codec.Read): Read =
@@ -808,7 +809,7 @@ object Codec extends Logging:
       case codec.ReadType.READ_TYPE_KEY_SET => KeySet(m.keys.map(b => Key(b.toByteArray)).toList)
       case codec.ReadType.Unrecognized(v) => throw new EncodingError(f"Invalid Read Type: $v")
 
-    Read(toStore, from, readUuid, objPtr, readType)
+    Read(toStore, from, readUuid, objPtr, readType, m.awaitCommit.map(u => TransactionId(decodeUUID(u))).toSet)
 
 
   def encode(o: ReadResponse): codec.ReadResponse =

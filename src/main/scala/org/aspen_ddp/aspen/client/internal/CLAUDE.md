@@ -34,3 +34,6 @@
   leader's outcome arrives or the give-up point (`result` stays `Committed`). `TransactionManager` forgets a driver on
   `ClientTransactionDriver.stopped` (leader outcome heard, or `Unknown` reached; with no retransmits it completes with
   `result`), not on `result`
+- `BaseReadDriver` re-reads a store whose reply holds a lock of a known-committed transaction at once; that `Read`
+  carries `awaitCommit` (the known-committed txids among the locks) so the store can park the reply until it applies
+  them. First reads and full resends carry it empty. The store ignores the field until it implements parking

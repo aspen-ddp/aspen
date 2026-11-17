@@ -425,6 +425,15 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decoded = Codec.decode(Codec.encode(original))
     decoded shouldBe original
 
+  test("Read with awaitCommit round-trip"):
+    val ptr = dataPtr(1)
+    val none = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, FullObject())
+    Codec.decode(Codec.encode(none)).awaitCommit shouldBe Set()
+
+    val two = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, FullObject(),
+      awaitCommit = Set(TransactionId(uuid(41)), TransactionId(uuid(42))))
+    Codec.decode(Codec.encode(two)).awaitCommit shouldBe Set(TransactionId(uuid(41)), TransactionId(uuid(42)))
+
   test("Read round-trip"):
     val ptr = dataPtr(1)
 

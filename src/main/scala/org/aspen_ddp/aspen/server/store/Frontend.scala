@@ -1595,7 +1595,8 @@ class Frontend(val storeId: StoreId,
     * recovered commit vote has loaded its objects and taken its locks, this store would report the state the vote's
     * transaction replaces, unlocked, and a repair trusting the read could undo that commit on a store that applied it
     */
-  def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType): Unit =
+  def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType,
+                           awaitCommit: Set[TransactionId] = Set()): Unit =
     if stopped then
       logger.trace(s"Store $storeId dropped read $readUUID: fail-stopped")
     else if holding then

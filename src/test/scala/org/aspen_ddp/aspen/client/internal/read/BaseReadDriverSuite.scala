@@ -344,6 +344,36 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     reads(m, ds0) shouldBe 1
   }
 
+  def lastRead(m: RecordingClient, store: StoreId): Read =
+    m.requests.collect { case rd: Read if rd.toStore == store => rd }.head
+
+  test("a re-read for a known-committed lock names that transaction") {
+    val m = new RecordingClient:
+      override val txStatusCache: TransactionStatusCache = new TransactionStatusCache()
+    val r = mkReader(m)
+    val ts = HLCTimestamp.now
+
+    r.begin()
+    m.requests.collect { case rd: Read => rd }.foreach(_.awaitCommit shouldBe Set())
+
+    m.txStatusCache.transactionCommitted(lockTx)
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, stale(ts)))
+    lastRead(m, ds0).awaitCommit shouldBe Set(lockTx)
+    lastRead(m, ds1).awaitCommit shouldBe Set()
+  }
+
+  test("a re-read of a lock that became known committed after the reply names that transaction") {
+    val m = new RecordingClient:
+      override val txStatusCache: TransactionStatusCache = new TransactionStatusCache()
+    val r = mkReader(m)
+    val ts = HLCTimestamp.now
+
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, stale(ts)))
+    m.txStatusCache.transactionCommitted(lockTx)
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, Left(ReadError.ObjectNotFound)))
+    lastRead(m, ds0).awaitCommit shouldBe Set(lockTx)
+  }
+
   test("a store holding the lock of an undecided transaction is not re-read") {
     val m = new RecordingClient
     val r = mkReader(m)

@@ -59,13 +59,17 @@ abstract class BaseReadDriver(
     * object's revision unchanged), in a key's revision. A store's own reply is not counted, so a reply cannot cause
     * its own re-read */
   private def holdsKnownCommittedLock(store: StoreId, locks: Set[TransactionId]): Boolean =
+    knownCommitted(store, locks).nonEmpty
+
+  /** The subset of the store's locks known to belong to committed transactions (see holdsKnownCommittedLock) */
+  private def knownCommitted(store: StoreId, locks: Set[TransactionId]): Set[TransactionId] =
     if locks.isEmpty then
-      false
+      Set()
     else
       val othersApplied = lastResponses.iterator.collect:
         case (s, Right(cs)) if s != store => cs.revision.lastUpdateTxUUID
       .toSet
-      locks.exists: txid =>
+      locks.filter: txid =>
         othersApplied.contains(txid.uuid) || objectReader.appliedElsewhere(store, txid.uuid) ||
           client.txStatusCache.getTransactionResolution(txid).exists(_._1)
 
@@ -73,11 +77,11 @@ abstract class BaseReadDriver(
     * Its reply is stale, and it was the only reply that store will send before the next full resend */
   private def rereadStoresWithNewlyCommittedLocks(): Unit =
     val ready = undecidedLockStores.collect:
-      case (store, locks) if holdsKnownCommittedLock(store, locks) => store
-    ready.foreach: store =>
+      case (store, locks) if holdsKnownCommittedLock(store, locks) => store -> knownCommitted(store, locks)
+    ready.foreach: (store, committed) =>
       undecidedLockStores -= store
       committedLockRereads += 1
-      sendReadRequest(store)
+      sendReadRequest(store, committed)
 
   private def elapsedMillis: Long = (System.nanoTime() - startNanos) / 1000000
 
@@ -113,9 +117,9 @@ abstract class BaseReadDriver(
   }
 
   /** Sends a Read request to the specified store. */
-  protected def sendReadRequest(dataStoreId: StoreId): Unit = {
+  protected def sendReadRequest(dataStoreId: StoreId, awaitCommit: Set[TransactionId] = Set()): Unit = {
     logger.trace(s"Read UUID $readUUID: Sending read request for object ${objectPointer.id} to store $dataStoreId. Comment: $comment")
-    client.messenger.sendClientRequest(Read(dataStoreId, client.clientId, readUUID, objectPointer, readType))
+    client.messenger.sendClientRequest(Read(dataStoreId, client.clientId, readUUID, objectPointer, readType, awaitCommit))
   }
 
   /** Sends a Read request to all stores that have not already responded. May be called outside a synchronized block */
@@ -140,10 +144,11 @@ abstract class BaseReadDriver(
 
     undecidedLockStores -= response.fromStore
 
-    val hasLocksForKnownCommittedTransactions = response.result match {
-      case Left(_) => false
-      case Right(cs) => holdsKnownCommittedLock(response.fromStore, cs.lockedWriteTransactions)
+    val committedLocks = response.result match {
+      case Left(_) => Set[TransactionId]()
+      case Right(cs) => knownCommitted(response.fromStore, cs.lockedWriteTransactions)
     }
+    val hasLocksForKnownCommittedTransactions = committedLocks.nonEmpty
 
     val isUnknownStoreResponse = response.result match
       case Left(err) =>
@@ -163,7 +168,7 @@ abstract class BaseReadDriver(
           committedLockStoresReported += response.fromStore
           logger.warn(s"Read UUID $readUUID of object ${objectPointer.id}: store ${response.fromStore} still holds a " +
             s"lock of a committed transaction after ${elapsedMillis}ms. Replies so far: $responseSummary")
-      sendReadRequest(response.fromStore)
+      sendReadRequest(response.fromStore, committedLocks)
     }
     else {
       response.result.foreach: cs =>

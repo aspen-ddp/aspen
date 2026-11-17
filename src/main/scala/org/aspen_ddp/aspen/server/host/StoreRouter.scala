@@ -160,7 +160,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
           ctx.net.sendClientResponse(msg)
       route(r.toStore, unknown): store =>
         if r.objectPointer.poolId == store.storeId.poolId then
-          store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, r.objectPointer, r.readType)
+          store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, r.objectPointer, r.readType, r.awaitCommit)
 
 
     case r: CurrentAllocationsRequest =>

@@ -154,7 +154,8 @@ final case class Read(
                        fromClient: ClientId,
                        readUUID: UUID,
                        objectPointer: ObjectPointer,
-                       readType: ReadType) extends ClientRequest:
+                       readType: ReadType,
+                       awaitCommit: Set[TransactionId] = Set()) extends ClientRequest:
   override def toString: String = f"Read toStore $toStore from $fromClient uuid $readUUID object ${objectPointer.id}"
 
 final case class ReadResponse( toClient: ClientId,

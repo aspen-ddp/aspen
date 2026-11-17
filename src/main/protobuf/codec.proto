@@ -351,6 +351,7 @@ message Read {
   repeated bytes keys = 12;
   repeated uint32 range_offsets = 13;
   repeated uint32 range_lengths = 14;
+  repeated UUID await_commit = 15;
 }
 
 message ReadResponse {

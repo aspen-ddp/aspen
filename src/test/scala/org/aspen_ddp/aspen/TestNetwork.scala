@@ -501,6 +501,10 @@ class TestNetwork(executionContext: ExecutionContext,
   /** The client's transactions not yet completed (HorizonClientDriver), checked by heartbeat */
   private var clientDrivers: List[HorizonClientDriver] = Nil
 
+  /** The client's driver of transaction `txid`, until heartbeat drops it once completed */
+  def clientDriver(txid: TransactionId): Option[ClientTransactionDriver] = synchronized:
+    clientDrivers.find(_.txd.transactionId == txid)
+
   private def clientDriverFactory(c: ReadDriverClient, txd: TransactionDescription,
                                   updateData: Map[StoreId, TransactionData]): ClientTransactionDriver =
     val d = new HorizonClientDriver(hostOptions.transactionHorizon, c, txd, updateData, commitAsUnknown)

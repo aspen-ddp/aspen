@@ -259,7 +259,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, false), (ds1, false), (ds2, false))
   }
 
-  test("past expiry, a quorum reporting an accepted commit is proposed, not abort") {
+  test("a quorum reporting an accepted commit is proposed over an abort vote") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
     val driver = new TTD(ds0, messenger, mkprep(2, 0, 0, txd), new TFinalizer(), _ => ())
@@ -270,7 +270,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, true), (ds1, true), (ds2, true))
   }
 
-  test("past expiry, a driver holding a proof does not propose abort on an undecided tally") {
+  test("a driver holding a proof does not propose abort on an undecided tally") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
     val driver = new TTD(ds0, messenger, mkprep(2, 0, 0, txd), new TFinalizer(), _ => ())

@@ -245,8 +245,9 @@ class StoreSuite extends AnyFunSuite with Matchers:
   // waits for the silent store. Past it both voters are frozen (they promise and accept nothing more). The expiry tally
   // still holds while the third store is silent (ExpiryTally rule G): it may have voted commit, which with the leader's
   // vote is Replication(3, 2)'s write threshold, so a client may have learned commit from the votes. (Under the old
-  // rules it discarded at once: no accept of commit existed.) Once the third store reports it never voted, no pool can
-  // reach its write threshold of commit votes, and T is discarded (rule E)
+  // rules it discarded at once: no accept of commit existed.) Once the third store reports it never voted, one commit
+  // voter is below the read threshold of 2, so T's update can never be restored, and T is discarded (rule D, which
+  // comes first; rule E, no pool able to reach its write threshold of commit votes, would discard it too)
   test("a commit voter whose peer voted abort is discarded past expiry once its third store replies, not before") {
     var now = fixedStart
     val lookup = new ManualLookup

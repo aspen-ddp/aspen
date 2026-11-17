@@ -774,6 +774,16 @@ host siblings also wait. No backoff schedule, no in-pass retry of the right-neig
 
 **F6 (Medium) A Rebuilding (silent) store can stall transactions whose live voters disagree.**
 
+> **Refresh (2026-11-16, client 1-RTT commit, Todo 8.1): ended by expiry rule E, not by a driver abort.** No driver
+> proposes abort on an undecided tally any more (paxos-transactions P7a), since the client may have been told commit
+> from the votes. While the rebuilding store is silent the expiry tally holds (rule G): its vote may have been
+> commit, which with S1's is the write threshold. Once it replies, it reports `amnesiac` if its old incarnation may
+> have voted, or "unknown". With "unknown", S1's single commit vote leaves the pool short of its write threshold
+> (rule E; with a changed object rule D fires first, with the same discard), and T is discarded after S1's
+> UnackedCommits lookup. StoreSuite "a commit voter whose peer voted abort is discarded past expiry once its third
+> store replies, not before". The lock bound below no longer holds: the locks are kept for as long as the store is
+> silent.
+
 > **Refresh (2026-11-15, cross-document G1): ended by expiry, not by the driver.** Past expiry both voters are frozen
 > and accept nothing, so the driver's abort proposal no longer succeeds. The expiry tally ends T instead: no store's
 > latest accept is commit, and the silent store alone cannot make a commit chosen, so it discards (paxos 10.10, rule 3;

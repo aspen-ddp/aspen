@@ -98,6 +98,12 @@ still join it.
 
 ### 2. Expiry (server, store side)
 
+> **Superseded in part, 2026-11-16.** The decision rules of this section (rules 2-4, and the 2026-11-15 revisions)
+> are replaced by rules A-G of `docs/superpowers/specs/2026-11-16-client-1rtt-commit-design.md` section 4.3(b), as
+> amended there. They count commit votes as well as accepts, since the client learns a commit from the votes. Rule 1
+> (adopt), the status query, the freeze and the discard actions are unchanged. The code is `ExpiryTally`, and the
+> argument is in `docs/safety/paxos-transactions.md` 10.10.
+
 Under the floor, a Tx whose peers have forgotten T gets no answers from them, so without a further rule it would wait
 forever (today it is driven to an abort, often a false one, F2). Expiry decides such a Tx from its peers' state, which
 they report on request. The design is the user's: ask the peers, and discard only when they prove the transaction can

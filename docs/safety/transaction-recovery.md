@@ -1293,7 +1293,8 @@ above for that store. This is the residual of paxos F6 (Todo 2.13), and it is ci
 > finalized and forgotten T. The forget floor (paxos 10.10) closed that: a store that forgot T refuses its prepares
 > below its floor, or answers from its status cache inside it (a size eviction raises the floor), so every promise a
 > driver counts comes from real acceptor state, and Paxos, safe with offline acceptors, never chooses abort once
-> commit was chosen. Todo 4.1's past-expiry abort is an ordinary proposal (P7a) and is covered by the same argument.
+> commit was chosen. Todo 4.1's past-expiry abort was an ordinary proposal covered by the same argument (removed
+> 2026-11-16: no driver proposes abort on an undecided tally, paxos P7a).
 > The fix sketch's bound and abort ban would therefore add machinery with no safety role. *Fix:* `Store.driveTransaction`
 > no longer waits for the first lookup (`Tx.awaitsFirstUnackedLookup` is gone), so the vote is driven at heartbeat or
 > by a leader's prepare like any recovered Tx. When a lookup later finds the entry (of any incarnation), the Frontend

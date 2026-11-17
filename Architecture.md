@@ -135,30 +135,35 @@ designated leader is the randomly chosen index within that set of stores that wi
 of course, that store is offline. In which case, failure recovery kicks in and another DataStore will 
 volunteer to take over.
 
-Transactions are designed to reach consensus on the Commit/Abort decision as fast as possible. The 
-original, unmodified, single-synod Paxos algorithm is used to achieve consensus on this decision and 
-it does so in a single round-trip in the error free case. To do this, we send some additional data 
-along with the Prepare and Promise messages. The TransactionDescription and updated object content 
-are sent along with the Prepare message. Each DataStore examines the state of its local objects and 
-if all the requirements are met, it writes its “VoteCommit” decision to persistent state along with 
-the TransactionDescription, local object data, and the required Paxos minimum proposal id and 
-accepted value state. The Promise message is sent to all DataStores for all objects in the 
-transaction. Each DataStore tracks the promise messages it receives from all stores and, if the 
-VoteCommits exceed a 2/3rds majority for all objects to be modified, it will be impossible for the 
-transaction to reach any decision other than Commit even if all the DataStores crash and have to be 
-recovered. Because of this, each DataStore can self-generate the Accept message rather than waiting 
-for the designated leader to send the message over the network. This is what allows the 
-one-round-trip commit resolution. However, it does come at the cost of increased message delays in 
-the case of an Abort decision. To allow self-generation of the pro-commit Accept message, it’s the 
-only valid Accept message that can be sent in round 1 of the Paxos algorithm. To resolve an abort, we 
-have to move on to round 2 and start with another Prepare message for the new round.
+Transactions are designed to let the client learn a commit as fast as possible: in one round trip, with
+one durable write, in the error-free case. The TransactionDescription and updated object content are sent
+along with the Prepare message, to every DataStore of every object in the transaction. Each DataStore examines
+the state of its local objects and, if all the requirements are met, takes their locks and writes its
+"VoteCommit" decision to persistent state, along with the TransactionDescription, its local object data, and the
+Paxos promise. Only once that write is durable does it send its Promise (with the vote) to the designated leader
+and its vote (`TransactionVote`) to the client. A vote never changes once written. Two conflicting transactions
+cannot both gather a write threshold of commit votes on one object: the votes hold locks, and the write threshold
+is a majority. So once every object has its pool's write threshold of commit votes, commit is the only outcome the
+transaction can have, and the client completes `Committed` on those votes alone, without waiting for the leader.
 
-It’s worth pointing out that the transaction recovery process is pessimistic and, when enacted, it 
-always attempts to drive the transaction to an Abort decision. If sufficient stores have received the 
-necessary data to achieve a commit, the recovery process will still result in a commit decision but 
-because the DataStore driving the transaction does not have the full data for every object being 
-modified, it cannot re-transmit Prepare messages with the local object updates for each DataStore. 
-Thus it always tries to Abort.
+Consensus among the DataStores is ordinary single-decree Paxos, unchanged. The designated leader tallies the votes
+from the Promises, proposes commit or abort, sends the Accept messages, and announces the outcome to the stores and
+the client once a quorum has accepted it. There is no commit-only round 1 and no self-generated Accept: any round
+may choose either value. The stores learn the outcome on the leader's path, so it takes longer for them to learn it
+than for the client. Abort is never learned from votes.
+The client completes `Aborted` only on the leader's message, after Paxos has chosen abort. Aborts are not the fast
+path, since the client retries them anyway.
+
+It's worth pointing out that the transaction recovery process is pessimistic. Its prepares prefer abort, since the
+DataStore driving the transaction does not have the full data for every object being modified and so cannot
+re-transmit Prepare messages with each store's local object updates. But no driver ever proposes abort unless its
+tally is abort-certain: some object has too few possible commit votes left to ever reach its write threshold.
+Otherwise it waits, or proposes a value its promise quorum already accepted. If enough stores voted commit, recovery
+commits. A transaction whose stores stay unreachable past the transaction horizon ends by expiry. The stores still
+holding it query every peer and decide from the replies (`ExpiryTally`, rules A-G): commit when the votes or an
+accepted commit prove it, discard when an accepted abort or the missing votes rule commit out, and otherwise hold,
+while a store is silent or too many are lost to tell. They never discard a transaction whose client may have been
+told it committed.
 
 Recovery and every other store-side driver send prefer-abort prepares: a DataStore that has not yet voted
 never checks the transaction's requirements on such a prepare. It proves the commit at once if an object it hosts

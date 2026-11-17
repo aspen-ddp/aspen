@@ -209,6 +209,17 @@ Rules for an unknown outcome, in order. Rule 1, Adopt, is unchanged. These repla
   so nothing is chosen later. A conflicting transaction can't have committed: it would need `t` commit votes, but T's
   `vc >= r` voters hold its locks, and `t + r > w` (the root CLAUDE.md threshold invariant), which is the argument
   today's rule 2 uses.
+
+  *Amendment 2026-11-16 (found while documenting, Task 7).* Rule F as written above is unsafe. A primary store that
+  accepted abort, was finalized and let its cached outcome expire answers "unknown". With a lock-only primary
+  object, it and one amnesiac store can hide a chosen abort that the client was told of. Example: Replication(3,2),
+  S0 commit, S1 and S2 abort and accept it, S2 forgets T, S1 is rebuilt. As built, F requires `k_p + n_p < t`,
+  where `n_p` is the number of primary stores replying "unknown". G holds otherwise, including with every store
+  replied when `k_p + n_p >= t`. With a changed primary object `n_p` never matters, because `vc_p >= r` leaves at
+  most `w - r < t` other stores. One divergence between observers remains, and is accepted. One observer discards by
+  C over an abort accepted by fewer than a quorum. The accepter then forgets T, and another observer commits by F.
+  No client was told abort, F's locked voters exclude a conflicting commit, and the commit's missed-update marks
+  repair the store that discarded. See `docs/safety/paxos-transactions.md` 10.10 and `ExpiryTallyConsistencySuite`.
 - **G. Hold** otherwise. That happens while some store is silent (transient). With every store replied, it happens only
   when `k_p >= t`, beyond the pool's loss tolerance (`t - r < t`), so data was lost too. Keep the
   `UNDECIDABLE TRANSACTION` log for that case.

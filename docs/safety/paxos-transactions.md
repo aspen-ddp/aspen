@@ -18,7 +18,12 @@ a transaction it does not hold (the per-store forget floor), a 30 s status cache
 status, and the client error `TransactionOutcomeUnknown`. It is new mechanism, not the replay horizon removed on
 2026-11-09 (that one made stores vote `TooOld`; this one makes them refuse to take part). Its passages are marked
 "(horizon)" and cite `e9e6f3f6`; the mechanism and its safety argument are in 10.10, the findings it changes in the
-re-assessment table at the start of section 12.
+re-assessment table at the start of section 12. Refreshed 2026-11-16 for the client 1-RTT commit
+(`docs/superpowers/specs/2026-11-16-client-1rtt-commit-design.md`, Todo 8.1, branch `paxos_1rtt`): each store sends
+its durable vote to the client (`TransactionVote`), and the client completes `Committed` once every object has `t`
+commit votes. No driver proposes abort unless its tally is abort-certain, and expiry decides by rules A-G. Its
+passages are marked "(1-RTT)": the invariant P-VC (3), the message (4), the flow (5), expiry (10.10), the abort-path
+audit (10.12) and F1.
 
 Related documents (siblings, not duplicated here): [crash-recovery-log.md](crash-recovery-log.md) (CRL interface and
 SimpleCRL), [transaction-requirements.md](transaction-requirements.md) (requirement checks, locks, commit-in-flight
@@ -75,7 +80,14 @@ one object" argument (see [transaction-requirements.md](transaction-requirements
 
 ## 2. Design intent versus implementation (read this first)
 
-`Architecture.md:139-155` and `Todo.txt:11-14` at `c3ad5493` describe the intended protocol:
+> *(1-RTT) 2026-11-16:* the client now learns a commit in one round trip, but not by the mechanism quoted below.
+> Stores send their durable vote to the client as well as to the proposer (`TransactionVote`). The client completes
+> `Committed` once every object has its pool's `t` commit votes (`ClientTransactionDriver.commitCertain`). The leader
+> path (tally, `TxAccept`, `TxResolved`, finalization) is unchanged and is still how the stores learn. The table
+> keeps the 2026-11-09 comparison, with the client rows updated. `Architecture.md` now describes this protocol, and
+> F1 is FIXED.
+
+`Architecture.md:139-155` and `Todo.txt:11-14` at `c3ad5493` described the intended protocol:
 
 > each DataStore writes its VoteCommit with the Paxos state, sends the Promise to **all** DataStores, tracks the
 > promises, and once VoteCommits exceed the threshold for every object **self-generates the Accept** ... it is the only
@@ -85,18 +97,20 @@ one object" argument (see [transaction-requirements.md](transaction-requirements
 
 | Aspect | Documented intent | Code (verified) |
 |---|---|---|
-| Who receives the Promise/vote | every store | only the proposer named in the prepare's `from` (the leader): `TxPrepareResponse(m.from, ...)` at `Tx.scala:873` |
+| Who receives the Promise/vote | every store | the Promise and vote: only the proposer named in the prepare's `from` (the leader), `TxPrepareResponse(m.from, ...)`. (1-RTT) The vote alone also goes to the originating client, `TransactionVote`, from the same CRL-save completion handler (`Tx.sendPrepareResponse`) |
 | Who generates Accept | each acceptor, locally | only a `TransactionDriver`: the sole construction site of `TxAccept` is `TransactionDriver.scala:545` |
-| Who is the learner | each store (or the client) | the driver's `Learner` (`TransactionDriver.scala:103`, `:394`); the client's learner is commented out (`ClientTransactionDriver.scala:28`, `:45-59`) |
+| Who is the learner | each store (or the client) | the driver's `Learner` (`TransactionDriver.scala:103`, `:394`). (1-RTT) The client also learns a commit from the votes (P-VC), but never an abort |
 | Round-1 commit-only rule | commit may only be proposed/accepted in round 1; abort needs round 2 | **No such rule exists.** `Acceptor.receiveAccept` accepts any value at any `>=` promised id (`common/paxos/Acceptor.scala:24-35`). A leader tallying an abort proposes `Accept((1,L), false)` directly in round 1; a recovery driver (round >= 2) may propose commit if it tallies `t` commit votes (`TransactionDriver.scala:314-365`). |
-| Latency | one round trip | 5 sequential one-way hops to the client (section 5), with two serial durable CRL writes (vote, accept) on the path. |
+| Latency | one round trip | (1-RTT) A commit takes 2 one-way hops to the client (prepare, vote), with one durable CRL write. An abort still takes 5 (leader tally, Accept, `TransactionResolved`), with two serial writes. The stores learn on the leader's path either way (section 5). |
 
 Consequences for readers of this spec:
 
 * The statements "aborts require a new round" and "recovery always aborts" must **not** be used as invariants; they
   are not true of the code. Safety here rests on ordinary single-decree Paxos (P8) plus immutable, durable votes (P4,
-  P6), not on a round-1 restriction.
-* `Architecture.md`/`Todo.txt` should be updated, or the fast path implemented (flaw F1).
+  P6), not on a round-1 restriction. (1-RTT) The client's fast commit adds an invariant of its own, P-VC: once every
+  object has `t` commit votes, commit is T's only outcome. It also rests on the votes, not on a round rule. Use P-VC
+  rather than "round 1 is commit-only".
+* *(1-RTT)* `Architecture.md` now describes the protocol as built (F1 FIXED).
 
 ---
 
@@ -133,18 +147,40 @@ therefore survives any crash of that store.
 every object in the txd, at least the pool's write threshold of that object's pool's stores reported `VoteCommit`
 in the current round (`TransactionDriver.scala:321-356`, analysed in 7.2). Combined with P5 and P12 this means a
 decided commit is backed by locked, durable commit votes at a write quorum of every object's pool.
+*(1-RTT) Re-derived 2026-11-16.* Three things propose commit: a driver's tally, as above; a proof holder adopting an
+accepted commit of its post-proof round (P15, 10.5), where T's update was already applied, so T committed; and an
+expiry commit (10.10, rules A, B, F). Expiry commits without a Paxos round: it resolves T at every store, and its
+driver finalizes. The client also concludes commit from the votes (P-VC), on the same test the tally uses. So every
+commit, wherever it is concluded, rests on `t` durable commit votes per object, on a proof, or on an expiry rule
+whose argument is in 10.10. The client's conclusion needs P-VC, below: no other path may then resolve T as abort.
 
 **P7 Abort is always a valid free choice.** If no value has been chosen, any proposer may propose abort at any time
 without violating anything (aborts apply nothing). So misclassifying a non-vote as an abort vote (F7) can cost
 liveness/throughput but not safety, provided P8 holds.
 
-**P7a The expiry abort is an ordinary abort proposal (2026-11-15, F8).** Past expiry a driver proposes abort on an
-undecided tally. It does so under exactly the conditions of the vote-based abort: a promise quorum of the current
-round, no proof held, and `Proposer.proposalValue` preferring any accepted value of that quorum. Only the vote count is
-relaxed, and by P7 the vote count never makes an abort safe; P6 concerns commit only. A commit chosen and then
-forgotten is not overturned: an acceptor forgets T only at TxFinalized and never rejoins it (forget floor), so every
-promise quorum meets the accepting quorum at a store that still reports the accepted commit. A commit voter whose
-driver decides abort still makes its UnackedCommits lookup first when expiring (`needsUnackedCheck`).
+**P7a Abort is proposed only on an abort-certain tally (1-RTT, 2026-11-16; replaces the 2026-11-15 expiry abort).**
+P7 still holds for Paxos, but it is no longer enough: P-VC also forbids an abort while every object may have `t`
+commit votes. A driver's local proposal is abort only when some object is abort-certain (`w - a < t`,
+`TransactionDriver.receiveTxPrepareResponse`). Otherwise `Proposer.proposalValue` re-proposes an accepted value its
+promise quorum reports, or the driver waits. The past-expiry abort of an undecided tally (2026-11-15, F8;
+`TransactionDriver.Start.pastExpiry`) was removed. A T whose tally stays undecided now ends by expiry (10.10): with
+every store replied and none amnesiac, by rule A or E.
+TransactionDriverSuite "an undecided tally never proposes abort", "an abort-certain tally still proposes abort".
+
+**P-VC Vote-decided commit (1-RTT, 2026-11-16).** If every object of T has `t` commit votes (its pool's write
+threshold), commit is T's only possible outcome. Recovery and expiry abort or discard T only when that cannot be the
+case. The client relies on it: it completes `Committed` on those votes alone (`ClientTransactionDriver.receive(vote)`,
+`commitCertain` over `txd.allReferencedObjectsSet`, the driver's object set). Why it holds:
+* Votes are durable before they are sent, to the leader or to the client (P5; `Tx.sendPrepareResponse` runs only in
+  the completion handler of the CRL save that holds the vote). They are immutable (P4) and recovered with the Tx.
+  A rebuilt store loses its vote but reports itself `amnesiac`, never as a non-voter.
+* A store has one vote, so `c >= t` commit votes leave at most `w - t` abort votes for that object, and no tally
+  can be abort-certain (`w - a < t` needs `a > w - t`). By P7a no driver proposes abort, so no abort is ever
+  accepted (lemma L1, 10.10). Paxos can then choose only commit.
+* Expiry discards only by rules C, D and E, and each of them rules out a commit-certain tally, or loses the data
+  (10.10). The audit in 10.12 covers every other way T can end as abort.
+* Two conflicting transactions cannot both have `t` commit votes on one object: the votes take locks (P12), and `t`
+  is a majority (1.3).
 
 **P8 Single chosen value.** For one transaction at most one of {commit, abort} is chosen by the primary pool's
 acceptors, given P1-P3 and that the acceptor state of a possibly-chosen value is still held by a quorum-intersecting
@@ -251,9 +287,14 @@ bound above, the eviction watermark, the load floor) and a prepare for it is ref
 fault and a missing one is not.
 
 **P18 Client outcome.** The client's future completes with the first `TransactionResolved` or `TransactionFinalized`
-it receives (`ClientTransactionDriver.scala:61-63`, `:37-44`); it never checks that two reports agree. Resolution
+it receives (`ClientTransactionDriver.receive`). A disagreeing later report is logged as a split decision. Resolution
 precedes finalization, so a client can see "committed" before FinalizationActions have run and before any store has
-applied the update (the commit is durable only as votes and accepted state in CRLs; see P6, P13).
+applied the update (the commit is durable only as votes and accepted state in CRLs; see P6, P13). *(1-RTT)* It also
+completes `Committed` once every object has `t` `VoteCommit` `TransactionVote`s (P-VC), before any store has
+accepted, let alone applied. Each store's first vote is kept; a differing later one is logged and ignored. Abort and
+`Undetermined` votes complete nothing: `Aborted` comes only from the leader's messages, after Paxos chose abort.
+`SimpleClientTransactionDriver` keeps retransmitting after a vote-completion until a leader message or its give-up,
+so a leader that missed the client's prepare still gets a driver started.
 
 **P19 First resolution wins.** `Tx.resolved` (`Tx.scala:772`), `TransactionDriver.onResolution` (`:691`),
 `Tx.receiveFinalized` (`:925`) and the client (`:37-44`) each keep the first outcome and silently ignore a different
@@ -271,11 +312,12 @@ later one. Nothing detects a split decision (F11).
 | `TxAcceptResponse` | acceptor -> driver | `Nack` or `Accepted(value)` | `Message.scala:290-301` |
 | `TxResolved` | driver -> all stores (+ `notifyOnResolution`); or store -> driver (cache reply, proof of commit) | `committed` | `Message.scala:303-311` |
 | `TransactionResolved` / `TransactionFinalized` | driver (or store cache reply) -> originating client | `committed` | `Message.scala:222-234` |
+| `TransactionVote` (1-RTT) | store -> originating client | `disposition` (`VoteCommit` or `VoteAbort` only). Sent with every prepare response, Promise or Nack, from the completion handler of the CRL save holding the vote; never by a muted or frozen Tx, never for a proof | `Message.scala:246-251`; `Tx.sendPrepareResponse` |
 | `TxCommitted` | store -> its last proposer | object ids this store could not apply | `Message.scala:313-319` |
 | `TxFinalized` | driver -> all stores; store cache reply -> proposer | `committed`, `late`, `owed` (addendum: stores the finalizer wrote UnackedCommits entries for; empty for aborts, late commits and the cache relay) | `Message.scala:321-329`; relay `Store.scala:180` |
 | `TxHeartbeat` | driver -> all stores | resets the stores' idle timers | `Message.scala:331-335` |
 | `TxUnknownStore` | router -> sender | the addressed store is not on this host | `server/host/StoreRouter.scala:143-146` |
-| `TxStatusRequest/Response` | - | handled by `Tx.receiveStatusRequest` (`Tx.scala:1146-1150`) but **no code sends a request** | dead code |
+| `TxStatusRequest/Response` | expiring Tx -> every store of T, and back | `startTimestamp`; the reply's `TxStatus` (status, finalized, late, `holdsAcceptorState`, `accepted`, `votedCommit`, `amnesiac`) or `None` ("unknown") | `Frontend.expiryHeartbeat`, `Tx.receiveStatusRequest`, `Frontend.receiveStatusRequestWithoutTx` (10.10) |
 
 No network guarantee is assumed beyond "messages may be lost, delayed, duplicated and reordered" (the QUIC plugin
 drops messages over budget, `CLAUDE.md`; Paxos and the retransmit loops tolerate the rest).
@@ -294,6 +336,8 @@ hosts an object of the transaction.
  |                 crl.save{txd, data, vote, promised=(1,L)}; ON DURABLE ->
  |                 |    |    |      |    |         |
  |                 +----+----+----->L<---+----+----+   TxPrepareResponse(Promise(None), vote)  (hop 2)
+ |<----------------+----+----+------+----+---------+   TransactionVote(vote), same handler      (hop 2)
+ |  C: every object has t VoteCommits -> Committed (1-RTT; abort is never learned here)
  |                                  L: first client prepare at the leader created the driver
  |                                     (Store.scala:191-193); tally votes; setLocalProposal(v)
  |                 <-- TxAccept((1,L), v) ---- L ----->  (primary pool stores only)           (hop 3)
@@ -318,12 +362,13 @@ Step table with code references:
 | 2 | Client sends `TxPrepare((1,L), from=L, fromClient=true)` with each store's own object slices to **every** store of every referenced pool, then retransmits all of it every `retransmitDelay` until an outcome arrives (never gives up; logs "HUNG" every 3rd retry). | `ClientTransactionDriver.scala:65-84`, `SimpleClientTransactionDriver.scala:37-50` |
 | 3 | Store entry: `Store.receiveTransactionMessage` applies CRL backpressure to unseen prepares (`admitPrepare`), then `handleTransactionMessage` consults the status cache (section 10.6) and, **if this store is the primary pool's designated leader**, calls `driveTransaction`. Then `Frontend` creates or finds the `Tx`. | `Store.scala:150-193`, `Frontend.scala:751-758,793-831` |
 | 4 | New `Tx`: loads hosted objects; `completeLoad` runs `determineDisposition` and `lock()`. | `Tx.scala:419-440,442-497,318-323` |
-| 5 | `respondToPrepare`: `acceptor.receivePrepare` (in memory), `crl.save(state)`, **then** send `TxPrepareResponse` to `m.from`. | `Tx.scala:857-886` |
+| 5 | `respondToPrepare`: `acceptor.receivePrepare` (in memory), `crl.save(state)`, **then** send `TxPrepareResponse` to `m.from` and, for `VoteCommit`/`VoteAbort`, `TransactionVote` to the originating client (1-RTT). | `Tx.scala:857-886`; `Tx.sendPrepareResponse` |
+| 5a | (1-RTT) Client: keeps each store's first vote; completes `Committed` once every referenced object has its pool's `t` commit votes. Abort votes complete nothing. It keeps retransmitting until the leader's outcome. | `ClientTransactionDriver.receive(vote)`, `commitCertain` |
 | 6 | Leader driver collects responses for its **current** proposal id only; records each vote; feeds primary-pool promises to the `Proposer`. At promise quorum plus a sufficient tally, sets the local proposal and sets `shouldSendAcceptMessages`. | `TransactionDriver.scala:281-365` |
 | 7 | `sendAcceptMessages`: `TxAccept` to primary-pool stores not yet in `acceptedPeers`. | `:539-551` |
 | 8 | Acceptor: `Acceptor.receiveAccept`, `crl.save`, **then** `TxAcceptResponse`. | `Tx.scala:888-903`, `Acceptor.scala:24-36` |
 | 9 | `Learner.receiveAccepted` counts distinct peers at the highest id; at `t` it fixes `resolvedValue`. | `Learner.scala:14-37`, `TransactionDriver.scala:394-396` |
-| 10 | `onResolution`: commit -> create finalizer (runs FinalizationActions) and queue `TxResolved` to all data stores plus `notifyOnResolution`; abort -> `onFinalized(false)` at once. Client gets `TransactionResolved`. | `:690-726` |
+| 10 | `onResolution`: commit -> create finalizer (runs FinalizationActions) and queue `TxResolved` to all data stores plus `notifyOnResolution`; abort -> `onFinalized(false)` at once. Client gets `TransactionResolved` (for an abort, `TransactionFinalized` first). A client that completed on votes ignores it, or logs a split decision if it disagrees. | `:690-726` |
 | 11 | Stores apply/abort (section 9). | `Tx.scala:737-792` |
 | 12 | Finalizer completes -> `onFinalized(true)` -> `TxFinalized` to all stores, `TransactionFinalized` to client, driver shuts down. | `:471-496` |
 | 13 | Store `TxFinalized`: Tx forgotten, status cache `finalized=true`, CRL record deleted once backend commits are done. | `Tx.scala:924-960`, `Frontend.scala:770-787,664-690` |
@@ -463,8 +508,9 @@ Properties (verified by case analysis):
   (F2, F6; since 2026-11-13 no driver counts an acceptor that forgot T, so amnesia no longer feeds the tally, 10.10).
 * (2026-11-15, F8 fixed) Every object is classified, none skipped: commit-certain (`c >= t`), abort-certain
   (`w - a < t`) or undecided. Any abort-certain object decides abort, whatever the other objects lack. Otherwise any
-  undecided object waits, and from expiry on proposes abort (P7a). This matches the table above except that the
-  first short object no longer hides a later abort-certain one.
+  undecided object waits. *(1-RTT, 2026-11-16)* It never proposes abort, past expiry included (P7a); the 2026-11-15
+  past-expiry abort is gone, and such a T ends by expiry (10.10). This matches the table above except that the first
+  short object no longer hides a later abort-certain one.
 
 ### 7.3 Rounds, Nacks, backoff
 
@@ -779,26 +825,86 @@ answers unknown only below its floor".
 `TxFinalized` that may never come) past the horizon plus `expiryMargin` (`MaxStartLead` + `txHeartbeatTimeout` + one
 heartbeat, `Frontend.scala:50-55`) queries every other store of T at store heartbeat, at once and then after 1, 2, 4 and
 every 8 heartbeats, each round with a fresh request id (`expiryHeartbeat`, `Frontend.scala:607-640`). The pure
-`ExpiryTally.decide` (`server/transaction/ExpiryTally.scala`) applies, in order (rules 2-4 revised 2026-11-15,
-cross-document G1; the earlier rule 3 discarded on more than `w - t` non-holders):
+`ExpiryTally.decide` (`server/transaction/ExpiryTally.scala`) applies the rules below. *(1-RTT, 2026-11-16)* Rules
+A-G replace rules 2-4. Those were revised 2026-11-15 (cross-document G1); before that, rule 3 discarded on more than
+`w - t` non-holders. The old rule 3 discarded T when no commit was chosen, whatever the votes said. So every store
+could vote commit, the client be told so, the leader die before its Accept, and T still be discarded. That
+contradicts P-VC.
 
-1. any reply with an outcome is adopted (commit over abort), a commit through `TxResolved` (late if finalized or late,
-   so a commit voter looks up its UnackedCommits entry), an abort as a finalized abort;
-2. **commit** when more than `w - t` of the primary pool's stores report commit as their latest accept and, in every
-   pool of a changed object, at least its read threshold `r` (`consistentRestoreThreshold`) of commit voters hold the
-   update. The deciding store resolves T committed at every store, applies it, and its driver finalizes it;
-3. **discard** when some changed object's pool cannot reach `r` even counting its silent stores, or when the commit
-   accepts, amnesiac (rebuilt) and silent primary stores together number fewer than `t` and the accepts and silent
-   stores no more than `w - t`. A commit voter (`needsUnackedCheck`) first looks up its entry: none found by a lookup
-   started after the decision discards it, one found applies T and concludes it as a late commit, and a failed lookup
-   keeps it holding. A `Tx` that already knows its outcome concludes it instead (`Tx.concludeKnownOutcome`) once more
-   than `w - t` primary stores are non-holders. Discarding (`Frontend.expireTransaction`; `Tx.expire`) releases locks
-   and objects, deletes the CRL state as for a forgotten abort, forgets the `Tx`, and writes nothing in the status cache;
-4. otherwise **hold** and ask again: a store is silent, or (logged `UNDECIDABLE TRANSACTION`) every store reported and
-   more of them lost their acceptor state than the pool tolerates.
+Rule 1, **Adopt**, is unchanged. Any reply with an outcome is adopted, commit over abort. A commit is adopted through
+`TxResolved` (late if finalized or late, so a commit voter looks up its UnackedCommits entry), an abort as a
+finalized abort.
+
+*Lemmas.* Both follow from immutable votes and P7a:
+* **L1.** Every accepted abort traces back to an abort-certain tally. A driver's local proposal is abort only on one,
+  and `Proposer.proposalValue` otherwise only re-proposes an accepted value. A proof holder proposes only an accepted
+  commit of its post-proof round, and expiry proposes nothing (10.12). So if any store holds an accepted abort, some
+  object never had `t` commit votes: no commit was ever chosen, and no client was told commit.
+* **L2.** Every accepted commit traces back to a commit-certain tally (every object had `t` commit votes) or to a
+  proof of commit (T's update was already applied, so T committed). Either way commit is T's only outcome.
+
+Abort-certain and commit-certain exclude each other, so accepted aborts and accepted commits never both exist.
+
+*Counts.* Counts are taken per pool of every referenced object, changed or lock-only, with that pool's write
+threshold `t`:
+* `vc`: stores that replied and voted commit (`TxStatus.votedCommit`, for lock-only pools too);
+* `k`: amnesiac stores, which may have voted or accepted anything;
+* `s`: silent stores.
+
+Every other replier is a provable non-commit-voter now: "unknown" (`None`), or a frozen Tx that did not vote commit.
+In the primary pool, `aa` / `ac` stores report abort / commit as their latest accept, `k_p` / `sp` are its `k` /
+`s`, and `n_p` stores replied "unknown". Each changed pool has a read threshold `r` (`consistentRestoreThreshold`).
+A reported vote is final: an unresolved Tx answers only once it is frozen and its objects are loaded (its vote
+decided), or once it is muted for good (`Tx.receiveStatusRequest`). Until then it is silent.
+
+The rules, in order:
+* **A. Commit by votes.** Every referenced pool has `vc >= t`; silence is allowed. No tally was ever abort-certain,
+  so by L1 no abort was accepted, and `vc >= t >= r` holders can restore the update.
+* **B. Commit, accepted.** `ac >= 1` and every changed pool has `vc >= r`. By L2 commit is the only outcome.
+* **C. Discard, accepted abort.** `aa >= 1`. By L1 no commit was chosen or reported.
+* **D. Discard, data lost.** Some changed pool has `vc + s < r`, so the update can never be restored. `dataLost`,
+  logged as an error, when a commit may have been chosen or reported: `ac >= 1`, or every pool has `vc + k + s >= t`.
+* **E. Discard, commit impossible.** Some pool has `vc + k + s < t`. No tally was ever commit-certain.
+* **F. Commit by survivors.** All of these hold:
+  * no store of T is silent;
+  * every pool has `vc + k >= t`;
+  * `k_p + n_p < t`;
+  * every changed pool has `vc >= r`.
+
+  B and C did not fire, so every primary store that still holds T and is not amnesiac accepted nothing. Only the
+  amnesiac and "unknown" stores, fewer than a quorum, could hide an accepted abort, so no abort was chosen and no
+  client heard one: a client hears abort only through Paxos. Frozen acceptors and muted rebuilt stores accept
+  nothing more. A conflicting commit would need `t` votes, but T's `vc >= r` voters hold its locks, and `t + r > w`.
+* **G. Hold** otherwise. Some store is silent (transient), or every store replied and `k_p + n_p >= t`. That is
+  logged as `UNDECIDABLE TRANSACTION` (with a changed primary object D fires first, so only a lock-only primary
+  object reaches it).
+
+*Unknown replies from stores that forgot T (2026-11-16).* "Unknown" does not prove that a store never held T. A
+store that took part, learned the outcome and was finalized (or discarded T by expiry), and whose cached outcome
+then expired, answers "unknown" as well.
+* *Discard side.* "Unknown" only lowers `vc`, so it can push a tally toward discard, never toward commit, and a
+  discard at the asking store is safe in every case. If T aborted, discarding is right. If T committed and was
+  finalized: a counted commit voter that never acknowledged has an UnackedCommits entry, written before any
+  acceptor forgets T (P14). Its lookup runs before any discard (`needsUnackedCheck`), finds the entry and applies
+  T. Every other asker (a non-voter, an abort voter, an uncounted voter) holds nothing it is owed. Its copy is
+  repaired from its ErrorTree mark, as for any store that missed T. The rules before 2026-11-16 made the same
+  assumption, on the discard side only.
+* *Commit side.* An "unknown" store's accept is hidden, so it must not be taken as "accepted nothing". Until the fix
+  of 2026-11-16, F counted only `k_p`. That was unsafe with a lock-only primary object. Example, Replication(3,2):
+  * S0 votes commit; S1 and S2 vote abort and accept it, so abort is chosen and the client is told it.
+  * S2 is finalized and forgets T. S1 is rebuilt.
+  * S0 and the secondary pool's commit voters see `vc = 1`, `k = 1`, one "unknown", and committed by F.
+
+  F now counts `n_p` with `k_p`. With a changed primary object `n_p` never matters: `vc_p >= r` leaves at most
+  `w - r < t` other stores.
+
+Actions are as before. A commit (A, B, F) is `onExpiryCommit`: the deciding store resolves T at every store,
+applies it, and its driver finalizes it. A discard (C, D, E) is as described below, a commit voter's UnackedCommits
+lookup first.
 
 **Freeze.** A `Tx` past T's expiry by its own store's clock promises and accepts nothing more (`Tx.frozen`), and an
-unresolved `Tx` answers a status query only then (or when muted for good). A frozen acceptor is an offline one, which
+unresolved `Tx` answers a status query only then, once its objects are loaded and its vote decided (1-RTT), or when
+muted for good. A frozen acceptor is an offline one, which
 Paxos allows, and it makes every counted state final: votes never change, and nothing more is accepted. A silent store
 counts on every side as possibly holding what would block a decision.
 
@@ -806,32 +912,51 @@ A driver past the horizon plus the margin that has no outcome is stopped and rem
 T (`Store.removeExpiredDrivers`, `Store.scala:110-122`). The client's `TransactionManager` forgets its driver however
 it concludes, `Unknown` included (`client/internal/transaction/TransactionManager.scala:33-45`).
 
-**Why rules 2 and 3 are safe.** *Commit.* Any quorum (`t` stores) that chose abort includes one of the more than
-`w - t` stores whose latest accept is commit. That store accepted abort at the chosen ballot, and every proposal
-accepted at a later ballot carries the chosen value, so its latest accept would be abort: abort was never chosen. Those
-stores are frozen, and the other `t - 1` cannot form a quorum, so nothing is chosen afterwards either. The update is
-held by at least `r` commit voters per changed pool, so it can be applied and repaired. Applying it late is safe: a
-commit voter has held T's locks since its vote (in memory, or through its CRL record and the recovery hold), repair
-defers to a store's own locks even with a proof (`Reconcile.RepairSnapshot.proven`), and a conflicting commit would
-need `t` votes, which overlap T's locked voters in at least `2t - w` stores. Writes T does not lock are
-order-independent (the builder's rules). If T was already finalized, a counted voter that never acknowledged has an
-UnackedCommits entry, and an uncounted voter's locked copy never moved, so applying it equals a timely apply.
-*Discard.* A commit chosen and not yet finalized has `t` acceptors, each still holding its accept (a later accept
-carries the same value), amnesiac, or silent: an acceptor forgets T only once T is decided, a commit only at
-`TxFinalized` (P9). Fewer than `t` of those rule it out, and the frozen states admit no new choice. Or the update cannot
-reach `r` copies: then a commit of it is lost, as any object below its read threshold is, and discarding keeps T
-atomic. The remaining cases are as before: T aborted, or committed and finalized, in which case the finalizer wrote
-this store's UnackedCommits entry if it was owed (the lookup found none). *Exclusive.* The commit rule needs `vc >= r`
-where data discard needs `vc + s < r`, and more than `w - t` accepts where the other discard allows at most `w - t`
-accepts plus silent stores. Frozen states never change and a store leaves a count only by deciding, after which it
-reports its outcome (rule 1), so no two holders reach opposite decisions.
-Until 2026-11-15 a rebuilt store answered "unknown" for T started before its `acceptorSince`, a claim this argument
-then said was safe within the pool's tolerance. It was not: its old incarnation lost its accept undecided, and with one
-store that never heard of T the last holders of a chosen commit discarded it (cross-document G1). It now reports
-`amnesiac`. Tests: ExpiryTallySuite; FrontendSuite "an expiring commit voter whose peers accepted commit decides commit,
-applies it and has it finalized", "a Tx past its expiry promises and accepts nothing", "a commit voter past the horizon
-with no UnackedCommits entry is discarded once a later lookup finds none"; HorizonIntegrationSuite "holders of a chosen
-commit apply it past expiry though a rebuilt store forgot it", "stuck holders short of a quorum all discard".
+**Why rules A-G are safe.** Each rule's own argument is given above. *Applying a commit late is safe:* a commit
+voter has held T's locks since its vote, in memory, or through its CRL record and the recovery hold. Repair defers
+to a store's own locks even with a proof (`Reconcile.RepairSnapshot.proven`). A conflicting commit would need `t`
+votes, which overlap T's locked voters (`t + r > w`). Writes T does not lock are order-independent (the builder's
+rules). If T was already finalized, a counted voter that never acknowledged has an UnackedCommits entry, and an
+uncounted voter's locked copy never moved, so applying it equals a timely apply. *Discarding is safe:* C, D and E
+each rule out a chosen or reported commit, or (D with `dataLost`) the update is below its read threshold and lost,
+as any such object is.
+
+*Consistency across observers.* No two observers reach a commit (A, B, F) and a discard (C, D, E). Reported states
+are final, and a store leaves a count only by deciding, after which it reports its outcome (rule 1). So observers
+differ only in which stores are silent to them, and in which stores have since forgotten T. The pairs:
+* *A or B against C:* excluded by L1/L2 and by the exclusion of the two tallies.
+* *A or B against E:* A's or B's evidence means a tally was commit-certain. Every pool truly has `t` commit voters,
+  each still voting commit, amnesiac, or silent to the other observer, unless it has forgotten T. A voter forgets T
+  only once T is decided, here as commit (P-VC), and a discard beside a decided commit is the safe discard-side case
+  above.
+* *A, B or F against D:* the commit needs `vc >= r` at its observer, D needs `vc + s < r` at its own, and a store
+  silent to one observer can only add to the other's `vc + s`.
+* *F against C:* F's observer sees every primary store and finds no accepted abort. C needs one reported by a
+  non-amnesiac store still holding T, which F's observer would have seen, unless that store has since forgotten T.
+  That leaves one divergence, accepted by ruling: C's observer saw an abort accepted by fewer than a quorum (never
+  chosen), the accepter then discarded or was finalized and forgot T, and F's observer later counts it as "unknown".
+  It is safe for clients. The abort was never chosen, so no client was told abort. F's `vc >= r` voters hold T's
+  locks, so no conflicting commit exists (`t + r > w`). And the commit's finalization (its missed-update marks)
+  repairs the store that discarded, as any store that missed T is repaired.
+* *F against E:* F's observer has no silence, so its `vc + k` is at least the count of commit voters still holding
+  or amnesiac, and E's observer counts at least that much in `vc + k + s`.
+
+*Liveness for rebuild F6* (every store replied, none amnesiac): every store is a commit voter or a provable
+non-voter, so either every pool has `vc >= t` (A) or some pool has `vc < t = vc + k + s` (E). Holding is the answer
+while stores are silent, and with every store replied only when `k_p + n_p >= t`.
+
+*Tests:*
+* ExpiryTallySuite: one test per rule A-G, `dataLost`, "a forgotten primary store's unknown reply may hide a chosen
+  abort: rule F holds".
+* ExpiryTallyConsistencySuite: exhaustive over the true final states of small pools, changed and lock-only, with
+  forgotten stores. No observer commits over a chosen abort, and no split other than the accepted C-then-F one.
+* FrontendSuite and StoreSuite expiry tests.
+* HorizonIntegrationSuite "holders of a chosen commit apply it past expiry though a rebuilt store forgot it" (rule
+  B) and "stuck holders short of a quorum all discard" (rule E).
+
+Until 2026-11-15 a rebuilt store answered "unknown" for T started before its `acceptorSince`. Its old incarnation had
+lost its accept undecided, and with one store that never heard of T the last holders of a chosen commit discarded it
+(cross-document G1). It now reports `amnesiac`.
 
 **Rejoin invariant.** Once a store discards or forgets T, its floor makes it refuse every later prepare for T: a
 discarded acceptor is indistinguishable from an offline one, and Paxos is safe with offline acceptors. **A store never
@@ -936,6 +1061,32 @@ stores commit while the client is told Unknown. Each test fails without its fix.
   `MigratePoolToSetDurableTask`) still mint a task id per attempt. Their callers' own guards (the usage threshold, the
   group membership check, `migration` InProgress) keep a retry from enrolling again.
 
+### 10.12 Abort paths audit (1-RTT, 2026-11-16)
+
+P-VC says that once every object of T has `t` commit votes, T resolves only as commit. This audit checks every way
+T can end as abort or be discarded against it (client 1-RTT design, 4.3(c)). Let `c_o >= t` be the commit votes on
+each object `o`. Each store has one vote (P4), so `a_o <= w - c_o <= w - t`.
+
+| Path | Why it cannot abort T once `c_o >= t` everywhere | Code |
+|---|---|---|
+| Driver tally, abort-certain | Needs some object with `w - a_o < t`, i.e. `a_o > w - t`, contradicting `a_o <= w - t`. `Undetermined` is no vote (F7), and a store's later answer repeats its saved vote | `TransactionDriver.receiveTxPrepareResponse` |
+| Driver tally, undecided past expiry | Removed (P7a). An undecided driver waits, or proposes an accepted value | same; TransactionDriverSuite "an undecided tally never proposes abort" |
+| `Proposer.proposalValue` adopting an accepted abort | Some proposer must have proposed abort first. Every proposal source is covered here: the tally's local proposal (abort only when abort-certain, above); a re-proposal of an accepted value (recursively the same); a proof holder, whose `proposalValue` is only an accepted commit of its post-proof round, or none (`commitProven`). Expiry and late resolution propose nothing. So every accepted abort traces back to an abort-certain tally (L1), impossible here | `Proposer.proposalValue`, `TransactionDriver` |
+| Proof holders and late resolution | A proof means T committed. `resolveLate` resolves commit only. A proof holder never proposes abort | `TransactionDriver.resolveLate`, 10.5 |
+| Status-cache relays, `TxResolved`/`TxFinalized` from the cache | They repeat an outcome a real resolution wrote. The cache is monotone (Committed never replaced, Ruling 30, P17) | `Store.receiveTransactionMessage`, `TransactionStatusCache.updateStatus` |
+| Expiry rule 1 (Adopt) | Repeats a reported outcome; commit is preferred over abort | `ExpiryTally.decide` |
+| Expiry C, D, E | C needs an accepted abort (L1: impossible). E needs some pool with `vc + k + s < t`, impossible while each of the `t` voters still holds T, is amnesiac or is silent. A voter answers "unknown" only once it forgot T, after T was decided: then T committed and was finalized (P-VC), and a discard beside it is the safe discard side of 10.10. D fires only when the update is below its read threshold, a loss beyond the pool's tolerance, logged `dataLost` | 10.10 |
+| Expiry discard of a store that is owed the commit | A commit voter makes its UnackedCommits lookup before discarding (`needsUnackedCheck`). A store that decided T, was finalized and forgot it answers "unknown" (10.10). If T committed and was finalized, the finalizer wrote an entry for every counted voter that never acknowledged before any acceptor forgot T, so the lookup applies T. Other stores are repaired from their ErrorTree marks | `Frontend.expireTransaction`, `Tx.needsUnackedCheck` |
+| UnackedCommits held aborts | An expiring or recovered commit vote holds an *accept* of an abort until its lookup answers. An abort proposal exists only as above (L1) | `Tx.heldAborts` |
+| `NoClientPrepare` (prefer-abort) votes | Cast only by a store that never saw the client's prepare, so it is not one of the `c_o` commit voters. Its abort vote counts in `a_o <= w - c_o`, as any abort vote does | `Tx.awaitingClientPrepare` |
+| `InvalidDescription` votes | Depend only on the description and the store's pool (`DescriptionValidator`), so every store of that pool votes abort. Then `c_o = 0` for its objects, and `c_o >= t` never holds | `Tx.invalidDescription` |
+| A prover's abort vote saved on later prepares (F13) | A prover has no Paxos state for T and finds T's update applied, so T committed. Its saved abort vote can only reach a driver that holds its proof or tallies after the commit was chosen, and a promise quorum then reports the accepted commit (P8). Inside the window a store that forgot T answers from its cache; past it, it refuses | `Tx.proveCommitted`, 10.10 |
+
+No other path resolves T as abort: `TxResolved(false)` and `TransactionResolved(false)` are sent only by a driver
+whose `Learner` saw a quorum accept abort, or as a relay of one (P10). The client never completes `Aborted` on votes
+(P18). The one divergence the expiry rules admit (C-then-F over an unchosen abort, 10.10) involves no abort that a
+client was told or Paxos chose.
+
 ---
 
 ## 11. Failure scenarios
@@ -954,7 +1105,8 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 | `TxResolved` lost | Safe, live | Driver re-sends `TxResolved` to stores not in `knownResolved` until finalized; otherwise `TxFinalized` carries the outcome. |
 | `TxFinalized` lost | Safe, live: the idle store's driver asks within the status cache's life (5-6 s idle < 30 s cache, horizon); past it, its peers refuse the driver and the Tx concludes its outcome or is discarded by expiry (10.10) | `Store.scala:84-88`, `Host.scala:62-72`. Meanwhile the store holds its locks (until expiry at the latest). |
 | `TxCommitted` lost | Safe | Finalizer's missed-update logic marks the store for repair, which reconciles exactly. |
-| `TransactionResolved`/`Finalized` lost to client | Safe. A retransmit inside the horizon is answered from a `Tx` or the cache; past horizon + `MaxStartLead` the client stops and fails with `TransactionOutcomeUnknown` (horizon; F2 closed) | `SimpleClientTransactionDriver.scala:48,73` |
+| `TransactionResolved`/`Finalized` lost to client | Safe. (1-RTT) A commit is still learned from the votes (FastCommitIntegrationSuite "the client learns commit from votes while every leader outcome to it is dropped"). A retransmit inside the horizon is answered from a `Tx` or the cache; past horizon + `MaxStartLead` the client stops and fails with `TransactionOutcomeUnknown` (horizon; F2 closed) | `SimpleClientTransactionDriver.scala:48,73` |
+| `TransactionVote` lost (1-RTT) | Safe, live | Re-sent with every prepare response, so the client's prepare retransmits recover it. The leader's outcome completes the client anyway. |
 | Duplicates of any message | Safe | 10.1-10.3. |
 | Reordering | Safe | Proposal ids filter stale responses; `TxFinalized` before `TxResolved` is fine (5); a commit decision arriving before the prepare/data is held (9.1). A `TxResolved` arriving before any prepare is only remembered in the cache (`Frontend.scala:763-769`), so the later-created `Tx` learns it only at `TxFinalized`. |
 | Message to a store on another host after migration | Safe | `TxUnknownStore`, peer queries (`CLAUDE.md`). |
@@ -970,7 +1122,7 @@ Conventions: "safe" = no split decision, no loss of a decided commit, no applied
 | Slow store (behind) | It votes late or never; the quorum decides without it. If it missed the commit it is marked for repair by the finalizer. |
 | Leader partitioned from some stores | Driver cannot reach a quorum -> waits; recovery drivers on other stores start after 5 heartbeats; dueling resolved by Paxos. |
 | Minority of acceptors partitioned | Proceeds. A majority-or-more partition: no progress (liveness), no unsafe decision. |
-| Secondary pool below `t` reachable, or a silent store whose vote would decide | (2026-11-15, F8) An object already abort-certain decides abort at once. Otherwise the driver waits until T is past the horizon plus the expiry margin, then proposes abort; commit-vote locks are held for at most that long plus one resend interval. |
+| Secondary pool below `t` reachable, or a silent store whose vote would decide | (2026-11-15, F8) An object already abort-certain decides abort at once. Otherwise the driver waits. (1-RTT, 2026-11-16) It never proposes abort on an undecided tally (P7a). Past the horizon plus the expiry margin the holders decide by expiry rules A-G (10.10). They hold while a store stays silent, and commit-vote locks are held meanwhile. |
 
 ### 11.3 Crash at each step
 
@@ -1057,7 +1209,7 @@ Findings the horizon (10.10) touches. Every other finding of this document is un
 | F5 | unchanged | A new driver still starts at `(1,L)` | `Proposer.scala:11`; `SimpleTransactionDriver.scala` |
 | F6 | unchanged (reach widened) | Abort still deletes the CRL record at resolution; with no horizon a forgotten abort is re-decidable by any later prepare (P-N4) | `Tx.scala:749`; `Frontend.scala:589-591` |
 | F7 | unchanged | Every non-`VoteCommit` counts as abort | `TransactionDriver.scala:332-337` |
-| F8 | **fixed** 2026-11-15 | Every object is classified; any abort-certain object decides abort at once; an undecided tally proposes abort past expiry | `TransactionDriver.receiveTxPrepareResponse`; `Store.driveTransaction` (`Start.pastExpiry`) |
+| F8 | **fixed** 2026-11-15 | Every object is classified; any abort-certain object decides abort at once. *(1-RTT, 2026-11-16)* An undecided tally no longer proposes abort past expiry (that path and `Start.pastExpiry` were removed, P7a); expiry rules A-G end such a T | `TransactionDriver.receiveTxPrepareResponse` |
 | F9 | **fixed** (Ruling 30) | `TransactionStatusCache.updateStatus` is monotone (atomic compute): `finalized` and `late` are sticky and a resolved status never reverts to Unresolved, so neither `Tx.resolved` nor the `Tx` constructor can downgrade an entry (X3) | `TransactionStatusCache.scala` `updateStatus` |
 | F10 | unchanged | `lastProposer` still follows client prepares; the proof is sent there too (P-N1) | `Tx.scala:806,630` |
 | F11 | unchanged | Conflicting outcomes are still ignored silently; `resolveLate` logs an error only for late-after-abort | `Tx.scala:772`; `TransactionDriver.scala:601-602,691` |
@@ -1082,6 +1234,13 @@ Findings the addendum touches. Every other finding of this document is unchanged
 | P-N5, P-N6 | unchanged (REFUTED stands) | | |
 
 ### F1. Documented 1-RTT protocol is not what the code does. Confidence: high (informational, wrong docs)
+
+> **FIXED 2026-11-16 (1-RTT, Todo 8.1).** The client learns a commit in one round trip, from the stores' durable
+> votes (`TransactionVote`, P-VC, section 5). The documented mechanism (self-generated Accepts, a commit-only round 1)
+> was not adopted, and `Architecture.md` now describes the protocol as built: votes to the client, the unchanged
+> leader path for the stores, abort only through Paxos, recovery that never proposes abort on an undecided tally,
+> and expiry by rules A-G. P2 is unaffected (acceptors still accept only a driver's Accept). P6 is re-derived in
+> section 3. Tests: ClientTransactionDriverSuite; FastCommitIntegrationSuite.
 
 > **Verification 2026-11-09: CONFIRMED. Severity: doc-only.** Only TransactionDriver.sendAcceptMessages constructs TxAccept (TransactionDriver.scala:539-548; grep finds no other constructor). Stores answer a prepare with Promise+vote addressed to the prepare's sender (Tx.respondToPrepare, Tx.scala:857-886, `TxPrepareResponse(m.from,...)`) after a CRL save; the driver sets its local proposal only after tallying (TransactionDriver.scala:298-360) and no round check exists in Acceptor (Acceptor.scala:24-35). Error-free path: client TxPrepare -> store (CRL write #1: vote+promise, Tx.scala:879-882) -> leader -> TxAccept -> acceptors (CRL write #2, Tx.scala:888-903) -> TxAcceptResponse -> leader -> TransactionResolved -> client = 5 one-way hops (about 2.5 RTT) and 2 serial durable writes before the client learns; stores learn at a 6th hop (TxResolved). Aborts are decided in round 1; there is no commit-only round 1 and no self-generated Accept. Todo.txt:11-14 at c3ad5493 and Architecture.md describe a protocol the code does not implement (no partial 1RTT).
 > *Fix sketch:* Fix the docs (Todo.txt, Architecture.md) now; if 1RTT is wanted, have stores self-accept commit in round 1 and restrict round >=2 to abort-or-recover, then re-derive P2/P6.
@@ -1258,15 +1417,22 @@ value; combined with F6 it widens the amnesia window. Fix: count `Undetermined` 
 
 ### F8. The tally cannot decide an abort while any referenced pool has fewer than `t` answers. Confidence: medium (liveness)
 
+> **Refresh (1-RTT, 2026-11-16).** The past-expiry abort below is removed. It could abort a T whose client had
+> been told commit from the votes. A driver never proposes abort on an undecided tally (P7a). Such a T ends by
+> expiry: with every store replied and none amnesiac, rule A or rule E decides (10.10), which is how rebuild F6 ends
+> now. The tests named below were renamed or replaced: "an undecided tally never proposes abort", "a quorum
+> reporting an accepted commit is proposed over an abort vote", and StoreSuite "a commit voter whose peer voted
+> abort is discarded past expiry once its third store replies, not before".
+
 > **Refresh (2026-11-15, cross-document G1).** Past expiry every store's acceptor is frozen, so the driver's abort
 > proposal described below no longer succeeds there; the expiry tally (10.10) ends such a T, discarding it when no
 > commit can be chosen. The StoreSuite test named below is now "... is discarded past expiry, not before".
 
 > **FIXED 2026-11-15 (Todo 4.1, with rebuild-process F6).** The tally classifies every object (no `break()`): one
 > abort-certain object (`w - a < t`) decides abort at once, since votes never change. A tally that is undecided because
-> stores have not voted waits, as a transient partition or restart may heal, until T is past the horizon plus the
-> expiry margin on the driver's store (`TransactionDriver.Start.pastExpiry`, `Frontend.pastExpiry`); it then proposes
-> abort, unless the promise quorum reports an accepted value (P7a). The horizon alone did not bound the wait: expiry
+> stores have not voted waits, as a transient partition or restart may heal. *(Superseded 2026-11-16, see above: until
+> then it waited only until T was past the horizon plus the expiry margin and then proposed abort; that branch and
+> its `Start.pastExpiry` plumbing are gone, and it now waits for expiry rules A-G.)* The horizon alone did not bound the wait: expiry
 > discards only with more than `w - t` non-holders, so a commit voter and an abort voter that both hold acceptor state
 > `Hold` forever, and a silent store returning past the horizon refuses the prepare without a reply. Tests:
 > TransactionDriverSuite "an object that can no longer commit decides abort though another object is short of
@@ -1681,7 +1847,8 @@ Nacks (extra rounds under contention).
 
 ### Verification summary (2026-11-09)
 
-* **1RTT:** not implemented. Only the designated leader (or a recovery driver) sends `TxAccept` (`TransactionDriver.scala:539-548`, the only constructor). Error-free: client prepare -> store (CRL write 1) -> leader -> Accept -> acceptors (CRL write 2) -> leader -> `TransactionResolved` to the client = 5 one-way hops, 2 serial durable writes. Aborts are decided in round 1.
+* **1RTT:** (2026-11-16) implemented for commits, by votes to the client, not by self-generated Accepts (F1 FIXED,
+  P-VC). The 2026-11-09 finding follows. Not implemented. Only the designated leader (or a recovery driver) sends `TxAccept` (`TransactionDriver.scala:539-548`, the only constructor). Error-free: client prepare -> store (CRL write 1) -> leader -> Accept -> acceptors (CRL write 2) -> leader -> `TransactionResolved` to the client = 5 one-way hops, 2 serial durable writes. Aborts are decided in round 1.
 * **Is a decision ever "fixed" by acceptor state after finalization?** No. Commit keeps acceptor state until `TxFinalized` at each store; abort drops it at resolution; after finalization a stale prepare starts a fresh consensus instance (F2). Applied stores are never rolled back by it, but the client and any still-live commit voter are told abort.
 * **Refresh 2026-11-09 (replay pins):** the fresh instance is now steered by the pin rule and the late-commit rule
   (10.5): with a proof it resolves late (nothing applied, client told committed), otherwise it aborts (F2 narrowed). A

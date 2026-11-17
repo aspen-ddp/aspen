@@ -37,11 +37,11 @@ and is reflected in the rows below. Each has its own "Suspected flaws" section, 
 
 ## Answers to questions raised in Todo.txt
 
-- **1RTT commit:** not implemented. Only the designated leader's driver sends `TxAccept`
-  (`TransactionDriver.scala:521-531` at `c181375b`). Round 1 carries no commit-only rule, and aborts are decided in
-  round 1. In the error-free case the client learns the outcome after 5 one-way hops and 2 serial CRL writes. Todo.txt
-  and Architecture.md describe a protocol the code does not implement (paxos F1). Either the protocol needs
-  implementing or the description needs correcting.
+- **1RTT commit:** implemented 2026-11-16 for commits (paxos F1 FIXED, P-VC). Each store sends its durable vote to
+  the client (`TransactionVote`). The client completes `Committed` once every object has its pool's write threshold
+  of commit votes: 2 one-way hops and one CRL write. Only the designated leader's driver still sends `TxAccept`, and
+  round 1 has no commit-only rule. An abort is learned only from the leader, after Paxos chose it.
+  Architecture.md describes this protocol.
 - **Is RevisionLock exclusive?** Yes. It takes the same exclusive object lock as a DataUpdate and changes nothing.
   **Fixed (2026-11-10):** renamed to `ExclusiveRevisionLock` (transaction-requirements §12).
 - **Two failure-recovery modes?** Driver loss and participant loss are the roots. A lost `TxFinalized`, a recovered
@@ -133,7 +133,8 @@ P-N10, R-N7 to R-N12, Q-N7, Q-N8, RP-N6 to RP-N8, CRL F22 to F24, rebuild N3, cr
 | Recovery F12 / X4 | **FIXED** (Ruling 31) (was CONFIRMED) | `Store.close` shuts down the store's drivers, so no zombie driver keeps re-preparing; P-N4's delayed duplicate client prepare is unaffected. 2026-11-16 (Todo 6.3, G3): transfer out, relinquish, shutdown and fail-stop all reach it (tested); a reload over a shared backend, which skips it, now stops the drivers too |
 | CRL F9, F7, F8 | **FIXED** 2026-11-14 (was CONFIRMED / PLAUSIBLE) | A dead CRL fails every pending and later call with `CrlFailed`, and its host unloads the device until restart. The killers are removed: admission counts every recovered record at open (F8), and stream files are preallocated (fallocate on Linux, zeros elsewhere), so a full device cannot fail a CRL write (F7). Residual: copy-on-write file systems |
 | Requirements F12 | CONFIRMED, deferred (2026-11-15, Backlog device health/alerts) | `awaitingCommits` has no timer, so an FSIF ENOSPC freeze stalls the object forever; tolerated by expiry, no per-commit watchdog |
-| Paxos F8, Rebuild F6 | **FIXED** 2026-11-15 (was CONFIRMED) | The tally classifies every object, so one abort-certain object decides abort at once. An undecided tally waits until past the horizon plus the expiry margin, then proposes abort (expiry alone held such a Tx forever). Residual: locks held up to about 31 s plus one resend interval while a silent store's vote would decide |
+| Paxos F8, Rebuild F6 | **FIXED** 2026-11-15 (was CONFIRMED); revised 2026-11-16 (Todo 8.1) | The tally classifies every object, so one abort-certain object decides abort at once. An undecided tally never proposes abort (the 2026-11-15 past-expiry abort could contradict a client told commit from the votes). Expiry rules A-G end it: with every store replied and none amnesiac, rule A commits or rule E discards. Residual: locks held until expiry (about 28 s) while a silent store's vote would decide, and for as long as it stays silent |
+| Paxos F1 | **FIXED** 2026-11-16 (Todo 8.1; was CONFIRMED, doc-only and latency) | The documented 1-RTT round-1 commit did not exist. The client now learns a commit from the stores' durable votes in one round trip (P-VC), abort only from the leader. Recovery never proposes abort on an undecided tally, and expiry decides by rules A-G, so no path can resolve abort once every object has its write threshold of commit votes (paxos 10.12). Architecture.md describes the protocol as built |
 | Repair F3, F8, F9 | **FIXED** 2026-11-15 (was CONFIRMED / PLAUSIBLE) | Repair livelock. F3: the completion gate is sound now that timestamps are monotone and copies come from reads (tests). F8: after 3 stale passes the store parks the reconcile until the object settles, up to 1 s. F9: a timed-out scan is cancelled, keeps its DeferralState, and stays at the floor if it had seen entries. Residual: an object whose copy changes under every install or never settles stays stale, with a warning |
 | Requirements Q-N6, F13 | **FIXED** 2026-11-15 (Todo 4.10; was CONFIRMED / PLAUSIBLE, liveness) | The allocation action's lock is shared, so its two finalizer runs no longer collide; an executor's task allocations run one at a time instead of colliding O(n^2) on the executor object; only a writer blocked by nothing but held shared locks opens the exclusive preference window. Residual: the lock still collides with the allocator's own writes; executors in different processes still collide (backoff); a viable writer that aborts elsewhere still holds the window for 250 ms |
 | Requirements Q-N3 | **CLOSED** 2026-11-15 by design (Todo 4.10; was CONFIRMED) | Derived per-write checks turn blind wins into abort-and-retry under the existing backoff |

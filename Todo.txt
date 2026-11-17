@@ -71,5 +71,4 @@ PRIORITY 7: documentation corrections
 PRIORITY 8: unimplemented features
 ----------------------------------
 
-8.1  P-F1: Architecture.md (~line 153) describes a 1-RTT round-1 commit that the code does not yet implement.
-     Implement it.
+(no open items)

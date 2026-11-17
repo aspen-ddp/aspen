@@ -3,8 +3,8 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.{Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
-import org.aspen_ddp.aspen.common.network.{ClientResponse, TransactionFinalized, TransactionResolved, TransactionVote,
-  TxAccept, TxMessage}
+import org.aspen_ddp.aspen.common.network.{ClientResponse, Read, TransactionFinalized, TransactionResolved,
+  TransactionVote, TxAccept, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDisposition, TransactionId}
@@ -29,6 +29,12 @@ class FastCommitIntegrationSuite extends IntegrationTestSuite with org.scalatest
     TestNetwork.HostOptions(heartbeatPeriod = Duration(100, MILLISECONDS), recordCrl = true, recoveryDrivers = true,
       leaderRetransmits = true)
 
+  /** A client that records its own outcomes, as a production client does, so its reads know its commits */
+  private val knowsOwnCommits = "a read straight after a fast commit returns the new revision without spinning"
+
+  override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
+    if name == knowsOwnCommits then testHostOptions.copy(clientStatusCache = true) else testHostOptions
+
   /** How long the client may take to learn commit from votes. The horizon is the default one, minutes away, so a
     * client that waits for the leader's outcome while it is dropped does not complete in this time */
   private val voteCommitBound = Duration(2, SECONDS)
@@ -46,6 +52,14 @@ class FastCommitIntegrationSuite extends IntegrationTestSuite with org.scalatest
       Future.failed(new AssertionError("Timed out pumping events"))
     else
       Future { Thread.sleep(1); step(clock) }.flatMap(_ => pump(f, clock, until))
+
+  /** Pumps the hosts for `d` */
+  private def pumpFor(d: Duration, clock: Boolean): Future[Unit] =
+    val until = System.nanoTime() + d.toNanos
+    def loop(): Future[Unit] =
+      if System.nanoTime() >= until then Future.unit
+      else Future { Thread.sleep(1); step(clock) }.flatMap(_ => loop())
+    loop()
 
   /** `f`'s outcome, once it completes */
   private def outcome[T](f: Future[T], clock: Boolean, until: Long = deadline()): Future[Try[T]] =
@@ -200,3 +214,36 @@ class FastCommitIntegrationSuite extends IntegrationTestSuite with org.scalatest
       withClue("T applied nowhere: "):
         (0 until 3).map(storeRevision(_, x)) shouldBe
           (0 until 3).map(i => Some(if i == behind then xBefore.revision else ObjectRevision(t0)))
+
+  // Spec 5: the client learns commit from the votes before any store applies it. A read then finds T's lock at every
+  // store, and the client knows T committed, so it re-reads each store naming T (Read.awaitCommit). The store parks
+  // the re-read until T's commit applies, rather than answering the lock again: no store is re-read for T more than
+  // once
+  test(knowsOwnCommits):
+    val awaitingReads = new java.util.concurrent.ConcurrentLinkedQueue[Read]()
+    for
+      x <- allocateX()
+      xBefore <- client.read(x)
+      tx = client.newTransaction()
+      _ = net.dropTxMessage = (m: TxMessage) => m.isInstanceOf[TxAccept] && m.transactionId == tx.id
+      _ = tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+      result <- outcome(tx.commit(), clock = false, until = deadline(voteCommitBound))
+      _ = result shouldBe a[Success[?]]
+      // The leader's Accept retransmissions are lost too
+      _ <- pumpFor(Duration(300, MILLISECONDS), clock = true)
+      _ = withClue("no store has applied T: "):
+            holders(tx.id) shouldBe Set(0, 1, 2)
+            (0 until 3).foreach(i => storeRevision(i, x) shouldBe Some(xBefore.revision))
+      _ = net.dropTxMessage = _ => false
+      _ = net.observeRead = r => if r.objectPointer.id == x.id && r.awaitCommit.nonEmpty then awaitingReads.add(r)
+      xAfter <- pump(client.read(x), clock = true)
+      _ = net.observeRead = _ => ()
+    yield
+      import scala.jdk.CollectionConverters.*
+      xAfter.revision shouldBe ObjectRevision(tx.id)
+      xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](2)
+      val rereads = awaitingReads.asScala.toList
+      rereads.map(_.awaitCommit).toSet should (be (Set()) or be (Set(Set(tx.id))))
+      val perStore = rereads.groupMapReduce(_.toStore)(_ => 1)(_ + _)
+      withClue(s"re-reads naming T per store: $perStore: "):
+        perStore.values.filter(_ > 1) shouldBe empty

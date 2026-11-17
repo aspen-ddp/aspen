@@ -6150,4 +6150,109 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       net.sentTx.collect { case r: TxPrepareResponse => r } shouldBe Nil
       lockedWriteTransactions(frontend, net, op1) shouldBe empty
   }
+
+  // ---- Parked reads: a re-read awaiting a committed transaction's apply (Frontend.parkRead, spec 5) ----
+
+  private def readResponses(net: TestNet): List[ReadResponse] = net.clientResponses.toList.collect { case r: ReadResponse => r }
+
+  private def awaitingRead(frontend: Frontend, readUUID: UUID, awaitCommit: Set[TransactionId]): Unit =
+    frontend.readObjectForNetwork(clientId, readUUID, op1, FullObject(), awaitCommit)
+
+  test("a read awaiting a lock holder's commit is answered when the commit applies") {
+    withExpiryFrontend: (frontend, _, net, _, _, _, _) =>
+      prepare(frontend, net, expiringTxd(List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+      awaitingRead(frontend, new UUID(2, 1), Set(txid1))
+      readResponses(net) shouldBe Nil
+
+      resolve(frontend, net, txid1, committed = true)
+      val rs = readResponses(net)
+      rs.size shouldBe 1
+      rs.head.readUUID shouldBe new UUID(2, 1)
+      val cs = rs.head.result.toOption.get
+      cs.revision shouldBe ObjectRevision(txid1)
+      cs.lockedWriteTransactions shouldBe empty
+  }
+
+  test("a read awaiting a lock holder's commit is answered when the holder aborts") {
+    withExpiryFrontend: (frontend, _, net, _, _, _, _) =>
+      prepare(frontend, net, expiringTxd(List(overwrite(op1))))
+      awaitingRead(frontend, new UUID(2, 1), Set(txid1))
+      resolve(frontend, net, txid1, committed = false)
+      readResponses(net).map(_.result.toOption.get.revision) shouldBe List(rev0)
+  }
+
+  test("a read awaiting a transaction that holds no lock is answered at once") {
+    withExpiryFrontend: (frontend, _, net, _, _, _, _) =>
+      prepare(frontend, net, expiringTxd(List(overwrite(op1))))
+      awaitingRead(frontend, new UUID(2, 1), Set(txid2))
+      readResponses(net).map(_.result.toOption.get.lockedWriteTransactions) shouldBe List(Set(txid1))
+  }
+
+  test("a parked read is answered at ParkedReadWait with the current state") {
+    withExpiryFrontend: (frontend, _, net, _, _, clock, _) =>
+      prepare(frontend, net, expiringTxd(List(overwrite(op1))))
+      awaitingRead(frontend, new UUID(2, 1), Set(txid1))
+      clock.now += Frontend.ParkedReadWait.toMillis - 1
+      frontend.expireParkedReads()
+      readResponses(net) shouldBe Nil
+
+      clock.now += 1
+      frontend.expireParkedReads()
+      readResponses(net).map(_.result.toOption.get.lockedWriteTransactions) shouldBe List(Set(txid1))
+      // Answered once: neither a later heartbeat nor the holder's release answers it again
+      frontend.expireParkedReads()
+      resolve(frontend, net, txid1, committed = true)
+      readResponses(net).size shouldBe 1
+  }
+
+  test("a parked read is answered when its transaction is discarded at expiry") {
+    withExpiryFrontend: (frontend, _, net, _, lookup, clock, _) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      passHorizon(clock)
+      awaitingRead(frontend, new UUID(2, 1), Set(txid1))
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, None)
+      reply(frontend, net, peer2, None)
+      readResponses(net) shouldBe Nil
+
+      lookup.answer(txid1, lookup.absent)
+      frontend.transactions.contains(txid1) shouldBe false
+      val rs = readResponses(net)
+      rs.size shouldBe 1
+      rs.head.result.toOption.get.revision shouldBe rev0
+      rs.head.result.toOption.get.lockedWriteTransactions shouldBe empty
+  }
+
+  test("a resent read replaces its parked entry") {
+    withExpiryFrontend: (frontend, _, net, _, _, _, _) =>
+      prepare(frontend, net, expiringTxd(List(overwrite(op1))))
+      awaitingRead(frontend, new UUID(2, 1), Set(txid1))
+      awaitingRead(frontend, new UUID(2, 1), Set(txid1))
+      readResponses(net) shouldBe Nil
+      resolve(frontend, net, txid1, committed = true)
+      readResponses(net).map(_.readUUID) shouldBe List(new UUID(2, 1))
+  }
+
+  test("past MaxParkedReads a read is answered at once") {
+    withExpiryFrontend: (frontend, _, net, _, _, _, _) =>
+      prepare(frontend, net, expiringTxd(List(overwrite(op1))))
+      (1 to Frontend.MaxParkedReads).foreach(n => awaitingRead(frontend, new UUID(3, n), Set(txid1)))
+      readResponses(net) shouldBe Nil
+      awaitingRead(frontend, new UUID(4, 1), Set(txid1))
+      readResponses(net).map(_.readUUID) shouldBe List(new UUID(4, 1))
+
+      resolve(frontend, net, txid1, committed = true)
+      readResponses(net).size shouldBe Frontend.MaxParkedReads + 1
+  }
+
+  test("fail-stop drops parked reads without answering") {
+    withExpiryFrontend: (frontend, _, net, _, _, clock, _) =>
+      prepare(frontend, net, expiringTxd(List(overwrite(op1))))
+      awaitingRead(frontend, new UUID(2, 1), Set(txid1))
+      frontend.failStop("test")
+      clock.now += Frontend.ParkedReadWait.toMillis
+      frontend.expireParkedReads()
+      readResponses(net) shouldBe Nil
+  }
 }

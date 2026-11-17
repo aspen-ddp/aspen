@@ -610,12 +610,15 @@ class Tx( trs: TransactionRecoveryState,
         pendingCollisionPrepare = None
         answerPrepare(m)
 
-  private def unlock(): Unit = if (locked) {
-    locked = false
+  /** Releases the locks and answers the reads parked on them (Frontend.locksReleased) */
+  private def unlock(): Unit = if locked then
+    releaseLocks()
+    frontend.locksReleased(objects.keys)
 
+  private def releaseLocks(): Unit =
+    locked = false
     RequirementsLocker.unlock(transactionId, requirements, objects, lockedWrites)
     lockedWrites = Map()
-  }
 
 
   private def trsObjectUpdates: List[ObjectUpdate] =
@@ -906,7 +909,10 @@ class Tx( trs: TransactionRecoveryState,
   private def doCommit(): Unit = if (!committed && !committing && allObjectsLoaded) {
     committing = true
 
-    unlock()
+    // The reads parked on the locks are answered only once the update is applied in memory, below: answered now, they
+    // would show the state it replaces
+    val wasLocked = locked
+    if locked then releaseLocks()
 
     // An applied stub: the store already holds this transaction's update (or must never take it through its
     // UnackedCommits entry), so nothing is applied again, as for a recovered commit vote whose entry was found. A
@@ -924,6 +930,7 @@ class Tx( trs: TransactionRecoveryState,
       objectCommitErrors = changedHere.toList
     else
       issueCommits()
+    if wasLocked then frontend.locksReleased(objects.keys)
 
     // After the commits are issued, so that they are what the next transactions on these objects wait for
     if commitQueued then

@@ -42,6 +42,15 @@ object Frontend {
     */
   val RepairSettleWait: FiniteDuration = FiniteDuration(1, SECONDS)
 
+  /** How long a client's read may wait for a committed transaction it names (Read.awaitCommit) to release its locks on
+    * the object (parkRead). Checked on the store's heartbeat, so a parked read is answered with the state as it then is
+    * up to a heartbeat period later
+    */
+  val ParkedReadWait: FiniteDuration = FiniteDuration(1, SECONDS)
+
+  /** The most reads a store parks at once. A read arriving with this many parked is answered at once */
+  val MaxParkedReads: Int = 1024
+
   /** How long a UnackedCommits lookup may go unanswered before the store heartbeat makes another. An answer can be
     * lost: one completing before its store is installed in the StoreRouter is dropped
     */
@@ -520,6 +529,18 @@ class Frontend(val storeId: StoreId,
     * Declared before the constructor's recovery, which can release held messages (releaseHeldMessages)
     */
   private val parkedRepairs = scala.collection.mutable.HashMap[ObjectId, ParkedRepair]()
+
+  /** A client's read waiting for committed transactions it names (Read.awaitCommit) to release their locks on its
+    * object, until `until` (wallClockMillis). See parkRead
+    */
+  private final class ParkedRead(val clientId: ClientId, val pointer: ObjectPointer, val readType: ReadType,
+                                 val awaitCommit: Set[TransactionId], val until: Long)
+
+  /** By object, then read: a resent read replaces its entry. Declared before the constructor's recovery, whose Txs
+    * release locks (locksReleased)
+    */
+  private val parkedReads = scala.collection.mutable.HashMap[ObjectId, scala.collection.mutable.HashMap[UUID, ParkedRead]]()
+  private var parkedReadCount: Int = 0
   private val commitStage = s"store commit (${backend.getClass.getSimpleName})"
 
   /** A transaction's backend commits on this store, made through commit.
@@ -1214,6 +1235,7 @@ class Frontend(val storeId: StoreId,
   def close(): Future[Unit] =
     closed = true
     failParkedRepairs()
+    dropParkedReads()
     // A stub not yet durable has not replaced its transaction's state: that stays counted too
     admission.retain(storeId, admitted.valuesIterator.map(_.bytes).sum + stubReplacedAdmissions.valuesIterator.sum +
       stubBytesCharged)
@@ -1387,6 +1409,7 @@ class Frontend(val storeId: StoreId,
     if !stopped then
       stopped = true
       failParkedRepairs()
+      dropParkedReads()
       logger.error(s"Store $storeId fail-stops: $reason. It handles nothing more and will be rebuilt")
       onFailStop(new IllegalStateException(s"Store $storeId fail-stopped: $reason"))
 
@@ -1602,7 +1625,64 @@ class Frontend(val storeId: StoreId,
     else if holding then
       logger.trace(s"Store $storeId dropped read $readUUID: holding for recovered transactions")
     else
-      readForNetwork(clientId, readUUID, pointer, readType)
+      unparkRead(pointer.id, readUUID)
+      if awaitCommit.isEmpty || !parkRead(clientId, readUUID, pointer, readType, awaitCommit) then
+        readForNetwork(clientId, readUUID, pointer, readType)
+
+  /** Parks a re-read whose client knows a transaction committed that still holds a write lock on the object here
+    * (Read.awaitCommit): answered now, it would only show the lock again, and the client would re-read until this
+    * store applies the commit. It is answered once none of the named transactions holds a lock on the object
+    * (locksReleased), or at ParkedReadWait with the state as it is then (expireParkedReads). Never past
+    * MaxParkedReads. Only an in-memory state can hold locks, so a read that would reach the backend is not parked.
+    * Safety is unaffected: a parked read only delays its own answer
+    */
+  private def parkRead(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType,
+                       awaitCommit: Set[TransactionId]): Boolean =
+    val objectId = pointer.id
+    val waits = servableState(objectId).exists(_.lockedWriteTransactions.exists(awaitCommit.contains))
+    if waits && parkedReadCount < Frontend.MaxParkedReads then
+      logger.trace(s"Store $storeId: read $readUUID of $objectId waits for the commit of $awaitCommit to apply")
+      parkedReads.getOrElseUpdate(objectId, scala.collection.mutable.HashMap())(readUUID) =
+        ParkedRead(clientId, pointer, readType, awaitCommit, wallClockMillis() + Frontend.ParkedReadWait.toMillis)
+      parkedReadCount += 1
+      true
+    else
+      false
+
+  private def unparkRead(objectId: ObjectId, readUUID: UUID): Unit =
+    if parkedReadCount > 0 then
+      parkedReads.get(objectId).foreach: reads =>
+        if reads.remove(readUUID).isDefined then
+          parkedReadCount -= 1
+          if reads.isEmpty then parkedReads.remove(objectId)
+
+  /** Answers the parked reads (parkRead) of `objectIds` none of whose named transactions still holds a lock there.
+    * Called by every Tx that releases its locks (Tx.unlock), after a commit's update is applied in memory
+    */
+  def locksReleased(objectIds: Iterable[ObjectId]): Unit =
+    if parkedReadCount > 0 then
+      objectIds.foreach: objectId =>
+        parkedReads.get(objectId).foreach: reads =>
+          val locks = servableState(objectId).map(_.lockedWriteTransactions).getOrElse(Set())
+          val ready = reads.filter((_, r) => !r.awaitCommit.exists(locks.contains)).toList
+          ready.foreach((readUUID, _) => unparkRead(objectId, readUUID))
+          ready.foreach((readUUID, r) => readObjectForNetwork(r.clientId, readUUID, r.pointer, r.readType))
+
+  /** Answers, with the state as it now is, every parked read past its deadline. Called on the store's heartbeat */
+  def expireParkedReads(): Unit =
+    if parkedReadCount > 0 then
+      val now = wallClockMillis()
+      val due = parkedReads.toList.flatMap((objectId, reads) =>
+        reads.toList.collect { case (readUUID, r) if r.until <= now => (objectId, readUUID, r) })
+      due.foreach((objectId, readUUID, _) => unparkRead(objectId, readUUID))
+      due.foreach((_, readUUID, r) => readObjectForNetwork(r.clientId, readUUID, r.pointer, r.readType))
+
+  /** Drops every parked read unanswered, as an offline store would: the store fail-stopped or is closing, and the
+    * clients retransmit
+    */
+  private def dropParkedReads(): Unit =
+    parkedReads.clear()
+    parkedReadCount = 0
 
   private def readForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType): Unit = {
     val objectId = pointer.id

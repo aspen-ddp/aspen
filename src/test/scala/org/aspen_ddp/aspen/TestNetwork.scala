@@ -149,7 +149,10 @@ object TestNetwork {
                                leaderRetransmits: Boolean = false,
                                wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None,
                                missingDataWait: Duration = Frontend.MissingDataWait,
-                               transactionHorizon: FiniteDuration = TransactionHorizon.Horizon)
+                               transactionHorizon: FiniteDuration = TransactionHorizon.Horizon,
+                               /** The client records its transactions' outcomes, as a production client does
+                                 * (SimpleAspenClient), so its reads know its own commits. Default: NoCache */
+                               clientStatusCache: Boolean = false)
 
   /** Opens a fresh no-op CRL for each device, creating the crl directory a real one would, so discovery does not
     * take the device's stores to have lost theirs */
@@ -164,13 +167,14 @@ object TestNetwork {
                 radicle: KeyValueObjectPointer,
                 ida: IDA,
                 userTypeFactories: List[RegisteredTypeFactory] = Nil,
-                txDriverFactory: ClientTransactionDriver.Factory = ClientTransactionDriver.noErrorRecoveryFactory)
+                txDriverFactory: ClientTransactionDriver.Factory = ClientTransactionDriver.noErrorRecoveryFactory,
+                statusCache: TransactionStatusCache = TransactionStatusCache.NoCache)
     extends BaseAspenClient(
       executionContext,
       radicle,
       ClientId(new UUID(0, 1)),
       msngr,
-      TransactionStatusCache.NoCache,
+      statusCache,
       BaseReadDriver.noErrorRecoveryReadDriver,
       txDriverFactory,
       userTypeFactories):
@@ -423,6 +427,9 @@ class TestNetwork(executionContext: ExecutionContext,
    *  itself once started. */
   private val lockstep: Boolean = smgrThreading.isInstanceOf[LockstepThreading]
 
+  /** Called with every Read the test's client sends, before it is delivered */
+  @volatile var observeRead: Read => Unit = _ => ()
+
   private var readCounting = false
   private var countedReads: Set[(UUID, ObjectId)] = Set()
 
@@ -447,7 +454,9 @@ class TestNetwork(executionContext: ExecutionContext,
 
     def sendClientRequest(msg: ClientRequest): Unit = {
       msg match
-        case r: Read if r.fromClient == client.clientId => recordRead(r)
+        case r: Read if r.fromClient == client.clientId =>
+          recordRead(r)
+          observeRead(r)
         case _ => ()
       handleEvents()
       if !crashed(hostFor(msg.toStore)) then
@@ -513,7 +522,8 @@ class TestNetwork(executionContext: ExecutionContext,
     d
 
   val client: AspenClient = new TClient(executionContext, cliMessenger, radicle, ida, userTypeFactories,
-    clientDriverFactory)
+    clientDriverFactory,
+    if hostOptions.clientStatusCache then new TransactionStatusCache() else TransactionStatusCache.NoCache)
   FinalizerFactory.client = client
 
   /** The CRL of every store the bootstrap host loads */

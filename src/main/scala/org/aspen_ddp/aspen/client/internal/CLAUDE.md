@@ -36,4 +36,6 @@
   `result`), not on `result`
 - `BaseReadDriver` re-reads a store whose reply holds a lock of a known-committed transaction at once; that `Read`
   carries `awaitCommit` (the known-committed txids among the locks) so the store can park the reply until it applies
-  them. First reads and full resends carry it empty. The store ignores the field until it implements parking
+  them (`Frontend.parkRead`, `server/store/CLAUDE.md`), so the re-read is answered once with the applied commit
+  rather than spinning on the lock. A store that answers it anyway (cap, `ParkedReadWait`) is re-read again as before.
+  First reads and full resends carry it empty

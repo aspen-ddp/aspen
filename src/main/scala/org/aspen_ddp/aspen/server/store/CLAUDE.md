@@ -213,6 +213,17 @@
   starts, and `releaseHeldMessages` runs all of them when holding ends. It runs once, through `reconcileForRepair`
   with `awaitSettle` off. Past `Frontend.RepairSettleWait` (1 s, `expireParkedRepairs` on the store heartbeat) it
   answers stale. Fail-stop and close fail it
+- Parked reads (client 1-RTT commit design section 5): a client read whose `Read.awaitCommit` names a transaction
+  holding a write lock on the object's in-memory state (`lockedWriteTransactions`) is parked (`parkRead`, keyed by
+  object and `readUUID`: a resent read replaces its entry) instead of answered: the client knows that transaction
+  committed, and the reply would only show its lock again. Every `Tx.unlock` calls `locksReleased(objects)`, which
+  answers each parked read on them none of whose named transactions still holds a lock there; so commit, abort,
+  expiry discard (`Tx.expire`) and forget all release them. `doCommit` drops its locks before applying, but calls
+  `locksReleased` only after `issueCommits` applied the update in memory, so the answer shows it. Past
+  `Frontend.ParkedReadWait` (1 s, `expireParkedReads` on the store heartbeat) a parked read is answered with the
+  state as it is then. At `Frontend.MaxParkedReads` (1024) parked a read is answered at once. A read reaching the
+  backend is never parked (an uncached object holds no locks). Fail-stop and close drop parked reads unanswered; the
+  client retransmits. Safety is unaffected: a parked read only delays its own answer
 - `deleteObjectForRepair` refuses (`Frontend.RepairDeleteDeferred`) while the store holds for recovered transactions or
   the object has a pending backend read, a commit, repair write or deletion in flight, or a transaction referencing
   it (repair F6); while its backend removal is outstanding the object counts in `deleting`, so reads, snapshots and

@@ -17,8 +17,8 @@ object ExpiryTally:
       */
     case Adopt(committed: Boolean, finalizedOrLate: Boolean)
     /** Rules A, B and F (decideUnknown): abort was never chosen and never can be (A: every pool has its write
-      * threshold of commit votes; B: an accepted commit; F: every store replied and too few are amnesiac to hide a
-      * chosen abort), and enough commit voters hold T's update to restore each changed object at its read threshold.
+      * threshold of commit votes; B: an accepted commit; F: every store replied and too few are amnesiac or "unknown"
+      * to hide a chosen abort), and enough commit voters hold T's update to restore each changed object at its read threshold.
       * T is decided committed here: applied for real and finalized, and the finalization's missed-update marks repair
       * the stores that never applied it
       */
@@ -31,7 +31,8 @@ object ExpiryTally:
       */
     case Discard(dataLost: Boolean)
     /** Rule G: some store's state is still unknown (it is silent), or, with every store reported (`undecidable`),
-      * at least the primary pool's write threshold of stores lost their acceptor state, beyond its tolerance
+      * at least the primary pool's write threshold of stores are amnesiac or answered "unknown", so they may hide a
+      * chosen abort
       */
     case Hold(undecidable: Boolean)
 
@@ -93,10 +94,18 @@ object ExpiryTally:
     *
     * Counts, per pool of every referenced object (changed or lock-only), with that pool's write threshold `t`: `vc`
     * stores replied and voted commit, `k` replied amnesiac (they may have voted, or accepted, anything) and `s` are
-    * silent. Every other replier is a provable non-commit-voter: "unknown" (below its floor, it can never join T) or a
-    * frozen Tx that did not vote commit. In the primary pool `aa` / `ac` stores report abort / commit as their latest
-    * accept, and `k_p` / `sp` are its `k` / `s`. Each changed pool has a read threshold `r`
-    * (IDA.consistentRestoreThreshold). In order:
+    * silent. Every other replier is a provable non-commit-voter now: "unknown" (below its floor, it can never join T)
+    * or a frozen Tx that did not vote commit. In the primary pool `aa` / `ac` stores report abort / commit as their
+    * latest accept, `k_p` / `sp` are its `k` / `s`, and `n_p` stores replied "unknown". Each changed pool has a read
+    * threshold `r` (IDA.consistentRestoreThreshold).
+    *
+    * "Unknown" does not mean the store never held T. A store that accepted T's outcome, was finalized (or discarded T
+    * by expiry) and then let its cached outcome expire answers "unknown" too. That never makes a vote count wrong: a
+    * store that forgot T no longer holds its update, so not counting it in `vc` only pushes a tally toward discard,
+    * which is safe (a commit voter's UnackedCommits lookup before it discards; missed-update marks for the rest). But
+    * its accept is hidden: `aa` and `ac` count only stores that still hold T. Rules A and B do not depend on that
+    * (L1/L2 argue from votes and from a reported accept), C and D only discard, and F counts "unknown" primary replies
+    * with the amnesiac ones. In order:
     *  - A. Commit: every referenced pool has `vc >= t`. No tally was ever abort-certain, so by L1 no abort was
     *    accepted; and `vc >= t >= r` holders of the update can restore it.
     *  - B. Commit: `ac >= 1` and every changed pool has `vc >= r`. By L2 commit is the only outcome.
@@ -105,15 +114,19 @@ object ExpiryTally:
     *    may have been chosen or reported: `ac >= 1`, or every referenced pool has `vc + k + s >= t`.
     *  - E. Discard: some referenced pool has `vc + k + s < t`. No tally was ever commit-certain, so no commit was chosen
     *    or reported.
-    *  - F. Commit: no store of T is silent, every referenced pool has `vc + k >= t`, `k_p < t` (primary) and every
-    *    changed pool has `vc >= r`. B and C did not fire and no store is silent, so every non-amnesiac primary store
-    *    accepted nothing. Only the `k_p` amnesiac stores, fewer than a quorum, could hide an accepted abort, so no
-    *    abort was chosen, and no client heard one (a client hears abort only through Paxos). Frozen acceptors and
-    *    muted rebuilt stores accept nothing more, so nothing is chosen later. No conflicting transaction committed: it
-    *    would need `t` commit votes, but T's `vc >= r` voters hold its locks, and `t + r > w`.
-    *  - G. Hold otherwise: some store is silent (transient), or, every store replied, `k_p >= t`, beyond the pool's
-    *    loss tolerance (`undecidable`). With a changed primary object D fires first then (`t + r > w`), so only an
-    *    unchanged primary object reaches it.
+    *  - F. Commit: no store of T is silent, every referenced pool has `vc + k >= t`, `k_p + n_p < t` (primary) and
+    *    every changed pool has `vc >= r`. B and C did not fire and no store is silent, so every primary store that
+    *    still holds T and is not amnesiac accepted nothing. Only the `k_p` amnesiac and `n_p` "unknown" stores, fewer
+    *    than a quorum, could hide an accepted abort, so no abort was chosen, and no client heard one (a client hears
+    *    abort only through Paxos). (Counting only `k_p` was unsafe, found 2026-11-16: with a lock-only primary object,
+    *    a quorum of one rebuilt store and one that accepted abort, was finalized and forgot T could hide a chosen
+    *    abort. With a changed primary object `n_p` never matters: `vc_p >= r` leaves at most `w - r < t` others.)
+    *    Frozen acceptors and muted rebuilt stores accept nothing more, so nothing is chosen later. No conflicting
+    *    transaction committed: it would need `t` commit votes, but T's `vc >= r` voters hold its locks, and `t + r > w`.
+    *  - G. Hold otherwise: some store is silent (transient), or, every store replied, `k_p + n_p >= t`
+    *    (`undecidable`): the amnesiac and "unknown" primary stores may hide a chosen abort, and the amnesiac ones may
+    *    have voted commit with the voters seen, so a client may have been told either outcome. With a changed primary
+    *    object D fires first then (`t + r > w`), so only an unchanged primary object reaches it.
     *
     * No two observers reach a commit (A, B, F) and a discard (C, D, E). Reported states are final (an unresolved Tx
     * replies only once frozen and its objects are loaded), and a store leaves a count only by deciding, after which
@@ -124,10 +137,16 @@ object ExpiryTally:
     *  - A, B or F against D: the commit needs `vc >= r` at its observer, D needs `vc + s < r` at its own, and a store
     *    silent to one observer can only add to the other's `vc + s`.
     *  - F against C: F's observer sees every non-amnesiac primary store and finds no accepted abort; C needs one
-    *    reported by a non-amnesiac store, which F's observer would have seen.
+    *    reported by a non-amnesiac store, which F's observer would have seen. One divergence remains, and is accepted:
+    *    C's observer saw an abort accepted by fewer than a quorum (never chosen), the accepter then discarded or was
+    *    finalized and forgot T, and F's observer, later, counts it as "unknown". That is safe for clients: the abort
+    *    was never chosen, so no client was told abort; F's `vc >= r` voters hold T's locks, so no conflicting commit
+    *    exists (`t + r > w`); and the discarding store is repaired by the commit's finalization (its missed-update
+    *    marks), as any store that missed T is.
     *  - F against E: F's observer has no silence, so its `vc + k` is the true count, and E's observer counts at least
     *    that much in `vc + k + s`.
-    * ExpiryTallyConsistencySuite checks this exhaustively over the states the protocol can produce.
+    * ExpiryTallyConsistencySuite checks this exhaustively over the states the protocol can produce, stores that forgot
+    * T included, and that no observer commits over a chosen abort.
     *
     * Liveness with every store replied and none amnesiac (rebuild F6): every store is a commit voter or a provable
     * non-voter, so either every pool has `vc >= t` (A) or some pool has `vc < t = vc + k + s` (E).
@@ -156,6 +175,8 @@ object ExpiryTally:
     def everyPool(f: (PoolId, Counts) => Boolean) = counts.forall(f.tupled)
     def changedRestorable = changedPools.forall(p => counts(p).vc >= r(p))
     val kp = counts.get(primaryPool).map(_.k).getOrElse(0)
+    /** Primary stores that replied "unknown": never joined T, or accepted, decided and forgot it */
+    val np = primary.count(st => replies.get(st).exists(_.isEmpty))
 
     if everyPool((p, c) => c.vc >= t(p)) then
       Decision.Commit // A
@@ -168,7 +189,7 @@ object ExpiryTally:
     else if counts.exists((p, c) => c.vc + c.k + c.s < t(p)) then
       Decision.Discard(dataLost = false) // E
     else if counts.valuesIterator.forall(_.s == 0) && everyPool((p, c) => c.vc + c.k >= t(p)) &&
-      kp < primaryIda.writeThreshold && changedRestorable then
+      kp + np < primaryIda.writeThreshold && changedRestorable then
       Decision.Commit // F
     else
       Decision.Hold(undecidable = replies.size >= txd.allDataStores.size) // G

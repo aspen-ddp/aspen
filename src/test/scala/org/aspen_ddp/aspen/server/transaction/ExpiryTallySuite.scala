@@ -97,6 +97,19 @@ class ExpiryTallySuite extends AnyFunSuite with Matchers:
     ExpiryTally.decide(txd, Map(primary(0) -> holder(), primary(1) -> holder(), primary(2) -> holder(),
       primary(4) -> amnesiac)) shouldBe Decision.Hold(undecidable = false)
 
+  test("a forgotten primary store's unknown reply may hide a chosen abort: rule F holds"):
+    // T locks a Replication(3, 2) primary object and overwrites a secondary one. Stores 1 and 2 voted abort and
+    // accepted it, so abort was chosen and finalized; store 1 was then rebuilt (amnesiac), and store 2 forgot T and
+    // its cached outcome, so it answers "unknown". "Unknown" cannot tell a store that never joined from one that
+    // accepted and forgot, so F counts it with the amnesiac stores: two of them, a quorum, may hide a chosen abort.
+    // Every store replied, and the amnesiac store may instead have voted commit with store 0, so a client may have
+    // been told commit: undecidable
+    val lockedPrimary = txdWith(Replication(3, 2), Map(otherPoolId -> Replication(3, 2)),
+      List(DataUpdate(otherPtr, rev0, DataUpdateOperation.Overwrite)), primaryReq = ExclusiveRevisionLock(op1, rev0))
+    ExpiryTally.decide(lockedPrimary, Map(primary(0) -> holder(), primary(1) -> amnesiac, primary(2) -> unknown,
+      secondary(0) -> holder(), secondary(1) -> holder(), secondary(2) -> holder())) shouldBe
+      Decision.Hold(undecidable = true)
+
   test("fewer known commit votes than the write threshold with a store silent holds"):
     // Rule G: the silent stores may be commit voters (A) or abort acceptors (C)
     ExpiryTally.decide(txd, Map(primary(0) -> holder(), primary(1) -> holder(), primary(2) -> holder())) shouldBe

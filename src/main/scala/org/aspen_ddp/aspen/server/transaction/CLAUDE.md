@@ -172,11 +172,15 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   `vc >= r` (L2). (C) **Discard** when `aa >= 1` (L1). (D) **Discard** when some changed pool has `vc + s < r` (the
   update can never be restored; `dataLost`, logged as an error, when `ac >= 1` or every pool has `vc + k + s >= t`: a
   commit may have been chosen or reported). (E) **Discard** when some pool has `vc + k + s < t` (no tally was
-  commit-certain). (F) **Commit** when no store of T is silent, every pool has `vc + k >= t`, `k_p < t` and every
-  changed pool has `vc >= r` (only the amnesiac stores, fewer than a quorum, could hide an accepted abort; a
-  conflicting commit would need a locked voter since `t + r > w`). (G) **Hold** otherwise: some store is silent, or,
-  every store reported, `k_p >= t` (logged `UNDECIDABLE TRANSACTION`, then every `Frontend.UndecidableLogRounds`
-  rounds; with a changed primary object D fires first, so only an unchanged primary object reaches it).
+  commit-certain). (F) **Commit** when no store of T is silent, every pool has `vc + k >= t`, `k_p + n_p < t` (`n_p`:
+  primary stores replying "unknown") and every changed pool has `vc >= r` (only the amnesiac and "unknown" stores,
+  fewer than a quorum, could hide an accepted abort: a store that accepted, was finalized or discarded T and let its
+  cached outcome expire answers "unknown" too; a conflicting commit would need a locked voter since `t + r > w`).
+  (G) **Hold** otherwise: some store is silent, or, every store reported, `k_p + n_p >= t` (logged `UNDECIDABLE
+  TRANSACTION`, then every `Frontend.UndecidableLogRounds` rounds; with a changed primary object D fires first, so
+  only an unchanged primary object reaches it). Accepted divergence: one store discards by C over an abort accepted
+  by fewer than a quorum, the accepter forgets T, and another commits by F: no client heard abort (never chosen),
+  F's locked voters exclude a conflicting commit, and the commit's missed-update marks repair the discarder.
   On a commit (A, B, F) the deciding store sends `TxResolved(commit)` to every store of T, applies it (a commit
   voter's locks have kept its locked parts unchanged: repair defers to a store's own locks, and a conflicting commit
   would need a locked voter), and its driver finalizes it (`Frontend.onExpiryCommit` -> `Store.finalizeExpiryCommit`),

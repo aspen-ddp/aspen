@@ -1036,7 +1036,7 @@ class Frontend(val storeId: StoreId,
           round.undecidableRounds += 1
           if round.undecidableRounds == 1 || round.undecidableRounds % UndecidableLogRounds == 0 then
             logger.error(s"UNDECIDABLE TRANSACTION ${tx.transactionId} on store $storeId: every store of it has " +
-              s"reported, and more of its primary pool lost their acceptor state than the pool tolerates, so its " +
+              s"reported, and too many of its primary pool are rebuilt or forgot it to rule out a chosen abort, so its " +
               s"outcome cannot be proven. Its locks and CRL state are held. Replies: ${round.replies}")
       case ExpiryTally.Decision.Commit =>
         round.decided = true

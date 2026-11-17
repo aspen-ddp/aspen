@@ -33,16 +33,7 @@ X = cross-document-review (its section 5 lists contradictions between documents)
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.2  Counted commit voter whose UnackedCommits entry has no incarnation never applies: R-W1                [S]
-     CONFIRMED. A takeover driver that did not count votes writes incarnation None for stores it never heard
-     from; Frontend.unackedLookupComplete treats Found(None) as not owed, so a store that cast a counted commit
-     vote applies nothing and relies on reconcile, which cannot restore T once holders are fewer than r (t = r,
-     e.g. Replication(3,2)). Committed data lost after crash-restarts plus one lost message. Fix: treat
-     Found(None) as owed for a recovered Tx holding its own commit vote; decide the live-expiring-voter case
-     (apply on None, or have the takeover marker record "voters unknown"). Shared root with 2.5 and RP-W1's
-     phase-B leg (2.6): fix this first. Also correct the "reads mask it" reasoning in
-     docs/superpowers/specs/2026-11-14-store-incarnation-design.md and server/transaction/CLAUDE.md. TestNetwork
-     test with Replication(3,2).
+(no open items)
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
@@ -68,8 +59,10 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
      applied and finalized first. After a crash or transfer the recovered vote re-checks (DoesNotExist passes
      again), re-inserts k at that store only, reports success, and nothing is marked: permanent divergence,
      resurrection on a second event. Fix (recovery path only): quarantine a changed KV object whose timestamp is
-     later than T's start, or record the delete durably (persistWithoutUpdateOf analog). Also fixes contradiction
-     X 5.4 (transaction-recovery.md section 9 overclaims reconcile healing).
+     later than T's start, or record the delete durably (persistWithoutUpdateOf analog). A second path needs no
+     crash: a replay at a store that never saw T applies it late through an UnackedCommits entry naming no
+     incarnation (transaction-recovery.md section 7); a recovery-path-only fix does not cover it. Also fixes
+     contradiction X 5.4 (transaction-recovery.md section 9 overclaims reconcile healing).
 
 2.4  Expiry status replies report a commit vote that may not be durable: P-W1                              [S]
      PLAUSIBLE. Tx.statusForExpiry reports votedCommit from memory before the vote's CRL save completes, and a
@@ -90,7 +83,8 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
      CONFIRMED. MissedUpdateMarker drops a mark whose missedTimestamp is not later than the held entry's, with no
      write, so a repair that read before the earlier-started, later-committed transaction can still delete the
      entry (KeyRevision unchanged); the store never gets that update. Also reaches UnackedCommits entries via the
-     phase-A shortcut (Counts.recordCompleted) where a voter forgot T without applying (1.2's path). Fix: a
+     phase-A shortcut (Counts.recordCompleted) where a voter forgot T without applying (an entry naming another
+     incarnation). Fix: a
      declined mark rewrites the held value (moves its revision); record completion only after the phase-A delete
      commits. StoreRepairerSuite test with testingOnlyBeforeEntryDelete.
 

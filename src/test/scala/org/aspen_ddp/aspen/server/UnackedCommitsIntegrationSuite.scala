@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.transaction.UnackedCommitEntry
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, SinglePoolNodeAllocator, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
-import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
+import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.network.{TxFinalized, TxMessage, TxResolved}
 import org.aspen_ddp.aspen.common.paxos.PersistentState
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyValueObjectPointer,
@@ -20,7 +20,7 @@ import org.aspen_ddp.aspen.server.store.{UnackedCommitLookup, UnackedLookupResul
 
 import java.nio.{ByteBuffer, ByteOrder}
 import scala.concurrent.Future
-import scala.util.Try
+import scala.util.{Success, Try}
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 
 /** A store that voted commit, crashed before learning the outcome, and is restarted after the transaction was
@@ -42,6 +42,13 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
 
   override def testIda: IDA = ReedSolomon(5, 3, 4)
 
+  private val unknownIncarnationTest =
+    "a recovered commit vote whose UnackedCommits entry names no incarnation applies it under Replication(3, 2)"
+
+  /** t = r: one lost holder of a committed update leaves it unreadable unless its owed voter applies it */
+  override def testIdaFor(name: String): IDA =
+    if name == unknownIncarnationTest then Replication(3, 2) else testIda
+
   /** Holds the host's UnackedCommits lookups while `holding`, for the test to answer: through the real lookup, or
     * with a given result. Each is answered through the Frontend's own `answer`, as the host's lookup answers
     */
@@ -52,9 +59,18 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
     @volatile var holding = false
     @volatile var pending: List[Held] = Nil
     @volatile var made: Int = 0
+    /** Stores whose found entries are answered as naming no incarnation, as a takeover driver's marker writes them */
+    @volatile var unknownIncarnation: Set[StoreId] = Set()
     def lookup(storeId: StoreId, transactionId: TransactionId, requestId: Long,
-               answer: Try[UnackedLookupResult] => Unit): Unit =
+               reply: Try[UnackedLookupResult] => Unit): Unit =
       made += 1
+      val answer: Try[UnackedLookupResult] => Unit =
+        if unknownIncarnation.contains(storeId) then
+          {
+            case Success(UnackedLookupResult.Found(_)) => reply(Success(UnackedLookupResult.Found(None)))
+            case other => reply(other)
+          }
+        else reply
       if holding then pending = pending :+ Held(storeId, transactionId, requestId, answer)
       else inner.lookup(storeId, transactionId, requestId, answer)
 
@@ -119,13 +135,16 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
   /** Commits the transaction `build` makes. Every store votes on it, but the stores of `holders` never hear its
     * outcome (TxResolved and TxFinalized to them are dropped), so each keeps its commit vote unresolved, as a store
     * that crashed right after voting does. They are reported offline meanwhile, so none of them leads it. The drop
-    * stays in place until restartAfterForgotten.
+    * stays in place until restartAfterForgotten. The stores of `silent` get none of its messages and send none: they
+    * never see it, and are reported offline too, so none of them is chosen to lead it.
     */
-  private def commitHeldBy(holders: Set[StoreId])(build: Transaction => Future[Unit]): Future[TransactionId] =
+  private def commitHeldBy(holders: Set[StoreId], silent: Set[StoreId] = Set())
+                          (build: Transaction => Future[Unit]): Future[TransactionId] =
     val tx = TestTransactions.replaySafe(client.newTransaction())
-    net.offlineStores = holders
-    net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id && holders.contains(m.to) &&
-      (m.isInstanceOf[TxResolved] || m.isInstanceOf[TxFinalized])
+    net.offlineStores = holders ++ silent
+    def outcome(m: TxMessage) = m.isInstanceOf[TxResolved] || m.isInstanceOf[TxFinalized]
+    net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id &&
+      (silent.contains(m.to) || silent.contains(m.from) || (holders.contains(m.to) && outcome(m)))
     for
       _ <- build(tx)
       _ <- pump(tx.commit(), clock = false)
@@ -288,6 +307,40 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
       after <- client.read(dataPtr)
     yield
       (0 until 5).foreach(i => storeRevision(i, dataPtr) shouldBe Some(ObjectRevision(txid)))
+      after.revision shouldBe ObjectRevision(txid)
+      after.data.getByteArray.toSeq shouldBe Seq[Byte](2)
+
+  // transaction-recovery.md section 7, entries naming no incarnation. A driver that did not count the votes (a takeover
+  // after the original driver died before its marker wrote) gives a store it never heard from an entry naming no
+  // incarnation. Here store 2 cast a counted, saved commit vote, store 1 never saw the transaction, and only store 0
+  // applied it: with t = r = 2 the update is readable only if store 2 applies it from its entry. The lookup reports
+  // store 2's entry as naming no incarnation, which is what the takeover's marker writes; the stores' state is the same
+  // either way.
+  test(unknownIncarnationTest):
+    for
+      dataPtr <- client.transactUntilSuccessful: tx =>
+                   given Transaction = tx
+                   tx.replaySafe("test")
+                   client.getStoragePool(Radicle.poolId).flatMap(_.allocator.allocateDataObject(DataBuffer(Array[Byte](1))))
+      _ <- settle(clock = false)
+      before <- client.read(dataPtr)
+      txid <- commitHeldBy(Set(sid(2)), silent = Set(sid(1))): tx =>
+                tx.overwrite(dataPtr, before.revision, DataBuffer(Array[Byte](2)))
+                Future.unit
+      _ = neverAccepted(2, txid)
+      marked <- unackedEntries(txid)
+      _ = withClue("only store 0 holds the overwrite, and store 2 owes it: "):
+            storeRevision(0, dataPtr) shouldBe Some(ObjectRevision(txid))
+            storeRevision(1, dataPtr) shouldBe Some(before.revision)
+            storeRevision(2, dataPtr) shouldBe Some(before.revision)
+            marked.keySet shouldBe Set(2)
+      _ = lookups.unknownIncarnation = Set(sid(2))
+      _ <- restartAfterForgotten(txid, List(2))
+      _ <- eventually("store 2 applied the overwrite", clock = true):
+             Future.successful(storeRevision(2, dataPtr).contains(ObjectRevision(txid)))
+      _ <- settle(clock = true)
+      after <- client.read(dataPtr)
+    yield
       after.revision shouldBe ObjectRevision(txid)
       after.data.getByteArray.toSeq shouldBe Seq[Byte](2)
 

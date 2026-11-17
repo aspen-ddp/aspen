@@ -919,9 +919,13 @@ class Frontend(val storeId: StoreId,
 
   /** The answer to UnackedCommits lookup `requestId`, delivered on the store's executor.
     *
-    * An entry found resolves the Tx committed, whichever lookup found it. It applies through the entry only if the
-    * entry names this store's own incarnation (Tx.unackedCommitFound); one naming another incarnation, or none,
-    * concludes it committed with nothing applied (Tx.unackedCommitNotOwed). Either way it is never taken as absent.
+    * An entry found resolves the Tx committed, whichever lookup found it. It applies through the entry unless the
+    * entry names another incarnation of this store (Tx.unackedCommitFound). One naming none (a driver that did not
+    * count the votes never heard from this store) applies too: every Tx that awaits a lookup holds its own commit vote,
+    * which may be the counted vote the commit relied on (transaction-recovery.md, 7). Otherwise it is a replay's vote,
+    * which passed T's pin, so the pinned object is still before T here and T's committed update is what it lacks. One
+    * naming another incarnation concludes it committed with nothing applied (Tx.unackedCommitNotOwed): the vote that
+    * counted was lost to a rebuild. Either way it is never taken as absent.
     * None found releases the aborts it held, or makes a held late commit apply nothing, if the lookup was made after
     * the latest of them arrived; otherwise, if it was the latest lookup, another is made.
     * A failure of the latest lookup keeps the aborts held, and retryUnackedLookups tries again. Ignored once the Tx
@@ -938,16 +942,20 @@ class Frontend(val storeId: StoreId,
           result match
             case Success(UnackedLookupResult.Found(found)) =>
               unackedLookups.remove(txid)
-              if found.contains(incarnation) then
-                // Forgotten by the Tx itself only for a held late commit: see Tx.unackedCommitFound
-                tx.unackedCommitFound()
-              else
-                // Another incarnation's vote counted (this store was rebuilt since), or the driver never heard from
-                // this store: T committed, but nothing is owed to this incarnation. See Tx.unackedCommitNotOwed
-                logger.info(s"Store $storeId (incarnation ${incarnation.uuid}): the UnackedCommits entry for " +
-                  s"transaction $txid names incarnation ${found.fold("unknown")(_.uuid.toString)}: applying nothing " +
-                  s"through it")
-                tx.unackedCommitNotOwed()
+              found match
+                case Some(other) if other != incarnation =>
+                  // Another incarnation's vote counted (this store was rebuilt since): T committed, but nothing is
+                  // owed to this incarnation. See Tx.unackedCommitNotOwed
+                  logger.info(s"Store $storeId (incarnation ${incarnation.uuid}): the UnackedCommits entry for " +
+                    s"transaction $txid names incarnation ${other.uuid}: applying nothing through it")
+                  tx.unackedCommitNotOwed()
+                case _ =>
+                  // Its own incarnation, or none (a driver that did not count the votes never heard from this store).
+                  // Forgotten by the Tx itself only for a held late commit: see Tx.unackedCommitFound
+                  if found.isEmpty then
+                    logger.info(s"Store $storeId: the UnackedCommits entry for transaction $txid names no " +
+                      s"incarnation: applying through it, as this store holds its own commit vote")
+                  tx.unackedCommitFound()
               if tx.provesCommitToItsDriver then
                 onCommitProven(txid)
             case Success(UnackedLookupResult.Absent) if requestId >= l.firstCounting =>

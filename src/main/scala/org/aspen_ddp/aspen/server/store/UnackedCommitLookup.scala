@@ -6,7 +6,8 @@ import org.aspen_ddp.aspen.common.transaction.TransactionId
 import scala.util.Try
 
 /** What a UnackedCommits lookup found: no entry, or an entry naming the incarnation of the store whose vote counted
-  * (None: unknown, the driver never heard from the store). See Frontend.unackedLookupComplete
+  * (None: unknown, the driver never heard from the store, which a store holding its own commit vote applies like its
+  * own incarnation). See Frontend.unackedLookupComplete
   */
 enum UnackedLookupResult:
   case Absent

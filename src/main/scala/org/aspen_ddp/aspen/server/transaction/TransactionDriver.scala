@@ -154,7 +154,8 @@ abstract class TransactionDriver(
     * one leaves a known value in place. It should not change within one transaction's voting (a rebuilt store is muted
     * for every transaction started before its acceptorSince), but that leans on the mute's clock assumptions: a store
     * that reports two different incarnations is recorded as unknown instead (conflictedIncarnations), for good, so its
-    * entry names no incarnation and no incarnation of it applies through it
+    * entry names no incarnation, which a Tx holding its own commit vote applies through
+    * (Frontend.unackedLookupComplete)
     */
   private var peerIncarnations: Map[StoreId, StoreIncarnation] = Map()
 

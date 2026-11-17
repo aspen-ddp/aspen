@@ -3079,7 +3079,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.get(unackedTxid).map(_.holdsLocks) shouldBe Some(false)
   }
 
-  test("a recovered commit vote whose entry names no incarnation resolves committed, applies nothing and never accepts its held abort") {
+  // transaction-recovery.md section 7, entries naming no incarnation: a driver that did not count the votes writes one
+  // for a store it never heard from, which may be the counted voter the commit relied on
+  test("a recovered commit vote whose entry names no incarnation applies it and never accepts its held abort") {
     val statusCache = new TransactionStatusCache()
     val (frontend, backend, net, crl, lookup) = unackedFixture(statusCache = statusCache)
     lookup.answer(unackedTxid, lookup.absent)
@@ -3088,6 +3090,42 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       proof = false))
     lookup.requests.count(_ == unackedTxid) shouldBe 2
     lookup.answer(unackedTxid, Success(UnackedLookupResult.Found(None)))
+
+    // As for a matching entry: the Tx resolves committed, applies its update and waits for TxFinalized, recording
+    // nothing in the status cache, its held abort never accepted
+    kvKeys(backend) should not contain k(2)
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+    val tx = frontend.transactions(unackedTxid)
+    tx.status shouldBe TransactionStatus.Committed
+    tx.isFinalized shouldBe false
+    tx.provesCommitToItsDriver shouldBe true
+    tx.awaitsUnackedLookup shouldBe false
+    tx.holdsLocks shouldBe false
+    crl.deleted should not contain (unackedTxid)
+    crl.stubsSaved shouldBe Nil
+    statusCache.getStatus(unackedTxid) shouldBe
+      Some(TransactionStatusCache.Entry(TransactionStatus.Unresolved, finalized = false, late = false))
+    lockedWriteTransactions(frontend, net, kvPtr) should not contain (unackedTxid)
+
+    frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, unackedTxid, committed = true, late = false,
+      owed = Set(), startTimestamp = HLCTimestamp.now))
+    frontend.transactions.contains(unackedTxid) shouldBe false
+    kvKeys(backend) should not contain k(2)
+    crl.stubsSaved should contain (unackedTxid) // Applied through its entry: a stub replaces its state
+    statusCache.getStatus(unackedTxid) shouldBe
+      Some(TransactionStatusCache.Entry(TransactionStatus.Committed, finalized = true, late = false))
+  }
+
+  test("a recovered commit vote whose entry names another incarnation resolves committed, applies nothing and never " +
+    "accepts its held abort") {
+    val statusCache = new TransactionStatusCache()
+    val (frontend, backend, net, crl, lookup) = unackedFixture(statusCache = statusCache)
+    lookup.answer(unackedTxid, lookup.absent)
+
+    frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false, late = false,
+      proof = false))
+    lookup.requests.count(_ == unackedTxid) shouldBe 2
+    lookup.answer(unackedTxid, Success(UnackedLookupResult.Found(Some(incarnationA))))
 
     // T committed, but its finalization may not be complete: the Tx resolves committed, applies nothing, and waits for
     // TxFinalized, recording nothing in the status cache (as for a matching entry), its held abort never accepted
@@ -3372,11 +3410,19 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     appliedNothing(frontend, backend, net, crl, statusCache)
   }
 
-  test("a live Tx with its own commit vote applies nothing on a late commit when its entry's incarnation is unknown") {
+  test("a live Tx with its own commit vote applies a late commit when its entry's incarnation is unknown") {
+    // Its vote was cast by this incarnation: it counted (a takeover driver never heard from this store), or this store
+    // never saw T and its vote passed T's pin. T committed either way (transaction-recovery.md section 7)
     val statusCache = new TransactionStatusCache()
     val (frontend, backend, net, crl, lookup) = lateFixture(statusCache, incarnation = Some(incarnationB))
     lateCommitAnswered(frontend, net, lookup, None)
-    appliedNothing(frontend, backend, net, crl, statusCache)
+    backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+    frontend.transactions.contains(txid1) shouldBe false
+    committedMessages(net).map(_.objectCommitErrors).distinct shouldBe List(Nil)
+    crl.stubsSaved should contain (txid1)
+    statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
+      finalized = true, late = true))
+    lockedWriteTransactions(frontend, net, op1) shouldBe empty
   }
 
   test("a held late commit at a store holding a stub applies nothing whatever its entry's incarnation") {
@@ -6139,9 +6185,16 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     crl.stubsSaved should contain (txid1)
   }
 
-  test("a recovered commit vote whose entry names no incarnation concludes as finalized, applying nothing, once its " +
+  test("a recovered commit vote whose entry names no incarnation applies it and concludes as finalized once its " +
     "peers can no longer decide T") {
     val (backend, crl) = entryCommitConcludesAtExpiry(Some(None))
+    kvKeys(backend) should not contain k(2)
+    crl.stubsSaved should contain (txid1)
+  }
+
+  test("a recovered commit vote whose entry names another incarnation concludes as finalized, applying nothing, " +
+    "once its peers can no longer decide T") {
+    val (backend, crl) = entryCommitConcludesAtExpiry(Some(Some(incarnationA)))
     kvKeys(backend) should contain (k(2))
     crl.stubsSaved shouldBe Nil
     crl.deleted should contain (txid1)

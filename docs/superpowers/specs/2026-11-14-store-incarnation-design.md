@@ -102,10 +102,11 @@ closed by the fence.
   `commitVoters` takes the voters (`Option[Set[StoreId]]`, as today) plus `incarnations: Map[StoreId,
   StoreIncarnation]` for every store the driver heard from, in both cases. An entry records the store's incarnation
   when the map has it, and unknown only for a store that never answered this driver.
-- **Decided:** an unknown incarnation never applies (see below). The accepted cost: a store legitimately owed T that
-  was silent to the finalizing driver gets T from the repair scan's reconcile (typically about 22 s to 15 min) instead
-  of from its entry; that one replica is stale meanwhile and reads mask it. This is a rare failure path (driver
-  takeover plus a store silent to the new driver), and it keeps the decision clock-free everywhere.
+- **Decided:** an unknown incarnation applies at a Tx holding its own commit vote (see below). Reconcile cannot stand
+  in for it: a store owed T that was silent to the finalizing driver may hold the counted vote the commit relied on,
+  and when `t = r` (Replication(3, 2)) T can then be held by fewer than `r` other stores, so reads return the pre-T
+  state and the entry's reconcile never reaches T's timestamp. That loses a committed update after a driver takeover
+  plus one lost prepare.
 
 ### Entry format
 
@@ -120,8 +121,8 @@ closed by the fence.
   `Host.unackedLookup` decodes the head entry instead of returning `isDefined`.
 - `Frontend.unackedLookupComplete` maps the result to the Tx:
   - `Absent`: as today (`Tx.unackedCommitAbsent`).
-  - `Found(Some(own))`: as today (`Tx.unackedCommitFound`): apply, stub, conclude.
-  - `Found(other or None)`: **committed, owed nothing here**. The Tx concludes committed exactly as it does today when
+  - `Found(Some(own))` or `Found(None)`: `Tx.unackedCommitFound`: apply, stub, conclude. `None` is logged at info.
+  - `Found(other)`: **committed, owed nothing here**. The Tx concludes committed exactly as it does today when
     the store holds an applied stub: a held late commit calls `applyNothing(committed = true, ...)`; a recovered or
     expiring commit vote resolves committed and applies nothing (its locks and held aborts are released, held aborts
     are never accepted, since T committed); the case-3 `forgetLookupHeld` path writes the stub as it does for any found
@@ -130,11 +131,13 @@ closed by the fence.
   - Log the mismatch at info with both incarnations.
 - Why this is complete: an exact match means the vote that counted was cast by this incarnation. A store that saw T
   never rejoins it (forget floor), so a fresh Tx here with a matching entry is the original voter still holding its
-  Tx, or its CRL-recovered successor, which is what the entry is for. Any other Tx (a replay at a rebuilt store, or at
-  a store that never saw T) finds a mismatch or unknown and applies nothing.
-- Consequence for an existing residual: a store that never saw T and has an entry (only possible through the unknown-
-  voters case) no longer applies T late; reconcile heals it instead (the transaction CLAUDE.md "Residual" under
-  Applied stubs). Strictly safer, a little more repair work.
+  Tx, or its CRL-recovered successor, which is what the entry is for. A replay at a rebuilt store finds its old
+  incarnation's entry and applies nothing, whatever the clocks.
+- Why an unknown entry applies: every Tx that looks up holds its own commit vote. Either that vote counted (the
+  store is owed T), or it is a replay's vote (at a store that never saw T, or at a rebuilt store under an unknown
+  entry), which passed T's pin, so the pinned object is still before T there and T's committed update is what the
+  store lacks. The residual is a non-pinned object of T changed since, such as a blind Insert of a key deleted later:
+  transaction-requirements Q-W3.
 
 ### Repair fence
 
@@ -175,12 +178,12 @@ closed by the fence.
    state; after, it applies nothing and the scan's reconcile leaves the store matching its peers.
 2. Same-incarnation late commit still applies through its entry (regression for the legitimate path), and a recovered
    commit vote with a matching entry still applies.
-3. Recovered commit vote finding an entry of unknown incarnation: resolves committed, applies nothing, never accepts
-   its held abort; the scan reconciles the object.
+3. Recovered commit vote finding an entry of unknown incarnation: resolves committed, applies its update, never
+   accepts its held abort; under Replication(3, 2) with one other holder, a read then returns T.
 3a. Takeover: the original driver dies after the commit is chosen; a second driver adopts the accepted commit and
    finalizes. A store that answered the second driver's prepare and sent no TxCommitted gets an entry with its own
-   incarnation and applies through it; a store silent to the second driver gets an unknown entry and is healed by the
-   scan.
+   incarnation and applies through it; a store silent to the second driver gets an unknown entry and applies through
+   it too.
 4. Entry encode/decode round trip, chunks carry the incarnation, size bounds hold.
 5. Store load without an `incarnation` file creates one durably; a rebuild's finish writes a fresh one; a transfer
    keeps it.

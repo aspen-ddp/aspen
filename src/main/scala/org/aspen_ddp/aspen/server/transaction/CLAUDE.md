@@ -119,10 +119,14 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   abort and retries at heartbeat (`Frontend.UnackedLookupTimeout`, 5 s). Past the horizon its peers refuse its
   driver, so such a Tx ends by expiry (below)
 - The apply decision (`Frontend.unackedLookupComplete`; the lookup answers `UnackedLookupResult.Absent` or
-  `Found(incarnation)`, `Host.unackedLookup` decoding the entry): only `Found(Some(own))`, naming
-  `Frontend.incarnation`, applies through the entry (`Tx.unackedCommitFound`). `Found` of another incarnation (a
-  rebuilt store, Rebuild N3) or `None` (the driver never heard from the store, or heard two incarnations from it)
-  logs both at info and calls `Tx.unackedCommitNotOwed`: T committed, and nothing is applied through the entry, held
+  `Found(incarnation)`, `Host.unackedLookup` decoding the entry): `Found(Some(own))`, naming `Frontend.incarnation`,
+  and `Found(None)` (a driver that did not count the votes never heard from the store, or heard two incarnations from
+  it) apply through the entry (`Tx.unackedCommitFound`; `None` logged at info). Every Tx that looks up holds its own
+  commit vote, which may be the counted one the commit relied on: with `t = r` (Replication(3, 2)) skipping it can
+  leave T below the read threshold, beyond reconcile. A vote that did not count is a replay's, which passed T's pin,
+  so T is what the store lacks (residual: a blind Insert of T over a later delete, transaction-requirements Q-W3).
+  `Found` of another incarnation (a rebuilt store, Rebuild N3) logs both at info and calls
+  `Tx.unackedCommitNotOwed`: T committed, and nothing is applied through the entry, held
   aborts dropped and never accepted. A recovered or expiring commit vote does as for a matching entry, applying
   nothing (`notOwedHere`, as with an applied stub: its objects in `objectCommitErrors`): it resolves committed,
   records nothing in the status cache, proves the commit to its driver and stays until TxFinalized, since T's
@@ -230,9 +234,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   bounded by their rate times ~30 s whatever the repair scans do; the scan neither reads nor drops them. An entry with
   no stub is harmless at a store that saw T: it never
   rejoins T, so no replay Tx exists there to apply through it (a second driver's lost TxFinalized included). Residual:
-  a store that never saw T (below a quorum) gets T from reconcile: its entry can exist only through the unknown-voters
-  case, which names no incarnation, so a late commit there applies nothing through it, and the entry's reconcile
-  installs the committed state, since repair leaves the entry until the store can no longer join T
+  a store that never saw T (below a quorum): its entry can exist only through the unknown-voters case, which names no
+  incarnation. A replay Tx there that voted commit applies T through it on a late commit (its vote passed T's pin);
+  otherwise the entry's reconcile installs the committed state, since repair leaves the entry until the store can no
+  longer join T
   (`server/repair/CLAUDE.md`; transaction-recovery Todo 2.9 re-assessment)
 - A Tx finalized while its commit is held for its turn defers concluding its state (`Frontend.finalizationDeferred`).
   Every deferring Tx of the txid (a replay's too) is listed, and the state is deleted or stubbed only by the call that

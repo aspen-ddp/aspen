@@ -746,7 +746,10 @@ an absent key), for example the allocate-and-insert pattern whose `AllocationFin
 finalization. T2 deletes k (`KeyRevision(k, T1)`) and is applied, persisted and finalized at store S while T1's
 finalization is still running. S crashes, or is transferred, and recovers before T1's `TxFinalized` is sent. T1's
 recovered vote is driven, learns commit from its peers' status caches, and re-inserts k at S only. If T2's state is also
-still in the CRL and re-applies after T1, the stores converge; if T2 was finalized first, they do not.
+still in the CRL and re-applies after T1, the stores converge; if T2 was finalized first, they do not. A second path
+needs no crash: a replayed prepare of T1 at a store that never saw it votes commit (k is absent there too) and, given
+a late commit, applies T1 through an UnackedCommits entry naming no incarnation (transaction-recovery.md section 7),
+after repair has already brought that store to T2's state.
 
 Consequence: S alone holds a deleted key, with no ErrorTree or UnackedCommits entry: permanent divergence of one
 replica until a later write of k fails its check at S and gets S marked. Reads use a majority and are unaffected, but

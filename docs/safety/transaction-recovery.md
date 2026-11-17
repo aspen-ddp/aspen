@@ -314,8 +314,9 @@ every entry of the batch. The marker transaction is `replaySafe` (marks only mov
   `TxCommitted` (its backend commits persisted) or has an entry, through which a recovered or expiring voter applies T,
   and repair leaves the entry alone while the store may still hold or join T. So at least a write threshold of stores
   holds T. An uncounted voter or non-voter that sent no `TxCommitted` gets only ErrorTree marks, which repair keeps
-  until the store's copy reaches T's timestamp, read from the holders above. This argument needs each owed voter's
-  entry to name its incarnation: see open weakness R-W1.
+  until the store's copy reaches T's timestamp, read from the holders above. An owed voter's entry names its
+  incarnation, or none when the finalizing driver did not count the votes and never heard from it; either way the
+  voter applies through it (section 7).
 * A store that applied durably but whose `TxCommitted` was late or lost is marked too: a harmless extra repair pass
   (reconcile is exact, `server/store/Reconcile`), and, if it was a counted voter, an entry whose late apply its applied
   stub suppresses (5.4).
@@ -353,8 +354,10 @@ entry)", charged to `CrlAdmission` and carrying T's start (crash-recovery-log.md
   drops stubs.
 * **Entries without stubs.** An entry with no stub is harmless at a store that saw T: it never rejoins T, so no Tx
   exists there to apply through it. A store that never saw T can hold a replay's Tx only above its floor; its entry,
-  if any, comes from the unknown-voters case and names no incarnation, so a late commit there applies nothing through
-  it; the entry's reconcile installs T, and repair leaves the entry until the store can no longer join T
+  if any, comes from the unknown-voters case and names no incarnation. A replay's commit vote there passed T's pin, so
+  a late commit applies T through the entry, which is the update the store lacks (residual: transaction-requirements
+  Q-W3, a non-pinned key T writes blindly, deleted since). A replay that voted abort applies nothing, and the entry's
+  reconcile installs T; repair leaves the entry until the store can no longer join T
   (`RepairTarget.mayJoinTransaction`).
 
 ## 6. Expiry (situation 8)
@@ -374,8 +377,8 @@ Mechanism and proofs: paxos-transactions.md (transaction horizon), `server/trans
   applied it), holds, or discards. A Tx that knows its outcome concludes once more than `w - t` primary stores are
   non-holders (`Tx.concludeKnownOutcome`); one that does not holds while a store is silent.
 * A discard of a commit vote (`needsUnackedCheck`) first waits for an UnackedCommits lookup started after the
-  decision: no entry discards it, an entry applies T as a late commit (own incarnation) or concludes it with nothing
-  applied (other or unknown incarnation), a failed lookup keeps it holding. Discarding releases locks and objects,
+  decision: no entry discards it, an entry applies T as a late commit (own or unknown incarnation) or concludes it
+  with nothing applied (another incarnation), a failed lookup keeps it holding. Discarding releases locks and objects,
   deletes the CRL state, and leaves the status cache alone; the floor then refuses every later prepare for T.
 
 ## 7. Participant recovery (situations 2, 5, 7)
@@ -496,24 +499,33 @@ state, and Paxos, safe with offline acceptors, never chooses abort once commit w
 * It holds any abort resolution or abort `TxFinalized` until a lookup started after the first held abort finds no
   entry (`Tx.holdAbort`, `Frontend.unackedLookupComplete`, `firstCounting`); a later abort replaces the held message
   but does not move the wait. Then the held aborts are handled again and accepted (`Tx.unackedCommitAbsent`).
-* **Entry found naming its own incarnation** (`Tx.unackedCommitFound`): it resolves committed without writing the
-  status cache and applies its saved update; it keeps its CRL and acceptor state and waits for `TxFinalized` (or its
-  driver, which now holds the proof, or expiry); a stub replaces its state when it is forgotten.
-* **Entry found naming another incarnation, or none** (`Tx.unackedCommitNotOwed`): T committed, but nothing is applied
+* **Entry found naming its own incarnation, or none** (`Tx.unackedCommitFound`): it resolves committed without
+  writing the status cache and applies its saved update; it keeps its CRL and acceptor state and waits for
+  `TxFinalized` (or its driver, which now holds the proof, or expiry); a stub replaces its state when it is forgotten.
+  An entry names none when the finalizing driver did not count the votes (it learned commit from an accepted value, a
+  `TxResolved` or a relay) and never heard from the store. That store may hold the counted vote the commit relied on:
+  for a pool with `t = r` (Replication(3, 2)), the original driver dying before its marker wrote, plus one lost prepare,
+  leaves T at one other store, below the read threshold, so reconcile could never restore it. Every Tx that looks up
+  holds its own commit vote, so an unknown entry is applied. If that vote did not count, it is a replay's vote, which
+  passed T's pin: the pinned object is before T here, and T's committed update is what the store lacks. A rebuilt store
+  whose `acceptorSince` mute a skewed clock defeated is in the same position. The residual is a non-pinned object of T
+  changed since (a blind Insert of a key deleted later), transaction-requirements Q-W3.
+* **Entry found naming another incarnation** (`Tx.unackedCommitNotOwed`): T committed, but nothing is applied
   through the entry. A recovered or expiring vote resolves committed without writing the cache, drops its held aborts
   unaccepted, releases its locks, proves the commit to its driver, applies nothing (`notOwedHere`, reporting its
   objects in `objectCommitErrors`) and stays until `TxFinalized` or expiry concludes it (`concludeOwedCommit`, no
   stub). It cannot be forgotten earlier: an entry is durable before `TxFinalized` may have been sent, and a finalized
   cache entry here would let the relay report T late while other stores' entries are not yet durable. The entry is
   left for the repair scan, whose reconcile installs the committed state. Another incarnation means the store was
-  rebuilt since its vote; none means the finalizing driver never heard from the store (but see R-W1).
+  rebuilt since its vote, so the vote that counted is lost and this incarnation's copy comes from its rebuild.
 * **Lookup failure or no answer**: retried at heartbeat, re-issued after `UnackedLookupTimeout`; the Tx keeps holding
   aborts (and its locks) meanwhile, and is driven.
 * A found entry of any incarnation is never taken as absent. When a lookup finds an entry while a driver already runs,
   the Frontend hands the proof to it (`Frontend.onCommitProven` -> `Store.giveProof`).
 
 **Late commit at any commit voter** (`Tx.lateCommit`, recovered or live): held for a lookup started then; an own entry
-applies T and the Tx is forgotten as finalized with a stub; another or no incarnation, or no entry, applies nothing. A
+applies T and the Tx is forgotten as finalized with a stub, as does an entry naming no incarnation; another
+incarnation, or no entry, applies nothing. A
 stub already held applies nothing without a lookup. A Tx already resolved committed looks its entry up only to decide
 its stub (5.4, case 3). A Tx without its own commit vote (abort vote, no vote, prover, muted) applies nothing and
 sends no `TxCommitted`.
@@ -719,49 +731,15 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
   the store is owed T.
 * No driver starts while a store's CRL state loads, costing a client retransmit of latency.
 * Duplicate recovery drivers each run the finalization actions once.
-* A store owed T that the finalizing driver never heard from gets an entry naming no incarnation and applies nothing
-  through it; repair's reconcile installs T (store-incarnation design). R-W1 shows where this does not hold.
+* A store that never saw T, whose entry names no incarnation (the unknown-voters case), applies T through it if a
+  replayed prepare reached it and voted commit; a blind Insert of T can then reinstate a key deleted since, at that
+  store only (transaction-requirements Q-W3).
 * A transaction undecidable at expiry (too many rebuilt or forgetting primary stores, ExpiryTally rule G) holds its
   locks and CRL state, logged `UNDECIDABLE TRANSACTION`; a repair read of an allocation it holds stalls the scan
   (Backlog.txt, "Repair scan stalls on an allocation held past expiry").
 * Mixed-version finalizer types (Backlog.txt, "Mixed-Version Support").
 
 ## Open weaknesses
-
-### R-W1. A counted commit voter whose entry a takeover marker wrote with no incarnation never applies its vote (CONFIRMED; lost committed data)
-Mechanism: a driver that did not count the votes itself (`TransactionDriver.countedCommitVoters` is `None`: it learned
-commit from an accepted value, a `TxResolved` or a relay) passes only the incarnations it heard in its own prepare
-replies (`peerIncarnations`). `MissedUpdateFinalizationAction.writeMissedUpdates` writes an UnackedCommits entry for
-every store without `TxCommitted` and gives a store it never heard from `incarnations.get(store) = None`.
-`MissedUpdateMarker.writeBatch` writes an entry only where none is held, so whichever marker commits first fixes the
-incarnation; if the original driver died before its marker wrote, the takeover's `None` is the only entry.
-`Host.unackedLookup` decodes the zero UUID as `Found(None)`, and `Frontend.unackedLookupComplete` applies through the
-entry only for `found.contains(incarnation)`: `Found(None)` goes to `Tx.unackedCommitNotOwed`, which for a recovered or
-expiring vote sets `notOwedHere` (doCommit applies nothing) and for a held late commit calls `applyNothing`. The store
-that cast a counted, saved commit vote therefore never applies it; the entry is "left for reconcile", but reconcile
-reads the object through the pool, which returns T's update only if `r` other stores hold it.
-Trigger / scenario: pool of width 3, `t = r = 2` (e.g. Replication(3, 2)), stores A (leader), B, C. The client's
-prepare to C is lost (or dropped by CRL backpressure) and the client then dies. A and B vote commit; D0 on A gets
-A and B to accept commit, resolves (the client may already know commit from the votes or D0's `TransactionResolved`)
-and A applies. Before D0's marker writes (it waits for the other actions plus 2 s), A's host crashes, and B crashes
-before learning the outcome. A restarts: its recovered Tx is driven (D1 on A); C, prefer-abort, votes abort after 5 s
-and promises; D1's promise quorum {A, C} carries A's accepted commit, so D1 proposes and resolves commit with
-`voters = None`, never hearing from B. D1's marker writes B's entry with incarnation `None` and finalizes; A and C
-forget T. B restarts later: its recovered vote's lookup returns `Found(None)`, so it resolves committed and applies
-nothing (or, reached by the relay's late commit, `applyNothing`). Only A holds T; C and B hold the old revision.
-Consequence: a committed update (possibly reported committed to the client) is held by fewer than `r` stores. Reads
-return the pre-T state, and the ErrorTree/UnackedCommits reconciles of B and C read that state, fail the
-`missedTimestamp` gate, and stay forever. The committed update is lost although every failure was a crash-restart
-plus one lost message. The coverage argument of 5.3 fails whenever the owed voter is among the last `r` holders. The
-same happens to a live commit voter partitioned from D1 that ends by expiry (adopt late commit, then `Found(None)`).
-Suggested fix: treat `Found(None)` as owed for a Tx holding its own commit vote whose state came from this incarnation's
-CRL (`recovered = true`): a rebuild drops the CRL, and a store that never saw T has no recovered Tx, so neither case
-the `None` rule guards can reach it. For a live expiring voter, either apply on `Found(None)` too (accepting the
-self-healing divergence of a never-saw store's replay Tx, which transaction-requirements.md already covers), or have
-the takeover marker omit `None` entries for stores it did not hear and instead record that the voters were unknown in
-the entry so the lookup can tell "never heard" from "never saw". Add a TestNetwork test of the scenario above with a
-Replication(3, 2) pool.
-Effort: S   Priority: 1
 
 ### R-W2. A finalization action that keeps retrying (rather than failing) keeps the marker from running (CONFIRMED; liveness)
 Mechanism: `RegisteredTransactionFinalizerFactory.Finalizer` executes the marker only once `settled(first)` completes,

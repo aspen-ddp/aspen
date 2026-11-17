@@ -175,8 +175,8 @@ class Tx( trs: TransactionRecoveryState,
   /** See foundUnackedEntry */
   def provesCommitToItsDriver: Boolean = foundUnackedEntry && ofinalized.isEmpty
 
-  /** A recovered or expiring commit vote found an UnackedCommits entry naming another incarnation of this store, or
-    * none (unackedCommitNotOwed): T committed, and nothing of it is applied here (doCommit), as when the store holds an
+  /** A recovered or expiring commit vote found an UnackedCommits entry naming another incarnation of this store
+    * (unackedCommitNotOwed): T committed, and nothing of it is applied here (doCommit), as when the store holds an
     * applied stub. It also sets foundUnackedEntry: the entry proves the commit to its driver all the same
     */
   private var notOwedHere = false
@@ -931,7 +931,7 @@ class Tx( trs: TransactionRecoveryState,
 
     // An applied stub: the store already holds this transaction's update (or must never take it through its
     // UnackedCommits entry), so nothing is applied again, as for a recovered commit vote whose entry was found. A
-    // recovered vote whose entry names another incarnation, or none, applies nothing either (unackedCommitNotOwed)
+    // recovered vote whose entry names another incarnation applies nothing either (unackedCommitNotOwed)
     if notOwedHere || frontend.hasAppliedStub(transactionId) then
       if notOwedHere then
         logger.info(s"Tx $transactionId. Store $storeId is owed nothing through its UnackedCommits entry: nothing " +
@@ -1499,9 +1499,9 @@ class Tx( trs: TransactionRecoveryState,
         frontend.forget(this)
 
   /** The pool's UnackedCommits tree holds this store's entry for the transaction, but it names another incarnation
-    * of the store (the one whose vote counted, lost to a rebuild since) or none (the driver never heard from this
-    * store): T committed, and this incarnation is owed nothing through the entry. A replayed client prepare at a
-    * rebuilt store, or at a store that never saw T, would otherwise apply T over newer state.
+    * of the store (the one whose vote counted, lost to a rebuild since): T committed, and this incarnation is owed
+    * nothing through the entry. A replayed client prepare at a rebuilt store would otherwise apply T over newer state.
+    * An entry naming no incarnation is not this case: it applies (Frontend.unackedLookupComplete).
     *  - A late commit of a transaction already applied here (lateCommit's forget-lookup): it writes its stub and is
     *    forgotten, as for a matching entry (unackedCommitFound): a stub only ever suppresses an apply.
     *  - A held late commit, or a commit vote whose expiry Discard was decided: a real late outcome exists (T was

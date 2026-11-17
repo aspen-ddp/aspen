@@ -790,8 +790,8 @@ narrowed to `only = {k0}` and never look at k1; T may then commit at any time un
 for a hot k0 is many scan periods. The same hole reaches UnackedCommits entries through the phase-A shortcut
 (`Counts.recordCompleted` / `completedAt`): phase A records X complete at t2 from a read that predates T, and phase B
 of the same scan treats T's UnackedCommits entry for X as complete. That matters only where S can forget T without
-applying it (a recovered vote whose entry names another incarnation or none, which "leaves the entry for the repair
-scan", `Frontend.unackedLookupComplete`).
+applying it (a recovered vote whose entry names another incarnation, which "leaves the entry for the repair scan",
+`Frontend.unackedLookupComplete`).
 Consequence: S's copy of X never receives T's update of k1, and no entry records it. Reads stay correct (quorum), but
 X's redundancy is one store short until something else rewrites k1 at S, S misses a later update of X, or S is rebuilt.
 For a cold object that is permanent.

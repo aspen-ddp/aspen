@@ -66,9 +66,7 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.5  P-F13 body: rewrite it as intended (Ruling 10). CRL F14: pick one status for readStoreState vs disk
-     recovery. CRL F17: document that MapBackend gives no durability. Req F9 remainder: LocalTimeRequirement
-     is per-store clock (test-only).
+(no open items)
 
 PRIORITY 8: unimplemented features
 ----------------------------------

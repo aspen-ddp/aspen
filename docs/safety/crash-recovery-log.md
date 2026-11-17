@@ -129,8 +129,9 @@ Items marked **(intended)** are what the design requires; section 11 lists where
 - **C14 (readStoreState is ordered).** `readStoreState` is answered in order with the saves and deletes issued before
   it, so it sees every save whose call preceded it. `dropStore` relies on this to delete only what existed when called
   (`CrashRecoveryLog.scala:155-162`).
-- **C15 (recovered status).** Disk recovery always returns `TransactionStatus.Unresolved`
-  (`Recovery.scala:100`). `readStoreState` returns the in-memory record, whose status is whatever was last saved (F14).
+- **C15 (recovered status).** Disk recovery and `readStoreState` return the same status: the one last saved. The
+  static record stores it in bits 3-4 of the Paxos mask byte (`LogContent` `Tx.writeStaticEntry`/`loadTx`), so the
+  record's size is unchanged (F14, fixed 2026-11-16).
 
 ---
 
@@ -1177,6 +1178,15 @@ after the backend commit, `Tx.scala:608-610`), so a re-application is normally e
 
 ### F14. `readStoreState` and disk recovery return different statuses (low confidence of harm)
 
+> **FIXED 2026-11-16 (Todo 7.5).** One status: the one last saved. The static record now persists it (bits 3-4 of
+> the Paxos mask byte; size and `CrlAdmission.TxOverheadBytes` unchanged) and `Recovery` restores it instead of
+> `Unresolved`. Reproduced first: a crash recovered saved `Committed` and `Aborted` records as `Unresolved`. This
+> mattered more than the finding said: transaction-recovery F6's fix restores a recovered Tx's resolution from its
+> saved status, and was tested only through `TestCrl`, so after a real crash of a SimpleCRL it never applied (the
+> Tx fell back to the unresolved path: lookup and driver). Test: SimpleCRLSuite "A crash recovers each record's
+> saved status, as readStoreState returns it (CRL F14)"; "Tx Static Save & Load with ObjectUpdate data" checks the
+> encoding.
+
 **Verification: CONFIRMED (code), severity doc-only.** `Recovery.scala:100` sets Unresolved; `SimpleCRL.scala:265` returns the live state. Fix sketch: pick one and document it.
 
 Disk recovery sets `TransactionStatus.Unresolved` (`Recovery.scala:100`); `readStoreState` returns `tx.state` as last
@@ -1220,6 +1230,10 @@ argument is not in the spec; it deserves one.
 Combined with F3 each restart is a rotation-class risk.
 
 ### F17. Durable backend assumption (A4) for backends other than RocksDB/FSIF (not verified)
+
+> **CLOSED 2026-11-16 (Todo 7.5), documented.** `MapBackend`'s scaladoc and `server/store/CLAUDE.md` (Backends) now
+> state that it gives no durability, is for tests only (no `BackendOpener` constructs it), and that any backend used
+> outside tests must complete a commit only once it is durable.
 
 **Verification: REFUTED for RocksDB and FSIF, doc-only for MapBackend.** RocksDB writes with `setSync(true)` (`BufferedConsistentRocksDB.scala:110-112`); FSIF's commit completes when the journal batch is forced (`FsifBackend.scala` header, durable-before-map). `MapBackend` is memory only, so it loses its data on a crash regardless of the CRL.
 

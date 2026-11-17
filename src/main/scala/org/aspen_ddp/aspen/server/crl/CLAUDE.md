@@ -1,6 +1,9 @@
 ### Crash Recovery Log
 - Similar to a write-ahead-log in traditional databases
 - Stores the state necessary for Paxos as well as the TransactionDescription, commit/abort vote, and object data
+- A record's saved `TransactionStatus` is persisted (bits 3-4 of the static record's Paxos mask byte), so disk
+  recovery returns the status `readStoreState` and `crl_save.log` do (safety F14). A recovered Tx restores a saved
+  resolution from it (`Tx.oresolution`, transaction-recovery R-F6)
 - Only read at application startup to recover in-progress transactions
 - Takes advantage of the fact that Transactions are typically very short-lived so their state usually does not need to
   be retained for long

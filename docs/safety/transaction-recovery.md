@@ -956,6 +956,11 @@ Fix direction: restore `oresolution` from `trs.status` on recovery.
 > **Fixed 2026-11-14.** `oresolution` is restored from the saved status. A recovered `Committed` Tx applies its update
 > on load and an `Aborted` one deletes its state (re-assessment for recovered resolutions, above). Also fixed: a commit
 > whose backend completed synchronously inside `issueCommits` was concluded twice (a duplicate `TxCommitted`).
+>
+> **2026-11-16 (crash-recovery-log F14, Todo 7.5).** The fix held only for states read without a crash (transfers,
+> `TestCrl`): SimpleCRL's disk recovery returned every record `Unresolved`, so after a real crash the restore never
+> ran and the Tx took the unresolved path (lookup, driver). The CRL now persists the status, so the fix holds across
+> a crash too.
 
 > **Verification 2026-11-09: CONFIRMED (mechanism). Severity: resurrection (see paxos F3).** Same as paxos F3 (Frontend.scala:655; no server-side HLC update).
 > *Fix sketch:* As paxos F3.

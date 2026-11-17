@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectRefcount, ObjectType}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{TransactionDisposition, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 
 import java.nio.ByteBuffer
@@ -52,6 +52,7 @@ object Tx:
                        txdLocation: StreamLocation,
                        updateLocations: Option[List[(ObjectId, StreamLocation)]],
                        disposition: TransactionDisposition.Value,
+                       status: TransactionStatus.Value,
                        paxosAcceptorState: PersistentState)
 
   def loadTx(bb: ByteBuffer): LoadingTx =
@@ -71,6 +72,11 @@ object Tx:
     val promised = if ((pmask & 1 << 0) != 0) Some(ProposalId(prom_num, prom_peer)) else None
     val accepted = if ((pmask & 1 << 1) != 0) Some((ProposalId(accept_num, accept_peer), (pmask & 1 << 2) != 0)) else None
     val paxState = PersistentState(promised, accepted)
+    val status = (pmask >> 3) & 3 match
+      case 0 => TransactionStatus.Unresolved
+      case 1 => TransactionStatus.Committed
+      case 2 => TransactionStatus.Aborted
+      case x => throw CorruptedEntry(s"Invalid status encoding value: $x")
     val numObjectUpdates = bb.getInt()
     var updateLocations: Option[List[(ObjectId, StreamLocation)]] = None
     var updateList: List[(ObjectId, StreamLocation)] = Nil
@@ -85,7 +91,7 @@ object Tx:
     else
       Some(updateList.reverse)
 
-    LoadingTx(txid, txdLocation, updateLocations, disposition, paxState)
+    LoadingTx(txid, txdLocation, updateLocations, disposition, status, paxState)
 
 
 /** A live entry of the CRL: a transaction's state (Tx) or an applied stub (Stub). Records are queued by the entry that
@@ -170,6 +176,8 @@ final class Tx(id: TxId,
     //         bit 0 - have promise proposal
     //         bit 1 - have accepted proposal
     //         bit 2 - accepted boolean value (only valid if bit 1 is set)
+    //         bits 3-4 - the saved TransactionStatus: 0 Unresolved, 1 Committed, 2 Aborted. Recovery restores it, so a
+    //                    crash returns the status readStoreState does (crash-recovery-log F14)
     //     object_updates: 4-byte-count, num_updates * (16:objuuid + FileLocation))
     //
     val base = TxId.StaticSize + StreamLocation.StaticSize + 1 + 11 + 4
@@ -201,6 +209,10 @@ final class Tx(id: TxId,
       mask |= 1 << 1
       if t._2 then
         mask |= 1 << 2 // Mark as accepted
+    mask |= (state.status match
+      case TransactionStatus.Unresolved => 0
+      case TransactionStatus.Committed => 1
+      case TransactionStatus.Aborted => 2) << 3
 
     bb.put(mask.toByte)
 

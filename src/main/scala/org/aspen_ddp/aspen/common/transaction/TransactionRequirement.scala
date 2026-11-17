@@ -10,6 +10,8 @@ sealed abstract class TransactionRequirement
 /** Holds when the local time of each store checking it equals, is less than, or is greater than `timestamp`
   * (`Equals`, `LessThan`, `GreaterThan`). Every store hosting an object of the transaction checks it against its own
   * clock when it votes, so stores can disagree, and a store's failure aborts its vote for all of its objects.
+  * Test-only: no production code constructs it and TransactionBuilder has no method for it (transaction-requirements
+  * F9). A per-store clock is no basis for a decision the stores must share; use HLC object timestamps instead.
   */
 case class LocalTimeRequirement(timestamp: HLCTimestamp,
                                 tsRequirement: LocalTimeRequirement.Requirement.Value) extends TransactionRequirement

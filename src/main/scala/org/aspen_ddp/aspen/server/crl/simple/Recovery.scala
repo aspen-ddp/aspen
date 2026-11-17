@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.crl.simple
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.ObjectId
-import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.ObjectUpdate
 import org.aspen_ddp.aspen.server.crl.{CrlCorrupt, TransactionRecoveryState}
 import scribe.Logging
 
@@ -145,7 +145,7 @@ object Recovery extends Logging:
         readStreamLocation(ltx.txdLocation),
         ous,
         ltx.disposition,
-        TransactionStatus.Unresolved,
+        ltx.status,
         ltx.paxosAcceptorState)
       val locations = ltx.txdLocation :: ltx.updateLocations.getOrElse(Nil).map(_._2)
       RecoveredTx(ltx.id, trs, ltx.txdLocation, ltx.updateLocations, locations.map(entryHolding).min)

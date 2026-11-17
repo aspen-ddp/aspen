@@ -805,6 +805,10 @@ a recovered commit vote for it relies on the recovery driver (see [transaction-r
 > `TimestampLessThan/GreaterThan(k, ts)` hold when the key's timestamp is `<` / `>` `ts`. The definitions carry scaladoc
 > and `RequirementsCheckerSuite` tests each direction. Remaining by design: `LocalTimeRequirement` is checked by each
 > store against its own clock, so stores can disagree (documented on the class); it is still unused outside tests.
+>
+> **CLOSED 2026-11-16 (Todo 7.5).** The remainder is documented: the class scaladoc says each store checks it against
+> its own clock, that it is test-only (no production constructor, no `TransactionBuilder` method), and that shared
+> decisions should use HLC object timestamps instead. Nothing else remains.
 
 
 `Equals` throws when equal (`Checker:207-209`), the other two compare `now` to `ts` in the opposite direction from the

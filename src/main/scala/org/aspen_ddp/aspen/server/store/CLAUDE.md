@@ -187,6 +187,9 @@
   in-flight commits; a failed backend commit stays pinned and served
 
 #### Backends (`backend/`)
+- A backend's commit completion must mean durable: the CRL deletes a committed transaction's record once the backend
+  commit completes. RocksDB writes synced, FSIF completes at the journal force. `MapBackend` is memory only and gives
+  no durability (crash-recovery-log F17); it is for tests, and no opener constructs it
 - Pluggable: RocksDB, in-memory Map, and FSIF (`backend/fsif`, a flat file of fixed-size segments located by a
   4-byte storePointer, with a journal and checkpointed index; design in `backend/fsif/DESIGN.md`). FSIF freezes
   writes on ENOSPC and keeps serving reads. A repair write never overwrites a different occupant of its slot: it

@@ -530,7 +530,7 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("Tx Static Save & Load with ObjectUpdate data") {
-    val tx = Tx(txid, trs, Some(txdLoc), updateLocations)
+    val tx = Tx(txid, trs.copy(status = TransactionStatus.Committed), Some(txdLoc), updateLocations)
 
     val buffer = new Array[Byte](4096 * 5)
 
@@ -545,6 +545,7 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(ltx.txdLocation == txdLoc)
     assert(ltx.updateLocations == updateLocations)
     assert(ltx.paxosAcceptorState == pax)
+    assert(ltx.status == TransactionStatus.Committed)
   }
 
   test("Tx Static Save & Load without ObjectUpdate data") {
@@ -613,6 +614,34 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(byStore(storeId).head.paxosAcceptorState == pax)
     assert(byStore(storeId2).head.serializedTxd == trsValidTxd2.serializedTxd)
 
+    i2.crl.shutdown()
+  }
+
+  test("A crash recovers each record's saved status, as readStoreState returns it (CRL F14)") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+
+    val committed = trsValidTxd.copy(status = TransactionStatus.Committed)
+    val aborted = trsValidTxd2.copy(status = TransactionStatus.Aborted,
+      paxosAcceptorState = PersistentState(Some(promise), Some((accept, false))))
+    val unresolved = trsValidTxd4
+    saveAndWait(i.crl, transactionId, committed)
+    saveAndWait(i.crl, transactionId2, aborted)
+    saveAndWait(i.crl, transactionId4, unresolved)
+
+    def statuses(crl: CrashRecoveryLog): Map[StoreId, TransactionStatus.Value] =
+      List(storeId, storeId2, storeId3).map: s =>
+        s -> Await.result(crl.readStoreState(s), 10.seconds).transactions.head.status
+      .toMap
+
+    val expected = Map(storeId -> TransactionStatus.Committed, storeId2 -> TransactionStatus.Aborted,
+      storeId3 -> TransactionStatus.Unresolved)
+    assert(statuses(i.crl) == expected)
+
+    i.crl.shutdown()
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i2.trsList.map(t => t.storeId -> t.status).toMap == expected)
+    assert(statuses(i2.crl) == expected)
+    assert(i2.trsList.find(_.storeId == storeId2).get.paxosAcceptorState == aborted.paxosAcceptorState)
     i2.crl.shutdown()
   }
 

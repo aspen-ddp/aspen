@@ -1372,16 +1372,34 @@ conflicting `TxResolved`/`TxFinalized` at every site and a counter.
 local proposal from round 1 is reused without re-tallying (`Proposer.scala:54`); safe because votes are immutable, but
 the invariant is implicit.
 
-### F13. `proveCommitted` leaves an in-memory `VoteAbort` that a later save can persist. Confidence: low
+### F13. A prover's abort vote is saved on later prepares. Confidence: high (intended, Ruling 10)
+
+> **CLOSED 2026-11-16 by design (Todo 7.5).** The body below is rewritten as the code now behaves; the original
+> concern is kept under "Original finding".
+
+`decideDisposition` sets `disposition = VoteAbort` and, when the abort is due only to objects that already show T
+(`appliedHere`), calls `proveCommitted` (`Tx.scala` `decideDisposition`, `proveCommitted`). Only a memoryless
+acceptor proves (`mayProve`: nothing accepted and no Paxos state recovered from the CRL). Its first answer is the
+proof, a `TxResolved` with `proof = true` to the proposer; nothing is saved then. The prover stays a live Tx and an
+ordinary acceptor (replay-pins Amendments, Rulings 10, 11, 14): each later prepare gets a promise carrying no
+accepted value plus the abort vote, saved to the CRL before it is sent (`answerPrepare` → `answerPrepareAsAcceptor`),
+and an accept is saved with the same disposition (`receiveAccept`). Those memoryless promises to a round started
+after the proof are what let the driver resolve late (`TransactionDriver.resolveLate`). A muted prover sends only the
+proof. On any real outcome the prover applies nothing, sends no `TxCommitted` and is forgotten (`applyNothing`).
+
+A saved `VoteAbort` on a committed transaction is therefore intended. It is a true vote: the store's requirements
+fail, and it holds no commit vote, so it is owed nothing. The P4 exception the original finding raised does not arise:
+after a crash the Tx recovers with Paxos state, so `mayProve` is false and it answers as an ordinary acceptor with the
+abort vote it saved, which the driver, holding the proof, does not count against the commit. Cost: one extra CRL
+record per prover, within admission (crash-recovery-log, replay-pins re-assessment).
+
+**Original finding (2026-11-09, superseded).** `decideDisposition` assigned `VoteAbort` before `proveCommitted`; the
+Tx never answered with it, but a later accept or prepare saved it, so a restart could recover a `VoteAbort` on a
+committed transaction and send it to a later driver.
 
 > **Verification 2026-11-09: CONFIRMED (mechanism). Severity: doc-only/low.** decideDisposition sets disposition = VoteAbort before proveCommitted (Tx.scala:582-586); answerPrepare then returns without respondToPrepare, but receiveAccept saves the in-memory disposition (Tx.scala:888-903).
 > *Fix sketch:* Set disposition only after the proof check, or reset it to Undetermined in proveCommitted.
 
-
-`decideDisposition` assigns `disposition = VoteAbort` before it calls `proveCommitted` (`Tx.scala:582-586`). That Tx
-never answers with it, but `receiveAccept` (`:896-897`) and a later prepare save `disposition` as it stands, so a restart
-can recover a `VoteAbort` on a committed transaction (status `Committed`). It would be sent as an abort vote to a later
-driver. Practically masked by the proof, but P4's exception.
 
 ### F14. Adopted late object data is not persisted until the next save. Confidence: medium, low impact
 

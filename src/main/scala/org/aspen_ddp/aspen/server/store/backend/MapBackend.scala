@@ -8,6 +8,12 @@ import org.aspen_ddp.aspen.server.store.ObjectState
 
 import scala.concurrent.{Future, Promise}
 
+/** An in-memory backend for tests. It gives no durability: a commit's completion means only that the map holds it,
+  * so a crash loses the store's data whatever the CRL holds, and the CRL's record of a committed transaction may be
+  * deleted (Frontend, after the backend commit) with nothing durable left (crash-recovery-log F17). No
+  * BackendOpener constructs it. A backend used outside tests must complete a commit only once it is durable (RocksDB:
+  * synced writes; FSIF: the journal force)
+  */
 class MapBackend(val storeId: StoreId) extends Backend {
 
   private var chandler: Option[CompletionHandler] = None

@@ -20,9 +20,12 @@
   when no revision can still reach the threshold and no store holds the lock of any segment's revision (repair F12)
 - `InvalidObject.provesDeletion` counts only `ObjectNotFound`/`ObjectMismatch` replies (or a consistent majority at
   refcount 0). `StoreNotFound` and `AllocationPending` (a commit voter that has not applied the object's allocation,
-  `server/store/CLAUDE.md`) are errors that prove nothing, so a read of an object whose allocation just committed
-  never proves it deleted. Callers that drop or skip an object on absence (repair, rebuild, the allocation and split
-  finalization actions) act only on the proof
+  `server/store/CLAUDE.md`) prove nothing. `BaseReadDriver` does not even hand either to the object reader: it
+  re-reads that store at once (the store parks an `AllocationPending` re-read until the allocation applies or aborts,
+  `Frontend.parkAllocationRead`). So a read of an object whose allocation committed waits for it to apply and never
+  fails or proves it deleted, which a client that learned the commit from the votes (before any store applied it)
+  needs to read its own new object. Callers that drop or skip an object on absence (repair, rebuild, the allocation
+  and split finalization actions) act only on the proof
 - `ClientTransactionDriver.result` is a `ClientOutcome` (`Committed`, `Aborted`, `Unknown`). `SimpleClientTransactionDriver`
   stops retransmitting and completes `Unknown` once the client's clock is past `startTimestamp + horizon + MaxStartLead`
   (`TransactionHorizon.clientGiveUp`), checked at each retransmit tick. A transaction already that late at `begin()`

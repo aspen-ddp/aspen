@@ -637,8 +637,9 @@ class Tx( trs: TransactionRecoveryState,
 
   /** This store voted to commit the allocation of `objectId` and has not applied it: its fresh state is known only to
     * this transaction, so a client read misses. The store answers `AllocationPending` rather than `ObjectNotFound`
-    * (Frontend.backendReadComplete), so a read straight after the allocation commits cannot prove the object deleted
-    * (transaction-requirements Q-N5). Once doCommit starts, the in-flight commit's state is served
+    * (Frontend.backendReadComplete; it parks the read until this is false, Frontend.parkAllocationRead), so a read
+    * straight after the allocation commits cannot prove the object deleted (transaction-requirements Q-N5). Once
+    * doCommit starts, the in-flight commit's state is served
     */
   def allocationUnapplied(objectId: ObjectId): Boolean =
     allocatedHere.contains(objectId) && disposition == TransactionDisposition.VoteCommit && !committing &&

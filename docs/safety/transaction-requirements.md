@@ -991,6 +991,24 @@ can starve shared lockers. Documented behaviour.
 >   the stores apply the allocation, then records the entry under a lock", "a run after the object's deletion records
 >   no entry"; SplitFinalizationActionSuite "a split FA that reads its node before the stores apply it waits, then
 >   indexes it". Both window tests fail without the store change.
+>   *2026-11-16 (client 1-RTT commit):* a client that learns its allocation committed from the votes reads the new
+>   object before any store applied it, and a threshold of `AllocationPending` replies ended the read `InvalidObject`
+>   (no proof, but a failed read of the client's own object; ThreadedHostSuite). `BaseReadDriver` now re-reads a store
+>   that answers `AllocationPending` instead of delivering the reply, and the store parks that read until no held Tx
+>   has the allocation pending (`Frontend.parkAllocationRead`; answered `AllocationPending` at `ParkedReadWait`). A
+>   read of such an object therefore waits for the allocation's outcome: the object once it applies, a proof-capable
+>   `ObjectNotFound` once it aborts. The proof argument above is unchanged. The actions' and repair's "retry" cases now
+>   wait inside the read. Tests: FastCommitIntegrationSuite "a read of an object whose allocation the client learned
+>   committed from the votes waits for it to apply"; FrontendSuite "a read of an allocation voted for but not applied
+>   is answered once it applies" (renamed from "... answers AllocationPending"), "a parked read of an allocation is
+>   answered ObjectNotFound when the allocation aborts", "a parked read of an unapplied allocation is answered
+>   AllocationPending at ParkedReadWait"; BaseReadDriverSuite "an AllocationPending reply re-reads that store at once
+>   and never ends the read"; StoreRepairerSuite G8 (the scan's read waits, then finds the object live).
+>   The same regression exposed an older window: a client read's backend load in flight when the allocation's commit
+>   applied in memory completed with a miss after `allocationPending` had turned false, and was answered
+>   `ObjectNotFound`, so two such stores proved a live object deleted. A miss for a client read now serves the state
+>   committed meanwhile (`Frontend.backendReadComplete`). Test: FrontendSuite "a backend miss for a read that
+>   completes after the allocation applied serves the committed state".
 > * `MissedUpdateMarker.writeBatch` ("missed-update marks are idempotent", `MissedUpdateMarker.scala:165`): **PLAUSIBLE
 >   (stale-replica, narrow)**. Re-writing one batch is idempotent, but a replayed or late batch's blind upsert replaces a
 >   newer entry's `missedTimestamp` with an older one (repair F10) and re-creates UnackedCommits entries the repair

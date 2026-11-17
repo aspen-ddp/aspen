@@ -95,7 +95,7 @@ object Frontend {
 
   sealed abstract class ReadKind
 
-  case class NetworkRead(clientId: ClientId, requestUUID: UUID, readType: ReadType) extends ReadKind
+  case class NetworkRead(clientId: ClientId, requestUUID: UUID, readType: ReadType, pointer: ObjectPointer) extends ReadKind
 
   case class TransactionRead(transactionId: TransactionId) extends ReadKind
 
@@ -533,10 +533,11 @@ class Frontend(val storeId: StoreId,
   private val parkedRepairs = scala.collection.mutable.HashMap[ObjectId, ParkedRepair]()
 
   /** A client's read waiting for committed transactions it names (Read.awaitCommit) to release their locks on its
-    * object, until `until` (wallClockMillis). See parkRead
+    * object, or, for `allocation`, for this store's unapplied commit vote on the object's allocation to apply or abort,
+    * until `until` (wallClockMillis). See parkRead and parkAllocationRead
     */
   private final class ParkedRead(val clientId: ClientId, val pointer: ObjectPointer, val readType: ReadType,
-                                 val awaitCommit: Set[TransactionId], val until: Long)
+                                 val awaitCommit: Set[TransactionId], val until: Long, val allocation: Boolean = false)
 
   /** By object, then read: a resent read replaces its entry. Declared before the constructor's recovery, whose Txs
     * release locks (answerParkedReads)
@@ -1651,6 +1652,28 @@ class Frontend(val storeId: StoreId,
     else
       false
 
+  /** Parks a client's read that missed in the backend while this store holds an unapplied commit vote on the object's
+    * allocation (allocationPending). Answered now it could only say AllocationPending, which the client re-reads at
+    * once: the allocation either applies (doCommit then serves its state) or aborts (an absence). It is answered once
+    * no held transaction has the allocation pending (answerParkedReads, from the allocating Tx's unlock), or at
+    * parkedReadWait with AllocationPending if it still is (expireParkedReads). Never past MaxParkedReads. Safety is
+    * unaffected: a parked read only delays its own answer
+    */
+  private def parkAllocationRead(netRead: NetworkRead, pointer: ObjectPointer): Boolean =
+    if parkedReadCount < Frontend.MaxParkedReads then
+      logger.trace(s"Store $storeId: read ${netRead.requestUUID} of ${pointer.id} waits for its allocation to apply")
+      unparkRead(pointer.id, netRead.requestUUID)
+      parkedReads.getOrElseUpdate(pointer.id, scala.collection.mutable.HashMap())(netRead.requestUUID) =
+        ParkedRead(netRead.clientId, pointer, netRead.readType, Set(), wallClockMillis() + parkedReadWait.toMillis,
+          allocation = true)
+      parkedReadCount += 1
+      true
+    else
+      false
+
+  private def parkedReadReady(objectId: ObjectId, r: ParkedRead, locks: => Set[TransactionId]): Boolean =
+    if r.allocation then !allocationPending(objectId) else !r.awaitCommit.exists(locks.contains)
+
   private def unparkRead(objectId: ObjectId, readUUID: UUID): Unit =
     if parkedReadCount > 0 then
       parkedReads.get(objectId).foreach: reads =>
@@ -1665,19 +1688,25 @@ class Frontend(val storeId: StoreId,
     if parkedReadCount > 0 then
       objectIds.foreach: objectId =>
         parkedReads.get(objectId).foreach: reads =>
-          val locks = servableState(objectId).map(_.lockedWriteTransactions).getOrElse(Set())
-          val ready = reads.filter((_, r) => !r.awaitCommit.exists(locks.contains)).toList
+          lazy val locks = servableState(objectId).map(_.lockedWriteTransactions).getOrElse(Set())
+          val ready = reads.filter((_, r) => parkedReadReady(objectId, r, locks)).toList
           ready.foreach((readUUID, _) => unparkRead(objectId, readUUID))
           ready.foreach((readUUID, r) => readObjectForNetwork(r.clientId, readUUID, r.pointer, r.readType))
 
-  /** Answers, with the state as it now is, every parked read past its deadline. Called on the store's heartbeat */
+  /** Answers, with the state as it now is, every parked read past its deadline: AllocationPending for an allocation
+    * read whose allocation is still pending, which would otherwise only park again. Called on the store's heartbeat */
   def expireParkedReads(): Unit =
     if parkedReadCount > 0 then
       val now = wallClockMillis()
       val due = parkedReads.toList.flatMap((objectId, reads) =>
         reads.toList.collect { case (readUUID, r) if r.until <= now => (objectId, readUUID, r) })
       due.foreach((objectId, readUUID, _) => unparkRead(objectId, readUUID))
-      due.foreach((_, readUUID, r) => readObjectForNetwork(r.clientId, readUUID, r.pointer, r.readType))
+      due.foreach: (objectId, readUUID, r) =>
+        if r.allocation && allocationPending(objectId) then
+          net.sendClientResponse(ReadResponse(r.clientId, storeId, readUUID, HLCTimestamp.now,
+            Left(ReadError.AllocationPending)))
+        else
+          readObjectForNetwork(r.clientId, readUUID, r.pointer, r.readType)
 
   /** Drops every parked read unanswered, as an offline store would: the store fail-stopped or is closing, and the
     * clients retransmit
@@ -1706,7 +1735,7 @@ class Frontend(val storeId: StoreId,
       case None =>
         logger.trace(s"Reading uncached object from backing store for read $readUUID")
 
-        val nr = NetworkRead(clientId, readUUID, readType)
+        val nr = NetworkRead(clientId, readUUID, readType, pointer)
 
         pendingReads.get(objectId) match
           case Some(lst) =>
@@ -2004,14 +2033,20 @@ class Frontend(val storeId: StoreId,
             case netRead: NetworkRead if holding =>
               logger.trace(s"Store $storeId dropped read ${netRead.requestUUID}: holding for recovered transactions")
 
+            // The miss is older than a state committed meanwhile (an allocation applied while the load was in flight):
+            // the committed state is served instead, as the success branch serves a newer in-flight state
+            case netRead: NetworkRead if err == ReadError.ObjectNotFound && servableState(objectId).isDefined =>
+              logger.trace(s"Store $storeId: backend miss for read ${netRead.requestUUID} of $objectId superseded by a " +
+                "committed state")
+              readForNetwork(netRead.clientId, netRead.requestUUID, netRead.pointer, netRead.readType)
+
             case netRead: NetworkRead =>
               logger.trace(s"Completed backend load for read ${netRead.requestUUID}. ERROR $err. Sending read response")
-              val reply = if err == ReadError.ObjectNotFound && allocationPending(objectId) then
-                ReadError.AllocationPending
-              else
-                err
-              val rr = ReadResponse(netRead.clientId, storeId, netRead.requestUUID, HLCTimestamp.now, Left(reply) )
-              net.sendClientResponse(rr)
+              val pending = err == ReadError.ObjectNotFound && allocationPending(objectId)
+              if !pending || !parkAllocationRead(netRead, netRead.pointer) then
+                val reply = if pending then ReadError.AllocationPending else err
+                val rr = ReadResponse(netRead.clientId, storeId, netRead.requestUUID, HLCTimestamp.now, Left(reply) )
+                net.sendClientResponse(rr)
 
             case tr: TransactionRead => transactions.get(tr.transactionId).foreach { tx =>
               // A miss is what lets a transaction allocate the object here; a deletion in flight is no miss

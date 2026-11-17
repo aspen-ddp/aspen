@@ -308,6 +308,23 @@ Client → stores (vote saved) → client: 2 one-way hops and one CRL write. Sto
   - A retransmit of the same `readUUID` replaces the parked entry rather than adding one.
   - Cap the number of reads parked per store. Past the cap, answer at once.
 - Safety: none affected. A false or stale claim from a client only delays its own read.
+- Allocations (added after the ThreadedHostSuite regression): a client told Committed by the votes reads its new
+  object before any store applied the allocation. Every commit voter then misses it in its backend and answers
+  `AllocationPending` (transaction-requirements Q-N5), and a threshold of those used to end the read `InvalidObject`
+  (no proof, but still a failed read of the client's own object). Now:
+  - `BaseReadDriver` treats an `AllocationPending` reply like `StoreNotFound`: not an answer, the store is re-read at
+    once, and the object reader never sees it. The allocation either applies or aborts (then `ObjectNotFound`).
+  - The store parks a client read that would answer `AllocationPending` (`Frontend.parkAllocationRead`; no
+    `awaitCommit` needed: the store knows its own unapplied commit vote) until no held Tx has the allocation pending
+    (`answerParkedReads`, from the allocating Tx's unlock, after `doCommit` applied it in memory). At `ParkedReadWait`
+    it answers `AllocationPending` and the client re-reads, so a stuck allocation costs one round trip a second.
+  - No protocol change. Every reader of such an object waits for the allocation's outcome rather than failing: its
+    pointer is published only by the allocating transaction, so it is, or is about to be, committed.
+  - A client read's backend miss that completes after the allocation applied in memory serves the committed state
+    (its load was in flight across the apply), not `ObjectNotFound`.
+  - Read-your-writes after a vote-completed commit rests on the client's status cache (`TransactionImpl` records
+    the commit, so `BaseReadDriver` re-reads stores still holding its locks). A client without one (the TestNetwork
+    default, `HostOptions.clientStatusCache = false`) can read the old revision under the commit's lock.
 
 ## 6. Constraints
 

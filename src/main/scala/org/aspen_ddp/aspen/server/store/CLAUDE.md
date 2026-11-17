@@ -45,8 +45,11 @@
   backend miss for a client read, a store that holds a Tx with a commit vote on the object's allocation, not yet
   applied (`Tx.allocationUnapplied`: no `doCommit` yet, not known aborted), answers `AllocationPending`, not
   `ObjectNotFound` (`Frontend.allocationPending`; it scans the held transactions, misses only). A read straight after
-  the allocation commits therefore cannot prove the object deleted (transaction-requirements Q-N5). Once `doCommit`
-  starts, the in-flight state is served
+  the allocation commits therefore cannot prove the object deleted (transaction-requirements Q-N5). The read is
+  parked rather than answered (`parkAllocationRead`, Parked reads below), and the client re-reads a store that answers
+  `AllocationPending` anyway. Once `doCommit` starts, the in-flight state is served, and a client read's backend
+  miss that completes after that (its load was in flight when the commit applied) serves that state rather than
+  answering `ObjectNotFound`: the miss predates it
 - A prepare that reaches a store after its transaction was finalized is not applied there: the store relies on
   missed-update repair. A collision is an ordinary abort vote, even with an already-completed transaction, except
   one with a lock holder the transaction is built on (it requires the revision the holder writes): the store then
@@ -225,6 +228,12 @@
   state as it is then. At `Frontend.MaxParkedReads` (1024) parked a read is answered at once. A read reaching the
   backend is never parked (an uncached object holds no locks). Fail-stop and close drop parked reads unanswered; the
   client retransmits. Safety is unaffected: a parked read only delays its own answer
+- Parked allocation reads: a client read that misses in the backend while `allocationPending` holds is parked too
+  (`parkAllocationRead`, `ParkedRead.allocation`; `NetworkRead` carries the pointer for it), with no `awaitCommit`: the
+  store knows its own unapplied commit vote. `answerParkedReads` answers it once no held Tx has the allocation
+  pending (the allocating Tx's unlock: after `doCommit` applied it in memory, so the state is served, or on abort or
+  discard, so `ObjectNotFound`). At `parkedReadWait` it is answered `AllocationPending` if still pending, which the
+  client re-reads at once; at `MaxParkedReads` it is answered `AllocationPending` at once
 - `deleteObjectForRepair` refuses (`Frontend.RepairDeleteDeferred`) while the store holds for recovered transactions or
   the object has a pending backend read, a commit, repair write or deletion in flight, or a transaction referencing
   it (repair F6); while its backend removal is outstanding the object counts in `deleting`, so reads, snapshots and

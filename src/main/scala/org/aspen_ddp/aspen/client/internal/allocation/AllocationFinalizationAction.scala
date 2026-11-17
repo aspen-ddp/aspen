@@ -30,8 +30,9 @@ class AllocationFinalizationAction(val client: AspenClient,
     *  - any other read failure: the attempt fails and is retried
     *
     * A read straight after resolution can precede the stores applying the allocation. Its commit voters then answer
-    * `AllocationPending`, not `ObjectNotFound`, so the read fails without proof and is retried: a live object is never
-    * taken to be gone (skipping its entry would lose it on repair and rebuild). Residual: an object already below
+    * `AllocationPending`, not `ObjectNotFound`, and the read waits for them to apply it (BaseReadDriver re-reads such
+    * a store, which parks the re-read): a live object is never taken to be gone (skipping its entry would lose it on
+    * repair and rebuild). Residual: an object already below
     * writeThreshold live copies reads as deleted and gets no entry; it was unreadable already (repair-process F5).
     *
     * Neither the insert of an absent key (`DoesNotExist`) nor the lock is a pin, so the transaction is marked

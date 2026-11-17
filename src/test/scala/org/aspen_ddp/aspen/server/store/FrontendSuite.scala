@@ -4014,30 +4014,64 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     stored.data.getByteArray shouldBe Array[Byte](1)
   }
 
-  // transaction-requirements Q-N5: the finalizer reads a new object as soon as its allocation resolves, possibly
-  // before the stores apply it. A commit voter's fresh state is known only to its Tx, so the read misses; answering
-  // ObjectNotFound there would let a read of a live, committed object prove it deleted
-  test("a read of an allocation voted for but not applied answers AllocationPending") {
+  // transaction-requirements Q-N5: the finalizer, and the client that learned the commit from the votes, read a new
+  // object as soon as its allocation resolves, possibly before the stores apply it. A commit voter's fresh state is
+  // known only to its Tx, so the read misses; answering ObjectNotFound there would let a read of a live, committed
+  // object prove it deleted. The read is parked until the allocation applies (or aborts), and then answered
+  test("a read of an allocation voted for but not applied is answered once it applies") {
     val (frontend, backend, net) = lockFixture()
     val newPtr = DataObjectPointer(ObjectId(new UUID(0, 32)), poolId, Array[Byte]())
-    def read(n: Int): Either[ReadError.Value, ReadResponse.CurrentState] =
+    def read(n: Int): Option[Either[ReadError.Value, ReadResponse.CurrentState]] =
       frontend.readObjectForNetwork(clientId, new UUID(2, n), newPtr, MetadataOnly())
-      takeReadResponse(net).get.result
+      takeReadResponse(net).map(_.result)
 
-    read(1) shouldBe Left(ReadError.ObjectNotFound)
+    read(1) shouldBe Some(Left(ReadError.ObjectNotFound))
     prepare(frontend, net, allocateData(txid1, newPtr)).disposition shouldBe TransactionDisposition.VoteCommit
-    read(2) shouldBe Left(ReadError.AllocationPending)
+    read(2) shouldBe None
     resolve(frontend, net, txid1, committed = true)
-    read(3).map(_.revision) shouldBe Right(ObjectRevision(txid1))
+    val parked = takeReadResponse(net).get
+    parked.readUUID shouldBe new UUID(2, 2)
+    parked.result.map(_.revision) shouldBe Right(ObjectRevision(txid1))
+    read(3).map(_.map(_.revision)) shouldBe Some(Right(ObjectRevision(txid1)))
 
     // Deleted while the allocating Tx is still held (not finalized): an absence again, not a pending allocation
     val delete = RefcountUpdate(newPtr, ObjectRefcount.Default,
       ObjectRefcount(ObjectRefcount.Default.updateSerial + 1, 0))
     prepare(frontend, net, lockTxd(txid2, List(delete))).disposition shouldBe TransactionDisposition.VoteCommit
     resolve(frontend, net, txid2, committed = true)
-    read(4) match
+    read(4).get match
       case Left(err) => err shouldBe ReadError.ObjectNotFound
       case Right(cs) => cs.refcount.count shouldBe 0
+  }
+
+  // A client's backend load of the object can be in flight when the allocation's commit applies in memory (a real
+  // backend completes reads later, on another thread). Its miss then predates the committed state, which is what the
+  // read must get: no Tx has the allocation pending any more, so the miss would read as a plain absence
+  test("a backend miss for a read that completes after the allocation applied serves the committed state") {
+    val backend = new DeferredCommitBackend
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 36)), poolId, Array[Byte]())
+    prepare(frontend, net, allocateData(txid1, newPtr)).disposition shouldBe TransactionDisposition.VoteCommit
+    backend.deferReads = true
+    frontend.readObjectForNetwork(clientId, new UUID(2, 1), newPtr, MetadataOnly())
+    takeReadResponse(net) shouldBe None
+    resolve(frontend, net, txid1, committed = true)
+    takeReadResponse(net) shouldBe None
+    backend.deliverReads()
+    takeReadResponse(net).map(_.result.map(_.revision)) shouldBe Some(Right(ObjectRevision(txid1)))
+  }
+
+  test("a parked read of an allocation is answered ObjectNotFound when the allocation aborts") {
+    val (frontend, _, net) = lockFixture()
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 34)), poolId, Array[Byte]())
+    prepare(frontend, net, allocateData(txid1, newPtr)).disposition shouldBe TransactionDisposition.VoteCommit
+    frontend.readObjectForNetwork(clientId, new UUID(2, 1), newPtr, MetadataOnly())
+    takeReadResponse(net) shouldBe None
+    resolve(frontend, net, txid1, committed = false)
+    takeReadResponse(net).map(_.result) shouldBe Some(Left(ReadError.ObjectNotFound))
   }
 
   test("a read of an aborted allocation answers ObjectNotFound") {
@@ -6302,6 +6336,25 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
       resolve(frontend, net, txid1, committed = true)
       readResponses(net).size shouldBe Frontend.MaxParkedReads + 1
+  }
+
+  test("a parked read of an unapplied allocation is answered AllocationPending at ParkedReadWait") {
+    withExpiryFrontend: (frontend, _, net, _, _, clock, _) =>
+      val newPtr = DataObjectPointer(ObjectId(new UUID(0, 35)), poolId, Array[Byte]())
+      prepare(frontend, net, allocateData(txid1, newPtr).copy(startTimestamp = startedAgo(1_000)))
+        .disposition shouldBe TransactionDisposition.VoteCommit
+      frontend.readObjectForNetwork(clientId, new UUID(2, 1), newPtr, MetadataOnly())
+      readResponses(net) shouldBe Nil
+      clock.now += Frontend.ParkedReadWait.toMillis - 1
+      frontend.expireParkedReads()
+      readResponses(net) shouldBe Nil
+
+      clock.now += 1
+      frontend.expireParkedReads()
+      readResponses(net).map(_.result) shouldBe List(Left(ReadError.AllocationPending))
+      // Answered once
+      resolve(frontend, net, txid1, committed = true)
+      readResponses(net).size shouldBe 1
   }
 
   test("fail-stop drops parked reads without answering") {

@@ -115,7 +115,8 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
             case Left(CommonReadError.ObjectNotFound) => (t._1 + 1, t._2)
             case Left(CommonReadError.CorruptedObject) => (t._1, t._2 + 1)
             // StoreNotFound says nothing of the object, and AllocationPending is a commit voter that has not applied
-            // the object's allocation yet (transaction-requirements Q-N5): neither is an absence
+            // the object's allocation yet (transaction-requirements Q-N5): neither is an absence. BaseReadDriver
+            // re-reads both rather than delivering them, so a read never ends on them
             case Left(_) => t
             case Right(_) => t
 

@@ -374,6 +374,27 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     lastRead(m, ds0).awaitCommit shouldBe Set(lockTx)
   }
 
+  // A commit voter that has not applied the object's allocation answers AllocationPending (transaction-requirements
+  // Q-N5): the allocation will apply, or abort and the store then answers ObjectNotFound. Neither the reply nor a
+  // threshold of them ends the read, which would fail a read of an object the client was just told it allocated
+  test("an AllocationPending reply re-reads that store at once and never ends the read") {
+    val m = new RecordingClient
+    val r = mkReader(m)
+    val ts = HLCTimestamp.now
+
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, Left(ReadError.AllocationPending)))
+    reads(m, ds0) shouldBe 1
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, Left(ReadError.AllocationPending)))
+    reads(m, ds1) shouldBe 1
+    r.receiveReadResponse(ReadResponse(client, ds2, readUUID, ts, Left(ReadError.AllocationPending)))
+    reads(m, ds2) shouldBe 1
+    r.readResult.isCompleted shouldBe false
+
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, current(ts)))
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, current(ts)))
+    Await.result(r.readResult, awaitDuration).revision shouldBe lockTxRev
+  }
+
   test("a store holding the lock of an undecided transaction is not re-read") {
     val m = new RecordingClient
     val r = mkReader(m)

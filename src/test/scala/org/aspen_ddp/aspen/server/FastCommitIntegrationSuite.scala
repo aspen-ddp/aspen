@@ -54,6 +54,14 @@ class FastCommitIntegrationSuite extends IntegrationTestSuite with org.scalatest
     else
       Future { Thread.sleep(1); step(clock) }.flatMap(_ => pump(f, clock, until))
 
+  /** Pumps the hosts for `d` */
+  private def pumpFor(d: Duration, clock: Boolean): Future[Unit] =
+    val until = System.nanoTime() + d.toNanos
+    def loop(): Future[Unit] =
+      if System.nanoTime() > until then Future.unit
+      else Future { Thread.sleep(1); step(clock) }.flatMap(_ => loop())
+    loop()
+
   /** `f`'s outcome, once it completes */
   private def outcome[T](f: Future[T], clock: Boolean, until: Long = deadline()): Future[Try[T]] =
     pump(f, clock, until).transform(r => Success(r))
@@ -259,3 +267,32 @@ class FastCommitIntegrationSuite extends IntegrationTestSuite with org.scalatest
       val fullPerStore = fullReads.asScala.toList.groupMapReduce(_.toStore)(_ => 1)(_ + _)
       withClue(s"re-reads naming T per store: $perStore; full reads per store: $fullPerStore: "):
         perStore.filter((store, n) => n > fullPerStore.getOrElse(store, 0)) shouldBe empty
+
+  // The client learns an allocation committed from the votes, before any store applies it. Each commit voter then
+  // misses the object in its backend and holds the allocation unapplied, so it answers a read AllocationPending. That
+  // proves nothing, but taking a threshold of such replies as the read's end failed it InvalidObject: the client could
+  // not read the object it had just been told it allocated. The read waits for the allocation to apply instead
+  test("a read of an object whose allocation the client learned committed from the votes waits for it to apply"):
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      tx = client.newTransaction()
+      _ = tx.replaySafe("test")
+      _ = net.dropTxMessage = (m: TxMessage) => m.isInstanceOf[TxAccept] && m.transactionId == tx.id
+      x <- pool.allocator.allocateDataObject(DataBuffer(Array[Byte](7)))(using tx)
+      // Every Accept is dropped, so only the votes can complete it
+      result <- outcome(tx.commit(), clock = false)
+      _ = result shouldBe a[Success[?]]
+      _ = withClue("no store has applied the allocation: "):
+            holders(tx.id) shouldBe Set(0, 1, 2)
+            (0 until 3).foreach(i => storeRevision(i, x) shouldBe None)
+      read = client.read(x)
+      // Long enough for many of the test client's full resends (BaseReadDriver.ResendEvery) and heartbeats
+      _ <- pumpFor(Duration(300, MILLISECONDS), clock = true)
+      _ = withClue(s"the read neither failed nor completed while the allocation had not applied (${read.value}): "):
+            read.isCompleted shouldBe false
+            (0 until 3).foreach(i => storeRevision(i, x) shouldBe None)
+      _ = net.dropTxMessage = _ => false
+      xAfter <- pump(read, clock = true)
+    yield
+      xAfter.revision shouldBe ObjectRevision(tx.id)
+      xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](7)

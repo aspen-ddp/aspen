@@ -396,7 +396,8 @@ class StoreRepairerSuite extends IntegrationTestSuite:
 
   // G8: the age gate compares the repairing host's HLC with the marker transaction's, so a repairer whose clock runs
   // ahead opens it early. It only paces: the read decides, and a committed allocation its stores have not applied yet
-  // reads as AllocationPending, never as a deletion. An age of zero is the gate a fast enough repairing clock sees
+  // reads as AllocationPending, never as a deletion: the read waits for the allocation to apply (the stores park it)
+  // and then finds the object live. An age of zero is the gate a fast enough repairing clock sees
   test("an entry past the age gate whose allocation has committed but not yet applied is kept, not deleted (G8)"):
     @volatile var allocating: Option[TransactionId] = None
     @volatile var held: List[TxResolved] = Nil
@@ -411,6 +412,12 @@ class StoreRepairerSuite extends IntegrationTestSuite:
         synchronized { held = r :: held }
         true
       case _ => false
+    def pumpFor(millis: Long): Future[Unit] =
+      val until = System.nanoTime() + millis * 1000000
+      def loop(): Future[Unit] =
+        if System.nanoTime() > until then Future.unit
+        else Future { Thread.sleep(1); net.handleEvents() }.flatMap(_ => loop())
+      loop()
     val target = RecordingTarget(List(storeId))
     for
       ptr <- client.transact: tx =>
@@ -420,19 +427,24 @@ class StoreRepairerSuite extends IntegrationTestSuite:
           new PoolObjectAllocator(client, pool).allocateKeyValueObject(Map(Key(Array[Byte](9)) -> Value(Array[Byte](9))))
       listed <- client.getStoragePool(PoolId.BootstrapPoolId).flatMap(_.allocationTree.get(Key(ptr.id.toBytes)))
       _ <- seedErrorEntry(ptr.id, ptr.storePointer)
-      result <- StoreRepairer(client, target).scan(storeId, noDeletionAge)
-      stillThere <- errorEntryExists(ptr.id)
+      scan = StoreRepairer(client, target).scan(storeId, noDeletionAge)
+      _ <- pumpFor(300)
+      scanDoneEarly = scan.isCompleted
+      deletionsEarly = target.deletions
       _ = net.dropTxMessage = _ => false
       _ = net.recordTxMessage = _ => false
       _ = synchronized(held).foreach(net.deliverTransactionMessage)
+      result <- scan
       _ <- net.waitForTransactionsToComplete()
       after <- client.read(ptr)
     yield
       listed shouldBe None
       held should not be empty
+      withClue("the scan's read waited for the allocation to apply: "):
+        scanDoneEarly shouldBe false
+        deletionsEarly shouldBe Nil
       target.deletions shouldBe Nil
-      result.deferred shouldBe 1
-      stillThere shouldBe true
+      result.seen shouldBe 1
       after.pointer.id shouldBe ptr.id
 
   /** A RecordingTarget whose repair writes fail as an FSIF store's do over a foreign occupant of the slot */

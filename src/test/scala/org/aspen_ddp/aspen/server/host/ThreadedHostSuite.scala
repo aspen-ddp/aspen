@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.client.TestTransactions
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, ObjectRevision}
@@ -19,6 +19,11 @@ class ThreadedHostSuite extends IntegrationTestSuite:
   override def testThreading: ExecutionContext => HostThreading = _ => new StoreThreadPool(maxThreads = 3)
 
   override def subFixtureTeardown(): Unit = net.smgr.threading.shutdown()
+
+  /** The client records its own outcomes, as a production client does. It learns a commit from the stores' votes,
+   *  before they apply it, so a read straight after one can find the commit's locks on the old revision: only a client
+   *  that knows the commit re-reads those stores (awaitCommit) rather than returning the old revision */
+  override def testHostOptions: TestNetwork.HostOptions = super.testHostOptions.copy(clientStatusCache = true)
 
   private val Objects = 20
   private val WritesPerObject = 10

@@ -752,6 +752,12 @@ class Tx( trs: TransactionRecoveryState,
         mutedAwaitingLoad = false
         if !provenCommitted then
           frontend.forgetMuted(this)
+    else if frozen then
+      // Past expiry a Tx promises nothing more and sends no vote: one decided after its status reply would contradict
+      // the final state that reply reported (ExpiryTally)
+      if delayedPrepare.nonEmpty then
+        logger.trace(s"Tx $transactionId on store $storeId is frozen past expiry: dropping its delayed prepare response")
+      delayedPrepare = None
     else delayedPrepare.foreach { response =>
       logger.trace(s"AllObjectsLoaded. Saving to CRL before sending PrepareResponse for tx ${transactionId}")
       val r = response.copy(disposition=disposition, collisions=collisions)
@@ -791,7 +797,15 @@ class Tx( trs: TransactionRecoveryState,
     reason.foreach(r => logger.warn(s"Tx $transactionId on store $storeId: refusing its description, which $r"))
     reason
 
-  private def determineDisposition(): Unit = {
+  private def determineDisposition(): Unit = if undecidedFrozen then {
+    // A frozen Tx never decides a vote: "frozen, loaded and undecided" is then a final non-voter, as its status reply
+    // reports it (receiveStatusRequest). Whatever it was waiting for is moot
+    waitingOn = Set()
+    if awaitingCommits.nonEmpty then
+      frontend.stopAwaitingCommits(awaitingCommits, this)
+      awaitingCommits = Set()
+    logger.trace(s"Tx $transactionId on store $storeId is frozen past expiry: it decides no vote")
+  } else {
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
     val quarantined = pointersById.keysIterator.filter(frontend.isQuarantined).toList
     val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet
@@ -1557,10 +1571,12 @@ class Tx( trs: TransactionRecoveryState,
     * (Frontend.mayHaveForgottenUndecided)
     */
   def receiveStatusRequest(m: TxStatusRequest): Unit =
-    // An unresolved Tx answers only once its reported state is final (ExpiryTally): frozen with its vote decided (its
-    // objects loaded: until then it may yet vote commit), or muted for good (amnesiac, or below the floor). Silent
-    // until then, as a store whose state is unknown: one muted only for starting too far ahead may yet join. Its own
-    // clock passes T's expiry within the hosts' skew
+    // An unresolved Tx answers only once its reported state is final (ExpiryTally): frozen with its objects loaded
+    // (until then it may yet vote commit), or muted for good (amnesiac, or below the floor). A frozen Tx decides no
+    // vote (determineDisposition) and sends none (sendDelayedPrepare), so one still undecided then, waiting on an
+    // in-flight commit, a collision or its client's prepare, is a final non-voter. Silent until then, as a store
+    // whose state is unknown: one muted only for starting too far ahead may yet join. Its own clock passes T's expiry
+    // within the hosts' skew
     val mutedForGood = muted && (frontend.mayHaveForgottenUndecided(txd.startTimestamp) || frontend.belowForgetFloor(txd))
     if oresolution.nonEmpty || (frozen && allObjectsLoaded) || mutedForGood then
       net.sendTransactionMessage(TxStatusResponse(m.from, storeId, transactionId, m.requestUUID, Some(statusForExpiry)))
@@ -1579,6 +1595,12 @@ class Tx( trs: TransactionRecoveryState,
     * tally decides from the same states (ExpiryTally). Derived from the clock, so a reload cannot thaw it
     */
   def frozen: Boolean = frontend.pastExpiry(txd)
+
+  /** Frozen with T's outcome unknown here and a vote that would count: such a Tx decides no vote
+    * (determineDisposition). A muted Tx never votes commit, and once the outcome is known the vote no longer matters,
+    * so both still decide as before (a muted one may prove the commit)
+    */
+  private def undecidedFrozen: Boolean = !muted && oresolution.isEmpty && !outcomeKnown && frozen
 
   def commitComplete(objectId: ObjectId, result: Either[Unit, CommitError.Value]): Unit = {
     result match

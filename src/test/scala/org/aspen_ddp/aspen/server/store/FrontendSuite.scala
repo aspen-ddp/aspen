@@ -5555,8 +5555,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("a frozen Tx whose objects have not loaded is silent to status requests until they load") {
-    // Its vote is undecided until the objects load, so a reply would report votedCommit = false and the vote could
-    // still become commit: an expiry tally counting that reply as final would be wrong
+    // Its vote is undecided until the objects load. Expectation changed in the final review (2026-11-16): a frozen Tx
+    // now decides no vote, since a vote decided after a status reply could contradict that reply, so once its objects
+    // load it reports a final non-vote (it used to vote commit at load, and send that vote past expiry). The silence
+    // before the load is kept: the gate (Tx.receiveStatusRequest) answers only once the objects are loaded
     val clock = new TestClock(floorNow)
     val backend = new DeferredCommitBackend
     backend.deferReads = true
@@ -5577,7 +5579,63 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     backend.deliverReads()
     frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
-    statusResponses(net).map(_.status.map(_.votedCommit)) shouldBe List(Some(true))
+    statusResponses(net).map(_.status.map(_.votedCommit)) shouldBe List(Some(false))
+    txVotes(net) shouldBe Nil
+  }
+
+  // A frozen Tx never decides a vote, so "frozen, loaded and undecided" is a final non-voter: the status reply that
+  // reports it (votedCommit = false) can never be contradicted by a later vote (ExpiryTally: reported states are final)
+
+  /** A status request for `txid` from store 1, and the votedCommit of this store's replies to it */
+  private def statusOf(frontend: Frontend, net: TestNet, txd: TransactionDescription): List[Option[Boolean]] =
+    net.sentTx = Nil
+    frontend.receiveTransactionMessage(TxStatusRequest(storeId, StoreId(poolId, 1), txd.transactionId, reqUUID,
+      txd.startTimestamp))
+    statusResponses(net).map(_.status.map(_.votedCommit))
+
+  test("a frozen Tx waiting on an in-flight commit never votes once that commit persists") {
+    var now = System.currentTimeMillis()
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024, wallClockMillis = () => now)
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+    // Built on txid1's commit, so it would vote commit once that commit persists
+    val txd2 = lockTxd(txid2, List(overwriteAfter(txid1))).copy(startTimestamp = HLCTimestamp(now << 16))
+    sendPrepare(frontend, txd2)
+    prepareResponses(net, txid2) shouldBe empty
+
+    now = now + org.aspen_ddp.aspen.common.transaction.TransactionHorizon.Horizon.toMillis +
+      Frontend.DefaultExpiryMargin.toMillis + 1
+    frontend.transactions(txid2).frozen shouldBe true
+    statusOf(frontend, net, txd2) shouldBe List(Some(false))
+    net.clientResponses.clear()
+
+    backend.deliverOne()
+    prepareResponses(net, txid2) shouldBe empty
+    txVotes(net) shouldBe Nil
+    frontend.transactions(txid2).holdsLocks shouldBe false
+    statusOf(frontend, net, txd2) shouldBe List(Some(false))
+  }
+
+  test("a frozen Tx waiting for its client's prepare never votes when that prepare arrives late") {
+    var now = System.currentTimeMillis()
+    val (frontend, _, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024, wallClockMillis = () => now)
+    val txd = lockTxd(txid1, List(SharedRevisionLock(op1, rev0))).copy(startTimestamp = HLCTimestamp(now << 16))
+    // Only a driver's prepare: the vote waits for the client's (prefer-abort)
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+    prepareResponses(net, txid1) shouldBe empty
+
+    now = now + org.aspen_ddp.aspen.common.transaction.TransactionHorizon.Horizon.toMillis +
+      Frontend.DefaultExpiryMargin.toMillis + 1
+    frontend.transactions(txid1).frozen shouldBe true
+    statusOf(frontend, net, txd) shouldBe List(Some(false))
+    net.clientResponses.clear()
+
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true))
+    prepareResponses(net, txid1) shouldBe empty
+    txVotes(net) shouldBe Nil
+    frontend.transactions(txid1).holdsLocks shouldBe false
+    statusOf(frontend, net, txd) shouldBe List(Some(false))
   }
 
   // Cross-document review G1. Replication(3, 2): read threshold 2, width - writeThreshold 1

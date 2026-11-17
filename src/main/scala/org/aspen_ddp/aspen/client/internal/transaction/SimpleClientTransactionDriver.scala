@@ -26,9 +26,10 @@ object SimpleClientTransactionDriver {
 
 }
 
-/** Retransmits the prepare until the leader's outcome arrives (a completion from the stores' votes does not stop it) or is past the horizon plus `MaxStartLead` on the client's
-  * clock, when it completes with `ClientOutcome.Unknown` instead: the stores no longer join the transaction, so
-  * nothing more can change its outcome. A transaction already that late at `begin()` is never sent.
+/** Retransmits the prepare until the leader's outcome arrives (a completion from the stores' votes does not stop it)
+  * or is past the horizon plus `MaxStartLead` on the client's clock, when it completes with `ClientOutcome.Unknown`
+  * instead (or keeps the Committed it learned from votes): the stores no longer join the transaction, so nothing
+  * more can change its outcome. A transaction already that late at `begin()` is never sent.
   */
 class SimpleClientTransactionDriver(
                                      val retransmitDelay: Duration,
@@ -56,7 +57,8 @@ class SimpleClientTransactionDriver(
         false
       } else {
         retries += 1
-        if (retries % 3 == 0)
+        // A transaction committed by its votes only waits for the leader's reply; it is not hung
+        if (retries % 3 == 0 && !result.isCompleted)
           logger.info(s"***** HUNG Client Transaction ${txd.transactionId}")
         true
       }
@@ -68,7 +70,11 @@ class SimpleClientTransactionDriver(
   private val task = client.backgroundTaskManager.schedulePeriodic(retransmitDelay)(tick())
 
   private def giveUp(): Unit = {
-    logger.warn(s"Client Transaction ${txd.transactionId} is past the transaction horizon: outcome unknown")
+    if (result.isCompleted)
+      logger.info(s"Client Transaction ${txd.transactionId} is past the transaction horizon; it committed by its " +
+        "votes, and the leader's outcome never arrived")
+    else
+      logger.warn(s"Client Transaction ${txd.transactionId} is past the transaction horizon: outcome unknown")
     complete(ClientOutcome.Unknown)
     stop()
   }

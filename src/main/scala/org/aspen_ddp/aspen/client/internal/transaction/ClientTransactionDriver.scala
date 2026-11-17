@@ -54,9 +54,10 @@ class ClientTransactionDriver(
 
   def shutdown(): Unit = {}
 
-  /** An outcome opposite to the one already reached is a split decision (paxos F11) and is logged as an error. Only
-    * duplicates that race the first outcome can reach here: TransactionManager forgets the driver once it has one, so
-    * the stores and their drivers are the detectors
+  /** An outcome opposite to the one already reached is a split decision (paxos F11) and is logged as an error.
+    * TransactionManager keeps a driver until it is `stopped`, so a leader's abort after a completion from commit votes
+    * reaches here and is logged; once stopped by the leader's outcome the driver is forgotten, and a later conflicting
+    * outcome is left to the stores and their drivers to detect
     */
   protected def complete(outcome: ClientOutcome): Unit = synchronized {
     promise.future.value.flatMap(_.toOption).foreach { first =>
@@ -89,7 +90,8 @@ class ClientTransactionDriver(
       votes.get(vote.fromStore) match
         case Some(first) =>
           if (first != vote.disposition)
-            logger.error(s"Store ${vote.fromStore} voted $first, then ${vote.disposition} on transaction ${txd.transactionId}; ignoring the later vote")
+            logger.error(s"Store ${vote.fromStore} voted $first, then ${vote.disposition} on transaction " +
+              s"${txd.transactionId}; ignoring the later vote")
         case None =>
           votes += vote.fromStore -> vote.disposition
           if (commitCertain)

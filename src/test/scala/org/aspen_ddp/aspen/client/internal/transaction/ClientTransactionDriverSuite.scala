@@ -212,13 +212,75 @@ class ClientTransactionDriverSuite extends AnyFunSuite with Matchers:
       d.result.value shouldBe Some(scala.util.Success(ClientOutcome.Committed))
     finally f.done()
 
+  /** The log lines, at Info or above, that name `txid`, with their levels */
+  private def logNaming(txid: TransactionId)(f: => Unit): List[(scribe.Level, String)] =
+    val lines = new java.util.concurrent.LinkedBlockingQueue[(scribe.Level, String)]()
+    val handler = scribe.handler.LogHandler(scribe.Level.Info): r =>
+      val text = r.logOutput.plainText
+      if text.contains(txid.toString) then lines.add((r.level, text))
+    scribe.Logger.root.withHandler(handler).replace()
+    try f
+    finally scribe.Logger.root.withoutHandler(handler).replace()
+    lines.toArray(Array.empty[(scribe.Level, String)]).toList
+
   test("a leader abort after a vote commit is logged as a split, and the result stays Committed"):
     val f = new Fixture
     try
       val d = f.driver(0.millis)
       d.begin()
       vote(d, poolId, 0); vote(d, poolId, 1)
-      resolved(d, false)
+      val log = logNaming(d.txd.transactionId)(resolved(d, false))
       d.result.value shouldBe Some(scala.util.Success(ClientOutcome.Committed))
       d.stopped.isCompleted shouldBe true
+      log.map(_._1) shouldBe List(scribe.Level.Error)
+      log.head._2 should include("Split decision")
+    finally f.done()
+
+  test("a differing second vote from the same store is logged and ignored"):
+    val f = new Fixture
+    try
+      // Commit first: the later abort is ignored, so store 0's commit still counts toward the write threshold
+      val d = f.driver(0.millis)
+      d.begin()
+      vote(d, poolId, 0)
+      val log = logNaming(d.txd.transactionId)(vote(d, poolId, 0, TransactionDisposition.VoteAbort))
+      log.map(_._1) shouldBe List(scribe.Level.Error)
+      log.head._2 should include("ignoring the later vote")
+      vote(d, poolId, 1)
+      d.result.value shouldBe Some(scala.util.Success(ClientOutcome.Committed))
+
+      // Abort first: the later commit is ignored, so one commit vote is short of the write threshold
+      val d2 = f.driver(0.millis)
+      d2.begin()
+      vote(d2, poolId, 0, TransactionDisposition.VoteAbort)
+      logNaming(d2.txd.transactionId)(vote(d2, poolId, 0)).map(_._1) shouldBe List(scribe.Level.Error)
+      vote(d2, poolId, 1)
+      d2.result.isCompleted shouldBe false
+    finally f.done()
+
+  test("after a vote-completion a retransmit tick logs no hung transaction, and a give-up warns of no unknown outcome"):
+    val f = new Fixture
+    try
+      val d = f.driver(0.millis)
+      d.begin()
+      vote(d, poolId, 0); vote(d, poolId, 1)
+      // Three ticks reach the "HUNG" log of an undecided transaction
+      logNaming(d.txd.transactionId)((0 until 3).foreach(_ => d.tick())) shouldBe Nil
+      f.now += giveUp.toMillis + 1
+      val log = logNaming(d.txd.transactionId)(d.tick())
+      d.stopped.isCompleted shouldBe true
+      log.map(_._1) shouldBe List(scribe.Level.Info)
+      log.head._2 should not include "outcome unknown"
+    finally f.done()
+
+  test("an undecided transaction still logs that it is hung and warns that its outcome is unknown at give-up"):
+    val f = new Fixture
+    try
+      val d = f.driver(0.millis)
+      d.begin()
+      logNaming(d.txd.transactionId)((0 until 3).foreach(_ => d.tick())).map(_._2).exists(_.contains("HUNG")) shouldBe
+        true
+      f.now += giveUp.toMillis + 1
+      val log = logNaming(d.txd.transactionId)(d.tick())
+      log.exists((level, text) => level == scribe.Level.Warn && text.contains("outcome unknown")) shouldBe true
     finally f.done()

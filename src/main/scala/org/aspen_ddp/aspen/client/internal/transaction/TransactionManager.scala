@@ -52,7 +52,8 @@ class TransactionManager(val client: AspenClient,
       synchronized { transactions -= resolved.transactionId }
     }
   }
-  /** Delivers to the registered driver; a vote never completes the transaction, so the driver is kept */
+  /** Delivers to the registered driver. Commit votes may complete its result, but the driver is kept until it is
+    * `stopped`, so the leader's outcome still reaches it */
   def receive(vote: TransactionVote): Unit = {
     val otd = synchronized { transactions.get(vote.transactionId) }
     otd.foreach(_.receive(vote))

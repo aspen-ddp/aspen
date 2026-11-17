@@ -5590,11 +5590,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         passHorizon(clock)
         frontend.expiryHeartbeat()
         reply(frontend, net, peer1, acceptedCommit)
-        finalizing shouldBe Nil // One accept: abort may have been chosen by this store and store 2
-        net.sentTx.collect { case r: TxResolved => r } shouldBe Nil
-        reply(frontend, net, peer2, acceptedCommit)
 
-        // Two accepts: abort was never chosen and never can be, and two voters hold the update
+        // ExpiryTally rule A, with store 2 silent: this store and store 1 voted commit, the write threshold of
+        // Replication(3, 2). No tally had the two non-commit votes an abort-certain one needs, so by L1 no abort was
+        // ever accepted (under the old rules one accept was not enough: store 2's reply was awaited)
         net.sentTx.collect { case r: TxResolved => (r.to, r.committed, r.late, r.proof) }.toSet shouldBe
           Set((peer1, true, false, false), (peer2, true, false, false))
         backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
@@ -5751,6 +5750,13 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val round = statusRequests(net).last.requestUUID
     frontend.receiveTransactionMessage(TxStatusResponse(storeId, from, txid1, round, status))
 
+  /** A rebuilt peer, for T started before its acceptor: it may have voted, or accepted, anything */
+  private val amnesiacPeer = Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false,
+    late = false, holdsAcceptorState = true, amnesiac = true))
+  /** A frozen peer that did not vote commit and accepted nothing */
+  private val nonVoter = Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
+    holdsAcceptorState = true))
+
   private val holding = Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
     holdsAcceptorState = true))
 
@@ -5899,34 +5905,40 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       passHorizon(clock)
       frontend.expiryHeartbeat()
       val first = statusRequests(net).last.requestUUID
-      reply(frontend, net, peer1, acceptedCommit)
+      // Store 1 rebuilt, store 2 silent: hold (ExpiryTally rule G)
+      reply(frontend, net, peer1, amnesiacPeer)
       frontend.expiryHeartbeat() // A new round
-      statusRequests(net).last.requestUUID should not be first
+      val second = statusRequests(net).last.requestUUID
+      second should not be first
 
-      // Store 2's answer to the first round, with store 1's from that round, would decide commit
+      // Store 2's answer to the first round, a non-voter's, with store 1's from that round, would decide discard
+      // (rule D: one holder of the update, below the read threshold of two). Counted in the new round, where store 1 is
+      // silent, it holds
       net.sentTx = Nil
-      frontend.receiveTransactionMessage(TxStatusResponse(storeId, peer2, txid1, first, acceptedCommit))
-      net.sentTx.collect { case r: TxResolved => r } shouldBe Nil
+      frontend.receiveTransactionMessage(TxStatusResponse(storeId, peer2, txid1, first, nonVoter))
+      frontend.receiveTransactionMessage(TxStatusResponse(storeId, peer2, txid1, second, nonVoter))
+      lookup.requests shouldBe Nil
       frontend.transactions(txid1).status shouldBe TransactionStatus.Unresolved
   }
 
-  test("a Tx past the horizon whose silent peer may have accepted commit keeps holding and later learns the outcome") {
+  test("a Tx past the horizon whose silent peer may have accepted abort keeps holding and later learns the outcome") {
     withExpiryFrontend: (frontend, backend, net, _, lookup, clock, _) =>
       frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
       passHorizon(clock)
       frontend.expiryHeartbeat()
-      // One commit accept, and store 2 silent: it may have accepted commit too (commit) or not (discard)
-      reply(frontend, net, peer1, acceptedCommit)
+      // Store 1 rebuilt and store 2 silent (ExpiryTally rule G): store 2 may hold an accepted abort (with store 1's
+      // lost vote, two non-commit votes make an abort-certain tally), or have voted commit (rule A)
+      reply(frontend, net, peer1, amnesiacPeer)
       frontend.expiryHeartbeat()
-      reply(frontend, net, peer1, acceptedCommit)
+      reply(frontend, net, peer1, amnesiacPeer)
       lookup.requests shouldBe Nil
       frontend.transactions(txid1).status shouldBe TransactionStatus.Unresolved
       lockedWriteTransactions(frontend, net, op1) should contain (txid1)
 
-      // A later round finds store 1 resolved: the outcome is adopted
+      // A later round finds store 2 resolved: the outcome is adopted
       frontend.expiryHeartbeat()
       frontend.expiryHeartbeat()
-      reply(frontend, net, peer1, Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = false,
+      reply(frontend, net, peer2, Some(TxStatusResponse.TxStatus(TransactionStatus.Committed, finalized = false,
         late = false, holdsAcceptorState = true)))
       frontend.transactions(txid1).status shouldBe TransactionStatus.Committed
       backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)

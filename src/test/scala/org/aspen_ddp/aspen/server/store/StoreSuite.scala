@@ -242,9 +242,12 @@ class StoreSuite extends AnyFunSuite with Matchers:
     override def sendTransactionMessages(msg: List[TxMessage]): Unit = batched = batched ++ msg
 
   // Rebuild F6, paxos F8: a commit vote, an abort vote and a silent third store. Before expiry the driver's tally
-  // waits for the silent store. Past it both voters are frozen (they promise and accept nothing more), and the expiry
-  // tally discards T: no accept of commit exists, and the silent store alone cannot make one chosen
-  test("a commit voter whose peer voted abort and whose third store is silent is discarded past expiry, not before") {
+  // waits for the silent store. Past it both voters are frozen (they promise and accept nothing more). The expiry tally
+  // still holds while the third store is silent (ExpiryTally rule G): it may have voted commit, which with the leader's
+  // vote is Replication(3, 2)'s write threshold, so a client may have learned commit from the votes. (Under the old
+  // rules it discarded at once: no accept of commit existed.) Once the third store reports it never voted, no pool can
+  // reach its write threshold of commit votes, and T is discarded (rule E)
+  test("a commit voter whose peer voted abort is discarded past expiry once its third store replies, not before") {
     var now = fixedStart
     val lookup = new ManualLookup
     val batchNet = new BatchNet
@@ -280,6 +283,12 @@ class StoreSuite extends AnyFunSuite with Matchers:
       store.receiveTransactionMessage(TxStatusResponse(leader, peer, txid1, r.requestUUID,
         Some(TxStatusResponse.TxStatus(TransactionStatus.Unresolved, finalized = false, late = false,
           holdsAcceptorState = true))))
+    // The third store is silent: hold
+    lookup.requests shouldBe Nil
+    store.frontend.transactions.contains(txid1) shouldBe true
+    // It answers "unknown": it never joined T
+    status.filter(_.to == storeId).foreach: r =>
+      store.receiveTransactionMessage(TxStatusResponse(leader, storeId, txid1, r.requestUUID, None))
     // The commit voter looks up its UnackedCommits entry before it discards T
     lookup.requests shouldBe List(txid1)
     lookup.answer(txid1, lookup.absent)

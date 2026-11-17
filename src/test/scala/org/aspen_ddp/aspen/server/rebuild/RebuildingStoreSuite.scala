@@ -3,11 +3,12 @@ package org.aspen_ddp.aspen.server.rebuild
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.scalatest.compatible
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
-import org.aspen_ddp.aspen.common.network.CurrentAllocationsReply
-import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription}
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker
+import org.aspen_ddp.aspen.common.network.{CurrentAllocationsReply, TransactionVote, TxMessage, TxPrepareResponse}
+import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription, TransactionDisposition, TransactionId}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
@@ -204,6 +205,54 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       after.values.flatten.exists(_.pointers.exists(_.id == held.id)) should be(false)
       rebuild.testingOnlyRestoredKeys.map(_.bytes.toList) should contain(held.id.toBytes.toList)
       os.exists(dev / storeId.directoryName) should be(true)
+
+  /** The stores' votes on `txid`, or None for a store not holding it */
+  private def votes(txid: TransactionId): List[Option[TransactionDisposition.Value]] =
+    net.stores.map: s =>
+      net.hostFor(s.storeId).control.router.loaded.get(s.storeId)
+        .flatMap(_.frontend.transactions.get(txid)).map(_.vote)
+
+  atest("an object read under an undecided commit's write lock is marked against the rebuilt store (RB-W2)"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    def awaitVotes(txid: TransactionId, n: Int): Future[Unit] =
+      if votes(txid).forall(_.contains(TransactionDisposition.VoteCommit)) then Future.unit
+      else if n == 0 then Future.failed(new Exception(s"the stores never all voted commit on $txid: ${votes(txid)}"))
+      else Future(()).flatMap(_ => awaitVotes(txid, n - 1))
+    for
+      _ <- populate(5)
+      locked <- allocateOne()
+      free <- allocateOne()
+      _ <- net.waitForTransactionsToComplete()
+      before <- client.read(locked.asInstanceOf[DataObjectPointer])
+      // T overwrites `locked`; every vote on it is dropped, so each store holds its commit vote and T's lock undecided
+      tx = client.newTransaction()
+      isVote = (m: TxMessage) => m match
+                 case r: TxPrepareResponse => r.transactionId == tx.id
+                 case _ => false
+      _ = net.dropTxMessage = isVote
+      _ = net.recordTxMessage = isVote
+      _ = net.dropClientResponse =
+            case v: TransactionVote => v.transactionId == tx.id
+            case _ => false
+      _ = tx.overwrite(locked.asInstanceOf[DataObjectPointer], before.revision, DataBuffer(Array[Byte](8)))
+      tCommit = tx.commit()
+      _ <- awaitVotes(tx.id, 5000)
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends)
+      _ <- rebuild.complete
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      lockedEntry <- pool.errorTree.get(MissedUpdateMarker.errorKey(storeId, locked.id))
+      freeEntry <- pool.errorTree.get(MissedUpdateMarker.errorKey(storeId, free.id))
+      _ = withClue("T is still undecided: ")(tCommit.isCompleted should be(false))
+      // The votes reach the leader late: T commits
+      _ = net.dropTxMessage = _ => false
+      _ = net.dropClientResponse = _ => false
+      _ = net.recordTxMessage = _ => false
+      _ = net.takeRecordedTxMessages().foreach(net.deliverTransactionMessage)
+      _ <- tCommit
+    yield
+      withClue("the copy read under T's lock is recorded for repair: ")(lockedEntry should be(defined))
+      withClue("an unlocked copy is not: ")(freeEntry should be(None))
 
   atest("a listed allocation whose transaction finalizes before the sweep is restored from a read"):
     given ExecutionContext = executionContext

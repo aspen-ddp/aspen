@@ -107,7 +107,8 @@ The premises other subsystems take from this:
   transaction that can still commit with the old vote counted needs `t - 1` live commit voters among the other stores,
   so `w - t + 1` replies include one. Without this, in Replication(3,2) the rebuilt store plus T's abort voter would
   commit a T' over T's lock on a lock-only object, and T could then commit after it (RebuiltVoterLockIntegrationSuite).
-  The stale-copy consequence is rebuild-process.md RB-W2.
+  The rebuild marks a copy whose read reported a write lock, so a copy predating such a T is repaired
+  (rebuild-process.md 5.2, locked copies).
 
 ### 2.4 Repair and transactions on one object
 
@@ -224,13 +225,11 @@ fixed abort voters of an abort-certain object, so it cannot lift an aborted T to
 for a T that really committed commits what was committed. But the statement is not literally true, and such a Tx
 hides its host's cached outcome from status queries (the reply is `Unresolved`, so other observers do not adopt it).
 
-### 5.7 RB-W2's example lies outside the tolerance it assumes
-rebuild-process.md RB-W2 uses Replication(3,2). There `t = r`, so losing one of T's two holders (S0) before S1 applies
-leaves T below the read threshold: by `CLAUDE.md` ("the write threshold's margin above [the read threshold] is the
-only tolerance for failures on newly updated objects") that object is lost whatever the rebuild does, and reads of X
-return the pre-T state from S0 (rebuilt) and S2. The weakness is real for pools with `t > r` (for example
-Replication(5,4), `r = 3`: S0 acknowledged and lost, two of S1-S3 still unapplied, S4 a non-voter), where T survives
-on `r` stores and S0 alone stays stale without an entry.
+### 5.7 The stale rebuilt copy's example lay outside the tolerance it assumed
+Resolved. The weakness (a walk copying an object while a commit the lost store applied is unapplied elsewhere) was
+described with Replication(3,2), where `t = r` and losing one of T's two holders before the other applies is beyond
+tolerance anyway. It is real for `t > r` (for example Replication(5,4)), where rebuild-process.md 5.2 (locked copies)
+closes it: a copy read under a write lock is marked in the ErrorTree.
 
 ---
 

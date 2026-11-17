@@ -27,6 +27,11 @@
   the listed objects directly, re-querying in rounds (1 s doubling to 30 s): unresolved waits; committed restores,
   retrying any read failure; no longer listed restores, or settles on `InvalidObject.provesDeletion`. It never waits
   on a finalization, which could need this store. A cancel abandons the wait (`CurrentAllocationsQuery.Abandoned`)
+- Locked copies (rebuild-process.md 5.2): `restore` copies from an ordinary read, which ignores write locks of
+  transactions not known committed. When any reply reported one (`ObjectState.readLocks`), the object is marked in the
+  ErrorTree against this store (missed at `HLCTimestamp.Zero`) before the restore completes, so a commit the lost
+  store applied and acknowledged while a peer had not is repaired; repair defers while the lock is reported. A failed
+  mark is a failed object
 - Unreadable objects (Rebuild F15): `retryFailures` fails the pass while any object is still unreadable, unless the
   store's Rebuilding entry carries `acceptLoss` (set by `accept-rebuild-loss`). Then each one still in the
   AllocationTree is marked in the ErrorTree against this store (`MissedUpdateMarker.mark`, missed at

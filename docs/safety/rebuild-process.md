@@ -234,6 +234,19 @@ retired such a copy). Otherwise `runPass`.
   `restore` does a full `client.read`, then `ObjectState.getRebuildDataForStore(storeId)` (re-encodes the object and
   takes this store's slice; a partial KV state yields none) and `Backend.rebuildWrite` with the read's revision,
   refcount and timestamp.
+* Locked copies: a read ignores the write locks of transactions it does not know committed, and the one store that
+  applied such a T may be the lost one, whose acknowledgment left T's finalizer nothing to mark. So when any reply of
+  the read reported a write lock (`ObjectState.readLocks`), `restore` marks the object in the ErrorTree against this
+  store (`MissedUpdateMarker.mark`, missed at `HLCTimestamp.Zero`) and completes only once the mark is written: the
+  walk never advances past an unrecorded copy, and a failed mark is a failed object (retried by 5.4). This covers
+  every stale copy of that kind: the rebuilding store is silent, and at most `w - t < r` stores hold T's old revision
+  without a lock of T (its non-commit-voters), so `r` matching old-revision replies include an unapplied commit voter
+  reporting T's lock. The mark needs no transaction timestamp: after promotion, at most `w - t + 1` stores hold the old
+  revision without the lock (the rebuilt store added), still below `r` whenever `t > r` (a majority `r` gives
+  `2r >= w + 1`), so repair's read of a stale copy reports the lock and defers rather than completing the entry.
+  For `t <= r`, losing a store that held T before its peers applied it is beyond the pool's tolerance (`CLAUDE.md`,
+  read threshold). Marks also land for locks that change nothing (an exclusive lock-only requirement) or for
+  transactions that abort; each costs one repair read, on the rebuild's path, not the transaction's.
 * A per-object read failure is recorded in `failed` and the checkpoint advances past it. More than
   `RebuildState.MaxFailedObjects` (10,000) failures latch an abort. An out-of-space error (`Backend.isOutOfSpace`,
   ENOSPC or EDQUOT) latches an abort and logs `REBUILD OUT OF SPACE`. A cancel latches `RebuildCancelled`.
@@ -462,8 +475,8 @@ store is loaded, and are then reconciled by its repair scans ([repair-process.md
   anything else defers. Younger entries are deferred (an allocation whose tree entry has not landed yet).
 
 So an entry for the rebuilt store is deleted only once its copy is complete. Not closed by repair: an object whose
-copy changes under every install, or never settles, stays stale and is warned about; and a staleness the finalizer
-never marked is never repaired (RB-W2 is such a case).
+copy changes under every install, or never settles, stays stale and is warned about; and a staleness nothing marked
+is never repaired (5.2's locked copies are marked for this reason).
 
 ### 8.3 Coverage limits
 
@@ -551,6 +564,8 @@ never marked is never repaired (RB-W2 is such a case).
   residual.
 * **B20 A rebuilt store grants no commit vote over a lock its old incarnation's vote may still back** (6.4, inherited
   votes), up to the same clock-skew residual.
+* **B21 A copy read under a write lock is recorded before the walk passes it.** Its ErrorTree mark is written before
+  the restore completes (5.2, locked copies).
 
 Not an invariant: the rebuild validates neither the decision that declared the store lost nor the pool's ability to
 supply it; see [systemic-loss-protection.md](systemic-loss-protection.md).
@@ -658,32 +673,6 @@ store was certainly not their voter, and its misses are marked). Add a Rebuildin
 held undecided while the rebuilding store is silent must not keep the rebuild from finishing.
 Effort: S   Priority: 4
 
-### RB-W2. A committed update the lost store acknowledged but its peers have not yet applied is copied stale with no repair record (PLAUSIBLE; permanent replica divergence)
-Mechanism: the walk restores each object from an ordinary `client.read`, which returns whichever revision `r` replies
-hold (`BaseObjectReader.getStoreStates`), ignoring write locks of transactions the client does not know to be committed
-(`BaseReadDriver.knownCommitted` counts only the status cache and other stores' applied revisions, and the one store
-that applied T is the silent rebuilding one). If the lost store's old incarnation applied T and sent `TxCommitted`
-before it was lost, the finalizer writes no ErrorTree mark and no UnackedCommits entry for it
-(`MissedUpdateFinalizationAction.markMissedUpdates`). Since `r > w - t`, a read can still find `r` stores at the old
-revision whenever at least `r - (w - t)` of T's other commit voters have not applied T yet. Only allocations are covered
-by the pending-allocation query (5.3); ordinary updates are not.
-Trigger / scenario: Replication(3,2). T updates X with commit votes from S0 and S1; S2 votes abort. S0 learns the
-commit, applies, acknowledges, and is then lost (device CRL lost at a crash, or a fail-stop). S1 has not received T's
-resolution (message loss; it learns from a recovery driver after `txHeartbeatTimeout`, or at `TxFinalized`). The rebuild
-of S0 starts quickly, X is early in key order, and the walk reads X while S1 still holds T's lock unapplied: S1 and S2
-both report the old revision, which reaches `r = 2`, and S0's staging copy gets it. S1 then applies T, S2 is repaired
-from its mark, and S0 keeps the old revision with no entry.
-Consequence: one replica stale until X is next written (S0 then votes abort on the revision requirement and is
-marked); a cold object stays stale for good, and a later loss of another replica can leave X without `r` matching
-copies. The window is from S0's acknowledgment until every commit voter applied T: usually seconds, longer while
-resolution is delayed.
-Suggested fix: when the restored object's replies carry any write lock (`ObjectState.readLocks`, or the matching
-replies' `lockedWriteTransactions`), mark the object in the ErrorTree against the rebuilding store (`MissedUpdateMarker
-.mark` at the read's timestamp) so repair reconciles it after promotion; alternatively re-read after the locks clear.
-Locked objects are rare, so the cost is off the hot path. A test: an update applied and acknowledged only by the store
-being rebuilt, with its other commit voter's apply held, must end with the rebuilt store current.
-Effort: S   Priority: 2
-
 ### RB-W3. Staging or a finished copy from an earlier Rebuilding episode of the store is resumed or promoted (CONFIRMED mechanism; permanent replica divergence)
 Mechanism: nothing ties a staging directory, its checkpoint, or a `rebuild-complete` directory to the Rebuilding entry
 that produced it. Only `StoreRebuilds.abandonUnlisted` deletes staging for a store no longer Rebuilding on the device,
@@ -697,7 +686,7 @@ Later D2 is failed and the drain selects D (Operational in the tree, with space)
 D. H restarts: its first reconcile finds S Rebuilding on D and resumes the old checkpoint (objects before the key keep
 their era-1 contents), or flips the old finished copy Active.
 Consequence: every object updated while S lived elsewhere and positioned before the checkpoint's key (or every such
-object, for a finished copy) is stale on S with no ErrorTree entry: permanent divergence of one replica, as in RB-W2.
+object, for a finished copy) is stale on S with no ErrorTree entry: permanent divergence of one replica.
 The old copy also carries an `acceptor-since` from its own finish, well before the new episode's.
 Suggested fix: give each Rebuilding episode an identity: write a fresh UUID into the Rebuilding `StoreEntry` (the
 unused `transferId` field fits) at every transition into Rebuilding (R1-R4), record it in the checkpoint and beside

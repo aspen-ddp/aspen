@@ -133,11 +133,10 @@ object RebuildingStore:
  *  the client, and writing this store's slice of it into a fresh backend.
  *
  *  The store is not Active while this runs, so it participates in no transactions and receives
- *  no writes. Objects the walk has not yet reached are therefore read at their current value.
- *  The gap is the other side: an object already copied and then written before the rebuild
- *  finishes leaves a stale slice here. That is the same condition as a store that missed writes
- *  while briefly offline, and the repair-on-read path heals it for anything something reads.
- *  Cold objects are not healed; a background scrubber is deliberately out of scope.
+ *  no writes. An object written after the walk copied it is stale here, as on a store that missed
+ *  writes while offline: the silent store is marked in the ErrorTree by the writer's finalizer. A
+ *  copy read while a reply reported a write lock may predate a commit the lost store applied, which
+ *  no finalizer marks, so `restore` marks it. Repair scans reconcile both once the store is loaded.
  */
 class RebuildingStore(client: AspenClient,
                       val storeId: StoreId,
@@ -547,6 +546,9 @@ class RebuildingStore(client: AspenClient,
     else
       restore(ptr)
 
+  /** Reads `ptr` through the client and writes this store's slice of it into staging. A read whose replies report a
+   *  write lock also marks the object in the ErrorTree against this store (rebuild-process.md 5.2, locked copies):
+   *  the read ignores locks of transactions not known committed, so the copy may predate one the lost store applied */
   private def restore(ptr: ObjectPointer): Future[Unit] =
     def metadataOf(os: ObjectState): (ObjectType.Value, Metadata) = os match
       case kvos: KeyValueObjectState =>
@@ -560,10 +562,19 @@ class RebuildingStore(client: AspenClient,
       case p: KeyValueObjectPointer => client.read(p)
       case p: DataObjectPointer => client.read(p)
 
-    fos.map: os =>
+    fos.flatMap: os =>
       val (objectType, metadata) = metadataOf(os)
       val localData = os.getRebuildDataForStore(storeId)
       backend.rebuildWrite(ptr, objectType, metadata, localData.getOrElse(DataBuffer()))
+      if os.readLocks.keys.isEmpty && !os.readLocks.objectLevel then
+        Future.unit
+      else
+        // A reply held a write lock: a committed transaction its holder has not applied yet, which the lost store may
+        // have applied and acknowledged (so its finalizer marks nothing), may be missing from this copy. Recorded for
+        // repair before the restore completes, so the walk never checkpoints past an unrecorded copy. Missed at
+        // HLCTimestamp.Zero: the walk does not know the transaction, and repair defers while the lock is reported
+        client.missedUpdateMarker.mark(List(
+          MissedUpdate(storeId, ptr.id, Some(ptr.objectType), ptr.storePointer, HLCTimestamp.Zero)))
 
   /** `advance`: the walk's position moves to `key` (false for the sweep, which leaves the checkpoint alone) */
   private def recordRestored(key: Key, advance: Boolean): Future[Unit] =

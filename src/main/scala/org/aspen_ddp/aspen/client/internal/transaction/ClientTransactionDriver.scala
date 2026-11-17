@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 import org.aspen_ddp.aspen.client.ReadDriverClient
 import org.aspen_ddp.aspen.client.internal.transaction.TransactionBuilder.TransactionData
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.network.{TransactionFinalized, TransactionResolved, TxPrepare}
+import org.aspen_ddp.aspen.common.network.{TransactionFinalized, TransactionResolved, TransactionVote, TxPrepare}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
@@ -58,6 +58,8 @@ class ClientTransactionDriver(
   }
 
   def receive(finalized: TransactionFinalized): Unit = complete(ClientOutcome(finalized.committed))
+
+  def receive(vote: TransactionVote): Unit = ()
 
   def receive(resolved: TransactionResolved): Unit = complete(ClientOutcome(resolved.committed))
 

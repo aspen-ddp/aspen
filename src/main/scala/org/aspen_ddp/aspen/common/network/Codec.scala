@@ -958,6 +958,18 @@ object Codec extends Logging:
     TransactionResolved(toClient, fromStore, transactionId, committed)
 
 
+  def encode(o: TransactionVote): codec.TransactionVote =
+    codec.TransactionVote(
+      toClient = Some(encodeUUID(o.toClient.uuid)),
+      fromStore = Some(encode(o.fromStore)),
+      transactionId = Some(encodeUUID(o.transactionId.uuid)),
+      disposition = encodeTransactionDisposition(o.disposition)
+    )
+
+  def decode(m: codec.TransactionVote): TransactionVote =
+    TransactionVote(ClientId(decodeUUID(m.toClient.get)), decode(m.fromStore.get),
+      TransactionId(decodeUUID(m.transactionId.get)), decodeTransactionDisposition(m.disposition))
+
   def encode(o: TransactionFinalized): codec.TransactionFinalized =
     codec.TransactionFinalized(
       toClient = Some(encodeUUID(o.toClient.uuid)),

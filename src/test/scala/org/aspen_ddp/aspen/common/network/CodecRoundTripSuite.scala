@@ -542,6 +542,11 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decoded = Codec.decode(Codec.encode(original))
     decoded shouldBe original
 
+  test("TransactionVote round-trip"):
+    for d <- List(TransactionDisposition.VoteCommit, TransactionDisposition.VoteAbort, TransactionDisposition.Undetermined) do
+      val original = TransactionVote(ClientId(uuid(1)), storeId(2), TransactionId(uuid(3)), d)
+      Codec.decode(Codec.encode(original)) shouldBe original
+
   test("HostHeartbeat round-trip"):
     val original = HostHeartbeat(HostId(uuid(1)))
     val decoded = Codec.decode(Codec.encode(original))

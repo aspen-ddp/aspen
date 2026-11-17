@@ -11,6 +11,8 @@
   allocations in its pool held by transactions it has not seen finalized or abort (`PendingAllocation`). A rebuild
   asks its peers through `AspenClient.currentAllocations` (`client/internal/CurrentAllocationsQuery`), which resends to
   silent stores until enough answer (Rebuild F10)
+- `TransactionVote` (client response): a store's durable vote (`TransactionDisposition`) on a transaction, sent to
+  the originating client. `TransactionManager.receive(vote)` hands it to the registered driver and keeps the driver
 - Low-level networking dealing with things like network endpoints, transport protocols, and the like are mostly 
   handled by the networking plugin.
 - The Network Layer is pluggable via `common.network.NetworkPlugin`. QUIC is the only plugin

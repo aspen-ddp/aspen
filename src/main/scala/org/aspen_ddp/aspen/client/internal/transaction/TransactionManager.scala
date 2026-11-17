@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.client.internal.transaction.TransactionBuilder.TransactionData
-import org.aspen_ddp.aspen.common.network.{TransactionFinalized, TransactionResolved}
+import org.aspen_ddp.aspen.common.network.{TransactionFinalized, TransactionResolved, TransactionVote}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 
@@ -52,6 +52,12 @@ class TransactionManager(val client: AspenClient,
       synchronized { transactions -= resolved.transactionId }
     }
   }
+  /** Delivers to the registered driver; a vote never completes the transaction, so the driver is kept */
+  def receive(vote: TransactionVote): Unit = {
+    val otd = synchronized { transactions.get(vote.transactionId) }
+    otd.foreach(_.receive(vote))
+  }
+
   def receive(finalized: TransactionFinalized): Unit = {
     val otd = synchronized { transactions.get(finalized.transactionId) }
     otd.foreach { td =>

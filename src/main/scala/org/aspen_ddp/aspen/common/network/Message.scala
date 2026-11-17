@@ -243,6 +243,13 @@ final case class TransactionFinalized(
                                        committed: Boolean) extends ClientResponse:
   override def toString: String = f"TransactionFinalized to $toClient from $fromStore tx $transactionId committed $committed"
 
+final case class TransactionVote(
+                                  toClient: ClientId,
+                                  fromStore: StoreId,
+                                  transactionId: TransactionId,
+                                  disposition: TransactionDisposition.Value) extends ClientResponse:
+  override def toString: String = f"TransactionVote to $toClient from $fromStore tx $transactionId disposition $disposition"
+
 /**
  * Sent in response to a transaction message if the recipient does not host the
  * store. Usually this will be due to the store having been transferred to a new

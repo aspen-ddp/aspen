@@ -108,6 +108,7 @@ object QuicMessageCodec:
     case m: CurrentAllocationsReply => codec.Message.Msg.CurrentAllocationsReply(Codec.encode(m))
     case m: TransactionFinalized => codec.Message.Msg.TxFinalized(Codec.encode(m))
     case m: TransactionResolved => codec.Message.Msg.TxResolved(Codec.encode(m))
+    case m: TransactionVote => codec.Message.Msg.TxVote(Codec.encode(m))
     case m: StartStoreTransfer => codec.Message.Msg.StartStoreTransfer(Codec.encode(m))
     case m: CheckStorageDevice => codec.Message.Msg.CheckStorageDevice(Codec.encode(m))
     case m: ServiceMessage => codec.Message.Msg.ServiceMessage(Codec.encode(m))
@@ -278,6 +279,7 @@ object QuicMessageCodec:
           case codec.Message.Msg.CurrentAllocationsReply(r) => Right(Codec.decode(r))
           case codec.Message.Msg.TxResolved(r) => Right(Codec.decode(r))
           case codec.Message.Msg.TxFinalized(r) => Right(Codec.decode(r))
+          case codec.Message.Msg.TxVote(r) => Right(Codec.decode(r))
           case codec.Message.Msg.Empty => Left("Empty message")
       catch
         case t: Throwable => Left(s"Failed to decode message: $t")

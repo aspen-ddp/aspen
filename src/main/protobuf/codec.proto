@@ -419,6 +419,13 @@ message TransactionFinalized {
   bool committed = 4;
 }
 
+message TransactionVote {
+  UUID to_client = 1;
+  StoreId from_store = 2;
+  UUID transaction_id = 3;
+  TransactionDisposition disposition = 4;
+}
+
 //---------------------------------------------------------------------------
 //- Node Support Message
 //---------------------------------------------------------------------------
@@ -557,6 +564,7 @@ message Message {
     WrongHost wrong_host = 35;
     CurrentAllocationsRequest current_allocations_request = 36;
     CurrentAllocationsReply current_allocations_reply = 37;
+    TransactionVote tx_vote = 38;
   }
   UUID to_host = 100; // Intended destination HostId. Absent when the sender did not say
 }

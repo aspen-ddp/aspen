@@ -653,6 +653,7 @@ abstract class BaseAspenClient(
     case m: TransactionCompletionResponse => rmgr.receive(m)
     case m: TransactionResolved => txManager.receive(m)
     case m: TransactionFinalized => txManager.receive(m)
+    case m: TransactionVote => txManager.receive(m)
 
   private[aspen] def sendHostMessage(msg: HostMessage): Unit =
     messenger.sendHostMessage(msg)

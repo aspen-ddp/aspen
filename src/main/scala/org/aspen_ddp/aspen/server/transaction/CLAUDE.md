@@ -75,7 +75,11 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   abort (an abort Paxos already accepted still resolves). A resolution reached after the transaction was forgotten
   is late (`late = true`; the cached outcome is finalized): the driver runs no finalization actions, and a store
   applies it only when it holds its own commit vote and its UnackedCommits entry names the store's own incarnation
-  (UnackedCommits below). Everything else (abort vote, prover, muted Tx) applies nothing and sends no TxCommitted
+  (UnackedCommits below). Everything else (abort vote, prover, muted Tx) applies nothing and sends no TxCommitted.
+  A proof plus a memoryless post-proof quorum resolves late only while T is inside the horizon by the driver's
+  clock (`TransactionDriver.Start.pastHorizon`): an expiry commit is accepted by no acceptor, so its unfrozen holders
+  answer memoryless promises while its finalizer runs, and a late outcome would cancel that finalizer. It exists only
+  past horizon + expiry margin by the decider's clock, and the 8 s margin covers inter-host skew
 - Driver prepares are prefer-abort (`fromClient == false`): a Tx with no vote and no client prepare never checks
   requirements on one. It proves at once if it can (`appliedBy`), else withholds its whole response until the data, a
   client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes: then it votes abort

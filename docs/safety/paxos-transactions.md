@@ -677,7 +677,17 @@ T started is logged (`Tx.LateClientPrepareAfter`).
   an accepted commit (`Proposer.prepareQuorumWithoutAcceptedCommit`; an older accepted abort counts as memoryless):
   `resolveLate`. Argument: the proof shows a quorum Q accepted commit before the proof was sent; Q intersects the
   responders; an acceptor forgets a committed T only on `TxFinalized` or a late outcome; a rebuilt acceptor is muted;
-  so T's finalization completed. (See Open weaknesses, P-W2: the argument assumes the commit was chosen by Paxos.)
+  so T's finalization completed. The argument needs a commit chosen by Paxos, so the condition is taken only while T
+  is inside the horizon by the driver's own clock (`TransactionDriver.Start.pastHorizon`). An expiry commit
+  (`Frontend.decideExpiry`) is accepted by no acceptor: its holders not yet frozen by their own clocks answer
+  memoryless promises while the expiry driver's finalizer still writes its marks, and a late outcome would cancel that
+  finalizer (`receiveTxFinalized` -> `resolveLate`), leaving stores unmarked and never repaired. It is decided only
+  past the horizon plus the expiry margin by the decider's clock, and the margin (8 s) covers the inter-host skew
+  (`RebuildingStore.AcceptorSinceMargin` less `MaxStartLead`), so it exists only once T is past the horizon by every
+  host's clock. Past the horizon the condition would prove nothing in any case: a store that forgot T refuses the
+  prepare (forget floor), and inside its own horizon answers by the finalized relay (late condition 2). A proof holder
+  past the horizon waits for a `TxFinalized`, a late message or an accepted commit, or is stopped with its store's Tx
+  (`Store.removeExpiredDrivers`).
 * **Late condition 2.** A `TxResolved` or `TxFinalized` with `late = true`, including a store's finalized relay.
 * **Late resolution** runs no finalization actions, cancels any it started, finalizes at once, and every
   `TxResolved`/`TxFinalized` it sends carries `late = true` with an empty `owed`. A late commit after an abort
@@ -1070,31 +1080,6 @@ transaction eventually resolves without operator action given a healthy quorum.
 ---
 
 ## Open weaknesses
-
-### P-W2. Late condition 1 after an expiry commit cancels the expiry finalizer (PLAUSIBLE; permanent replica divergence)
-Mechanism: `TransactionDriver.resolveLate` on a proof plus a memoryless post-proof quorum
-(`Proposer.prepareQuorumWithoutAcceptedCommit`) assumes a Paxos quorum accepted commit and later forgot it, which
-happens only at `TxFinalized`, so the finalization completed. An expiry commit (`Frontend.decideExpiry`, Commit) applies
-T at every holder through a plain `TxResolved(commit)` with no acceptor accepting anything. Holders whose clocks run
-behind the decider's are not frozen yet (`Tx.frozen` uses each store's own clock), so their resolved Txs still answer
-prepares with promises carrying no accepted value. A proof can come from a commit vote that finds the UnackedCommits
-entry the expiry finalizer's marker just wrote (`Store.giveProof`). A late `TxFinalized` reaching the expiry driver
-then makes it call `resolveLate` (`receiveTxFinalized`), which cancels its finalizer (`finalizer.foreach(_.cancel())`)
-and finalizes with an empty `owed`. The same reaches every other holder's expiry driver.
-Trigger / scenario: store X decides rule A or F past expiry by its clock and starts its finalizer. Stores Y and W have
-clocks a few seconds behind X (within the 8 s skew bound), so their Txs are resolved by X's `TxResolved` but not
-frozen. W restarts, recovers its commit vote, finds the entry X's marker wrote for it, and its driver gets the proof,
-starts a post-proof round, collects memoryless promises from W and Y, and resolves late. Its late `TxFinalized` cancels
-X's finalizer while the marker is still writing other pools' ErrorTree marks and entries.
-Consequence: stores that never applied T (abort voters, non-voters, stores with no Tx) may get no ErrorTree mark and
-are never repaired, so the divergence is permanent. Undecided commit voters reached by the late commit find no entry
-and apply nothing, and T can end applied at fewer stores than the read threshold. The trigger needs inter-host skew,
-a restart and a lookup inside the skew window, so it is unlikely.
-Suggested fix: do not take late condition 1 once T is past the horizon by the driver's clock: no store that forgot T
-answers there, so the condition proves nothing. Alternatively, mark Txs resolved by an expiry commit so that they answer
-no later prepare, as if frozen. Inside the window the finalized relay (late condition 2) already covers forgotten
-stores. A test with a skewed `wallClockMillis` per store can reproduce it.
-Effort: S   Priority: 2
 
 ### P-W3. A driver ignoring an abort `TxFinalized` is dropped from its store's driver map (CONFIRMED; hygiene)
 Mechanism: `Store.handleTransactionMessage` removes a driver from `transactionDrivers` on every `TxFinalized` for its

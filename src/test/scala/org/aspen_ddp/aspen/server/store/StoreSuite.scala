@@ -376,8 +376,9 @@ class StoreSuite extends AnyFunSuite with Matchers:
   /** A store recovering a commit vote for a traceless KV delete of key 2, its other stores having forgotten it. Its
     * entry is found, then its heartbeat starts its driver
     */
-  private def foundEntryStore(): (Store, RecordingNet, StubFinalizer) =
-    val (store, net, finalizer, lookup, backend) = recoveredVoteStore()
+  private def foundEntryStore(wallClockMillis: () => Long = () => System.currentTimeMillis()
+                             ): (Store, RecordingNet, StubFinalizer) =
+    val (store, net, finalizer, lookup, backend) = recoveredVoteStore(wallClockMillis)
     lookup.answer(foundTxid, lookup.own)
     KVObjectState.decode(backend.get(oid2).get.data).content.keySet should not contain k(2)
     store.heartbeat() // The Tx has been idle for the zero heartbeat timeout: its store drives it
@@ -385,7 +386,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     (store, net, finalizer)
 
   /** The store of foundEntryStore before its recovered vote's lookup is answered */
-  private def recoveredVoteStore(): (Store, RecordingNet, StubFinalizer, ManualLookup, MapBackend) =
+  private def recoveredVoteStore(wallClockMillis: () => Long = () => System.currentTimeMillis()
+                                ): (Store, RecordingNet, StubFinalizer, ManualLookup, MapBackend) =
     val backend = new MapBackend(storeId)
     val kv = mkKVObjectState()
     backend.bootstrapAllocate(oid2, kv.objectType, kv.metadata, kv.data)
@@ -405,7 +407,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     // Parasitic: the driver's finalizer completion runs inline, so the test sees its TxFinalized
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.parasitic, backend, cache, net,
       BackgroundTaskManager.NoBackgroundTaskManager, crl, new TransactionStatusCache(), finalizer,
-      TransactionDriver.noErrorRecoveryFactory, Duration.Zero, None, unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded)
+      TransactionDriver.noErrorRecoveryFactory, Duration.Zero, None, unackedLookup = lookup, loadedAt = FrontendSuite.longLoaded,
+      wallClockMillis = wallClockMillis)
     lookup.frontend = Some(store.frontend)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     (store, net, finalizer, lookup, backend)
@@ -437,6 +440,34 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
     store.receiveTransactionMessage(TxFinalized(storeId, storeId, foundTxid, committed = true, late = true, owed = Set(),
       startTimestamp = HLCTimestamp.now))
+    store.frontend.transactions.contains(foundTxid) shouldBe false
+  }
+
+  // paxos-transactions.md, late condition 1: an expiry commit is accepted by no acceptor, so its holders not yet frozen
+  // by their own clocks answer memoryless promises while the expiry driver's finalizer writes its marks. A late
+  // TxFinalized from this driver would cancel that finalizer. Past the horizon the driver waits for the real one
+  test("past the horizon a found recovered vote's driver does not resolve late on memoryless promises") {
+    var now = System.currentTimeMillis()
+    val (store, net, finalizer) = foundEntryStore(() => now)
+    val tx = store.frontend.transactions(foundTxid)
+    now = tx.txd.startTimestamp.wallTime + store.frontend.horizon.toMillis + 1
+    val p = currentProposal(net)
+    p should not be initialProposal
+
+    // Holders resolved by the expiry commit, not yet frozen: memoryless promises
+    promise(store, 1, p, None)
+    promise(store, 2, p, None)
+
+    net.sentTx.collect { case a: TxAccept => a.value } shouldBe Nil
+    net.sentTx.collect { case f: TxFinalized => f } shouldBe Nil
+    net.sentTx.collect { case r: TxResolved if r.late => r } shouldBe Nil
+    finalizer.created shouldBe 0
+    store.hasTransactions shouldBe true
+
+    // The expiry driver's TxFinalized, sent once its marks are durable
+    store.receiveTransactionMessage(TxFinalized(storeId, StoreId(poolId, 1.toByte), foundTxid, committed = true,
+      late = false, owed = Set(storeId), startTimestamp = tx.txd.startTimestamp))
+    net.sentTx.collect { case f: TxFinalized => (f.committed, f.late) }.distinct shouldBe List((true, false))
     store.frontend.transactions.contains(foundTxid) shouldBe false
   }
 

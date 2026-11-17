@@ -39,14 +39,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.5  Late condition 1 after an expiry commit cancels the expiry finalizer: P-W2                            [S]
-     PLAUSIBLE. An expiry commit bypasses Paxos, so holders not yet frozen by their own (slower) clocks answer
-     memoryless promises; a proof plus that quorum makes a driver resolve late and its TxFinalized cancels the
-     expiry finalizer before its marks/entries are written. Stores never marked are never repaired. Fix: no late
-     condition 1 past the horizon by the driver's clock (or expiry-resolved Txs answer no prepare). Also fixes
-     contradiction X 5.1 (the "acceptor forgot T implies finalized" statements in transaction-recovery.md and
-     paxos-transactions.md).
-
 2.6  A declined ErrorTree mark does not invalidate a repair that deletes the held entry: RP-W1             [S]
      CONFIRMED. MissedUpdateMarker drops a mark whose missedTimestamp is not later than the held entry's, with no
      write, so a repair that read before the earlier-started, later-committed transaction can still delete the
@@ -187,7 +179,7 @@ PRIORITY 7: documentation corrections
 7.1  Contradictions between safety docs (cross-document-review.md section 5)                               [S]
      5.2 a prover is forgotten only on TxFinalized or a late outcome (fix paxos-transactions.md proof section and
      transaction-recovery.md 4.4); 5.3 rebuild-process.md 5.3 "expiry never discards a committed, unfinalized Tx"
-     is false (rule D). 5.1, 5.5, 5.7 are fixed with 2.5, 3.1, 2.7 (5.4 is resolved).
+     is false (rule D). 5.5, 5.7 are fixed with 3.1, 2.7 (5.1, 5.4 are resolved).
 
 7.2  Architecture.md contention rules do not match the driver: P-W4                                        [S]
      Abort needs more than w - t abort votes; no-commit-vote does not abort (the tally waits); no timestamps are

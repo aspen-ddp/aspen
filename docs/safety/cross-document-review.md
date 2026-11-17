@@ -52,8 +52,10 @@ The premises other subsystems take from this:
   rule leaves at least `t` primary stores that are commit voters or amnesiac (A: `vc >= t`; B: an accepted commit
   traces back to a commit-certain tally; F: `vc + k >= t`), and both kinds count as holders. So more than `w - t`
   non-holders need one of them to have forgotten T first, which only `TxFinalized`, a late outcome or a discard does.
-  Late condition 1 is the one inference that does rely on "a memoryless quorum means T was finalized", and an expiry
-  commit breaks it (paxos-transactions.md, P-W2; contradiction 5.1 below).
+  Late condition 1 is the one inference that does rely on "a memoryless quorum means T was finalized", which holds
+  only for a commit chosen by Paxos: it is taken only inside the horizon by the driver's clock, and an expiry commit
+  exists only past the horizon plus the expiry margin by the decider's clock, a margin that covers the inter-host
+  skew (paxos-transactions.md, late condition 1).
 * **A recovered or expiring commit vote is not dropped silently.** It accepts an abort, or discards itself, only after
   an UnackedCommits lookup that began after the abort (or the discard decision) found no entry.
 * **Repair waits until the store cannot join T.** An entry is left alone while T's start is at or above the store's
@@ -171,7 +173,7 @@ Every clock comparison that crosses subsystems, and what bounds it:
 | Forget floor time leg (`now - horizon`) | the store's own wall clock against T's start | same host only; a backward step of more than about 8 s reopens the window (paxos-transactions.md) |
 | `MaxStartLead` mute and the join ceiling | host wall clock | caps every accepted start, and so every object timestamp and client HLC, at the fastest host plus 2 s |
 | Arrival margin, rebuilt store's `acceptor-since` | old host against new host | inter-host skew below 8 s |
-| Expiry (`Frontend.pastExpiry`, freeze) | each store's own clock | stores freeze at different moments under skew (P-W2) |
+| Expiry (`Frontend.pastExpiry`, freeze) | each store's own clock | stores freeze at different moments under skew; the 8 s margin covers the inter-host skew, so an expiry commit exists only past the horizon on every clock (late condition 1) |
 | Repair age gate (60 s) | repairing host's HLC against the marker's start | paces only; the read decides a deletion |
 | Repair `mayJoinTransaction` | the store's own floor | same host |
 | Repair completion gate | object timestamps, no clock | object timestamps never decrease |
@@ -182,14 +184,10 @@ Every clock comparison that crosses subsystems, and what bounds it:
 ## 5. Contradictions
 
 ### 5.1 "An acceptor having forgotten T implies every finalization action completed"
-transaction-recovery.md (finalizer, "Finalization gates forgetting") states this as the premise of `resolveLate` and
-of the late branches of `Tx.unackedCommitFound`, `unackedCommitNotOwed` and `concludeOwedCommit`; paxos-transactions.md
-(late condition 1) argues it from "an acceptor forgets a committed T only on `TxFinalized` or a late outcome". The
-code does not support the premise as used: an expiry commit (`Frontend.decideExpiry`) resolves T with a plain
-`TxResolved(commit)` and no acceptor accepts anything, so a memoryless post-proof quorum is reachable while the
-expiry finalizer still runs. paxos-transactions.md's P-W2 is right. The premise holds for a Paxos-chosen commit, and
-the expiry conclusion of a known outcome holds by counting (section 2.1), but late condition 1, and everything that
-inherits a late outcome from it (finalized-and-late cache entries relayed for 30 s), does not.
+Resolved. The premise holds for a commit chosen by Paxos. An expiry commit (`Frontend.decideExpiry`) is accepted by
+no acceptor, so a memoryless post-proof quorum is reachable while its finalizer runs; late condition 1 is therefore
+taken only inside the horizon by the driver's clock, where no expiry commit can exist yet (paxos-transactions.md,
+late condition 1; transaction-recovery.md, "Finalization gates forgetting").
 
 ### 5.2 When a prover is forgotten
 paxos-transactions.md (proof of commit on an unknown transaction) says a prover "on any real outcome ... applies

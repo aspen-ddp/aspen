@@ -197,8 +197,8 @@ that post-proof round reports no accepted commit (`Proposer.prepareQuorumWithout
 expiring commit vote that found its UnackedCommits entry proves the commit to its own store's driver the same way.
 
 A driver therefore learns the outcome by: an `Accepted` quorum (`learner.finalValue`); a peer's non-proof
-`TxResolved`; a peer's `TxFinalized`; a late message (`late = true`) or a proof plus a memoryless post-proof quorum
-(both `resolveLate`). A recovery driver that runs Paxos proposes the highest accepted value its promise quorum reports
+`TxResolved`; a peer's `TxFinalized`; a late message (`late = true`) or, inside the horizon by the driver's clock, a
+proof plus a memoryless post-proof quorum (both `resolveLate`). A recovery driver that runs Paxos proposes the highest accepted value its promise quorum reports
 (`Proposer.proposalValue`), so a value chosen before the takeover is kept.
 
 ### 4.3 Proposal-id competition
@@ -251,7 +251,9 @@ the client.
   it (which a committed T allows only after its finalization). Finding an UnackedCommits entry applies the update but
   keeps the Tx until one of those. So an acceptor having forgotten T implies every finalization action completed. A
   durable UnackedCommits entry implies only that T committed: the other actions may still be failing. This is the
-  premise `resolveLate` relies on when it runs no actions, and the late branches of `Tx.unackedCommitFound`,
+  premise `resolveLate` relies on when it runs no actions (a memoryless quorum shows it only for a commit chosen by
+  Paxos, so late condition 1 is taken only inside the horizon by the driver's clock, before any expiry commit, which
+  no acceptor accepts, can exist: paxos-transactions.md, late condition 1), and the late branches of `Tx.unackedCommitFound`,
   `Tx.unackedCommitNotOwed` and `Tx.concludeOwedCommit` rely on it too. A muted Tx and a prover are dropped without
   `TxFinalized`, but neither voted commit; `unackedCommitFound`, `unackedCommitNotOwed` (for a recovered or expiring
   vote) and `proveCommitted` record nothing in the status cache, so a finalized cache entry, and the late relay from
@@ -581,7 +583,7 @@ lookup that finds no entry.
    -> votes per object (commit-certain / abort-certain / undecided); proof: never abort, post-proof round
    -> local proposal fixed; ACCEPT to primary-pool stores (+ prepares every third send); learn-only: no Accept
    -> learner: Accepted quorum   ==> resolved(c)         [or TxResolved / TxFinalized from a peer]
-      proof + memoryless post-proof quorum, or late message ==> resolveLate: finalized, no actions
+      proof + memoryless post-proof quorum (inside the horizon), or late message ==> resolveLate: finalized, no actions
    resolved(c): commit => startFinalizer ; abort => finalized at once
    -> TxResolved to all data stores + notifyOnResolution + client; re-sent to stores not known resolved
    -> commit: finalizer.complete ==> TxFinalized(owed) to stores, TransactionFinalized to client

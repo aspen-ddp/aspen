@@ -995,6 +995,55 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     allLate(outcomes(messenger)) should be (true)
   }
 
+  // Past the horizon no store that forgot T answers a prepare, so a memoryless quorum shows only stores that never
+  // accepted, as after an expiry commit (which no acceptor accepts): resolving late would cancel the expiry driver's
+  // finalizer before its marks are written (paxos-transactions.md, late condition 1)
+  test("past the horizon a proof with a quorum of memoryless promises does not resolve late") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    var completed = false
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => completed = true,
+      start = TransactionDriver.Start(pastHorizon = () => true))
+
+    proofFrom(driver, txd, ds1)
+    promise(driver, txd, ds0, TransactionDisposition.VoteAbort)
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+
+    completed should be (false)
+    driver.testFinalized should be (false)
+    finalizer.createCount should be (0)
+    abortAccepts(messenger) should be (Nil)
+    outcomes(messenger) should be (Nil)
+
+    // The expiry driver's TxFinalized, sent once its marks are durable, finalizes it with the stores it lists
+    driver.receiveTxFinalized(TxFinalized(ds0, ds1, txd.transactionId, committed = true, late = false,
+      owed = Set(ds2), txd.startTimestamp))
+    completed should be (true)
+    val finals = messenger.messages.collect { case f: TxFinalized => f }
+    finals should not be (Nil)
+    finals.foreach { f =>
+      f.late should be (false)
+      f.committed should be (true)
+      f.owed should be (Set(ds2))
+    }
+  }
+
+  test("past the horizon a proof holder still adopts an accepted commit of its post-proof round") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val finalizer = new TFinalizer()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), finalizer, _ => (),
+      start = TransactionDriver.Start(pastHorizon = () => true))
+
+    proofFrom(driver, txd, ds1)
+    promise(driver, txd, ds0, TransactionDisposition.VoteCommit, Some((ProposalId(1, 2), true)))
+    promise(driver, txd, ds2, TransactionDisposition.VoteAbort)
+
+    outcomes(messenger) should be (Nil)
+    messenger.messages.collect { case a: TxAccept => a.value }.toSet should be (Set(true))
+  }
+
   // The counterexample to counting pre-proof promises: they may predate another driver's choice of commit at a higher
   // proposal, which an unfinalized prover (a muted rebuilt store) then shows. Only a post-proof round counts
   test("memoryless promises received before the proof do not make it late; a post-proof round's quorum does") {

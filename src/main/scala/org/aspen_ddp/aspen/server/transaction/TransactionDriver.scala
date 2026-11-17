@@ -48,7 +48,10 @@ object TransactionDriver {
     */
   case class Start(initialProposal: Boolean = false,
                    highestSeen: Option[ProposalId] = None,
-                   onSplitDecision: (TransactionId, String) => Unit = logSplitDecision)
+                   onSplitDecision: (TransactionId, String) => Unit = logSplitDecision,
+                   /** Whether the transaction is past the horizon by the driver's host clock: late condition 1 is
+                     * then never taken (see `holdsProof`). Store passes its Frontend's clock and horizon */
+                   pastHorizon: () => Boolean = () => false)
 
   private def logSplitDecision(txid: TransactionId, detail: String): Unit =
     scribe.error(s"Split decision: transaction $txid: $detail")
@@ -205,7 +208,7 @@ abstract class TransactionDriver(
 
   /** A store proved the commit (a `TxResolved` with `proof = true`): this driver never proposes abort, adopts only an
     * accepted commit, and resolves late once a prepare quorum of the current round reports no accepted commit
-    * (Ruling 29). See `resolveLate`
+    * (Ruling 29), but only while T is inside the horizon by this host's clock (`Start.pastHorizon`). See `resolveLate`
     */
   private var holdsProof: Boolean = false
 
@@ -403,10 +406,12 @@ abstract class TransactionDriver(
 
           // A proof holder (Ruling 29) adopts only an accepted commit of the current, post-proof round: commit was
           // chosen at some ballot c and every value accepted at c or higher is commit, so an accepted abort predates c.
-          // A quorum reporting no accepted commit is memoryless and resolves late. Neither case uses the vote tally,
+          // A quorum reporting no accepted commit is memoryless and resolves late, inside the horizon only (see
+          // resolveLate): past it the proof holder waits for a TxFinalized or an accepted commit, or is stopped with
+          // its store's Tx (Store.removeExpiredDrivers). Neither case uses the vote tally,
           // which picks only a local proposal (a proof holder needs none, and the prover never votes, so the tally
           // could wait forever); Proposer.commitProven makes the proposal commit or none
-          if (holdsProof && !resolved && proposer.prepareQuorumWithoutAcceptedCommit)
+          if (holdsProof && !resolved && !start.pastHorizon() && proposer.prepareQuorumWithoutAcceptedCommit)
             resolveLate()
           else if (holdsProof && !resolved && proposer.prepareQuorumReached && proposer.proposalValue.isDefined)
             shouldSendAcceptMessages = mayPropose
@@ -696,7 +701,14 @@ abstract class TransactionDriver(
     *    for the transaction, so if it was in Q it forgot on TxFinalized too. Promises to earlier rounds never count: they may have been given
     *    before Q accepted, at a higher proposal of another driver, and then prove nothing (the prover may be a muted
     *    rebuilt store while that driver's finalizer still runs). The first proof therefore starts a new round
-    *    (`receiveTxResolved`);
+    *    (`receiveTxResolved`). Taken only while T is inside the horizon by this host's clock (`Start.pastHorizon`).
+    *    The argument needs a commit chosen by Paxos: an expiry commit (Frontend.decideExpiry) is accepted by no
+    *    acceptor, and its holders not yet frozen by their own clocks answer memoryless promises while the expiry
+    *    driver's finalizer still writes its marks; resolving late then would cancel that finalizer. An expiry commit is
+    *    decided only past the horizon plus the expiry margin by the decider's clock, and the margin (8 s) covers the
+    *    inter-host skew (RebuildingStore.AcceptorSinceMargin less MaxStartLead), so it exists only once T is past the
+    *    horizon by every host's clock. Past the horizon the condition proves nothing anyway: a store that forgot T
+    *    refuses its prepares (Frontend.forgetFloorMillis), and inside its own horizon answers by the finalized relay;
     *  - a `TxResolved` or `TxFinalized` with `late = true`: another driver, or a store's finalized relay, already
     *    knows it is late. A store's status cache marks a transaction finalized only from a real TxFinalized or a late
     *    outcome.

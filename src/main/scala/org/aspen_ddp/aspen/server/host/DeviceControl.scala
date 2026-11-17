@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
-import org.aspen_ddp.aspen.server.store.{Frontend, QuarantineVerifier, UnackedCommitLookup}
+import org.aspen_ddp.aspen.server.store.{Frontend, HeldVoteQuery, QuarantineVerifier, UnackedCommitLookup}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
@@ -81,6 +81,8 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
                           /** Verifies the stores' quarantined objects through repair (Frontend.quarantine) */
                           val quarantineVerifier: QuarantineVerifier = QuarantineVerifier.Never,
+                          /** Asks a rebuilt store's peers for their held votes (Frontend.inheritedVoteLock) */
+                          val heldVoteQuery: HeldVoteQuery = HeldVoteQuery.Never,
                           /** How long the stores' Txs wait for a client's prepare (Frontend.missingDataWait) */
                           val missingDataWait: Duration = Frontend.MissingDataWait,
                           /** How long the stores' parked re-reads wait (Frontend.parkedReadWait). A test seam */

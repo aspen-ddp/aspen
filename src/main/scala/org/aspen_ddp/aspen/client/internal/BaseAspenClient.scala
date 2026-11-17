@@ -635,6 +635,16 @@ abstract class BaseAspenClient(
 
   override private[aspen] def currentAllocations(stores: List[StoreId], needed: Int, stopWhen: () => Boolean)
     : Future[Map[StoreId, List[PendingAllocation]]] =
+    given ExecutionContext = clientContext
+    pendingTransactions(stores, needed, stopWhen).map(_.view.mapValues(_.allocations).toMap)
+
+  override private[aspen] def heldVotes(stores: List[StoreId], needed: Int, stopWhen: () => Boolean)
+    : Future[List[HeldVote]] =
+    given ExecutionContext = clientContext
+    pendingTransactions(stores, needed, stopWhen).map(_.valuesIterator.flatMap(_.heldVotes).toList)
+
+  private def pendingTransactions(stores: List[StoreId], needed: Int, stopWhen: () => Boolean)
+    : Future[Map[StoreId, CurrentAllocationsReply]] =
     val q = new CurrentAllocationsQuery(clientId, messenger.sendClientRequest, backgroundTaskManager, stores, needed,
       stopWhen, id => allocationQueries.remove(id))
     allocationQueries.put(q.queryUUID, q)

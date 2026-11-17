@@ -774,6 +774,15 @@ The old incarnation stopped before the rebuild began, so every T it joined start
 `wall_old(stop) + MaxStartLead`, which is before `acceptorSince` unless the old host's clock led the new one's by more
 than 8 s plus the rebuild's duration.
 
+**The rebuilt store's inherited votes.** The mute keeps the rebuilt store out of T, but a commit vote its old
+incarnation cast still counts: a driver keeps a vote in `peerDispositions` until a nack or a proof starts a new round,
+and a muted store sends neither; a client's vote count (`ClientTransactionDriver`) is final; rule B places no condition
+on lock-only pools. The rebuilt store holds none of T's locks, so it votes abort (`InheritedVoteLock`) on every object
+until it knows which transactions its old votes may still back, then on their objects until each is decided
+(`Frontend.inheritedVoteLock`; rebuild-process.md, the rebuilt store's acceptor state). Otherwise, with `2t - w = 1`
+(Replication(3,2), (5,3)), the rebuilt store plus T's abort voter commit a conflicting T' on a lock-only object and T
+then commits with its lock requirement broken.
+
 **Why the floor timing is safe without cross-host clock agreement.** A store writes its cache entry for T after it saw
 T, when by `MaxStartLead` its clock read at least `start - 2 s`. The entry lives 30 s past its last write, so when it
 expires the store's clock reads past `start + 28 s`, beyond the 20 s horizon: the store already refuses T. A restart or

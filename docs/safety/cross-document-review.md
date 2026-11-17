@@ -94,8 +94,18 @@ The premises other subsystems take from this:
   locked parts, and a read that needs a voted, unapplied allocation parks rather than answering `ObjectNotFound`
   (`Frontend.parkAllocationRead`), so no read in an allocation's apply window proves a deletion.
 * A rebuild copies state from ordinary reads and ignores the locks they report, and the rebuilt store holds no lock
-  for any transaction its old incarnation voted in. The consequences are rebuild-process.md RB-W2 (a stale copy) and
-  X-W2 below (a conflicting commit on a lock-only object).
+  for any transaction its old incarnation voted in. Those votes still count: a driver keeps a vote until a nack or a
+  proof starts a new round (a muted store sends neither), a client's vote count is final, and expiry rule B places no
+  condition on lock-only pools. So the rebuilt store holds **inherited votes** instead
+  (`Frontend.inheritedVoteLock`, rebuild-process.md, the rebuilt store): it votes abort (`InheritedVoteLock`) on every
+  object until a query of its peers' held votes (`HeldVote`, in `CurrentAllocationsReply`) completes past
+  `RebuildingStore.inheritedVotesAfter` (the pass start plus the horizon and twice `AcceptorSinceMargin`, after which
+  no store casts a vote on a transaction the old incarnation joined), then on the objects of the transactions they
+  report, until a later query no longer reports one or its `TxResolved`/`TxFinalized` reaches the store. A
+  transaction that can still commit with the old vote counted needs `t - 1` live commit voters among the other stores,
+  so `w - t + 1` replies include one. Without this, in Replication(3,2) the rebuilt store plus T's abort voter would
+  commit a T' over T's lock on a lock-only object, and T could then commit after it (RebuiltVoterLockIntegrationSuite).
+  The stale-copy consequence is rebuild-process.md RB-W2.
 
 ### 2.4 Repair and transactions on one object
 
@@ -251,36 +261,3 @@ pre-repair copy, or install the plan into a copy and swap it in only on success)
 lock holders reference; or refuse a reconcile write while the object has any lock holder (rare, costs a later pass).
 Test: FrontendSuite with a backend whose `repair` fails, a live commit voter holding a key lock, then its commit.
 Effort: S   Priority: 3
-
-### X-W2. A lost lock-only commit voter's lock admits a conflicting commit before T commits (PLAUSIBLE; overwritten update)
-Mechanism: a commit vote's locks live in memory and in the voter's CRL record. A store declared lost and rebuilt
-(rebuild-process.md) loses both; the rebuilt incarnation is muted for T but serves transactions started after its
-`acceptor-since` with state copied from reads that ignore reported locks. The vote it cast before the loss still
-counts: a driver whose current round holds it can tally T commit-certain (`TransactionDriver.receiveTxPrepareResponse`),
-a client may already have learned commit from it (P-VC), and expiry rule B commits on one accepted commit with no
-condition on lock-only pools (`ExpiryTally.decideUnknown`: B checks only `changedRestorable`). Rule F alone states
-`vc > w - t` for lock-only pools, because amnesiac stores hold no lock. For a changed object, a conflicting commit
-needs `2t - w` lost voters, which always exceeds the data tolerance `t - r` (since `t + r > w`), so the object is
-lost first anyway. For a lock-only object there is no data to lose, and `2t - w` is 1 for Replication(3,2) and (5,3):
-one lost voter is enough.
-Trigger / scenario: Replication(3,2) pool L holds a fence object F. T (an old vdisk writer's block commit, or any
-transaction with a `SharedRevisionLock`/`ExclusiveRevisionLock` on F) gets commit votes on F from L0 and L1; L2 voted
-abort. T stays undecided because a store of its primary pool is silent (the leader's round holds L1's vote and waits).
-L1's device CRL is lost; L1 is rebuilt and promoted. A fence takeover T' (bumping F) gets commit votes from L1
-(rebuilt, no lock) and L2 and commits. The silent primary store returns, the leader's round tallies T commit-certain
-with L1's old vote, and T commits after T'. (Variant: L0 accepted commit before the loss, the driver died, and an
-expiry round past L1's return commits T by rule B.)
-Consequence: T commits with its lock requirement broken: the old writer's block write lands after the fence moved,
-which the fence exists to prevent (and strict serializability is lost). L0 detects it only by accident, at T's apply
-re-check, as a live-voter `INVARIANT VIOLATION` fail-stop; transaction-requirements.md Q-W1's suggested fix ("never
-fail-stop on a lock-only object") would make it silent. The trigger needs a store loss plus T staying undecided for a
-whole rebuild, so it is rare.
-Suggested fix: a rebuilt store must not grant a conflicting commit vote on an object some transaction started before
-its `acceptor-since` may hold locked. Options: have the rebuild record every object whose restoring read reported a
-write lock (the same signal RB-W2's fix uses; shared revision locks are not reported today and would have to be) and
-make the rebuilt store vote abort on those objects until a read shows the lock gone; or require, in expiry rule B and
-in the driver's tally, that each lock-only pool still has more than `w - t` live (non-amnesiac) commit voters, holding
-otherwise. Keep Q-W1's fix from hiding a lock-only re-check failure that coincides with a rebuild. Test: TestNetwork,
-Replication(3,2) lock-only pool, rebuild one voter while T is held undecided, commit a conflicting T', then let T
-decide.
-Effort: M   Priority: 2

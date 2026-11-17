@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.store
 import org.aspen_ddp.aspen.common.ida.IDA
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, CurrentAllocationsReply, CurrentAllocationsRequest, PendingAllocation, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
+import org.aspen_ddp.aspen.common.network.{ClientId, CurrentAllocationsReply, CurrentAllocationsRequest, HeldVote, PendingAllocation, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
@@ -66,6 +66,11 @@ object Frontend {
     * clients ratchet their HLCs from can run ahead of the hosts' clocks
     */
   val MaxStartLead: FiniteDuration = TransactionHorizon.MaxStartLead
+
+  /** A rebuilt store's query of its peers' held votes (inheritedVoteLock) is repeated after this, doubling to
+    * InheritedVoteQueryMaxInterval, while it holds any */
+  val InheritedVoteQueryInitialInterval: FiniteDuration = FiniteDuration(1, SECONDS)
+  val InheritedVoteQueryMaxInterval: FiniteDuration = FiniteDuration(30, SECONDS)
 
   /** How long past the horizon an unresolved Tx waits before it queries its peers' status (expiryHeartbeat). It covers
     * the start lead a store tolerates and the idle self-drive delay (the heartbeat timeout plus one heartbeat), so that
@@ -136,6 +141,13 @@ class Frontend(val storeId: StoreId,
                  * clock by more than MaxStartLead (startsTooFarAhead). None: an ordinary store
                  */
                val acceptorSince: Option[HLCTimestamp] = None,
+               /** Set for a rebuilt store whose inherited votes are not yet known to be released
+                 * (RebuildingStore.InheritedVotesFile): from when, in wallClockMillis milliseconds, its peers' held
+                 * votes are complete. See inheritedVoteLock. None: none inherited
+                 */
+               inheritedVotesAfter: Option[Long] = None,
+               /** Asks the pool's other stores for the votes they hold: see inheritedVoteLock */
+               val heldVoteQuery: HeldVoteQuery = HeldVoteQuery.Never,
                /** Recovers nothing at construction: transaction messages are held until recover is called. For
                  * stores whose backend's completion handler is set after they are built (StoreLoader), where a read
                  * a recovered transaction issued in the constructor would never complete
@@ -306,9 +318,90 @@ class Frontend(val storeId: StoreId,
           else Some(PendingAllocation(txd.transactionId, tx.knownOutcome.contains(true), pointers))
       .toList)
 
+  /** The transactions this store holds whose commit vote may still count: outcome unknown, and a vote that is commit or
+    * not yet decided (a collision wait or an in-flight commit may still decide commit). A muted Tx never votes commit.
+    * Each with its objects in this store's pool. Answered with currentAllocations: None while the CRL loads
+    */
+  def heldVotes(): List[HeldVote] =
+    transactions.valuesIterator.flatMap: tx =>
+      if tx.muted || tx.isFinalized || tx.knownOutcome.isDefined || tx.vote == TransactionDisposition.VoteAbort then
+        None
+      else
+        val txd = tx.txd
+        val oids = txd.allReferencedObjectsSet.iterator.filter(_.poolId == storeId.poolId).map(_.id).toSet
+        if oids.isEmpty then None else Some(HeldVote(txd.transactionId, txd.startTimestamp, oids))
+    .toList
+
   def receiveCurrentAllocationsRequest(req: CurrentAllocationsRequest): Unit =
     currentAllocations().foreach: allocations =>
-      net.sendClientResponse(CurrentAllocationsReply(req.fromClient, storeId, req.queryUUID, allocations))
+      net.sendClientResponse(CurrentAllocationsReply(req.fromClient, storeId, req.queryUUID, allocations, heldVotes()))
+
+  // ---- Inherited votes (a rebuilt store; cross-document-review.md, locks across crashes and copies) ----
+  //
+  // A commit vote of this store's lost incarnation still counts for its transaction T (a driver's round, a client's
+  // vote count, expiry rule B), but this store holds none of T's locks: its state came from reads that ignore locks.
+  // Granting a commit vote on an object T locks to a transaction started after acceptorSince could let both commit,
+  // T after the other with its requirement broken. So until the store knows which transactions its old votes may still
+  // back, it votes abort on every object, and then on the objects of those transactions until its peers show them
+  // resolved. T can still commit with the old vote counted only with writeThreshold - 1 live commit voters among the
+  // other stores, so HeldVoteQuery's replies include one of them. A reply is complete only once every vote on such a T
+  // has been cast: the old incarnation voted only before the loss, so before the rebuild pass began, and no store
+  // joins T past its start plus the horizon (the forget floor), which inheritedVotesAfter adds to the pass start with
+  // the clock margins. The vote is an abort, not a wait: one abort vote does not abort a transaction its peers commit
+
+  /** None: every object is locked (no query since the gate has completed) */
+  private var inheritedVotes: Option[Map[TransactionId, Set[ObjectId]]] =
+    if inheritedVotesAfter.isDefined then None else Some(Map())
+  private var inheritedObjects: Set[ObjectId] = Set()
+  private var heldVoteQueryInFlight: Boolean = false
+  private var heldVoteQueryNotBefore: Long = inheritedVotesAfter.getOrElse(0L)
+  private var heldVoteQueryInterval: Long = InheritedVoteQueryInitialInterval.toMillis
+
+  /** A transaction started at or after acceptorSince votes abort on `oid` (InheritedVoteLock) */
+  def inheritedVoteLock(oid: ObjectId): Boolean = inheritedVotes match
+    case None => true
+    case Some(votes) => votes.nonEmpty && inheritedObjects.contains(oid)
+
+  /** The transactions this store's inherited votes may still back. None: not known yet, every object is locked */
+  def inheritedVoteTransactions: Option[Set[TransactionId]] = inheritedVotes.map(_.keySet)
+
+  private def holdsInheritedVotes: Boolean = inheritedVotes.forall(_.nonEmpty)
+
+  /** Store heartbeat: asks the peers again, once past the gate and the backoff, while any inherited vote is held */
+  def retryHeldVoteQuery(): Unit =
+    if holdsInheritedVotes && !heldVoteQueryInFlight && wallClockMillis() >= heldVoteQueryNotBefore then
+      heldVoteQueryInFlight = true
+      heldVoteQuery.query(storeId, result => post(() => heldVotesAnswered(result)))
+
+  /** T's outcome is decided (a TxResolved, proof included, or a TxFinalized for it reached this store, which is one of
+    * T's stores): T can no longer commit after a transaction this store votes on from now, so its inherited vote is
+    * released at once rather than at the next query */
+  private def inheritedVoteDecided(txid: TransactionId): Unit = inheritedVotes match
+    case Some(votes) if votes.contains(txid) => setInheritedVotes(votes - txid)
+    case _ => ()
+
+  private def setInheritedVotes(next: Map[TransactionId, Set[ObjectId]]): Unit =
+    if !inheritedVotes.contains(next) then
+      logger.info(s"Store $storeId: inherited votes now held for ${next.keySet}")
+    inheritedVotes = Some(next)
+    inheritedObjects = next.valuesIterator.flatten.toSet
+    if next.isEmpty then
+      RebuildingStore.removeInheritedVotes(backend.path)
+
+  private def heldVotesAnswered(result: Try[List[HeldVote]]): Unit =
+    heldVoteQueryInFlight = false
+    result match
+      case Failure(err) =>
+        logger.warn(s"Store $storeId: query of its peers' held votes failed, retrying: $err")
+      case Success(held) =>
+        // A transaction started at or after acceptorSince never had this store's old vote
+        val reported = held.iterator.filter(v => acceptorSince.forall(v.startTimestamp < _))
+          .toList.groupMapReduce(_.transactionId)(_.objectIds)(_ ++ _)
+        setInheritedVotes(inheritedVotes match
+          case None => reported
+          case Some(votes) => votes.filter((txid, _) => reported.contains(txid)))
+    heldVoteQueryNotBefore = wallClockMillis() + heldVoteQueryInterval
+    heldVoteQueryInterval = math.min(heldVoteQueryInterval * 2, InheritedVoteQueryMaxInterval.toMillis)
 
   def awaitLocksReleased(holder: TransactionId, waiter: Tx): Unit =
     val others = collisionWaiters.getOrElse(holder, Nil).filterNot(_ eq waiter)
@@ -1436,6 +1529,7 @@ class Frontend(val storeId: StoreId,
     case m: TxPrepare => receivePrepare(m)
     case m: TxAccept => transactions.get(m.transactionId).foreach(tx => tx.receiveAccept(m))
     case m: TxResolved =>
+      inheritedVoteDecided(m.transactionId)
       transactions.get(m.transactionId) match
         case Some(tx) => tx.receiveResolved(m)
         // Remembered for a prepare that arrives after this (see receivePrepare). A late outcome implies the
@@ -1446,6 +1540,7 @@ class Frontend(val storeId: StoreId,
           if !m.proof then
             statusCache.updateStatus(m.transactionId, statusOf(m.committed), finalized = m.late, late = m.late)
     case m: TxFinalized =>
+      inheritedVoteDecided(m.transactionId)
       transactions.get(m.transactionId) match
         case Some(tx) =>
           // Not if the Tx holds the abort for a UnackedCommits lookup

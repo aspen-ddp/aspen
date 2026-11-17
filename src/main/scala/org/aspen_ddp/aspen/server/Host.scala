@@ -16,7 +16,7 @@ import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDevice
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
-import org.aspen_ddp.aspen.server.store.{Frontend, QuarantineVerifier, ReconcileResult, RepairSnapshot, Store, UnackedCommitLookup,
+import org.aspen_ddp.aspen.server.store.{Frontend, HeldVoteQuery, QuarantineVerifier, ReconcileResult, RepairSnapshot, Store, UnackedCommitLookup,
   UnackedLookupResult}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler, DefaultBackendOpener}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -32,6 +32,9 @@ import scala.util.Try
 
 
 object Host:
+  /** How long a rebuilt store's query of its peers' held votes waits for its replies (Host.heldVoteQuery) */
+  val HeldVoteQueryDeadline: FiniteDuration = FiniteDuration(30, SECONDS)
+
   private[server] sealed abstract class Event
 
   private[server] case class HostMsg(msg: HostMessage) extends Event
@@ -262,6 +265,24 @@ class Host(val client: AspenClient,
         .getOrElse(Future.failed(new IllegalStateException("repair service not started"))))
       .onComplete(answer)
 
+  /** Stores have no client, so a rebuilt store's query of its peers' held votes (Frontend.inheritedVoteLock) goes
+   *  through the host's: `width - writeThreshold + 1` of the pool's other stores, given up after HeldVoteQueryDeadline
+   *  (its store asks again at a later heartbeat). */
+  private val heldVoteQuery: HeldVoteQuery = (storeId, answer) =>
+    given ExecutionContext = ec
+    Future.unit
+      .flatMap(_ => client.getStoragePool(storeId.poolId))
+      .flatMap: pool =>
+        val ida = pool.ida
+        val peers = (0 until ida.width).filter(_ != storeId.poolIndex).map(i => StoreId(storeId.poolId, i.toByte)).toList
+        val needed = math.min(ida.width - ida.writeThreshold + 1, peers.size)
+        if needed <= 0 then
+          Future.successful(Nil)
+        else
+          val deadline = System.nanoTime() + Host.HeldVoteQueryDeadline.toNanos
+          client.heldVotes(peers, needed, () => System.nanoTime() > deadline)
+      .onComplete(answer)
+
   private val deviceControl: DeviceControl = new DeviceControl(
     metadata = seams.wrapMetadata.fold(hostMetadata)(wrap => wrap(hostMetadata)),
     scheduler = controlScheduler,
@@ -307,6 +328,7 @@ class Host(val client: AspenClient,
     writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker),
     unackedLookup = seams.wrapUnackedLookup.fold(unackedLookup)(wrap => wrap(unackedLookup)),
     quarantineVerifier = quarantineVerifier,
+    heldVoteQuery = heldVoteQuery,
     missingDataWait = seams.missingDataWait,
     parkedReadWait = seams.parkedReadWait,
     storeLoadedAt = seams.storeLoadedAt,

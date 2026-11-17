@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.internal
 
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, CurrentAllocationsReply, CurrentAllocationsRequest, PendingAllocation}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, CurrentAllocationsReply, CurrentAllocationsRequest}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 
@@ -12,8 +12,8 @@ object CurrentAllocationsQuery:
   /** The query was given up because its caller's `stopWhen` held */
   final class Abandoned extends Exception("CurrentAllocations query abandoned")
 
-/** Asks `stores` for the allocations they hold unfinalized (`CurrentAllocationsRequest`), resending to the stores that
-  * have not replied until `needed` of them have. Completes with each replying store's answer, or fails with
+/** Asks `stores` for the allocations and votes they hold (`CurrentAllocationsRequest`), resending to the stores that
+  * have not replied until `needed` of them have. Completes with each replying store's reply, or fails with
   * `Abandoned` at the first resend after `stopWhen` holds. A store still loading its CRL, or not hosted anywhere,
   * does not reply and so never counts toward `needed`.
   */
@@ -28,10 +28,10 @@ private[client] final class CurrentAllocationsQuery(clientId: ClientId,
 
   val queryUUID: UUID = UUID.randomUUID()
 
-  private val promise: Promise[Map[StoreId, List[PendingAllocation]]] = Promise()
-  private var replies: Map[StoreId, List[PendingAllocation]] = Map()
+  private val promise: Promise[Map[StoreId, CurrentAllocationsReply]] = Promise()
+  private var replies: Map[StoreId, CurrentAllocationsReply] = Map()
 
-  def result: Future[Map[StoreId, List[PendingAllocation]]] = promise.future
+  def result: Future[Map[StoreId, CurrentAllocationsReply]] = promise.future
 
   private val resend = tasks.retryWithExponentialBackoff(tryNow = true, Duration(1, SECONDS), Duration(10, SECONDS)):
     if promise.isCompleted then
@@ -48,7 +48,7 @@ private[client] final class CurrentAllocationsQuery(clientId: ClientId,
   def receive(m: CurrentAllocationsReply): Unit =
     val done = synchronized:
       if stores.contains(m.fromStore) && !promise.isCompleted then
-        replies += m.fromStore -> m.allocations
+        replies += m.fromStore -> m
         if replies.size >= needed then Some(replies) else None
       else
         None

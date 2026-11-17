@@ -326,6 +326,26 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       (since.get - before) should be >= RebuildingStore.AcceptorSinceMargin.asInstanceOf[scala.concurrent.duration.Duration]
       (since.get - after) should be <= RebuildingStore.AcceptorSinceMargin.asInstanceOf[scala.concurrent.duration.Duration]
 
+  atest("a rebuilt store holds its inherited votes until a query past its pass's start plus the horizon and margins"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val horizon = scala.concurrent.duration.FiniteDuration(2, scala.concurrent.duration.SECONDS)
+    for
+      _ <- populate(3)
+      _ <- net.waitForTransactionsToComplete()
+      before = System.currentTimeMillis()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+        horizon = horizon)
+      _ <- rebuild.complete
+      after = System.currentTimeMillis()
+    yield
+      val gate = RebuildingStore.readInheritedVotes(dev / storeId.directoryName, horizon)
+      val lead = horizon.toMillis + 2 * RebuildingStore.AcceptorSinceMargin.toMillis
+      gate.isDefined should be(true)
+      // The pass started between the two readings
+      (gate.get - before) should be >= lead
+      (gate.get - after) should be <= lead
+
   atest("a rebuild gives the store a fresh incarnation"):
     given ExecutionContext = executionContext
     val dev = deviceDir()

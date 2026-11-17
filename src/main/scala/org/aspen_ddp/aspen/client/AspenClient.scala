@@ -912,6 +912,12 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   private[aspen] def currentAllocations(stores: List[StoreId], needed: Int, stopWhen: () => Boolean)
     : Future[Map[StoreId, List[org.aspen_ddp.aspen.common.network.PendingAllocation]]]
 
+  /** The votes `stores` hold that may still count (`HeldVote`, Frontend.heldVotes), once `needed` of them have
+   *  answered, from every reply. Resends until then; fails with `CurrentAllocationsQuery.Abandoned` once `stopWhen`
+   *  holds */
+  private[aspen] def heldVotes(stores: List[StoreId], needed: Int, stopWhen: () => Boolean)
+    : Future[List[org.aspen_ddp.aspen.common.network.HeldVote]]
+
   /** Completes after `delay`, on the client's background timer */
   private[aspen] def after(delay: scala.concurrent.duration.FiniteDuration): Future[Unit]
   private[aspen] def sendHostMessage(msg: HostMessage): Unit

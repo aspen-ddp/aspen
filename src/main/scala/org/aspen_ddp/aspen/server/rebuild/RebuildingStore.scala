@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjec
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.PendingAllocation
-import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId}
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, StoreCreation}
@@ -70,8 +70,11 @@ object RebuildingStore:
   private def acceptorSinceAfter(now: HLCTimestamp): HLCTimestamp =
     HLCTimestamp(now.asLong + (AcceptorSinceMargin.toMillis << 16))
 
-  def writeAcceptorSince(storePath: os.Path): Unit =
-    DurableFiles.write(storePath / AcceptorSinceFile, acceptorSinceAfter(HLCTimestamp.now).asLong.toString)
+  def writeAcceptorSince(storePath: os.Path): Unit = writeAcceptorSince(storePath, acceptorSinceAfter(HLCTimestamp.now))
+
+  /** Writes `at` as the store's acceptor start (finish passes now plus AcceptorSinceMargin) */
+  def writeAcceptorSince(storePath: os.Path, at: HLCTimestamp): Unit =
+    DurableFiles.write(storePath / AcceptorSinceFile, at.asLong.toString)
 
   /** The store's acceptor start, if it was rebuilt. A file that cannot be read counts as now plus the margin: later
    *  than the truth, which only mutes more transactions */
@@ -81,6 +84,39 @@ object RebuildingStore:
       None
     else
       Some(scala.util.Try(HLCTimestamp(os.read(file).trim.toLong)).getOrElse(acceptorSinceAfter(HLCTimestamp.now)))
+
+  /** In a rebuilt store's directory until its inherited votes are released: the wall-clock time, in milliseconds,
+   *  from which its peers' held votes are complete (Frontend.inheritedVotesAfter, inheritedVoteLock). Written by
+   *  finish beside AcceptorSinceFile and carried by transfers the same way; removed by the Frontend once no inherited
+   *  vote is held. Until a query after that time completes, the store votes abort on every object */
+  val InheritedVotesFile = "inherited-votes"
+
+  /** From when a rebuild pass that started at `passStartMillis` (its host's wall clock) sees every vote its store's
+   *  lost incarnation's transactions can still get. The old incarnation voted only before the pass began, in
+   *  transactions started at most MaxStartLead after its host's clock; no store joins a transaction past its start
+   *  plus `horizon` by its own clock. The query is sent, and the peers answer, on clocks that may each differ from the
+   *  old and rebuilding hosts' by the inter-host skew: one AcceptorSinceMargin covers the lead and one skew, a second
+   *  the other skew */
+  def inheritedVotesAfter(passStartMillis: Long, horizon: FiniteDuration): Long =
+    passStartMillis + horizon.toMillis + 2 * AcceptorSinceMargin.toMillis
+
+  def writeInheritedVotes(storePath: os.Path, afterMillis: Long): Unit =
+    DurableFiles.write(storePath / InheritedVotesFile, afterMillis.toString)
+
+  /** The store's inherited-votes gate, if it holds inherited votes. A file that cannot be read counts as now plus the
+   *  horizon and both margins: later than the truth, as the store loads after its rebuild's pass began */
+  def readInheritedVotes(storePath: os.Path, horizon: FiniteDuration): Option[Long] =
+    val file = storePath / InheritedVotesFile
+    if !os.exists(file) then
+      None
+    else
+      Some(scala.util.Try(os.read(file).trim.toLong)
+        .getOrElse(inheritedVotesAfter(System.currentTimeMillis(), horizon)))
+
+  /** No inherited vote is held any more. Not forced: a reload that still finds the file queries again */
+  def removeInheritedVotes(storePath: os.Path): Unit =
+    try os.remove(storePath / InheritedVotesFile)
+    catch case NonFatal(_) => ()
 
   /** Objects between checkpoints. Small enough that a crash costs little, large enough that
    *  the flush is not the dominant cost. */
@@ -116,7 +152,10 @@ class RebuildingStore(client: AspenClient,
                       testingOnlyOnRestored: () => Unit = () => (),
                       testingOnlyOnFinishClosed: () => Unit = () => (),
                       testingOnlyAfterWalk: () => Future[Unit] = () => Future.unit,
-                      testingOnlyAfterQuery: () => Future[Unit] = () => Future.unit)
+                      testingOnlyAfterQuery: () => Future[Unit] = () => Future.unit,
+                      /** How long after its start a transaction may be joined (inheritedVotesAfter). The default
+                        * horizon is the longest any host uses */
+                      horizon: FiniteDuration = TransactionHorizon.Horizon)
   extends StoreRebuild with Logging:
 
   import RebuildingStore.*
@@ -225,8 +264,12 @@ class RebuildingStore(client: AspenClient,
       b.close().recover:
         case t => logger.warn(s"Rebuild of $storeId: backend close failed: $t")
 
+  /** When the current pass began, on this host's wall clock (inheritedVotesAfter) */
+  @volatile private var passStartMillis: Long = System.currentTimeMillis()
+
   /** One full pass: open (or reopen) the staging area, walk, retry failures, complete. */
   private def runPass(): Future[Unit] =
+    passStartMillis = System.currentTimeMillis()
     // The checkpoint is never deleted on restart -- reading it is what makes a restart a
     // resume.
     val resume = RebuildState.load(stagingPath)
@@ -698,6 +741,9 @@ class RebuildingStore(client: AspenClient,
       RebuildState.removeAll(stagingPath)
       // The rebuilt store has no Paxos state: it takes no part in transactions started before now (plus the margin)
       writeAcceptorSince(stagingPath)
+      // Its old incarnation's commit votes may still count, with none of their locks held here: the store votes abort
+      // on what they may lock until its peers' held votes, complete from this time on, release them
+      writeInheritedVotes(stagingPath, inheritedVotesAfter(passStartMillis, horizon))
       // A new life for the store, replacing any incarnation the staging directory carried
       StoreIncarnationFile.writeFresh(stagingPath)
       // Last before the move: the directory is a finished rebuild, kept out of service until its flip commits

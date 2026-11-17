@@ -5,7 +5,7 @@ import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TransactionVote, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, HeldVote, ReadResponse, TransactionVote, TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, FullObject, Insert, Key, KeySet, KeyValueOperation, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -1335,6 +1335,120 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
       votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
       crl.txSaved shouldBe true
+  }
+
+  // ---- A rebuilt store's inherited votes (Frontend.inheritedVoteLock) ----
+  //
+  // Its old incarnation's commit votes may still count, with none of their locks held here, so it votes abort on what
+  // they may lock until its peers show their transactions resolved.
+
+  /** Records held-vote queries and answers them when the test says */
+  class ManualHeldVoteQuery extends HeldVoteQuery:
+    private var answers: List[Try[List[HeldVote]] => Unit] = Nil
+    def made: Int = answers.size
+    def query(storeId: StoreId, answer: Try[List[HeldVote]] => Unit): Unit = answers = answers :+ answer
+    def answer(result: Try[List[HeldVote]]): Unit = answers.last(result)
+
+  private val inheritedTxid = TransactionId(new UUID(0, 99))
+
+  /** A rebuilt store (acceptor started 2 s ago) holding its inherited-votes file, gate at `after` */
+  private def withInheritedVotes(after: Long = 0L)(f: (Frontend, ManualHeldVoteQuery, os.Path) => Unit): Unit =
+    withInheritedVotesClock(after)((frontend, query, dir, _) => f(frontend, query, dir))
+
+  private def withInheritedVotesClock(after: Long)
+                                     (f: (Frontend, ManualHeldVoteQuery, os.Path, TestClock) => Unit): Unit =
+    val clock = new TestClock(System.currentTimeMillis())
+    val dir = os.temp.dir(deleteOnExit = true)
+    RebuildingStore.writeInheritedVotes(dir, after)
+    val backend = new MapBackend(storeId):
+      override def path: os.Path = dir
+    val query = new ManualHeldVoteQuery
+    val since = ago(FiniteDuration(2, SECONDS))
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
+      new TestCrl, new TransactionStatusCache(), acceptorSince = Some(since),
+      inheritedVotesAfter = RebuildingStore.readInheritedVotes(dir, FiniteDuration(20, SECONDS)),
+      heldVoteQuery = query, loadedAt = Some(since.wallTime - Frontend.MaxStartLead.toMillis),
+      wallClockMillis = () => clock.now)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    f(frontend, query, dir, clock)
+
+  /** This store's vote on a fresh transaction (started after the acceptor) with `reqs` */
+  private def voteOn(frontend: Frontend, txid: TransactionId, reqs: List[TransactionRequirement])
+      : TransactionDisposition.Value =
+    val txd = lockTxd(txid, reqs).copy(startTimestamp = ago(FiniteDuration(1, SECONDS)))
+    val updates = reqs.collect { case r: DataUpdate => ObjectUpdate(r.objectPointer.id, DataBuffer(Array[Byte](1))) }
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(objectUpdates = updates))
+    frontend.transactions(txid).vote
+
+  test("a rebuilt store votes abort on every object until a query of its peers' held votes past its gate completes") {
+    withInheritedVotes(after = System.currentTimeMillis() + 60_000): (frontend, query, _) =>
+      voteOn(frontend, txid1, List(overwrite(op1))) shouldBe TransactionDisposition.VoteAbort
+      frontend.retryHeldVoteQuery()
+      withClue("no query before the gate: ")(query.made shouldBe 0)
+      frontend.inheritedVoteTransactions shouldBe None
+  }
+
+  test("a rebuilt store votes abort only on the objects of the transactions its inherited votes may still back") {
+    withInheritedVotes(): (frontend, query, dir) =>
+      frontend.retryHeldVoteQuery()
+      query.made shouldBe 1
+      // A transaction started after the acceptor never had the old incarnation's vote: not inherited
+      query.answer(Success(List(HeldVote(inheritedTxid, ago(FiniteDuration(3, SECONDS)), Set(fenceOid)),
+        HeldVote(txid2, ago(FiniteDuration(1, SECONDS)), Set(oid1)))))
+      frontend.inheritedVoteTransactions shouldBe Some(Set(inheritedTxid))
+      voteOn(frontend, txid1, List(overwrite(op1))) shouldBe TransactionDisposition.VoteCommit
+      voteOn(frontend, TransactionId(new UUID(0, 98)), List(VersionBump(fencePtr, rev0))) shouldBe
+        TransactionDisposition.VoteAbort
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe true
+  }
+
+  test("a rebuilt store releases an inherited vote once its peers no longer report its transaction") {
+    withInheritedVotesClock(0L): (frontend, query, dir, clock) =>
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(List(HeldVote(inheritedTxid, ago(FiniteDuration(3, SECONDS)), Set(fenceOid)))))
+      withClue("no query again before the backoff: "):
+        frontend.retryHeldVoteQuery()
+        query.made shouldBe 1
+      clock.now += Frontend.InheritedVoteQueryInitialInterval.toMillis
+      frontend.retryHeldVoteQuery()
+      query.made shouldBe 2
+      query.answer(Success(Nil))
+      frontend.inheritedVoteTransactions shouldBe Some(Set())
+      voteOn(frontend, txid1, List(VersionBump(fencePtr, rev0))) shouldBe TransactionDisposition.VoteCommit
+      withClue("the file is removed: ")(os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false)
+      frontend.retryHeldVoteQuery()
+      withClue("no query once none is held: ")(query.made shouldBe 2)
+  }
+
+  test("a rebuilt store releases an inherited vote when its transaction's outcome reaches it") {
+    withInheritedVotes(): (frontend, query, dir) =>
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(List(HeldVote(inheritedTxid, ago(FiniteDuration(3, SECONDS)), Set(fenceOid)))))
+      frontend.receiveTransactionMessage(TxFinalized(storeId, StoreId(poolId, 1), inheritedTxid, committed = false,
+        late = false, owed = Set(), startTimestamp = ago(FiniteDuration(3, SECONDS))))
+      frontend.inheritedVoteTransactions shouldBe Some(Set())
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false
+  }
+
+  test("a failed query of a rebuilt store's peers keeps every object locked") {
+    withInheritedVotes(): (frontend, query, _) =>
+      frontend.retryHeldVoteQuery()
+      query.answer(Failure(new Exception("no quorum")))
+      frontend.inheritedVoteTransactions shouldBe None
+      voteOn(frontend, txid1, List(overwrite(op1))) shouldBe TransactionDisposition.VoteAbort
+  }
+
+  test("a store reports the commit votes it holds unresolved, and not its abort votes or resolved ones") {
+    val (frontend, _, net) = lockFixture()
+    val start = ago(FiniteDuration(1, SECONDS))
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = start)).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1))).copy(startTimestamp = start)).disposition shouldBe
+      TransactionDisposition.VoteAbort
+    frontend.heldVotes() shouldBe List(HeldVote(txid1, start, Set(oid1)))
+    resolve(frontend, net, txid1, committed = false)
+    frontend.heldVotes() shouldBe Nil
   }
 
   test("a rebuilt store gives no promise for an older transaction cached as resolved, and keeps the cached outcome") {

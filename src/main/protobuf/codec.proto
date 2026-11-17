@@ -399,11 +399,18 @@ message PendingAllocation {
   repeated ObjectPointer pointers = 3; // the objects the transaction allocates in the store's pool
 }
 
+message HeldVote {
+  UUID transaction_uuid = 1;
+  uint64 start_timestamp = 2;
+  repeated UUID object_ids = 3; // the transaction's objects in the store's pool
+}
+
 message CurrentAllocationsReply {
   StoreId from_store = 1;
   UUID to_client = 2;
   UUID query_uuid = 3;
   repeated PendingAllocation allocations = 4;
+  repeated HeldVote held_votes = 5;
 }
 
 message TransactionResolved {

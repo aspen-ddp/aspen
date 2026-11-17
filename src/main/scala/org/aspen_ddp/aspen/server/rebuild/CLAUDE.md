@@ -2,6 +2,11 @@
 - A rebuilt store lost its Paxos acceptor state. `RebuildingStore.finish` writes `acceptor-since` (finish time plus
   `AcceptorSinceMargin`, 10 s) into its directory; how the Frontend enforces it: `server/store/CLAUDE.md`. The
   margin covers `Frontend.MaxStartLead` (2 s) plus host-to-host clock skew; client clocks do not enter into it
+- `finish` also writes `inherited-votes` (`writeInheritedVotes`): the pass start (`passStartMillis`, reset by each
+  `runPass`) plus the `horizon` parameter (default `TransactionHorizon.Horizon`, the longest a host uses) plus twice
+  `AcceptorSinceMargin`. From then on every vote on a transaction the old incarnation joined has been cast, so the
+  rebuilt store's first query of its peers' held votes after it is complete (`Frontend.inheritedVoteLock`,
+  `server/store/CLAUDE.md`)
 - `finish` also writes a fresh `incarnation` file (`StoreIncarnationFile.writeFresh`) into staging, overwriting any
   present, after `acceptor-since` and before the marker: a rebuilt store is a new incarnation
 - Completion identity (Rebuild F3, F4): `finish` writes a durable `rebuild-complete` marker in staging just before

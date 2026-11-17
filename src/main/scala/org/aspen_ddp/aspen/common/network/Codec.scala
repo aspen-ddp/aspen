@@ -915,7 +915,12 @@ object Codec extends Logging:
         codec.PendingAllocation(
           transactionUuid = Some(encodeUUID(a.transactionId.uuid)),
           committed = a.committed,
-          pointers = a.pointers.map(p => encode(p)))
+          pointers = a.pointers.map(p => encode(p))),
+      heldVotes = o.heldVotes.map: v =>
+        codec.HeldVote(
+          transactionUuid = Some(encodeUUID(v.transactionId.uuid)),
+          startTimestamp = v.startTimestamp.asLong,
+          objectIds = v.objectIds.toList.map(id => encodeUUID(id.uuid)))
     )
 
   def decode(m: codec.CurrentAllocationsReply): CurrentAllocationsReply =
@@ -925,7 +930,10 @@ object Codec extends Logging:
       decodeUUID(m.queryUuid.get),
       m.allocations.toList.map: a =>
         PendingAllocation(TransactionId(decodeUUID(a.transactionUuid.get)), a.committed,
-          a.pointers.toList.map(p => decode(p))))
+          a.pointers.toList.map(p => decode(p))),
+      m.heldVotes.toList.map: v =>
+        HeldVote(TransactionId(decodeUUID(v.transactionUuid.get)), HLCTimestamp(v.startTimestamp),
+          v.objectIds.map(u => ObjectId(decodeUUID(u))).toSet))
 
   def encode(o: TransactionCompletionResponse): codec.TransactionCompletionResponse =
     codec.TransactionCompletionResponse(

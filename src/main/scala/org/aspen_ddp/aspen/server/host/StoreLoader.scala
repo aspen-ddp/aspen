@@ -363,6 +363,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited),
                 ctx.unackedLookup, ctx.quarantineVerifier, Some(router.post(backend.storeId)),
                 RebuildingStore.readAcceptorSince(backend.path),
+                inheritedVotesAfter = RebuildingStore.readInheritedVotes(backend.path, ctx.transactionHorizon),
+                heldVoteQuery = ctx.heldVoteQuery,
                 incarnationOverride = Some(StoreIncarnationFile.loadOrCreate(backend.path, storeId)),
                 poolIDA = poolIDA,
                 admissionTier = admissionTier,

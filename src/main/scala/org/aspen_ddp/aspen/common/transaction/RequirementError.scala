@@ -38,6 +38,13 @@ case class BackendCommitFailed() extends RequirementError
   */
 case class ObjectQuarantined() extends RequirementError
 
+/** This store was rebuilt, and a transaction its lost incarnation voted commit on may still commit and may lock the
+  * object (Frontend.inheritedVoteLock): the rebuilt store holds none of that transaction's locks, so it grants no
+  * commit vote on the object until its peers show the transaction resolved. Purely local, like
+  * RequirementCheckFailure.
+  */
+case class InheritedVoteLock() extends RequirementError
+
 /** A transaction allocates an object this store already holds (in memory or in its backend): a replayed allocation,
   * which must not overwrite the live object (transaction-requirements F11). Purely local, like RequirementCheckFailure.
   */

@@ -62,6 +62,15 @@
   prepare for an unknown transaction started earlier (`Tx.muted`): proven committed if an object shows its update,
   otherwise forgotten with no promise, vote, accept or CRL save, as if the store were offline. Its old incarnation
   may have accepted in such a transaction, and a fresh promise could let a quorum choose against the chosen value
+- Inherited votes (`Frontend.inheritedVoteLock`, cross-document-review.md section 2.3): the old incarnation's commit
+  votes still count for their transactions, with none of their locks held here. While the `inherited-votes` file
+  (`RebuildingStore.InheritedVotesFile`, passed as `inheritedVotesAfter`) is present, `Tx.determineDisposition` votes
+  abort (`InheritedVoteLock`, beside `ObjectQuarantined`) on every object until a query of the peers' held votes
+  (`HeldVoteQuery`, Host → `client.heldVotes`, `Store.heartbeat` → `retryHeldVoteQuery`, from the file's time on,
+  1 s doubling to 30 s) completes, then on the objects of the reported transactions started before `acceptorSince`.
+  A transaction is released when a later query no longer reports it or its `TxResolved`/`TxFinalized` reaches the
+  store; with none left the file is removed. Muted Txs are decided first, so only transactions started after
+  `acceptorSince` are affected
 - Start-time lead (`Frontend.MaxStartLead`, 2 s): every store mutes, the same way, a prepare for an unknown transaction
   whose client-chosen start timestamp leads the host's wall clock (`wallClockMillis`, not the JVM-wide HLC, which the
   host's own client ratchets) by more; the designated leader does not drive it (`Store`). The client's retransmission
@@ -71,7 +80,9 @@
   `Frontend.currentAllocations` lists, for every held Tx neither finalized nor known aborted, the objects it allocates
   in this store's pool, and whether it is known committed. Silent while the CRL loads (`awaitingCrl`): it may hold
   transactions it does not know yet. A committed Tx is held until TxFinalized, after its AllocationFinalizationAction,
-  so every allocation whose AllocationTree entry may still be missing is listed by each store holding it
+  so every allocation whose AllocationTree entry may still be missing is listed by each store holding it. The reply
+  also carries `Frontend.heldVotes`: each held Tx with outcome unknown, not muted, whose vote is commit or undecided,
+  with its objects in this pool (a rebuilt store's inherited votes)
 - Status query (`TxStatusRequest`, carrying the transaction's `startTimestamp`; horizon design section 2): every
   store with a final state answers. A store with a Tx replies with `Tx.statusForExpiry`: status, finalized, late,
   `holdsAcceptorState` (false only for a Tx muted for good below the floor), its latest `accepted` value and

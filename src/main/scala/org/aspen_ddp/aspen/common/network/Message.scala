@@ -210,7 +210,8 @@ final case class TransactionCompletionResponse(
                                                 isComplete: Boolean) extends ClientResponse:
   override def toString: String = f"TransactionCompletionResponse to $toClient from $fromStore query $queryUUID isComplete $isComplete"
 
-/** Asks a store for the allocations in its pool that it holds unfinalized (Rebuild F10). A store still loading its
+/** Asks a store for the allocations in its pool that it holds unfinalized (rebuild-process.md, pending allocations),
+  * and the transactions whose commit vote it may still cast or hold unresolved (HeldVote). A store still loading its
   * CRL does not answer */
 final case class CurrentAllocationsRequest(toStore: StoreId,
                                            fromClient: ClientId,
@@ -223,10 +224,18 @@ final case class PendingAllocation(transactionId: TransactionId,
                                    committed: Boolean,
                                    pointers: List[ObjectPointer])
 
+/** A transaction a store holds with its outcome unknown and a vote that is commit or not yet decided: a commit vote
+  * that may still count. `objectIds` are the transaction's objects in the store's pool (a rebuilt store's inherited
+  * votes: Frontend.inheritedVotes) */
+final case class HeldVote(transactionId: TransactionId,
+                          startTimestamp: HLCTimestamp,
+                          objectIds: Set[ObjectId])
+
 final case class CurrentAllocationsReply(toClient: ClientId,
                                          fromStore: StoreId,
                                          queryUUID: UUID,
-                                         allocations: List[PendingAllocation]) extends ClientResponse:
+                                         allocations: List[PendingAllocation],
+                                         heldVotes: List[HeldVote] = Nil) extends ClientResponse:
   override def toString: String =
     s"CurrentAllocationsReply to $toClient from $fromStore query $queryUUID: ${allocations.size} transactions"
 

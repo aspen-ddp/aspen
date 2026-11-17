@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare, ProposalId}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, ObjectQuarantined, DataUpdate, InvalidDescription, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, InheritedVoteLock, ObjectQuarantined, DataUpdate, InvalidDescription, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -280,6 +280,9 @@ class Tx( trs: TransactionRecoveryState,
 
   /** The outcome this Tx knows, if resolved: see ExpiryTally.decide */
   def knownOutcome: Option[Boolean] = oresolution
+
+  /** This store's vote: Undetermined until it is decided (a collision or an in-flight commit holds it back) */
+  def vote: TransactionDisposition.Value = disposition
 
   /** ExpiryTally decided Discard for a Tx that knows its outcome: no quorum holds T past the horizon, so no TxFinalized
     * will come, and a commit was finalized (a quorum forgets a commit only then). It concludes as finalized:
@@ -784,7 +787,8 @@ class Tx( trs: TransactionRecoveryState,
 
   /** Decides the vote, or withholds it. A muted transaction is proven committed or takes no part, its requirements
     * unchecked. One that has seen no client prepare votes abort, or proves the commit, its requirements unchecked
-    * (prefer-abort, see awaitingClientPrepare). An object whose backend commit failed on this store gets an abort
+    * (prefer-abort, see awaitingClientPrepare). An object whose backend commit failed on this store, that is
+    * quarantined, or that a rebuilt store's inherited votes may lock (Frontend.inheritedVoteLock) gets an abort
     * vote. One with a commit in flight, whether or not this transaction builds on it, makes the transaction wait with
     * its vote withheld and no locks taken (see Frontend.commitInFlight); the requirements are checked against the state
     * as it is once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
@@ -809,6 +813,7 @@ class Tx( trs: TransactionRecoveryState,
   } else {
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
     val quarantined = pointersById.keysIterator.filter(frontend.isQuarantined).toList
+    val inherited = pointersById.keysIterator.filter(frontend.inheritedVoteLock).toList
     val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet
 
     if muted && oresolution.isEmpty && !outcomeKnown then
@@ -829,10 +834,11 @@ class Tx( trs: TransactionRecoveryState,
       waitingOn = Set()
       awaitingCommits = Set()
       decideDisposition(Map(), List(InvalidDescription(invalidDescription.get)))
-    else if failed.nonEmpty || quarantined.nonEmpty then
+    else if failed.nonEmpty || quarantined.nonEmpty || inherited.nonEmpty then
       waitingOn = Set()
       awaitingCommits = Set()
-      decideDisposition(quarantined.map(_ -> ObjectQuarantined()).toMap ++ failed.map(_ -> BackendCommitFailed()), Nil)
+      decideDisposition(inherited.map(_ -> InheritedVoteLock()).toMap ++ quarantined.map(_ -> ObjectQuarantined()) ++
+        failed.map(_ -> BackendCommitFailed()), Nil)
     else if inFlight.nonEmpty && oresolution.isEmpty && !outcomeKnown then
       // Once the outcome is known the vote no longer matters, so nothing waits for it: a resolved transaction may
       // decide here only because its objects finished loading after the resolution

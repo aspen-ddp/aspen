@@ -295,9 +295,10 @@ acceptance: a pool below its read threshold is not papered over.
 
 `rebuildFlush`, close the backend, **re-check the abort latch** (a cancel or fail-stop during the close fails the
 pass), remove the checkpoint and temp file, write `acceptor-since` (`writeAcceptorSince`: now plus
-`AcceptorSinceMargin`, 10 s), write a fresh `incarnation` (`StoreIncarnationFile.writeFresh`), write `rebuild-complete`
-durably, `os.move(staging, final)`, fsync the device directory. All three files are written durably in staging before
-the move, so the directory at the final path carries them from the instant it appears.
+`AcceptorSinceMargin`, 10 s), write `inherited-votes` (`writeInheritedVotes`: the pass start plus the horizon plus
+twice the margin; section 6.4, inherited votes), write a fresh `incarnation` (`StoreIncarnationFile.writeFresh`), write
+`rebuild-complete` durably, `os.move(staging, final)`, fsync the device directory. All four files are written durably
+in staging before the move, so the directory at the final path carries them from the instant it appears.
 
 ### 5.7 Completion and promotion (`StoreRebuilds.startRebuild`)
 
@@ -389,6 +390,25 @@ mute, not on the failure budget:
   old incarnation's applied stubs (`dropStore`), which is harmless for the same reason.
 * A late commit reaching the rebuilt store for a muted transaction applies nothing; its owed state comes back through
   the ErrorTree or UnackedCommits entries the finalizer wrote for it.
+* **Inherited votes.** A commit vote the old incarnation cast still counts for its transaction T (a driver keeps it
+  until a nack or proof starts a new round, which a muted store never causes; a client's vote count is final; expiry
+  rule B does not look at lock-only pools), but the rebuilt store holds none of T's locks. A transaction T' started
+  after `acceptor-since` must not get its commit vote on an object T may lock, or T' commits (in Replication(3,2) with
+  T's abort voter) and T can still commit after it. So `finish` writes `inherited-votes`
+  (`RebuildingStore.writeInheritedVotes`, durable, carried by transfers) holding the pass start plus the horizon plus
+  twice `AcceptorSinceMargin`: the old incarnation voted only before the pass began, in transactions started at most
+  `MaxStartLead` after its clock, and no store joins a transaction past its start plus the horizon, so from then on
+  every vote on such a T has been cast; one margin covers the lead and the old host's skew, the other the skew of the
+  querying and answering hosts. Until a query after that time completes, the Frontend votes abort
+  (`InheritedVoteLock`) on every object. The query (`HeldVoteQuery`, Host → `client.heldVotes`) asks `w - t + 1` of
+  the other stores for the transactions they hold with outcome unknown and a vote that is commit or undecided
+  (`Frontend.heldVotes`, carried in `CurrentAllocationsReply`); T can still commit with the old vote counted only with
+  `t - 1` live commit voters among them, so the replies include one. The store then votes abort only on the objects
+  of the reported transactions started before its `acceptor-since`, repeats the query at heartbeat (1 s doubling to
+  30 s), and releases a transaction once a query no longer reports it or its `TxResolved`/`TxFinalized` reaches the
+  store (one of T's stores): T is then decided and cannot commit after a later T'. Once none is held the file is
+  removed; a reload that still finds it queries again. An abort vote, not a withheld one: a single store's abort does
+  not abort a transaction its peers commit (RebuiltVoterLockIntegrationSuite).
 
 ---
 
@@ -511,7 +531,7 @@ never marked is never repaired (RB-W2 is such a case).
   `fn` before the next.
 * **B8 Listed allocations outlive the walk's progress.** Every checkpoint carries every allocation listed so far.
 * **B9 Promotion is atomic and complete.** The final path appears only by renaming staging after the abort latch is
-  re-checked and `acceptor-since`, `incarnation` and `rebuild-complete` are durable.
+  re-checked and `acceptor-since`, `inherited-votes`, `incarnation` and `rebuild-complete` are durable.
 * **B10 Load follows the metadata decision.** The store is loaded only after `markRebuiltStoreActive` returned
   `Adopt`, or after a tree read shows its entry Active.
 * **B11 Metadata flips are guarded.** Every tree-entry change in this subsystem is a transaction carrying a
@@ -529,6 +549,8 @@ never marked is never repaired (RB-W2 is such a case).
   host may still answer peers holding a stale store-to-host mapping (the no-fencing trade-off accepted for adoption).
 * **B19 A rebuilt store never joins a transaction its old incarnation may have joined** (6.4), up to the clock-skew
   residual.
+* **B20 A rebuilt store grants no commit vote over a lock its old incarnation's vote may still back** (6.4, inherited
+  votes), up to the same clock-skew residual.
 
 Not an invariant: the rebuild validates neither the decision that declared the store lost nor the pool's ability to
 supply it; see [systemic-loss-protection.md](systemic-loss-protection.md).

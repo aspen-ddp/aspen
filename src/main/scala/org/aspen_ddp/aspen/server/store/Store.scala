@@ -47,6 +47,10 @@ class Store(val storageDeviceId: StorageDeviceId,
             val postToStore: Option[(Store => Unit) => Unit] = None,
             /** A rebuilt store's acceptor start (Frontend.acceptorSince). None: an ordinary store */
             val acceptorSince: Option[HLCTimestamp] = None,
+            /** A rebuilt store's inherited-votes gate (Frontend.inheritedVotesAfter). None: none inherited */
+            inheritedVotesAfter: Option[Long] = None,
+            /** Asks the pool's other stores for their held votes (Frontend.heldVoteQuery) */
+            heldVoteQuery: HeldVoteQuery = HeldVoteQuery.Never,
             /** Recover the CRL's transactions only when frontend.recover is called (Frontend.deferRecovery) */
             deferRecovery: Boolean = false,
             /** How long a Tx waits for its client's prepare (Frontend.missingDataWait). A test seam */
@@ -99,7 +103,8 @@ class Store(val storageDeviceId: StorageDeviceId,
     post = postToStore match
       case None => task => task()
       case Some(postTo) => task => postTo(s => if s eq this then task()),
-    acceptorSince = acceptorSince, deferRecovery = deferRecovery, wallClockMillis = wallClockMillis,
+    acceptorSince = acceptorSince, inheritedVotesAfter = inheritedVotesAfter, heldVoteQuery = heldVoteQuery,
+    deferRecovery = deferRecovery, wallClockMillis = wallClockMillis,
     horizon = horizon, loadedAt = loadedAt, arrivedAt = arrivedAt, joinCeiling = joinCeiling, expiryMargin = expiryMargin,
     onFailStop = err => onFailStop(this, err), incarnationOverride = incarnationOverride, poolIDA = poolIDA,
     admissionTier = admissionTier,
@@ -151,6 +156,7 @@ class Store(val storageDeviceId: StorageDeviceId,
     frontend.transactions.values.foreach(_.checkCollisionWait())
     frontend.retryUnackedLookups()
     frontend.retryQuarantineVerifications()
+    frontend.retryHeldVoteQuery()
     frontend.expireParkedRepairs()
     frontend.expireParkedReads()
     frontend.expiryHeartbeat()

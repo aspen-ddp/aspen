@@ -39,15 +39,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.1  Rebuilt lock-only commit voter admits a conflicting commit before T commits: X-W2                     [M]
-     PLAUSIBLE. A rebuilt store holds none of its old incarnation's locks and copies state from reads that ignore
-     locks, but its pre-loss vote still counts (driver round, client 1-RTT, expiry rule B). For lock-only objects
-     2t - w = 1 for Replication(3,2)/(5,3), so one lost voter lets T' commit over T's lock (e.g. a vdisk fence).
-     Fix: rebuild records objects whose restoring read reported write locks (shared revision locks must start
-     being reported) and votes abort on them until clear; or require > w - t live voters per lock-only pool in
-     rule B and the tally. Shares the "rebuild ignores reported locks" signal with 2.7. Caution: today the live
-     voter fail-stop in Tx.issueCommits is the only (accidental) detector; see 3.2.
-
 2.2  Two recovered commit votes on one lock; the earlier's release unlocks the later: Q-W2                 [M]
      PLAUSIBLE. Recovered votes re-take single-holder locks unconditionally (overwrite); release clears only the
      holder's own lock. If A's lock wins and A resolves, B (unresolved counted commit vote) holds no lock and a
@@ -92,7 +83,9 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
      PLAUSIBLE. The walk's ordinary read ignores write locks; a lost store that applied and sent TxCommitted gets
      no mark, so the rebuilt copy can be stale with no record. Real only for t > r (e.g. Replication(5,4)); the
      doc's Replication(3,2) example is beyond tolerance (contradiction X 5.7, correct the example). Fix: mark in
-     the ErrorTree any restored object whose replies carried write locks (same signal as 2.1).
+     the ErrorTree any restored object whose replies carried write locks, or use the held-vote query a rebuilt
+     store already makes (Frontend.heldVotes / inheritedVoteLock): the objects of every transaction its peers
+     report are the candidates for a stale copy.
 
 2.8  Staging or a finished copy from an earlier Rebuilding episode is resumed or promoted: RB-W3           [M]
      CONFIRMED mechanism. Nothing ties staging, its checkpoint, or a rebuild-complete directory to the Rebuilding
@@ -127,8 +120,9 @@ PRIORITY 3: systemic loss protection
      pool at once. X-W1 PLAUSIBLE: a failed backend repair write discards the referenced ObjectState a live voter
      holds locked; the voter's apply throws StaleObjectState and the store fail-stops. Fix together: quarantine
      the object instead of fail-stopping (covers Backlog 5.8), never fail-stop on a lock-only object, and on a
-     failed repair write restore the pre-repair state instead of discard. Must not hide 2.1 (X-W2): keep logging
-     lock-only re-check failures, or land 2.1 first. Correct server/store/CLAUDE.md and server/transaction/
+     failed repair write restore the pre-repair state instead of discard. Keep logging lock-only re-check
+     failures (a rebuilt store's inherited votes now prevent the conflict that once surfaced there, so a failure
+     is a new bug). Correct server/store/CLAUDE.md and server/transaction/
      CLAUDE.md ("where two conflicting commits surface").
 
 3.3  CRL recovery accepts forged entries from object payloads: CRL-W1                                      [S]
@@ -198,8 +192,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
 
 6.1  Open questions left by the review                                                                      [S-M]
-     - X-W2 (2.1): does a returning muted store or leader retransmit force a new round that discards the stale
-       vote? If always, only the rule-B leg remains.
      - X-W1 (3.2): is any non-fatal FSIF repair failure (other than RepairSlotOccupied) reachable for an object
        held in memory? If not, X-W1 is latent (priority 5).
      - A Tx created from a resolved cache entry (outcomeDecided) votes without locks and reports Unresolved

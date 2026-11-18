@@ -249,6 +249,8 @@ the client.
   marker's write, so it finalizes while the stores that forgot T still hold their finalized cache entries. Its entries
   may land after its `TxFinalized`; a stub may then precede its entry, which is harmless (5.4).
 * **A driver that resolved commit ignores an abort `TxFinalized`** (Committed wins; reported as a split decision).
+  Its store keeps it until it is finalized (`TransactionDriver.isFinalized`), so heartbeats, stall reports and
+  `Store.close` still reach it.
 * **Finalization gates forgetting.** An acceptor forgets a committed transaction only on `TxFinalized`, on a late
   outcome (which follows one), or past the horizon by expiry once more than `w - t` primary acceptors no longer hold
   it (which a committed T allows only after its finalization). Finding an UnackedCommits entry applies the update but

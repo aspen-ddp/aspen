@@ -65,7 +65,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - A conflicting second outcome (split decision) is logged as an error and counted in the host status cache's
   `splitDecisions` (`TransactionStatusCache.recordSplitDecision`) by the cache itself, the Tx (`receiveResolved`,
   `receiveFinalized`) and the driver (`Start.onSplitDecision`); each keeps its first outcome, and a driver that resolved
-  commit ignores an abort `TxFinalized` (paxos F11)
+  commit ignores an abort `TxFinalized` (paxos F11). A store drops a driver on `TxFinalized` only if the driver is
+  then finalized (`isFinalized`); one that ignored it stays until its own `TxFinalized`
 
 #### Proofs and late resolution
 - A prepare for a transaction a store does not know, whose update an object there already shows (its revision, or

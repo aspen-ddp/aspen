@@ -59,10 +59,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.1  Driver ignoring an abort TxFinalized is dropped from the store's driver map: P-W3                     [S]
-     CONFIRMED (also raised by transaction-recovery). Only after a split decision. Fix: remove only if the
-     driver concluded after receiveTxFinalized.
-
 5.2  Markerless directory at a store path the tree does not list is loaded and served: RB-W5              [S]
      PLAUSIBLE, narrowed: code no longer leaves one (copies are retired with a marker, deletes are rename-first),
      so only a directory put back by hand remains. Fix: have the reconcile close (and retire) a loaded store whose

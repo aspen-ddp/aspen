@@ -272,6 +272,9 @@ abstract class TransactionDriver(
   /** The driver resolved or finalized the transaction: it knows the outcome, and its finalization may still be running */
   def hasOutcome: Boolean = synchronized { resolved || finalized }
 
+  /** The driver finalized: its TxFinalized is sent and it has no more work */
+  def isFinalized: Boolean = synchronized { finalized }
+
   /** Releases the driver's timers. Overrides must call it: it stops a pending finalizer restart */
   def shutdown(): Unit = synchronized {
     stopped = true

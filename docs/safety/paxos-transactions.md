@@ -275,6 +275,9 @@ started. A client can see `Committed` before any store has accepted or applied a
 keep the first outcome. A conflicting second one is logged as an error and counted in the host status cache's
 `splitDecisions` (`Tx.reportConflictingOutcome`, `TransactionDriver.splitDecision`, `TransactionStatusCache.updateStatus`).
 A driver that resolved commit ignores an abort `TxFinalized` and keeps finalizing (Committed wins, as in the cache).
+Its store keeps it: `Store.handleTransactionMessage` drops a driver on `TxFinalized` only once the driver is finalized
+(`TransactionDriver.isFinalized`), so heartbeats, stall reports and `Store.close` still reach it, and its own
+`TxFinalized`, which it also sends to its store, removes it.
 
 ---
 
@@ -1079,19 +1082,6 @@ transaction eventually resolves without operator action given a healthy quorum.
 ---
 
 ## Open weaknesses
-
-### P-W3. A driver ignoring an abort `TxFinalized` is dropped from its store's driver map (CONFIRMED; hygiene)
-Mechanism: `Store.handleTransactionMessage` removes a driver from `transactionDrivers` on every `TxFinalized` for its
-transaction, after `driver.receiveTxFinalized`. A driver that resolved commit ignores an abort `TxFinalized` and keeps
-finalizing (Committed wins, `TransactionDriver.receiveTxFinalized`), but once removed it gets no `heartbeat`. Its
-`TxFinalized` is then sent once, never repeated, and its stall no longer appears in `Store.stalledFinalizations`. Its
-timers and finalizer restarts keep running, unowned by the store, and `Store.close` cannot stop them.
-Trigger / scenario: only after a split decision (an abort `TxFinalized` for a committed transaction), which the horizon
-should prevent and which is already counted in `splitDecisions`.
-Consequence: a lost `TxFinalized` falls back on the stores' idle recovery; stall alarms and shutdown miss the driver.
-Suggested fix: remove the driver only if it is finalized after `receiveTxFinalized` (`hasOutcome` and finalized), or
-have the driver report whether it concluded.
-Effort: S   Priority: 5
 
 ### P-W4. Architecture.md's contention rules do not match the driver (CONFIRMED; documentation)
 Mechanism: `Architecture.md` ("Transactions", the Optimistic Concurrency Control list) says: abort when abort votes by

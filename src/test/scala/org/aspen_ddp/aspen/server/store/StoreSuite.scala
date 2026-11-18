@@ -507,6 +507,33 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.hasTransactions shouldBe false
   }
 
+  // paxos-transactions.md, split decisions: a driver that resolved commit ignores an abort TxFinalized (committed
+  // wins) and keeps finalizing, so its store keeps it until its own TxFinalized
+  test("a driver that resolved commit and ignores an abort TxFinalized stays in its store until it finalizes") {
+    val (store, net, finalizer) = foundEntryStore()
+    finalizer.completion = scala.concurrent.Promise() // The finalization actions are still running
+    val p = currentProposal(net)
+    promise(store, 1, p, Some((initialProposal, true)))
+    promise(store, 2, p, None)
+    val accepts = net.sentTx.collect { case a: TxAccept => a }
+    for i <- List(1, 2) do
+      store.receiveTransactionMessage(TxAcceptResponse(storeId, StoreId(poolId, i.toByte), foundTxid,
+        accepts.head.proposalId, Right(TxAcceptResponse.Accepted(true))))
+    finalizer.created shouldBe 1
+    net.sentTx = Nil
+
+    store.receiveTransactionMessage(TxFinalized(storeId, peer, foundTxid, committed = false, late = false,
+      owed = Set(), startTimestamp = HLCTimestamp.now))
+    net.sentTx.collect { case f: TxFinalized => f } shouldBe Nil
+    store.hasTransactions shouldBe true
+
+    finalizer.completion.success(())
+    val own = net.sentTx.collect { case f: TxFinalized => f }
+    own.map(f => (f.committed, f.late)).distinct shouldBe List((true, false))
+    store.receiveTransactionMessage(own.find(_.to == storeId).get)
+    store.hasTransactions shouldBe false
+  }
+
   // ---- Recovered commit votes are driven at once (Todo 4.4, R-N3; Ruling 20's wait for the first lookup is gone) ----
 
   test("a recovered vote whose lookup is unanswered or failing is driven at once, and an entry found later gives its running driver the proof") {

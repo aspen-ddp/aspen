@@ -346,7 +346,10 @@ class Store(val storageDeviceId: StorageDeviceId,
 
       case m: TxFinalized => transactionDrivers.get(m.transactionId).foreach { driver =>
         driver.receiveTxFinalized(m)
-        transactionDrivers -= m.transactionId
+        // A driver that ignores it (it resolved commit, or a late commit after its abort: a split decision) keeps
+        // finalizing, so the store keeps it for heartbeats, stall reports and close; its own TxFinalized removes it
+        if driver.isFinalized then
+          transactionDrivers -= m.transactionId
       }
 
       case m: TxUnknownStore => transactionDrivers.get(m.transactionId).foreach { driver =>

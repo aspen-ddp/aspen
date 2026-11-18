@@ -207,6 +207,13 @@
   the entry is deleted, a Tx is forgotten without one, or the store closes; a Tx waiting on an in-flight commit keeps
   its admission. Recovered transactions are counted too, without a check. Accepted gap: a retransmit past the mark
   while a store awaits its crl_save.log is dropped
+- Oversized prepares (CRL-W2): `Frontend.admitPrepare` returns `PrepareAdmission` (`Admitted`, `Full`, `Oversized`)
+  and `Store.receiveTransactionMessage` drops both non-admitted kinds the same way: no reply, no vote, no CRL write.
+  `Oversized`: the transaction's counted bytes (for an admitted one, its bytes plus the uncounted data the prepare
+  brings) exceed `crl.maxTransactionBytes`. Nothing is charged; data arriving after a data-less prepare is dropped
+  likewise, leaving the store as one that never received it (a commit elsewhere reaches it through missed-update
+  repair; the data-less admission is released by the usual paths). Warned once per `OversizedLogPeriod` (10 s) per
+  store, naming the transaction and its bytes. Checked after `Full`, so a full lane never serializes
 
 #### Object cache (`cache/`)
 - Each store's object cache is its own LRU, owned by its executor, under one host byte budget (`HostObjectCache`): an

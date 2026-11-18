@@ -836,6 +836,20 @@ class SimpleCRLSuite extends FileBasedTests {
     assertShutdownReturns(i.crl)
   }
 
+  test("An entry larger than a stream kills the CRL: the backstop admission must keep it from (CRL-W2)") {
+    val i = SimpleCRL(tdir, 3, 4096 * 4)
+    val tooBig = ObjectUpdate(ou1.objectId, DataBuffer(new Array[Byte](4096 * 5)))
+    i.crl.save(transactionId, trsValidTxd.copy(objectUpdates = List(tooBig)), () => ())
+    Await.result(i.crl.failed, 5.seconds)
+    assertShutdownReturns(i.crl)
+  }
+
+  test("A SimpleCRL takes transactions of up to half a stream less the entry overhead reserve (CRL-W2)") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i.crl.maxTransactionBytes == 1024 * 1024 / 2 - SimpleCRL.EntryOverheadReserve)
+    i.crl.shutdown()
+  }
+
   test("A live CRL has not failed") {
     val i = SimpleCRL(tdir, 3, 1024 * 1024)
     saveAndWait(i.crl, transactionId, trsValidTxd)

@@ -263,8 +263,13 @@ class Store(val storageDeviceId: StorageDeviceId,
       logger.trace(s"Store $storeId dropped $msg: fail-stopped")
     // Backpressure: while the device's CRL is filling past this store's lane (CrlAdmission), a prepare for a
     // transaction this store has not seen is dropped without a reply. The client retransmits; other stores may commit it without this one, which repair catches up
-    case m: TxPrepare if !frontend.admitPrepare(m) =>
-      logger.trace(s"Store $storeId dropped the prepare of unseen Tx ${m.txd.transactionId}: its device's CRL is filling")
+    // A transaction too large for the CRL is dropped the same way (CRL-W2): admitPrepare warns of it, rate-limited
+    case m: TxPrepare => frontend.admitPrepare(m) match
+      case PrepareAdmission.Admitted => handleTransactionMessage(msg)
+      case PrepareAdmission.Full =>
+        logger.trace(s"Store $storeId dropped the prepare of unseen Tx ${m.txd.transactionId}: its device's CRL is filling")
+      case PrepareAdmission.Oversized =>
+        logger.trace(s"Store $storeId dropped the prepare of Tx ${m.txd.transactionId}: too large for its device's CRL")
     case _ => handleTransactionMessage(msg)
   }
 

@@ -24,6 +24,13 @@ import scala.concurrent.{Await, Future, Promise}
 import scala.util.{Failure, Success, Try}
 
 
+/** Frontend.admitPrepare's answer. Store.receiveTransactionMessage drops a prepare that is not Admitted without a
+  * reply: Full while the device's CRL is past the store's lane, Oversized when the transaction's CRL bytes on this
+  * store exceed CrashRecoveryLog.maxTransactionBytes, which no later prepare of it can fix (CRL-W2)
+  */
+enum PrepareAdmission:
+  case Admitted, Full, Oversized
+
 object Frontend {
 
   /** A repair's deletion of an object was refused because the object is in use on the store (a read, a commit or a
@@ -103,6 +110,9 @@ object Frontend {
     * watermark is the binding part of the floor, every client prepare is refused
     */
   val RefusalLogPeriod: FiniteDuration = FiniteDuration(10, SECONDS)
+
+  /** How often, at most, a store warns of an oversized prepare it drops (admitPrepare) */
+  val OversizedLogPeriod: FiniteDuration = FiniteDuration(10, SECONDS)
 
   sealed abstract class ReadKind
 
@@ -212,6 +222,9 @@ class Frontend(val storeId: StoreId,
 
   // A refused client prepare is warned of once per RefusalLogPeriod at most (refusePrepare)
   private val refusalLog = new LogRateLimit(RefusalLogPeriod.toMillis, wallClockMillis)
+
+  // A dropped oversized prepare is warned of once per OversizedLogPeriod at most (admitPrepare)
+  private val oversizedLog = new LogRateLimit(OversizedLogPeriod.toMillis, wallClockMillis)
 
   /** When the store was loaded on this host: it remembers nothing of transactions it saw before (forgetFloorMillis) */
   val loadedAtMillis: Long = loadedAt.getOrElse(wallClockMillis())
@@ -1254,31 +1267,58 @@ class Frontend(val storeId: StoreId,
     * the device's admission is below this store's tier's ceiling (CrlAdmission lanes: a metadata or bootstrap store
     * keeps room for the marker batches data transactions finalize with). The status cache is host-wide, so a transaction merely started on another
     * store is not known here.
+    *
+    * Oversized: the transaction's counted bytes, with data already counted for an admitted one, would exceed
+    * `crl.maxTransactionBytes`, so saving it would kill the CRL (CRL-W2). Nothing is charged. Data arriving after a
+    * data-less prepare is dropped the same way, leaving the store as one that never received it: a commit elsewhere
+    * reaches it through missed-update repair, and the data-less admission is released by the usual paths
     */
-  def admitPrepare(m: TxPrepare): Boolean =
+  def admitPrepare(m: TxPrepare): PrepareAdmission =
     val txid = m.txd.transactionId
     admitted.get(txid) match
       case Some(a) =>
-        chargeData(a, m.objectUpdates)
-        true
-      case None if transactions.contains(txid) || statusCache.getStatus(txid).exists(_.finalized) => true
+        val added = uncounted(a, m.objectUpdates)
+        val bytes = dataBytes(added)
+        if added.nonEmpty && a.bytes + bytes > crl.maxTransactionBytes then
+          oversized(txid, a.bytes + bytes)
+        else
+          chargeData(a, added)
+          PrepareAdmission.Admitted
+      case None if transactions.contains(txid) || statusCache.getStatus(txid).exists(_.finalized) =>
+        PrepareAdmission.Admitted
       // Checked before serializing: a prepare that will be dropped costs nothing more
-      case None if admission.full(admissionTier) => false
+      case None if admission.full(admissionTier) => PrepareAdmission.Full
       case None =>
         val stxd = m.txd.serialize()
-        val bytes = CrlAdmission.TxOverheadBytes + stxd.size +
-          m.objectUpdates.iterator.map(ou => CrlAdmission.objectUpdateBytes(ou.data.size)).sum
-        if admission.tryAdmit(bytes, admissionTier) then
+        val bytes = CrlAdmission.TxOverheadBytes + stxd.size + dataBytes(m.objectUpdates)
+        if bytes > crl.maxTransactionBytes then
+          oversized(txid, bytes)
+        else if admission.tryAdmit(bytes, admissionTier) then
           admitted(txid) = new Admitted(bytes, m.objectUpdates.iterator.map(_.objectId).toSet, Some(stxd))
-          true
+          PrepareAdmission.Admitted
         else
-          false
+          PrepareAdmission.Full
+
+  private def oversized(txid: TransactionId, bytes: Long): PrepareAdmission =
+    oversizedLog.admit().foreach: held =>
+      logger.warn(s"Store $storeId drops transaction $txid: its $bytes CRL bytes here exceed the device CRL's " +
+                  s"${crl.maxTransactionBytes} per transaction, so it can never commit with this store. Its " +
+                  s"client writes too much to one store in one transaction${LogRateLimit.heldText(held)}")
+    PrepareAdmission.Oversized
+
+  /** The CRL bytes CrlAdmission counts for the object data of `updates` */
+  private def dataBytes(updates: List[ObjectUpdate]): Long =
+    updates.iterator.map(ou => CrlAdmission.objectUpdateBytes(ou.data.size)).sum
+
+  /** The updates of `updates` whose data `a` has not counted yet */
+  private def uncounted(a: Admitted, updates: List[ObjectUpdate]): List[ObjectUpdate] =
+    updates.filterNot(ou => a.dataCounted.contains(ou.objectId))
 
   /** Charges `a` for the data of `updates` not counted yet, without a limit check */
   private def chargeData(a: Admitted, updates: List[ObjectUpdate]): Unit =
-    val added = updates.filterNot(ou => a.dataCounted.contains(ou.objectId))
+    val added = uncounted(a, updates)
     if added.nonEmpty then
-      val bytes = added.iterator.map(ou => CrlAdmission.objectUpdateBytes(ou.data.size)).sum
+      val bytes = dataBytes(added)
       admission.charge(bytes)
       a.bytes += bytes
       a.dataCounted ++= added.iterator.map(_.objectId)

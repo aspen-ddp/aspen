@@ -1615,7 +1615,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   /** Admits the prepare as Store does, then delivers it */
   private def admitAndReceive(frontend: Frontend, m: TxPrepare): Unit =
-    frontend.admitPrepare(m) shouldBe true
+    frontend.admitPrepare(m) shouldBe PrepareAdmission.Admitted
     frontend.receiveTransactionMessage(m)
 
   test("a prepare for an unknown transaction older than the horizon creates no Tx, sends nothing and saves nothing") {
@@ -5565,6 +5565,62 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     admission.admittedBytes shouldBe 100
   }
 
+  // ---- CRL-W2: a transaction whose CRL bytes exceed crl.maxTransactionBytes is dropped, never saved ----
+
+  /** A TestCrl that takes transactions of at most 10 000 CRL bytes */
+  class SmallTxCrl extends TestCrl:
+    override def maxTransactionBytes: Long = 10000
+
+  /** `m` carrying 20 000 bytes of object data for its first DataUpdate */
+  def oversized(m: TxPrepare): TxPrepare =
+    m.copy(objectUpdates = m.objectUpdates.map(ou => ObjectUpdate(ou.objectId, DataBuffer(new Array[Byte](20000)))))
+
+  test("oversizedPrepare: a prepare larger than the CRL takes is Oversized and charges nothing") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val crl = new SmallTxCrl
+    val (store, _, net) = admissionStore(admission, crl)
+    val p1 = oversized(dataPrepare(ledTxd(txid1, List(overwrite(op1)))))
+
+    store.frontend.admitPrepare(p1) shouldBe PrepareAdmission.Oversized
+    admission.admittedBytes shouldBe 0
+
+    // Dropped without a reply, the CRL untouched
+    store.receiveTransactionMessage(p1)
+    store.frontend.transactions shouldBe empty
+    net.sentTx shouldBe empty
+    crl.txSaved shouldBe false
+    admission.admittedBytes shouldBe 0
+  }
+
+  test("oversizedLateData: data arriving after a data-less prepare that makes it oversized is dropped") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val crl = new SmallTxCrl
+    val (store, _, _) = admissionStore(admission, crl)
+    val withData = oversized(dataPrepare(ledTxd(txid1, List(overwrite(op1)))))
+    val dataLess = withData.copy(objectUpdates = Nil, fromClient = false)
+
+    store.frontend.admitPrepare(dataLess) shouldBe PrepareAdmission.Admitted
+    val afterFirst = admission.admittedBytes
+    afterFirst shouldBe admissionBytes(dataLess)
+    store.frontend.admitPrepare(withData) shouldBe PrepareAdmission.Oversized
+    admission.admittedBytes shouldBe afterFirst
+
+    // Through the store, the data-less prepare is handled and the oversized one dropped: no save carries the data
+    store.receiveTransactionMessage(dataLess)
+    store.receiveTransactionMessage(withData)
+    admission.admittedBytes shouldBe afterFirst
+    crl.savedStates.foreach(_.objectUpdates shouldBe empty)
+  }
+
+  test("fullLaneStillFull: a small new prepare at the ceiling is Full, not Oversized") {
+    val admission = new CrlAdmission(100)
+    admission.tryAdmit(100) shouldBe true
+    val (store, _, _) = admissionStore(admission, new SmallTxCrl)
+
+    store.frontend.admitPrepare(dataPrepare(ledTxd(txid1, List(overwrite(op1))))) shouldBe PrepareAdmission.Full
+    admission.admittedBytes shouldBe 100
+  }
+
   // Cross-document-review X5: data transactions filling a shared device must not block the marker batches, on the
   // device's metadata-pool stores, that those transactions finalize with
   test("past the data lane a data store drops a new prepare while a metadata store on the device admits one") {
@@ -5662,7 +5718,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (store, _, _) = admissionStore(admission, crl)
     val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
     // Admitted, as a forgotten transaction whose CRL state the stub replaces would be
-    store.frontend.admitPrepare(p1) shouldBe true
+    store.frontend.admitPrepare(p1) shouldBe PrepareAdmission.Admitted
     store.frontend.transactions.contains(txid1) shouldBe false
     admission.admittedBytes shouldBe admissionBytes(p1)
 
@@ -5774,10 +5830,10 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     crl.holdStubSaves = true
     val (store, _, _) = admissionStore(admission, crl)
     val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
-    store.frontend.admitPrepare(p1) shouldBe true
+    store.frontend.admitPrepare(p1) shouldBe PrepareAdmission.Admitted
     store.frontend.recordAppliedStub(txid1, stubStart)(())
     // A replayed prepare: charged for itself, while the replaced state stays counted until the stub is durable
-    store.frontend.admitPrepare(p1) shouldBe true
+    store.frontend.admitPrepare(p1) shouldBe PrepareAdmission.Admitted
     admission.admittedBytes shouldBe 2 * admissionBytes(p1) + CrlAdmission.AppliedStubBytes
     crl.heldStubSaves.foreach(_())
     admission.admittedBytes shouldBe admissionBytes(p1) + CrlAdmission.AppliedStubBytes
@@ -5786,7 +5842,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     // Closed before the stub is durable, the replaced state stays counted, retained for the store
     crl.heldStubSaves = Nil
-    store.frontend.admitPrepare(p1) shouldBe true
+    store.frontend.admitPrepare(p1) shouldBe PrepareAdmission.Admitted
     store.frontend.recordAppliedStub(txid1, stubStart)(())
     store.frontend.close()
     admission.retainedBytes(storeId) shouldBe admissionBytes(p1) + CrlAdmission.AppliedStubBytes
@@ -5949,7 +6005,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.awaitRecovery()
 
     val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
-    frontend.admitPrepare(p1) shouldBe true
+    frontend.admitPrepare(p1) shouldBe PrepareAdmission.Admitted
     frontend.receiveTransactionMessage(p1)
     recoverable = List(TransactionRecoveryState(storeId, p1.txd.serialize(), p1.objectUpdates,
       TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial))

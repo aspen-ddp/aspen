@@ -61,6 +61,10 @@
   the fail-stop backstop. The admission counts everything the CRL holds from the device's open
   (`recoveredBytesByStore`, `CrlAdmission.recoveredBytes`), retained per store until the store loads and counts its
   own, or its entries leave the CRL: records of stores that do not load are copied forward too (safety F8)
+- `maxTransactionBytes` (SimpleCRL: half a stream less `EntryOverheadReserve`, 8 KiB; trait default unlimited): the
+  most bytes, as `CrlAdmission` counts them, one store's transaction may hold. `Frontend.admitPrepare` drops a prepare
+  past it unsaved (`PrepareAdmission.Oversized`, `server/store/CLAUDE.md`), so no entry outgrows a stream and trips
+  `Stream.writeEntry`'s `require`, which would kill the CRL (CRL-W2)
 - Deletions are final within an entry: a save of an id the unwritten entry already deletes is skipped, and its
   handler runs once the deletion is durable. It creates no live record (`LogEntry.deletesFinally`): an unwritten one
   would pin `oldestEntryNeeded` until recovery broke on the wrap. The exceptions are deletions a stub's save or a

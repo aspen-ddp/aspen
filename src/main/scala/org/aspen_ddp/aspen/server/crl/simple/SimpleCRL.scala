@@ -16,6 +16,9 @@ import scala.concurrent.{Future, Promise}
 
 object SimpleCRL extends Logging:
 
+  /** What maxTransactionBytes keeps back from half a stream for the entry's own headers and record framing */
+  val EntryOverheadReserve: Long = 8192
+
   sealed abstract class ActionRequest()
 
   case class SaveTransaction(txid: TransactionId,
@@ -215,6 +218,11 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     * the next stream's live data always fits. Stream.writeEntry's require stays as the backstop
     */
   override def admissionLimitBytes: Long = maxSizeInBytes / 2
+
+  /** Half a stream, less EntryOverheadReserve for the headers of the entry that holds it, so one transaction's entry
+    * always fits in a stream. A larger one would kill the CRL at Stream.writeEntry's require (CRL-W2)
+    */
+  override def maxTransactionBytes: Long = maxSizeInBytes / 2 - EntryOverheadReserve
 
   private val ioQueue = new LinkedBlockingQueue[ActionRequest]()
 

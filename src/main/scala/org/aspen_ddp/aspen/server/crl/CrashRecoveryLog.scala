@@ -211,6 +211,11 @@ trait CrashRecoveryLog {
   /** How many bytes of live state the CRL admits */
   def admissionLimitBytes: Long = Long.MaxValue
 
+  /** The most CRL bytes, as CrlAdmission counts them, one transaction of one store may hold. A prepare past it is
+    * dropped unsaved (Frontend.admitPrepare's Oversized), so no entry can outgrow a stream (CRL-W2). The default is
+    * unlimited, for CRLs that keep nothing on disk */
+  def maxTransactionBytes: Long = Long.MaxValue
+
   /** What the CRL held for each store when it was opened, as CrlAdmission counts it (`CrlAdmission.recoveredBytes`).
     * The device's admission is charged for all of it at open, retained for each store until the store loads (and
     * counts its own afresh) or its entries leave the CRL: the records of stores that do not load are copied forward

@@ -80,9 +80,13 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val tmp = os.temp.dir(prefix = "aspen-quic-e2e")
     try
       val (dataPort, httpPort, storeTransferPort) = freePorts()
+      // All three bootstrap stores share one device, whose CRL must take the largest object tested (32 MiB) on each:
+      // 128 MiB streams bound one store's transaction at 64 MiB less 8 KiB and admit 120 MiB in all (crash-recovery-log
+      // 6.1). The capacity default may be the 64 MiB floor, whose 32 MiB bound drops the object as Oversized
       Console.withOut(new java.io.ByteArrayOutputStream):
         Main.bootstrap(Replication(3, 2), tmp / "bootstrap-host", "bootstrap-host", "127.0.0.1",
-                       dataPort, httpPort, storeTransferPort, tmp / "aspen-client-config.yaml") shouldBe 0
+                       dataPort, httpPort, storeTransferPort, tmp / "aspen-client-config.yaml",
+                       crlFileSizeMb = Some(128)) shouldBe 0
 
       val host = Main.startHost(tmp / "bootstrap-host")
       try

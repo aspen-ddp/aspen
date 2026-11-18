@@ -89,9 +89,10 @@ final class CrlAdmission(val limitBytes: Long):
     * per-transaction bound). What is already retained for the store is left out of that total: the CRL can hold for a
     * store with a save file only records of that file (an extraction or a load interrupted by a crash), which the
     * load saves again in place, so the two charges count the same records until the store's recovery releases what
-    * is retained (A2). Those are read once, by the control thread, which releases them; a store being replaced may
-    * add to them meanwhile, which only makes the check stricter. One compare-and-set, as tryAdmit: no admission
-    * between the check and the charge */
+    * is retained (A2). Those are read once, on the control thread. For a load replacing a loaded store they may
+    * include that store's live admissions (StoreRouter.install's retainAdmissions, if it ran before the read), which
+    * are left out of the check too; a retain landing after the read only makes it stricter. One compare-and-set, as
+    * tryAdmit: no admission between the check and the charge */
   def tryChargeLoaded(storeId: StoreId, bytes: Long, slack: Long): Boolean =
     val max = if limitBytes > Long.MaxValue - slack then Long.MaxValue else limitBytes + slack
     val own = retainedBytes(storeId)

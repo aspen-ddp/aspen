@@ -1814,7 +1814,10 @@ object Main {
                 dataPort: Int,
                 httpPort: Int,
                 storeTransferPort: Int,
-                clientConfigFile: os.Path): Int = {
+                clientConfigFile: os.Path,
+                // The bootstrap device's crl-max-file-size-mb; None takes the capacity default (CrlSizingDefaults).
+                // One store transaction holds at most half a stream (CrashRecoveryLog.maxTransactionBytes)
+                crlFileSizeMb: Option[Int] = None): Int = {
 
     if isUnreachableAddress(address) then
       println(s"Warning: '$address' is not reachable from other machines. Hosts added to this " +
@@ -1878,7 +1881,8 @@ object Main {
       hostConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
     )
 
-    val storageDevConfig = StorageDeviceConfig(StorageDeviceId(UUID.randomUUID()), aspenSystemId)
+    val storageDevConfig = StorageDeviceConfig(StorageDeviceId(UUID.randomUUID()), aspenSystemId,
+      crlFileSizeMb = crlFileSizeMb)
 
     os.write(bootstrapDevDir / StorageDeviceConfig.configFilename, storageDevConfig.yamlConfig)
     DeviceMarkers.writeOwningHost(bootstrapDevDir, bootstrapHostId)

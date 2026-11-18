@@ -784,8 +784,7 @@ class RebuildingStore(client: AspenClient,
       // Last before the move: the directory is a finished rebuild, kept out of service until its flip commits
       DurableFiles.write(stagingPath / RebuildCompleteMarkerFile, rebuildCompleteContent(episode))
 
-      os.move(stagingPath, finalPath)
       // Durable before the store is reported in place: a device shut down and moved after this
       // must come back with the store at finalPath, or an adopting host refuses it.
-      DurableFiles.syncDirectory(finalPath / os.up)
+      DurableFiles.move(stagingPath, finalPath)
       logger.info(s"Rebuild of $storeId: store in place at $finalPath")

@@ -580,8 +580,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             true
     storeDirs.foreach(ctx.rebuilds.markRebuildRequired)
     if os.exists(crlDir) then
-      os.move(crlDir, devicePath / s"crl.lost-${UUID.randomUUID()}")
-    DurableFiles.syncDirectory(devicePath)
+      DurableFiles.move(crlDir, devicePath / s"crl.lost-${UUID.randomUUID()}")
     // A fresh CRL: the stores now marked recover nothing from it
     ctx.crlFactory.openCRL(devicePath, sdCfg, holdsStores = false)
 
@@ -616,6 +615,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         try os.remove.all(creating)
         catch case t: Throwable =>
           logger.warn(s"Failed to remove stale store-creation directory $creating: $t")
+        // And whatever an interrupted delete left (StoreCopies.delete)
+        StoreCopies.sweepDeleting(storageDevicePath)
         Try(os.list(storageDevicePath)) match
           case Failure(t) =>
             // Same hazard as the scan in checkForNewDevices: listing can fail with an IO

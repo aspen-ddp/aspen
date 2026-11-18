@@ -47,19 +47,6 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt. The items below are independent S/M fixes.)
 
-3.1  Retention gaps: lost-store copies deleted before a rebuild succeeds: SL-W1, SL-W2, SL-W3, SL-W4       [S each]
-     All CONFIRMED. Contradict server/host/CLAUDE.md "nothing of a lost store is destroyed before its rebuild
-     succeeds" (contradiction X 5.5; also rebuild-process.md B3/4.3).
-     - SL-W1: re-placing a queued rebuild (replaceRebuild) lets the Deleted Stores pass os.remove.all the source
-       copy and dropLeftoverCrlState drop its CRL entries. Fix: route a rebuild-required directory through
-       discardLostStore into pending-delete/ (or use 2.8's episode id).
-     - SL-W2: accept-rebuild-loss, then clearPendingDeletes deletes the copy that may hold the accepted-lost
-       objects. Fix: keep the copy until explicit release when the rebuild accepted any loss; warn in the CLI.
-     - SL-W3: StoreRebuilds.failedOnClose removes crl_save.log, the only copy of the store's transaction state.
-       Fix: rename it to lost-crl-state.log durably.
-     - SL-W4: clearPendingDeletes deletes a copy whose store.cfg fails to parse. Fix: rename-first deletes
-       (deleting- prefix) and delete unparsed only with that prefix; shares the fix with 5.2 (RB-W5).
-
 3.2  Live-voter apply fail-stop fires without a real violation: Q-W1, X-W1 (and Backlog 5.8)               [M]
      Q-W1 CONFIRMED: Tx.issueCommits fail-stops whenever a live commit voter's re-check skips any object,
      lock-only ones included; a later non-conflicting commit applied first (fence takeover, allocator follow-up,
@@ -121,10 +108,10 @@ PRIORITY 5: performance and hygiene
      CONFIRMED (also raised by transaction-recovery). Only after a split decision. Fix: remove only if the
      driver concluded after receiveTxFinalized.
 
-5.2  Markerless leftover directory at a store path is loaded and served: RB-W5                             [S]
-     PLAUSIBLE. In-place os.remove.all can remove a marker and fail before config.yaml; tryLoadStore then loads
-     an old incarnation. Fix: rename-first deletes (shared with SL-W4 in 3.1), and have the reconcile close a
-     loaded store whose device entry is absent.
+5.2  Markerless directory at a store path the tree does not list is loaded and served: RB-W5              [S]
+     PLAUSIBLE, narrowed: code no longer leaves one (copies are retired with a marker, deletes are rename-first),
+     so only a directory put back by hand remains. Fix: have the reconcile close (and retire) a loaded store whose
+     device entry is absent.
 
 5.3  CRL completion handlers run on the writer thread before the next write: CRL-W4                        [S]
      PLAUSIBLE. Network sends in handlers serialize on the device's one writer thread under group commit. Fix:
@@ -157,7 +144,7 @@ PRIORITY 7: documentation corrections
 7.1  Contradictions between safety docs (cross-document-review.md section 5)                               [S]
      5.2 a prover is forgotten only on TxFinalized or a late outcome (fix paxos-transactions.md proof section and
      transaction-recovery.md 4.4); 5.3 rebuild-process.md 5.3 "expiry never discards a committed, unfinalized Tx"
-     is false (rule D). 5.5 is fixed with 3.1 (5.1, 5.4, 5.7 are resolved).
+     is false (rule D). (5.1, 5.4, 5.5, 5.7 are resolved.)
 
 7.2  Architecture.md contention rules do not match the driver: P-W4                                        [S]
      Abort needs more than w - t abort votes; no-commit-vote does not abort (the tally waits); no timestamps are
@@ -173,7 +160,6 @@ PRIORITY 7: documentation corrections
        it also says a silent store is marked for every hosted object (lock-only objects are excluded).
      - server/repair/CLAUDE.md ScanTimedOut bullet mentions an orphan pass / confirmOrphans (gone).
      - server/crl/CLAUDE.md: say readStoreState serves loads, transfers and drops from memory.
-     - server/host/CLAUDE.md retention sentence: fixed with 3.1.
 
 7.4  Stale scaladoc and code comments                                                                      [S]
      TransactionDriver.resolveLate (entry durable only after other actions: stale); MissedUpdateFinalizationAction
@@ -183,14 +169,10 @@ PRIORITY 7: documentation corrections
      CrashRecoveryLog trait (saveAppliedStub / whenDurable handlers run on the writer thread);
      TransactionDescription.tracelessObjects has no caller (remove).
 
-7.5  Stale text in server/store/backend/fsif/DESIGN.md and Backlog.txt                                     [S]
-     fsif/DESIGN.md 4.5 step 3 and 4.2: discarded/ is gone; discardLostStore saves to lost-crl-state.log, drops
-     (closeUnloaded dropDurably = false), moves to pending-delete/, deleted only once the store is Active;
-     failedOnClose rationale. Backlog.txt: the systemic-loss item's discard description and its SL row ids
-     (old X2/X3/X5/X6/X7 -> new destructive rows X3, X4, X5, X6); "Why there is no per-commit watchdog" (an
-     undecided driver never proposes abort; waiting Txs end by expiry rules A-G); the out-of-space sub-item about
-     a late prepare after cache expiry is obsolete (receivePrepare refuses below the forget floor); the repair
-     stall item's scope (see 4.3).
+7.5  Stale text in Backlog.txt                                                                              [S]
+     "Why there is no per-commit watchdog" (an undecided driver never proposes abort; waiting Txs end by expiry
+     rules A-G); the out-of-space sub-item about a late prepare after cache expiry is obsolete (receivePrepare
+     refuses below the forget floor); the repair stall item's scope (see 4.3).
 
 
 PRIORITY 8: unimplemented features

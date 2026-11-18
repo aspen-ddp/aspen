@@ -2264,6 +2264,8 @@ object Main {
       case Success(_) =>
         println(s"Store $storeName may finish its rebuild without the objects its pool cannot supply.")
         println("Each is recorded in the pool's ErrorTree, so repair restores it if it becomes readable again.")
+        println("Warning: once the rebuilt store is Active, every older copy of it (in a device's pending-delete")
+        println("directory) is deleted, including any slices of those objects it holds. Copy it aside first to keep it.")
       case Failure(_: AspenClient.StoreNotRebuilding) =>
         println(s"Error: store $storeName is not being rebuilt")
       case Failure(err) =>

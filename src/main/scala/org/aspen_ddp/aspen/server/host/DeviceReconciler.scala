@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.{Host, StoreConfig}
+import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
@@ -27,14 +27,12 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   // Devices with a re-check waiting out TransferOutRecheckDelay. At most one each.
   private var scheduledRechecks: Set[StorageDeviceId] = Set()
   private var deferredChecks: Set[StorageDeviceId] = Set()
-  // Pending-delete copies whose store's state is being read elsewhere (clearPendingDeletes)
-  private var pendingDeleteLookups: Set[os.Path] = Set()
   // Stores whose leftover device-CRL entries are being dropped (dropLeftoverCrlState)
   private var crlDropsRunning: Set[StoreId] = Set()
 
   private[server] def activeDeviceChecks: Set[StorageDeviceId] = activeChecks
 
-  private[server] def pendingDeleteLookupsInFlight: Set[os.Path] = pendingDeleteLookups
+  private[server] def pendingDeleteLookupsInFlight: Set[os.Path] = ctx.copies.releaseLookupsInFlight
 
   private[server] def scheduledDeviceRechecks: Set[StorageDeviceId] = scheduledRechecks
 
@@ -68,9 +66,9 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     (loaded :+ m.deviceId).distinct.foreach(checkStorageDevice)
 
   /** Drops the device-CRL entries of every store the device no longer holds: one its entry does not name, with no
-   *  directory on the device and not loaded. That is a store transferred away, left so by a crash between a transfer
-   *  out's save file and the deletion of its entries, or by one between the deletion of its directory and the drop of
-   *  its entries (or by a failed drop). Left there, they would be copied forward forever, uncounted by admission, and
+   *  directory on the device, not loaded and not being retired. Retiring a copy (StoreCopies.retire) drops them
+   *  before the copy leaves the store's path, so this is a safety net: for a directory removed by hand, or for
+   *  entries a crash left behind when the drop came after the directory went. Left there, they would be copied forward forever, uncounted by admission, and
    *  recovered if the store ever came back. The CRL is what is read, not a list kept in memory, so a restart forgets
    *  nothing. A store transferred back has its entry, and so its entries are its own once more.
    *
@@ -89,7 +87,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       case Success(stores) =>
         def leftover(storeId: StoreId): Boolean =
           !remote.stores.contains(storeId) && !local.loadedStores.contains(storeId) &&
-            !os.exists(local.devicePath / storeId.directoryName) && !crlDropsRunning.contains(storeId)
+            !os.exists(local.devicePath / storeId.directoryName) && !crlDropsRunning.contains(storeId) &&
+            !ctx.copies.isRetiring(storeId)
         // Only while the device is still loaded: an unloaded one's CRL is shut down
         if ctx.devices.devices.get(deviceId).exists(_ eq local) then
           stores.filter(leftover).toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
@@ -108,7 +107,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                              s"$deviceId no longer holds. Retrying at the device's next check. Error: $t")
 
   /** Reconciles a loaded device's on-disk state against the state recorded for it in the
-   *  storage-devices tree: deletes stores transferred away, flips stores whose CRL state was lost
+   *  storage-devices tree: retires the copies of stores no longer owned here, flips stores whose CRL state was lost
    *  to Rebuilding, reinstates stores left offline by an abandoned transfer out or a cancelled
    *  shutdown, creates Initializing stores, and starts transfers in.
    *
@@ -148,22 +147,17 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       //----------------------
       // Deleted Stores
       //
+      // An offline store whose entry is gone from this device is no longer owned here: a transfer out completed, or
+      // its rebuild was re-placed onto another device (Rebuild F12). Its copy is retired, not deleted: it and its
+      // CRL state are kept in pending-delete until the store is Active on the device its pool names (StoreCopies).
+      // For a completed transfer that is already so, and the check the retire asks for deletes it.
       local.offlineStores.filter(storeId =>
         !remote.stores.contains(storeId)
       ).foreach: storeId =>
-        ctx.router.clearOffline(storeId)
-        local.offlineStores -= storeId
-        // Dropped from loadedStores too, or a later shutdown would take this store for one still
-        // open (it is no longer in offlineStores) and fail writing a marker into a deleted
-        // directory on every attempt.
+        // Dropped from loadedStores at once, or a later shutdown would take this store for one still open and write
+        // a marker into a retired directory. It stays offline (silent) until its copy has left its path.
         local.loadedStores -= storeId
-        val storePath = local.devicePath / storeId.directoryName
-        if os.exists(storePath) then
-          logger.info(s"Deleting successfully transferred store $storePath")
-          try
-            os.remove.all(storePath)
-          catch
-            case t: Throwable => logger.error(s"Failed to delete store $storePath. Error: $t")
+        retireUnowned(local, storeId)
       // Any entries a store transferred away left in the device CRL go too
       dropLeftoverCrlState(local, remote)
 
@@ -363,60 +357,25 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       //----------------------
       // Pending Deletes
       //
-      clearPendingDeletes(local, remote)
+      // Retired copies whose store is Active on its owner device, and the remains of interrupted deletes
+      ctx.copies.release(local, remote)
 
-  /** Deletes each store copy discardLostStore kept in the device's pending-delete directory once its store is Active
-   *  again, wherever it was rebuilt: on this device by its own entry, elsewhere by the pool's entry for the store and
-   *  that device's state. Anything else, a failed read included, keeps the copy for a later check: a rebuild that
-   *  cannot finish must not cost the old copy. A directory with no store config is what an interrupted delete leaves,
-   *  and is deleted. */
-  private def clearPendingDeletes(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
-    val pendingDir = local.devicePath / RebuildingStore.PendingDeleteDirectory
-    val copies =
-      try
-        if os.isDir(pendingDir) then os.list(pendingDir).filter(os.isDir(_)).toList else Nil
-      catch
-        case t: Throwable =>
-          logger.warn(s"Failed to list $pendingDir: $t")
-          Nil
-
-    def delete(copy: os.Path, why: String): Unit =
-      logger.info(s"Deleting $copy: $why")
-      try os.remove.all(copy)
-      catch case t: Throwable => logger.warn(s"Failed to delete $copy. Retrying at a later check. Error: $t")
-
-    copies.filterNot(pendingDeleteLookups.contains).foreach: copy =>
-      val config = copy / StoreConfig.configFilename
-      scala.util.Try(StoreConfig.loadStoreConfig(config)) match
-        case Failure(_) =>
-          delete(copy, "it holds no store config, as an interrupted delete leaves it")
-        case Success(cfg) =>
-          val storeId = cfg.storeId
-          remote.stores.get(storeId) match
-            case Some(entry) =>
-              if entry.status == StorageDeviceState.StoreStatus.Active then
-                delete(copy, s"store $storeId is Active again on this device")
-            case None =>
-              pendingDeleteLookups += copy
-              val factive =
-                try
-                  for
-                    pool <- ctx.client.getStoragePoolState(storeId.poolId)
-                    holder = pool.stores(storeId.poolIndex)
-                    state <- ctx.metadata.lookupStorageDeviceState(holder.storageDeviceId)
-                  yield
-                    state.storageDeviceId == holder.storageDeviceId &&
-                    state.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active)
-                catch case NonFatal(t) => Future.failed(t)
-              factive.onComplete: result =>
-                pendingDeleteLookups -= copy
-                result match
-                  case Success(true) =>
-                    if os.exists(copy) then
-                      delete(copy, s"store $storeId is Active again on another device")
-                  case Success(false) => ()
-                  case Failure(t) =>
-                    logger.info(s"Keeping $copy: the state of store $storeId could not be read. Error: $t")
+  /** The Deleted Stores pass's retire of `storeId`'s copy on `local`, whose entry no longer names it. The store
+   *  leaves offlineStores, and its router offline mark goes, only once its path is clear, so a failed retire is
+   *  retried by the next pass. A copy that reaches pending-delete has the device checked again, so it is released
+   *  without waiting for the periodic check. */
+  private def retireUnowned(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+    def forget(): Unit =
+      ctx.router.clearOffline(storeId)
+      local.offlineStores -= storeId
+    if !os.exists(local.devicePath / storeId.directoryName) then
+      forget()
+    else if !ctx.copies.isRetiring(storeId) then
+      logger.info(s"Store $storeId is no longer owned by device ${local.storageDeviceId}. Retiring its copy")
+      ctx.copies.retire(local, storeId).foreach: clear =>
+        if clear then
+          forget()
+          checkStorageDevice(local.storageDeviceId)
 
   /** Checks `storageDeviceId` again after TransferOutRecheckDelay, so a store left offline behind
    *  a transfer-out marker is reinstated soon after an aborted transfer's send ends rather than at

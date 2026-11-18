@@ -999,7 +999,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       pool <- client.createNewStoragePool("pending-delete-pool", Replication(1, 1), None, RocksDBConfig(),
                 StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
       elsewhere = StoreId(pool, 0.toByte)
-      copy = deviceDir / RebuildingStore.PendingDeleteDirectory / s"${elsewhere.directoryName}-old"
+      copy = deviceDir / RebuildingStore.PendingDeleteDirectory / StoreCopies.pendingDeleteName(elsewhere)
       _ <- setPoolEntry(elsewhere, deviceB)
       _ <- setDeviceState(deviceB)(_.copy(stores = Map(
              elsewhere -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None))))
@@ -1018,6 +1018,121 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     yield
       keptWhileRebuilding should be(true)
       os.exists(copy) should be(false)
+
+  /** The retired copies in `deviceDir`'s pending-delete directory */
+  private def pendingCopies(deviceDir: os.Path): List[os.Path] =
+    val dir = deviceDir / RebuildingStore.PendingDeleteDirectory
+    if os.exists(dir) then os.list(dir).toList else Nil
+
+  atest("a lost copy whose rebuild was re-placed away is retired with its CRL entries, not deleted"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      // Declared lost and queued for a rebuild slot, then re-placed onto another device: the entry leaves this one
+      _ = os.write.over(marker(storeDir), "")
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map()))
+      _ <- waitForTransactionsToComplete()
+      restarted = newCrlHost(hostRoot, second)
+      crl = second.opened.head
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, pendingCopies(deviceDir).nonEmpty && !restarted.control.copies.isRetiring(storeId))
+      copies = pendingCopies(deviceDir)
+      saved = copies.map(c => CrashRecoveryLog.loadValidStoreState(c / RebuildingStore.LostCrlStateFile, storeId))
+      leftInCrl = held(crl, storeId)
+      // The store is not Active anywhere its pool names: later checks keep the copy
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty &&
+                                 restarted.control.reconciler.pendingDeleteLookupsInFlight.isEmpty)
+      kept = copies.forall(os.exists(_))
+      _ = second.shutdownAll()
+    yield
+      os.exists(storeDir) should be(false)
+      copies.size should be(1)
+      copies.map(c => StoreCopies.pendingDeleteStore(c.last)) should be(List(Some(storeId)))
+      saved.map(_.map(_.transactions.map(_.txd.transactionId))) should be(List(Right(List(txid))))
+      leftInCrl should be(Set())
+      heldOnDisk(deviceDir, storeId) should be(Set())
+      kept should be(true)
+
+  atest("a store that fails during a transfer-out close keeps its extracted CRL state in its retired copy"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    val opener = new FailingRocksOpener(executionContext)
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory, seams = Host.Seams(backends = Some(opener)), rebuilds = rebuilds)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = host.control.devices.devices(deviceA).crl
+      _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
+      _ = opener.failing = true
+      closing = host.control.loader.closeStore(storeId, extractCrl = true)
+      _ <- pumpUntil(host, closing.isCompleted)
+      closed <- closing.transform(r => scala.util.Success(r))
+      _ = opener.failing = false
+      saveFileKept = os.exists(Backend.crlSaveFile(storeDir))
+      // The extraction deleted them from the device CRL: the save file is the only copy
+      heldAfterClose = held(crl, storeId)
+      // The rebuild starts once the copy is retired; the copy is kept until the store is Active again
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpWithTx(host, rebuilds.created.nonEmpty)
+      copies = pendingCopies(deviceDir)
+      saved = copies.map(c => CrashRecoveryLog.loadValidStoreState(c / RebuildingStore.LostCrlStateFile, storeId))
+      _ = factory.shutdownAll()
+    yield
+      closed.failed.toOption should be(Some(Host.StoreFailedOnClose(storeId)))
+      saveFileKept should be(true)
+      heldAfterClose should be(Set())
+      os.exists(storeDir) should be(false)
+      saved.map(_.map(_.transactions.map(_.txd.transactionId))) should be(List(Right(List(txid))))
+      copies.forall(c => !os.exists(Backend.crlSaveFile(c))) should be(true)
+
+  atest("a pending-delete copy is identified by its name, never by its store config"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, deviceDir, _) <- activeStoreDevice()
+      pendingDir = deviceDir / RebuildingStore.PendingDeleteDirectory
+      // storeId is Active on this device: its copy goes, though its store config does not parse
+      released = pendingDir / StoreCopies.pendingDeleteName(storeId)
+      _ = os.makeDir.all(released)
+      _ = os.write.over(released / StoreConfig.configFilename, "not: [a store config")
+      // A name that identifies no store copy is kept, whatever it holds
+      unknown = pendingDir / "unknown"
+      _ = os.makeDir.all(unknown)
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpWithTx(host, host.control.reconciler.activeDeviceChecks.isEmpty && !os.exists(released))
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = factory.shutdownAll()
+    yield
+      os.exists(released) should be(false)
+      os.exists(unknown) should be(true)
+      // Deleted rename-first: nothing is left behind in deleting/ either
+      os.list(deviceDir / StoreCopies.DeletingDirectory) should be(empty)
+
+  atest("whatever an interrupted delete left in deleting/ is removed when the device loads"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, deviceDir, _) <- activeStoreDevice()
+      leftover = deviceDir / StoreCopies.DeletingDirectory / s"${storeId.directoryName}-${UUID.randomUUID()}"
+      _ = os.makeDir.all(leftover / "sub")
+      _ = os.write.over(leftover / "sub" / "data", "partial")
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = factory.shutdownAll()
+    yield
+      os.exists(leftover) should be(false)
 
   atest("a device the tree records as failed is unloaded, marked, and not loaded again by a restart"):
     given ExecutionContext = executionContext

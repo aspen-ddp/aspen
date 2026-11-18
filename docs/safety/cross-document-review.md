@@ -211,10 +211,12 @@ among the residual classes. A re-allocation at a store that never saw T is still
 mark for that store is unconsumed when the zombie appears.
 
 ### 5.5 "Nothing of a lost store is destroyed before its rebuild succeeds"
-rebuild-process.md (invariant B3 and "the discard of a marked store (nothing destroyed)") states it; so does
-`server/host/CLAUDE.md`. systemic-loss-protection.md SL-W1 (a re-placed queued rebuild's copy deleted by the Deleted
-Stores pass), SL-W2 (an accepted loss) and SL-W4 (an unparsable store config) are exits that destroy the copy first.
-systemic-loss-protection.md is right.
+Resolved. Every copy that stops being its store's owner copy is retired into `pending-delete/` with its CRL state
+(`StoreCopies.retire`), and released only once the store is Active on the device its pool names
+(`StoreCopies.release`). That covers a re-placed queued rebuild's copy, which the Deleted Stores pass now retires, and a
+transfer-out close's save file, which the retire keeps. A copy is identified by its name, not its store config, and
+deletes are rename-first. An accepted rebuild loss ends in that Active flip by design: the acceptance is the
+operator's release. rebuild-process.md B3, systemic-loss-protection.md 4.4 and `server/host/CLAUDE.md` all state it.
 
 ### 5.6 Expiry rule F's "live commit voters holding T's locks"
 paxos-transactions.md (rule F and the abort-paths audit) says F commits only where every pool has more than `w - t`

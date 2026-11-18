@@ -218,8 +218,8 @@ the update (`Tx.persistWithoutUpdateOf`), and a concluded one's deletion or stub
 | Planned device shutdown | stores close with `extractCrl = false`, records stay live; then `crl.shutdown()` | `DeviceShutdown.closeForShutdown`, `shutDownCrl` |
 | Transfer out, store open | on the executor after `closing`: `readStoreState`; `saveStoreState` to `crl_save.log` (tmp, fsync, rename, directory fsync); `store.close()`; then `deleteTransactions(state.entryIds)` and the retained admission released | `StoreLoader.handleClose(extractCrl = true)` |
 | Transfer out, store closed | `readStoreState`, merged over any earlier save file (`StoreRecoveryState.supersededBy`), saved, then `deleteTransactions`; fails if the store was opened during the read (`opensStarted`) | `StoreTransfers.extractUnloaded` |
-| Rebuild of a store with lost state | marker `rebuild-required` durable; `readStoreState` saved to `lost-crl-state.log` (unless already there); `dropStore`; directory renamed into pending-delete | `StoreRebuilds.discardLostStore` |
-| Store no longer on the device | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory and no drop running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
+| Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source) | marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it, else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore` and the Deleted Stores pass) |
+| Store no longer on the device (safety net: a retire drops first) | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory, no drop and no retire running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
 | Store whose `crl_save.log` load failed | `dropStore` | `StoreLoader.closeUnloaded(dropDurably = true)` |
 
 The rule that makes this safe: **entries leave the device CRL only through a written deletion, and only after another
@@ -537,11 +537,12 @@ All stores on a device share one ring, one writer thread and one admission count
 - **Ordering across stores.** Entries interleave records of different stores; `readStoreState` filters by `StoreId`.
 - **Deleting one store does not touch another.** `dropStore` names only that store's ids; others' records stay live
   and keep being copied forward.
-- **A store being rebuilt.** Its records stay live until `discardLostStore` has saved them to `lost-crl-state.log`
-  and `dropStore` completes; they are counted by admission from the open. Then the directory moves to pending-delete
-  and the rebuild starts.
+- **A store being rebuilt.** Its records stay live until its retire (`StoreCopies.retire`) has saved them to
+  `lost-crl-state.log` and `dropStore` completes; they are counted by admission from the open. Then the directory
+  moves to pending-delete and the rebuild starts.
 - **A store that fails.** A backend fail-stop at close marks it `rebuild-required`; its entries are dropped when the
-  rebuild discards it. A store whose `crl_save.log` is unusable is marked the same way.
+  rebuild retires it. A transfer-out close had already moved them into `crl_save.log`, which the retire renames to
+  `lost-crl-state.log`. A store whose `crl_save.log` is unusable is marked the same way.
 - **A shared stall.** A slow `DSYNC`, a full admission lane or a dead CRL affects every store on the device. There is
   no per-store allocation by design.
 - **Fate sharing.** A lost CRL marks every store on the device `rebuild-required`; a failed CRL unloads every store.
@@ -611,7 +612,7 @@ per-device CRL location; `deviceCrlDir` is the only definition.
 | 10.9 | Adoption by another host | Safe under A3 |
 | 10.10 | Crash during transfer-out, before `crl_save.log` is durable | Safe |
 | 10.11 | Crash during transfer-out, after `crl_save.log` is durable | Safe |
-| 10.12 | Crash during `discardLostStore` | Safe |
+| 10.12 | Crash during a retire | Safe |
 | 10.13 | Stores sharing a CRL, one dropped while it is loaded again | Safe |
 | 10.14 | CRL files unrecoverable at open | Safe for the CRL; every store rebuilt |
 | 10.15 | Sizing mismatch, or another opener holds the lock | Safe; the device is refused |
@@ -671,7 +672,7 @@ places, identical, because the store served nothing in between. The restart find
 durable first, the save file is the only copy; the destination validates the staged copy before promotion
 (`loadValidStoreState`, while the source still holds the state).
 
-**10.12 Crash during `discardLostStore`.** The `rebuild-required` marker is durable before anything else, so the
+**10.12 Crash during a retire (`StoreCopies.retire`).** The `rebuild-required` marker is durable before anything else, so the
 store is never served. A crash before `lost-crl-state.log` or before the drop is durable leaves the entries live; the
 next attempt saves (unless the file exists) and drops again. A crash after the drop and before the move finds no
 entries (an empty deletion completes without a write) and moves the directory.

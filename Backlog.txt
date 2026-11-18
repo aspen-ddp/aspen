@@ -154,10 +154,11 @@ System-level protection against correlated "lost store" declarations
   - This can't be fixed inside a store implementation, because each store sees only its own files. It needs a
     system-level check.
   - Store content must never be deleted automatically on purely local detection.
-    - Today `Host.discardLostStore` moves the directory into the device's discard directory and deletes it at once,
-      and `tryLoadDevice` empties that directory at startup.
-    - Instead, move it to `<storage-device>/suspected-loss/<store-dir>-<uuid>` and keep it. Record why, when, which
-      software version, and which check fired.
+    - Today the copy is retired (`StoreCopies.retire`) into `<device>/pending-delete/<store-dir>-<uuid>` with its CRL
+      state, and deleted (`StoreCopies.release`) as soon as the store is Active on its owner device, which may be
+      minutes later. There is no retention period beyond that.
+    - Instead, keep it for longer (as `<storage-device>/suspected-loss/<store-dir>-<uuid>`, or by holding the
+      pending-delete release). Record why, when, which software version, and which check fired.
     - A rebuild can still proceed into a fresh directory, so availability doesn't depend on the decision.
     - A device CRL that fails to open is the same kind of local detection: `DeviceDiscovery.openDeviceCrl` moves it
       aside as `<device>/crl.lost-<uuid>` (up to num-streams x file size, 900 MB by default) and marks every store on
@@ -200,7 +201,7 @@ System-level protection against correlated "lost store" declarations
        forces openCRL to throw fleet-wide during a simulated rolling restart. Build that test first.
        Include: S7/Q1 (crl.lost-<uuid> is kept but never used: define retention and salvage, or delete it), S8
        (record each declaration durably with its cause, visible in show-* commands), SL Q3-Q6, and the destructive
-       4.2 rows X2/X3/X5/X6/X7 as false-positive amplifiers (X5 removes crl_save.log after a fail-stop). Every
+       4.3 rows X3 and X6 as false-positive amplifiers. Every
        automatic fail-stop (backend I/O error, failed CRL recovery, Frontend.failStop) is a lost-store declaration
        and falls under the same check (Backlog: "System-level protection against correlated lost store
        declarations").

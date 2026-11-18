@@ -104,7 +104,7 @@
   store with `extractCrl`, copying its state from the device CRL into `crl_save.log` to travel with it. Such a file is
   then the only copy of that state: if it fails to load (missing, truncated, or naming another store) the store is
   never served. It gets a `rebuild-required` marker, its entry is flipped to Rebuilding by the reconcile, and the
-  directory is moved to `pending-delete/` before the rebuild. Adoption of a device does the same for a `transferring-out` store
+  copy is retired (below) before the rebuild. Adoption of a device does the same for a `transferring-out` store
   without a valid save file instead of refusing the device, and adopts any `rebuild-required` directory as Rebuilding
   whatever its other markers. A network transfer validates the staged copy's save file before promotion and retries on
   failure, since the source still holds the state
@@ -118,19 +118,51 @@
 - `Host.StoreFailStopped` (a store's CRL recovery threw, or its Frontend fail-stopped, `server/store/CLAUDE.md`) is
   handled as a backend failure (`StoreRebuilds.handleFailStopped`), but only while that Store is still the one
   installed under its id: a late fail-stop of a closed or replaced store is ignored, so its directory is not marked
-- A backend fail-stop during a store's close marks it `rebuild-required` instead of closing it cleanly (no
-  `crl_save.log`). Such a store is never transferred: its transfer is aborted so it is rebuilt
-- A store's device-CRL entries are dropped for good (`CrashRecoveryLog.dropStore`, durable) only once it cannot be
-  served: when a rebuild discards a `rebuild-required` directory (`StoreRebuilds.discardLostStore`: marker durable,
-  then the entries saved into the directory's `lost-crl-state.log`, then the drop durable, then the directory moved
-  to `<device>/pending-delete/` and the rebuild started at once in the same callback). A discard holds a rebuild
-  slot from its start (`maxConcurrentRebuilds` counts `droppingCrlState` as well as running rebuilds), and the slot
-  passes straight to the rebuild, so one reconcile pass cannot discard every marked store at once. Or when an unloaded store's save file still
-  holds them, or when the reconcile deletes the directory of a store transferred away (`DeviceReconciler`, retried
-  on failure). Without the marker on disk, entries stay in the device CRL. A transfer out reads them
-  (`readStoreState`, leaving them live) into `crl_save.log` (loaded or not, `StoreTransfers.closeForTransferOut`)
-  and deletes them from the device CRL (`deleteTransactions`) only once that file is durable: a crash or failed save
-  before that leaves the device CRL holding them
+- A backend fail-stop during a store's close marks it `rebuild-required` instead of closing it cleanly. A
+  `crl_save.log` a transfer-out close wrote stays: its entries have left the device CRL, so it is the only copy of
+  the store's transaction state, and the retire keeps it as the copy's lost CRL state. Every reader of a store
+  directory checks `rebuild-required` before its save file. Such a store is never transferred: its transfer is
+  aborted so it is rebuilt
+- Store copies (`StoreCopies`). A store has one owner: the device its pool names. Ownership moves by a transfer or a
+  rebuild and takes effect when the new device's entry becomes Active. From then on every other copy, whatever it
+  is, may go, and only then. So a copy that stops being the owner's is never deleted where it stands. This covers a
+  completed transfer out's source and a lost copy, whether its rebuild runs here or was re-placed away. Instead it is
+  **retired** (`StoreCopies.retire`), each step durable before the next:
+  1. the `rebuild-required` marker is written;
+  2. its CRL state is saved into the copy's `lost-crl-state.log`. A file already there is kept. Otherwise the copy's
+     `crl_save.log` is renamed to that name, or else the store's device-CRL entries are read and saved;
+  3. `CrashRecoveryLog.dropStore` removes the entries from the device CRL;
+  4. the copy is renamed to `<device>/pending-delete/<store-dir>-<uuid>`.
+
+  A crash at any step leaves the marker, so the next retire redoes what remains. Two passes retire:
+  - The Rebuilding pass, for a `rebuild-required` copy at the path of a store rebuilt here
+    (`StoreRebuilds.discardLostStore`). It holds a rebuild slot from its start (`maxConcurrentRebuilds` counts
+    `droppingCrlState`), and the slot passes straight to the rebuild in the same callback, so one reconcile cannot
+    retire every marked store at once.
+  - The Deleted Stores pass, for an offline store whose entry has left the device. The store stays offline until its
+    path is clear, so a failed retire is retried.
+
+  The reconcile **releases** (`StoreCopies.release`) a `pending-delete/` copy once its store is Active on its owner
+  device: on this device by its own entry, elsewhere by the pool's entry and that device's state. This is the only
+  release condition. A rebuild that cannot finish, a failed read, or a name that identifies no store keeps the copy.
+  An accepted rebuild loss is no exception: the operator's acceptance is the release, and `accept-rebuild-loss` says
+  so. The store comes from the copy's name, never from parsing anything inside it.
+
+  Every delete of a copy is **rename-first** (`StoreCopies.delete`). The copy is renamed into `<device>/deleting/`,
+  durably, then removed, and whatever is left there is removed at device load and at each reconcile. So an
+  interrupted delete never strips a marker from a copy at a store path or leaves a partial copy in `pending-delete/`.
+  A copy that never was the owner's and holds nothing its source lacks is deleted directly (still rename-first):
+  `LocalDevices.discardStoreDirectory` and a stale arrived copy in `StoreTransfers.startIn`. Scratch areas
+  (`creating/`, `rebuilding/<id>`, transfer staging) are never loaded and are swept whole at device load, so they
+  are deleted in place.
+
+  Every rename of a copy, of a store's CRL state, or of a lost device CRL goes through `DurableFiles.move`, which
+  forces both directories. Without the marker on disk, a store's entries stay in the device CRL. A transfer out reads
+  them (`readStoreState`, leaving them live) into `crl_save.log`, whether the store is loaded or not
+  (`StoreTransfers.closeForTransferOut`), and deletes them from the device CRL (`deleteTransactions`) only once that
+  file is durable: a crash or failed save before that leaves the device CRL holding them.
+  `DeviceReconciler.dropLeftoverCrlState` drops the entries of a store with no entry, no directory and no retire
+  running, as a safety net for a directory removed by hand
 - A rebuilt store's directory carries `rebuild-complete` from its move into place until its entry leaves
   Rebuilding; `tryLoadStore` leaves such a store offline (`server/rebuild/CLAUDE.md`)
 - A failed rebuild pass or a permanently failed flip never re-checks its own device at once, which would restart the
@@ -145,10 +177,8 @@
   checks the device again), and deletes a `rebuilding/<id>` staging copy only when no rebuild of it is running. A
   flip of a rebuild whose entry has since moved to another episode is `RebuildOutcome.Superseded`: nothing is
   written, and its copy, marked for the earlier episode, is retired by the next `startRebuild`
-- Nothing of a lost store is destroyed before its rebuild succeeds: its `pending-delete/` copy (data plus saved CRL
-  entries) is deleted by the device's reconcile only once the store is Active again, on this device by its own
-  entry, elsewhere by the pool's entry and that device's state; a failed read keeps it. A fail-stopped backend's CRL
-  entries likewise stay live until that discard saves them
+- Nothing of a store's previous copy is destroyed before the store is Active on its owner device (the store copies
+  rule above). A fail-stopped backend's CRL entries likewise stay live until the retire saves them
 - A device the tree records Failed is retired by its host's reconcile (`DeviceShutdown.retireFailedDevice`): a
   durable `failed` marker (`DeviceMarkers`), then unloaded as a relinquished device is. A device with the marker is
   never loaded or claimed; nothing on it is deleted. The tombstone (`FailedStorageDeviceDurableTask`) nudges the

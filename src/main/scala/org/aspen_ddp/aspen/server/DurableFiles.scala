@@ -60,6 +60,15 @@ object DurableFiles extends Logging:
       os.remove(file)
       syncDirectory(file / os.up)
 
+  /** Renames `source` (a file or a directory) to `target` atomically, then forces the directory that now names it and,
+   *  if different, the one that named it, so that after a crash exactly one of the two paths exists. Both must be on
+   *  one file system. Every rename of a store copy, a store's CRL state or a device CRL goes through here. */
+  def move(source: os.Path, target: os.Path): Unit =
+    os.move(source, target, atomicMove = true)
+    syncDirectory(target / os.up)
+    if source / os.up != target / os.up then
+      syncDirectory(source / os.up)
+
   /** Forces every regular file and directory under `root`, `root` included, to stable storage: files first, then
    *  each directory below its entries. For a freshly written tree before it is renamed into place. */
   def syncTree(root: os.Path): Unit =

@@ -677,9 +677,10 @@ correlated loss.
 - **Opened but not served** (device unloaded or another backend serves it) **and failed**
   (`StoreLoader.handleBackendOpened`).
 - **Failed during a `ShutdownStore` close** (`StoreLoader.handleClose`, then `StoreRebuilds.failedOnClose`). The
-  store is marked, and the `crl_save.log` a transfer-out close just wrote is **deleted**, so an adopter sees
-  `rebuild-required` and treats the store as CrlLost (L22). Entries left in the device CRL are dropped when the
-  rebuild discards the directory, after the marker is durable.
+  store is marked, so an adopter sees `rebuild-required` and treats the store as CrlLost (L22): every reader checks the
+  marker before the save file. A `crl_save.log` a transfer-out close just wrote is kept, since its entries have left
+  the device CRL; the rebuild's retire renames it to `lost-crl-state.log` in the retired copy. Entries left in the
+  device CRL are saved and dropped by that retire, after the marker is durable.
 - **Transfer out** (`StoreTransfers.startOut`):
   - a store already marked whose entry is TransferringOut is returned to rebuild (Ruling 25,
     `StoreTransfers.returnLostTransferToRebuild`);
@@ -713,13 +714,13 @@ In addition, the rebuild staging store is discarded on `StoreLost` (4.1, related
 2. The reconcile's Lost CRL State pass (`DeviceReconciler.reconcileDeviceState`) finds marked offline stores whose
    entry is Active and calls `StoreRebuilds.requestRebuild`. That flips the entry to Rebuilding in a transaction, but only if the device is
    not failed and is owned by this host.
-3. `StoreRebuilds.startRebuild` calls `discardLostStore` first. It moves the directory to
-   `<device>/discarded/<store>-<uuid>`, syncs the device directory, and **deletes it at once**
-   (`os.remove.all`). If the delete fails, the copy is removed by `DeviceDiscovery.tryLoadDevice` at the next device
-   load, which empties `discarded/`.
+3. `StoreRebuilds.startRebuild` calls `discardLostStore` first, which retires the copy (`StoreCopies.retire`): its CRL
+   state saved into `lost-crl-state.log`, its device-CRL entries dropped, then the directory moved, durably, to
+   `<device>/pending-delete/<store>-<uuid>`. The copy is deleted (rename-first, through `<device>/deleting/`) only
+   once the store is Active on the device its pool names (`StoreCopies.release`).
 4. `RebuildingStore` rebuilds into `<device>/rebuilding/...` and moves it into place.
 
-So the store's content is gone as soon as the rebuild starts. The Backlog item proposes keeping it instead in
+So the store's content is gone as soon as its rebuild succeeds. The Backlog item proposes keeping it longer, in
 `<storage-device>/suspected-loss/<store-dir>-<uuid>`, together with the reason, time, software version and the
 check that fired, and leaving the decision to a system-level check that looks for correlation across stores,
 pools and hosts.

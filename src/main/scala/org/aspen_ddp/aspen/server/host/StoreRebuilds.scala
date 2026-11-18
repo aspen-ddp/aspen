@@ -577,9 +577,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     ctx.reconciler.checkStorageDevice(storageDeviceId)
 
   /** A store closed by ShutdownStore whose backend failed-stop meanwhile: its page-cache state can't be trusted, so
-   *  it is rebuilt rather than treated as cleanly closed. Marked rebuild-required, and the CRL save file the close
-   *  just wrote is removed so nothing takes the directory for a clean close; it is dropped from loadedStores so a
-   *  shutdown retry does not pick it again. */
+   *  it is rebuilt rather than treated as cleanly closed. Marked rebuild-required, which every reader of the directory
+   *  checks before its CRL save file, so nothing takes it for a clean close; it is dropped from loadedStores so a
+   *  shutdown retry does not pick it again. A save file the close wrote (a transfer out's, whose entries have left the
+   *  device CRL) is the only copy of the store's transaction state: it stays, and the rebuild's retire keeps it in the
+   *  copy as its lost CRL state (StoreCopies.retire). */
   def failedOnClose(store: Store): Unit =
     val storeId = store.storeId
     val path = store.backend.path
@@ -591,7 +593,6 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       sds.offlineStores += storeId
     try
       markRebuildRequired(path)
-      DurableFiles.remove(Backend.crlSaveFile(path))
     catch
       case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at $path: $t")
     ctx.reconciler.checkStorageDevice(store.storageDeviceId)
@@ -702,18 +703,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  over a directory at the store's path that is not a finished rebuild (RebuildingStore.start). Returns whether
    *  the path is clear now, so the rebuild may start.
    *
-   *  Nothing is destroyed: the copy is kept under RebuildingStore.PendingDeleteDirectory until the store is Active
-   *  again (DeviceReconciler deletes it then), so a rebuild that cannot finish loses nothing. The single point where
-   *  a discarded store's entries leave its device CRL, in a fixed order, each step durable before the next: the
-   *  `rebuild-required` marker (already there: it is what says the state is gone), then the entries saved into the
-   *  directory (RebuildingStore.LostCrlStateFile, kept if a crash left it), then dropped (CrashRecoveryLog.dropStore:
-   *  a rebuild onto this device would recover them otherwise), then the directory renamed into pending-delete. A
-   *  crash at any point leaves the marker, so the next attempt saves (unless already saved) and drops again. The
-   *  store is never served meanwhile, so the entries cannot change. The save and drop complete asynchronously: this
-   *  returns false meanwhile, the store holding a rebuild slot (`droppingCrlState`). Once the drop is durable the
-   *  directory is moved and the rebuild started at once, in the same callback, so the slot passes to it with no gap
-   *  in which another store's discard could take it. A failure frees the slot and leaves everything in place for a
-   *  later check.
+   *  The copy is retired (StoreCopies.retire: marker, CRL state saved into the copy, device-CRL entries dropped,
+   *  moved into pending-delete), and deleted once the store is Active on the device its pool names. The retire
+   *  completes asynchronously: this returns false meanwhile, the store holding a rebuild slot (`droppingCrlState`).
+   *  Once the copy is in pending-delete the rebuild is started at once, in the same callback, so the slot passes to
+   *  it with no gap in which another store's discard could take it. A failure frees the slot and leaves everything in
+   *  place for a later check.
    */
   private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
     val storePath = local.devicePath / storeId.directoryName
@@ -722,50 +717,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     else
       if !droppingCrlState.contains(storeId) then
         droppingCrlState += storeId
-        val saveFile = storePath / RebuildingStore.LostCrlStateFile
-        val dropped =
-          try
-            val saved =
-              if os.exists(saveFile) then
-                Future.unit
-              else
-                local.crl.readStoreState(storeId).map(trs => CrashRecoveryLog.saveStoreState(storeId, trs, saveFile))
-            saved.flatMap(_ => local.crl.dropStore(storeId))
-          catch case NonFatal(t) => Future.failed(t)
-        dropped.onComplete: result =>
+        ctx.copies.retire(local, storeId).foreach: clear =>
           droppingCrlState -= storeId
-          result match
-            case Failure(t) =>
-              logger.error(s"Failed to save and drop the CRL state of store $storeId before rebuilding it. Not " +
-                           s"rebuilding it yet. Error: $t")
-            case Success(_) =>
-              local.admission.releaseRetained(storeId)
-              // A device unloaded meanwhile is discarded by whichever load of it comes next
-              if ctx.devices.devices.get(local.storageDeviceId).exists(_ eq local) then
-                if moveLostStoreToPendingDelete(local, storeId) then
-                  startRebuild(local, storeId, episode)
+          if clear then
+            startRebuild(local, storeId, episode)
       false
-
-  /** Renames a discarded store's directory into pending-delete, durably. Returns whether the path is clear. */
-  private def moveLostStoreToPendingDelete(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
-    val storePath = local.devicePath / storeId.directoryName
-    try
-      if os.exists(storePath) then
-        val pendingDir = local.devicePath / RebuildingStore.PendingDeleteDirectory
-        if !os.exists(pendingDir) then
-          os.makeDir.all(pendingDir)
-          DurableFiles.syncDirectory(local.devicePath)
-        val target = pendingDir / s"${storeId.directoryName}-${UUID.randomUUID()}"
-        logger.warn(s"Moving store $storeId at $storePath, whose CRL state was lost, to $target before rebuilding " +
-                    s"it. It is deleted once the store is Active again")
-        os.move(storePath, target)
-        DurableFiles.syncDirectory(local.devicePath)
-        DurableFiles.syncDirectory(pendingDir)
-      true
-    catch
-      case t: Throwable =>
-        logger.error(s"Failed to discard store $storeId at $storePath. Not rebuilding it yet. Error: $t")
-        false
 
 object StoreRebuilds:
   /** Host.StoreFailStopped's `what` for a store whose CRL recovery failed */

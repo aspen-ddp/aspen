@@ -36,15 +36,13 @@ class LocalDevices extends Logging:
    *  files would corrupt them. */
   var closingCrls: Map[os.Path, Future[Unit]] = Map()
 
-  /** Reclaims the store copy a transfer just delivered onto a device that turned out to be
-   *  tombstoned.
-   *
-   *  Only reached with TransferOutcome.SourceRestored, which means the pool still names the
-   *  source and the source still holds the data -- so there is nothing here worth keeping. Its
-   *  transferred-in marker keeps tryLoadStore from loading it, but nothing else would ever
-   *  reclaim it, since reconcileDeviceState ignores a failed device outright. Were it loaded, and
-   *  the source happened to live on this same host, the load would replace the source's entry in
-   *  `stores`, which is keyed by StoreId alone.
+  /** Deletes a copy that never was its store's owner copy and holds nothing its source lacks, so it needs no retiring
+   *  (StoreCopies): the copy a transfer delivered onto a device that turned out to be tombstoned
+   *  (TransferOutcome.SourceRestored: the pool still names the source, which still holds the data), or one a rebuild
+   *  built from its peers on a device the tree does not say owns it (RebuildOutcome.Discard). Its transferred-in or
+   *  rebuild-complete marker keeps tryLoadStore from loading it, but nothing else would ever reclaim it, since
+   *  reconcileDeviceState ignores a failed device outright. Were it loaded, and the source happened to live on this
+   *  same host, the load would replace the source's entry in `stores`, which is keyed by StoreId alone.
    *
    *  Nothing is unloaded because nothing was loaded: the load is downstream of the decision.
    */
@@ -62,10 +60,6 @@ class LocalDevices extends Logging:
         if os.exists(storePath) then
           logger.warn(s"Discarding the copy of store $storeId on device $deviceId. " +
                       s"$reason: $storePath")
-          try
-            os.remove.all(storePath)
-          catch
-            case t: Throwable =>
-              // The store is not loaded, so nothing serves it now. The cost of the leak is a
-              // directory on a dead device that a restart would load and then never route to.
-              logger.error(s"Failed to delete the discarded store copy $storePath. Error: $t")
+          // Rename-first: a failure leaves the copy whole, its marker included, so a restart never loads it.
+          // The store is not loaded, so nothing serves it now
+          StoreCopies.delete(sds.devicePath, storePath, reason)

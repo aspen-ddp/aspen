@@ -400,21 +400,30 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         // earlier transfer that was aborted or given up on predates whatever the source has
         // accepted since, so resuming it would install stale data. Discard it and start over.
         val promotedMarker = finalPath / StoreTransfer.TransferredInMarkerFile
-        if os.exists(promotedMarker) then
-          val markerId = try os.read(promotedMarker).trim catch case _: Throwable => ""
-          if !transferId.exists(_.toString == markerId) then
-            logger.warn(s"Discarding the arrived copy of store $storeId on device $toDeviceid: it " +
-                        s"belongs to transfer '$markerId', not to the current transfer $transferId")
-            try
-              os.remove.all(finalPath)
-              ctx.router.clearOffline(storeId)
-              toDevice.offlineStores -= storeId
-            catch case t: Throwable =>
-              logger.error(s"Failed to remove the stale arrived copy of store $storeId at $finalPath: $t")
+        val staleKept = os.exists(promotedMarker) &&
+          locally:
+            val markerId = try os.read(promotedMarker).trim catch case _: Throwable => ""
+            if transferId.exists(_.toString == markerId) then
+              false
+            else
+              logger.warn(s"Discarding the arrived copy of store $storeId on device $toDeviceid: it " +
+                          s"belongs to transfer '$markerId', not to the current transfer $transferId")
+              // Rename-first: a failure leaves the copy whole behind its marker. The source still owns the store
+              if StoreCopies.delete(devicePath, finalPath, s"a stale arrived copy of store $storeId") then
+                ctx.router.clearOffline(storeId)
+                toDevice.offlineStores -= storeId
+                false
+              else
+                true
+
+        // A stale copy that could not be deleted must not be resumed: the next check tries again
+        if staleKept then
+          logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the stale arrived copy at " +
+                       s"$finalPath could not be deleted. Retrying at a later check")
 
         // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
         // step finished -- needs no bytes, only that step.
-        if os.exists(finalPath / StoreTransfer.TransferredInMarkerFile) then
+        else if os.exists(finalPath / StoreTransfer.TransferredInMarkerFile) then
           logger.info(s"Store $storeId has already arrived on device $toDeviceid. Resuming its " +
                       s"pool update")
           val transferUUID = UUID.randomUUID()
@@ -501,8 +510,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                     // accepted by an adopter on the strength of this marker alone.
                     DurableFiles.write(stagedPath / StoreTransfer.TransferredInMarkerFile,
                                        transferId.map(_.toString).getOrElse(""))
-                    os.move(stagedPath, finalPath)
-                    DurableFiles.syncDirectory(devicePath)
+                    DurableFiles.move(stagedPath, finalPath)
                     true
                   catch
                     case t: Throwable =>

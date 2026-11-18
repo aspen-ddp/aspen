@@ -129,7 +129,8 @@ object RebuildState extends YObject[RebuildState] with Logging:
     os.move(path / tempFilename, path / stateFilename,
             replaceExisting = true, atomicMove = true)
 
-  /** Delete the checkpoint from `path`, along with any temp file a crashed save left behind. */
+  /** Delete the checkpoint from `path`, along with any temp file a crashed save left behind. Either may be missing:
+   *  `os.remove` without `checkExists` is `Files.deleteIfExists`, so a missing file is no error. */
   def removeAll(path: os.Path): Unit =
     os.remove(path / stateFilename)
     os.remove(path / tempFilename)

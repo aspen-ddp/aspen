@@ -6,6 +6,12 @@
   system metadata structures
 - Transaction rules every caller must follow (pin rule, one update per object, store new pointers) are in the root
   CLAUDE.md; builder internals in `internal/transaction/CLAUDE.md`
+- Reads are untimed: they retry until they restore the object or fail fatally. `withReadTimeout(d)` returns an
+  `ObjectReader` (`internal/TimedObjectReader`) whose every read method fails with `ReadTimeout` after `d` and stops
+  retrying. `ReadTimeout` is not an `InvalidObject` (it proves nothing about existence) and `readOptional` does not
+  swallow it. `Duration.Inf` returns the client; non-positive or non-finite durations are refused. The timeout bounds
+  the object read, not IDA resolution. For callers that must not wait forever (repair scans, rebuild walks); the
+  usage example is `UsageGuide.md` "Timed reads", kept compiling by `examples/TimedReadsSuite`
 
 ### IDA data operations
 - RandomAccessReedSolomon lays data out in rows of `k * cellSize` bytes with an 8-byte length trailer, so

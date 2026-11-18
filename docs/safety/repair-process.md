@@ -745,10 +745,11 @@ but the object was unreadable already.
 ### 12.8 An object whose read never completes
 
 A read of an object below its read threshold, or of a key that stays `NotRestorable`, or of an allocation held
-indefinitely (Backlog.txt "Repair scan stalls on an allocation held past expiry"), never completes. The store's scan
+indefinitely (ExpiryTally rule G), never completes. The store's scan
 stops at that entry until the deadline cancels it; the next scan stops at the same entry (the walk always starts at
 the range's head), so later entries of the store are not repaired, and each scan leaves one read retrying in the
-background. Tracked in Backlog.txt (the fix there, timed reads mapped to deferral, covers every cause above).
+background. Tracked in Todo.txt 4.3: timed reads (`client.withReadTimeout`) exist, and mapping a `ReadTimeout` to
+deferral covers every cause above once the scan uses them.
 
 ### 12.9 More scenarios
 
@@ -768,8 +769,7 @@ background. Tracked in Backlog.txt (the fix there, timed reads mapped to deferra
 
 - **Bootstrap tree sweep staleness window** (Backlog.txt): a bootstrap store whose scans come back clean backs off to
   the 15 min cap, so a missed untracked write to the bootstrap pool's own trees can stay unhealed that long.
-- **Head-of-line blocking on an unreadable object** (Backlog.txt "Repair scan stalls on an allocation held past
-  expiry"; 12.8).
+- **Head-of-line blocking on an unreadable object** (Todo.txt 4.3; 12.8).
 - **Traceless follow-ups** (Backlog.txt "Traceless commits follow-ups"): UnackedCommits entries are per transaction,
   so a voter that keeps missing `errorTimeout` grows the tree.
 - **Large UnackedCommits entries**: a `NodeSizeExceeded` for a node too small for one object's chunk is permanent; the

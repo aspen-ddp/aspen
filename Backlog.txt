@@ -13,22 +13,6 @@ permanently loses another pool's missed-update record (X9). Suggested fix: give 
 (e.g. 1 min, a new RepairPolicy setting), independent of the scan back-off. Cost: one walk of the bootstrap trees
 per minute per bootstrap store; the trees are small.
 
-Repair scan stalls on an allocation held past expiry (found 2026-11-17, client 1-RTT commit final review). Since the
-client 1-RTT commit work (docs/superpowers/specs/2026-11-16-client-1rtt-commit-design.md), a read never fails on an
-AllocationPending reply: BaseReadDriver re-reads that store, which parks the read until the allocation applies or
-aborts (Frontend.parkAllocationRead). If the allocating transaction is held indefinitely (ExpiryTally rule G, an
-undecidable case after rebuilds), it never applies or aborts, and SimpleReadDriver never gives up, so the read waits
-forever. Repair's object reads (StoreRepairer.readObject) then never complete: the store's sequential scan stops at
-that entry until the scan deadline cuts it off, every later scan stops at the same entry (later ErrorTree and
-UnackedCommits entries go unrepaired), and each scan leaks one background read that keeps retransmitting.
-Before this change the AllocationPending reply reached the object reader, the read failed InvalidObject short of a
-deletion proof, and repairListed deferred the entry.
-Suggested fix: add an optional timeout to the client read methods (AspenClient.read and the read drivers). The
-default is infinite, matching current behavior. A timed-out read fails with a distinct error and stops its driver
-(no leaked retransmits). Repair scans switch to timed reads and map a timeout to the existing defer path (entry
-kept for a later pass), so a held allocation costs one bounded wait per scan instead of stalling it. Document it in
-server/repair/CLAUDE.md and client/internal/CLAUDE.md.
-
 --- Mid Term ---
 
 Isolate every device's I/O, and detect and handle hung devices

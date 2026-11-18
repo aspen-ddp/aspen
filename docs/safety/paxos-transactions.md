@@ -1049,7 +1049,7 @@ transaction eventually resolves without operator action given a healthy quorum.
 * **Undecidable transactions.** Rule G with every store replied holds T, its locks and its CRL state indefinitely,
   logged `UNDECIDABLE TRANSACTION`. Reached only after rebuilds or forgotten stores reach a primary quorum with a
   lock-only primary object, or a lock-only pool with too few live commit voters. A held allocation also stalls repair
-  scans (Backlog.txt, "Repair scan stalls on an allocation held past expiry").
+  scans (Todo.txt 4.3, repair scan stalls on an unreadable object).
 * **Data lost at expiry.** Rule D with `dataLost` discards a T that may have committed, because its update is held by
   fewer than the read threshold of a changed pool (rebuilds beyond `t - r` of the commit voters).
 * **C-then-F divergence.** One store may discard by C over an abort accepted by fewer than a quorum while another later

@@ -730,8 +730,7 @@ one host each sit in such a pool. With `maxConcurrentRebuilds = 2`, every other 
 too, waits until the silent stores return.
 Consequence: rebuilds of healthy pools stall behind unhealthy ones; the 10,000-failure abort and its backoff never
 engage; a shutdown proceeds with staging open.
-Suggested fix: the bounded read proposed in `Backlog.txt` ("Repair scan stalls on an allocation held past expiry",
-an optional read timeout) applied to the rebuild's reads too: a timed-out read is a failed object (so the
+Suggested fix (Todo.txt 4.3): use timed reads (`client.withReadTimeout`, now available) for the rebuild's reads: a timed-out read is a failed object (so the
 `MaxFailedObjects` abort and the backoff take over), and the driver stops. Alternatively complete the pass's future on
 cancel without awaiting the in-flight read and close the backend once that read ends.
 Effort: M   Priority: 4

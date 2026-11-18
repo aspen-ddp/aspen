@@ -57,14 +57,23 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
      CONFIRMED. sweepPending waits on any listed unresolved allocation with no bound; rule G holds T while a store
      of T is silent, and the rebuilding store is silent until the sweep finishes. Fix: stop waiting once T's
      start is past horizon + expiry margin (the rebuilt store is muted for T and will be marked), and skip Txs
-     started after the rebuild began. Not covered by the bounded read of 4.3 (it is a query).
+     started after the rebuild began. Not covered by the bounded read of 4.3 (it is a query). Timed reads are
+     available (client.withReadTimeout; a timed-out read fails ReadTimeout and stops retrying) for any object read
+     the sweep makes, but the unbounded wait itself is the sweep's and needs the fix above.
 
-4.3  Reads with no timeout stall the rebuild walk/sweep and the repair scan: RB-W4 + Backlog item         [M]
+4.3  Reads with no timeout stall the rebuild walk/sweep and the repair scan: RB-W4                       [M]
      CONFIRMED. A never-completing client.read holds a rebuild slot and cancel cannot end it; healthy pools'
-     rebuilds stall behind it. Same root and fix as Backlog.txt "Repair scan stalls on an allocation held past
-     expiry" (bounded read; a timed-out read is a failed object). The repair agent notes the Backlog item is
-     broader than stated: any object below its read threshold or a key that stays NotRestorable stalls the scan
-     the same way; update the Backlog text. Do the bounded read once for both consumers.
+     rebuilds stall behind it. The repair scan stalls the same way: its object reads (StoreRepairer.readObject)
+     wait forever on an allocation held past expiry (ExpiryTally rule G: the store parks the AllocationPending
+     re-read until the allocation applies or aborts, Frontend.parkAllocationRead), on any object below its read
+     threshold, or on a key that stays NotRestorable. The store's sequential scan stops at that entry until the
+     scan deadline cuts it off, every later scan stops at the same entry (later ErrorTree and UnackedCommits
+     entries go unrepaired), and each scan leaks a background read that keeps retransmitting.
+     Timed reads are implemented (client.withReadTimeout, see client/CLAUDE.md): a timed-out read fails
+     ReadTimeout and stops its driver, so nothing leaks. What remains is switching the consumers to them: the
+     rebuild walk/sweep treats a ReadTimeout as a failed object; repair maps it to the existing defer path (entry
+     kept for a later pass, as for InvalidObject short of a deletion proof), so a stuck object costs one bounded
+     wait per scan. Document it in server/repair/CLAUDE.md and server/rebuild/CLAUDE.md.
 
 
 PRIORITY 5: performance and hygiene
@@ -135,7 +144,7 @@ PRIORITY 7: documentation corrections
 7.5  Stale text in Backlog.txt                                                                              [S]
      "Why there is no per-commit watchdog" (an undecided driver never proposes abort; waiting Txs end by expiry
      rules A-G); the out-of-space sub-item about a late prepare after cache expiry is obsolete (receivePrepare
-     refuses below the forget floor); the repair stall item's scope (see 4.3).
+     refuses below the forget floor).
 
 
 PRIORITY 8: unimplemented features

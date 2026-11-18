@@ -10,6 +10,11 @@
   (logged at trace), except that a late `StoreNotFound` still drops the sender's cached endpoint. Stale stores found by
   a read are not repaired by the read: repair is the server's job (`server/repair`). The client keeps no object
   cache, and a `TxPrepare` carries only the transaction's object updates (no pre-transaction rebuilds).
+- A timed read (`ReadManager.read(..., timeout)`, finite) schedules one task on the client's
+  `backgroundTaskManager`; when it fires on an incomplete read it calls `ReadDriver.timeOut()` (fails the read with
+  `ReadTimeout` and runs `onComplete`, cancelling `SimpleReadDriver`'s retransmits) and releases the read. A read
+  that completes first cancels the task. An untimed read (`Duration.Inf`, the default) schedules nothing.
+  `BaseAspenClient`'s read bodies take the timeout; the public `ObjectReader` methods pass `Duration.Inf`
 - A stale pointer or cached state of a deleted object can neither read nor revive it, even through a store that
   missed the deletion (a zombie slice): ids are never reused, every requirement on a missing or refcount-0 object
   fails `MissingObject`, and zombies are short of both thresholds (safety cross-document G7)

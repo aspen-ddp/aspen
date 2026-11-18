@@ -747,7 +747,7 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
   (transaction-requirements.md 10.5c).
 * A transaction undecidable at expiry (too many rebuilt or forgetting primary stores, ExpiryTally rule G) holds its
   locks and CRL state, logged `UNDECIDABLE TRANSACTION`; a repair read of an allocation it holds stalls the scan
-  (Backlog.txt, "Repair scan stalls on an allocation held past expiry").
+  (Todo.txt 4.3, repair scan stalls on an unreadable object).
 * Mixed-version finalizer types (Backlog.txt, "Mixed-Version Support").
 
 ## Open weaknesses

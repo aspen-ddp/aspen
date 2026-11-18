@@ -9,10 +9,26 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory
 import scribe.Logging
 
 import java.util.UUID
-import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue}
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, LinkedBlockingQueue, Semaphore}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.collection.immutable.HashMap
 import scala.concurrent.{Future, Promise}
+import scala.concurrent.duration.*
+import scala.util.control.NonFatal
+
+/** When a SimpleCRL may grow by one stream (CrashRecoveryLog.requestGrowth): while its ring is below `maxStreams`,
+  * and only if `freeSpace()`, less the new stream, stays at or above `minFreePercent` of `capacity()`. Both are
+  * functions of the file system holding the CRL, read at each attempt. After a refused or failed attempt, requests
+  * are ignored for `retryAfter` */
+case class GrowthPolicy(maxStreams: Int,
+                        minFreePercent: Int,
+                        capacity: () => Long,
+                        freeSpace: () => Long,
+                        retryAfter: FiniteDuration = 10.seconds)
+
+object GrowthPolicy:
+  /** No stream beyond the ring a CRL was opened with */
+  val Disabled: GrowthPolicy = GrowthPolicy(0, 100, () => 0L, () => 0L)
 
 object SimpleCRL extends Logging:
 
@@ -58,6 +74,10 @@ object SimpleCRL extends Logging:
 
   /** Runs the handler once every request queued before it is durable (CrashRecoveryLog.whenDurable) */
   case class Barrier(handler: () => Unit) extends ActionRequest
+
+  /** Queued by the growth thread once stream `streamNumber` is preallocated, renamed into place and its directory
+    * forced: the CRL thread commits it into the ring */
+  case class GrowthReady(streamNumber: Int) extends ActionRequest
 
 
   case class InitialCRLState(crl: SimpleCRL,
@@ -132,13 +152,15 @@ object SimpleCRL extends Logging:
     *                  new CRL being created, and nothing in `streamsDir` is written.
     * @param ringForTest the ring of a CRL created by this call, a permutation of `0 until numStreams`, in place of
     *                    numeric order: lets tests reach rings only a growth makes. An existing CRL keeps its ring
+    * @param growth when the CRL may grow (requestGrowth). A `maxStreams` at or below the ring size grows nothing
     */
   def apply(streamsDir: os.Path,
             numStreams: Int,
             maxSizeInBytes: Long,
             onThreadDeath: Throwable => Unit = _ => (),
             mustExist: Boolean = false,
-            ringForTest: Option[Vector[StreamId]] = None): InitialCRLState =
+            ringForTest: Option[Vector[StreamId]] = None,
+            growth: GrowthPolicy = GrowthPolicy.Disabled): InitialCRLState =
     // Held from before the files are read until the writer has closed them. A failed open releases it
     val lock = CrlLock.acquire(streamsDir)
     try
@@ -158,11 +180,13 @@ object SimpleCRL extends Logging:
 
       InitialCRLState(
         new SimpleCRL(
+          streamsDir,
           sizing,
           files,
           r,
           onThreadDeath,
-          lock),
+          lock,
+          growth),
         r.trsList,
         r.appliedStubs)
     catch case t: Throwable =>
@@ -257,18 +281,26 @@ object SimpleCRL extends Logging:
         if os.size(f) != maxSizeInBytes then
           throw CrlSizingMismatch(streamsDir, s"${f.last} is ${os.size(f)} bytes, expected $maxSizeInBytes")
 
-class SimpleCRL private (sizing: SimpleCRL.Sizing,
+class SimpleCRL private (streamsDir: os.Path,
+                         initialSizing: SimpleCRL.Sizing,
                          files: List[(StreamId, os.Path)],
                          r: Recovery.Result,
                          onThreadDeath: Throwable => Unit,
-                         lock: CrlLock) extends CrashRecoveryLog with Logging:
+                         lock: CrlLock,
+                         growth: GrowthPolicy) extends CrashRecoveryLog with Logging:
 
   import SimpleCRL._
 
-  val maxSizeInBytes: Long = sizing.maxSizeInBytes
-  private val crlId: UUID = sizing.crlId
+  val maxSizeInBytes: Long = initialSizing.maxSizeInBytes
+  private val crlId: UUID = initialSizing.crlId
 
-  val numStreams: Int = files.size
+  /** The ring as recorded in the SizingFile. Owned by the CRL thread: only a committed growth changes it */
+  private var sizing: Sizing = initialSizing
+
+  /** `sizing`'s ring size, for other threads: set by the CRL thread once a growth is committed */
+  @volatile private var ringSize: Int = initialSizing.numStreams
+
+  def numStreams: Int = ringSize
 
   /** The most an entry other than an evacuation may hold (crash-recovery-log 6.1, W1): a request that would push the
     * newest unwritten entry past it seals that entry. A lone transaction, at most maxTransactionBytes, always fits */
@@ -322,7 +354,8 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
   /** Rotations since a head was last written (W6) */
   private var rotationsWithoutHead: Int = 0
 
-  private val streams: Array[Stream] = new Array[Stream](files.length)
+  /** By stream number: a growth appends the next one */
+  private val streams = scala.collection.mutable.ArrayBuffer.fill[Stream](files.length)(null)
 
   /** The live transactions as saved: readStoreState's view. A deleted one leaves at once, though the image keeps
     * it until its deletion's entry is built */
@@ -337,12 +370,49 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
     * its write completes */
   private var afterInFlight: List[() => Unit] = Nil
 
-  /** Shuts the writer down, releasing the lock once it has closed the stream files and before `completionHandler` */
+  // ---- Growth (crl/CLAUDE.md): preallocated on the growth thread, committed on the CRL thread ----
+
+  private val limitListeners = new CopyOnWriteArrayList[Long => Unit]()
+
+  /** Held by the growth thread across each step that touches the directory, and by stopGrowth to set
+    * `growthStopped`: once it is set no growth step runs, so nothing is written after the lock is released */
+  private val growthFileLock = new Object
+  @volatile private var growthStopped = false
+
+  /** An attempt is under way: from the request that starts it to its refusal, failure or commit (endGrowthAttempt) */
+  private val growthBusy = new AtomicBoolean(false)
+  private val growthRequests = new Semaphore(0)
+  @volatile private var growthAllowedAt: Long = System.nanoTime()
+  private val growthAttemptsEnded = new AtomicInteger(0)
+
+  /** A GrowthReady waiting for the rotation in progress to place its head (commitGrowthWhenQuiescent). CRL thread */
+  private var pendingGrowth: Option[Int] = None
+
+  /** The CRL's own thread for growth's slow steps, off the CRL thread (a preallocation may zero-fill) and off the
+    * writer (DSYNC writes are not delayed). None when the policy allows no stream beyond the ring */
+  private val growthThread: Option[Thread] =
+    if growth.maxStreams <= initialSizing.numStreams then None
+    else
+      val t = new Thread(() => growthLoop(), s"crl-growth-${streamsDir.last}")
+      t.setDaemon(true)
+      Some(t)
+
+  /** Stops the growth thread: it is interrupted, and runs no further step. Waits for at most the step it is in */
+  private def stopGrowth(): Unit =
+    growthFileLock.synchronized:
+      growthStopped = true
+    growthThread.foreach(_.interrupt())
+
+  /** Shuts the writer down, releasing the lock once it has closed the stream files and before `completionHandler`.
+    * Growth stops first, so no growth step runs after the lock is released: a growth in flight is abandoned, and
+    * leaves at most a `.tmp` or an unlisted stream file, which the next open removes */
   private def shutdownWriter(completionHandler: () => Unit): Unit =
+    stopGrowth()
     writer.shutdown: () =>
       lock.release()
       completionHandler()
 
+  // Indexed by stream number below: a ring lists `0 until ringSize`
   files.foreach: tpl =>
     if tpl._1 == r.activeStreamId then
       streams(tpl._1.number) = new Stream(r.activeStreamId, crlId, writer,
@@ -425,6 +495,7 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
         onThreadDeath(t)
   }
   ioThread.start()
+  growthThread.foreach(_.start())
 
   /** The serial number the next entry built takes */
   def currentEntrySerialNumber: Long = nextSerial
@@ -476,10 +547,12 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
       issue(head)
     else
       // W6: within the admission limit every head is written within n − 1 rotations (crash-recovery-log 6.1, Lemma
-      // B). More means its assumption broke; rotating on would only spin, with every deletion stuck behind the head
-      if rotationsWithoutHead >= numStreams - 1 then
-        throw IllegalStateException(s"CRL entry of ${head.entrySize} bytes not written after ${numStreams - 1} " +
-          s"rotations in a row (n − 1 for $numStreams streams): the live data exceeds what the ring holds, the " +
+      // B). More means its assumption broke; rotating on would only spin, with every deletion stuck behind the head.
+      // The ring does not change while the count runs: a growth waits for the head (commitGrowthWhenQuiescent)
+      val n = sizing.numStreams
+      if rotationsWithoutHead >= n - 1 then
+        throw IllegalStateException(s"CRL entry of ${head.entrySize} bytes not written after ${n - 1} " +
+          s"rotations in a row (n − 1 for $n streams): the live data exceeds what the ring holds, the " +
           s"bound of crash-recovery-log 6.1")
       rotationsWithoutHead += 1
       currentStream = sizing.successor(StreamId(currentStream)).number
@@ -556,7 +629,13 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
           val barriers = afterInFlight.reverse
           afterInFlight = Nil
           barriers.foreach(_())
+          // Nothing is in flight: if that was a head, the ring may take a stream before the next write
+          commitGrowthWhenQuiescent()
           startWrite()
+
+        case GrowthReady(streamNumber) =>
+          pendingGrowth = Some(streamNumber)
+          commitGrowthWhenQuiescent()
 
         case Barrier(handler) =>
           // Every earlier request is in an unwritten entry, in the entry being written, or already durable
@@ -574,6 +653,152 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
         case Shutdown(completionHandler) =>
           shutdownWriter(completionHandler)
           return
+
+  /** Commits a pending growth unless a rotation is under way: between a rotation's evacuation entry and its head
+    * (rotationsWithoutHead counts from the one to the other, W6), the stream after the active one may still hold
+    * pieces the evacuation in flight is moving, and the count of rotations must run over one ring */
+  private def commitGrowthWhenQuiescent(): Unit =
+    pendingGrowth.foreach: n =>
+      if rotationsWithoutHead == 0 then
+        pendingGrowth = None
+        commitGrowth(n)
+
+  /** Inserts stream `n`, preallocated and renamed into place by the growth thread, right after the active stream A.
+    * The rewrite of the SizingFile is the commit point (crl/CLAUDE.md, growth) and the last step that touches the
+    * files: only once it is durable does the writer know of the stream, and only then is the limit raised. So a crash
+    * before it leaves an unlisted `<n>.crl`, which the next open removes (removeUncommittedGrowth), and a crash after
+    * it a listed, all-zero stream, which recovery reads as holding no entry.
+    *
+    * The invariant holds after the insert: the stream after A is now `n`, which holds no entry at all, and A's old
+    * successor, now after `n`, holds nothing of the image: A's entry evacuated it, the rotation is complete
+    * (commitGrowthWhenQuiescent), and pieces are written only into A. So the rotation into `n` carries nothing,
+    * and the rotation after it enters a stream holding nothing needed, as every rotation does. Lemma A does not
+    * depend on the ring size. Lemma B, for the n + 1 streams, needs the live bytes within n · (S/2 − H): they are
+    * within the old ring's (n − 1) · (S/2 − H), as admitted under the old limit, until the listeners raise it, after
+    * the commit. W6 counts n rotations from the next head on, over the new ring */
+  private def commitGrowth(n: Int): Unit =
+    if n != sizing.numStreams then
+      // One growth at a time, numbered by the ring it was started from: never another number
+      logger.error(s"CRL growth of stream $n does not match the ring of ${sizing.numStreams} streams. Ignoring it")
+      endGrowthAttempt(backOff = true)
+    else
+      val file = streamsDir / s"$n.crl"
+      val sizingFile = streamsDir / SizingFile
+      val active = StreamId(currentStream)
+      val grown = sizing.copy(ring = sizing.ring.patch(sizing.ring.indexOf(active) + 1, List(StreamId(n)), 0))
+      val committed =
+        try
+          DurableFiles.write(sizingFile, grown.encode)
+          true
+        catch case NonFatal(e) =>
+          // Before its rename the old file stands, and the stream is unlisted: removed, the CRL as it was. After it,
+          // only the directory's force failed: the new ring is named but may not be durable, and nothing may be
+          // written to the stream until it is. One more force decides; if it fails the CRL fails (it throws here),
+          // and the next open finds either ring, both of which it opens
+          val onDisk = Sizing.decode(os.read(sizingFile))
+          if onDisk.contains(sizing) then
+            logger.warn(s"CRL growth in $streamsDir failed writing its $SizingFile. Removing ${file.last}", e)
+            try DurableFiles.remove(file)
+            catch case NonFatal(r) => logger.warn(s"CRL growth could not remove ${file.last}: it is removed at open", r)
+            endGrowthAttempt(backOff = true)
+            false
+          else if onDisk.contains(grown) then
+            DurableFiles.syncDirectory(streamsDir)
+            true
+          else
+            throw IllegalStateException(s"CRL $SizingFile in $streamsDir is unreadable after a failed growth", e)
+      if committed then
+        writer.addStream(StreamId(n), file)
+        streams += new Stream(StreamId(n), crlId, writer, UUID.randomUUID(), 0)
+        sizing = grown
+        ringSize = grown.numStreams
+        val limit = admissionLimitBytes
+        logger.info(s"CRL in $streamsDir grew to ${grown.numStreams} streams " +
+          s"(ring ${grown.ring.map(_.number).mkString(",")}): admission limit $limit bytes")
+        limitListeners.forEach: f =>
+          try f(limit)
+          catch case NonFatal(e) => logger.error("CRL admission limit listener failed", e)
+        endGrowthAttempt(backOff = false)
+
+  /** Ends a growth attempt: the next request starts another, no sooner than `retryAfter` after a refusal or failure */
+  private def endGrowthAttempt(backOff: Boolean): Unit =
+    if backOff then
+      growthAllowedAt = System.nanoTime() + growth.retryAfter.toNanos
+    growthAttemptsEnded.incrementAndGet()
+    growthBusy.set(false)
+
+  private def growthLoop(): Unit =
+    try
+      while !growthStopped do
+        growthRequests.acquire()
+        if !growthStopped then
+          attemptGrowth()
+    catch
+      case _: InterruptedException => () // Stopped
+      case t: Throwable =>
+        if !growthStopped then
+          logger.error(s"CRL growth thread of $streamsDir died: the CRL no longer grows", t)
+
+  /** Runs `step` unless growth has stopped, under growthFileLock: false, and nothing done, once it has */
+  private def growthStep(step: => Unit): Boolean =
+    growthFileLock.synchronized:
+      if growthStopped then
+        false
+      else
+        step
+        true
+
+  /** Steps 1 and 2 of a growth (crl/CLAUDE.md, growth), on the growth thread: checks the policy, preallocates
+    * `<n>.crl.tmp`, forced, and renames it to `<n>.crl` with the directory forced. The CRL thread commits it.
+    * A refusal or failure leaves the CRL as it was; a failure removes what it created, and never fails the CRL */
+  private def attemptGrowth(): Unit =
+    val n = ringSize
+    val tmp = streamsDir / s"$n.crl.tmp"
+    val file = streamsDir / s"$n.crl"
+    try
+      if n >= growth.maxStreams then
+        logger.warn(s"CRL in $streamsDir is full and at its stream cap ($n, crl-max-streams): not growing")
+        endGrowthAttempt(backOff = true)
+      else
+        val capacity = growth.capacity()
+        val free = growth.freeSpace()
+        val floor = capacity * growth.minFreePercent / 100
+        if free - maxSizeInBytes < floor then
+          logger.warn(s"CRL in $streamsDir is full, but a stream of $maxSizeInBytes bytes would leave $free bytes " +
+            s"free below ${growth.minFreePercent}% of $capacity (crl-min-free-percent): not growing")
+          endGrowthAttempt(backOff = true)
+        else if growthStep(FilePreallocation.preallocate(tmp, maxSizeInBytes)) &&
+                growthStep({ os.move(tmp, file, atomicMove = true); DurableFiles.syncDirectory(streamsDir) }) then
+          ioQueue.put(GrowthReady(n))
+        // Otherwise growth stopped: the attempt is abandoned, and the next open removes what it left
+    catch
+      case _: InterruptedException => () // Stopped: abandoned
+      case NonFatal(e) =>
+        logger.warn(s"CRL growth in $streamsDir failed. Retrying no sooner than ${growth.retryAfter}", e)
+        // Nothing was handed to the CRL thread, so `<n>.crl` is unlisted
+        try
+          growthStep({
+            List(tmp, file).foreach(f => os.remove(f, checkExists = false))
+            DurableFiles.syncDirectory(streamsDir)
+          })
+        catch case NonFatal(r) => logger.warn(s"CRL growth could not remove its files: they are removed at open", r)
+        endGrowthAttempt(backOff = true)
+
+  override def requestGrowth(): Unit =
+    if growthThread.nonEmpty && !growthStopped && System.nanoTime() - growthAllowedAt >= 0 &&
+       growthBusy.compareAndSet(false, true) then
+      growthRequests.release()
+
+  override def onAdmissionLimitRaised(f: Long => Unit): Unit = limitListeners.add(f)
+
+  /** Tests only: whether a growth attempt is under way, how many have ended, and whether the growth thread runs */
+  private[simple] def growthBusyForTest: Boolean = growthBusy.get
+  private[simple] def growthAttemptsEndedForTest: Int = growthAttemptsEnded.get
+  private[simple] def growthThreadAliveForTest: Boolean = growthThread.exists(_.isAlive)
+
+  /** Tests only, on the CRL thread: the room left in the active stream, and the number of requests queued */
+  private[simple] def activeStreamRoomForTest: Long = streams(currentStream).room
+  private[simple] def queuedRequestsForTest: Int = ioQueue.size
 
   /** Each id's deletions go to the newest unwritten entry, which is sealed when they would overflow it (W1), and the
     * handler to the last: it runs once every deletion is durable. `resavable` deletions are cancelled by a save of the

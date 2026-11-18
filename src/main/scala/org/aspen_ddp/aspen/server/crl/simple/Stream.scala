@@ -17,6 +17,9 @@ class Stream(val streamId: StreamId,
     currentUUID = UUID.randomUUID()
 
 
+  /** Tests only: the bytes left after the entries written since the stream was last entered */
+  private[simple] def room: Long = streamWriter.maxSizeInBytes - nextWriteOffset
+
   def canWriteEntry(entry: LogEntry): Boolean =
     nextWriteOffset + entry.entrySize <= streamWriter.maxSizeInBytes
 

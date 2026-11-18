@@ -33,9 +33,23 @@
     sizing like that is unreadable); device configs ask for at least 4.
   "After" is the ring order recorded in `crl/sizing` (`Sizing.ring`, `ring: 0,2,1`; `Sizing.successor`), not numeric
   order: rotation and `Recovery`'s newer-intact-entry check of the next stream both follow it. Stream files are
-  `<n>.crl` for `n` in `0 until ringSize`; a growth will insert the next number after the active stream, and its
-  rewrite of `crl/sizing` is the commit point. A sizing file whose ring is missing or not a permutation of
-  `0 until num-streams` is unreadable. Tests reach other rings with `SimpleCRL.apply`'s `ringForTest` (creation only)
+  `<n>.crl` for `n` in `0 until ringSize`; a growth inserts the next number after the active stream, and its
+  rewrite of `crl/sizing` is the commit point (Growth, below). A sizing file whose ring is missing or not a
+  permutation of `0 until num-streams` is unreadable. Tests reach other rings with `SimpleCRL.apply`'s `ringForTest`
+  (creation only)
+- Growth (`requestGrowth`, `GrowthPolicy`, `SimpleCRL.apply`'s `growth`; default `Disabled`): one stream at a time,
+  never shrinking. `requestGrowth` (any thread, cheap, idempotent) wakes the CRL's own growth thread (daemon, none
+  when `maxStreams` is at or below the ring size), which checks the policy (`ringSize < maxStreams`, `freeSpace() - S
+  >= capacity() * minFreePercent / 100`), preallocates `<n>.crl.tmp` (n = ring size), renames it to `<n>.crl`, forces
+  the directory and queues `GrowthReady(n)`. The CRL thread commits it only at a quiescent point
+  (`commitGrowthWhenQuiescent`: no rotation between its evacuation and its head, so W6's count runs over one ring):
+  `crl/sizing` rewritten with `n` right after the active stream, then `StreamWriter.addStream`, then the
+  `onAdmissionLimitRaised` listeners with the new `admissionLimitBytes`. The sizing rewrite must stay the last step
+  that touches the files: `removeUncommittedGrowth` relies on it. A refusal or failure logs, removes what it created
+  and ignores requests for `retryAfter` (10 s); it never fails the CRL, except a sizing rewrite whose rename landed
+  and whose directory force fails twice (whether the new ring is durable is then unknown). Shutdown and death stop
+  the growth thread under `growthFileLock` before the CRL lock is released: a growth in flight is abandoned at its
+  next step, never waited for, and its leftovers are removed at the next open
 - One CRL per storage device, in `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`), opened by
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
 - Sizing keys in the device config are all optional (`CrlSizingDefaults.resolve`, from the capacity of the file

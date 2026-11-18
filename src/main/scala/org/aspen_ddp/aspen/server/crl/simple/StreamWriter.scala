@@ -25,6 +25,9 @@ object WriterThread:
     override def hashCode: Int =
       (streamId, offset, java.util.Arrays.hashCode(buffers.asInstanceOf[Array[AnyRef]]), onWriteComplete).##
 
+  /** A stream a growth committed (SimpleCRL), opened by the caller: writes queued after it may go to it */
+  case class AddStream(streamId: StreamId, channel: FileChannel) extends Command
+
   case class Shutdown(completionHandler: () => Unit) extends Command
 
 
@@ -33,19 +36,22 @@ class StreamWriter(val maxSizeInBytes: Long,
                    onThreadDeath: Throwable => Unit = _ => ()) extends Logging:
   
   private val queue = new LinkedBlockingQueue[WriterThread.Command]()
-  // The files exist, preallocated at their full size (SimpleCRL.createStreams): a write never allocates, so it cannot
-  // fail with ENOSPC (crash-recovery-log F7)
-  private val streams = files.map(t =>
+
+  // The files exist, preallocated at their full size (SimpleCRL.createStreams, a growth's preallocation): a write
+  // never allocates, so it cannot fail with ENOSPC (crash-recovery-log F7)
+  private def open(path: os.Path): FileChannel =
     // FileChannel rather than os-lib: os-lib cannot open with DSYNC
-    val channel = FileChannel.open(t._2.toNIO,
+    val channel = FileChannel.open(path.toNIO,
       StandardOpenOption.DSYNC,
       StandardOpenOption.WRITE)
     if channel.size() != maxSizeInBytes then
       val size = channel.size()
       channel.close()
-      throw new IllegalStateException(s"CRL stream ${t._2} is $size bytes, not $maxSizeInBytes")
-    t._1 -> channel
-  ).toMap
+      throw new IllegalStateException(s"CRL stream $path is $size bytes, not $maxSizeInBytes")
+    channel
+
+  // Built here, then touched by the writer thread only (AddStream)
+  private val streams = scala.collection.mutable.HashMap.from(files.map(t => t._1 -> open(t._2)))
   private var exitLoop = false
   // Set once the writer thread has died. Nothing takes from the queue after that, so a Shutdown queued then (or
   // still queued) is completed by completeShutdowns instead: the CRL's own shutdown waits on it.
@@ -72,7 +78,10 @@ class StreamWriter(val maxSizeInBytes: Long,
             channel.position(w.offset)
             writeFully(channel, w.buffers)
             w.onWriteComplete()
-            
+
+        case WriterThread.AddStream(streamId, channel) =>
+          streams += streamId -> channel
+
         case WriterThread.Shutdown(completionHandler) =>
           streams.valuesIterator.foreach(_.close)
           exitLoop = true
@@ -100,9 +109,17 @@ class StreamWriter(val maxSizeInBytes: Long,
     while next != null do
       next match
         case WriterThread.Shutdown(completionHandler) => completionHandler()
+        case WriterThread.AddStream(_, channel) =>
+          try channel.close()
+          catch case _: Throwable => ()
         case _: WriterThread.Write => ()
       next = queue.poll()
   
+  /** Opens `path`, a preallocated stream of `maxSizeInBytes`, here, so a file that cannot be opened throws to the
+   *  caller, and queues it to the writer thread ahead of every later write */
+  def addStream(id: StreamId, path: os.Path): Unit =
+    queue.add(WriterThread.AddStream(id, open(path)))
+
   def write(streamId: StreamId, 
             offset: Long, 
             buffers: Array[ByteBuffer],

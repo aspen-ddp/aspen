@@ -216,6 +216,15 @@ trait CrashRecoveryLog {
     * unlimited, for CRLs that keep nothing on disk */
   def maxTransactionBytes: Long = Long.MaxValue
 
+  /** Asks the CRL for more room: SimpleCRL grows by one stream if its growth policy allows, one growth at a time and
+    * no sooner than its back-off after a refused or failed one. Idempotent and cheap, callable from any thread: the
+    * work runs on a thread of the CRL's own. The default does nothing, for CRLs that do not grow */
+  def requestGrowth(): Unit = ()
+
+  /** Registers `f`, called on the CRL's thread with the new admissionLimitBytes after each committed growth. The
+    * default never calls it */
+  def onAdmissionLimitRaised(f: Long => Unit): Unit = ()
+
   /** What the CRL held for each store when it was opened, as CrlAdmission counts it (`CrlAdmission.recoveredBytes`).
     * The device's admission is charged for all of it at open, retained for each store until the store loads (and
     * counts its own afresh) or its entries leave the CRL: the records of stores that do not load are copied forward

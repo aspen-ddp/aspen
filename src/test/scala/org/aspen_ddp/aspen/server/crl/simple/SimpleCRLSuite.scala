@@ -10,13 +10,14 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation, Tx}
 import org.aspen_ddp.aspen.server.FilePreallocationSuite
-import org.aspen_ddp.aspen.server.FilePreallocation
+import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlFailed, CrlLocked, CrlMissing, CrlSizingMismatch, StoreRecoveryState,
   TransactionRecoveryState}
 
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.Await
 import scala.concurrent.duration.*
 import scala.language.implicitConversions
@@ -1861,7 +1862,6 @@ class SimpleCRLSuite extends FileBasedTests {
 
   test("A rotation write torn at any sector leaves every earlier acknowledged save recoverable") {
     val size = 4096L * 4
-    val sector = 4096
     val files = (0 until 3).map(i => tdir / s"$i.crl")
     // X lives throughout with data spanning several sectors, so a rotation that copies it forward writes a
     // multi-sector entry. Y is re-saved to move the log on
@@ -1896,31 +1896,43 @@ class SimpleCRLSuite extends FileBasedTests {
     var largestRotation = 0
     var evacuatedFirst = false
     for (stream, before, after) <- rotations.reverse do
-      // A rotation writes its evacuation, then the pending entry once the evacuation is durable: each write is torn
-      // on its own, over the stream as the writes before it left it
-      val writes = currentCycle(after(stream)).map((o, h) => (o, h.entrySize.toInt))
-      assert(writes.nonEmpty)
+      val writes = tornRotationWrites(stream, before, after)
       evacuatedFirst ||= writes.size > 1
-      writes.zipWithIndex.foreach: (extent, k) =>
-        val (start, length) = extent
-        val base = before(stream).clone()
-        System.arraycopy(after(stream), 0, base, 0, start)
-        val changed = (start / sector until (start + length) / sector).filter: s =>
-          !java.util.Arrays.equals(base, s * sector, (s + 1) * sector, after(stream), s * sector, (s + 1) * sector)
-        assert(changed.nonEmpty)
-        largestRotation = largestRotation.max(changed.size)
-        // Sectors 0..n-1 of the new entry persisted, and the rest not; or every sector but the first (old head intact)
-        def torn(newSectors: Set[Int]): IndexedSeq[Array[Byte]] =
-          val bytes = base.clone()
-          newSectors.foreach(s => System.arraycopy(after(stream), s * sector, bytes, s * sector, sector))
-          before.updated(stream, bytes)
-        for n <- 0 until changed.size do
-          recoversXandY(torn(changed.take(n).toSet), s"rotation into $stream, write $k, first $n of ${changed.size} sectors")
-        recoversXandY(torn(changed.drop(1).toSet), s"rotation into $stream, write $k, all but its first sector")
+      writes.foreach: w =>
+        largestRotation = largestRotation.max(w.sectors)
+        w.images.foreach((what, image) => recoversXandY(image, what))
     // Some rotation evacuated X before writing the pending entry
     assert(largestRotation > 1)
     assert(evacuatedFirst)
   }
+
+  /** One write of a rotation: the sectors it changed, and every image a crash during it can leave */
+  private case class TornWrite(sectors: Int, images: List[(String, IndexedSeq[Array[Byte]])])
+
+  /** The writes of the rotation into `stream`, which turned the files `before` into `after`. A rotation writes its
+    * evacuation, then the pending entry once the evacuation is durable: each write is torn on its own, over the
+    * stream as the writes before it left it. Sectors 0..n-1 of the new entry persisted and the rest not, for each n;
+    * or every sector but the first (the old head intact) */
+  private def tornRotationWrites(stream: Int, before: IndexedSeq[Array[Byte]],
+                                 after: IndexedSeq[Array[Byte]]): List[TornWrite] =
+    val sector = 4096
+    val writes = currentCycle(after(stream)).map((o, h) => (o, h.entrySize.toInt))
+    assert(writes.nonEmpty)
+    writes.zipWithIndex.map: (extent, k) =>
+      val (start, length) = extent
+      val base = before(stream).clone()
+      System.arraycopy(after(stream), 0, base, 0, start)
+      val changed = (start / sector until (start + length) / sector).filter: s =>
+        !java.util.Arrays.equals(base, s * sector, (s + 1) * sector, after(stream), s * sector, (s + 1) * sector)
+      assert(changed.nonEmpty)
+      def torn(newSectors: Set[Int]): IndexedSeq[Array[Byte]] =
+        val bytes = base.clone()
+        newSectors.foreach(s => System.arraycopy(after(stream), s * sector, bytes, s * sector, sector))
+        before.updated(stream, bytes)
+      val images = (0 until changed.size).toList.map(n =>
+        s"rotation into $stream, write $k, first $n of ${changed.size} sectors" -> torn(changed.take(n).toSet)) :+
+        (s"rotation into $stream, write $k, all but its first sector" -> torn(changed.drop(1).toSet))
+      TornWrite(changed.size, images)
 
   test("An open of a CRL whose live set is more than a stream recovers it without writing") {
     val size = 4096L * 4
@@ -2696,5 +2708,342 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(r.trsList.nonEmpty)
     recoveredById(r).foreach((tid, t) => assert(saves.toMap.get(tid).map(_.objectUpdates) == Some(t.objectUpdates)))
     r.crl.shutdown()
+  }
+
+  // ---- Growth ----
+
+  private val growthStreamSize = 64 * 1024L
+
+  /** A large device, mostly free, so growth is allowed unless a test says otherwise. The back-off is long: a test
+    * whose request is refused sees a later one ignored, and one that needs a retry passes a short one */
+  private def growthPolicy(maxStreams: Int = 20,
+                           capacity: () => Long = () => 1L << 40,
+                           freeSpace: () => Long = () => 1L << 39,
+                           retryAfter: FiniteDuration = 1.hour): GrowthPolicy =
+    GrowthPolicy(maxStreams, 5, capacity, freeSpace, retryAfter)
+
+  private def openGrowing(policy: GrowthPolicy = growthPolicy(), dir: os.Path = tdir): SimpleCRL.InitialCRLState =
+    SimpleCRL(dir, 4, growthStreamSize, growth = policy)
+
+  private def recordedRing(dir: os.Path = tdir): Vector[Int] =
+    SimpleCRL.Sizing.decode(os.read(dir / SimpleCRL.SizingFile)).get.ring.map(_.number)
+
+  /** The limits `crl` reports raised, in order */
+  private def limitsRaised(crl: SimpleCRL): LinkedBlockingQueue[java.lang.Long] =
+    val q = new LinkedBlockingQueue[java.lang.Long]()
+    crl.onAdmissionLimitRaised(limit => q.put(limit))
+    q
+
+  /** The next limit raised: a growth committed */
+  private def nextRaise(q: LinkedBlockingQueue[java.lang.Long]): Long =
+    Option(q.poll(10, TimeUnit.SECONDS)).map(_.longValue).getOrElse(fail("no growth was committed"))
+
+  private def eventually(what: String)(done: => Boolean): Unit =
+    val deadline = System.nanoTime() + 10.seconds.toNanos
+    while !done do
+      assert(System.nanoTime() < deadline, what)
+      Thread.sleep(1)
+
+  private def awaitAttemptsEnded(crl: SimpleCRL, count: Int): Unit =
+    eventually(s"growth attempt $count did not end")(crl.growthAttemptsEndedForTest >= count)
+
+  /** The streams the writer enters over the next `rotations` rotations, driven by fillers */
+  private def nextStreams(crl: SimpleCRL, fill: Filler, rotations: Int): List[Int] =
+    var entered = List[Int]()
+    var saves = 0
+    while entered.size < rotations do
+      val from = crl.currentStreamNumber
+      fill.next()
+      saves += 1
+      assert(saves < 1000, s"no rotation after $saves saves")
+      if crl.currentStreamNumber != from then
+        entered = crl.currentStreamNumber :: entered
+    entered.reverse
+
+  private def growthLeftovers(dir: os.Path = tdir): List[String] =
+    os.list(dir).map(_.last).filter(f => f == "4.crl" || f.endsWith(".crl.tmp")).toList
+
+  test("A growth inserts a stream after the active one and raises the limit") {
+    val s = growthStreamSize
+    val i = openGrowing()
+    val raised = limitsRaised(i.crl)
+    val x = sized(1, 3000)
+    saveAndWait(i.crl, x._1, x._2)
+    val fill = Filler(i.crl)
+    fill.until(2)
+    i.crl.requestGrowth()
+    assert(nextRaise(raised) == 3 * s / 2 - s / 16)
+    assert(recordedRing() == Vector(0, 1, 2, 4, 3))
+    assert(i.crl.numStreams == 5)
+    assert(i.crl.admissionLimitBytes == 3 * s / 2 - s / 16)
+    assert(os.size(tdir / "4.crl") == s)
+    assert(!os.exists(tdir / "4.crl.tmp"))
+    assert(nextStreams(i.crl, fill, 1) == List(4))
+    i.crl.shutdown()
+
+    val r1 = openGrowing()
+    assert(r1.crl.numStreams == 5)
+    assert(r1.crl.currentStreamNumber == 4)
+    assert(recoveredById(r1)(x._1).objectUpdates == x._2.objectUpdates)
+    // Around the whole ring, X carried forward by each rotation that empties its stream
+    assert(nextStreams(r1.crl, Filler(r1.crl), 5) == List(3, 0, 1, 2, 4))
+    r1.crl.shutdown()
+    val r2 = openGrowing()
+    assert(recoveredById(r2)(x._1).objectUpdates == x._2.objectUpdates)
+    r2.crl.shutdown()
+  }
+
+  test("Growth stops at maxStreams") {
+    val i = openGrowing(growthPolicy(maxStreams = 5))
+    val raised = limitsRaised(i.crl)
+    i.crl.requestGrowth()
+    nextRaise(raised)
+    awaitAttemptsEnded(i.crl, 1)
+    i.crl.requestGrowth()
+    awaitAttemptsEnded(i.crl, 2)
+    assert(raised.isEmpty)
+    assert(i.crl.numStreams == 5)
+    assert(recordedRing().size == 5)
+    assert(!os.exists(tdir / "5.crl") && !os.exists(tdir / "5.crl.tmp"))
+    // The refusal backs off: a request now is ignored
+    i.crl.requestGrowth()
+    assert(!i.crl.growthBusyForTest)
+    i.crl.shutdown()
+
+    // A ring already at its cap, or growth disabled, runs no growth thread, and a request does nothing
+    for policy <- List(growthPolicy(maxStreams = 5), GrowthPolicy.Disabled) do
+      val r = openGrowing(policy)
+      assert(!r.crl.growthThreadAliveForTest)
+      r.crl.requestGrowth()
+      assert(!r.crl.growthBusyForTest)
+      r.crl.shutdown()
+    assert(recordedRing().size == 5)
+  }
+
+  test("Growth is refused below the free-space floor") {
+    val s = growthStreamSize
+    val capacity = 100 * s
+    // The free space less the new stream must stay at or above 5% of the capacity: 5 S
+    val i = openGrowing(growthPolicy(capacity = () => capacity, freeSpace = () => 6 * s - 1))
+    i.crl.requestGrowth()
+    awaitAttemptsEnded(i.crl, 1)
+    assert(i.crl.numStreams == 4)
+    assert(recordedRing() == Vector(0, 1, 2, 3))
+    assert(growthLeftovers().isEmpty)
+    // Backed off: a request now is ignored
+    i.crl.requestGrowth()
+    assert(!i.crl.growthBusyForTest)
+    i.crl.shutdown()
+
+    val r = openGrowing(growthPolicy(capacity = () => capacity, freeSpace = () => 6 * s))
+    val raised = limitsRaised(r.crl)
+    r.crl.requestGrowth()
+    nextRaise(raised)
+    assert(r.crl.numStreams == 5)
+    r.crl.shutdown()
+  }
+
+  test("A failed preallocation leaves the CRL unchanged and alive, and growth retries after its back-off") {
+    val failing = new AtomicBoolean(true)
+    val i = openGrowing(growthPolicy(
+      capacity = () => if failing.get then throw new java.io.IOException("statfs failed") else 1L << 40,
+      retryAfter = 20.millis))
+    val raised = limitsRaised(i.crl)
+    val x = sized(1, 3000)
+    saveAndWait(i.crl, x._1, x._2)
+    i.crl.requestGrowth()
+    awaitAttemptsEnded(i.crl, 1)
+    assert(i.crl.numStreams == 4)
+    assert(recordedRing() == Vector(0, 1, 2, 3))
+    assert(growthLeftovers().isEmpty)
+    assert(!i.crl.failed.isCompleted)
+    val y = sized(2, 3000)
+    saveAndWait(i.crl, y._1, y._2)
+    assert(readState(i.crl, storeId).transactions.map(_.txd.transactionId).toSet == Set(x._1, y._1))
+
+    failing.set(false)
+    eventually("no growth after the back-off"):
+      i.crl.requestGrowth()
+      !raised.isEmpty
+    assert(i.crl.numStreams == 5)
+    i.crl.shutdown()
+  }
+
+  test("Growth crashed before its commit leaves a .tmp or an unlisted stream: removed at open") {
+    for leftover <- List("4.crl.tmp", "4.crl") do
+      val dir = tdir / leftover.replace('.', '-')
+      val i = openGrowing(dir = dir)
+      val x = sized(1, 3000)
+      saveAndWait(i.crl, x._1, x._2)
+      i.crl.shutdown()
+      FilePreallocation.preallocate(dir / leftover, growthStreamSize)
+      val r = openGrowing(dir = dir)
+      assert(!os.exists(dir / leftover))
+      assert(r.crl.numStreams == 4)
+      assert(recoveredById(r)(x._1).objectUpdates == x._2.objectUpdates)
+      r.crl.shutdown()
+  }
+
+  test("Growth committed but its stream never written: it opens, and the next rotation enters it") {
+    val s = growthStreamSize
+    val i = SimpleCRL(tdir, 4, s)
+    val x = sized(1, 3000)
+    saveAndWait(i.crl, x._1, x._2)
+    Filler(i.crl).until(2)
+    i.crl.shutdown()
+    // The files as a crash right after the SizingFile's rewrite leaves them
+    FilePreallocation.preallocate(tdir / "4.crl", s)
+    val recorded = SimpleCRL.Sizing.decode(os.read(tdir / SimpleCRL.SizingFile)).get
+    DurableFiles.write(tdir / SimpleCRL.SizingFile, recorded.copy(ring = Vector(0, 1, 2, 4, 3).map(StreamId(_))).encode)
+
+    val r = SimpleCRL(tdir, 4, s)
+    assert(r.crl.numStreams == 5)
+    assert(r.crl.currentStreamNumber == 2)
+    assert(r.crl.admissionLimitBytes == 3 * s / 2 - s / 16)
+    assert(recoveredById(r)(x._1).objectUpdates == x._2.objectUpdates)
+    assert(nextStreams(r.crl, Filler(r.crl), 1) == List(4))
+    r.crl.shutdown()
+    val r2 = SimpleCRL(tdir, 4, s)
+    assert(recoveredById(r2)(x._1).objectUpdates == x._2.objectUpdates)
+    r2.crl.shutdown()
+  }
+
+  test("A growth's first entry in its new stream, torn at any sector, leaves the state before it") {
+    val i = openGrowing()
+    val raised = limitsRaised(i.crl)
+    val x = sized(1, 3000)
+    saveAndWait(i.crl, x._1, x._2)
+    Filler(i.crl).until(2)
+    i.crl.requestGrowth()
+    nextRaise(raised)
+
+    // Saves of 20 KB each until one enters stream 4: its entry is the first written there, several sectors long
+    val files = (0 until 5).map(n => tdir / s"$n.crl")
+    var saved = List(x)
+    var rotation: Option[(IndexedSeq[Array[Byte]], IndexedSeq[Array[Byte]])] = None
+    var k = 0
+    while rotation.isEmpty do
+      k += 1
+      assert(k < 10)
+      val before = files.map(os.read.bytes(_))
+      val t = sized(100 + k, 20000)
+      saveAndWait(i.crl, t._1, t._2)
+      settle(i.crl)
+      if i.crl.currentStreamNumber == 4 then
+        rotation = Some((before, files.map(os.read.bytes(_))))
+      else
+        saved = t :: saved
+    i.crl.shutdown()
+
+    val (before, after) = rotation.get
+    val writes = tornRotationWrites(4, before, after)
+    assert(writes.exists(_.sectors > 1))
+    val expected = saved.map(t => t._1 -> t._2.objectUpdates).toMap
+    writes.flatMap(_.images).foreach: (what, image) =>
+      files.zip(image).foreach((f, bytes) => os.write.over(f, bytes))
+      val r = try SimpleCRL(tdir, 4, growthStreamSize) catch case t: Throwable => fail(s"$what: $t")
+      assert(recoveredById(r).view.mapValues(_.objectUpdates).toMap == expected, what)
+      r.crl.shutdown()
+  }
+
+  test("A growth that arrives during a rotation is committed once the rotation's head is written") {
+    val i = openGrowing()
+    val fill = Filler(i.crl)
+    // X lies in stream 3, which the rotation from 1 into 2 evacuates
+    fill.until(3)
+    val x = sized(1, 3000)
+    saveAndWait(i.crl, x._1, x._2)
+    fill.until(0)
+    fill.until(1)
+    // Stream 1 left with too little room for S's six sectors, so S's save rotates
+    while onCrl(i.crl)(i.crl.activeStreamRoomForTest) >= 6 * 4096 do
+      fill.next()
+    assert(i.crl.currentStreamNumber == 1)
+    val s = sized(2, 21000)
+
+    val sDurable = new AtomicBoolean(false)
+    val durableAtCommit = new LinkedBlockingQueue[Boolean]()
+    i.crl.onAdmissionLimitRaised(_ => durableAtCommit.put(sDurable.get))
+    val release = holdCrlThread(i.crl)
+    i.crl.save(s._1, s._2, () => sDurable.set(true))
+    i.crl.requestGrowth()
+    // S, then the growth, queue behind the held CRL thread: S's rotation is under way, its evacuation of X in flight,
+    // when the growth arrives
+    eventually("the growth is not queued")(i.crl.queuedRequestsForTest == 2)
+    release.countDown()
+    assert(durableAtCommit.poll(10, TimeUnit.SECONDS) == true)
+    assert(i.crl.currentStreamNumber == 2)
+    assert(recordedRing() == Vector(0, 1, 2, 4, 3))
+    assert(nextStreams(i.crl, fill, 1) == List(4))
+    i.crl.shutdown()
+
+    val r = openGrowing()
+    assert(recoveredById(r).view.mapValues(_.objectUpdates).toMap ==
+      List(x, s).map(t => t._1 -> t._2.objectUpdates).toMap)
+    r.crl.shutdown()
+  }
+
+  test("A stream a crashed growth orphaned is removed, and the next growth recreates it (growthOrphanThenRegrow)") {
+    val s = growthStreamSize
+    val i = openGrowing()
+    val x = sized(1, 3000)
+    saveAndWait(i.crl, x._1, x._2)
+    i.crl.shutdown()
+    // Renamed into place but never committed, holding bytes of no entry
+    os.write(tdir / "4.crl", Array.fill[Byte](s.toInt)(0x5a))
+
+    val r = openGrowing()
+    assert(!os.exists(tdir / "4.crl"))
+    val raised = limitsRaised(r.crl)
+    r.crl.requestGrowth()
+    nextRaise(raised)
+    assert(recordedRing() == Vector(0, 4, 1, 2, 3))
+    val grown = os.read.bytes(tdir / "4.crl")
+    assert(grown.length == s && grown.forall(_ == 0))
+    assert(nextStreams(r.crl, Filler(r.crl), 1) == List(4))
+    r.crl.shutdown()
+
+    val r2 = openGrowing()
+    assert(r2.crl.numStreams == 5)
+    assert(recoveredById(r2)(x._1).objectUpdates == x._2.objectUpdates)
+    r2.crl.shutdown()
+  }
+
+  test("A growth in flight at shutdown is abandoned without holding the shutdown up (growthDuringShutdown)") {
+    val inPolicy = new CountDownLatch(1)
+    val latch = new CountDownLatch(1)
+    val i = openGrowing(growthPolicy(freeSpace = () =>
+      inPolicy.countDown()
+      latch.await()
+      1L << 39))
+    val x = sized(1, 3000)
+    saveAndWait(i.crl, x._1, x._2)
+    i.crl.requestGrowth()
+    assert(inPolicy.await(10, TimeUnit.SECONDS))
+    val shutdown = new CountDownLatch(1)
+    new Thread(() => { i.crl.shutdown(); shutdown.countDown() }).start()
+    assert(shutdown.await(10, TimeUnit.SECONDS), "shutdown waited for the growth")
+    latch.countDown()
+    eventually("the growth thread outlived the CRL")(!i.crl.growthThreadAliveForTest)
+    assert(growthLeftovers().isEmpty)
+
+    val r = openGrowing()
+    assert(r.crl.numStreams == 4)
+    assert(recordedRing() == Vector(0, 1, 2, 3))
+    assert(recoveredById(r)(x._1).objectUpdates == x._2.objectUpdates)
+    r.crl.shutdown()
+  }
+
+  test("Growth requested of a CRL that died does nothing") {
+    val i = openGrowing()
+    val tooBig = ObjectUpdate(ou1.objectId, DataBuffer(new Array[Byte](2 * growthStreamSize.toInt)))
+    i.crl.save(transactionId, trsValidTxd.copy(objectUpdates = List(tooBig)), () => ())
+    Await.result(i.crl.failed, 10.seconds)
+    eventually("the growth thread outlived the CRL")(!i.crl.growthThreadAliveForTest)
+    i.crl.requestGrowth()
+    assert(!i.crl.growthBusyForTest)
+    i.crl.shutdown()
+    assert(growthLeftovers().isEmpty)
+    assert(recordedRing().size == 4)
   }
 }

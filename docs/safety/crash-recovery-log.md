@@ -26,13 +26,13 @@ stubs (section 3.6), a second, much smaller kind of record.
 
 | Id | Assumption | Where it matters |
 |----|------------|------------------|
-| A1 | A `write` to a file opened with `DSYNC` that returns normally is on stable storage, including after power loss. Disk write caches honour flush/FUA or are disabled. | All of section 5.6 |
-| A2 | A failed or never-returning `write` means the data is not relied on. Writes are never retried; the CRL dies instead (5.10). | `S/crl/simple/StreamWriter` |
-| A3 | Only one CRL instance writes a device's `crl/` files. Enforced by `CrlLock` for every opener on the same file system (5.1); not enforced for two hosts mounting one shared device. | adoption, double mounts |
-| A4 | Backend commit completion means the object update is durable in the backend (RocksDB writes with `setSync(true)`, FSIF completes once its journal batch is forced). The CRL record of a committed transaction is deleted only after that. `MapBackend` gives no durability and is for tests only. | section 3.4 |
-| A5 | The CRL and the stores it serves are on the same device and move together. | sections 7-9 |
-| A6 | A store's `save`/`delete*` calls come from its own executor; the CRL thread serialises everything. | section 5.3 |
-| A7 | The file system overwrites in place. On copy-on-write file systems (btrfs, ZFS) every CRL write allocates and can fail with `ENOSPC`; the open warns once. | 5.1, 10.17 |
+| AS1 | A `write` to a file opened with `DSYNC` that returns normally is on stable storage, including after power loss. Disk write caches honour flush/FUA or are disabled. | All of section 5.6 |
+| AS2 | A failed or never-returning `write` means the data is not relied on. Writes are never retried; the CRL dies instead (5.10). | `S/crl/simple/StreamWriter` |
+| AS3 | Only one CRL instance writes a device's `crl/` files. Enforced by `CrlLock` for every opener on the same file system (5.1); not enforced for two hosts mounting one shared device. | adoption, double mounts |
+| AS4 | Backend commit completion means the object update is durable in the backend (RocksDB writes with `setSync(true)`, FSIF completes once its journal batch is forced). The CRL record of a committed transaction is deleted only after that. `MapBackend` gives no durability and is for tests only. | section 3.4 |
+| AS5 | The CRL and the stores it serves are on the same device and move together. | sections 7-9 |
+| AS6 | A store's `save`/`delete*` calls come from its own executor; the CRL thread serialises everything. | section 5.3 |
+| AS7 | The file system overwrites in place. On copy-on-write file systems (btrfs, ZFS) every CRL write allocates and can fail with `ENOSPC`; a CRL's creation warns of it once. | 5.1, 10.17 |
 
 ---
 
@@ -64,11 +64,14 @@ store; an applied stub is a `TransactionId` with its transaction's start `HLCTim
 | `failed: Future[Throwable]` | Completes, with the cause, if the CRL dies (5.10). |
 | `shutdown()` | Blocks until the CRL's threads have stopped and its files are closed. Idempotent. |
 | `admissionLimitBytes` | The device's admission limit (section 6): `(n − 2) · S/2 − S/16` in SimpleCRL, for `n` streams of `S` bytes. |
+| `maxTransactionBytes` | The most bytes, as admission counts them, one store's transaction may hold: `S/2 − 8192` in SimpleCRL. A prepare past it is dropped unsaved (section 6, Oversized). |
+| `requestGrowth()` | Asks for more room; cheap, idempotent, from any thread. SimpleCRL adds one stream if its growth policy allows (5.11). |
+| `onAdmissionLimitRaised(f)` | Registers `f`, called on the CRL thread with the new `admissionLimitBytes` after each committed growth. |
 | `openCRL(devicePath, config)` | Recover and open. Throws `CrlLocked`, `CrlSizingMismatch`, `CrlCorrupt`, `BrokenEntryChain`, or whatever reading the files threw. |
 
 The trait's defaults (read through `getFullRecoveryState`, `dropStore` as read-then-delete, `whenDurable` at once,
-no failure) are for CRLs that keep nothing on disk, such as test CRLs. `loadStore`'s default runs its callbacks on the
-global pool; SimpleCRL overrides it.
+no failure, no per-transaction bound, no growth) are for CRLs that keep nothing on disk, such as test CRLs.
+`loadStore`'s default runs its callbacks on the global pool; SimpleCRL overrides it.
 
 ### 2.1 Numbered contract
 
@@ -76,9 +79,9 @@ global pool; SimpleCRL overrides it.
 
 - **C1 (save before send).** `onDurable` of `save(t, s, h)` runs only after the entry holding `h` has been written
   with `DSYNC` and the write returned. A caller sends nothing that depends on `s` before `onDurable`. Exception, by
-  design: a save of an id that the same unwritten entry already deletes finally is skipped and still acknowledged
-  (C9). A deletion is the store's decision to forget the transaction, which already makes every earlier state of it
-  forgettable.
+  design: a save of an id that an unwritten entry, the one in flight included, already deletes finally is skipped
+  and still acknowledged (C9, W1b). A deletion is the store's decision to forget the transaction, which already
+  makes every earlier state of it forgettable.
 - **C2 (entry order).** Entries are written one at a time, in serial order. Entry N+1 is not issued until entry N's
   write returned and every handler of N ran (`writeInProgress`; the writer queues `WriteComplete` only after the
   handlers). So when a handler of entry N runs, every earlier entry is durable. Handlers run on the **writer thread**,
@@ -107,10 +110,11 @@ global pool; SimpleCRL overrides it.
 **Deletion**
 
 - **C9 (deletion finality in an entry).** A deletion of (store, txid) applies to that txid's saves in the same entry
-  and in all older ones. A save of the same txid queued after a final deletion into the same unwritten entry is
-  skipped and acknowledged once the deletion is durable, and creates no in-memory record (`LogEntry.deletesFinally`,
-  `SimpleCRL.onSaveTransaction`). Deletions made by a stub's save or by `dropStore` are cancellable: a later save of
-  the id in the same entry removes the deletion and is written (`LogEntry.deleteTxUnlessResaved`, `LogEntry.addTx`).
+  and in all older ones. A save of the same txid queued while a final deletion of it lies in any unwritten entry,
+  the one in flight included (W1b), is skipped and acknowledged once the deletion is durable, and creates no
+  in-memory record (`LogEntry.deletesFinally`, `SimpleCRL.onSaveTransaction`). Deletions made by a stub's save or
+  by `dropStore` are cancellable: a later save of the id in the same entry removes the deletion and is written
+  (`LogEntry.deleteTxUnlessResaved`, `LogEntry.addTx`).
 - **C10 (deletion durability).** `deleteTransactions` and `dropStore` complete only after the entry carrying the
   deletion is durable. `deleteTransaction` and `deleteAppliedStub` have no completion; `whenDurable` orders later
   work after them.
@@ -120,10 +124,12 @@ global pool; SimpleCRL overrides it.
 - **C11 (live bound).** An evacuation entry always fits an empty stream, and every other entry is at most half a
   stream (W1). With the live data within 6.1's bound, which admission keeps (section 6), every entry is written within
   `n − 1` rotations. A head not written after `n − 1` rotations in a row fails the CRL (W6, 5.10);
-  `Stream.writeEntry`'s `require` stays as the fail-stop backstop. Admission does not bound a single transaction (see
-  CRL-W2).
-- **C12 (sizing is fixed).** Stream count and size are fixed when a CRL is created and recorded in `crl/sizing`; an
-  existing CRL always opens with them, whatever the device config says.
+  `Stream.writeEntry`'s `require` stays as the fail-stop backstop. A single transaction is bounded too: a prepare that
+  would make its counted bytes on a store exceed `maxTransactionBytes` is dropped unsaved (section 6, Oversized), so
+  a lone record always fits an entry.
+- **C12 (sizing is recorded).** The stream size is fixed when a CRL is created; the stream count only grows, one
+  stream at a time (5.11), and never shrinks. Both, with the ring order, are recorded in `crl/sizing`; an existing
+  CRL always opens with them, whatever the device config says.
 
 **Ownership**
 
@@ -210,7 +216,7 @@ A committed transaction's record is deleted at finalization only once its backen
 `transactionCommitComplete` concludes it when the last one succeeds. A failed backend commit keeps the record, with
 its object data, for the life of the loaded store; a reload recovers the transaction from it. A recovered commit vote
 that quarantines objects keeps its record, data included, until the quarantine clears (`quarantinedConclusions`).
-This is the rule behind A4.
+This is the rule behind AS4.
 
 A backend deletion of an object that a transaction allocated recently waits until no CRL state durably holds that
 allocation's update (`Frontend.awaitAllocationsDurable`): an unconcluded transaction's state is saved again without
@@ -295,9 +301,14 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   before that (a reopen loop would reach `CrlOpenAttempts`) nor marked Failed in the tree.
 - **Unloaded.** `DeviceShutdown.shutDownCrl` runs `crl.shutdown()` on `CrlShutdownEc` and records the path in
   `LocalDevices.closingCrls` until it returns, so the device is not loaded again over open files.
-- **Sizing.** `crl-num-streams` and `crl-max-file-size-mb` are required keys of the device yaml
-  (`StorageDeviceConfig`; `aspen` writes 3 and 300 by default). They size only a new CRL; an existing one keeps the
-  sizing in `crl/sizing` and logs a warning if the config differs.
+- **Sizing.** The device yaml's CRL keys are optional (`StorageDeviceConfig`, `CrlSizingDefaults.resolve`, from the
+  capacity of the file system holding the device): `crl-num-streams` 4 (also the minimum), `crl-max-file-size-mb`
+  capacity / 2048 rounded down to 4 KiB, at least 64 MiB, `crl-max-streams` 20 and `crl-min-free-percent` 5. The first
+  two size only a new CRL; an existing one keeps the sizing in `crl/sizing` and logs a warning if the config
+  differs. The last two bound growth (5.11) and are read at each open.
+- **Grown.** When admission is full the Frontend asks the CRL to grow (`requestGrowth`); a committed growth raises
+  the device's admission limit through `onAdmissionLimitRaised` (`CrlAdmission.raiseLimit`, registered by
+  `DeviceDiscovery`).
 
 ---
 
@@ -307,7 +318,12 @@ Code: `S/crl/simple/`.
 
 ### 5.1 Files, creation and the lock
 
-A CRL is `crl/sizing`, `crl/lock`, and `numStreams` files `0.crl ... N-1.crl`, each exactly `maxSizeInBytes` long.
+A CRL is `crl/sizing`, `crl/lock`, and one file `<k>.crl` for each `k` in `0 until n`, each exactly `maxSizeInBytes`
+long. `crl/sizing` records the stream size, the CRL id and the **ring**: the stream numbers in the order they are
+written (`Sizing.ring`, e.g. `ring: 0,4,1,2,3`). A growth inserts the next number after the active stream (5.11), so
+the ring need not be in numeric order. "Next", "successor" and "after" below always mean ring order
+(`Sizing.successor`), in rotation and in recovery alike. A sizing file whose ring is missing or not a permutation of
+`0 until num-streams` is unreadable.
 
 `SimpleCRL.apply`:
 
@@ -318,20 +334,25 @@ A CRL is `crl/sizing`, `crl/lock`, and `numStreams` files `0.crl ... N-1.crl`, e
    not fence two hosts mounting one shared device.
 2. `recordedSizing`: an existing `sizing` file gives the sizing and the CRL id (at least 3 streams of a multiple of
    4096 bytes, S1, and a `crl-id`, else `CrlSizingMismatch`; a new CRL asked for fewer or another size is refused).
-   With no `sizing` file, stream files mean `CrlSizingMismatch`; no stream files mean a new CRL, whose requested sizing and a new random CRL id are written durably (`DurableFiles.write`) before any
+   With no `sizing` file, stream files mean `CrlSizingMismatch`; no stream files mean a new CRL, whose requested
+   sizing (its ring in numeric order) and a new random CRL id are written durably (`DurableFiles.write`) before any
    stream file. A `sizing` file with no stream files is a creation that crashed before them, and its sizing and id
    stand.
-3. `createStreamsIfNew`: a leftover `*.crl.tmp` means a creation that never finished: it and any stream files are
+3. `removeUncommittedGrowth`: a `<n>.crl` or `<n>.crl.tmp` (`n` the ring size) that the ring does not list is a
+   growth that never committed (5.11). It is removed, with a warning, but only when every listed stream exists and
+   no other stream file is unlisted; otherwise the open is `CrlSizingMismatch` and removes nothing, since removing
+   it beside missing streams could leave none and step 4 would then create an empty CRL under live stores.
+4. `createStreamsIfNew`: a leftover `*.crl.tmp` means a creation that never finished: it and any stream files are
    removed and creation starts over. With no stream files, each is preallocated as `<n>.crl.tmp`
    (`FilePreallocation.preallocate`: `fallocate(2)` mode 0 through FFM on Linux, zero-fill elsewhere or on
    `EOPNOTSUPP`; forced), renamed into place, and the directory forced. Only then does the writer start, so a `.tmp`
    at open always means a creation that wrote no entry.
-4. `checkSizing`: the stream files must be exactly the expected set, each of the recorded size.
-5. `Recovery.recover` (5.7), then the constructor (5.7). A constructor that fails shuts its writer down and waits for
+5. `checkSizing`: the stream files must be exactly the set the ring lists, each of the recorded size.
+6. `Recovery.recover` (5.7), then the constructor (5.7). A constructor that fails shuts its writer down and waits for
    it before rethrowing, so a retry never runs two writers over the same files.
 
 `StreamWriter` opens existing files only, with `DSYNC | WRITE`, and refuses one of the wrong size. Because the files
-are preallocated and the file system overwrites in place (A7), a CRL write never allocates, and a full device cannot
+are preallocated and the file system overwrites in place (AS7), a CRL write never allocates, and a full device cannot
 fail it with `ENOSPC`.
 
 The streams form a ring. One is **active** and written append-only. When an entry does not fit, the writer advances
@@ -380,14 +401,16 @@ who has learned the id, which means read access to the device itself.
 
 ### 5.3 In-memory structures and threads
 
-Two threads per CRL:
+Two threads per CRL, and a third for growth when the CRL may grow:
 
 - the **CRL thread** takes `ActionRequest`s from `ioQueue` and owns all mutable state: the live records
   (`transactions`, `stubs`), the durable image (`Image`) with its live-piece index (`LivePieces`), the unwritten
   entries (`sealedEntries`, `currentLogEntry`), the streams' offsets, and `afterInFlight` barriers;
 - the **writer thread** (`StreamWriter`) takes `Write` commands, positions the channel and writes every buffer
   (`writeFully` loops, since a gathering write takes at most `IOV_MAX` buffers per call), then runs the entry's
-  completion handlers and queues `WriteComplete` to the CRL thread (`Stream.writeEntry`).
+  completion handlers and queues `WriteComplete` to the CRL thread (`Stream.writeEntry`);
+- the **growth thread** (none when `crl-max-streams` is at or below the ring size at open) runs a growth's slow
+  steps off the CRL thread, so a zero-filling preallocation never delays a write (5.11).
 
 The CRL keeps two views of each record (6.1, W1a and W3):
 
@@ -433,11 +456,13 @@ record while the last durable entry still names it live (6.1, "Why W1a and W3 ar
 `save` queues `SaveTransaction`. `onSaveTransaction`:
 
 1. If any unwritten entry, the one in flight included, deletes the id finally (C9, W1b), queue only the handler
-   (on the newest unwritten entry, or after the write in flight) and return.
+   (on the newest unwritten entry when a queued one deletes it; in `afterInFlight` when only the entry in flight
+   does, run at its `WriteComplete`) and return.
 2. Take the form: the state, with the update data kept unless the record's data was dropped.
 3. Decide what it writes: its pieces when the record is new, when the update count changes (W4), or when it replaces
    a form in the same entry that was to write them; otherwise it names the pieces an earlier entry wrote or will
-   write (FIFO, so that entry is built first).
+   write (FIFO, so that entry is built first). A form taken after `dropTransactionObjectData` writes no updates and
+   is not a count change: it names its txd where the last-built form has it (W4's exception).
 4. Add the form and the handler to the newest unwritten entry, sealing it first if the form would push it past
    `maxEntryBytes = S/2` (W1); `startWrite`.
 
@@ -480,7 +505,7 @@ written only into the active stream, so every piece in a stream is reached as "n
 ### 5.6 Durability
 
 - Every stream file is opened `DSYNC`: each `write` returns only after its data and the metadata needed to read it are
-  on stable storage (A1). No separate `force`, no `O_DIRECT`.
+  on stable storage (AS1). No separate `force`, no `O_DIRECT`.
 - One write in flight per CRL; throughput is `entries/s = 1 / (write latency + handler time)`, since the next entry is
   issued only after the previous one's handlers ran (C2).
 - Preallocation with `fallocate` leaves unwritten extents; the first write to each converts it, a metadata change
@@ -566,6 +591,60 @@ and queues `WriterDied`; the CRL thread throws it. Any throw on the CRL thread (
 was already in flight when the CRL thread died is still written and its handlers run. The files hold what was
 written, so a restart recovers them as after a crash.
 
+Shutdown and death stop growth first (5.11), before the lock is released.
+
+### 5.11 Growth
+
+A SimpleCRL grows by one stream of its recorded size at a time and never shrinks (`requestGrowth`, `GrowthPolicy`).
+`Frontend.admitPrepare` calls `requestGrowth` on every `Full`; the call is cheap and idempotent, and wakes the growth
+thread unless an attempt is under way, the ring is at `crl-max-streams` (refused at once, logged once), or a refused
+or failed attempt's back-off (`retryAfter`, 10 s) has not passed. With `n` the ring size, the steps are, each durable
+before the next:
+
+1. On the growth thread, the policy is checked: the ring is below `crl-max-streams`, and the file system's free space
+   less one stream stays at or above `crl-min-free-percent` of its capacity. Then `<n>.crl.tmp` is preallocated at
+   the stream size and forced (`FilePreallocation.preallocate`).
+2. On the growth thread, it is renamed to `<n>.crl` and the directory forced. `GrowthReady(n)` is queued to the CRL
+   thread.
+3. On the CRL thread, at a quiescent point (`commitGrowthWhenQuiescent`: no rotation under way between its
+   evacuation entry and its head, `rotationsWithoutHead == 0`), `crl/sizing` is rewritten with `n` inserted right
+   after the active stream *A* (`DurableFiles.write`: tmp, force, atomic rename, directory force). This rewrite is
+   the **commit point**, and the last step that touches the files.
+4. Then the writer opens the stream (`StreamWriter.addStream`), the CRL's ring and stream table take it, and the
+   `onAdmissionLimitRaised` listeners get the new `admissionLimitBytes`, `(n − 1) · S/2 − S/16`.
+
+**Why the ring invariant holds after the insert.** The stream after *A* is now `n`, which holds no entry at all.
+*A*'s old successor, now after `n`, holds nothing of the image: the rotation into *A* evacuated it, that rotation is
+complete (step 3 waits for its head), and pieces are written only into the active stream *A*. So the rotation into
+`n` evacuates the stream after it, which holds nothing pinned, and every later rotation enters a stream holding
+nothing needed, as before. A rotation in progress is never re-aimed: between an evacuation and its head, the stream
+after the active one may still hold pieces the evacuation in flight is moving, and W6's count must run over one
+ring.
+
+**Why Lemmas A and B hold for `n + 1` streams.** Lemma A is per stream and does not depend on the ring size. Lemma B
+for the grown ring needs the live bytes within `n · (S/2 − H)`; they are within the old ring's `(n − 1) · (S/2 − H)`,
+since everything was admitted under the old limit, until step 4 raises it, after the commit. From then on Lemma C
+gives the bound for the new limit and Lemma B holds for the new ring. W6 counts `n` rotations from the next head on, over the new ring.
+
+**Open-time rules, which rest on the commit point being last.** A crash before step 3's rename leaves `<n>.crl.tmp`
+or an unlisted `<n>.crl` beside a ring of `n` streams: the next open removes it (`removeUncommittedGrowth`, 5.1) and
+opens the old ring. A crash after it leaves a listed `<n>.crl` that may hold no entry: it is all zeros, which
+recovery reads as no entry, and it lies right after the stream that was active, as the invariant requires. Any other
+unlisted file, or a listed one missing, is `CrlSizingMismatch`, never removed. Because nothing touches the files after
+the sizing rewrite, there is no third state.
+
+**Failures.** A refused or failed attempt logs, removes what it created, backs off, and never fails the CRL. There
+are two fail-stop exceptions, both after the new sizing file is renamed into place: its directory force fails and a
+second force fails too (whether the new ring is durable is then unknown, so nothing may be written to the stream),
+and `addStream` fails to open the committed file. Each throws on the CRL thread (5.10); a restart opens whichever ring
+is on disk, both of which are consistent. A sizing file unreadable after a failed rewrite is fatal the same way.
+
+**Shutdown and death.** They set `growthStopped`, interrupt the growth thread and take `growthFileLock`, under which
+every growth step that touches the directory runs, before the CRL lock is released. The step in progress aborts (a
+zero-fill or force with `ClosedByInterruptException`; a `fallocate` is one call), no later step runs, and the
+leftovers are removed at the next open. A `StreamWriter` asked to write to a stream it does not know dies rather than
+completing the write unwritten.
+
 ---
 
 ## 6. Admission and backpressure
@@ -585,8 +664,17 @@ cannot discharge. W1-W6 and S1 are SimpleCRL's, A1-A4 the Frontend's and the sto
   object data and static record (`63 + 30 per update` + data). Otherwise the prepare is dropped silently
   (`Store.receiveTransactionMessage`) and the client retransmits. The check is against the total before the
   admission, so one admission may cross the ceiling by its own size, at most `T`.
-- **Oversized.** A prepare that would make its transaction's counted bytes on the store exceed `T`, with data already
-  counted for an admitted one, is dropped the same way and charges nothing (`PrepareAdmission.Oversized`).
+- **Oversized.** A prepare that would make its transaction's counted bytes on the store exceed `T`
+  (`crl.maxTransactionBytes`), with data already counted for an admitted one, is dropped the same way and charges
+  nothing (`PrepareAdmission.Oversized`): no reply, no vote, no CRL write, and a warning, rate-limited
+  (`Frontend.OversizedLogPeriod`), naming the transaction and its bytes. The check is one comparison on the prepare
+  path. The bound keeps a lone record's entry within `S/2` (W1), which Lemma B needs, and keeps any record from
+  outgrowing a stream, which would fail the CRL at `writeHead`'s `require` on every retransmit. A transaction
+  oversized on every store can never commit; its client sees `TransactionOutcomeUnknown` once retransmits stop
+  (`client/internal/CLAUDE.md`). Data arriving after a data-less prepare that would cross `T` is dropped the same way,
+  leaving the store as one that never received it: a commit elsewhere reaches it through missed-update repair, and
+  the data-less admission is released by the usual paths. Nothing ties a pool's `maxSliceSize` to `T` yet
+  (Backlog.txt).
 - **Late data** of an admitted transaction is charged by `admitPrepare` only while the total is below the store's
   tier ceiling (`tryAdmit`), as a new transaction is, and the prepare is dropped as `Full` otherwise (A1). A
   data-less prepare of an admitted transaction charges nothing and is handled.
@@ -608,6 +696,10 @@ cannot discharge. W1-W6 and S1 are SimpleCRL's, A1-A4 the Frontend's and the sto
 - **Not counted:** entry headers, trailing UUIDs and padding, static records rewritten by later saves, deletions
   queued in an entry, and the second copies written when the update count changes. None of these is ever moved by an
   evacuation, so none of them needs room in the ring (6.1).
+
+**Growth.** On `Full`, the Frontend also calls `crl.requestGrowth()`; a committed growth raises the device's limit
+(`CrlAdmission.raiseLimit`, only upward) and with it every lane's ceiling, so the retransmitted prepare meets the
+raised limit (5.11).
 
 Admission is a liveness tool and the only thing that maintains C11. A failure of C11 fails the CRL (5.10), which
 unloads the device until restart and leaves the files recoverable.
@@ -640,7 +732,8 @@ SimpleCRL (implemented: `SimpleCRL.writeHead`, `entryFor`, `onSaveTransaction`, 
   same-entry save).
 - **W1b, a deletion is final across every unwritten entry.** A save of a transaction whose final deletion lies in any
   unwritten entry, not only the newest, is skipped and creates no record (`LogEntry.deletesFinally`, 5.8, F4). Its
-  handler runs once that deletion is durable.
+  handler runs once that deletion is durable: on the newest unwritten entry, or, when only the entry in flight
+  deletes it, through `afterInFlight` at that write's completion.
 - **W2, evacuation first.** When the oldest unwritten entry, the *head* `h`, does not fit the rest of the active stream
   `X`, the writer enters `Y = successor(X)` at offset 0 and first writes an evacuation entry `E` carrying every image
   record (below) homed in `Z = successor(Y)`. Once `E` is durable, `h` is written in `Y` if `|E| + |h| ≤ S`;
@@ -653,7 +746,10 @@ SimpleCRL (implemented: `SimpleCRL.writeHead`, `entryFor`, `onSaveTransaction`, 
   evacuation carries it like any other record.
 - **W4, one home per record.** A snapshot whose update count differs from the record's previous snapshot writes the
   txd again too, not only the updates. So every record's image pieces lie in one entry, its *home*, which holds a
-  static record of it no smaller than the last-built one.
+  static record of it no smaller than the last-built one. The one exception is a snapshot taken after
+  `dropTransactionObjectData`: it keeps no update, so it writes nothing and names its txd piece where it lies. That
+  keeps the one home (its only piece is the txd, in the home already), and its static record, `63` bytes, is no
+  larger than any earlier one's, so Lemma A's per-record bound still holds.
 - **W5, evacuation writes nothing new.** An evacuation entry writes, for each record it carries, its last-built form,
   naming the pieces that were in `Z` at their new locations and the others where they lie. It writes no pending
   state, no new piece and no deletion.
@@ -684,7 +780,7 @@ Frontend and store loader (implemented: `Frontend.admitPrepare`, `recoverState`,
   that file's records (an interrupted extraction or load), which the load saves again in place. A refused load is
   retried at each device scan (`StoreLoader.storesAwaitingSpace`). Not implemented: transfer planning does not yet
   avoid a destination whose CRL cannot take the state; such a transfer ends in the never-fits rebuild at the
-  destination.
+  destination (Backlog.txt, "Transfers do not check the destination's CRL room").
 - **A4, no save without a charge.** A Tx saves to the CRL only while its transaction holds an admission record
   (`Frontend.admitted`, or a retained or recovered charge). The one Tx in `transactions` without a record is an
   abort whose state `deleteTransactionState` deleted at resolution, kept until `TxFinalized` (`Tx.stateDeleted`). It
@@ -752,10 +848,11 @@ last-built forms (W5), a deletion or save request changes the image only when it
 `n − 1` evacuate distinct streams, and a record carried into `Y_j` is not carried again before `n − 1` rotations, so
 the records carried by `E_1, …, E_{n−1}` are disjoint: their footprints `c_j` sum to at most `F`.
 
-`|h|` is fixed: by W1a it was settled when `h` was sealed, at most `S/2`, and nothing added later changes it. Rotation
-`j` fails to place `h` only if `|E_j| > S − |h|`. Both sides are multiples of 4096 (`|h|` is an entry size, `S` a
-multiple of 4096 by S1), so `|E_j| ≥ S − |h| + 4096`, while `|E_j| ≤ H + c_j + 4095`. Hence `c_j > S − |h| − H ≥
-S/2 − H`. If all `n − 1` rotations fail, `F ≥ Σ c_j > (n − 1)(S/2 − H)`, a contradiction. ∎
+`|h| ≤ S/2` at each placement attempt (W1). That is all the argument needs: it does not rely on `|h|` staying the
+same from one attempt to the next. Rotation `j` fails to place `h` only if `|E_j| > S − |h|`. Both sides are
+multiples of 4096 (`|h|` is an entry size, `S` a multiple of 4096 by S1), so `|E_j| ≥ S − |h| + 4096`, while
+`|E_j| ≤ H + c_j + 4095`. Hence `c_j > S − |h| − H ≥ S/2 − H`. If all `n − 1` rotations fail,
+`F ≥ Σ c_j > (n − 1)(S/2 − H)`, a contradiction. ∎
 
 The bound needs only the head; entries behind it are each a new instance of the lemma. Every rotation writes an
 evacuation entry that fits (Lemma A), so `Stream.writeEntry`'s `require` is never reached; a broken bound shows as
@@ -855,22 +952,24 @@ This is the only layout implemented (`CrashRecoveryLog.deviceCrlDir(devicePath) 
 - **One failure domain and one unit of movement.** The device carries every store's data and its transaction state. A
   drive pulled from a crashed or running host is in exactly the state a crash would leave, so another host can adopt
   it without cooperation from the old host (`DeviceDiscovery.tryAdoptDevice`).
-- **No cross-device ordering problem.** "Backend commit durable, then delete CRL record" (A4) is within one device.
+- **No cross-device ordering problem.** "Backend commit durable, then delete CRL record" (AS4) is within one device.
 - **Simple recovery.** A restart finds one self-describing directory.
 - **Sequential, append-only access.** SimpleCRL writes ascending offsets within one file at a time.
 
 ### 8.2 Drawbacks
 
 - **IO doubled.** Every byte of object data is written to the CRL and again to the backend (RocksDB WAL and SST, or
-  the FSIF journal and segment). Copy-forward writes live data a third time. Each entry is padded to 4 KiB and written
-  with `DSYNC`. CRL traffic competes with store traffic for the same bandwidth and flush queue.
+  the FSIF journal and segment). An evacuation writes data still live a lap later a third time. Each entry is padded
+  to 4 KiB and written with `DSYNC`. CRL traffic competes with store traffic for the same bandwidth and flush queue.
 - **Flushes couple the workloads.** On a journaling file system an `O_DSYNC` write forces a journal commit and a
   device cache flush, which also drains the store's own pending writes, and the other way round. A busy backend
   raises CRL latency, which is on the critical path of every vote.
-- **Wear.** On flash the ring (900 MB by default) is rewritten continuously.
+- **Wear.** On flash the ring (4 streams of capacity / 2048, at least 64 MiB each, by default) is rewritten
+  continuously.
 - **Rotating disks are hit hardest.** Each CRL commit is a synchronous write with a rotational delay and, because the
   CRL files are far from the backend's, a seek on the vote's critical path. Group commit hides some of it.
-- **Capacity.** 900 MB per device by default, not reclaimable by the stores; `crl.lost-*` directories add more.
+- **Capacity.** About 0.2% of the device by default (at least 256 MiB), growing up to 20 streams (about 1%) under
+  load and never shrinking, not reclaimable by the stores; `crl.lost-*` directories add more.
 - **Single-device failure is total.** State and data die together (stores are rebuilt from peers), and a damaged CRL
   turns into a rebuild of every store on the device.
 
@@ -894,19 +993,19 @@ per-device CRL location; `deviceCrlDir` is the only definition.
 
 ## 10. Failure scenarios
 
-"Safe" means no acknowledged state is lost and no wrong state is recovered, assuming A1-A7.
+"Safe" means no acknowledged state is lost and no wrong state is recovered, assuming AS1-AS7.
 
 | # | Scenario | Safe? |
 |---|----------|-------|
 | 10.1 | Crash mid-write of an appended entry | Yes |
 | 10.2 | Crash mid-write of an evacuation entry | Yes |
 | 10.3 | Corruption of a durable entry | Detected; the CRL is lost if a needed or hiding entry is hit |
-| 10.4 | Power loss with a lying write cache | No (A1) |
+| 10.4 | Power loss with a lying write cache | No (AS1) |
 | 10.5 | A head that does not fit, or a live set past the proven bound | Safe; past the bound the device is unloaded until restart |
 | 10.6 | A slow or hung `DSYNC` | Safe; liveness only |
 | 10.7 | A dead CRL thread or writer | Safe; the device is unloaded until restart |
 | 10.8 | The device is pulled | Safe |
-| 10.9 | Adoption by another host | Safe under A3 |
+| 10.9 | Adoption by another host | Safe under AS3 |
 | 10.10 | Crash during transfer-out, before `crl_save.log` is durable | Safe |
 | 10.11 | Crash during transfer-out, after `crl_save.log` is durable | Safe |
 | 10.12 | Crash during a retire | Safe |
@@ -916,6 +1015,8 @@ per-device CRL location; `deviceCrlDir` is the only definition.
 | 10.16 | Device full | Safe except on copy-on-write file systems |
 | 10.17 | Crash during CRL creation | Safe |
 | 10.18 | Saves queued behind a full ring | Safe; they wait at most `n − 1` rotations |
+| 10.19 | Crash during a growth | Safe |
+| 10.20 | A transaction too large for one entry | Safe; it is dropped and never commits |
 
 **10.1 Crash mid-write of an appended entry.** None of the entry's handlers has run, so nothing depended on it. If
 its header did not persist, the walk from the head stops at the previous entry. If the header persisted but not the
@@ -939,7 +1040,7 @@ entry or lies in the walk. Both are accepted: the outcome is a rebuild, simple r
 **10.4 Power loss with write caching.** `DSYNC` sends flush/FUA when the device reports a volatile cache. A drive that
 acknowledges flushes it did not perform can lose acknowledged entries (Paxos amnesia); if it loses an entry that a
 newer surviving one follows, recovery throws `CrlCorrupt`, otherwise it returns a shorter prefix silently. The same
-drive breaks the backends too; it is an operational requirement (A1).
+drive breaks the backends too; it is an operational requirement (AS1).
 
 **10.5 A head that does not fit, or a live set past the proven bound.** An evacuation entry always fits an empty
 stream (6.1, Lemma A) and every other entry is at most half a stream (W1), so `Stream.writeEntry`'s `require` is
@@ -1002,7 +1103,7 @@ configuration and version conditions).
 files and stores untouched and each scan retries. Not a lost CRL.
 
 **10.16 Device full.** The stream files are preallocated, so a CRL write never allocates, except on copy-on-write file
-systems (A7), where an `ENOSPC` kills the CRL (10.7). Freezing the device's writes instead is tracked in Backlog.txt
+systems (AS7), where an `ENOSPC` kills the CRL (10.7). Freezing the device's writes instead is tracked in Backlog.txt
 ("Full storage devices").
 
 **10.17 Crash during CRL creation.** `sizing` is written durably first; stream files go through `.tmp` and rename, and
@@ -1015,6 +1116,16 @@ entry runs, so nothing depends on it. Each rotation evacuates one stream ahead o
 within 6.1's bound the head fits beside one of the first `n − 1` evacuations (Lemma B). Meanwhile new prepares see
 the admission total (section 6); late data is held back the same way (A1). A crash during the wait loses only the
 unwritten entries, as in 10.1.
+
+**10.19 Crash during a growth.** Before the sizing rewrite commits it, the new stream is a `.crl.tmp` or an unlisted
+`.crl`, removed at the next open, which opens the old ring (5.1 step 3). After it, the new stream is listed, right after
+the stream that was active, and holds no entry or only entries written after the commit; a torn first write there is
+10.1 or 10.2. Recovery follows the recorded ring. Tested by crashing at each step (SimpleCRLSuite).
+
+**10.20 A transaction too large for one entry.** A prepare whose transaction would hold more than `maxTransactionBytes`
+on the store is dropped before anything is charged or saved (section 6, Oversized), so it cannot fail the CRL; a
+client retransmit is dropped again. It never commits on that store. An entry larger than a stream is still refused
+at `writeHead`'s `require`, which only a bug can reach.
 
 ---
 
@@ -1031,6 +1142,8 @@ unwritten entries, as in 10.1.
   devices").
 - `CrlLock` does not fence two hosts mounting shared storage (systemic-loss-protection.md).
 - Rot in the newest acknowledged entry is indistinguishable from a torn write (10.3).
+- A transaction whose CRL bytes on a store exceed `maxTransactionBytes` (about half a stream) is dropped silently and
+  can never commit there; its client sees only an unknown outcome (10.20).
 - Admission lanes reserve a quarter of the limit on devices with only data stores (Backlog.txt, "CRL admission lanes
   waste headroom on data-only devices"); same-tier finalizers (TKVL split, join, tail removal) still compete with
   their tier's traffic.
@@ -1038,26 +1151,6 @@ unwritten entries, as in 10.1.
 ---
 
 ## Open weaknesses
-
-### CRL-W2. One large transaction kills the CRL of every device it touches (CONFIRMED; liveness)
-Mechanism: `Frontend.admitPrepare` checks only that the device total is below the tier ceiling before admitting, and
-`chargeData` adds later data without a check; nothing compares a transaction's own CRL bytes with the stream size
-(no check in `DescriptionValidator`, `Store`, or the client's `TransactionBuilder` beyond per-object
-`maxSliceSize`, which may be unlimited and does not bound the number of objects). `SimpleCRL.writeCurrentLogEntry`
-rotates and `Stream.writeEntry`'s `require(canWriteEntry)` throws on the CRL thread when the entry (pending saves plus
-copy-forward) exceeds a stream.
-Trigger / scenario: a client prepares a transaction whose updates to one store total more than about
-`crl-max-file-size-mb` minus the live data of the next stream (with defaults, roughly 150-300 MB; much less on
-devices configured with small CRLs), e.g. five 64 MB objects. Each replica store's save makes an entry that cannot
-fit; the CRL dies; `crlFailed` unloads the device. After the host restarts (the open recovers fine: nothing was
-written), the client's driver retransmits, the prepare is admitted again and the device dies again.
-Consequence: every device holding a store of the transaction is unloaded, repeatedly, by one client request; all
-other stores on those devices go offline with it.
-Suggested fix: bound a transaction's CRL bytes per store (`CrlAdmission.recoveredBytes` of its prepare, plus late
-data) by a fixed fraction of the stream that admission's headroom accounts for, e.g. a quarter of the limit, and
-vote abort with a named `RequirementError` instead of admitting; expose the bound to clients (pool or system
-metadata) so `TransactionBuilder` fails early. Add a SimpleCRL test that an oversized save is refused, not fatal.
-Effort: M   Priority: 4
 
 ### CRL-W4. Completion handlers run on the writer thread before the next write is issued (PLAUSIBLE; performance)
 Mechanism: `Stream.writeEntry`'s callback runs `entry.runCompletionHandlers()` and only then queues `WriteComplete`;

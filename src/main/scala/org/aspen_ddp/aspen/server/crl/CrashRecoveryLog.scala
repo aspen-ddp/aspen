@@ -212,8 +212,8 @@ trait CrashRecoveryLog {
   def admissionLimitBytes: Long = Long.MaxValue
 
   /** The most CRL bytes, as CrlAdmission counts them, one transaction of one store may hold. A prepare past it is
-    * dropped unsaved (Frontend.admitPrepare's Oversized), so no entry can outgrow a stream (CRL-W2). The default is
-    * unlimited, for CRLs that keep nothing on disk */
+    * dropped unsaved (Frontend.admitPrepare's Oversized), so no entry can outgrow a stream (crash-recovery-log
+    * 10.20). The default is unlimited, for CRLs that keep nothing on disk */
   def maxTransactionBytes: Long = Long.MaxValue
 
   /** Asks the CRL for more room: SimpleCRL grows by one stream if its growth policy allows, one growth at a time and

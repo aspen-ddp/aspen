@@ -436,7 +436,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   /** Why `state` can never be saved in `crl` counting with `admission`, if it cannot: its bytes exceed the admission
    *  limit plus the per-transaction bound, the most a load is charged against (CrlAdmission.tryChargeLoaded), or one
-   *  of its transactions exceeds that bound (CRL-W2) */
+   *  of its transactions exceeds that bound (crash-recovery-log 10.20) */
   private def neverFits(state: StoreRecoveryState, crl: CrashRecoveryLog, admission: CrlAdmission): Option[String] =
     val bytes = CrlAdmission.recoveredBytes(state)
     val slack = crl.maxTransactionBytes

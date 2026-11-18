@@ -26,7 +26,7 @@ import scala.util.{Failure, Success, Try}
 
 /** Frontend.admitPrepare's answer. Store.receiveTransactionMessage drops a prepare that is not Admitted without a
   * reply: Full while the device's CRL is past the store's lane, Oversized when the transaction's CRL bytes on this
-  * store exceed CrashRecoveryLog.maxTransactionBytes, which no later prepare of it can fix (CRL-W2)
+  * store exceed CrashRecoveryLog.maxTransactionBytes, which no later prepare of it can fix (crash-recovery-log 10.20)
   */
 enum PrepareAdmission:
   case Admitted, Full, Oversized
@@ -1279,8 +1279,8 @@ class Frontend(val storeId: StoreId,
     * host-wide, so a transaction merely started on another store is not known here.
     *
     * Oversized: the transaction's counted bytes, with data already counted for an admitted one, would exceed
-    * `crl.maxTransactionBytes`, so saving it would kill the CRL (CRL-W2). Nothing is charged. Data arriving after a
-    * data-less prepare is dropped the same way, leaving the store as one that never received it: a commit elsewhere
+    * `crl.maxTransactionBytes`, so saving it would kill the CRL (crash-recovery-log 10.20). Nothing is charged. Data
+    * arriving after a data-less prepare is dropped the same way, leaving the store as one that never received it: a commit elsewhere
     * reaches it through missed-update repair, and the data-less admission is released by the usual paths
     */
   def admitPrepare(m: TxPrepare): PrepareAdmission =

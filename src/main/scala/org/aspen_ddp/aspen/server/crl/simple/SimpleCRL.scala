@@ -315,7 +315,7 @@ class SimpleCRL private (streamsDir: os.Path,
   override def admissionLimitBytes: Long = (numStreams - 2) * maxSizeInBytes / 2 - maxSizeInBytes / 16
 
   /** Half a stream, less EntryOverheadReserve for the headers of the entry that holds it, so one transaction's entry
-    * always fits in a stream. A larger one would kill the CRL at Stream.writeEntry's require (CRL-W2)
+    * always fits in a stream. A larger one would kill the CRL at writeHead's require (crash-recovery-log 10.20)
     */
   override def maxTransactionBytes: Long = maxSizeInBytes / 2 - EntryOverheadReserve
 
@@ -549,7 +549,8 @@ class SimpleCRL private (streamsDir: os.Path,
     * to be entered. The head waits for that write and tries again: beside the evacuation, or after another rotation */
   private def writeHead(): Unit =
     val head = sealedEntries.head
-    // Can never fit: only a lone record past maxTransactionBytes, which admission drops, is this large (CRL-W2)
+    // Can never fit: only a lone record past maxTransactionBytes, which admission drops, is this large
+    // (crash-recovery-log 10.20)
     require(head.entrySize <= maxSizeInBytes, s"CRL entry of ${head.entrySize} bytes is larger than a stream")
     if streams(currentStream).canWriteEntry(head) then
       sealedEntries.dequeue()
@@ -881,9 +882,9 @@ class SimpleCRL private (streamsDir: os.Path,
                       completionHandler: () => Unit): Unit =
     val txid = TxId(state.storeId, transactionId)
     // Deleted in an unwritten entry: the save is skipped but still reports success once the deletion is durable. No
-    // record is created for it: one that is never written would pin oldestEntryNeeded until the ring wraps over it,
-    // and be reported live by readStoreState (crash-recovery-log F4, W1b). Every deletion removes the id from
-    // `transactions` too, so no record exists here
+    // record is created for it: readStoreState would report it live, and it would save a state whose admission was
+    // already released (crash-recovery-log F4, W1b). Every deletion removes the id from `transactions` too, so no
+    // record exists here
     if skippedAfterFinalDeletion(txid, completionHandler) then
       startWrite()
       return

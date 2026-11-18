@@ -524,11 +524,20 @@ To protect the integrity of transactions in the event of system crashes or kill 
 uses a CrashRecoveryLog which functions much like a WriteAheadLog for a database. The 
 TransactionDescription, local object data, and required Paxos state is written to disk when a 
 transaction is started and the Paxos state is updated as needed. The current implementation functions 
-much like a circular ring buffer split over a few files. When beginning to overwrite a new file, any 
-needed state for live transactions in the second-to-last file is first copied over to the new file. 
+much like a circular ring buffer split over a few files. When the writer moves on to the next file in 
+the ring, it first copies forward any state of live transactions still held in the file after that 
+one, the next to be overwritten, so the file being written never holds anything recovery needs. 
 This process continues indefinitely and the CRL data is never read during normal operation. The only 
 time the log is read is during the initialization process to restore into memory the state needed to 
 resume the transactions from where they left off.
+
+The CRL limits how much in-flight transaction state a device admits. When that limit is reached and 
+disk space allows, the CRL grows by adding a whole file, up to a configured cap and only while the 
+device keeps a configured fraction of its space free, which raises the limit. A CRL never shrinks. 
+A single transaction is bounded too: one whose CRL bytes on any one store exceed about half a CRL 
+file is silently dropped, exactly as a prepare is dropped when the CRL is full, so it can never 
+commit and its client eventually sees an unknown outcome. Applications should not write objects whose 
+slice on any one store exceeds 10 MiB.
 
 Each StorageDevice has its own CRL, stored on the device itself and shared by the DataStores it hosts. 
 A device's in-flight transaction state therefore travels with the drive, so a drive can be pulled out of 

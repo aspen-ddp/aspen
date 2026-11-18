@@ -53,12 +53,6 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.1  One oversized transaction kills the CRL of every device it touches, repeatedly: CRL-W2               [M]
-     CONFIRMED. Nothing bounds a transaction's CRL bytes per store against the stream size; Stream.writeEntry's
-     require throws on the CRL thread; crlFailed unloads the device; the client's retransmit repeats it after a
-     restart. Fix: bound per-store CRL bytes of a transaction (fraction of the stream), vote abort with a named
-     RequirementError, expose the bound so TransactionBuilder fails early.
-
 4.2  Rebuild's pending-allocation sweep waits forever on a transaction held by its own silence: RB-W1     [S]
      CONFIRMED. sweepPending waits on any listed unresolved allocation with no bound; rule G holds T while a store
      of T is silent, and the rebuilding store is silent until the sweep finishes. Fix: stop waiting once T's

@@ -5569,7 +5569,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     admission.admittedBytes shouldBe 100
   }
 
-  // ---- CRL-W2: a transaction whose CRL bytes exceed crl.maxTransactionBytes is dropped, never saved ----
+  // ---- Oversized (crash-recovery-log 10.20): a transaction whose CRL bytes exceed crl.maxTransactionBytes is
+  //      dropped, never saved ----
 
   /** A TestCrl that takes transactions of at most 10 000 CRL bytes */
   class SmallTxCrl extends TestCrl:

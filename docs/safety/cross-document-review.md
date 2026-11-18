@@ -149,16 +149,18 @@ raises the host's eviction watermark, so an evicted entry's absence is never tru
 **CRL admission lanes.** Every committed but unfinalized transaction keeps its admitted CRL bytes until its
 finalization actions complete, and finalization needs a marker batch to commit in the metadata tier above. Admission
 therefore has lanes by the receiving store's pool, copied into its store config at creation (`AdmissionTier`,
-`CrlAdmission.ceiling`): a device admits a new data-pool transaction only below 3/4 of its limit `L` (half a CRL
-stream), a metadata-pool one below 7/8 `L`, a bootstrap-pool one up to `L`. A data transaction's marker batch writes
-trees in a metadata pool, a metadata transaction's in the bootstrap pool, and the bootstrap pool's own tree writes
-track nothing (`MissedUpdateFinalizationAction.limitTracking`). So each higher tier keeps about `L/8` of headroom on
-every device, and lower-tier load cannot prevent a transaction's finalization. `TxFinalized` is a message and never
-admitted. Charges made without a check (one transaction crossing its ceiling, data arriving after admission, records
-recovered at load, applied stubs) are bounded by the transactions already admitted, except that nothing bounds one
-transaction's size (crash-recovery-log.md, CRL-W2). What can still fill a lane is the tier's own traffic, including
-same-tier finalizers (TKVL split, join, tail removal): ordinary back-pressure that clears as the tier's transactions
-finalize upward. Data-only devices give up a quarter of their headroom (Backlog.txt).
+`CrlAdmission.ceiling`): a device admits a new data-pool transaction only below 3/4 of its limit `L`
+(crash-recovery-log.md section 6; it rises with each CRL growth), a metadata-pool one below 7/8 `L`, a bootstrap-pool
+one up to `L`. A data transaction's marker batch writes trees in a metadata pool, a metadata transaction's in the
+bootstrap pool, and the bootstrap pool's own tree writes track nothing
+(`MissedUpdateFinalizationAction.limitTracking`). So each higher tier keeps about `L/8` of headroom on every device,
+and lower-tier load cannot prevent a transaction's finalization. `TxFinalized` is a message and never admitted.
+Charges made without a check (one transaction crossing its ceiling, data arriving after admission, records recovered
+at load, applied stubs) are bounded by the transactions already admitted, and one transaction's bytes on a store by
+`maxTransactionBytes`, past which its prepare is dropped (crash-recovery-log.md section 6, Oversized). What can still
+fill a lane is the tier's own traffic, including same-tier finalizers (TKVL split, join, tail removal): ordinary
+back-pressure that clears as the tier's transactions finalize upward. Data-only devices give up a quarter of their
+headroom (Backlog.txt).
 
 **Repair backlog.** ErrorTree and UnackedCommits entries cost backend space in the metadata pools, not CRL bytes; an
 entry occupies CRL admission only while the batch writing it is in flight. The backlog drains one entry at a time per

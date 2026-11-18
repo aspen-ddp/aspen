@@ -264,7 +264,8 @@ class Store(val storageDeviceId: StorageDeviceId,
     // Backpressure: while the device's CRL is filling past this store's lane (CrlAdmission), a prepare for a
     // transaction this store has not seen, or one bringing data not yet counted, is dropped without a reply. The client
     // retransmits; other stores may commit it without this one, which repair catches up
-    // A transaction too large for the CRL is dropped the same way (CRL-W2): admitPrepare warns of it, rate-limited
+    // A transaction too large for the CRL is dropped the same way (crash-recovery-log 10.20): admitPrepare warns of
+    // it, rate-limited
     case m: TxPrepare => frontend.admitPrepare(m) match
       case PrepareAdmission.Admitted => handleTransactionMessage(msg)
       case PrepareAdmission.Full =>

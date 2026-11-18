@@ -7,7 +7,8 @@
 - Only read at application startup to recover in-progress transactions
 - Takes advantage of the fact that Transactions are typically very short-lived so their state usually does not need to
   be retained for long
-- Implemented as a series of fixed-size, write-only files that are continually recycled.
+- Implemented as a ring of fixed-size, write-only files (streams) that are continually recycled, which grows by whole
+  streams under load and never shrinks (Growth, below)
 - Functions similar to a circular buffer. Invariant: the stream after the active one holds no needed entry. The
   rules below are proven in safety `crash-recovery-log.md` 6.1 (W1-W6, S1); keep them when changing SimpleCRL:
   - Bounded entries (W1): a request that would push the newest unwritten entry past `maxEntryBytes` (S/2) seals it;
@@ -37,36 +38,39 @@
   rewrite of `crl/sizing` is the commit point (Growth, below). A sizing file whose ring is missing or not a
   permutation of `0 until num-streams` is unreadable. Tests reach other rings with `SimpleCRL.apply`'s `ringForTest`
   (creation only)
-- Growth (`requestGrowth`, `GrowthPolicy`, `SimpleCRL.apply`'s `growth`; default `Disabled`): one stream at a time,
-  never shrinking. `requestGrowth` (any thread, cheap, idempotent) wakes the CRL's own growth thread (daemon, none
-  when `maxStreams` is at or below the ring size), which checks the policy (`ringSize < maxStreams`, `freeSpace() - S
-  >= capacity() * minFreePercent / 100`), preallocates `<n>.crl.tmp` (n = ring size), renames it to `<n>.crl`, forces
-  the directory and queues `GrowthReady(n)`. The CRL thread commits it only at a quiescent point
-  (`commitGrowthWhenQuiescent`: no rotation between its evacuation and its head, so W6's count runs over one ring):
-  `crl/sizing` rewritten with `n` right after the active stream, then `StreamWriter.addStream`, then the
-  `onAdmissionLimitRaised` listeners with the new `admissionLimitBytes`. The sizing rewrite must stay the last step
-  that touches the files: `removeUncommittedGrowth` relies on it. `DeviceFactory.openCRL` builds the `GrowthPolicy` from the `CrlSizing` it resolved (capacity and free space from
-  `getTotalSpace` / `getUsableSpace` of the device path); `DeviceDiscovery` registers `sds.admission.raiseLimit` as the
-  listener right after constructing the device state, and `Frontend.admitPrepare` calls `requestGrowth` on every `Full`. At the cap `requestGrowth` refuses at once and logs
-  it once. A refused or failed attempt logs, removes what it created and ignores requests for `retryAfter` (10 s); it
-  never fails the CRL, with two fail-stop exceptions after the rename of the new sizing: its directory force failing
-  twice (whether the new ring is durable is then unknown), and `addStream` failing to open the committed file. A
-  restart opens whichever ring is on disk. Shutdown and death set `growthStopped`, interrupt the growth thread and
-  then take `growthFileLock`, before the CRL lock is released: the step in progress aborts (a zero-fill or force
-  with ClosedByInterruptException; a fallocate is one call), no later step runs, and the leftovers are removed at the
-  next open. `StreamWriter` dies of a write to a stream it does not know rather than completing it unwritten
+- Growth (`requestGrowth`, `GrowthPolicy`, `SimpleCRL.apply`'s `growth`; default `Disabled`; safety 5.11): one
+  stream at a time, never shrinking. `requestGrowth` (any thread, cheap, idempotent) wakes the CRL's own growth
+  thread (daemon, none when `maxStreams` is at or below the ring size), which checks the policy (`ringSize <
+  maxStreams`, `freeSpace() - S >= capacity() * minFreePercent / 100`), preallocates `<n>.crl.tmp` (n = ring size),
+  renames it to `<n>.crl`, forces the directory and queues `GrowthReady(n)`. The CRL thread commits it only at a
+  quiescent point (`commitGrowthWhenQuiescent`: no rotation between its evacuation and its head, so W6's count runs
+  over one ring): `crl/sizing` rewritten with `n` right after the active stream, then `StreamWriter.addStream`, then
+  the `onAdmissionLimitRaised` listeners with the new `admissionLimitBytes`. The sizing rewrite must stay the last
+  step that touches the files: `removeUncommittedGrowth` relies on it
+  - Wiring: `DeviceFactory.openCRL` builds the `GrowthPolicy` from the `CrlSizing` it resolved (capacity and free
+    space from `getTotalSpace` / `getUsableSpace` of the device path); `DeviceDiscovery` registers
+    `sds.admission.raiseLimit` as the listener right after constructing the device state; `Frontend.admitPrepare`
+    calls `requestGrowth` on every `Full`
+  - At the cap `requestGrowth` refuses at once and logs it once. A refused or failed attempt logs, removes what it
+    created and ignores requests for `retryAfter` (10 s); it never fails the CRL, with two fail-stop exceptions
+    after the rename of the new sizing: its directory force failing twice (whether the new ring is durable is then
+    unknown), and `addStream` failing to open the committed file. A restart opens whichever ring is on disk
+  - Shutdown and death set `growthStopped`, interrupt the growth thread and then take `growthFileLock`, before the
+    CRL lock is released: the step in progress aborts (a zero-fill or force with ClosedByInterruptException; a
+    fallocate is one call), no later step runs, and the leftovers are removed at the next open. `StreamWriter` dies
+    of a write to a stream it does not know rather than completing it unwritten
 - One CRL per storage device, in `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`), opened by
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
 - Sizing keys in the device config are all optional (`CrlSizingDefaults.resolve`, from the capacity of the file
   system holding the device): `crl-num-streams` 4 (also the minimum; fewer is refused), `crl-max-file-size-mb`
   capacity / 2048 rounded down to 4 KiB, at least 64 MiB, `crl-max-streams` 20, `crl-min-free-percent` 5 (the last two
-  are growth bounds, read at each open). Stream count and size are fixed when the device's
-  CRL is created and recorded durably in `crl/sizing` (`SimpleCRL.SizingFile`) before any stream file, with the
-  CRL's random id (`Sizing.crlId`). An existing
-  CRL always opens with its recorded sizing, whatever the config asks (a warning is logged), so config edits and
-  default changes are harmless. `SimpleCRL.apply` throws `CrlSizingMismatch` for stream files without a readable
-  sizing file or of another count or size than recorded. That is damage or a hand edit, never declared a lost CRL:
-  the device is refused until repaired (`DeviceDiscovery.openDeviceCrl`)
+  are growth bounds, read at each open). The stream size is fixed when the device's CRL is created; the stream count
+  only grows. Both are recorded durably in `crl/sizing` (`SimpleCRL.SizingFile`, with the ring) before any stream
+  file, with the CRL's random id (`Sizing.crlId`). An existing CRL always opens with its recorded sizing, whatever
+  the config asks (a warning is logged), so config edits and default changes are harmless. `SimpleCRL.apply` throws
+  `CrlSizingMismatch` for stream files without a readable sizing file or of another count or size than recorded.
+  That is damage or a hand edit, never declared a lost CRL: the device is refused until repaired
+  (`DeviceDiscovery.openDeviceCrl`)
 - `openCRL`'s `holdsStores` (`SimpleCRL.apply`'s `mustExist`): the device holds stores, so its CRL must exist. With no
   stream files (only `sizing` or `.crl.tmp` files at most) the open throws `CrlMissing`, writing nothing, and the
   caller declares the CRL lost instead of creating an empty one under live stores. So anything that creates
@@ -107,41 +111,44 @@
   (`removeUncommittedGrowth`, run before that creation rule), but only when every listed stream exists and no other
   file is unlisted. Otherwise, as for any other unlisted stream file, the open is `CrlSizingMismatch` and removes
   nothing: removing it beside missing streams could leave none, and a new empty CRL would be created under live
-  stores. `StreamWriter` opens existing files only. Copy-on-write file systems (btrfs, ZFS) allocate on overwrite
-  anyway: the open warns once
+  stores. `StreamWriter` opens existing files only. Copy-on-write file systems (btrfs, ZFS) allocate on every
+  overwrite whatever the preallocation, so a full device can stop the CRL there: the creation warns once
 - A failed CRL (its thread or its writer died; one path: the writer's death kills the CRL thread) answers nothing:
   every pending and later Future fails with `CrlFailed` (`SimpleCRL.tracked`), `failed` completes and
   `onThreadDeath` runs once. Save completions never run, so no vote follows. The host unloads the device until it
   restarts (`DeviceShutdown.crlFailed`, `server/host/CLAUDE.md`), and the restart recovers the files as after a crash
 - `admissionLimitBytes` (SimpleCRL: `(n − 2) · S/2 − S/16` for `n` streams of `S` bytes, 15S/16 at 4 streams: with
-  it every evacuation fits and every head is written within `n − 1` rotations, safety 6.1) sizes the
-  device's `CrlAdmission`, which drops prepares for unseen transactions past it. Lanes (`AdmissionTier`, the store's
-  pool's, persisted in its StoreConfig): data stores admit below 3/4 of it, metadata stores below 7/8, bootstrap
-  stores up to it, so the marker batches each tier's finalization needs keep headroom (safety X5, G10). `Stream.writeEntry`'s `require` stays
-  the fail-stop backstop. The admission counts everything the CRL holds from the device's open
+  it every evacuation fits and every head is written within `n − 1` rotations, safety 6.1) sizes the device's
+  `CrlAdmission`, which drops prepares for unseen transactions past it. It rises with each committed growth
+  (`onAdmissionLimitRaised`, `CrlAdmission.raiseLimit`). Lanes (`AdmissionTier`, the store's pool's, persisted in its
+  StoreConfig): data stores admit below 3/4 of it, metadata stores below 7/8, bootstrap stores up to it, so the
+  marker batches each tier's finalization needs keep headroom (safety X5, G10). `Stream.writeEntry`'s `require`
+  stays the fail-stop backstop. The admission counts everything the CRL holds from the device's open
   (`recoveredBytesByStore`, `CrlAdmission.recoveredBytes`), retained per store until the store loads and has counted
   its own, or its entries leave the CRL: records of stores that do not load are evacuated too (safety F8). The
   Frontend and store loader keep every save charged (safety 6.1, A1-A4: late data checked, reload swaps, loaded
   state checked by `tryChargeLoaded`, no save after a release)
-- `maxTransactionBytes` (SimpleCRL: half a stream less `EntryOverheadReserve`, 8 KiB; trait default unlimited): the
-  most bytes, as `CrlAdmission` counts them, one store's transaction may hold. `Frontend.admitPrepare` drops a prepare
-  past it unsaved (`PrepareAdmission.Oversized`, `server/store/CLAUDE.md`), so no entry outgrows a stream and trips
-  `Stream.writeEntry`'s `require`, which would kill the CRL (CRL-W2)
+- `maxTransactionBytes` (SimpleCRL: `T = S/2 − EntryOverheadReserve`, 8 KiB; trait default unlimited): the most bytes,
+  as `CrlAdmission` counts them, one store's transaction may hold. `Frontend.admitPrepare` drops a prepare past it
+  unsaved, with no reply (`PrepareAdmission.Oversized`, `server/store/CLAUDE.md`), so every entry stays within
+  `maxEntryBytes` (W1) and none trips `writeHead`'s `require`, which would kill the CRL (safety 6, Oversized, and
+  10.20). Such a transaction can never commit on the store; the client sees `TransactionOutcomeUnknown`
 - Deletions are final across every unwritten entry, the one in flight included (W1b): a save of an id any of them
   deletes is skipped, and its handler runs once the deletion is durable. It creates no live record
-  (`LogEntry.deletesFinally`, `SimpleCRL.skippedAfterFinalDeletion`): an unwritten one would pin `oldestEntryNeeded`
-  until recovery broke on the wrap, and save a state whose admission was released. The exceptions are deletions a
-  stub's save or a `dropStore` made, which a later save in the same entry cancels
+  (`LogEntry.deletesFinally`, `SimpleCRL.skippedAfterFinalDeletion`): `readStoreState` would report it live (safety
+  F4), and it would save a state whose admission was released. When only the entry in flight deletes the id, the
+  handler waits in `afterInFlight`. The exceptions are deletions a stub's save or a `dropStore` made, which a later
+  save in the same entry cancels
 - `dropTransactionObjectData` writes nothing: it only flags the live record, so saves made after it leave the data
   out. Saves already queued keep it (their forms are frozen), and so does the last-built form: an evacuation carries
   the dropped data, pinned, until a later save's entry is built. Until then a restart, and `readStoreState`, still
   return the data. A store that needs the data durably gone saves the state without it (`Tx.persistWithoutUpdateOf`);
   a save's update count change writes every piece again, the txd included (W4; transaction-recovery R-N13)
 - `whenDurable(storeId, handler)` (`Barrier`): runs the handler once every request queued before it is durable: on
-  the current entry if it holds anything, after the write in flight if the current entry is empty
-  (`afterInFlight`), else at once. It orders a write outside the CRL (a backend deletion) after a deletion, which has
-  no completion of its own. The trait's default runs it at once, for CRLs that keep nothing on disk; a CRL that
-  dies never runs it
+  the newest unwritten entry holding anything, sealed ones included (`newestUnwritten`); after the write in flight
+  if no unwritten entry holds anything (`afterInFlight`); else at once. It orders a write outside the CRL (a backend
+  deletion) after a deletion, which has no completion of its own. The trait's default runs it at once, for CRLs that
+  keep nothing on disk; a CRL that dies never runs it
 - Applied stubs (`StoreRecoveryState`, `saveAppliedStub`/`deleteAppliedStub`): a (store, txid) entry meaning the store
   holds that transaction's update, with the transaction's start timestamp (`Stub.StaticSize`: TxId + 8 B), by which the
   store expires it (`Frontend.expireStubs`). A namespace apart from transaction state (own header counts and deletion

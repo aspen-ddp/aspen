@@ -187,10 +187,6 @@ System-level protection against correlated "lost store" declarations
        and falls under the same check (Backlog: "System-level protection against correlated lost store
        declarations").
 
-CRL expansion. If sufficient free disk space is available, add another file to the CRL rather than slowing down
-the transactions. This needs to be capped though. Do not add another file if the total size of all files would
-exceed 3% of the device's size.
-
 Store commit delay FSIF commits seem to be taking longer than they should when backed by NVMe media. Investigate the
 timing of commits.
 
@@ -368,3 +364,22 @@ CRL admission lanes waste headroom on data-only devices (from Todo 4.3, 2026-11-
   Cleanup: size the data ceiling per device by whether any metadata or bootstrap store is placed on it (the
   reserve is needed only where such a store can load, including by transfer, rebuild or adoption), or otherwise
   reclaim the unused reserve without weakening the X5 / G10 capacity argument.
+
+Transfers do not check the destination's CRL room (from the CRL growth work, 2026-11-17):
+- A transfer does not check that the destination device's CRL can take the store's `crl_save.log` state (CRL
+  admission rule A3, docs/safety/crash-recovery-log.md 6.1). A state that can never fit there (its bytes above the
+  destination's admission limit plus its per-transaction bound, or one transaction above that bound, as a store
+  moved from a device with a larger CRL may hold) is treated as a lost save file at the destination, and the store
+  is rebuilt there. One that does not fit yet waits offline, retried at each device scan.
+- Fix: destination choice lives in the metadata management tasks (common/metadata/CLAUDE.md); have them avoid a
+  device whose CRL cannot take the state, which needs the source's CRL bytes for the store and the destination's
+  limits in the device's published state.
+
+Nothing ties a pool's maxSliceSize to the CRL's per-transaction bound (from the CRL growth work, 2026-11-17):
+- A prepare whose bytes on a store exceed that store's CRL `maxTransactionBytes` (half a CRL stream less 8 KiB) is
+  dropped silently (docs/safety/crash-recovery-log.md 10.20). A client write above it is therefore never refused up
+  front: it retransmits until the horizon and ends `TransactionOutcomeUnknown` (client/internal/CLAUDE.md), and a
+  retry fails the same way.
+- Fix: bound a pool's `maxSliceSize` (and the number of objects one transaction may write per store) by the
+  smallest `maxTransactionBytes` among the devices its stores may land on, publish it, and have
+  `TransactionBuilder` fail such a transaction at build time.

@@ -217,8 +217,8 @@
   tier ceiling, late data past it, A1), never for `Admitted` or `Oversized`. `CrlAdmission`'s limit is an `AtomicLong`
   raised only upward (`raiseLimit`, from the CRL thread after a growth commit); `limitBytes`, `ceiling`, `tryAdmit`,
   `full` and `tryChargeLoaded` read the current value, so the retransmitted prepare meets the raised lane
-- Oversized prepares (CRL-W2): `Frontend.admitPrepare` returns `PrepareAdmission` (`Admitted`, `Full`, `Oversized`)
-  and `Store.receiveTransactionMessage` drops both non-admitted kinds the same way: no reply, no vote, no CRL write.
+- Oversized prepares (safety crash-recovery-log 10.20): `Frontend.admitPrepare` returns `PrepareAdmission`
+  (`Admitted`, `Full`, `Oversized`) and `Store.receiveTransactionMessage` drops both non-admitted kinds the same way: no reply, no vote, no CRL write.
   `Oversized`: the transaction's counted bytes (for an admitted one, its bytes plus the uncounted data the prepare
   brings) exceed `crl.maxTransactionBytes`. Nothing is charged; data arriving after a data-less prepare is dropped
   likewise, leaving the store as one that never received it (a commit elsewhere reaches it through missed-update

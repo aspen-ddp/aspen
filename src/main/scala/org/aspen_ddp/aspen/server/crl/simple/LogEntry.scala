@@ -85,8 +85,8 @@ class LogEntry(image: Image) extends Logging:
     //
     // Deletions are final (deletesFinally). A save of a transaction deleted earlier in an unwritten entry is a timing
     // artifact and is skipped, but it still reports success once the delete is durable. SimpleCRL never adds such a
-    // save here: it queues only the handler, since a record that is never written would pin oldestEntryNeeded and be
-    // reported as live (crash-recovery-log F4).
+    // save here: it queues only the handler, since readStoreState would report the record live (crash-recovery-log
+    // F4, W1b).
     //
     // A deletion made by a stub's save or a dropStore (deleteTxUnlessResaved) is not final: a save after it is a new
     // state of the transaction (live beside the stub, or of the store loaded again). The save cancels that deletion,

@@ -39,6 +39,16 @@
   `TransactionManager` forgets a driver on `ClientTransactionDriver.stopped` (leader outcome heard, or the give-up
   point; with no retransmits it completes with `result`), not on `result`, so a leader abort after a vote-completion
   reaches the driver and is logged as a split decision
+- A transaction every store drops (each store's CRL `maxTransactionBytes` is below the transaction's bytes on it,
+  `server/store/CLAUDE.md` Oversized; or every device stays full) gets no reply at all: no vote, no
+  `TxPrepareResponse`, no leader outcome. `SimpleClientTransactionDriver` retransmits the prepare every
+  `txRetransmitDelay`, logging `HUNG Client Transaction` at info every third tick, until the client's clock passes
+  `startTimestamp + Horizon + MaxStartLead` (22 s). Then it logs a warning ("past the transaction horizon: outcome
+  unknown"), completes `Unknown`, and the commit Future fails with `TransactionOutcomeUnknown`; nothing is recorded in
+  the client's status cache. Nothing committed, but the client cannot tell this from an unknown outcome: retry
+  helpers treat it as transient (`StopRetrying.unlessCollision`, `CollisionRetry.mayHaveCommitted` turns true), so an
+  oversized transaction retried as is fails the same way on every attempt. Stores only warn, rate-limited, naming the
+  transaction and its bytes. Keep each object's slice on any one store at or below 10 MiB (Architecture.md)
 - `BaseReadDriver` re-reads a store whose reply holds a lock of a known-committed transaction at once; that `Read`
   carries `awaitCommit` (the known-committed txids among the locks) so the store can park the reply until it applies
   them (`Frontend.parkRead`, `server/store/CLAUDE.md`), so the re-read is answered once with the applied commit

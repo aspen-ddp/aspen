@@ -1,8 +1,11 @@
 package org.aspen_ddp.aspen.server.crl
 
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicLong
 
@@ -84,3 +87,25 @@ class CrlAdmissionSuite extends AnyFunSuite with Matchers:
     val a = CrlAdmission.Unlimited
     a.tryAdmit(Long.MaxValue / 4) shouldBe true
     a.tryAdmit(Long.MaxValue / 4) shouldBe true
+
+  test("a loaded state is charged, retained for its store, only while the total stays at most limit + slack"):
+    val s0 = StoreId(PoolId(new UUID(3, 1)), 0)
+    val a = new CrlAdmission(100)
+    a.charge(60)
+    a.tryChargeLoaded(s0, 51, slack = 10) shouldBe false
+    a.admittedBytes shouldBe 60
+    a.retainedBytes(s0) shouldBe 0
+    a.tryChargeLoaded(s0, 50, slack = 10) shouldBe true
+    a.admittedBytes shouldBe 110
+    a.retainedBytes(s0) shouldBe 50
+    // What is already retained for the store is the same records, saved again in place: left out of the check
+    a.tryChargeLoaded(s0, 50, slack = 10) shouldBe true
+    a.admittedBytes shouldBe 160
+    a.releaseRetained(s0)
+    a.admittedBytes shouldBe 60
+
+  test("a loaded state's check does not overflow for an unlimited admission"):
+    val s0 = StoreId(PoolId(new UUID(3, 1)), 0)
+    val a = CrlAdmission.Unlimited
+    a.tryChargeLoaded(s0, 1000, slack = Long.MaxValue) shouldBe true
+    a.admittedBytes shouldBe 1000

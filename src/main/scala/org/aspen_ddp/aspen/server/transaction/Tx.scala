@@ -108,7 +108,14 @@ class Tx( trs: TransactionRecoveryState,
   private var voteSaveIssued: Boolean = recovered && trs.disposition != TransactionDisposition.Undetermined
   private var voteDurable: Boolean = voteSaveIssued
 
+  /** The abort's CRL state was deleted (resolvedAndAllObjectsLoaded), which released its admission while the Tx stays
+    * in `transactions` until TxFinalized. Every save is charged to the device's admission first, and that charge is
+    * gone, so the Tx saves nothing more (crash-recovery-log 6.1, A4): a later prepare or accept is answered with the
+    * decided abort (answerResolved), and late object data is not adopted */
+  private var stateDeleted: Boolean = false
+
   private def saveState(state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
+    require(!stateDeleted, s"Tx $transactionId on store $storeId: a save after its CRL state was deleted is uncharged")
     savedToCrl = true
     if state.disposition != TransactionDisposition.Undetermined && !voteDurable then
       voteSaveIssued = true
@@ -122,7 +129,8 @@ class Tx( trs: TransactionRecoveryState,
     * the freeze would have gone out with, yet its status reply will report the vote once durable
     */
   private def saveUndurableVote(): Unit =
-    if !muted && disposition != TransactionDisposition.Undetermined && !voteSaveIssued && allObjectsLoaded then
+    if !muted && !stateDeleted && disposition != TransactionDisposition.Undetermined && !voteSaveIssued &&
+      allObjectsLoaded then
       saveState(TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, txStatus,
         acceptor.persistentState), () => ())
 
@@ -135,7 +143,7 @@ class Tx( trs: TransactionRecoveryState,
     */
   def persistWithoutUpdateOf(objectId: ObjectId)(onDurable: () => Unit): Unit =
     droppedUpdates += objectId
-    if savedToCrl then
+    if savedToCrl && !stateDeleted then
       val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, txStatus,
         acceptor.persistentState)
       saveState(state, () => frontend.post(onDurable))
@@ -791,6 +799,10 @@ class Tx( trs: TransactionRecoveryState,
         logger.trace(s"Tx $transactionId on store $storeId is frozen past expiry: dropping its delayed prepare response")
       delayedPrepare = None
       saveUndurableVote()
+    else if stateDeleted then
+      // Resolved aborted while the objects loaded (completeLoad): its state is gone, so its outcome is the answer
+      delayedPrepare.foreach(response => answerResolved(response.to))
+      delayedPrepare = None
     else delayedPrepare.foreach { response =>
       logger.trace(s"AllObjectsLoaded. Saving to CRL before sending PrepareResponse for tx ${transactionId}")
       val r = response.copy(disposition=disposition, collisions=collisions)
@@ -1156,6 +1168,7 @@ class Tx( trs: TransactionRecoveryState,
       if (committed)
         doCommit()
       else
+        stateDeleted = true
         frontend.deleteTransactionState(transactionId)
 
       unlock() // Ensure we've unlocked the objects now that result of the Tx is known
@@ -1208,14 +1221,14 @@ class Tx( trs: TransactionRecoveryState,
   private def adoptObjectUpdates(m: TxPrepare): Unit =
     val have = objectUpdates.iterator.map(_.objectId).toSet
     val added = m.objectUpdates.filterNot(ou => have.contains(ou.objectId))
-    if added.nonEmpty && !committing && !committed then
+    if added.nonEmpty && !committing && !committed && !stateDeleted then
       objectUpdates = objectUpdates ++ added
       // A muted Tx applies nothing, so its data need not be durable
       if !muted then
         adoptedDataUnsaved = true
         saveAdoptedData()
 
-  def receivePrepare(m: TxPrepare): Unit = {
+  def receivePrepare(m: TxPrepare): Unit = if stateDeleted then answerResolved(m.from) else {
     logger.trace(s"*** Got Prepare: ${m.transactionId}")
     lastProposer = m.from
 
@@ -1279,7 +1292,20 @@ class Tx( trs: TransactionRecoveryState,
     else
       answerPrepareAsAcceptor(m)
 
-  private def answerPrepareAsAcceptor(m: TxPrepare): Unit = if frozen then
+  /** Answers a proposer of a Tx whose state was deleted (stateDeleted) with its decided abort instead of a promise or
+    * an acceptance, which would need a save. Sound for Paxos: the abort is the value already chosen (learned from a
+    * driver's TxResolved, a TxFinalized, a recovered resolution or an adopted expiry outcome), so a proposer that
+    * learns it from here only learns the chosen value, and this acceptor, promising and accepting nothing, can help
+    * choose no other. Store answers the same from the status cache while it holds the outcome; this holds past its
+    * eviction */
+  private def answerResolved(to: StoreId): Unit =
+    logger.trace(s"Tx $transactionId on store $storeId: its aborted state is deleted; answering $to with the abort")
+    net.sendTransactionMessage(TxResolved(to, storeId, transactionId, committed = false, late = false, proof = false))
+
+  private def answerPrepareAsAcceptor(m: TxPrepare): Unit =
+    if stateDeleted then answerResolved(m.from) else answerPrepareWithState(m)
+
+  private def answerPrepareWithState(m: TxPrepare): Unit = if frozen then
     logger.trace(s"Tx $transactionId on store $storeId is frozen past expiry: no promise to ${m.from}")
     saveUndurableVote()
   else {
@@ -1304,7 +1330,7 @@ class Tx( trs: TransactionRecoveryState,
       delayedPrepare = Some(txr)
   }
 
-  def receiveAccept(m: TxAccept): Unit = if !muted && !frozen then {
+  def receiveAccept(m: TxAccept): Unit = if stateDeleted then answerResolved(m.from) else if !muted && !frozen then {
     updateLastEvent()
 
     val result = acceptor.receiveAccept(Accept(m.proposalId, m.value)) match {
@@ -1380,7 +1406,8 @@ class Tx( trs: TransactionRecoveryState,
     resolved(committed)
     ofinalized = Some(committed)
     releaseHeldCommit()
-    // Whatever the outcome: a prepare after an abort, or from a recovery driver, may have saved this Tx again. Deferred
+    // Whatever the outcome: a prepare from a recovery driver may have saved this Tx again (an abort whose state was
+    // deleted saves nothing more: stateDeleted). Deferred
     // while backend commits of a committed transaction are outstanding or failed, or still held for their turn
     if commitHeld then
       finalizeDeferred = true

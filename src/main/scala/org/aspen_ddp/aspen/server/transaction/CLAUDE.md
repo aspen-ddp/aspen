@@ -225,6 +225,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - Rejoin invariant: once a store discards T, its floor makes it refuse every later prepare for T: a discarded
   acceptor is indistinguishable from an offline one, and Paxos is safe with offline acceptors. **A store never
   rejoins a transaction it forgot.**
+- A resolved abort deletes its CRL state, releasing its admission, while the Tx waits for `TxFinalized`
+  (`Tx.stateDeleted`). It saves nothing more (crash-recovery-log 6.1, A4): a prepare, an accept or a delayed prepare
+  response is answered with `TxResolved(committed = false)` to the proposer, never a promise or acceptance. Sound: the
+  abort is the chosen value, and an acceptor that promises and accepts nothing can help choose no other
 
 #### Applied stubs
 - A durable (store, txid) record in the device CRL, charged to `CrlAdmission`, meaning the store holds

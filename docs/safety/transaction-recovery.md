@@ -424,7 +424,8 @@ ends in a rebuild: its counted commit votes are lost with it (rebuild-process.md
 
 `new Tx(trs, txd, ..., recovered = true)` restores the serialized txd, the saved object updates, the persisted vote,
 the persisted status and the acceptor state. A saved status of Committed or Aborted (re-saved by a prepare or accept
-after the resolution; the CRL persists it) is restored into `oresolution`: once its objects load such a Tx applies the
+after the resolution, before an abort's state is deleted; one deleted saves nothing more and answers with the abort,
+`Tx.stateDeleted`, crash-recovery-log 6.1 A4; the CRL persists it) is restored into `oresolution`: once its objects load such a Tx applies the
 commit with the recovered re-check rules, or deletes the abort's state, takes no locks and needs no lookup, then waits
 for `TxFinalized` as a live resolved Tx does. The constructor also seeds the host status cache with the saved status.
 

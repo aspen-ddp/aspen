@@ -310,15 +310,24 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
     val replaced = stores.put(store.storeId, entry)
     // A reload over a loaded store, with no close: its queued tasks run, later ones skip it. Its object cache view is
     // cleared here, on its executor, behind those tasks: the view's bytes belong to that executor. It is closed there
-    // too, releasing what its transactions were counted for: the new store counted the recovered ones again. A
+    // too. What its transactions were counted for stays counted, retained for the store, until the new store's
+    // recovery has counted the same records and releases it (Frontend.recoverState; crash-recovery-log 6.1, A2). A
     // backend the new store reuses is left open, but the old store's drivers stop either way (Todo 6.3), as in the
-    // crash a reload over the same backend stands for (TestNetwork.restartStore)
+    // crash a reload over the same backend stands for (TestNetwork.restartStore).
+    //
+    // The new store's recovery reads its state from the CRL after every save the old store issued: a reload keeps the
+    // executor (StoreLoader), the old store saves only from tasks on it, and the read (StoreRouter.readAndRecover) is
+    // issued from a task queued behind this one, and the CRL answers it behind the saves queued before it. Nothing
+    // reaches the old store after this task: routed tasks find `closed`, its Frontend's posts find another store
+    // installed (Store's `post`), its backend's completions find `closed`, and its CRL completions run on the CRL's
+    // thread only to send or to post. So no save of the old store follows the read, and no record of it is left out
+    // of what the new store counts
     if replaced != null then
       replaced.executor.execute: () =>
         replaced.closing = true
         replaced.closed = true
         replaced.store.objectCache.clear()
-        replaced.store.frontend.releaseAllAdmissions()
+        replaced.store.frontend.retainAdmissions()
         replaced.store.shutdownDrivers()
         if replaced.store.backend ne store.backend then
           replaced.store.close().failed.foreach(t =>

@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.util.LogRateLimit
 import org.aspen_ddp.aspen.server.{DurableFiles, Host, StoreConfig}
 import org.aspen_ddp.aspen.server.Host.{BackendFailed, BackendOpened, LoadStore, LoadStoreById, ShutdownStore,
   SpaceWait, StoreFailedOnClose, UnloadFailedStore}
@@ -37,7 +38,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // an exponential backoff counted in scans: next scan, then 2, 4, ... scans later, capped at
   // SpaceRetryCap. Each retry opens the store through startOpen, never blocking the control thread. A store
   // leaves this map when its load succeeds or fails for any other reason. Never marked for
-  // rebuild: the store's data is intact, it just cannot finish recovery until space returns.
+  // rebuild: the store's data is intact, it just cannot finish recovery until space returns. A store whose
+  // crl_save.log state its device's CRL cannot admit now (handleLoad, crash-recovery-log 6.1 A3) waits here too, retried
+  // at every scan: its CRL frees room as transactions conclude.
   private var storesAwaitingSpace: Map[StoreId, SpaceWait] = Map()
   // Stores whose backend open (recovery) or create is in progress (startOpen), each with the ShutdownStore
   // events that arrived meanwhile, newest first. Such a store is in its device's loadedStores, so a
@@ -323,6 +326,15 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         router.clearLoading(backend.storeId)
         p.failure(err)
 
+      case (Right(Some(state)), Some(crl)) if neverFits(state, crl, admissionOf(storageDeviceId)).nonEmpty =>
+        // No CRL of this device can ever take it (crash-recovery-log 6.1, A3), as for a store moved from a device with
+        // a larger CRL: retrying would keep the store offline for good, so it is rebuilt as one whose file is unusable
+        val err = new IllegalStateException(s"the CRL state of store ${backend.storeId} can never fit its device's " +
+          s"CRL: ${neverFits(state, crl, admissionOf(storageDeviceId)).get}")
+        ctx.rebuilds.crlSaveFileLost(storageDeviceId, backend, err)
+        router.clearLoading(backend.storeId)
+        p.failure(err)
+
       case (Right(_), None) =>
         // Its device was unloaded since the open: nothing may serve it
         val err = new IllegalStateException(s"device $storageDeviceId of store ${backend.storeId} is not loaded")
@@ -394,12 +406,49 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 if replacing.isEmpty then
                   ctx.threading.release(storeId)
                 abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
-              case Success(entry) =>
-                // Its recovered transactions are counted by the new store, in place of what its last close kept
+              // A crl_save.log state is charged, checked, before any of it is saved (crash-recovery-log 6.1, A3).
+              // Retained for the store, the charge is swapped for its recovery's own count (Frontend.recoverState),
+              // as what the device's open or its last close retained is: the store's records are never uncounted
+              // (A2). Charged here, after the build, so no later failure of the load leaves it charged: a failed
+              // loadStore drops the store's entries and releases what is retained for it (handleUnloadFailed)
+              case Success(entry) if !trs.forall(state => entry.store.frontend.admission.tryChargeLoaded(storeId,
+                  CrlAdmission.recoveredBytes(state), crl.maxTransactionBytes)) =>
+                val err = new IllegalStateException(s"the CRL of store $storeId's device has no room for its saved " +
+                  s"state now")
+                crlRoomLog.admit().foreach: held =>
+                  logger.warn(s"Store $storeId is not loaded yet: its crl_save.log state does not fit what its " +
+                              s"device's CRL admits now. Leaving it offline, its save file kept, and retrying at the " +
+                              s"device scans${LogRateLimit.heldText(held)}")
+                executor.execute(() => entry.store.objectCache.clear())
                 if replacing.isEmpty then
-                  entry.store.frontend.admission.releaseRetained(storeId)
+                  ctx.threading.release(storeId)
+                  // Retried as a store awaiting space is, once a scan, until it fits
+                  ctx.devices.devices.get(storageDeviceId).foreach: sds =>
+                    storesAwaitingSpace += storeId -> SpaceWait(sds, backend.path, 1, 1)
+                abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
+              case Success(entry) =>
                 router.install(entry)
                 awaitCrlLoad(entry.store, trs, p)
+
+  /** The admission of a device's CRL, Unlimited for a device not loaded here (the test seam's CRL) */
+  private def admissionOf(storageDeviceId: StorageDeviceId): CrlAdmission =
+    ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited)
+
+  /** Why `state` can never be saved in `crl` counting with `admission`, if it cannot: its bytes exceed the admission
+   *  limit plus the per-transaction bound, the most a load is charged against (CrlAdmission.tryChargeLoaded), or one
+   *  of its transactions exceeds that bound (CRL-W2) */
+  private def neverFits(state: StoreRecoveryState, crl: CrashRecoveryLog, admission: CrlAdmission): Option[String] =
+    val bytes = CrlAdmission.recoveredBytes(state)
+    val slack = crl.maxTransactionBytes
+    val max = if admission.limitBytes > Long.MaxValue - slack then Long.MaxValue else admission.limitBytes + slack
+    state.transactions.find(trs => CrlAdmission.recoveredBytes(trs) > slack) match
+      case Some(trs) =>
+        Some(s"a transaction of ${CrlAdmission.recoveredBytes(trs)} bytes exceeds its $slack per transaction")
+      case None if bytes > max => Some(s"its $bytes bytes exceed the $max it admits for one load")
+      case None => None
+
+  /** A crl_save.log state refused for want of room in its device's CRL is warned of once a minute at most */
+  private val crlRoomLog = new LogRateLimit(60_000)
 
   /** A LoadStore that failed before its store was installed: closes `backend` unserved and fails `p`. Unless an
    *  earlier store is still served in its place (`replaced`), the store is also left offline and dropped from its

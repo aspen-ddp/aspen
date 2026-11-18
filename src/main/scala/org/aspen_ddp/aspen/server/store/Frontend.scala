@@ -863,10 +863,16 @@ class Frontend(val storeId: StoreId,
   // Undeferred (tests only), the state is read here, which may block on the CRL
   if deferRecovery then awaitRecovery() else recoverState(Await.result(crl.readStoreState(storeId), Duration.Inf))
 
+  /** Counts and recreates the store's recovered state, then releases what was retained for the store: what the
+    * device's open, its last close, a loaded crl_save.log (CrlAdmission.tryChargeLoaded) or a store this one replaces
+    * (StoreRouter.install) counted for the same records. Counted first, then released, so the records are never
+    * uncounted in between, where other stores could admit into the gap (crash-recovery-log 6.1, A2). A recovery that
+    * throws leaves the retained bytes counted too, which only over-counts */
   private def recoverState(state: StoreRecoveryState): Unit =
     // Counted without a check, as recovered transactions are: the CRL already holds them
     chargeStubs(state.appliedStubs.count((txid, start) => addStub(txid, start)))
     recoverTransactions(state.transactions)
+    admission.releaseRetained(storeId)
 
   /** Recreates the transactions in `states`, which the CRL holds for this store, that are not already known.
     *
@@ -1260,13 +1266,17 @@ class Frontend(val storeId: StoreId,
 
   /** Whether a prepare may be handled.
     *
-    * A transaction this Frontend admitted (recovered ones included) always is, since dropping it would free nothing
-    * and could strand it. Object data it brings that is not yet counted is charged without a limit check. A known
-    * transaction always is too, as is one finalized in the status cache, which is answered from the cache and never
-    * reaches the CRL. Any other is counted for its description, object data and CRL record, and admitted only while
-    * the device's admission is below this store's tier's ceiling (CrlAdmission lanes: a metadata or bootstrap store
-    * keeps room for the marker batches data transactions finalize with). The status cache is host-wide, so a transaction merely started on another
-    * store is not known here.
+    * A transaction this Frontend admitted (recovered ones included) is, unless its prepare brings object data not yet
+    * counted: that data is charged only while the device's admission is below this store's tier's ceiling, as a new
+    * transaction is, and the prepare is dropped (Full) otherwise (crash-recovery-log 6.1, A1). Charged unchecked,
+    * data arriving after any number of data-less admissions made below the ceiling could each bring up to
+    * `maxTransactionBytes`. The client retransmits; a data-less prepare of it is still handled. A known transaction
+    * with no admission record is admitted too: it is one whose CRL state was deleted, which saves nothing more and
+    * answers with its outcome (Tx.stateDeleted, A4). So is one finalized in the status cache, which is answered from
+    * the cache and never reaches the CRL. Any other is counted for its description, object data and CRL record, and
+    * admitted only while the device's admission is below this store's tier's ceiling (CrlAdmission lanes: a metadata
+    * or bootstrap store keeps room for the marker batches data transactions finalize with). The status cache is
+    * host-wide, so a transaction merely started on another store is not known here.
     *
     * Oversized: the transaction's counted bytes, with data already counted for an admitted one, would exceed
     * `crl.maxTransactionBytes`, so saving it would kill the CRL (CRL-W2). Nothing is charged. Data arriving after a
@@ -1279,11 +1289,15 @@ class Frontend(val storeId: StoreId,
       case Some(a) =>
         val added = uncounted(a, m.objectUpdates)
         val bytes = dataBytes(added)
-        if added.nonEmpty && a.bytes + bytes > crl.maxTransactionBytes then
-          oversized(txid, a.bytes + bytes)
-        else
-          chargeData(a, added)
+        if added.isEmpty then
           PrepareAdmission.Admitted
+        else if a.bytes + bytes > crl.maxTransactionBytes then
+          oversized(txid, a.bytes + bytes)
+        else if admission.tryAdmit(bytes, admissionTier) then
+          countData(a, added, bytes)
+          PrepareAdmission.Admitted
+        else
+          PrepareAdmission.Full
       case None if transactions.contains(txid) || statusCache.getStatus(txid).exists(_.finalized) =>
         PrepareAdmission.Admitted
       // Checked before serializing: a prepare that will be dropped costs nothing more
@@ -1314,14 +1328,19 @@ class Frontend(val storeId: StoreId,
   private def uncounted(a: Admitted, updates: List[ObjectUpdate]): List[ObjectUpdate] =
     updates.filterNot(ou => a.dataCounted.contains(ou.objectId))
 
-  /** Charges `a` for the data of `updates` not counted yet, without a limit check */
+  /** Charges `a` for the data of `updates` not counted yet, without a limit check: only for data the CRL already
+    * holds (admitRecovered) */
   private def chargeData(a: Admitted, updates: List[ObjectUpdate]): Unit =
     val added = uncounted(a, updates)
     if added.nonEmpty then
       val bytes = dataBytes(added)
       admission.charge(bytes)
-      a.bytes += bytes
-      a.dataCounted ++= added.iterator.map(_.objectId)
+      countData(a, added, bytes)
+
+  /** Records that `a` is charged `bytes` for the data of `added` */
+  private def countData(a: Admitted, added: List[ObjectUpdate], bytes: Long): Unit =
+    a.bytes += bytes
+    a.dataCounted ++= added.iterator.map(_.objectId)
 
   /** Counts a transaction recovered from the CRL, without a limit check (the CRL already holds it), as admitPrepare
     * counts a new one: repeated restarts under load must not stack uncounted live bytes in the device CRL. One whose
@@ -1373,8 +1392,8 @@ class Frontend(val storeId: StoreId,
     allocationConcluded(txid)
     releaseAdmission(txid)
 
-  /** Releases everything this Frontend's transactions were admitted for: it is closing, or was built and never
-    * served */
+  /** Releases everything this Frontend's transactions were admitted for: it was built and never served. A store
+    * that served retains them instead (retainAdmissions): its records may be live in the CRL */
   def releaseAllAdmissions(): Unit =
     admitted.valuesIterator.foreach(a => admission.release(a.bytes))
     admitted.clear()
@@ -1383,18 +1402,24 @@ class Frontend(val storeId: StoreId,
     admission.release(stubBytesCharged)
     stubBytesCharged = 0L
 
-  /** Closes the store. Its entries stay live in the CRL unless the closer takes them out, so what its transactions
-    * were admitted for stays counted, retained for the store (CrlAdmission.retain) */
-  def close(): Future[Unit] =
-    closed = true
-    failParkedRepairs()
-    dropParkedReads()
-    // A stub not yet durable has not replaced its transaction's state: that stays counted too
+  /** Moves everything this Frontend's transactions and stubs were admitted for into what the device's admission
+    * retains for the store (CrlAdmission.retain), still counted: the store is closing or replaced, and its entries
+    * stay live in the CRL until they leave it or the store's next recovery counts them afresh (recoverState). A stub
+    * not yet durable has not replaced its transaction's state: that stays counted too */
+  def retainAdmissions(): Unit =
     admission.retain(storeId, admitted.valuesIterator.map(_.bytes).sum + stubReplacedAdmissions.valuesIterator.sum +
       stubBytesCharged)
     admitted.clear()
     stubReplacedAdmissions.clear()
     stubBytesCharged = 0L
+
+  /** Closes the store. Its entries stay live in the CRL unless the closer takes them out, so what its transactions
+    * were admitted for stays counted, retained for the store (retainAdmissions) */
+  def close(): Future[Unit] =
+    closed = true
+    failParkedRepairs()
+    dropParkedReads()
+    retainAdmissions()
     backend.close()
 
   def path: os.Path = backend.path

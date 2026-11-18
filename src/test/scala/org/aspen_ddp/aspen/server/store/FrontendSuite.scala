@@ -5621,6 +5621,63 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     admission.admittedBytes shouldBe 100
   }
 
+  // CRL admission rule A1 (crash-recovery-log 6.1): late data is checked against the lane as a new transaction is
+  test("lateDataFull: data for an admitted transaction is dropped as Full past the lane, and charged below it") {
+    val admission = new CrlAdmission(1024 * 1024)
+    val crl = new TestCrl
+    val (store, _, _) = admissionStore(admission, crl)
+    val withData = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+    val dataLess = withData.copy(objectUpdates = Nil, fromClient = false)
+
+    store.frontend.admitPrepare(dataLess) shouldBe PrepareAdmission.Admitted
+    // Other transactions fill the data lane
+    admission.charge(admission.ceiling(AdmissionTier.Data) - admission.admittedBytes)
+    val full = admission.admittedBytes
+    store.frontend.admitPrepare(withData) shouldBe PrepareAdmission.Full
+    admission.admittedBytes shouldBe full
+    // Through the store, the data-carrying prepare is dropped: no save carries the data
+    store.receiveTransactionMessage(dataLess)
+    store.receiveTransactionMessage(withData)
+    admission.admittedBytes shouldBe full
+    crl.savedStates.foreach(_.objectUpdates shouldBe empty)
+    // A data-less retransmission is still handled: it charges nothing
+    store.frontend.admitPrepare(dataLess) shouldBe PrepareAdmission.Admitted
+
+    // Below the ceiling the data is charged
+    admission.release(1)
+    store.frontend.admitPrepare(withData) shouldBe PrepareAdmission.Admitted
+    admission.admittedBytes shouldBe full - 1 + admissionBytes(withData) - admissionBytes(dataLess)
+  }
+
+  // CRL admission rule A4 (crash-recovery-log 6.1): a Tx whose admission was released saves nothing more
+  test("a resolved-aborted Tx whose state was deleted answers a prepare and an accept with TxResolved, saving nothing") {
+    val admission = new CrlAdmission(Long.MaxValue)
+    val crl = new TestCrl
+    val (store, _, net) = admissionStore(admission, crl)
+    val p1 = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+    store.receiveTransactionMessage(p1)
+    store.frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false, late = false,
+      proof = false))
+    crl.deleted shouldBe List(txid1)
+    admission.admittedBytes shouldBe 0
+    // Kept until TxFinalized
+    store.frontend.transactions.contains(txid1) shouldBe true
+    val saves = crl.savedStates.size
+    val driver = StoreId(poolId, 2.toByte)
+
+    val prepare = mkPrepare(p1.txd, fromClient = false).copy(from = driver, proposalId = ProposalId(5, 2))
+    store.frontend.admitPrepare(prepare) shouldBe PrepareAdmission.Admitted
+    store.frontend.receiveTransactionMessage(prepare)
+    store.frontend.receiveTransactionMessage(TxAccept(storeId, driver, txid1, ProposalId(5, 2), value = false))
+
+    crl.savedStates.size shouldBe saves
+    net.sentTx.collect { case r: TxResolved if r.to == driver => (r.transactionId, r.committed, r.proof) } shouldBe
+      List((txid1, false, false), (txid1, false, false))
+    net.sentTx.collect { case r: TxPrepareResponse if r.to == driver => r } shouldBe empty
+    net.sentTx.collect { case r: TxAcceptResponse if r.to == driver => r } shouldBe empty
+    admission.admittedBytes shouldBe 0
+  }
+
   // Cross-document-review X5: data transactions filling a shared device must not block the marker batches, on the
   // device's metadata-pool stores, that those transactions finalize with
   test("past the data lane a data store drops a new prepare while a metadata store on the device admits one") {
@@ -5851,8 +5908,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("object data arriving after a data-less prepare is charged once, and returned at finalization") {
-    // Past the mark once tx1 is admitted: the data is charged anyway, since tx1 is known
-    val admission = new CrlAdmission(1)
+    // Below the lane: data arriving for an admitted transaction past it is dropped (lateDataFull)
+    val admission = new CrlAdmission(Long.MaxValue)
     val (store, backend, net) = admissionStore(admission)
     val withData = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
     val dataLess = withData.copy(objectUpdates = Nil, fromClient = false)

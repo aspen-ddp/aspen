@@ -84,7 +84,14 @@
   directory is disowned, the stores closed and gossiped offline, the device unloaded, and nothing written. The device
   stays unloaded until the host restarts: it is not reloaded, which could loop into a lost-CRL declaration
   (`CrlOpenAttempts`), and it is not marked Failed in the tree. Its admission is charged at load for every store's CRL
-  records, retained per store (`CrlAdmission.chargeRetained`)
+  records, retained per store (`CrlAdmission.chargeRetained`). A loading store releases what is retained for it only
+  after its recovery has counted its records (`Frontend.recoverState`); a reload over a loaded store retains the old
+  store's admissions on the shared executor (`StoreRouter.install`), and the new store's CRL read is issued behind
+  every save the old one made (crash-recovery-log 6.1, A2)
+- A `crl_save.log` state is charged before `loadStore` saves it (`CrlAdmission.tryChargeLoaded`, at most the limit
+  plus one transaction, A3), after the Store is built and before install, retained for the store. Refused, the store
+  is left offline, its file kept, and retried every device scan through `storesAwaitingSpace` (one warning per
+  minute). A state that can never fit (above limit + T, or a transaction above T) takes `crlSaveFileLost`: rebuilt
 - Planned physical moves: `shutdownStorageDevice` makes Active stores Offline and the device ShuttingDown; its host
   closes the stores, leaving their CRL state live in the device CRL (no per-store marker or save file), writes
   `shutdown.state` (its HostId) in the device dir, and commits Shutdown. Each device dir also has `owning-host`

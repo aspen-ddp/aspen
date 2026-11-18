@@ -190,13 +190,18 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
    `readStoreState`. It does not block: the Future completes on the CRL thread and recovery is routed back to the
    executor. The store holds its transaction messages until `Frontend.recover` has recreated its transactions, so it
    saves nothing in between. A throw while reading or recovering fail-stops the store (`Host.StoreFailStopped`).
-4. With a save file: `crl.loadStore` saves every record into the device CRL, then `StoreRouter.crlLoaded` removes the
+4. With a save file: its state is first charged to the device's admission, checked (`CrlAdmission.tryChargeLoaded`,
+   section 6.1 A3); a state that does not fit now leaves the store offline with its file kept, retried at the device
+   scans, and one that never can is treated as an unusable file (step 2). Then `crl.loadStore` saves every record
+   into the device CRL, then `StoreRouter.crlLoaded` removes the
    file durably (`DurableFiles.remove`) and only then recovers. A crash between "records durable in the device CRL"
    and "file removed" loads the same records again under the same ids, which is harmless: the store served nothing in
    between. A failed `loadStore` unloads the store (`handleUnloadFailed`), which drops whatever reached the CRL
    (`closeUnloaded(dropDurably = true)`): the file is still the whole state.
 5. Recovered transactions are counted into the device's admission without a limit check (`Frontend.admitRecovered`),
-   as are recovered stubs (`chargeStubs`), replacing the share the device's open retained for the store (section 6).
+   as are recovered stubs (`chargeStubs`). Only then is what was retained for the store released: the share the
+   device's open, its last close, step 4's charge or a replaced store retained (`Frontend.recoverState`, section 6.1
+   A2).
 
 ### 3.4 Deletion is gated on the backend
 
@@ -570,8 +575,7 @@ written, so a restart recovers them as after a crash.
 streams of `S` bytes, 6.1 sets the limit SimpleCRL must give at `(n − 2) · S/2 − S/16`: `15S/16` for the minimum of
 4 streams, `9S − S/16` for 20. The per-transaction bound is `T = S/2 − 8192` (`SimpleCRL.EntryOverheadReserve`). 6.1
 proves that, with the rules it lists, these keep every entry writable, and it states the one assumption the proof
-cannot discharge. W1-W6 and S1 are SimpleCRL's and are implemented; A1-A4, the Frontend's and the store loader's, are
-requirements not yet implemented (phase C). The bullets below describe admission with those rules met.
+cannot discharge. W1-W6 and S1 are SimpleCRL's, A1-A4 the Frontend's and the store loader's; all are implemented.
 
 - **New transactions.** `Frontend.admitPrepare` admits a prepare for a transaction it has not seen only while the
   total is below its store's tier ceiling (`AdmissionTier`, the store's pool's, persisted in its StoreConfig): 3/4 of
@@ -583,18 +587,21 @@ requirements not yet implemented (phase C). The bullets below describe admission
   admission, so one admission may cross the ceiling by its own size, at most `T`.
 - **Oversized.** A prepare that would make its transaction's counted bytes on the store exceed `T`, with data already
   counted for an admitted one, is dropped the same way and charges nothing (`PrepareAdmission.Oversized`).
-- **Late data** of an admitted transaction (`chargeData` from `admitPrepare`) must be charged only while the total is
-  below the store's tier ceiling, as a new transaction is, and the prepare dropped otherwise (A1).
+- **Late data** of an admitted transaction is charged by `admitPrepare` only while the total is below the store's
+  tier ceiling (`tryAdmit`), as a new transaction is, and the prepare is dropped as `Full` otherwise (A1). A
+  data-less prepare of an admitted transaction charges nothing and is handled.
 - **Charged without a check:** stubs (`chargeStubs`), recovered transactions (`admitRecovered`, its `chargeData`
   included: that data is already in the CRL), and at device open everything the CRL holds, per store
-  (`recoveredBytesByStore`, `chargeRetained`). A loading store's recovery must count its recovered state before what
-  was counted for it is released (A2).
-- **Loaded state** (`loadStore`, from a `crl_save.log`) must be charged atomically before it is saved, only while the
-  total plus its bytes stays at most `limit + T` (A3).
+  (`recoveredBytesByStore`, `chargeRetained`). A loading store's recovery counts its recovered state and only then
+  releases what was retained for it (`Frontend.recoverState`, A2).
+- **Loaded state** (`loadStore`, from a `crl_save.log`) is charged before it is saved, in one check-and-charge
+  (`CrlAdmission.tryChargeLoaded`) that succeeds only while the total plus its bytes stays at most `limit + T`, and
+  is retained for the store (A3).
 - **Released** when the record is deleted (`deleteTransactionState`, `concludeTransactionState`), when a Tx is
   forgotten without reaching the CRL, or, for a transaction replaced by a stub, once the stub is durable. A stub's
-  charge is released when it expires (`dropAppliedStub`). A store replaced by a reload releases all its admissions
-  (`StoreRouter.install`, `releaseAllAdmissions`) once the replacing store has counted the same records (A2).
+  charge is released when it expires (`dropAppliedStub`). A store replaced by a reload moves all its admissions into
+  what is retained for the store (`StoreRouter.install`, `Frontend.retainAdmissions`), released once the replacing
+  store has counted the same records (A2).
 - **Retained.** A closing store keeps its bytes counted for it (`CrlAdmission.retain`) until its entries leave the CRL
   (`releaseRetained` after an extraction's deletion, a `dropStore`, a leftover drop) or it loads again and counts its
   own. Records of stores that never load on this run are therefore counted from the open while they are evacuated.
@@ -653,28 +660,38 @@ SimpleCRL (implemented: `SimpleCRL.writeHead`, `entryFor`, `onSaveTransaction`, 
 - **W6, fail-stop.** A head not written after `n − 1` rotations in a row means an assumption below was broken: the CRL
   fails (5.10) instead of rotating on. The files are recoverable as after a crash.
 
-Frontend and store loader (requirements, phase C: not yet implemented):
+Frontend and store loader (implemented: `Frontend.admitPrepare`, `recoverState`, `retainAdmissions`,
+`StoreRouter.install`, `StoreLoader.handleLoad`, `CrlAdmission.tryChargeLoaded`, `Tx.stateDeleted`):
 
 - **A1, late data is checked.** Data arriving in a prepare for an admitted transaction is charged only while the total
-  is below the store's tier ceiling, and the prepare is dropped (`Full`) otherwise. `admitRecovered`'s `chargeData` is
-  exempt: it counts data the CRL already holds, which the retained charge counted until then.
+  is below the store's tier ceiling (one `tryAdmit`), and the prepare is dropped (`Full`) otherwise, with no reply: the
+  client retransmits. `admitRecovered`'s `chargeData` is exempt: it counts data the CRL already holds, which the
+  retained charge counted until then.
 - **A2, nothing live is uncounted across a reload.** A loading store's recovered state is charged before what was
-  counted for its records is released: what its last close or the device's open retained (`releaseRetained` at
-  `StoreLoader`'s install) and the admissions of a store the reload replaces (`releaseAllAdmissions` at
-  `StoreRouter.install`). Both follow the deferred recovery's count, not the install.
+  counted for its records is released. Everything counted for them is retained for the store: by its last close, the
+  device's open, a loaded state's charge (A3), and, for a store the reload replaces, by `StoreRouter.install`, which
+  moves the old store's admissions there on the shared executor (`retainAdmissions`). `Frontend.recoverState`
+  releases it after its count. The replacing store's CRL read is issued from a task queued behind the install's, on
+  the executor the old store saved from, so it follows every save the old store made; nothing reaches the old store
+  after that task (comment at `StoreRouter.install`).
 - **A3, loaded state is checked.** `loadStore`'s state is charged before it is saved, in one atomic check-and-charge on
   `CrlAdmission` (a compare-and-set loop like `tryAdmit`) that succeeds only if the total plus its bytes is at most
   `limit + T`. The charge is retained for the store, so its recovery's own count replaces it under A2: a swap, not an
   addition. A refused load leaves the store offline with its `crl_save.log` kept and is retried later. A state that can
   never fit (its bytes above `limit + T`, or one transaction counted above `T`, as a store moved from a larger CRL may
-  hold) is not retried: its save file is treated as lost (`crlSaveFileLost`) and the store is rebuilt. A transfer does
-  not choose a destination whose CRL cannot take the state.
+  hold) is not retried: its save file is treated as lost (`crlSaveFileLost`) and the store is rebuilt. The check
+  leaves out what is already retained for the store: a CRL holding records for a store with a save file holds only
+  that file's records (an interrupted extraction or load), which the load saves again in place. A refused load is
+  retried at each device scan (`StoreLoader.storesAwaitingSpace`). Not implemented: transfer planning does not yet
+  avoid a destination whose CRL cannot take the state; such a transfer ends in the never-fits rebuild at the
+  destination.
 - **A4, no save without a charge.** A Tx saves to the CRL only while its transaction holds an admission record
-  (`Frontend.admitted`, or a retained or recovered charge). Two paths must keep it: `admitPrepare`'s admission of a
-  prepare for a known transaction (`transactions.contains`), which charges nothing, and an aborted Tx after
-  `deleteTransactionState` released its admission while the Tx stays in `transactions`, where a later Paxos message
-  would save it again, a re-save after the deletion. A Tx whose charge is released saves nothing more and answers no
-  message that needs a save; a prepare for a known transaction with no record is admitted only as a new one.
+  (`Frontend.admitted`, or a retained or recovered charge). The one Tx in `transactions` without a record is an
+  abort whose state `deleteTransactionState` deleted at resolution, kept until `TxFinalized` (`Tx.stateDeleted`). It
+  saves nothing more: a prepare (`admitPrepare` admits it as a known transaction, charging nothing), an accept, or a
+  prepare response delayed until its objects loaded is answered with a `TxResolved` of the abort to the proposer,
+  never a promise or an acceptance; late data is not adopted; `Tx.saveState` requires it. This is sound for Paxos:
+  the abort is the value already chosen, and an acceptor that promises and accepts nothing can help choose no other.
 
 **Why W1a and W3 are needed even without rotations.** With entries queued (W1), an entry built after a deletion
 request but before the entry holding the deletion would otherwise stamp `oldestEntryNeeded` past the deleted record's

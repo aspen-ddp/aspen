@@ -199,14 +199,20 @@
 - A store admits a prepare for a transaction it has not seen (not admitted or recovered by its Frontend, nor
   finalized in the host-wide status cache) for its description, object data and CRL record, and drops it silently
   while the device's admitted bytes are at or past its lane's ceiling (`Frontend.admissionTier`, from
-  `StoreConfig.admissionTier`): 3/4 of the limit (half a CRL stream, `SimpleCRL.admissionLimitBytes`) for data pools,
+  `StoreConfig.admissionTier`): 3/4 of the limit (`SimpleCRL.admissionLimitBytes`) for data pools,
   7/8 for metadata pools, the whole limit for the bootstrap pool. Marker batches are always a tier above what they
-  finalize, so lower-tier load never blocks them (safety X5, G10). Object data arriving later is charged once per
-  object without a check. Everything else (known transactions' prepares, accepts, resolutions, finalizations,
-  heartbeats, status requests) is handled. Bytes are released when
-  the entry is deleted, a Tx is forgotten without one, or the store closes; a Tx waiting on an in-flight commit keeps
-  its admission. Recovered transactions are counted too, without a check. Accepted gap: a retransmit past the mark
-  while a store awaits its crl_save.log is dropped
+  finalize, so lower-tier load never blocks them (safety X5, G10). Object data arriving later for an admitted
+  transaction is charged once per object, only below the lane's ceiling (`tryAdmit`); past it the prepare is dropped
+  as `Full` and the client retransmits (crash-recovery-log 6.1, A1). Everything else (data-less prepares of known
+  transactions, accepts, resolutions, finalizations, heartbeats, status requests) is handled. Bytes are released
+  when the entry is deleted or a Tx is forgotten without one; a Tx waiting on an in-flight commit keeps its
+  admission. A closing or replaced store moves its bytes into what the device retains for it
+  (`Frontend.retainAdmissions`). Recovered transactions are counted without a check (`admitRecovered`, data
+  included), and only then is what was retained for the store released (`recoverState`, A2: a swap, never a gap).
+  Accepted gap: a retransmit past the mark while a store awaits its crl_save.log is dropped
+- No save without a charge (A4): an abort whose CRL state was deleted at resolution (`Tx.stateDeleted`) stays in
+  `transactions` until `TxFinalized` with no admission; it saves nothing more, answering a prepare or accept with a
+  `TxResolved` of the abort, and adopts no late data. `Tx.saveState` requires it
 - Oversized prepares (CRL-W2): `Frontend.admitPrepare` returns `PrepareAdmission` (`Admitted`, `Full`, `Oversized`)
   and `Store.receiveTransactionMessage` drops both non-admitted kinds the same way: no reply, no vote, no CRL write.
   `Oversized`: the transaction's counted bytes (for an admitted one, its bytes plus the uncounted data the prepare

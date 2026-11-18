@@ -100,8 +100,10 @@
   pool's, persisted in its StoreConfig): data stores admit below 3/4 of it, metadata stores below 7/8, bootstrap
   stores up to it, so the marker batches each tier's finalization needs keep headroom (safety X5, G10). `Stream.writeEntry`'s `require` stays
   the fail-stop backstop. The admission counts everything the CRL holds from the device's open
-  (`recoveredBytesByStore`, `CrlAdmission.recoveredBytes`), retained per store until the store loads and counts its
-  own, or its entries leave the CRL: records of stores that do not load are evacuated too (safety F8)
+  (`recoveredBytesByStore`, `CrlAdmission.recoveredBytes`), retained per store until the store loads and has counted
+  its own, or its entries leave the CRL: records of stores that do not load are evacuated too (safety F8). The
+  Frontend and store loader keep every save charged (safety 6.1, A1-A4: late data checked, reload swaps, loaded
+  state checked by `tryChargeLoaded`, no save after a release)
 - `maxTransactionBytes` (SimpleCRL: half a stream less `EntryOverheadReserve`, 8 KiB; trait default unlimited): the
   most bytes, as `CrlAdmission` counts them, one store's transaction may hold. `Frontend.admitPrepare` drops a prepare
   past it unsaved (`PrepareAdmission.Oversized`, `server/store/CLAUDE.md`), so no entry outgrows a stream and trips

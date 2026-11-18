@@ -16,6 +16,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
+import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.{CompletionHandler, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionStatusCache}
@@ -202,6 +203,26 @@ object StoreRouterSuite:
     try f(fx) finally fx.shutdown()
 
   private def emptyCrl: CrashRecoveryLog = new GatedCrl(Future.unit)
+
+  /** A GatedCrl whose loadStore waits for `loadGate`, whose readStoreState waits for `readGate` as set when it is
+   *  called, and whose transactions take at most `maxTx` CRL bytes */
+  private class ReadGatedCrl(loadGate: Future[Unit] = Future.unit, maxTx: Long = Long.MaxValue)
+    extends GatedCrl(loadGate):
+    @volatile var readGate: Future[Unit] = Future.unit
+    override def maxTransactionBytes: Long = maxTx
+    override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
+      readGate.flatMap(_ => super.readStoreState(storeId))(using ExecutionContext.parasitic)
+
+  /** A commit vote of `s0` overwriting `oid` with `dataSize` bytes */
+  private def voteState(s0: StoreId, txid: TransactionId, dataSize: Int = 1): TransactionRecoveryState =
+    TransactionRecoveryState(s0, overwriteTxd(txid).serialize(), List(ObjectUpdate(oid, DataBuffer(new Array[Byte](dataSize)))),
+      TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial)
+
+  /** Waits, bounded, until `cond` holds */
+  private def awaitTrue(cond: => Boolean): Unit =
+    val deadline = System.nanoTime() + Bound * 1_000_000_000L
+    while !cond && System.nanoTime() < deadline do Thread.sleep(1)
+    assert(cond)
 
   /** Records every driver it creates and whether it was shut down (Ruling 31: Store.close stops them) */
   private class RecordingDriverFactory extends TransactionDriver.Factory:
@@ -469,6 +490,126 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       admission.admittedBytes should be(once)
       first.closed should be(true)
       second.closed should be(false)
+
+  /** A device over `crl` counting with `admission`, whose loadedStores already holds `storeId` */
+  private def addCountingDevice(fx: Fixture, storeId: StoreId, crl: CrashRecoveryLog,
+                                admission: CrlAdmission): LocalStorageDeviceState = fx.onControl:
+    val dir = os.temp.dir()
+    val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
+    sds.loadedStores += storeId
+    fx.ctx.devices.devices += deviceId -> sds
+    sds
+
+  // CRL admission rule A2 (crash-recovery-log 6.1): nothing live is uncounted across a load
+  test("a loading store's recovered state is counted before what the device's open retained for it is released"):
+    val s0 = StoreId(poolId, 0)
+    val crl = new ReadGatedCrl
+    val trs = voteState(s0, TransactionId(new UUID(15, 9)))
+    crl.save(TransactionId(new UUID(15, 9)), trs, () => ())
+    val bytes = CrlAdmission.recoveredBytes(trs)
+    val admission = new CrlAdmission(Long.MaxValue)
+    // As the device's open counts what its CRL holds
+    admission.chargeRetained(s0, bytes)
+    val read = Promise[Unit]()
+    crl.readGate = read.future
+    withRouter(crl): fx =>
+      addCountingDevice(fx, s0, crl, admission)
+      await(fx.load(bootstrappedBackend(s0)))
+      fx.awaitExecutor(fx.ctx.router.entry(s0).get.executor)
+      // Installed, its CRL read outstanding: its records are still counted
+      admission.admittedBytes should be(bytes)
+      read.success(())
+      awaitTrue(admission.retainedBytes(s0) == 0)
+      // Counted once, by the store
+      admission.admittedBytes should be(bytes)
+
+  test("a reload over a loaded store keeps its records counted until the new store has counted them"):
+    val s0 = StoreId(poolId, 0)
+    val crl = new ReadGatedCrl
+    val trs = voteState(s0, TransactionId(new UUID(15, 10)))
+    crl.save(TransactionId(new UUID(15, 10)), trs, () => ())
+    val bytes = CrlAdmission.recoveredBytes(trs)
+    val admission = new CrlAdmission(Long.MaxValue)
+    withRouter(crl): fx =>
+      addCountingDevice(fx, s0, crl, admission)
+      val first = bootstrappedBackend(s0)
+      await(fx.load(first))
+      awaitTrue(admission.admittedBytes == bytes)
+      val executor = fx.ctx.router.entry(s0).get.executor
+      val read = Promise[Unit]()
+      crl.readGate = read.future
+      await(fx.load(bootstrappedBackend(s0)))
+      fx.awaitExecutor(executor)
+      // The old store is closed on the executor, the new one's CRL read outstanding: still counted
+      first.closed should be(true)
+      admission.admittedBytes should be(bytes)
+      read.success(())
+      awaitTrue(admission.retainedBytes(s0) == 0)
+      admission.admittedBytes should be(bytes)
+
+  // CRL admission rule A3 (crash-recovery-log 6.1): a crl_save.log state is charged, checked, before it is saved
+  test("a crl_save.log state that fits is charged before it is saved, and counted once after recovery"):
+    val s0 = StoreId(poolId, 0)
+    val gate = Promise[Unit]()
+    val crl = new ReadGatedCrl(gate.future, maxTx = 10000)
+    val trs = voteState(s0, TransactionId(new UUID(15, 11)))
+    val bytes = CrlAdmission.recoveredBytes(trs)
+    val admission = new CrlAdmission(1000)
+    withRouter(crl): fx =>
+      addCountingDevice(fx, s0, crl, admission)
+      val backend = bootstrappedBackend(s0)
+      CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(List(trs)), backend.crlSaveFile)
+      val loaded = fx.load(backend)
+      fx.awaitControl()
+      // The save waits on the gate: charged already, retained for the store
+      admission.admittedBytes should be(bytes)
+      admission.retainedBytes(s0) should be(bytes)
+      gate.success(())
+      await(loaded)
+      awaitTrue(admission.retainedBytes(s0) == 0)
+      admission.admittedBytes should be(bytes)
+      os.exists(backend.crlSaveFile) should be(false)
+
+  test("a crl_save.log state that does not fit now is refused: the store stays offline, its file kept, and retried"):
+    val s0 = StoreId(poolId, 0)
+    val crl = new ReadGatedCrl(maxTx = 10000)
+    val trs = voteState(s0, TransactionId(new UUID(15, 12)))
+    val bytes = CrlAdmission.recoveredBytes(trs)
+    val admission = new CrlAdmission(1000)
+    // Other stores' transactions leave less than the state's bytes below limit + T
+    admission.charge(1000 + 10000 - bytes + 1)
+    val before = admission.admittedBytes
+    withRouter(crl): fx =>
+      val sds = addCountingDevice(fx, s0, crl, admission)
+      val backend = bootstrappedBackend(s0)
+      CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(List(trs)), backend.crlSaveFile)
+      intercept[Exception](await(fx.load(backend)))
+      assertAbandoned(fx, s0, sds, backend)
+      admission.admittedBytes should be(before)
+      admission.retainedBytes(s0) should be(0)
+      os.exists(backend.crlSaveFile) should be(true)
+      os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      crl.getFullRecoveryState(s0) should be(empty)
+      // Retried at the device scans, as a store awaiting space is
+      fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(Some(false))
+
+  for (what, states) <- List(
+    "a state above limit + T" -> ((s0: StoreId) => (1 to 3).toList.map(i => voteState(s0, TransactionId(new UUID(17, i)), 4000))),
+    "a transaction above T" -> ((s0: StoreId) => List(voteState(s0, TransactionId(new UUID(17, 9)), 20000)))) do
+    test(s"a crl_save.log holding $what never fits: its save file is treated as lost and the store rebuilt"):
+      val s0 = StoreId(poolId, 0)
+      val crl = new ReadGatedCrl(maxTx = 10000)
+      val admission = new CrlAdmission(if what.contains("limit") then 100 else Long.MaxValue)
+      withRouter(crl): fx =>
+        val sds = addCountingDevice(fx, s0, crl, admission)
+        val backend = bootstrappedBackend(s0)
+        CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(states(s0)), backend.crlSaveFile)
+        intercept[Exception](await(fx.load(backend)))
+        assertAbandoned(fx, s0, sds, backend)
+        admission.admittedBytes should be(0)
+        os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+        crl.getFullRecoveryState(s0) should be(empty)
+        fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(None)
 
   test("a reload over a loaded store leaves its view to its queued tasks, then uncounts it"):
     val s0 = StoreId(poolId, 0)

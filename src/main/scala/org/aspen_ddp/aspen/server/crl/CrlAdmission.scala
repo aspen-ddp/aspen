@@ -13,18 +13,20 @@ import scala.annotation.tailrec
   * A store admits a prepare for a transaction it has not seen only while the bytes admitted on the device are below
   * `limitBytes` (`CrashRecoveryLog.admissionLimitBytes`), and drops it otherwise: the client retransmits, and that
   * stall is the slowdown. Admitted bytes are released when the transaction's CRL entry is deleted, or when the store
-  * forgets a transaction that never reached the CRL. A store that closes leaves its entries live in the CRL unless its
-  * closer takes them out, so its bytes stay counted, retained for it (`retain`) until they leave the CRL with all of
-  * the store's entries (`releaseRetained`: a transfer out's extraction, a dropStore) or the store loads again and
-  * counts its recovered transactions afresh. The check is against the total before
-  * the admission, so one transaction may cross the limit: the limit leaves headroom for that.
+  * forgets a transaction that never reached the CRL. A store that closes, or is replaced by a reload, leaves its
+  * entries live in the CRL unless its closer takes them out, so its bytes stay counted, retained for it (`retain`)
+  * until they leave the CRL with all of the store's entries (`releaseRetained`: a transfer out's extraction, a
+  * dropStore) or the store loads again and, having counted its recovered transactions afresh, releases them (a swap,
+  * never a gap: crash-recovery-log 6.1, A2). The check is against the total before the admission, so one transaction
+  * may cross the limit: the limit leaves headroom for that.
   *
-  * A transaction is counted for its description, its object data (each object once, charged without a limit check
-  * when it arrives after the transaction was admitted) and the CRL's static record of it (`TxOverheadBytes`,
-  * `ObjectUpdateOverheadBytes`). Transactions recovered at store load are counted the same way, charged without a
-  * limit check (the CRL already holds them), so repeated restarts under load cannot stack uncounted live bytes. An
-  * accepted gap: a retransmitted prepare arriving past the mark while the store awaits its crl_save.log state is
-  * dropped until recovery recreates the transaction.
+  * A transaction is counted for its description, its object data (each object once; data arriving after the
+  * transaction was admitted is checked against the lane as a new transaction is, A1) and the CRL's static record of
+  * it (`TxOverheadBytes`, `ObjectUpdateOverheadBytes`). Transactions recovered at store load are counted the same
+  * way, charged without a limit check (the CRL already holds them), so repeated restarts under load cannot stack
+  * uncounted live bytes. A crl_save.log state is charged before it is saved, checked against the limit plus one
+  * transaction (`tryChargeLoaded`, A3). An accepted gap: a retransmitted prepare arriving past the mark while the
+  * store awaits its crl_save.log state is dropped until recovery recreates the transaction.
   *
   * Lanes (cross-document-review X5, G10): a new transaction is admitted only below its receiving store's tier's
   * ceiling (`AdmissionTier`): 3/4 of the limit for data pools, 7/8 for metadata pools, the whole limit for the bootstrap
@@ -52,7 +54,8 @@ final class CrlAdmission(val limitBytes: Long):
     else
       tryAdmit(bytes, tier)
 
-  /** Adds `bytes` whatever the total: for a transaction already admitted, which must not be dropped */
+  /** Adds `bytes` whatever the total: for what the CRL already holds (recovered state) and applied stubs, which
+    * must not be dropped */
   def charge(bytes: Long): Unit = total.addAndGet(bytes)
 
   /** Whether the total is at or past the ceiling of `tier`, so no new transaction of that tier is admitted */
@@ -80,6 +83,31 @@ final class CrlAdmission(val limitBytes: Long):
     if bytes > 0 then
       charge(bytes)
       retain(storeId, bytes)
+
+  /** Charges `bytes`, the state of `storeId`'s crl_save.log about to be saved in the CRL, retained for the store, if
+    * the total with them stays at most `limitBytes + slack` (crash-recovery-log 6.1, A3; the caller passes the CRL's
+    * per-transaction bound). What is already retained for the store is left out of that total: the CRL can hold for a
+    * store with a save file only records of that file (an extraction or a load interrupted by a crash), which the
+    * load saves again in place, so the two charges count the same records until the store's recovery releases what
+    * is retained (A2). Those are read once, by the control thread, which releases them; a store being replaced may
+    * add to them meanwhile, which only makes the check stricter. One compare-and-set, as tryAdmit: no admission
+    * between the check and the charge */
+  def tryChargeLoaded(storeId: StoreId, bytes: Long, slack: Long): Boolean =
+    val max = if limitBytes > Long.MaxValue - slack then Long.MaxValue else limitBytes + slack
+    val own = retainedBytes(storeId)
+    @tailrec
+    def attempt(): Boolean =
+      val current = total.get
+      if current - own > max - bytes then
+        false
+      else if total.compareAndSet(current, current + bytes) then
+        true
+      else
+        attempt()
+    val charged = attempt()
+    if charged then
+      retain(storeId, bytes)
+    charged
 
   /** What `storeId` is retained for */
   def retainedBytes(storeId: StoreId): Long = Option(retained.get(storeId)).map(_.longValue).getOrElse(0L)

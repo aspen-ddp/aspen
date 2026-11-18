@@ -63,13 +63,18 @@
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
 - Sizing keys in the device config are all optional (`CrlSizingDefaults.resolve`, from the capacity of the file
   system holding the device): `crl-num-streams` 4 (also the minimum; fewer is refused), `crl-max-file-size-mb`
-  capacity / 2048 rounded down to 4 KiB, at least 64 MiB, `crl-max-streams` 20, `crl-min-free-percent` 5 (the last two
-  are growth bounds, read at each open). The stream size is fixed when the device's CRL is created; the stream count
-  only grows. Both are recorded durably in `crl/sizing` (`SimpleCRL.SizingFile`, with the ring) before any stream
-  file, with the CRL's random id (`Sizing.crlId`). An existing CRL always opens with its recorded sizing, whatever
-  the config asks (a warning is logged), so config edits and default changes are harmless. `SimpleCRL.apply` throws
-  `CrlSizingMismatch` for stream files without a readable sizing file or of another count or size than recorded.
-  That is damage or a hand edit, never declared a lost CRL: the device is refused until repaired
+  capacity / 2048 rounded down to 4 KiB, at least 64 MiB, `crl-max-streams` 20 (at most 1024: a `StreamLocation`
+  holds the stream number in 2 bytes), `crl-min-free-percent` 5 (the last two are growth bounds, read at each open).
+  The stream size is fixed when the device's CRL is created; the stream count only grows. Both are recorded durably
+  in `crl/sizing` (`SimpleCRL.SizingFile`, with the ring) before any stream file, with the CRL's random id
+  (`Sizing.crlId`). An existing CRL always opens with its recorded sizing, whatever the config asks (a warning is
+  logged for another stream size or a smaller ring than configured; a ring grown past the configured count is
+  normal), so config edits and default changes are harmless. `DeviceFactory.openCRL` holds the config to `resolve`
+  only when `crl/` holds neither a sizing file nor stream files (a new CRL): a config `resolve` refuses is then
+  `CrlConfigInvalid`, with nothing created in `crl/`. With either file present it takes `resolveExisting`, which never
+  throws (invalid growth bounds disable growth), so a bad config never hides the `CrlSizingMismatch` below.
+  `SimpleCRL.apply` throws `CrlSizingMismatch` for stream files without a readable sizing file or of another count or
+  size than recorded. That is damage or a hand edit, never declared a lost CRL: the device is refused until repaired
   (`DeviceDiscovery.openDeviceCrl`)
 - `openCRL`'s `holdsStores` (`SimpleCRL.apply`'s `mustExist`): the device holds stores, so its CRL must exist. With no
   stream files (only `sizing` or `.crl.tmp` files at most) the open throws `CrlMissing`, writing nothing, and the

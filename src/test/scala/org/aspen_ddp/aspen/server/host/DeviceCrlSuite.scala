@@ -77,6 +77,7 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
     inner.dropTransactionObjectData(storeId, txid)
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = inner.deleteTransaction(storeId, txid)
   override def admissionLimitBytes: Long = inner.admissionLimitBytes
+  override def maxTransactionBytes: Long = inner.maxTransactionBytes
   override def requestGrowth(): Unit = inner.requestGrowth()
   override def onAdmissionLimitRaised(f: Long => Unit): Unit = inner.onAdmissionLimitRaised(f)
   override def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
@@ -1745,6 +1746,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     createCrl(deviceDir)
     val crlDir = CrashRecoveryLog.deviceCrlDir(deviceDir)
     damage(crlDir)
+    def contents = os.list(crlDir).map(f => f.last -> os.read.bytes(f).toSeq).toMap
+    val damaged = contents
     val factory = newFactory()
     val host = newCrlHost(hostRoot, factory)
 
@@ -1754,6 +1757,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     os.exists(marker(storeDir)) should be(false)
     os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
     factory.opened should be(Nil)
+    contents should be(damaged)
 
     repair(crlDir)
     host.control.discovery.checkForNewDevices() should be(List(deviceA))
@@ -1777,13 +1781,57 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         os.remove(crlDir / SimpleCRL.SizingFile),
       crlDir => os.write(crlDir / SimpleCRL.SizingFile, saved))
 
+  /** Removes the CRL's sizing file and gives the device `invalid` as its config: the open must be refused for the
+   *  missing sizing file (CrlSizingMismatch), not the config, so the CRL is never declared lost. Restoring the
+   *  sizing file opens it as recorded, the config notwithstanding */
+  private def unsizedCrlWithInvalidConfig(invalid: StorageDeviceConfig): Future[org.scalatest.Assertion] =
+    var saved = ""
+    sizingMismatchDevice(
+      crlDir =>
+        saved = os.read(crlDir / SimpleCRL.SizingFile)
+        os.remove(crlDir / SimpleCRL.SizingFile)
+        os.write.over(crlDir / os.up / StorageDeviceConfig.configFilename, invalid.yamlConfig),
+      crlDir => os.write(crlDir / SimpleCRL.SizingFile, saved))
+
+  atest("a device CRL with stream files, no recorded sizing and too few configured streams is refused, never lost"):
+    unsizedCrlWithInvalidConfig(StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = Some(1),
+      crlNumStreams = Some(3)))
+
+  atest("a device CRL with stream files, no recorded sizing and a maximum below its streams is refused, never lost"):
+    unsizedCrlWithInvalidConfig(StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = Some(1),
+      crlMaxStreams = Some(2)))
+
+  atest("a new device whose config cannot size a CRL is refused, creating nothing in its CRL directory"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    os.write.over(deviceDir / StorageDeviceConfig.configFilename,
+      StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = Some(1), crlNumStreams = Some(3)).yamlConfig)
+    val crlDir = CrashRecoveryLog.deviceCrlDir(deviceDir)
+    val factory = newFactory()
+    val host = newCrlHost(hostRoot, factory)
+
+    host.control.devices.devices.contains(deviceA) should be(false)
+    for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
+      host.control.discovery.checkForNewDevices() should be(Nil)
+    os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
+    os.list(crlDir) should be(Nil)
+    factory.opened should be(Nil)
+
+    os.write.over(deviceDir / StorageDeviceConfig.configFilename,
+      StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = Some(1)).yamlConfig)
+    host.control.discovery.checkForNewDevices() should be(List(deviceA))
+    Future.successful:
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.head
+      os.exists(crlDir / SimpleCRL.SizingFile) should be(true)
+
   atest("A device whose CRL lane fills grows its CRL and admits more"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
-    // Streams of 1 MiB, a ring of 4 that may grow to 5
+    // Streams of 1 MiB, a ring of 4 that may grow to 5, whatever the temp file system's free space
     os.write.over(deviceDir / StorageDeviceConfig.configFilename,
-      StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = Some(1), crlMaxStreams = Some(5)).yamlConfig)
+      StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = Some(1), crlMaxStreams = Some(5),
+        crlMinFreePercent = Some(0)).yamlConfig)
     createCrl(deviceDir)
     val storeDir = writeStoreDir(deviceDir)
     // One object per transaction, so none collides with another

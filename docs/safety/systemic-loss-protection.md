@@ -99,7 +99,8 @@ These are facts about the code at HEAD. They define the problem; none of them is
   `lost-crl-state.log` and the directory is renamed into `<device>/pending-delete/`. The copy is deleted only once
   the store is Active on its owner device (section 4.4). Nothing checks whether the pool can supply the rebuild before the store is taken out of service.
 * **S5 Errors are classified coarsely.** The CRL open distinguishes four cases. `CrlLocked` (another writer) is never
-  lost. `CrlSizingMismatch` refuses the device and never declares it lost. A transient error (`IOException`,
+  lost. `CrlSizingMismatch` refuses the device and never declares it lost, and so does `CrlConfigInvalid` (no CRL
+  yet, and the config cannot size one). A transient error (`IOException`,
   `UncheckedIOException` or `VirtualMachineError`, `DeviceDiscovery.isTransient`) is retried on later scans, up to
   `CrlOpenAttempts` (3) in a row; the count is kept in memory, so it resets at restart. Anything else, including
   `CrlCorrupt` and `Recovery.BrokenEntryChain`, declares at once. Elsewhere there is no classification:

@@ -4,8 +4,8 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlFailed, CrlLocked,
-  CrlMissing, CrlSizingDefaults, CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlConfigInvalid,
+  CrlFailed, CrlLocked, CrlMissing, CrlSizingDefaults, CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
 import scribe.Logging
 
 import java.util.UUID
@@ -85,17 +85,22 @@ object SimpleCRL extends Logging:
                              appliedStubs: Map[TxId, HLCTimestamp])
 
   /** Opens each device's SimpleCRL in `CrashRecoveryLog.deviceCrlDir`, creating the directory if absent. A new CRL is
-   *  sized by the device's config; an existing one keeps the sizing it recorded (SizingFile). `onThreadDeath` is
-   *  called if a CRL thread dies: that device's transactions stop. */
+   *  sized by the device's config (CrlConfigInvalid if the config cannot size it); an existing one keeps the sizing it
+   *  recorded (SizingFile). `onThreadDeath` is called if a CRL thread dies: that device's transactions stop. */
   case class DeviceFactory(onThreadDeath: Throwable => Unit = _ => ()) extends CrashRecoveryLogFactory:
     def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
       val dir = CrashRecoveryLog.deviceCrlDir(devicePath)
       os.makeDir.all(dir)
       val capacity = devicePath.toIO.getTotalSpace
-      // Only a CRL being created is held to the config: an existing one opens as recorded whatever it says
+      // Only a CRL being created is held to the config: an existing one opens as recorded whatever it says. Stream
+      // files without a sizing file are damage, which SimpleCRL.apply refuses (CrlSizingMismatch): a config refusal
+      // must not hide that
       val sizing =
-        if os.exists(dir / SizingFile) then CrlSizingDefaults.resolveExisting(config, capacity)
-        else CrlSizingDefaults.resolve(config, capacity)
+        if os.exists(dir / SizingFile) || streamFiles(dir).nonEmpty then
+          CrlSizingDefaults.resolveExisting(config, capacity)
+        else
+          try CrlSizingDefaults.resolve(config, capacity)
+          catch case e: IllegalArgumentException => throw CrlConfigInvalid(dir, e)
       // Free space is read at each growth attempt, from the file system holding the CRL
       val growth = GrowthPolicy(sizing.maxStreams, sizing.minFreePercent,
         () => devicePath.toIO.getTotalSpace, () => devicePath.toIO.getUsableSpace)
@@ -209,7 +214,9 @@ object SimpleCRL extends Logging:
       val recorded = Sizing.decode(os.read(file)).filter(s => s.numStreams >= 3 && s.maxSizeInBytes % 4096 == 0)
         .getOrElse:
           throw CrlSizingMismatch(streamsDir, s"its $SizingFile file is unreadable")
-      if recorded.numStreams != numStreams || recorded.maxSizeInBytes != maxSizeInBytes then
+      // A ring grown past the configured count is normal (requestGrowth): only a smaller ring or another stream
+      // size departs from the config
+      if recorded.numStreams < numStreams || recorded.maxSizeInBytes != maxSizeInBytes then
         logger.warn(s"The CRL in $streamsDir was created with ${recorded.numStreams} streams of " +
                     s"${recorded.maxSizeInBytes} bytes, not the $numStreams of $maxSizeInBytes configured. " +
                     s"Opening it with the sizing it was created with")
@@ -813,6 +820,8 @@ class SimpleCRL private (streamsDir: os.Path,
   /** Tests only, on the CRL thread: the room left in the active stream, and the number of requests queued */
   private[simple] def activeStreamRoomForTest: Long = streams(currentStream).room
   private[simple] def queuedRequestsForTest: Int = ioQueue.size
+  /** Tests only, on the CRL thread: nothing is unwritten, and the last write's completion has been processed */
+  private[simple] def idleForTest: Boolean = !writeInProgress && sealedEntries.isEmpty && currentLogEntry.isEmpty
 
   /** Each id's deletions go to the newest unwritten entry, which is sealed when they would overflow it (W1), and the
     * handler to the last: it runs once every deletion is durable. `resavable` deletions are cancelled by a save of the

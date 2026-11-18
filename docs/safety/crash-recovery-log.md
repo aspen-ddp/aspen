@@ -67,7 +67,7 @@ store; an applied stub is a `TransactionId` with its transaction's start `HLCTim
 | `maxTransactionBytes` | The most bytes, as admission counts them, one store's transaction may hold: `S/2 − 8192` in SimpleCRL. A prepare past it is dropped unsaved (section 6, Oversized). |
 | `requestGrowth()` | Asks for more room; cheap, idempotent, from any thread. SimpleCRL adds one stream if its growth policy allows (5.11). |
 | `onAdmissionLimitRaised(f)` | Registers `f`, called on the CRL thread with the new `admissionLimitBytes` after each committed growth. |
-| `openCRL(devicePath, config)` | Recover and open. Throws `CrlLocked`, `CrlSizingMismatch`, `CrlCorrupt`, `BrokenEntryChain`, or whatever reading the files threw. |
+| `openCRL(devicePath, config)` | Recover and open. Throws `CrlLocked`, `CrlSizingMismatch`, `CrlConfigInvalid` (no CRL yet, and the config cannot size one), `CrlCorrupt`, `BrokenEntryChain`, or whatever reading the files threw. |
 
 The trait's defaults (read through `getFullRecoveryState`, `dropStore` as read-then-delete, `whenDurable` at once,
 no failure, no per-transaction bound, no growth) are for CRLs that keep nothing on disk, such as test CRLs.
@@ -287,6 +287,10 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
 - **Refused, retried.** `CrlLocked` (another writer holds `crl/lock`) and `CrlSizingMismatch` (stream files without a
   readable `sizing` file, or not of the recorded count and size) are rethrown: the device stays unloaded, nothing is
   marked, every scan retries. A sizing mismatch is logged once; it means damage or a hand edit, never configuration.
+  So is `CrlConfigInvalid`: `crl/` holds neither a `sizing` file nor stream files, and the device config cannot size
+  a new CRL (`CrlSizingDefaults.resolve` refuses it); nothing is created. The config is held to `resolve` only then,
+  so it can never turn the refusal of a damaged CRL into a lost one. An emptied `crl/` under stores is refused this
+  way too while the config is invalid; once it is fixed, the open throws `CrlMissing` and the CRL is lost (below).
   An `IOException`, `UncheckedIOException` or `VirtualMachineError` (`DeviceDiscovery.isTransient`) is rethrown too,
   up to `CrlOpenAttempts` (3) consecutive scans.
 - **Lost.** If `crl/` is absent from a device that holds stores (a child directory with a store `config`), or holds no
@@ -303,9 +307,10 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   `LocalDevices.closingCrls` until it returns, so the device is not loaded again over open files.
 - **Sizing.** The device yaml's CRL keys are optional (`StorageDeviceConfig`, `CrlSizingDefaults.resolve`, from the
   capacity of the file system holding the device): `crl-num-streams` 4 (also the minimum), `crl-max-file-size-mb`
-  capacity / 2048 rounded down to 4 KiB, at least 64 MiB, `crl-max-streams` 20 and `crl-min-free-percent` 5. The first
-  two size only a new CRL; an existing one keeps the sizing in `crl/sizing` and logs a warning if the config
-  differs. The last two bound growth (5.11) and are read at each open.
+  capacity / 2048 rounded down to 4 KiB, at least 64 MiB, `crl-max-streams` 20 (at most 1024) and
+  `crl-min-free-percent` 5. The first two size only a new CRL; an existing one keeps the sizing in `crl/sizing` and
+  logs a warning if the config asks another stream size or more streams than the ring has. The last two bound
+  growth (5.11) and are read at each open.
 - **Grown.** When admission is full the Frontend asks the CRL to grow (`requestGrowth`); a committed growth raises
   the device's admission limit through `onAdmissionLimitRaised` (`CrlAdmission.raiseLimit`, registered by
   `DeviceDiscovery`).

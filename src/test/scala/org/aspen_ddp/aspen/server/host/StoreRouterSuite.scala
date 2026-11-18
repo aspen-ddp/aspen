@@ -210,6 +210,9 @@ object StoreRouterSuite:
     extends GatedCrl(loadGate):
     @volatile var readGate: Future[Unit] = Future.unit
     override def maxTransactionBytes: Long = maxTx
+    /** How many times growth was requested */
+    val growthRequests = new java.util.concurrent.atomic.AtomicInteger(0)
+    override def requestGrowth(): Unit = growthRequests.incrementAndGet()
     override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
       readGate.flatMap(_ => super.readStoreState(storeId))(using ExecutionContext.parasitic)
 
@@ -590,6 +593,8 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       os.exists(backend.crlSaveFile) should be(true)
       os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
       crl.getFullRecoveryState(s0) should be(empty)
+      // The full CRL is asked to grow
+      crl.growthRequests.get should be(1)
       // Retried at the device scans, as a store awaiting space is
       fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(Some(false))
 

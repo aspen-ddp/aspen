@@ -94,7 +94,8 @@
 - A `crl_save.log` state is charged before `loadStore` saves it (`CrlAdmission.tryChargeLoaded`, at most the limit
   plus one transaction, A3), after the Store is built and before install, retained for the store. Refused, the store
   is left offline, its file kept, and retried every device scan through `storesAwaitingSpace` (one warning per
-  minute). A state that can never fit (above limit + T, or a transaction above T) takes `crlSaveFileLost`: rebuilt
+  minute), and the CRL is asked to grow (`requestGrowth`). A state that can never fit (above limit + T, or a
+  transaction above T) takes `crlSaveFileLost`: rebuilt
 - Planned physical moves: `shutdownStorageDevice` makes Active stores Offline and the device ShuttingDown; its host
   closes the stores, leaving their CRL state live in the device CRL (no per-store marker or save file), writes
   `shutdown.state` (its HostId) in the device dir, and commits Shutdown. Each device dir also has `owning-host`
@@ -123,7 +124,8 @@
   only once its CRL was opened, so an emptied `crl/` is never taken as a new CRL), or `openCRL` throws (a corrupt CRL, `CrlCorrupt`, is logged as such), each store dir gets `rebuild-required`, the old directory is kept as `crl.lost-<uuid>`, and
   a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`). A CRL another writer holds open (`CrlLocked`) is never
   lost: the device stays unloaded and each scan retries. Nor is a CRL whose files disagree with its recorded sizing
-  (`CrlSizingMismatch`): the device is refused, an error is logged once, and each scan retries. A transient error (I/O or VM error,
+  (`CrlSizingMismatch`), nor a `crl/` holding no CRL yet whose device config cannot size one (`CrlConfigInvalid`):
+  the device is refused, an error is logged once, and each scan retries. A transient error (I/O or VM error,
   `DeviceDiscovery.isTransient`) leaves the device unloaded for the next scan instead, until `CrlOpenAttempts` (3) in a row
 - `Host.StoreFailStopped` (a store's CRL recovery threw, or its Frontend fail-stopped, `server/store/CLAUDE.md`) is
   handled as a backend failure (`StoreRebuilds.handleFailStopped`), but only while that Store is still the one

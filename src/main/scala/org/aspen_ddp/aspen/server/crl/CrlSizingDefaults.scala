@@ -10,6 +10,9 @@ object CrlSizingDefaults extends Logging:
 
   val MinStreams = 4
   val DefaultMaxStreams = 20
+  /** The most streams a CRL may grow to. A StreamLocation records its stream number in 2 bytes; this stays far
+   *  below that, and a ring this large is already a misconfiguration */
+  val MaxMaxStreams = 1024
   val DefaultMinFreePercent = 5
 
   /** A stream is capacity / 2048 by default, so the default growth cap of 20 streams is about 1% of the device */
@@ -36,6 +39,7 @@ object CrlSizingDefaults extends Logging:
     val maxStreams = config.crlMaxStreams.getOrElse(DefaultMaxStreams)
     require(maxStreams >= numStreams,
       s"crl-max-streams must be at least crl-num-streams ($numStreams), not $maxStreams")
+    require(maxStreams <= MaxMaxStreams, s"crl-max-streams must be at most $MaxMaxStreams, not $maxStreams")
 
     val minFreePercent = config.crlMinFreePercent.getOrElse(DefaultMinFreePercent)
     require(minFreePercent >= 0 && minFreePercent <= 100,
@@ -53,7 +57,7 @@ object CrlSizingDefaults extends Logging:
     val streamBytes = config.crlFileSizeMb.filter(_ > 0).fold(defaultStreamBytes(capacityBytes))(_.toLong << 20)
     val maxStreams = config.crlMaxStreams.getOrElse(DefaultMaxStreams)
     val minFreePercent = config.crlMinFreePercent.getOrElse(DefaultMinFreePercent)
-    val badMax = maxStreams < MinStreams
+    val badMax = maxStreams < MinStreams || maxStreams > MaxMaxStreams
     val badFree = minFreePercent < 0 || minFreePercent > 100
     if badMax || badFree then
       logger.warn(s"Invalid CRL growth bounds in the device config (crl-max-streams $maxStreams, " +

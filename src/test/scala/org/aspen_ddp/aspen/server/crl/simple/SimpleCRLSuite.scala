@@ -10,8 +10,9 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation, Tx}
 import org.aspen_ddp.aspen.server.FilePreallocationSuite
-import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlFailed, CrlLocked, CrlMissing, CrlSizingMismatch, StoreRecoveryState,
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
+import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlConfigInvalid, CrlCorrupt, CrlFailed, CrlLocked, CrlMissing, CrlSizingMismatch, StoreRecoveryState,
   TransactionRecoveryState}
 
 import java.nio.ByteBuffer
@@ -112,11 +113,14 @@ class SimpleCRLSuite extends FileBasedTests {
     crl.save(txid, trs, () => q.put(""))
     q.take()
 
-  /** A completion handler runs on the writer thread, possibly before the CRL thread has moved on to the next entry
-    * (writeCurrentLogEntry replaces currentLogEntry after handing the entry to the writer). A round trip through the
-    * CRL thread orders the test's reads of its state after that */
-  private def settle(crl: CrashRecoveryLog): Unit =
-    Await.result(crl.storesWithEntries(), 10.seconds)
+  /** A completion handler runs on the writer thread before the write's WriteComplete is queued, so a round trip
+    * through the CRL thread may overtake it. Waits, on the CRL thread, until every request is written and the last
+    * write's completion processed: the test's reads of the CRL's state (its stream, its serial) follow that */
+  private def settle(crl: SimpleCRL): Unit =
+    val deadline = System.nanoTime() + 10.seconds.toNanos
+    while !onCrl(crl)(crl.idleForTest) do
+      assert(System.nanoTime() < deadline, "the CRL did not settle")
+      Thread.sleep(1)
 
   test("Save & Recover CRL Saved State File Foo") {
     val savePath = tdir / "crl_save_file.log"
@@ -844,6 +848,35 @@ class SimpleCRLSuite extends FileBasedTests {
     os.write(tdir / "5.crl", new Array[Byte](size.toInt))
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, size))
     assert(os.exists(tdir / "5.crl"))
+  }
+
+  /** A device config sized for 1 MiB streams, with `f` applied */
+  private def deviceConfig(f: StorageDeviceConfig => StorageDeviceConfig = identity): StorageDeviceConfig =
+    val zero = new UUID(0, 0)
+    f(StorageDeviceConfig(StorageDeviceId(zero), zero, crlFileSizeMb = Some(1)))
+
+  test("A device CRL with stream files and no sizing file is a sizing mismatch whatever the config, never a config refusal") {
+    val device = tdir / "device"
+    os.makeDir(device)
+    SimpleCRL.DeviceFactory().openCRL(device, deviceConfig(), holdsStores = false).shutdown()
+    val crlDir = CrashRecoveryLog.deviceCrlDir(device)
+    os.remove(crlDir / SimpleCRL.SizingFile)
+    val files = os.list(crlDir).map(f => f.last -> os.read.bytes(f).toSeq).toMap
+    for invalid <- List(deviceConfig(_.copy(crlNumStreams = Some(3))), deviceConfig(_.copy(crlMaxStreams = Some(2))))
+    do
+      assertThrows[CrlSizingMismatch](SimpleCRL.DeviceFactory().openCRL(device, invalid, holdsStores = true))
+      assert(os.list(crlDir).map(f => f.last -> os.read.bytes(f).toSeq).toMap == files)
+  }
+
+  test("A new device CRL the config cannot size is a config refusal, and nothing is created in its directory") {
+    val device = tdir / "device"
+    os.makeDir(device)
+    for invalid <- List(deviceConfig(_.copy(crlNumStreams = Some(3))), deviceConfig(_.copy(crlMaxStreams = Some(1025))))
+    do
+      assertThrows[CrlConfigInvalid](SimpleCRL.DeviceFactory().openCRL(device, invalid, holdsStores = false))
+      assert(os.list(CrashRecoveryLog.deviceCrlDir(device)).isEmpty)
+    SimpleCRL.DeviceFactory().openCRL(device, deviceConfig(), holdsStores = false).shutdown()
+    assert(os.exists(CrashRecoveryLog.deviceCrlDir(device) / SimpleCRL.SizingFile))
   }
 
   test("A CRL whose thread died has released its lock once its shutdown returns") {
@@ -2693,6 +2726,78 @@ class SimpleCRLSuite extends FileBasedTests {
     r2.crl.shutdown()
   }
 
+  /** X (20 KB) lies in stream 3, Y in stream 0, and the writer is in stream 1 with too little room for the head H:
+    * H's rotation into stream 2 evacuates X. Two more entries follow H, the second holding `change` of X: they do not
+    * both fit stream 2, so a rotation into stream 3 first evacuates Y, over X's old entry. A crash before the change's
+    * entry is written, its evacuations durable, recovers X in its last-built form, from the first evacuation:
+    * evacuations carry the durable image, not the live state (W3). `finalX` is X as recovered once all is written */
+  private def evacuationCarriesImage(change: (SimpleCRL, (TransactionId, TransactionRecoveryState)) => Unit,
+                                     finalX: Option[List[ObjectUpdate]]): Unit =
+    val i = SimpleCRL(tdir, 4, ringStreamSize)
+    val fill = Filler(i.crl)
+    fill.until(3)
+    val x = sized(1, 20000)
+    saveAndWait(i.crl, x._1, x._2)
+    fill.until(0)
+    val y = sized(2, 3000)
+    saveAndWait(i.crl, y._1, y._2)
+    fill.until(1)
+    // Stream 1 left with less room than H's six sectors once h's sector is written
+    while onCrl(i.crl)(i.crl.activeStreamRoomForTest) >= 7 * 4096 do
+      fill.next()
+    val h = sized(100, 100)
+    val hold = holdWriter(i.crl, h)
+    assert(onCrl(i.crl)(i.crl.currentStreamNumber) == 1)
+    val before = streamBytes(tdir, 4)
+    val fs = (3 to 5).map(n => sized(n, 24000))
+    // Each seals the entry before it: H holds F1, the next F2, and the change's entry F3
+    fs.foreach(f => i.crl.save(f._1, f._2, () => ()))
+    change(i.crl, x)
+    assert(onCrl(i.crl)(i.crl.sealedEntryCount) == 2)
+    hold.release.countDown()
+    val durable = new LinkedBlockingQueue[String]()
+    i.crl.whenDurable(storeId, () => durable.put(""))
+    assert(durable.poll(10, TimeUnit.SECONDS) == "")
+    settle(i.crl)
+    val after = streamBytes(tdir, 4)
+    i.crl.shutdown()
+
+    // The change's entry is the last written, in stream 3. The files before its write: its extent as it was
+    val (changeAt, changeEntry) = currentCycle(after(3)).last
+    val changeEnd = changeAt + changeEntry.entrySize.toInt
+    val stream3 = after(3).clone()
+    System.arraycopy(before(3), changeAt, stream3, changeAt, changeEnd - changeAt)
+    val crash = tdir / "before-change"
+    os.makeDir(crash)
+    os.copy(tdir / SimpleCRL.SizingFile, crash / SimpleCRL.SizingFile)
+    after.updated(3, stream3).zipWithIndex.foreach((bytes, n) => os.write(crash / s"$n.crl", bytes))
+
+    val r1 = SimpleCRL(crash, 4, ringStreamSize)
+    assert(recoveredById(r1).keySet == Set(x._1, y._1, h._1, fs(0)._1, fs(1)._1))
+    assert(recoveredById(r1)(x._1).serializedTxd == x._2.serializedTxd)
+    assert(recoveredById(r1)(x._1).objectUpdates == x._2.objectUpdates)
+    r1.crl.shutdown()
+    // Stream 2 begins with the evacuation of X, in its last-built form; stream 3 with that of Y, over X's old entry
+    val evacuation1 = currentCycle(after(2)).head._2
+    assert(evacuation1.numTransactions == 1)
+    assert(evacuation1.dynamicDataSize == x._2.serializedTxd.size + 20000)
+    val evacuation2 = currentCycle(after(3)).head._2
+    assert(evacuation2.numTransactions == 1)
+    assert(evacuation2.dynamicDataSize == y._2.serializedTxd.size + 3000)
+
+    val r2 = SimpleCRL(tdir, 4, ringStreamSize)
+    assert(recoveredById(r2).get(x._1).map(_.objectUpdates) == finalX)
+    assert(recoveredById(r2).keySet - x._1 == (Set(y, h) ++ fs).map(_._1))
+    r2.crl.shutdown()
+
+  test("An evacuation carries a record deleted behind the head: a crash before the deletion recovers it (W3)") {
+    evacuationCarriesImage((crl, x) => crl.deleteTransaction(storeId, x._1), finalX = None)
+  }
+
+  test("An evacuation carries a record's last-built form, not an update-count change behind the head (W3)") {
+    evacuationCarriesImage((crl, x) => crl.save(x._1, x._2.copy(objectUpdates = Nil), () => ()), finalX = Some(Nil))
+  }
+
   test("A head not written within n - 1 rotations fails the CRL instead of rotating on (W6)") {
     val i = SimpleCRL(tdir, 4, ringStreamSize)
     // Saved without admission: live records of 20 KB each come to more than the ring holds
@@ -2943,6 +3048,89 @@ class SimpleCRLSuite extends FileBasedTests {
       val r = try SimpleCRL(tdir, 4, growthStreamSize) catch case t: Throwable => fail(s"$what: $t")
       assert(recoveredById(r).view.mapValues(_.objectUpdates).toMap == expected, what)
       r.crl.shutdown()
+  }
+
+  /** A crash at this moment of `crl`, open in `from`, once every write is durable: its files copied to `name` */
+  private def growthCrashImage(crl: SimpleCRL, from: os.Path, name: String): os.Path =
+    settle(crl)
+    val dir = tdir / name
+    os.makeDir(dir)
+    os.list(from).filter(f => os.isFile(f) && (f.ext == "crl" || f.last == SimpleCRL.SizingFile))
+      .foreach(f => os.copy(f, dir / f.last))
+    dir
+
+  test("A CRL grows again after a crash, into the ring its first growth permuted, and recovers each time") {
+    val i = openGrowing()
+    val raised = limitsRaised(i.crl)
+    val x = sized(1, 3000)
+    saveAndWait(i.crl, x._1, x._2)
+    val fill = Filler(i.crl)
+    fill.until(2)
+    i.crl.requestGrowth()
+    nextRaise(raised)
+    assert(recordedRing() == Vector(0, 1, 2, 4, 3))
+    // Into the new stream, then Y saved there
+    assert(nextStreams(i.crl, fill, 1) == List(4))
+    val y = sized(2, 3000)
+    saveAndWait(i.crl, y._1, y._2)
+    val crash1 = growthCrashImage(i.crl, tdir, "crash1")
+    i.crl.shutdown()
+
+    val r1 = openGrowing(dir = crash1)
+    assert(r1.crl.numStreams == 5)
+    assert(r1.crl.currentStreamNumber == 4)
+    assert(recoveredById(r1).view.mapValues(_.objectUpdates).toMap ==
+      List(x, y).map(t => t._1 -> t._2.objectUpdates).toMap)
+    // The second growth inserts stream 5 after the active stream 4
+    val raised1 = limitsRaised(r1.crl)
+    r1.crl.requestGrowth()
+    assert(nextRaise(raised1) == 4 * growthStreamSize / 2 - growthStreamSize / 16)
+    assert(recordedRing(crash1) == Vector(0, 1, 2, 4, 5, 3))
+    val fill1 = Filler(r1.crl)
+    assert(nextStreams(r1.crl, fill1, 1) == List(5))
+    val z = sized(3, 3000)
+    saveAndWait(r1.crl, z._1, z._2)
+    val crash2 = growthCrashImage(r1.crl, crash1, "crash2")
+    r1.crl.shutdown()
+
+    val r2 = openGrowing(dir = crash2)
+    assert(r2.crl.numStreams == 6)
+    assert(r2.crl.currentStreamNumber == 5)
+    assert(recordedRing(crash2) == Vector(0, 1, 2, 4, 5, 3))
+    val expected = List(x, y, z).map(t => t._1 -> t._2.objectUpdates).toMap
+    assert(recoveredById(r2).view.mapValues(_.objectUpdates).toMap == expected)
+    // Around the whole ring, every record carried forward by each rotation that empties its stream
+    assert(nextStreams(r2.crl, Filler(r2.crl), 6) == List(3, 0, 1, 2, 4, 5))
+    r2.crl.shutdown()
+    val r3 = openGrowing(dir = crash2)
+    assert(recoveredById(r3).view.mapValues(_.objectUpdates).toMap == expected)
+    assert((0 until 6).forall(n => os.size(crash2 / s"$n.crl") == growthStreamSize))
+    r3.crl.shutdown()
+  }
+
+  test("Reopening a grown CRL warns of no sizing difference; a smaller ring or another stream size than configured does") {
+    val i = openGrowing()
+    val raised = limitsRaised(i.crl)
+    i.crl.requestGrowth()
+    nextRaise(raised)
+    i.crl.shutdown()
+
+    val warnings = new LinkedBlockingQueue[String]()
+    val handler = scribe.handler.LogHandler(scribe.Level.Warn): r =>
+      val text = r.logOutput.plainText
+      if text.contains(tdir.toString) && text.contains("was created with") then
+        warnings.add(text)
+    def warnedOpening(numStreams: Int, streamSize: Long): Boolean =
+      warnings.clear()
+      scribe.Logger.root.withHandler(handler).replace()
+      try SimpleCRL(tdir, numStreams, streamSize).crl.shutdown()
+      finally scribe.Logger.root.withoutHandler(handler).replace()
+      !warnings.isEmpty
+    // Grown to 5 from the 4 configured: normal
+    assert(!warnedOpening(4, growthStreamSize))
+    assert(!warnedOpening(5, growthStreamSize))
+    assert(warnedOpening(6, growthStreamSize))
+    assert(warnedOpening(4, 2 * growthStreamSize))
   }
 
   test("A growth that arrives during a rotation is committed once the rotation's head is written") {

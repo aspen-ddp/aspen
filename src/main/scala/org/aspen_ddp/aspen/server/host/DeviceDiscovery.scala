@@ -5,8 +5,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
 import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, Host, StorageDeviceConfig, StorageDeviceManager,
   StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlCorrupt, CrlLocked, CrlMissing,
-  CrlSizingMismatch}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlConfigInvalid, CrlCorrupt, CrlLocked,
+  CrlMissing, CrlSizingMismatch}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.{Backend, StoreCreation}
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -528,6 +528,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  Nor is a CRL whose files do not match the sizing it recorded (CrlSizingMismatch): configuration cannot cause that,
    *  so it is a hand edit or damage of the directory, never by itself proof that the state is gone. The device is
    *  refused (left unloaded, an error logged once) until an operator repairs it (systemic-loss-protection.md S6, M6).
+   *  Nor is a CRL directory holding no CRL yet whose device config cannot size one (CrlConfigInvalid): the device is
+   *  refused the same way until the config is fixed.
    *  A device without stores simply gets its CRL created. */
   private def openDeviceCrl(devicePath: os.Path,
                             sdCfg: StorageDeviceConfig,
@@ -556,6 +558,15 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
               logger.error(s"Refusing to load storage device $devicePath: its CRL does not match the sizing it was " +
                            s"created with. Its stores are not declared lost. Restore the CRL directory's stream " +
                            s"files and sizing file, then the next scan loads it: $t")
+            throw t
+          case t: CrlConfigInvalid =>
+            // The directory holds no CRL yet and the config cannot size one: a refusal, like a sizing mismatch.
+            // Nothing was created, so the next scan after the config is fixed opens it
+            transientCrlFailures -= devicePath
+            if !reportedDirs.contains(devicePath) then
+              reportedDirs += devicePath
+              logger.error(s"Refusing to load storage device $devicePath: its config cannot size a new CRL. Its " +
+                           s"stores are not declared lost. Fix the device config, then the next scan loads it: $t")
             throw t
           case t: Throwable =>
             if storeDirs.isEmpty then

@@ -8,7 +8,7 @@ trait CrashRecoveryLogFactory {
   /** Opens the CRL of the device at `devicePath`, recovering its existing files. Throws if they cannot be
    *  recovered (CrlCorrupt when the media returned other than what was written), with CrlLocked if another writer, in
    *  this process or another, has them open, and with CrlSizingMismatch if its files do not match the sizing the CRL
-   *  recorded when it was created.
+   *  recorded when it was created, and with CrlConfigInvalid if a CRL it would create cannot be sized by `config`.
    *
    *  @param holdsStores the device holds stores. Stores exist only on a device whose CRL has been opened, so its CRL
    *                     must exist then: one with no files holding entries (none ever created, or all removed) throws
@@ -43,3 +43,10 @@ class CrlCorrupt(reason: String) extends Exception(s"CRL is corrupt: $reason")
  *  lost CRL: the device is refused until an operator repairs the directory (systemic-loss-protection.md S6) */
 class CrlSizingMismatch(crlDir: os.Path, reason: String)
   extends Exception(s"CRL stream files in $crlDir do not match the sizing the CRL was created with: $reason")
+
+/** Thrown by openCRL when the CRL directory holds no CRL yet (neither a sizing file nor stream files) and the device
+ *  config cannot size a new one (CrlSizingDefaults.resolve refuses it). Nothing is created in the CRL directory. It is
+ *  a refusal, never a lost CRL: the device is left unloaded, and the next scan after the config is fixed opens it.
+ *  An existing CRL never throws it: it opens with the sizing it recorded whatever the config says */
+class CrlConfigInvalid(crlDir: os.Path, cause: IllegalArgumentException)
+  extends Exception(s"The device config cannot size a new CRL in $crlDir: ${cause.getMessage}", cause)

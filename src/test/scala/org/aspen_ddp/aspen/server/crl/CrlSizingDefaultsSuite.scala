@@ -36,6 +36,16 @@ class CrlSizingDefaultsSuite extends AnyFunSuite with Matchers:
     an[IllegalArgumentException] should be thrownBy
       CrlSizingDefaults.resolve(base.copy(crlMaxStreams = Some(3)), 1L << 40)
 
+  test("a maximum above 1024 streams is refused"):
+    val e = the[IllegalArgumentException] thrownBy
+      CrlSizingDefaults.resolve(base.copy(crlMaxStreams = Some(1025)), 1L << 40)
+    e.getMessage should include("at most 1024")
+    CrlSizingDefaults.resolve(base.copy(crlMaxStreams = Some(1024)), 1L << 40).maxStreams should be(1024)
+
+  test("an existing CRL's config with a maximum above 1024 streams disables growth"):
+    CrlSizingDefaults.resolveExisting(base.copy(crlMaxStreams = Some(1025)), 1L << 40).maxStreams should be(0)
+    CrlSizingDefaults.resolveExisting(base.copy(crlMaxStreams = Some(1024)), 1L << 40).maxStreams should be(1024)
+
   test("a free percentage above 100 is refused"):
     an[IllegalArgumentException] should be thrownBy
       CrlSizingDefaults.resolve(base.copy(crlMinFreePercent = Some(101)), 1L << 40)

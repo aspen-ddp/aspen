@@ -314,6 +314,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       else
         Right(None)
 
+    // Why the saved state can never fit its device's CRL, if it cannot
+    val neverFitsReason = (savedState, deviceCrl) match
+      case (Right(Some(state)), Some(crl)) => neverFits(state, crl, admissionOf(storageDeviceId))
+      case _ => None
+
     (savedState, deviceCrl) match
       case (Left(err), _) if failed =>
         logger.error(s"Store ${backend.storeId} cannot be loaded: its backend failed. Rebuilding it. Error: $err")
@@ -326,11 +331,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         router.clearLoading(backend.storeId)
         p.failure(err)
 
-      case (Right(Some(state)), Some(crl)) if neverFits(state, crl, admissionOf(storageDeviceId)).nonEmpty =>
+      case (Right(Some(_)), Some(_)) if neverFitsReason.nonEmpty =>
         // No CRL of this device can ever take it (crash-recovery-log 6.1, A3), as for a store moved from a device with
         // a larger CRL: retrying would keep the store offline for good, so it is rebuilt as one whose file is unusable
         val err = new IllegalStateException(s"the CRL state of store ${backend.storeId} can never fit its device's " +
-          s"CRL: ${neverFits(state, crl, admissionOf(storageDeviceId)).get}")
+          s"CRL: ${neverFitsReason.get}")
         ctx.rebuilds.crlSaveFileLost(storageDeviceId, backend, err)
         router.clearLoading(backend.storeId)
         p.failure(err)
@@ -415,6 +420,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                   CrlAdmission.recoveredBytes(state), crl.maxTransactionBytes)) =>
                 val err = new IllegalStateException(s"the CRL of store $storeId's device has no room for its saved " +
                   s"state now")
+                // A full CRL asks to grow, as a transaction refused for room does (Frontend)
+                crl.requestGrowth()
                 crlRoomLog.admit().foreach: held =>
                   logger.warn(s"Store $storeId is not loaded yet: its crl_save.log state does not fit what its " +
                               s"device's CRL admits now. Leaving it offline, its save file kept, and retrying at the " +

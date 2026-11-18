@@ -77,6 +77,33 @@ first just continually retries transactions until they eventually succeed. The "
 passes the Throwable that caused the transaction to fail to a handler mechanism that can take corrective
 action and/or abort the retry loop if it determines that success is impossible.
 
+### Timed reads
+By default a read never gives up. It keeps retrying until it restores the object or hits an error that retrying
+cannot fix, such as the object not existing. This keeps error handling simple in the general case: when a network
+partition or downed hosts make the stores unreachable, the application just freezes until they are restored, then
+carries on as if nothing happened. There is no "the read failed, now what?" path to write.
+
+Sometimes giving up is the better choice, for example a status page that should show "unavailable" rather than
+hang, or a background scan that should skip an unreachable object and move on. For those cases,
+`client.withReadTimeout(d)` returns a reader with every read method of the client (`read`, `readKeys`,
+`readRange`, `readMetadata`, ...), whose reads fail with `ReadTimeout` after `d`. A timed-out read stops retrying,
+so nothing keeps running in the background. A `ReadTimeout` means only that no answer arrived in time: unlike
+`InvalidObject`, it says nothing about whether the object exists.
+
+```scala
+given ExecutionContext = client.clientContext
+
+// Reads through `patient` give up after half a second rather than waiting for the stores to come back
+val patient = client.withReadTimeout(500.millis)
+
+def readIfAvailable(ptr: KeyValueObjectPointer): Future[Option[KeyValueObjectState]] =
+  patient.read(ptr).map(Some(_)).recover:
+    case _: ReadTimeout => None // no answer in time; the object may well exist
+```
+
+This example runs as a test (`src/test/scala/org/aspen_ddp/aspen/examples/TimedReadsSuite.scala`), which shows
+it returning the object while the stores are reachable and `None` while every store is silent.
+
 ### DataObject & KeyValueObject
 Objects come in two flavors: Data and KeyValue. Both share the same metadata of ObjectRevision,
 ObjectRefcount, and HLCTimestamp. The ObjectRevision is just the UUID of the last transaction to

@@ -53,14 +53,6 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.2  Rebuild's pending-allocation sweep waits forever on a transaction held by its own silence: RB-W1     [S]
-     CONFIRMED. sweepPending waits on any listed unresolved allocation with no bound; rule G holds T while a store
-     of T is silent, and the rebuilding store is silent until the sweep finishes. Fix: stop waiting once T's
-     start is past horizon + expiry margin (the rebuilt store is muted for T and will be marked), and skip Txs
-     started after the rebuild began. Not covered by the bounded read of 4.3 (it is a query). Timed reads are
-     available (client.withReadTimeout; a timed-out read fails ReadTimeout and stops retrying) for any object read
-     the sweep makes, but the unbounded wait itself is the sweep's and needs the fix above.
-
 4.3  Reads with no timeout stall the rebuild walk/sweep and the repair scan: RB-W4                       [M]
      CONFIRMED. A never-completing client.read holds a rebuild slot and cancel cannot end it; healthy pools'
      rebuilds stall behind it. The repair scan stalls the same way: its object reads (StoreRepairer.readObject)

@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.PendingAllocation
 import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId}
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
-import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
+import org.aspen_ddp.aspen.server.store.{Frontend, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, StoreCreation}
 import scribe.Logging
 
@@ -131,6 +131,13 @@ object RebuildingStore:
     try os.remove(storePath / InheritedVotesFile)
     catch case NonFatal(_) => ()
 
+  /** How long the sweep waits on listed allocations before it records what is still unsettled for repair
+   *  (sweepPending). Every listed transaction started before the query, at most MaxStartLead ahead of its stores'
+   *  clocks, so by then its stores' own expiry resolution has had its chance. Liveness only: what is recorded is
+   *  repaired whatever its transaction's outcome */
+  val PendingWaitLimit: FiniteDuration =
+    TransactionHorizon.Horizon + Frontend.DefaultExpiryMargin + TransactionHorizon.MaxStartLead
+
   /** Objects between checkpoints. Small enough that a crash costs little, large enough that
    *  the flush is not the dominant cost. */
   val CheckpointInterval: Int = 1000
@@ -169,7 +176,9 @@ class RebuildingStore(client: AspenClient,
                       testingOnlyAfterQuery: () => Future[Unit] = () => Future.unit,
                       /** How long after its start a transaction may be joined (inheritedVotesAfter). The default
                         * horizon is the longest any host uses */
-                      horizon: FiniteDuration = TransactionHorizon.Horizon)
+                      horizon: FiniteDuration = TransactionHorizon.Horizon,
+                      /** How long the sweep waits before recording what is unsettled (PendingWaitLimit) */
+                      pendingWaitLimit: FiniteDuration = RebuildingStore.PendingWaitLimit)
   extends StoreRebuild with Logging:
 
   import RebuildingStore.*
@@ -331,7 +340,7 @@ class RebuildingStore(client: AspenClient,
              case Some(k) => tree.foreachFrom(k, restoreObject(_, _, _), stopWhen = aborted)
              case None => tree.foreach(restoreObject(_, _, _), stopWhen = aborted)
       _ <- testingOnlyAfterWalk()
-      _ <- sweepPending(pstate.ida, pending, 0)
+      _ <- sweepPending(pstate.ida, pending, 0, System.currentTimeMillis() + pendingWaitLimit.toMillis)
       // Check the abort latch after the walks and the sweep complete. If it's set, fail the pass before
       // retryFailures() and finish() run, leaving the checkpoint in staging.
       _ <- synchronized(abortCause) match
@@ -419,8 +428,15 @@ class RebuildingStore(client: AspenClient,
    *    (`InvalidObject.provesDeletion`: the allocation aborted, or the object was deleted since), settles it
    *  Transactions first listed in later rounds started after the store was lost and are covered by its missed-update
    *  marks, so they are ignored.
+   *
+   *  What is still unsettled at `deadlineMillis` (PendingWaitLimit after the sweep began) is marked in the ErrorTree
+   *  against this store and the sweep ends (RB-W1, markUnsettled). The wait cannot be unbounded: a transaction whose
+   *  live voters disagree is held past expiry while any of its stores is silent (ExpiryTally rule G), and this store
+   *  is silent until the rebuild finishes. Dropping it unmarked is not safe either: it may be decided commit, applied
+   *  and acknowledged by the lost incarnation, with its peers not knowing yet, so no finalizer marks this store.
    */
-  private def sweepPending(ida: IDA, pending: Map[TransactionId, PendingAllocation], round: Int): Future[Unit] =
+  private def sweepPending(ida: IDA, pending: Map[TransactionId, PendingAllocation], round: Int,
+                           deadlineMillis: Long): Future[Unit] =
     if pending.isEmpty || aborted() then
       Future.unit
     else
@@ -442,18 +458,36 @@ class RebuildingStore(client: AspenClient,
         now <- queryPeers(ida)
         settled <- Future.sequence(pending.values.toList.map(p => settle(p, now.get(p.transactionId))))
         remaining = settled.flatten.map(p => p.transactionId -> p).toMap
-        _ <- nextRound(ida, remaining, round)
+        _ <- nextRound(ida, remaining, round, deadlineMillis)
       yield ()
 
-  private def nextRound(ida: IDA, remaining: Map[TransactionId, PendingAllocation], round: Int): Future[Unit] =
+  private def nextRound(ida: IDA, remaining: Map[TransactionId, PendingAllocation], round: Int,
+                        deadlineMillis: Long): Future[Unit] =
     if remaining.isEmpty || aborted() then
       Future.unit
+    else if System.currentTimeMillis() >= deadlineMillis then
+      markUnsettled(remaining)
     else
       if round % 10 == 9 then
         logger.info(s"Rebuild of $storeId: still waiting on ${remaining.size} allocations its peers hold " +
                     s"unfinalized (${remaining.keys.take(5).mkString(", ")})")
       val delay = FiniteDuration(math.min(1L << math.min(round, 5), 30L), SECONDS)
-      client.after(delay).flatMap(_ => sweepPending(ida, remaining, round + 1))
+      client.after(delay).flatMap(_ => sweepPending(ida, remaining, round + 1, deadlineMillis))
+
+  /** Records every object of `remaining` in the pool's ErrorTree as missed by this store (missed at
+   *  HLCTimestamp.Zero, so it never displaces a newer mark), durably before finish. Repair restores the slice if the
+   *  allocation commits, and settles the entry by a read proving the object is not live if it aborts. A failed mark
+   *  fails the pass, which is retried */
+  private def markUnsettled(remaining: Map[TransactionId, PendingAllocation]): Future[Unit] =
+    val marks = remaining.values.toList.flatMap(_.pointers).filter(_.poolId == storeId.poolId).map: ptr =>
+      MissedUpdate(storeId, ptr.id, Some(ptr.objectType), ptr.storePointer, HLCTimestamp.Zero)
+    logger.warn(s"Rebuild of $storeId: ${remaining.size} allocations its peers hold are still unsettled after " +
+                s"$pendingWaitLimit; recording their ${marks.size} objects for repair " +
+                s"(${remaining.keys.take(5).mkString(", ")})")
+    client.missedUpdateMarker.mark(marks).recoverWith:
+      case NonFatal(t) =>
+        checkpointBestEffort("after a failed unsettled-allocation record")
+        Future.failed(new Exception(s"Rebuild of $storeId: failed to record its unsettled allocations: $t", t))
 
   /** Restores one object a peer listed as pending. None once restored (or when the restore cannot be attempted for a
    *  reason the abort latch already carries), else the read failure */

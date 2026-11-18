@@ -33,7 +33,13 @@
   lost store acknowledged is listed at the first query or already in the tree. After the walk, `sweepPending` restores
   the listed objects directly, re-querying in rounds (1 s doubling to 30 s): unresolved waits; committed restores,
   retrying any read failure; no longer listed restores, or settles on `InvalidObject.provesDeletion`. It never waits
-  on a finalization, which could need this store. A cancel abandons the wait (`CurrentAllocationsQuery.Abandoned`)
+  on a finalization, which could need this store. A cancel abandons the wait (`CurrentAllocationsQuery.Abandoned`).
+  Nor does it wait on resolution past `pendingWaitLimit` (default `PendingWaitLimit`: horizon plus
+  `Frontend.DefaultExpiryMargin` plus `MaxStartLead`) from the sweep's start: a transaction undecided between its live
+  voters is held by rule G while this (silent) store is rebuilding. What is still unsettled then is marked in the
+  ErrorTree against this store (`markUnsettled`, missed at `HLCTimestamp.Zero`) before `finish`, never dropped
+  unmarked (the lost incarnation may have applied and acknowledged a commit its peers do not know yet); repair
+  settles each entry whatever the outcome. A failed mark fails the pass
 - Locked copies (rebuild-process.md 5.2): `restore` copies from an ordinary read, which ignores write locks of
   transactions not known committed. When any reply reported one (`ObjectState.readLocks`), the object is marked in the
   ErrorTree against this store (missed at `HLCTimestamp.Zero`) before the restore completes, so a commit the lost

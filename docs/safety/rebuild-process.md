@@ -307,7 +307,16 @@ whose entry lands behind the walk's position. Two mechanisms close that gap:
   like a deletion); no longer listed (finalized, or aborted and forgotten), restore, or settle on a read with
   `InvalidObject.provesDeletion`. Transactions first listed in a later round are ignored. A cancel abandons the wait
   (`CurrentAllocationsQuery.Abandoned`). The sweep never waits on a finalization, which could need this very store
-  in a pool with `t = w`; it does wait on resolution (see RB-W1).
+  in a pool with `t = w`, and it does not wait on resolution past `PendingWaitLimit` (horizon plus
+  `Frontend.DefaultExpiryMargin` plus `MaxStartLead`, about 30 s, from the sweep's start). Whatever is still unsettled
+  then is marked in the ErrorTree against this store (`markUnsettled`, missed at `HLCTimestamp.Zero`), durably before
+  `finish`, and the sweep ends; a failed mark fails the pass. The wait cannot be unbounded: a transaction whose live
+  voters disagree is undecided, and past expiry `ExpiryTally` rule G holds it while any store of it is silent, which
+  this store is until the rebuild finishes. Nor can the sweep drop such a transaction unmarked: it may be decided
+  commit, applied and acknowledged by the lost incarnation while the replying peers do not know the outcome yet, and
+  then no finalizer marks this store. The mark makes the outcome irrelevant: repair restores the slice if the
+  allocation commits and settles the entry on `InvalidObject.provesDeletion` if it aborts. The limit is liveness
+  only, and a pass that fails after marking waits and marks again (marks only move forward).
 
 Coverage: an allocation the lost store acknowledged committed before the rebuild, so it is either unfinalized at the
 first query (listed, and on disk with every advance of the checkpoint) or finalized before it (in the tree ahead of
@@ -689,33 +698,6 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 ---
 
 ## Open weaknesses
-
-### RB-W1. The pending-allocation sweep waits forever on an allocation that the rebuilding store's own silence holds (CONFIRMED; liveness)
-Mechanism: `RebuildingStore.sweepPending`'s `settle` keeps waiting on any listed allocation whose transaction is still
-listed unresolved (`case Some(c) if !c.committed`), round after round, with no bound; only the abort latch ends the
-wait. `Frontend.currentAllocations` lists every transaction with allocations in the pool that the replying store holds
-neither finalized nor known aborted. A transaction T with allocations in the pool whose live voters disagree (one
-commit, one abort, or one commit and one frozen non-voter) is undecided; no driver proposes abort on it, and past expiry
-`ExpiryTally` rule G holds it while any store of T is silent ([paxos-transactions.md](paxos-transactions.md); in
-Replication(3,2) with `vc = 1`, `s = 1`: D needs `vc + s < r`, E needs `vc + k + s < t`, both false). The rebuilding
-store is silent until it is loaded (`StoreRebuilds.startRebuild` silences it), and it is loaded only after `finish`,
-which runs only after the sweep. The listed set is checkpointed (`listedAllocations`), so every later pass, re-placement
-excepted, waits on the same T.
-Trigger / scenario: Replication(3,2), S0 lost and rebuilding. A transaction T allocating an object in the pool reaches
-S1 (votes commit) and S2 (votes abort on a stale revision, or never gets the client's prepare and freezes undecided). T
-is in flight at a pass's `queryPeers`, so it is listed with `committed = false`. T can now be ended only by S0's reply;
-S0 replies only once the rebuild finishes; the rebuild finishes only once T resolves. T need not predate the loss: one
-started during the rebuild and stuck the same way is listed by the next pass's query (a resume after any failed pass).
-Consequence: the store stays Rebuilding for good, holding a rebuild slot on its host, with the pool one store short; T's
-commit voters keep their locks on the objects T touches for as long. `accept-rebuild-loss` does not help; only a
-device shutdown (cancel) or re-placement ends the pass, and the new pass lists T again.
-Suggested fix: stop waiting on an unresolved transaction once its start is past the horizon plus the expiry margin
-(`Frontend.expiryMargin`). From then on every store is frozen for T, the rebuilt store is muted for it (T starts before
-`acceptor-since`), so if T ever commits the rebuilt store sends no `TxCommitted` and the expiry commit's finalizer marks
-it in the ErrorTree; repair installs the object then. Also skip transactions that started after the rebuild began (the
-store was certainly not their voter, and its misses are marked). Add a RebuildingStoreSuite test: a listed allocation
-held undecided while the rebuilding store is silent must not keep the rebuild from finishing.
-Effort: S   Priority: 4
 
 ### RB-W4. A walk or sweep read that never completes holds the rebuild slot, and a cancel cannot end it (CONFIRMED; liveness)
 Mechanism: `client.read` never times out (`SimpleReadDriver` retransmits with backoff for ever; `BaseObjectReader

@@ -254,6 +254,48 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       withClue("the copy read under T's lock is recorded for repair: ")(lockedEntry should be(defined))
       withClue("an unlocked copy is not: ")(freeEntry should be(None))
 
+  atest("a listed allocation held undecided while the rebuilding store is silent does not keep the rebuild from finishing (RB-W1)"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    def awaitListedUnresolved(id: ObjectId, n: Int): Future[Unit] =
+      client.currentAllocations(peers, 2, () => false).flatMap: listed =>
+        if listed.values.forall(_.exists(a => !a.committed && a.pointers.exists(_.id == id))) then Future.unit
+        else if n == 0 then Future.failed(new Exception(s"the peers never listed $id unresolved: $listed"))
+        else Future(()).flatMap(_ => awaitListedUnresolved(id, n - 1))
+    for
+      _ <- populate(5)
+      _ <- net.waitForTransactionsToComplete()
+      // T allocates an object; every vote on it is dropped, so its stores hold it undecided
+      tx = client.newTransaction()
+      isVote = (m: TxMessage) => m match
+                 case r: TxPrepareResponse => r.transactionId == tx.id
+                 case _ => false
+      _ = net.dropTxMessage = isVote
+      _ = net.recordTxMessage = isVote
+      _ = net.dropClientResponse =
+            case v: TransactionVote => v.transactionId == tx.id
+            case _ => false
+      _ = tx.replaySafe("test")
+      pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      ptr <- pool.allocator.allocateDataObject(Array[Byte](3))(using tx)
+      tCommit = tx.commit()
+      _ <- awaitListedUnresolved(ptr.id, 5000)
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                    pendingWaitLimit = scala.concurrent.duration.Duration.Zero)
+      outcome <- outcomeOrStalled(rebuild)
+      entry <- pool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ptr.id))
+      _ = withClue("T is still undecided: ")(tCommit.isCompleted should be(false))
+      _ = net.dropTxMessage = _ => false
+      _ = net.dropClientResponse = _ => false
+      _ = net.recordTxMessage = _ => false
+      _ = net.takeRecordedTxMessages().foreach(net.deliverTransactionMessage)
+      _ <- tCommit
+      _ <- net.waitForTransactionsToComplete()
+    yield
+      withClue("the rebuild finishes: ")(outcome should be(Some(scala.util.Success(()))))
+      withClue("the unsettled allocation is recorded for repair: ")(entry should be(defined))
+      os.exists(dev / storeId.directoryName) should be(true)
+
   atest("a listed allocation whose transaction finalizes before the sweep is restored from a read"):
     given ExecutionContext = executionContext
     val dev = deviceDir()

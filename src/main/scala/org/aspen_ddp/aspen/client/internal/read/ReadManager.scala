@@ -105,8 +105,10 @@ class ReadManager(val client: ReadDriverClient, val driverFactory: ReadDriver.Fa
     driver.begin()
 
     if timeout.isFinite then
+      // The timer captures only the read's id: a cancelled task stays queued in BackgroundTaskManager's scheduler
+      // until its delay expires, and must not keep a completed read's slices and object reachable until then
       val timer = client.backgroundTaskManager.schedule(timeout):
-        driver.timeOut()
+        synchronized { outstandingReads.get(readUUID) }.foreach(_.timeOut())
         synchronized { outstandingReads -= readUUID }
       driver.readResult.onComplete(_ => timer.cancel())(using ExecutionContext.parasitic)
 

@@ -13,7 +13,9 @@
 - A timed read (`ReadManager.read(..., timeout)`, finite) schedules one task on the client's
   `backgroundTaskManager`; when it fires on an incomplete read it calls `ReadDriver.timeOut()` (fails the read with
   `ReadTimeout` and runs `onComplete`, cancelling `SimpleReadDriver`'s retransmits) and releases the read. A read
-  that completes first cancels the task. An untimed read (`Duration.Inf`, the default) schedules nothing.
+  that completes first cancels the task. The task captures only the read's id, never the driver: a cancelled task
+  stays queued in BackgroundTaskManager's scheduler until its delay, and must not retain a completed read's slices.
+  An untimed read (`Duration.Inf`, the default) schedules nothing.
   `BaseAspenClient`'s read bodies take the timeout; the public `ObjectReader` methods pass `Duration.Inf`
 - A stale pointer or cached state of a deleted object can neither read nor revive it, even through a store that
   missed the deletion (a zombie slice): ids are never reused, every requirement on a missing or refcount-0 object

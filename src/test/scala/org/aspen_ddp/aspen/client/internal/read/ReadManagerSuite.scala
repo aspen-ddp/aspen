@@ -135,6 +135,7 @@ class ReadManagerSuite extends AnyFunSuite with Matchers:
     val timers = new CapturingTimers
     val sent = new java.util.concurrent.atomic.AtomicReference[List[UUID]](Nil)
     @volatile var completions = 0
+    @volatile var timeOuts = 0
     val timedClient = new InlineClient:
       override def backgroundTaskManager: BackgroundTaskManager = timers
       override private[client] val messenger: Messenger = new Messenger:
@@ -149,6 +150,9 @@ class ReadManagerSuite extends AnyFunSuite with Matchers:
       (c: ReadDriverClient, op: ObjectPointer, i, id: UUID, comment: String, rt: ReadType) =>
         new BaseReadDriver(c, op, i, id, comment, rt):
           override protected def onComplete(): Unit = completions += 1
+          override def timeOut(): Unit =
+            timeOuts += 1
+            super.timeOut()
     val mgr = new ReadManager(timedClient, countingFactory)
     def uuid: UUID = sent.get.head
 
@@ -193,5 +197,19 @@ class ReadManagerSuite extends AnyFunSuite with Matchers:
     f.mgr.read(ptr, ida, "test")
     f.timers.scheduled should be (empty)
     f.mgr.outstandingReadCount should be (1)
+  }
+
+  test("a completed read's timer does not reach its driver, so a cancelled timer left queued retains nothing") {
+    // BackgroundTaskManager's scheduler keeps a cancelled task queued until its delay expires; a timer that
+    // referenced the driver would hold the read's slices and restored object for the whole timeout
+    val f = new TimedFixture
+    val result = f.mgr.read(ptr, ida, "test", timeout = 30.seconds)
+    val ts = HLCTimestamp.now
+    f.mgr.receive(respond(ds0, ts).copy(readUUID = f.uuid))
+    f.mgr.receive(respond(ds1, ts).copy(readUUID = f.uuid))
+    Await.result(result, 1.second) shouldBe a [DataObjectState]
+
+    f.timers.scheduled.head.fnRunIgnoringCancel()
+    f.timeOuts should be (0)
   }
 

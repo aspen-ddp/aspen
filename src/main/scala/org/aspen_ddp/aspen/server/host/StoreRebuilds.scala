@@ -538,6 +538,21 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               logger.error(s"Failed to mark store $storeId for rebuild at $storePath. Not rebuilding it yet: $t")
               false
 
+  /** A store served from `local` that the device's entry does not list: a copy put at the store path by hand, loaded
+   *  without reading the tree. Nothing ties it to the store's current state, so it is taken out of service as a
+   *  failed backend is (marked rebuild-required, closed, left offline, its CRL entries kept), and the Deleted Stores
+   *  pass of the check that follows retires it to pending-delete. A store still opening is left for a later check. */
+  def retireUnlistedServed(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+    val storePath = local.devicePath / storeId.directoryName
+    if !ctx.loader.isOpening(storeId) then
+      ctx.router.entry(storeId) match
+        case Some(entry) if entry.store.storageDeviceId == local.storageDeviceId &&
+                            entry.store.backend.path == storePath =>
+          val err = new IllegalStateException(s"$storePath holds a copy of store $storeId that the entry of " +
+                                              s"device ${local.storageDeviceId} does not list")
+          backendFailed(storeId, Some(entry.store.backend), err, "is served from a copy its device's entry does not list")
+        case _ => ()
+
   /** Writes the marker that keeps the store at `storePath` from ever being loaded again: its CRL
    *  save file is unusable and was the only copy of its transaction state. */
   def markRebuildRequired(storePath: os.Path): Unit = ctx.writeRebuildRequiredMarker(storePath)

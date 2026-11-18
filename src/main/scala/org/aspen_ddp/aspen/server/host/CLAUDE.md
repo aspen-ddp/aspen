@@ -153,6 +153,9 @@
     retire every marked store at once.
   - The Deleted Stores pass, for an offline store whose entry has left the device. The store stays offline until its
     path is clear, so a failed retire is retried.
+    A store served from the device that its entry does not list (a copy put back by hand: `tryLoadStore` reads no
+    tree) is first taken out of service as a failed backend is (`StoreRebuilds.retireUnlistedServed`: marked,
+    closed, offline), so the check that follows retires it.
 
   The reconcile **releases** (`StoreCopies.release`) a `pending-delete/` copy once its store is Active on its owner
   device: on this device by its own entry, elsewhere by the pool's entry and that device's state. This is the only

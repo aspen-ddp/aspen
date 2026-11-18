@@ -227,8 +227,8 @@ name that identifies no store is kept. Deletes are rename-first through `<device
 leaves nothing partial behind. A lost copy whose rebuild is re-placed onto another device before it ran (section 4.2)
 is retired the same way by the reconcile's Deleted Stores pass, once its entry has left this device, and released when
 the destination's flip makes the store Active there. An accepted loss (5.5) ends in that flip too: the old copy goes
-with it. What may be done with
-suspected-loss content is the subject of [systemic-loss-protection.md](systemic-loss-protection.md) and
+with it. The same pass first takes out of service a store served from a device whose entry does not list it (FS17), so
+a hand-placed copy is retired the same way. What may be done with suspected-loss content is the subject of [systemic-loss-protection.md](systemic-loss-protection.md) and
 `Backlog.txt` ("System-level protection against correlated lost store declarations").
 
 ---
@@ -695,8 +695,12 @@ operator accepts the loss; the next pass records it in the ErrorTree and finishe
 transfer-out marker and an empty save file; an adopter classes it Clean, and a restart of the device reinstates it.
 
 **FS17 A copy left at the store's path by an earlier tenancy.** `retireForeignCopy` marks it and the discard keeps it in
-pending-delete, so the store is rebuilt from the pool; a copy being served is first fail-stopped. Before the first
-reconcile reaches the Rebuilding entry, a device load may serve it (RB-W5).
+pending-delete, so the store is rebuilt from the pool; a copy being served is first fail-stopped. A copy put at a store
+path the device's entry does not list at all (a restored backup) is retired by the Deleted Stores pass: a served one is
+first fail-stopped (`StoreRebuilds.retireUnlistedServed`), marked and closed, and the check that follows moves it to
+pending-delete. `StoreLoader.tryLoadStore` reads no tree, so either copy serves from its load until the device's first
+reconcile, which a startup scan runs at once; the load floor (`Frontend.loadedAt`) keeps it out of every transaction
+started before the load.
 
 **FS18 A store re-placed away and back.** Its host is down mid-rebuild; `replaceRebuild` moves it, the copy finishes
 elsewhere and serves, and the store later comes back Rebuilding (a drain choosing the device, or the operator). The
@@ -708,20 +712,4 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 
 ## Open weaknesses
 
-### RB-W5. A markerless directory at a store path the tree does not list is loaded and served (PLAUSIBLE; stale replica)
-Mechanism: `StoreLoader.tryLoadStore` loads any directory with a `config.yaml` and no marker, without reading the tree,
-and nothing unloads a served store whose device entry is absent. The code no longer makes such a directory: every
-copy that stops being its owner's is retired with a `rebuild-required` marker (4.3), and every delete is rename-first
-through `<device>/deleting/` (`StoreCopies.delete`), so a partial delete cannot strip a marker and leave the rest at
-the store path. What remains is a directory put at a store path by hand (a restored backup, a copy moved back from
-`pending-delete/` without its marker removed deliberately). `retireForeignCopy` retires such a copy only when the
-store is Rebuilding on that device, and only from the first reconcile after the load.
-Trigger / scenario: an operator copies an old store directory back onto a device, then restarts its host. If S is
-Rebuilding on that device, the copy serves until the first reconcile (seconds); if the device has no entry for S, the
-copy serves indefinitely (its repair scans are fenced by the pool entry, but it answers reads and prepares from peers
-holding a stale mapping).
-Consequence: an old incarnation of S, with stale slices and no `acceptor-since`, answers reads and votes. The load
-floor (`Frontend.loadedAt`) keeps it out of transactions started before the load; it can still vote on newer ones from
-stale state.
-Suggested fix: have the reconcile close (and retire) a loaded store whose device entry is absent.
-Effort: S   Priority: 5
+None.

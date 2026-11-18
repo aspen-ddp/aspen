@@ -59,11 +59,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.2  Markerless directory at a store path the tree does not list is loaded and served: RB-W5              [S]
-     PLAUSIBLE, narrowed: code no longer leaves one (copies are retired with a marker, deletes are rename-first),
-     so only a directory put back by hand remains. Fix: have the reconcile close (and retire) a loaded store whose
-     device entry is absent.
-
 5.3  CRL completion handlers run on the writer thread before the next write: CRL-W4                        [S]
      PLAUSIBLE. Network sends in handlers serialize on the device's one writer thread under group commit. Fix:
      ordered completion executor; queue WriteComplete at once. Measure first.

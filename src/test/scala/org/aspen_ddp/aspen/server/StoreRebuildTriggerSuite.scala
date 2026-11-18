@@ -12,6 +12,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.store.backend.MapBackend
 
 import java.util.UUID
 import scala.collection.mutable
@@ -349,6 +350,46 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       pending should have size 1
       os.exists(pending.head / "data") should be(true)
       os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+
+  atest("a served store its device's entry does not list is taken out of service and retired (RB-W5)"):
+    // A copy put back at a store path by hand, loaded at startup without reading the tree. The reconcile takes it out
+    // of service and keeps it in pending-delete; a served store its entry lists (Active) is left alone
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newHost(hostRoot)
+    val unlisted = storeN(0)
+    val listed = storeN(1)
+    def backendAt(s: StoreId): MapBackend =
+      val dir = deviceDir / s.directoryName
+      os.makeDir.all(dir)
+      new MapBackend(s):
+        override def path: os.Path = dir
+    val loads = List(unlisted, listed).map(s => host.loadStore(deviceA, backendAt(s), None))
+
+    def served(s: StoreId): Boolean = host.control.router.loaded.contains(s)
+    def pending: List[os.Path] =
+      val dir = deviceDir / RebuildingStore.PendingDeleteDirectory
+      if os.exists(dir) then os.list(dir).toList else Nil
+    val active = StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
+    def answerChecks(): Boolean =
+      host.testingOnlyHandleEvents()
+      if !host.control.reconciler.activeDeviceChecks.contains(deviceA) then
+        recorded(host).armLookup(deviceA).success(deviceState(deviceA, Map(listed -> active)))
+        host.control.reconciler.checkStorageDevice(deviceA)
+        host.testingOnlyHandleEvents()
+      !os.exists(deviceDir / unlisted.directoryName)
+
+    for
+      _ <- yieldUntil({ host.testingOnlyHandleEvents(); loads.forall(_.isCompleted) && served(unlisted) && served(listed) })
+      _ <- yieldUntil(answerChecks())
+    yield
+      served(unlisted) should be(false)
+      loadedDevices(host)(deviceA).loadedStores should not contain unlisted
+      pending should have size 1
+      pending.head.last should startWith(unlisted.directoryName)
+      os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      served(listed) should be(true)
+      os.exists(deviceDir / listed.directoryName / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
 
   private def rebuildingIn(storeId: StoreId, episode: UUID): (StoreId, StorageDeviceState.StoreEntry) =
     storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None, Some(episode))

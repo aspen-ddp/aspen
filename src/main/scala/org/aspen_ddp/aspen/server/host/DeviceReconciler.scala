@@ -107,7 +107,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                              s"$deviceId no longer holds. Retrying at the device's next check. Error: $t")
 
   /** Reconciles a loaded device's on-disk state against the state recorded for it in the
-   *  storage-devices tree: retires the copies of stores no longer owned here, flips stores whose CRL state was lost
+   *  storage-devices tree: retires the copies of stores no longer owned here (a served one its entry does not list
+   *  is first taken out of service), flips stores whose CRL state was lost
    *  to Rebuilding, reinstates stores left offline by an abandoned transfer out or a cancelled
    *  shutdown, creates Initializing stores, and starts transfers in.
    *
@@ -151,6 +152,15 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // its rebuild was re-placed onto another device (Rebuild F12). Its copy is retired, not deleted: it and its
       // CRL state are kept in pending-delete until the store is Active on the device its pool names (StoreCopies).
       // For a completed transfer that is already so, and the check the retire asks for deletes it.
+      //
+      // A served store whose entry is absent is a copy put at the store path by hand: every path that serves a store
+      // has its entry first. It is taken out of service (marked, closed, offline), and the check that follows
+      // retires it here like any other offline one.
+      ctx.router.loaded.collect {
+        case (storeId, store) if store.storageDeviceId == local.storageDeviceId && !remote.stores.contains(storeId) =>
+          storeId
+      }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
+        ctx.rebuilds.retireUnlistedServed(local, storeId)
       local.offlineStores.filter(storeId =>
         !remote.stores.contains(storeId)
       ).foreach: storeId =>

@@ -424,8 +424,9 @@ T's update, the store proves the commit (`Tx.proveCommitted`): one `TxResolved(p
 save, no locks, nothing in the status cache, no local resolution. A response already held for the objects to load still
 goes out, as the abort vote it now is. The prover stays a live Tx and an ordinary acceptor: later prepares get a
 promise with no accepted value plus its abort vote, saved first (`Tx.answerPrepare` -> `answerPrepareAsAcceptor`); a
-muted prover re-sends only the proof. On any real outcome it applies nothing, sends no `TxCommitted` and is forgotten
-(`Tx.applyNothing`): it holds no commit vote, so it is owed nothing. Its saved abort vote is a true vote (its
+muted prover re-sends only the proof. Like any acceptor it is forgotten only on `TxFinalized` or a late outcome (a
+non-late `TxResolved` changes nothing at it, `Tx.receiveResolved`); then it applies nothing, sends no `TxCommitted` and
+records nothing (`Tx.applyNothing`): it holds no commit vote, so it is owed nothing. Its saved abort vote is a true vote (its
 requirements fail) and cannot make a tally abort-certain over `t` commit votes: it is not one of the commit voters, so
 it counts in `a <= w - c`. A recovered prover has Paxos state, so it no longer proves and answers with its saved vote.
 

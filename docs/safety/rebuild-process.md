@@ -301,8 +301,9 @@ whose entry lands behind the walk's position. Two mechanisms close that gap:
   10 s) until `w - t + 1` answer. Each lists the allocations in the pool held by transactions it has not seen
   finalized or aborted (`Frontend.currentAllocations`); a store still loading its CRL does not answer. A committed
   transaction is held by at least `t` of its commit voters in the pool until `TxFinalized`, which comes only after
-  its AllocationFinalizationAction recorded its objects, and expiry never discards a committed, unfinalized Tx. The
-  lost store may have been one voter, so `w - t + 1` answers from the other `w - 1` include a holder. That count never
+  its AllocationFinalizationAction recorded its objects, and expiry discards a Tx that may have committed only under
+  `ExpiryTally` rule D (`dataLost`: some changed pool has fewer than `r` commit voters and silent stores together, `vc + s < r`), where the allocation
+  is unrestorable anyway (paxos-transactions.md, expiry rule D). The lost store may have been one voter, so `w - t + 1` answers from the other `w - 1` include a holder. That count never
   exceeds `r` (Replication: `t >= r`; Reed-Solomon variants: `t >= restoreThreshold`, and `r` is a majority), so it
   adds no availability requirement beyond the reads the rebuild needs anyway.
 * The listed set is merged into `listedAllocations` and carried by every checkpoint, so the walk never advances

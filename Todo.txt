@@ -71,11 +71,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1  Contradictions between safety docs (cross-document-review.md section 5)                               [S]
-     5.2 a prover is forgotten only on TxFinalized or a late outcome (fix paxos-transactions.md proof section and
-     transaction-recovery.md 4.4); 5.3 rebuild-process.md 5.3 "expiry never discards a committed, unfinalized Tx"
-     is false (rule D). (5.1, 5.4, 5.5, 5.7 are resolved.)
-
 7.2  Architecture.md contention rules do not match the driver: P-W4                                        [S]
      Abort needs more than w - t abort votes; no-commit-vote does not abort (the tally waits); no timestamps are
      compared. Replace with the abort-certain / commit-certain / undecided classification and the collision wait.

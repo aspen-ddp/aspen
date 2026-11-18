@@ -194,17 +194,15 @@ taken only inside the horizon by the driver's clock, where no expiry commit can 
 late condition 1; transaction-recovery.md, "Finalization gates forgetting").
 
 ### 5.2 When a prover is forgotten
-paxos-transactions.md (proof of commit on an unknown transaction) says a prover "on any real outcome ... applies
-nothing ... and is forgotten (`Tx.applyNothing`)", and transaction-recovery.md (finalizer) says "a muted Tx and a
-prover are dropped without `TxFinalized`". The code (`Tx.receiveResolved`, `Tx.receiveFinalized`) ignores a non-late
-`TxResolved` at a prover and forgets it only on `TxFinalized` or a late outcome, as paxos-transactions.md P9 and
-transaction-recovery.md (how a driver learns the outcome) say. The latter statements are right.
+Resolved. A prover, like any acceptor, is forgotten only on `TxFinalized` or a late outcome; a non-late `TxResolved`
+changes nothing at it (`Tx.receiveResolved`, `Tx.receiveFinalized`, `Tx.applyNothing`). paxos-transactions.md (proof
+of commit on an unknown transaction, P9) and transaction-recovery.md 4.4 and "how a driver learns the outcome" all say
+so. Only a muted Tx is dropped without `TxFinalized` (`Frontend.forgetMuted`), and it never voted commit.
 
 ### 5.3 "Expiry never discards a committed, unfinalized Tx"
-rebuild-process.md (pending allocations) rests the `w - t + 1` coverage argument on this. paxos-transactions.md rule D
-discards a T that may have committed when a changed pool has `vc + s < r` (logged `dataLost`). paxos-transactions.md
-is right; the rebuild argument holds within the data
-tolerance (`t - r` lost commit voters), which is the only regime in which the allocation is restorable anyway.
+Resolved. Expiry rule D discards a T that may have committed when a changed pool has `vc + s < r` (logged `dataLost`).
+rebuild-process.md (pending allocations) states that exception: the `w - t + 1` coverage argument holds within the
+data tolerance (`t - r` lost commit voters), the only regime in which the allocation is restorable anyway.
 
 ### 5.4 Re-applied Inserts "are healed by reconcile"
 Resolved. A re-apply (a recovered commit vote, or one applying through its UnackedCommits entry) that would insert a

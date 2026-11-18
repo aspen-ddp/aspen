@@ -259,8 +259,9 @@ the client.
   premise `resolveLate` relies on when it runs no actions (a memoryless quorum shows it only for a commit chosen by
   Paxos, so late condition 1 is taken only inside the horizon by the driver's clock, before any expiry commit, which
   no acceptor accepts, can exist: paxos-transactions.md, late condition 1), and the late branches of `Tx.unackedCommitFound`,
-  `Tx.unackedCommitNotOwed` and `Tx.concludeOwedCommit` rely on it too. A muted Tx and a prover are dropped without
-  `TxFinalized`, but neither voted commit; `unackedCommitFound`, `unackedCommitNotOwed` (for a recovered or expiring
+  `Tx.unackedCommitNotOwed` and `Tx.concludeOwedCommit` rely on it too. A muted Tx is dropped without `TxFinalized`
+  once its objects load (`Frontend.forgetMuted`), but it never voted commit; a prover, like any acceptor, is forgotten
+  only on `TxFinalized` or a late outcome (`Tx.applyNothing`); `unackedCommitFound`, `unackedCommitNotOwed` (for a recovered or expiring
   vote) and `proveCommitted` record nothing in the status cache, so a finalized cache entry, and the late relay from
   it, always stems from a real `TxFinalized` or late outcome.
 

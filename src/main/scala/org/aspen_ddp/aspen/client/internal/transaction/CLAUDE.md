@@ -29,8 +29,8 @@
   never erases a known value); a store that never answered the driver gets `None`, as does one that reported two
   different incarnations (`TransactionDriver.recordIncarnation`: recorded as unknown for good). Value:
   `[timestamp:8][incarnation:16][count:4][pointers]`; the incarnation is the store's
-  `StoreIncarnation` UUID, the zero UUID meaning `None` (unknown), copied into every chunk. `MissedUpdateFinalizationAction` runs once every other action has settled, succeeded
-  or failed (Ruling 8, revised 2026-11-15), so an entry durable means T committed, not that the other actions are
+  `StoreIncarnation` UUID, the zero UUID meaning `None` (unknown), copied into every chunk. `MissedUpdateFinalizationAction` runs in parallel with the other actions (Ruling 8,
+  revised 2026-11-17), so an entry durable means T committed, not that the other actions are
   done: only TxFinalized (sent once a finalizer completed every action) implies that
 - `MissedUpdateFinalizationAction` disables missed-update tracking on an ErrorTree write only when the transaction
   references the pool the entry is about (in practice the bootstrap pool)

@@ -220,17 +220,20 @@ that every store votes and takes locks.
 ### 4.4 The finalizer and at-least-once semantics
 
 `TransactionDriver.onResolution(committed = true)` records the resolution time and calls `startFinalizer`, which
-creates the finalizer (every action but the marker executes in `Finalizer`'s constructor), hands it
+creates the finalizer (every action executes in `Finalizer`'s constructor), hands it
 `commitVoters(countedCommitVoters, peerIncarnations)` and the `commitErrors` collected so far, and on success calls
 `onFinalized(true, handedOffStores)`. `onFinalized` queues `TxFinalized(outcome, late, owed)` to every data store and
 `TransactionFinalized` to the client. An abort finalizes at once with no finalizer. A resolution the driver reached by
 Paxos (`sendResolutionMessage = true`) also queues `TxResolved` to every data store, `notifyOnResolution` stores and
 the client.
 
-* **Action order.** `RegisteredTransactionFinalizerFactory.Finalizer` executes every action except the
-  `MissedUpdateFinalizationAction` (the marker) at once; the marker executes once every other action's `complete` has
-  settled, succeeded or failed. `complete` fails with the first failure once all have settled. An action whose type
-  cannot be loaded, or whose factory throws, is a failed action (`Finalizer.of`), so the marker still runs.
+* **Action order.** `RegisteredTransactionFinalizerFactory.Finalizer` executes every action at once, the
+  `MissedUpdateFinalizationAction` (the marker) included, so no other action, failing or retrying for as long as an
+  outage lasts, keeps the missed stores' marks unwritten. A durable UnackedCommits entry therefore implies only that T
+  committed; every path that concludes T finalized rests on acceptors having forgotten T, which happens only on
+  TxFinalized, sent once a finalizer completed every action. `complete` fails with the first failure once all have
+  settled. An action whose type cannot be loaded, or whose factory throws, is a failed action (`Finalizer.of`), so the
+  marker still runs.
 * **Failure path.** A finalizer that cannot be created, or whose `complete` fails, is logged at error and started
   again from scratch after `finalizerRetryDelay` (1 s doubling to 60 s), until one completes, the driver finalizes
   another way, or it shuts down (`finalizerFailed`). The transaction is never finalized without its actions: without
@@ -280,7 +283,7 @@ Added to every transaction by `TransactionBuilder.buildTranaction` unless `disab
 (`MissedUpdateFinalizationAction.limitTracking`, used only for writes about the pool they touch: in practice the
 bootstrap pool's own trees, healed by the bootstrap tree sweep instead, repair-process.md).
 
-* `execute()` (after the other actions settle) schedules `markMissedUpdates` after `errorTimeout` (2 s).
+* `execute()` (when the finalizer is created) schedules `markMissedUpdates` after `errorTimeout` (2 s).
 * Fast path: `updateCommitErrors` completes the action, writing nothing, once every data store has reported and no
   report names an object other than a lock-only one. It applies only before the marks are handed off.
 * `writeMissedUpdates` builds:
@@ -597,10 +600,10 @@ lookup that finds no entry.
 ### 8.3 Finalizer (commit only)
 
 ```
- create: every action but the marker executes  ->  commitVoters(voters?, incarnations) -> updateCommitErrors
+ create: every action executes  ->  commitVoters(voters?, incarnations) -> updateCommitErrors
    others (allocation/deletion/TKVL): retry until success; a give-up fails the action
    marker: all data stores reported error-free? -> complete (no writes)
-           once every other action settled: execute -> after errorTimeout: markMissedUpdates
+           executed at create -> after errorTimeout: markMissedUpdates
                 -> MissedUpdateMarker (ErrorTree + UnackedCommits, one transaction per pool)
                 -> complete on success; fails on a permanent marker failure
  all settled, none failed -> driver.onFinalized
@@ -694,9 +697,9 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 * **Driver partitioned from some stores**: those stores go idle and start drivers that can reach the others.
 * **Driver on a store that closes or reloads**: shut down (`Store.shutdownDrivers`); other stores' heartbeat recovery
   takes over.
-* **Finalization action that keeps failing**: the finalizer is restarted with backoff, the driver keeps heartbeating,
-  stores keep T's Tx, CRL state and admission (locks were released on apply). The marker still runs once the failing
-  action settles, so missed stores are marked during the stall. A host lacking an action's type stalls T, alarmed,
+* **Finalization action that keeps failing or retrying**: the finalizer is restarted with backoff, the driver keeps
+  heartbeating, stores keep T's Tx, CRL state and admission (locks were released on apply). The marker runs in
+  parallel with it, so missed stores are marked during the stall. A host lacking an action's type stalls T, alarmed,
   until a driver that has the type finalizes it (mixed-version support is in Backlog.txt).
 * **Marker write that cannot succeed** (metadata pool without a write quorum): retried with backoff; finalization and
   forgetting wait, alarmed after 60 s. A permanent failure restarts the finalizer.
@@ -749,23 +752,3 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-### R-W2. A finalization action that keeps retrying (rather than failing) keeps the marker from running (CONFIRMED; liveness)
-Mechanism: `RegisteredTransactionFinalizerFactory.Finalizer` executes the marker only once `settled(first)` completes,
-i.e. once every other action's `complete` has settled. `AllocationFinalizationAction`, `DeletionFinalizationAction`,
-`SplitFinalizationAction`, `JoinFinalizationAction` and `TailRemovalFinalizationAction` all run
-`client.retryStrategy.retryUntilSuccessful`, which retries every failure other than `StopRetrying` and
-`UnpinnedTransaction` forever (`ExponentialBackoffRetryStrategy`). An action that cannot succeed for a long time
-therefore never settles, and the marker never executes. The "marker runs once the others settle" rule covers failed
-actions only.
-Trigger / scenario: T splits a TKVL node of a tree in pool U and writes objects in pool P, where store P2 misses T.
-Pool U loses its write quorum (or the split's tree is unreadable) for an hour. The split action retries throughout;
-the marker never executes, so P2's ErrorTree marks are not written, and P2 is not repaired for the hour, though P's
-metadata trees are healthy. The same happens to an allocation action whose object read keeps failing.
-Consequence: missed stores stay stale (one fewer copy, so less failure tolerance) for the length of an unrelated
-outage; the stall alarm fires but repair cannot start. No data is lost while T stays unfinalized: its holders keep T
-and recovered voters learn it from them or by expiry.
-Suggested fix: execute the marker once the others settle or after a bound (for example `FinalizationStallAfter`, or
-the first failed attempt of any action), whichever comes first. The marker is idempotent and an entry no longer implies
-the other actions are done, so running it early costs nothing in safety; a re-run finalizer re-marks harmlessly. Test
-with an action whose `complete` never settles.
-Effort: S   Priority: 4

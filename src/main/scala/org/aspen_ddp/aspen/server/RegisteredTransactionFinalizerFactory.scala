@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory}
-import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateFinalizationAction
 import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
@@ -9,65 +8,45 @@ import org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.transaction.TransactionFinalizer
 
-import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
 object RegisteredTransactionFinalizerFactory {
 
-  /** Runs a committed transaction's finalization actions. Every action executes at once except the
-    * MissedUpdateFinalizationAction (the marker), which executes once every other action's `complete` has settled,
-    * succeeded or failed (Ruling 8, revised 2026-11-15). `complete` covers all of them, and `cancel` cancels all of
-    * them, including a marker not yet started.
+  /** Runs a committed transaction's finalization actions. Every action, the MissedUpdateFinalizationAction (the
+    * marker) included, executes at once and in parallel, so the stores that missed the transaction are marked for
+    * repair whatever the other actions do, even while one of them retries for a long time (Ruling 8, revised
+    * 2026-11-17). `complete` covers all of them, and `cancel` cancels all of them.
     *
     * Invariant: a durable UnackedCommits entry implies the transaction committed, and nothing more: the other actions
-    * may have failed, to be run again by a fresh finalizer. What implies that every action is done is an acceptor
-    * having forgotten the transaction. A driver sends TxFinalized only once a finalizer's `complete` has succeeded, so
-    * once every action, the marker's writes in every pool included, is done. An acceptor forgets a committed
-    * transaction only on TxFinalized, or on a late outcome, which itself follows TxFinalized; finding its UnackedCommits
-    * entry (Tx.unackedCommitFound) applies the update but keeps the Tx until then, and an expiry Discard needs a quorum
-    * that forgot it. A late commit (TransactionDriver.resolveLate) relies on this when it runs none of the actions.
+    * may still be running, or may have failed, to be run again by a fresh finalizer. What implies that every action is
+    * done is an acceptor having forgotten the transaction. A driver sends TxFinalized only once a finalizer's
+    * `complete` has succeeded, so once every action, the marker's writes in every pool included, is done. An acceptor
+    * forgets a committed transaction only on TxFinalized, or on a late outcome, which itself follows TxFinalized;
+    * finding its UnackedCommits entry (Tx.unackedCommitFound) applies the update but keeps the Tx until then, and an
+    * expiry Discard needs a quorum that forgot it. A late commit (TransactionDriver.resolveLate) relies on this when it
+    * runs none of the actions.
     *
-    * Running the marker after a failed action writes the ErrorTree marks and UnackedCommits entries while the failing
-    * action is retried, so the stores that missed the transaction are repaired during a stall (transaction-recovery
-    * R-N2). Each retry runs the marker again; its writes are idempotent.
+    * Each retry of a failed finalizer runs the marker again; its writes are idempotent.
     *
-    * The marker receives `updateCommitErrors` and `commitVoters` from the start, before it executes, and keeps them.
+    * The marker receives `updateCommitErrors` and `commitVoters` right after the finalizer is created, before its
+    * `errorTimeout` lets it write, and keeps later updates.
     *
-    * `complete` settles once every action that executes has settled: it fails with the first failure, or succeeds if
-    * none failed. It relies on every action settling (an action that gives up fails its `complete`, never leaves it
-    * pending); failing earlier would let the driver cancel the marker before its turn. The driver then starts a fresh
-    * finalizer (TransactionDriver.startFinalizer).
+    * `complete` settles once every action has settled: it fails with the first failure, or succeeds if none failed. It
+    * relies on every action settling (an action that gives up fails its `complete`, never leaves it pending); failing
+    * earlier would let the driver cancel the marker before it writes. The driver then starts a fresh finalizer
+    * (TransactionDriver.startFinalizer).
     */
-  class Finalizer(val actions: List[FinalizationAction],
-                  runsLast: FinalizationAction => Boolean = Finalizer.isMissedUpdateMarker)
-                 (using ec: ExecutionContext) extends TransactionFinalizer {
+  class Finalizer(val actions: List[FinalizationAction])(using ec: ExecutionContext) extends TransactionFinalizer {
 
-    private val (last, first) = actions.partition(runsLast)
-    private var cancelled = false
+    actions.foreach(_.execute())
 
-    first.foreach(_.execute())
-
-    private def settled(fs: List[FinalizationAction]): Future[List[Try[Unit]]] =
-      Future.sequence(fs.map(_.complete.transform(t => Success(t))))
-
-    private val completion: Promise[Unit] = Promise()
-
-    // The check and the execute share the lock with cancel: a cancel between them would find no marker task to
-    // cancel, and the execute would then schedule its writes regardless
-    settled(first).foreach { firstResults =>
-      val runLast = synchronized {
-        if !cancelled then last.foreach(_.execute())
-        !cancelled
+    val complete: Future[Unit] =
+      Future.sequence(actions.map(_.complete.transform(t => Success(t)))).flatMap { results =>
+        results.collectFirst { case Failure(err) => err } match
+          case Some(err) => Future.failed(err)
+          case None => Future.unit
       }
-      val lastResults = if runLast then settled(last) else Future.successful(Nil)
-      lastResults.foreach { results =>
-        (firstResults ++ results).collectFirst { case Failure(err) => err } match
-          case Some(err) => completion.tryFailure(err)
-          case None => completion.trySuccess(())
-      }
-    }
-
-    def complete: Future[Unit] = completion.future
 
     def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = {
       actions.foreach(_.updateCommitErrors(commitErrors))
@@ -82,9 +61,7 @@ object RegisteredTransactionFinalizerFactory {
       actions.map(f => (f.getClass.getSimpleName, f.complete.isCompleted))
     }
 
-    def cancel(): Unit =
-      synchronized { cancelled = true }
-      actions.foreach(_.cancel())
+    def cancel(): Unit = actions.foreach(_.cancel())
   }
 
   object Finalizer:
@@ -102,8 +79,6 @@ object RegisteredTransactionFinalizerFactory {
     private final class FailedFinalizationAction(err: Throwable) extends FinalizationAction:
       def complete: Future[Unit] = Future.failed(err)
       def execute(): Unit = ()
-
-    def isMissedUpdateMarker(action: FinalizationAction): Boolean = action.isInstanceOf[MissedUpdateFinalizationAction]
 }
 
 class RegisteredTransactionFinalizerFactory(val client: AspenClient) extends TransactionFinalizer.Factory {

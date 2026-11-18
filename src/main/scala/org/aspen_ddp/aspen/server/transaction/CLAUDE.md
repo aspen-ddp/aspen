@@ -24,9 +24,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   finalizers (`failedHandedOff`). An action that gives up must fail its `complete`, never leave it pending
   An action whose type cannot be created (user jar missing, version skew) is a failed action: the marker still runs,
   and the transaction stays unfinalized, alarmed, until a driver that has the type finalizes it (safety X8)
-- Marker order (Ruling 8, revised 2026-11-15; `RegisteredTransactionFinalizerFactory.Finalizer`): the
-  missed-update marker executes once every other action has settled, succeeded or failed, so a failing action
-  still gets the missed stores marked (R-N2). `complete` waits for the marker, then fails with the first failure.
+- Marker order (Ruling 8, revised 2026-11-17; `RegisteredTransactionFinalizerFactory.Finalizer`): every action,
+  the missed-update marker included, executes at once, so an action failing or retrying through an outage never keeps
+  the missed stores unmarked. `complete` waits for every action, then fails with the first failure.
   An action whose type cannot be loaded, or whose factory throws, is a failed action (`Finalizer.of`), not a failed
   finalizer creation
 - Stall alarm (Todo 4.9): a committed transaction its driver has not finalized `FinalizationStallAfter` (60 s) after

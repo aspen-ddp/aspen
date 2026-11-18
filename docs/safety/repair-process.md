@@ -131,7 +131,7 @@ Details are in [transaction-recovery.md](transaction-recovery.md); what repair r
 1. `TransactionBuilder` adds a `MissedUpdateFinalizationAction` to every transaction unless tracking is disabled
    (`disableMissedUpdateTracking`; `AspenClient.newRepairTransaction` for repair proofs; `limitTracking` for writes
    to a pool's own trees, which happens only for the bootstrap pool).
-2. The marker action runs once every other finalization action of T has settled, succeeded or failed
+2. The marker action executes when T's finalizer is created, in parallel with T's other finalization actions
    (`RegisteredTransactionFinalizerFactory.Finalizer`).
 3. `updateCommitErrors`: when every data store replied and no error names a non-lock-only object, the action completes
    with no marks. Otherwise `execute` schedules `markMissedUpdates` after `errorTimeout` (2 s); stores replying

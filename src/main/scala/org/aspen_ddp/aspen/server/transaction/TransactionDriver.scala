@@ -713,10 +713,10 @@ abstract class TransactionDriver(
     *    knows it is late. A store's status cache marks a transaction finalized only from a real TxFinalized or a late
     *    outcome.
     *
-    * Either way the original finalization's other actions completed, by the invariant of
-    * RegisteredTransactionFinalizerFactory.Finalizer: UnackedCommits entries become durable only after every other
-    * finalization action of the transaction completed, and TxFinalized is sent only after all of them (see the ordering
-    * premise on `onResolution`). So this runs no finalizer (and cancels any it started: re-running them would itself be
+    * Either way some acceptor forgot T, which it does only on TxFinalized (or a late outcome, which itself follows one),
+    * and TxFinalized is sent only once a finalizer completed every action, the marker's UnackedCommits entries included
+    * (RegisteredTransactionFinalizerFactory.Finalizer; see the ordering premise on `onResolution`). So this runs no
+    * finalizer (and cancels any it started: re-running them would itself be
     * a replay) and finalizes at once. Every TxResolved and TxFinalized sent from here on carries `late = true`, so
     * receiving stores apply the commit only where an UnackedCommits entry says it is owed. A late commit sends no
     * accepts.

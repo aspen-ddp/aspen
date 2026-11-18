@@ -51,7 +51,7 @@ object RegisteredTransactionFinalizerSuite:
 class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
   import RegisteredTransactionFinalizerSuite.{*, given}
 
-  test("the missed-update marker executes only after every other action settles, and complete waits for all") {
+  test("the missed-update marker executes at once with the other actions, and complete waits for all") {
     val a = new StubAction
     val b = new StubAction
     val marker = new StubMarker
@@ -59,28 +59,35 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
 
     a.executed should be (true)
     b.executed should be (true)
-    marker.executed should be (false)
+    marker.executed should be (true)
 
-    // Commit errors and voters given before the marker executes reach it
+    // Commit errors and voters given after the marker executes reach it
     val errors = Map(TransactionDriverSuite.ds0 -> List.empty[ObjectId])
     f.commitVoters(Some(Set(TransactionDriverSuite.ds0)), Map())
     f.updateCommitErrors(errors)
     marker.voters should be (List(Some(Set(TransactionDriverSuite.ds0))))
     marker.errors should be (List(errors))
 
-    a.done.success(())
-    marker.executed should be (false)
-    b.done.success(())
-    marker.executed should be (true)
-    f.complete.isCompleted should be (false)
-
     marker.done.success(())
-    f.complete.isCompleted should be (true)
+    a.done.success(())
+    f.complete.isCompleted should be (false)
+    b.done.success(())
+    f.complete.value should be (Some(scala.util.Success(())))
   }
 
-  // Ruling 8 (revised 2026-11-15): a failed action still lets the marker write its marks, so the stores that missed
-  // the transaction are repaired while finalization is retried (transaction-recovery R-N2)
-  test("a failed action still runs the marker once the others settle, and complete fails only after the marker settles") {
+  // Ruling 8 (revised 2026-11-17): an action that never settles (one retrying through an outage) does not hold up the
+  // marker, so the stores that missed the transaction are repaired meanwhile
+  test("an action that never settles does not keep the marker from executing, and complete waits for it") {
+    val stuck = new StubAction
+    val marker = new StubMarker
+    val f = new Finalizer(List(stuck, marker))
+
+    marker.executed should be (true)
+    marker.done.success(())
+    f.complete.isCompleted should be (false)
+  }
+
+  test("a failed action fails complete only after the marker settles") {
     val a = new StubAction
     val b = new StubAction
     val marker = new StubMarker
@@ -88,28 +95,11 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
 
     val err = new Exception("action failed")
     b.done.failure(err)
-    marker.executed should be (false)
-    f.complete.isCompleted should be (false)
-
     a.done.success(())
-    marker.executed should be (true)
     f.complete.isCompleted should be (false)
 
     marker.done.success(())
     f.complete.value should be (Some(scala.util.Failure(err)))
-  }
-
-  test("a cancel after a failed action, before the others settle, keeps the marker from executing") {
-    val a = new StubAction
-    val b = new StubAction
-    val marker = new StubMarker
-    val f = new Finalizer(List(a, marker, b))
-
-    b.done.failure(new Exception("action failed"))
-    f.cancel()
-    a.done.success(())
-    marker.executed should be (false)
-    marker.cancelled should be (true)
   }
 
   test("an action that cannot be created is a failed action, and the marker still runs") {
@@ -119,8 +109,8 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     val f = Finalizer.of(List(scala.util.Success(a), scala.util.Failure(err), scala.util.Success(marker)))
 
     a.executed should be (true)
-    a.done.success(())
     marker.executed should be (true)
+    a.done.success(())
     marker.done.success(())
     f.complete.value should be (Some(scala.util.Failure(err)))
   }
@@ -137,7 +127,7 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     f.complete.value should be (Some(scala.util.Failure(err)))
   }
 
-  test("cancel cancels every action and keeps a marker not yet started from executing") {
+  test("cancel cancels every action, the marker included") {
     val a = new StubAction
     val marker = new StubMarker
     val f = new Finalizer(List(a, marker))
@@ -145,9 +135,6 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     f.cancel()
     a.cancelled should be (true)
     marker.cancelled should be (true)
-
-    a.done.success(())
-    marker.executed should be (false)
   }
 
   test("a finalizer reports the stores its marker owes, and none without a marker") {
@@ -156,14 +143,4 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     val f = new Finalizer(List(new StubAction, m))
     f.handedOffStores should be (m.owed)
     new Finalizer(List(new StubAction)).handedOffStores should be (Set())
-  }
-
-  test("without a marker, every action executes at once") {
-    val a = new StubAction
-    val b = new StubAction
-    val f = new Finalizer(List(a, b))
-    a.executed should be (true)
-    b.executed should be (true)
-    a.done.success(()); b.done.success(())
-    f.complete.isCompleted should be (true)
   }

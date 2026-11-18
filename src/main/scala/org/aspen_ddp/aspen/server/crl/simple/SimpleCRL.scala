@@ -282,18 +282,19 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
   // Reported through the CRL thread, which dies of it: the CRL has one death path
   private val writer = StreamWriter(maxSizeInBytes, files, t => ioQueue.put(WriterDied(t)))
   private var currentStream: Int = r.activeStreamId.number
-  // Replaced once the recovered records are queued, with the oldest entry they need
+
+  /** The serials of the entries holding every piece live records' newest static records name: its oldest is
+    * oldestEntryNeeded, which each entry stamps when its buffers are built (LogEntry.createEntryBuffers) */
+  private val livePieces = new LivePieces
+
   private var currentLogEntry: LogEntry = new LogEntry(r.initialPreviousEntryLocation,
-    r.initialNextEntrySerialNumber, r.initialOldestEntryNeeded)
+    r.initialNextEntrySerialNumber, livePieces)
   private val streams: Array[Stream] = new Array[Stream](files.length)
 
   private var transactions: HashMap[TxId, Tx] = new HashMap()
 
   /** Applied stubs: entries apart from transactions, under the same ids (StoreRecoveryState) */
   private var stubs: HashMap[TxId, Stub] = new HashMap()
-
-  private var queueHead: Option[Record] = None
-  private var queueTail: Option[Record] = None
 
   private var writeInProgress = false
   /** Barriers queued while the current entry was empty and a write was in progress: they run once it completes */
@@ -312,25 +313,25 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
     else
       streams(tpl._1.number) = new Stream(tpl._1, crlId, writer, UUID.randomUUID(), 0)
 
-  // The open writes nothing (crash-recovery-log F16): each recovered record keeps the locations its newest durable
-  // static record names, queued by the oldest entry holding any of them, as if this instance had written them. The
-  // last durable entry kept the ring's invariant (the stream after the active one holds nothing needed), so the next
-  // rotation's copy-forward finds and moves them as the instance before the crash would have. A failed open shuts
-  // its writer down: the caller may open the same files again
+  // The open writes nothing (crash-recovery-log F16): each recovered record keeps the pieces its newest durable
+  // static record names, each pinned in livePieces by the verified entry holding it (Recovery.entryHolding), as if
+  // this instance had written them. So the first entry's oldestEntryNeeded is no newer than any of them: every entry
+  // recovery read them from is walked again. The last durable entry kept the ring's invariant (the stream after the
+  // active one holds nothing needed), so the next rotation's copy-forward finds and moves them as the instance before
+  // the crash would have. A failed open shuts its writer down: the caller may open the same files again
   try
-    val recoveredTxs = r.txs.map: t =>
-      (new Tx(t.id, t.state, Some(t.txdLocation), t.updateLocations), t.entrySerialNumber)
-    val recoveredStubs = r.stubs.map: s =>
+    r.txs.foreach: t =>
+      val tx = new Tx(t.id, t.state)
+      require(t.updatePieces.size == t.state.objectUpdates.size)
+      tx.txdPiece = Some(t.txdPiece)
+      tx.updatePieces = t.updatePieces.map(Some(_))
+      tx.pieces.foreach(p => livePieces.add(p.serial))
+      transactions += (tx.id -> tx)
+    r.stubs.foreach: s =>
       val stub = new Stub(s.id, s.start)
       stub.anchor = Some(s.anchor)
-      (stub, s.entrySerialNumber)
-    (recoveredTxs ++ recoveredStubs).sortBy(_._2).foreach: (record, serial) =>
-      record match
-        case tx: Tx => transactions += (tx.id -> tx)
-        case stub: Stub => stubs += (stub.id -> stub)
-      addToQueueHead(record, serial)
-    currentLogEntry = new LogEntry(r.initialPreviousEntryLocation, r.initialNextEntrySerialNumber,
-      oldestEntryNeeded.max(r.initialOldestEntryNeeded))
+      livePieces.add(s.anchor.serial)
+      stubs += (stub.id -> stub)
   catch case t: Throwable =>
     val closed = new CountDownLatch(1)
     shutdownWriter(() => closed.countDown())
@@ -392,9 +393,8 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
 
   def currentStreamNumber: Int = currentStream
 
-  def oldestEntryNeeded: Long = queueTail match
-    case None => currentLogEntry.entrySerialNumber
-    case Some(lc) => lc.entrySerialNumber
+  /** As the next entry would stamp it if built now, its own pieces aside (they are no older) */
+  def oldestEntryNeeded: Long = livePieces.oldest.getOrElse(currentLogEntry.entrySerialNumber)
 
   private def startWrite(): Unit =
     if !writeInProgress && !currentLogEntry.isEmpty then
@@ -404,25 +404,27 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
     if !streams(currentStream).canWriteEntry(currentLogEntry) then
       currentStream = sizing.successor(StreamId(currentStream)).number
 
-      // The stream recycled now holds nothing needed: the previous rotation copied its live data forward. This entry
-      // copies forward the live data of the next stream to be recycled, so a torn write here, or there at the next
-      // rotation, overwrites only entries no recovery needs. The last durable entry's oldestEntryNeeded never points
-      // into the stream after the active one
+      // The stream recycled now holds nothing needed: the previous rotation copied its live pieces forward. This
+      // entry copies forward the live pieces of the next stream to be recycled, so a torn write here, or there at the
+      // next rotation, overwrites only entries no recovery needs. Only the pieces in those streams move; a record's
+      // others stay where they are, in streams written after the next one to be recycled, and its static record is
+      // rewritten here naming both. Once this entry is built no live piece is in the next stream, so its stamped
+      // oldestEntryNeeded never points there. Until it is durable the entry before it, stamped while the moved pieces
+      // were pinned, is the one a recovery starts from
       val recycled = StreamId(currentStream)
       val nextToRecycle = sizing.successor(recycled)
       streams(currentStream).recycleStream()
       def copyForward(record: Record)(add: => Unit): Unit =
-        val inRecycled = record.closeStream(recycled)
-        val inNext = record.closeStream(nextToRecycle)
+        val inRecycled = record.piecesIn(recycled)
+        val inNext = record.piecesIn(nextToRecycle)
         if inRecycled then
           logger.error(s"CRL entry ${record.id} still had data in recycled stream $recycled. Copying it forward")
         if inRecycled || inNext then
-          moveToQueueHead(record)
+          record.unlocate(recycled)
+          record.unlocate(nextToRecycle)
           add
       transactions.valuesIterator.foreach(tx => copyForward(tx)(currentLogEntry.addTx(tx, () => ())))
       stubs.valuesIterator.foreach(stub => copyForward(stub)(currentLogEntry.addStub(stub, () => ())))
-
-      currentLogEntry.oldestEntryNeeded = oldestEntryNeeded
 
     writeInProgress = true
     logger.trace(s"CRL beginning write for entry ${currentLogEntry.entrySerialNumber}")
@@ -430,7 +432,7 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
       ioQueue.put(WriteComplete(currentLogEntry.entrySerialNumber))
     })
     val nextEntrySerialNumber = currentLogEntry.entrySerialNumber+1
-    currentLogEntry = new LogEntry(location, nextEntrySerialNumber, oldestEntryNeeded)
+    currentLogEntry = new LogEntry(location, nextEntrySerialNumber, livePieces)
 
   private def crlThread(): Unit =
     while true do
@@ -503,43 +505,13 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
           currentLogEntry.deleteTxUnlessResaved(txid)
         else
           currentLogEntry.deleteTx(txid)
-        transactions.get(txid).foreach(tx => removeFromQueue(tx))
+        transactions.get(txid).foreach(_.forget(livePieces))
         transactions -= txid
         currentLogEntry.deleteStub(txid)
-        stubs.get(txid).foreach(stub => removeFromQueue(stub))
+        stubs.get(txid).foreach(_.forget(livePieces))
         stubs -= txid
       currentLogEntry.addCompletionHandler(completionHandler)
       startWrite()
-
-  private def moveToQueueHead(lc: Record): Unit =
-    lc.clearDynamicData()
-    removeFromQueue(lc)
-    addToQueueHead(lc)
-
-  private def removeFromQueue(lc: Record): Unit =
-    queueHead.foreach: h =>
-      if h eq lc then
-        queueHead = lc.prev
-
-    queueTail.foreach: t =>
-      if t eq lc then
-        queueTail = t.next
-
-    lc.prev.foreach(p => p.next = lc.next)
-    lc.next.foreach(n => n.prev = lc.prev)
-
-    lc.prev = None
-    lc.next = None
-
-  /** Queued by `entrySerialNumber`, the entry holding its oldest data: the current one, unless recovered */
-  private def addToQueueHead(lc: Record, entrySerialNumber: Long = currentLogEntry.entrySerialNumber): Unit =
-    lc.next = None
-    lc.prev = queueHead
-    queueHead.foreach(_.next = Some(lc))
-    lc.entrySerialNumber = entrySerialNumber
-    queueHead = Some(lc)
-    if queueTail.isEmpty then
-      queueTail = Some(lc)
 
   /** Leaves the transactions live: only a deletion, which is written, takes them out of the log */
   private def onGetRecoveryState(storeId: StoreId,
@@ -555,14 +527,13 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
                                 completionHandler: () => Unit): Unit =
     val txid = TxId(storeId, transactionId)
     transactions.get(txid).foreach: tx =>
-      removeFromQueue(tx)
+      tx.forget(livePieces)
       transactions -= txid
       currentLogEntry.deleteTxUnlessResaved(txid)
     val stub = stubs.get(txid) match
       case Some(stub) => stub
       case None =>
         val stub = new Stub(txid, start)
-        addToQueueHead(stub)
         stubs += (txid -> stub)
         stub
     currentLogEntry.addStub(stub, completionHandler)
@@ -571,7 +542,7 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
   private def onDeleteAppliedStub(storeId: StoreId, transactionId: TransactionId): Unit =
     val txid = TxId(storeId, transactionId)
     stubs.get(txid).foreach: stub =>
-      removeFromQueue(stub)
+      stub.forget(livePieces)
       stubs -= txid
       currentLogEntry.deleteStub(txid)
       startWrite()
@@ -591,17 +562,12 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
     val tx = transactions.get(txid) match
       case Some(tx) => tx
       case None =>
-        val tx = new Tx(txid, state, None, None)
-
-        addToQueueHead(tx)
-
+        val tx = new Tx(txid, state)
         transactions += (tx.id -> tx)
         tx
 
-    // A Tx started by a driver's data-less prepare saves again once a client's prepare supplies the data
-    if state.objectUpdates.size != tx.state.objectUpdates.size then
-      tx.objectUpdateLocations = None
-
+    // A Tx started by a driver's data-less prepare saves again once a client's prepare supplies the data. A changed
+    // update count forgets the update pieces (Tx.state_=), which stay pinned until this entry is built
     tx.state = state
 
     logger.trace(s"CRL adding transaction ${tx.id} to log entry ${currentLogEntry.entrySerialNumber}")
@@ -611,7 +577,7 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
   private def onDeleteTransaction(storeId: StoreId, transactionid: TransactionId): Unit =
     val txid = TxId(storeId, transactionid)
     currentLogEntry.deleteTx(txid)
-    transactions.get(txid).foreach(tx => removeFromQueue(tx))
+    transactions.get(txid).foreach(_.forget(livePieces))
     transactions -= txid
     startWrite()
 

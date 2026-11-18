@@ -9,9 +9,11 @@ import java.util.UUID
 import java.util.zip.CRC32C
 import scala.collection.immutable.HashMap
 
+/** @param livePieces the CRL's live-piece index: the pieces this entry writes are added to it, and the pieces its
+  *                   records forgot are removed, when its buffers are built (createEntryBuffers) */
 class LogEntry(val previousEntryLocation: StreamLocation,
                val entrySerialNumber: Long,
-               var oldestEntryNeeded: Long) extends Logging:
+               livePieces: LivePieces) extends Logging:
   import LogEntry._
 
   private var completionHandlers: List[() => Unit] = Nil
@@ -77,7 +79,11 @@ class LogEntry(val previousEntryLocation: StreamLocation,
   def addCompletionHandler(completionHandler: () => Unit): Unit =
     completionHandlers = completionHandler :: completionHandlers
 
+  /** A save of `txid` already in this entry is taken out: its record is deleted, and SimpleCRL has unpinned its pieces
+    * (Record.forget), so none may be located here and pinned again. Recovery would skip it beside the deletion
+    * anyway */
   def deleteTx(txid: TxId): Unit =
+    txs -= txid
     txDeletions = txid :: txDeletions
     txDelSet = txDelSet + txid
     resavable -= txid
@@ -108,7 +114,45 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
     val dynDataSize = dynamicDataSize
     val statDataSize = staticDataSize
-    var buffers: List[ByteBuffer] = Nil
+    var dynamicBuffers: List[ByteBuffer] = Nil
+    val bodyCrc = new CRC32C
+
+    // DynamicData ---------
+    var offset = startingOffset + StaticEntryHeaderSize
+
+    def allocate(buff: ByteBuffer): Piece =
+      val loc = StreamLocation(streamId, offset, buff.remaining())
+      offset += buff.remaining()
+      dynamicBuffers = buff :: dynamicBuffers
+      bodyCrc.update(buff.duplicate())
+      livePieces.add(entrySerialNumber)
+      Piece(loc, entrySerialNumber)
+
+    // Each record's pieces are located before its forgotten ones are unpinned: the static record built here names the
+    // new locations, so the old pieces are no longer needed once this entry is durable. Until then the last durable
+    // entry, stamped while they were pinned, still covers them
+    txs.valuesIterator.foreach: tx =>
+      if tx.txdPiece.isEmpty then
+        tx.txdPiece = Some(allocate(tx.state.serializedTxd.asReadOnlyBuffer()))
+
+      if tx.keepObjectUpdates then
+        tx.updatePieces = tx.updatePieces.lazyZip(tx.state.objectUpdates).map: (p, ou) =>
+          p.orElse(Some(allocate(ou.data.asReadOnlyBuffer())))
+      else
+        tx.releaseDroppedUpdates()
+      tx.unpinReleased(livePieces)
+
+    stubs.valuesIterator.foreach: stub =>
+      if stub.anchor.isEmpty then
+        livePieces.add(entrySerialNumber)
+        stub.anchor = Some(Piece(StreamLocation(streamId, offset, 0), entrySerialNumber))
+      stub.unpinReleased(livePieces)
+
+    // oldestEntryNeeded is stamped now, not when the entry was made: after this entry's pieces are added and its
+    // records' forgotten ones removed, so it is the oldest entry holding a piece some live record's newest static
+    // record names once this entry is durable. Every built record has a piece (a txd, an anchor), and its static record
+    // is in no older entry than any of them, so the walk back to it reaches every live static record too
+    val oldest = livePieces.oldest.getOrElse(entrySerialNumber)
 
     // Header ---------
     val harr = new Array[Byte](StaticEntryHeaderSize)
@@ -117,7 +161,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     Tx.putUUID(hbuff, streamUUID)
     Tx.putUUID(hbuff, crlId)
     hbuff.putLong(entrySerialNumber)
-    hbuff.putLong(oldestEntryNeeded)
+    hbuff.putLong(oldest)
     Tx.putStreamLocation(hbuff, previousEntryLocation)
     hbuff.putLong(dynDataSize)
     hbuff.putLong(statDataSize)
@@ -127,31 +171,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     hbuff.putInt(stubDeletions.size)
     // body_crc and header_crc are filled in once the body is built
 
-    buffers = ByteBuffer.wrap(harr) :: buffers
-    val bodyCrc = new CRC32C
-
-    // DynamicData ---------
-    var offset = startingOffset + StaticEntryHeaderSize
-
-    def allocate(buff: ByteBuffer): StreamLocation =
-      val loc = StreamLocation(streamId, offset, buff.remaining())
-      offset += buff.remaining()
-      buffers = buff :: buffers
-      bodyCrc.update(buff.duplicate())
-      loc
-
-    txs.valuesIterator.foreach: tx =>
-      if tx.txdLocation.isEmpty then
-        tx.txdLocation = Some(allocate(tx.state.serializedTxd.asReadOnlyBuffer()))
-
-      if tx.keepObjectUpdates && tx.objectUpdateLocations.isEmpty then
-        tx.objectUpdateLocations = Some(tx.state.objectUpdates.map: ou =>
-          (ou.objectId, allocate(ou.data.asReadOnlyBuffer()))
-        )
-
-    stubs.valuesIterator.foreach: stub =>
-      if stub.anchor.isEmpty then
-        stub.anchor = Some(StreamLocation(streamId, offset, 0))
+    var buffers: List[ByteBuffer] = dynamicBuffers ++ List(ByteBuffer.wrap(harr))
 
     // StaticData ---------
     val staticArr = new Array[Byte](statDataSize.toInt)

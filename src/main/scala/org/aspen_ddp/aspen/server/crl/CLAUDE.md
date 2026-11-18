@@ -9,8 +9,11 @@
   be retained for long
 - Implemented as a series of fixed-size, write-only files that are continually recycled.
 - Functions similar to a circular buffer. Invariant: the stream after the active one holds no needed entry. A rotation
-  recycles that stream and copies forward, into its first entry, the live data of the stream after it (the next to be
-  recycled), so a torn rotation write only ever overwrites entries no recovery needs. `SimpleCRL.apply` creates no
+  recycles that stream and copies forward, into its first entry, the live pieces of the stream after it (the next to
+  be recycled), so a torn rotation write only ever overwrites entries no recovery needs. A record's pieces (a Tx's txd
+  and each object update, a stub's anchor: `simple.Piece`, a location and the serial of the entry holding it) are
+  located one by one: a rotation moves only those in the evacuated streams (`Record.piecesIn`/`unlocate`) and rewrites
+  the record's static record naming the moved and unmoved ones. `SimpleCRL.apply` creates no
   CRL of fewer than 2 streams (a recorded sizing of fewer is unreadable); device configs ask for at least 4.
   "After" is the ring order recorded in `crl/sizing` (`Sizing.ring`, `ring: 0,2,1`; `Sizing.successor`), not numeric
   order: rotation and `Recovery`'s newer-intact-entry check of the next stream both follow it. Stream files are
@@ -39,11 +42,18 @@
   the walk verified. All-zero regions are not entries. Every header bears the CRL id from `crl/sizing`, and
   `StreamReader.readHeader` takes no other header for an entry: the old-cycle object data that the newer-entry scan
   probes at 4 KiB boundaries can never pass for an entry, whether crafted or an image of another CRL
+- `oldestEntryNeeded` is the oldest serial in `simple.LivePieces`, a counted index of the entries holding every piece
+  a live record's newest static record names (recovery reads pieces only from entries its walk verified). A piece's
+  serial is added when the entry writing it builds its buffers (`LogEntry.createEntryBuffers`, which also stamps the
+  entry's `oldestEntryNeeded`), and removed when the entry holding the record's next static record is built (the piece
+  was relocated or its data dropped: `Record.unpinReleased`) or the record is deleted (`Record.forget`). Removing it
+  only at that build is what keeps a torn entry safe: the entry before it was stamped while the piece was pinned. A
+  deleted record's save still in the unwritten entry is taken out of it (`LogEntry.deleteTx`), so it is never pinned
 - A failed open shuts its writer down before throwing, so a retry never runs two writers over the same files
-- An open writes nothing (safety F16): recovery returns each live record with the locations its newest static record
-  names and the serial of the oldest verified entry holding any of them (a stub: its anchor in the newest entry
-  holding it, `Recovery.RecoveredTx`/`RecoveredStub`), and the constructor queues them by that serial as if it had
-  written them. The next rotation copies them forward from there. Do not reintroduce an open-time re-save
+- An open writes nothing (safety F16): recovery returns each live record with the pieces its newest static record
+  names, each with the serial of the verified entry holding it (`Recovery.entryHolding`; a stub: its anchor in the
+  newest entry holding it, `Recovery.RecoveredTx`/`RecoveredStub`), and the constructor pins them in `LivePieces` as
+  if it had written them. The next rotation copies them forward from there. Do not reintroduce an open-time re-save
 - An open CRL holds an exclusive lock on `crl/lock` (`simple/CrlLock`), from before its files are read until its writer
   has closed them; a second opener, in this process or another, gets `CrlLocked` and touches nothing. Never open
   the lock file elsewhere: closing any descriptor of it drops the process's POSIX lock, which is why in-process
@@ -84,9 +94,11 @@
   would pin `oldestEntryNeeded` until recovery broke on the wrap. The exceptions are deletions a stub's save or a
   `dropStore` made, which a later save cancels
 - `dropTransactionObjectData` writes nothing: it only flags the in-memory record, so the next rewrite of the record
-  (a save, a copy-forward) leaves the data out. Until then a restart, and `readStoreState`, still return the data. A
+  (a save, a copy-forward) leaves the data out. The dropped update pieces stay located and pinned until that rewrite's
+  entry is built (the last durable static record still names them), and a rotation evacuating their stream rewrites
+  the record for them. Until then a restart, and `readStoreState`, still return the data. A
   store that needs the data durably gone saves the state without it (`Tx.persistWithoutUpdateOf`); a save's update
-  count change rewrites the record's update locations, keeping its txd location (transaction-recovery R-N13)
+  count change forgets the record's update pieces (`Tx.state_=`), keeping its txd piece (transaction-recovery R-N13)
 - `whenDurable(storeId, handler)` (`Barrier`): runs the handler once every request queued before it is durable: on
   the current entry if it holds anything, after the write in flight if the current entry is empty
   (`afterInFlight`), else at once. It orders a write outside the CRL (a backend deletion) after a deletion, which has

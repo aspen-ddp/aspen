@@ -460,16 +460,19 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val streamWriter = newWriter(4096 * 1000, 1)
 
-    val tx = Tx(txid, trs, None, None)
+    val tx = Tx(txid, trs)
 
-    val le = LogEntry(StreamLocation.Null, 0, 0)
+    // One index for both entries, as SimpleCRL keeps: the second entry's oldestEntryNeeded is the first, which holds
+    // the transaction's pieces
+    val live = new LivePieces
+    val le = LogEntry(StreamLocation.Null, 0, live)
     val stream = new Stream(stream0, crlId, streamWriter, UUID.randomUUID(), 0)
 
     le.addTx(tx, completionHandler)
 
     val entry1Location = stream.writeEntry(le, () => ())
 
-    val le2 = LogEntry(entry1Location, 1, 0)
+    val le2 = LogEntry(entry1Location, 1, live)
 
     le2.addTx(tx, completionHandler)
 
@@ -501,8 +504,8 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val streamWriter = newWriter(4096*1000, 1)
 
-    val tx = Tx(txid, trs, None, None)
-    val le = LogEntry(StreamLocation.Null, 0, 0)
+    val tx = Tx(txid, trs)
+    val le = LogEntry(StreamLocation.Null, 0, new LivePieces)
     val stream = new Stream(stream0, crlId, streamWriter, UUID.randomUUID(), 0)
 
     le.addTx(tx, completionHandler)
@@ -536,7 +539,9 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("Tx Static Save & Load with ObjectUpdate data") {
-    val tx = Tx(txid, trs.copy(status = TransactionStatus.Committed), Some(txdLoc), updateLocations)
+    val tx = Tx(txid, trs.copy(status = TransactionStatus.Committed))
+    tx.txdPiece = Some(Piece(txdLoc, 0))
+    tx.updatePieces = Vector(Some(Piece(ou1Loc, 0)), Some(Piece(ou2Loc, 0)))
 
     val buffer = new Array[Byte](4096 * 5)
 
@@ -555,7 +560,8 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("Tx Static Save & Load without ObjectUpdate data") {
-    val tx = Tx(txid, trs, Some(txdLoc), None, keepObjectUpdates = false)
+    val tx = Tx(txid, trs, keepObjectUpdates = false)
+    tx.txdPiece = Some(Piece(txdLoc, 0))
 
     val buffer = new Array[Byte](4096 * 5)
 
@@ -1199,7 +1205,7 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.shutdown()
   }
 
-  test("moveToQueueHead during recycling preserves all transactions") {
+  test("Copy-forward during recycling preserves all transactions") {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
@@ -1239,7 +1245,7 @@ class SimpleCRLSuite extends FileBasedTests {
       queue.take()
     assert(i.crl.currentStreamNumber == 2)
 
-    // Wrap to stream 0: triggers recycling, moveToQueueHead for both tx1 and tx2
+    // Wrap to stream 0: triggers recycling, copying forward both tx1 and tx2
     // (both had dynamic data in stream 0)
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
@@ -1495,10 +1501,10 @@ class SimpleCRLSuite extends FileBasedTests {
     val streamWriter = newWriter(4096 * 1000, 1)
     val stream = new Stream(stream0, crlId, streamWriter, UUID.randomUUID(), 0)
 
-    val tx1 = Tx(txid, trs, None, None)
-    val tx2 = Tx(txid2, trs2, None, None)
+    val tx1 = Tx(txid, trs)
+    val tx2 = Tx(txid2, trs2)
 
-    val le = LogEntry(StreamLocation.Null, 0, 0)
+    val le = LogEntry(StreamLocation.Null, 0, new LivePieces)
     le.addTx(tx1, () => ())
     le.addTx(tx2, () => ())
     le.deleteTx(txid)
@@ -1605,8 +1611,8 @@ class SimpleCRLSuite extends FileBasedTests {
   /** The bytes of a well-formed entry holding B, with serial number `serial`, as CRL `id` writes it under
     * `streamUUID` */
   private def entryImage(serial: Long, streamUUID: UUID, id: UUID): Array[Byte] =
-    val le = LogEntry(StreamLocation.Null, serial, serial)
-    le.addTx(Tx(txid2, trs2, None, None), () => ())
+    val le = LogEntry(StreamLocation.Null, serial, new LivePieces)
+    le.addTx(Tx(txid2, trs2), () => ())
     val out = new java.io.ByteArrayOutputStream()
     le.createEntryBuffers(0, id, streamUUID, stream0).foreach: b =>
       val a = new Array[Byte](b.remaining())
@@ -1626,15 +1632,15 @@ class SimpleCRLSuite extends FileBasedTests {
     System.arraycopy(forged, 0, payload, 8192 - dataStart, forged.length)
     val a = TransactionRecoveryState(storeId, txdata,
       List(ObjectUpdate(ObjectId(new UUID(0, 9)), DataBuffer(payload))), disp, status, pax)
-    val le = LogEntry(StreamLocation.Null, 0, 0)
-    le.addTx(Tx(txid, a, None, None), () => queue.put(""))
+    val le = LogEntry(StreamLocation.Null, 0, new LivePieces)
+    le.addTx(Tx(txid, a), () => queue.put(""))
     stream.writeEntry(le, () => ())
     queue.take()
 
     // The stream's next cycle: its only entry covers the first page, leaving A's payload behind it
     stream.recycleStream()
-    val le2 = LogEntry(StreamLocation.Null, 1, 1)
-    le2.addTx(Tx(txid2, trs2, None, None), () => queue.put(""))
+    val le2 = LogEntry(StreamLocation.Null, 1, new LivePieces)
+    le2.addTx(Tx(txid2, trs2), () => queue.put(""))
     stream.writeEntry(le2, () => ())
     queue.take()
     val stopped = new CountDownLatch(1)
@@ -2202,6 +2208,113 @@ class SimpleCRLSuite extends FileBasedTests {
 
   test("Records are copied forward by rotations when the CRL is reopened after every save") {
     rotateRecovered(reopenEvery = 1)
+  }
+
+  // ---- Piece relocation and the live-piece index ----
+
+  /** Drives the log with fillers of storeId2, each saved under a fresh id once the one before it is deleted, so the
+    * only live filler is the newest one and fillers pin nothing a rotation evacuates */
+  private class Filler(crl: SimpleCRL):
+    private var n = 0L
+    private def id(k: Long) = TransactionId(new UUID(8, k))
+
+    def next(): Unit =
+      crl.deleteTransaction(storeId2, id(n))
+      n += 1
+      saveAndWait(crl, id(n), trs2)
+      settle(crl)
+
+    def until(stream: Int): Unit =
+      while crl.currentStreamNumber != stream do
+        next()
+
+  private val pieceStreamSize = 4096L * 4
+
+  /** A (storeId) with its txd in the entry the rotation into stream 0 wrote (it was in stream 1, which that rotation
+    * evacuates) and its two 1500-byte updates in entry `eU` of stream 2, the oldest stream. Returns A and `eU` */
+  private def txdNewerThanUpdates(crl: SimpleCRL, fill: Filler): ((TransactionId, TransactionRecoveryState), Long) =
+    val (aId, a0) = mkTx(1, 0)
+    val a = a0.copy(objectUpdates = List(1, 2).map(k =>
+      ObjectUpdate(ObjectId(new UUID(9, k)), DataBuffer(Array.fill[Byte](1500)(k.toByte)))))
+    fill.until(1)
+    saveAndWait(crl, aId, a0) // A's data-less prepare: its txd only, in stream 1
+    fill.until(2)
+    settle(crl)
+    val eU = crl.currentEntrySerialNumber
+    saveAndWait(crl, aId, a) // The update count changes: the updates are written, in stream 2
+    fill.until(0)
+    ((aId, a), eU)
+
+  /** Recovers the CRL's files while it is open, as a crash now would: the CRL's own stores only */
+  private def recoverNow(): List[TransactionRecoveryState] =
+    val files = (0 until 3).map(n => (StreamId(n), tdir / s"$n.crl")).toList
+    Recovery.recover(files, recordedId(tdir), files.map(_._1).toVector).trsList.filter(_.storeId == storeId)
+
+  test("A rotation copies forward only the pieces in the evacuated stream") {
+    val crl = SimpleCRL(tdir, 3, pieceStreamSize).crl
+    val fill = Filler(crl)
+    val ((_, a), _) = txdNewerThanUpdates(crl, fill)
+    // The rotation into stream 0 wrote A's txd and at most the filler that triggered it, not A's updates
+    val evacuation = headerAt(tdir / "0.crl", 0)
+    assert(evacuation.dynamicDataSize >= a.serializedTxd.size)
+    assert(evacuation.dynamicDataSize <= a.serializedTxd.size + trs2.serializedTxd.size)
+    crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, pieceStreamSize)
+    val recovered = i2.trsList.filter(_.storeId == storeId)
+    assert(recovered.map(_.serializedTxd) == List(a.serializedTxd))
+    assert(recovered.map(_.objectUpdates) == List(a.objectUpdates))
+    i2.crl.shutdown()
+  }
+
+  /** A's updates are in the oldest entry needed when its object data is dropped. They stay pinned until A's next
+    * static record is built, by a save (`rewriteBySave`) or by the rotation that evacuates their stream: until then
+    * the last durable static record names them, and a crash recovers them */
+  private def droppedPiecesStayPinnedUntilRewrite(rewriteBySave: Boolean): Unit =
+    val crl = SimpleCRL(tdir, 3, pieceStreamSize).crl
+    val fill = Filler(crl)
+    val ((aId, a), eU) = txdNewerThanUpdates(crl, fill)
+    assert(crl.oldestEntryNeeded == eU)
+
+    crl.dropTransactionObjectData(storeId, aId)
+    fill.next()
+    assert(crl.currentStreamNumber == 0)
+    assert(crl.oldestEntryNeeded == eU)
+    assert(recoverNow().map(_.objectUpdates) == List(a.objectUpdates))
+
+    if rewriteBySave then
+      saveAndWait(crl, aId, a)
+      settle(crl)
+      assert(crl.oldestEntryNeeded > eU)
+      assert(recoverNow().map(_.objectUpdates) == List(Nil))
+
+    // Up to the wrap: the rotation into 1 evacuates stream 2, the one into 2 evacuates stream 0, back into 0
+    var evacuated = false
+    for stream <- List(1, 2, 0) do
+      while crl.currentStreamNumber != stream do
+        fill.next()
+        evacuated ||= crl.currentStreamNumber == 1
+        val rewritten = rewriteBySave || evacuated
+        if rewritten then
+          assert(crl.oldestEntryNeeded > eU)
+        else
+          assert(crl.oldestEntryNeeded == eU)
+        val now = recoverNow()
+        assert(now.map(_.serializedTxd) == List(a.serializedTxd))
+        assert(now.map(_.objectUpdates) == List(if rewritten then Nil else a.objectUpdates))
+    crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, pieceStreamSize)
+    assert(i2.trsList.filter(_.storeId == storeId).map(t => (t.serializedTxd, t.objectUpdates)) ==
+      List((a.serializedTxd, Nil)))
+    i2.crl.shutdown()
+
+  test("Dropped pieces stay pinned until a save rewrites the record") {
+    droppedPiecesStayPinnedUntilRewrite(rewriteBySave = true)
+  }
+
+  test("Dropped pieces stay pinned until the evacuation of their stream rewrites the record") {
+    droppedPiecesStayPinnedUntilRewrite(rewriteBySave = false)
   }
 
   // ---- dropStore is one request (crash-recovery-log F12) ----

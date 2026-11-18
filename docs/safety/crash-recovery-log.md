@@ -250,7 +250,7 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
 - **Crash between "commits durable" and "stub durable".** The record is still live, so the store recovers T as a
   commit vote and resolves it as any recovered transaction.
 - **Copy-forward.** A stub has a zero-length `anchor` location at the end of the dynamic data of the entry that first
-  wrote it, so a rotation copies it forward exactly as it does a transaction's data (`Stub.closeStream`).
+  wrote it, so a rotation copies it forward exactly as it does a transaction's data (`Record.piecesIn`, `unlocate`).
 - **Recovery.** A stub is live unless a newer or same-entry stub deletion names it; an entry never holds both a stub
   and its deletion (`LogEntry.addStub`/`deleteStub`). The open keeps each stub's anchor in the newest entry holding it.
 - **Admission.** Each stub is charged `CrlAdmission.AppliedStubBytes` (41: TxId 33, timestamp 8) without a check,
@@ -377,51 +377,82 @@ who has learned the id, which means read access to the device itself.
 Two threads per CRL:
 
 - the **CRL thread** takes `ActionRequest`s from `ioQueue` and owns all mutable state: `transactions` and `stubs`
-  (maps of `Record`s), the age-ordered queue (`queueHead`/`queueTail`), `currentLogEntry`, the streams' offsets, and
+  (maps of `Record`s), the live-piece index (`LivePieces`), `currentLogEntry`, the streams' offsets, and
   `afterInFlight` barriers;
 - the **writer thread** (`StreamWriter`) takes `Write` commands, positions the channel and writes every buffer
   (`writeFully` loops, since a gathering write takes at most `IOV_MAX` buffers per call), then runs the entry's
   completion handlers and queues `WriteComplete` to the CRL thread (`Stream.writeEntry`).
 
 `transactions` holds the full `TransactionRecoveryState` of every live record, object data included, even after
-`dropTransactionObjectData` (which only clears the record's flag and locations). A `Tx` record also knows where its
-txd and data currently are (`txdLocation`, `objectUpdateLocations`) and its queue position (`entrySerialNumber`, the
-entry holding its oldest data). A `Stub` record has its `anchor`.
+`dropTransactionObjectData` (which only clears the record's flag). A record's dynamic data is in pieces, each a
+`Piece`: a location and the serial of the entry holding it. A `Tx` has its txd piece (`txdPiece`) and one optional
+piece per object update (`updatePieces`, by index); a `Stub` has its `anchor`. Pieces are located one by one, so a
+record's pieces may lie in different entries and streams.
+
+**`oldestEntryNeeded` and `LivePieces`.** `LivePieces` counts, per entry serial, the pieces that live records' newest
+static records name; its oldest serial is `oldestEntryNeeded` (the current entry's serial if it is empty). Rules:
+
+- A piece's serial is added when the entry writing it builds its buffers (`LogEntry.createEntryBuffers`): only then is
+  its offset, and so its entry, known.
+- A piece a record forgets (relocated by a rotation, `Record.unlocate`; a save changing the update count,
+  `Tx.state_=`; dropped data at the record's next build, `Tx.releaseDroppedUpdates`) keeps its serial until the entry
+  holding the record's next static record is built, after the new locations are assigned (`Record.unpinReleased`).
+- A deleted record's serials are all removed at once (`Record.forget`), so the deletion entry may stamp past them
+  (below).
+- Each entry stamps `oldestEntryNeeded` when its buffers are built, after its own pieces are added and its records'
+  forgotten ones removed.
+
+Why it is safe: recovery walks from the last entry back to that entry's `oldestEntryNeeded` and reads every live
+record's pieces only from the entries it walked (`Recovery.entryHolding`, else `BrokenEntryChain`). Every built record
+has a piece, and a record's static record is in no older entry than any of its pieces, so the walk also reaches every
+live static record. When an entry is built, every live record's newest static record (in it or in an earlier, durable
+entry: one write is in flight at a time, and the next entry is built only after it completes) names only pieces still
+counted, so the stamp covers them. A forgotten piece is unpinned only by the build of the entry whose static record no
+longer names it; if that entry is torn at a crash, recovery starts from the entry before it, stamped while the piece
+was still pinned, and finds it where the record's newest durable static record names it. A dropped update stays pinned
+until the record's next build for the same reason: the last durable static record still names it. A deletion's entry,
+and every later one, may stamp past a deleted record's pieces: a recovery walking back from them reaches no save of
+the record without first reaching its deletion. A deleted record's save still in the unwritten entry is taken out of
+it (`LogEntry.deleteTx`), so its pieces are never located and pinned after the deletion unpinned them.
 
 ### 5.4 Write path
 
 `save` queues `SaveTransaction`. `onSaveTransaction`:
 
 1. If the current entry deletes the id finally (C9), queue only the handler and return.
-2. Look up the record; if absent, create it with no locations, put it at the queue head with the current entry's
-   serial, and register it.
-3. If the update count changed, forget the update locations so the data is written again.
+2. Look up the record; if absent, create it with no pieces and register it.
+3. If the update count changed, forget the update pieces so the data is written again (they stay pinned until this
+   entry is built).
 4. Set the state, add the record and the handler to `currentLogEntry`, `startWrite`.
 
 `startWrite` writes `currentLogEntry` only if it is not empty and no write is in progress. While a write is in
 flight, further requests accumulate in the next entry: group commit, the only batching. `LogEntry.isEmpty` counts
 records and deletions, not handlers. After a write is issued, the next entry is created with the location of the one
-just issued as its previous entry and `oldestEntryNeeded` as of that moment (a stale value is only older, which is
-safe: recovery walks further back over entries the ring has not recycled).
+just issued as its previous entry; its `oldestEntryNeeded` is stamped when it is built (5.3).
 
 `Stream.writeEntry` builds the buffers (`LogEntry.createEntryBuffers`): header, then the txd and update buffers of
 records with no location (which are assigned their new locations), stub anchors, the static region, the checksums,
-padding. The buffers are built on the CRL thread when the write is issued; the writer only writes them.
+padding. The pieces are located (and their serials added to `LivePieces`) before the header, which carries the
+`oldestEntryNeeded` stamped after them. The buffers are built on the CRL thread when the write is issued; the writer
+only writes them.
 
 ### 5.5 Rotation (compaction)
 
 When the current entry does not fit the active stream, `writeCurrentLogEntry` advances to stream *k*, recycles it, and
-for every live record with data in *k* or in *k+1* (`Record.closeStream`) clears its locations, moves it to the queue
-head and adds it to the entry. It then sets the entry's `oldestEntryNeeded` to the queue tail's serial.
+for every live record with pieces in *k* or in *k+1* (`Record.piecesIn`) forgets those pieces (`Record.unlocate`) and
+adds the record to the entry. The entry writes only the forgotten pieces again, and every such record's static record,
+naming its moved pieces and the ones left where they were. Building the entry unpins the forgotten pieces and stamps
+its `oldestEntryNeeded` (5.3).
 
 **Invariant: the stream after the active one holds no needed entry.** The rotation into *k* copies forward the live
-data of *k+1*, the next stream to be recycled, so *k* itself was cleared by the previous rotation. Whatever part of a
-torn rotation write persists, it overwrites only entries no recovery needs. After the moves every record whose data
-was in *k+1* is in the new entry, so the new entry's `oldestEntryNeeded` lies in *k-1* or *k*, never in *k+1*. With
-two streams the copy is the whole live set. A record found with data still in the recycled stream itself would break
-the invariant; it is logged as an error and copied too. No path produces one: a record's txd is never newer than its
-data, and data is written only into the active stream, so a record's oldest data is always reached as "next" before it
-is recycled.
+pieces of *k+1*, the next stream to be recycled, so *k* itself was cleared by the previous rotation. Whatever part of a
+torn rotation write persists, it overwrites only entries no recovery needs: the entry before it, from which recovery
+then starts, was stamped while the pieces it moves were still pinned in *k+1*, and none in *k*. After the build no
+counted piece is in *k+1* (dropped updates count, so a rotation evacuates them too, rewriting the record without
+them), so the new entry's `oldestEntryNeeded` lies in a stream written after *k+1*, never in *k+1*. With two streams
+the copy is the whole live set. A piece found still in the recycled stream itself would break the invariant; it is
+logged as an error and copied too. No path produces one: pieces are written only into the active stream, so every piece
+in a stream is reached as "next" before the stream is recycled.
 
 The rotation entry holds the pending entry plus the copy-forward. Admission keeps that within one stream for ordinary
 loads (section 6).
@@ -459,15 +490,16 @@ loads (section 6).
 4. **Apply.** Entries are applied newest first: a record already present is not replaced; one named by a deletion of
    the same or a newer entry is skipped (C4, C9). Stubs follow the same rule against stub deletions.
 5. **Data.** Each surviving transaction's txd and data are read from their locations, which must lie within the
-   dynamic data of a verified entry (`Recovery.entryHolding`), so they are covered by its checksum. Its queue serial
-   is the oldest such entry.
+   dynamic data of a verified entry (`Recovery.entryHolding`), so they are covered by its checksum. Each piece is
+   returned with that entry's serial (`Recovery.RecoveredTx`).
 
 The result also sets the active stream (with the **last entry's** UUID, so new entries remain readable from that
 stream), the next offset and serial, and the previous-entry link (to the last entry itself).
 
-**The open writes nothing.** The constructor queues each recovered record by its serial with the locations its
-newest static record names (a stub by its anchor in the newest entry holding it), as if this instance had written
-them, and starts the first entry with `oldestEntryNeeded` = max(queue tail, the last entry's value). The last durable
+**The open writes nothing.** The constructor gives each recovered record the pieces its newest static record names
+and counts each in `LivePieces` by the serial of the entry holding it (a stub by its anchor in the newest entry holding
+it), as if this instance had written them. The first entry's `oldestEntryNeeded` is stamped from them when it is built,
+so it is no newer than any entry the recovery read a piece from. The last durable
 entry kept the ring invariant (a torn rotation leaves the stream before it active, where it still holds), so the next
 rotation's copy-forward finds and moves them as the instance before the crash would have. A live set larger than a
 stream therefore still opens; its next rotation hits the `Stream.writeEntry` backstop.
@@ -481,12 +513,13 @@ Zero-filled regions are not entries: a zero header fails `header_crc`, and a zer
 
 ### 5.8 Deletion
 
-`deleteTransaction` records the TxId in the current entry's deletions, removes the record from the map and the queue,
-and starts a write. `deleteTransactions` and `dropStore` (`onDeleteTransactions`) put all their deletions in one entry
-with the handler: each id gets a transaction deletion and a stub deletion (66 bytes per id), and the record and stub
-are removed from memory. `dropStore`'s ids are those of the store held when the request is processed, and its
-transaction deletions are cancellable. `deleteAppliedStub` writes a stub deletion only for a stub held in memory. A
-deleted record already in the current entry stays there and is filtered at recovery by the deletion in the same entry.
+`deleteTransaction` records the TxId in the current entry's deletions, removes the record from the map and its pieces'
+serials from `LivePieces`, and starts a write. `deleteTransactions` and `dropStore` (`onDeleteTransactions`) put all
+their deletions in one entry with the handler: each id gets a transaction deletion and a stub deletion (66 bytes per
+id), and the record and stub are removed from memory. `dropStore`'s ids are those of the store held when the request
+is processed, and its transaction deletions are cancellable. `deleteAppliedStub` writes a stub deletion only for a
+stub held in memory. A deleted transaction's save already in the current entry is taken out of it
+(`LogEntry.deleteTx`, as `deleteStub` does for stubs): it would otherwise locate pieces of a record no longer counted.
 
 ### 5.9 Barriers
 

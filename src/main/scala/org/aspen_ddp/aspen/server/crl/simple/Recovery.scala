@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.transaction.ObjectUpdate
 import org.aspen_ddp.aspen.server.crl.{CrlCorrupt, TransactionRecoveryState}
 import scribe.Logging
@@ -28,16 +27,16 @@ object Recovery extends Logging:
     def trsList: List[TransactionRecoveryState] = txs.map(_.state)
     def appliedStubs: Map[TxId, HLCTimestamp] = stubs.map(s => s.id -> s.start).toMap
 
-  /** A live transaction, with where its data lies and the serial number of the oldest entry holding any of it: its
-    * place in the opened CRL's queue (SimpleCRL writes nothing at open) */
+  /** A live transaction, with its pieces as its newest static record names them, each with the serial number of the
+    * verified entry holding it: the opened CRL pins each in LivePieces as if it had written it (SimpleCRL writes
+    * nothing at open). `updatePieces` follows `state.objectUpdates`, by index */
   case class RecoveredTx(id: TxId,
                          state: TransactionRecoveryState,
-                         txdLocation: StreamLocation,
-                         updateLocations: Option[List[(ObjectId, StreamLocation)]],
-                         entrySerialNumber: Long)
+                         txdPiece: Piece,
+                         updatePieces: Vector[Piece])
 
-  /** A live applied stub, with its anchor and the serial number of the newest entry holding it */
-  case class RecoveredStub(id: TxId, start: HLCTimestamp, anchor: StreamLocation, entrySerialNumber: Long)
+  /** A live applied stub, with its anchor in the newest entry holding it */
+  case class RecoveredStub(id: TxId, start: HLCTimestamp, anchor: Piece)
 
   /** @param crlId the id the CRL recorded at its creation (SimpleCRL.Sizing): only headers bearing it are entries
     * @param ring  the order the streams are written in (SimpleCRL.Sizing.ring), a permutation of `files`' ids */
@@ -137,10 +136,11 @@ object Recovery extends Logging:
       entryHolding(loc)
       DataBuffer(readers(loc.streamId.number).read(loc.offset, loc.length))
 
+    def pieceAt(loc: StreamLocation): Piece = Piece(loc, entryHolding(loc))
+
     val txs = rs.txs.valuesIterator.map: ltx =>
-      val ous: List[ObjectUpdate] = ltx.updateLocations match
-        case None => Nil
-        case Some(lst) => lst.map(t => ObjectUpdate(t._1, readStreamLocation(t._2)))
+      val updateLocations = ltx.updateLocations.getOrElse(Nil)
+      val ous: List[ObjectUpdate] = updateLocations.map(t => ObjectUpdate(t._1, readStreamLocation(t._2)))
 
       val trs = TransactionRecoveryState(
         ltx.id.storeId,
@@ -149,8 +149,7 @@ object Recovery extends Logging:
         ltx.disposition,
         ltx.status,
         ltx.paxosAcceptorState)
-      val locations = ltx.txdLocation :: ltx.updateLocations.getOrElse(Nil).map(_._2)
-      RecoveredTx(ltx.id, trs, ltx.txdLocation, ltx.updateLocations, locations.map(entryHolding).min)
+      RecoveredTx(ltx.id, trs, pieceAt(ltx.txdLocation), updateLocations.map(t => pieceAt(t._2)).toVector)
     .toList
 
     Result(
@@ -161,4 +160,4 @@ object Recovery extends Logging:
       initialOldestEntryNeeded,
       initialPreviousEntryLocation,
       txs,
-      rs.stubs.iterator.map((id, s) => RecoveredStub(id, s.start, s.anchor, s.entrySerialNumber)).toList)
+      rs.stubs.iterator.map((id, s) => RecoveredStub(id, s.start, Piece(s.anchor, s.entrySerialNumber))).toList)

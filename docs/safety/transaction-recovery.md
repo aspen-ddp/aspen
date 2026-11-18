@@ -172,7 +172,7 @@ answers in this order:
 2. **Resolved, not finalized, in the cache**: the store sends `TxResolved(outcome, late = false)`. A driver treats it
    as resolution (`onResolution(sendResolutionMessage = false)`) and, for a commit, runs the finalizer itself. If the
    store holds no Tx and the transaction is above its floor, the Frontend creates one marked `outcomeDecided` (no
-   locks); below the floor it refuses the prepare.
+   locks; status queries get the cached outcome); below the floor it refuses the prepare.
 3. **Live `Tx`** (`Tx.receivePrepare`): it answers with its fixed vote and an acceptor promise, sent only after the
    CRL save of that state completes (or after its objects load, then the save). A Tx that already applied the commit
    also resends `TxCommitted` to the proposer.

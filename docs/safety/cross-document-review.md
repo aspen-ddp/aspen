@@ -222,13 +222,11 @@ deletes are rename-first. An accepted rebuild loss ends in that Active flip by d
 operator's release. rebuild-process.md B3, systemic-loss-protection.md 4.4 and `server/host/CLAUDE.md` all state it.
 
 ### 5.6 Expiry rule F's "live commit voters holding T's locks"
-paxos-transactions.md (rule F and the abort-paths audit) says F commits only where every pool has more than `w - t`
-live commit voters holding T's locks. A Tx created from a resolved, unfinalized cache entry (`Frontend.receivePrepare`
--> `Tx.outcomeDecided`) still votes, takes no locks, keeps `txStatus = Unresolved`, and reports
-`votedCommit = true` to status queries (`Tx.statusForExpiry`). This is harmless: such a store is never among the
-fixed abort voters of an abort-certain object, so it cannot lift an aborted T to a commit count (L1), and counting it
-for a T that really committed commits what was committed. But the statement is not literally true, and such a Tx
-hides its host's cached outcome from status queries (the reply is `Unresolved`, so other observers do not adopt it).
+Resolved. A Tx created from a resolved, unfinalized cache entry (`Frontend.receivePrepare` -> `Tx.outcomeDecided`)
+still votes and takes no locks, but it answers status queries with the cached outcome at once (`Tx.statusForExpiry`,
+as the cache now holds it, a finalization recorded since included), as the store would with no Tx, and its own expiry
+round keeps that outcome in its own reply, so every observer, itself included, adopts it (rule 1) before any count.
+Its commit vote therefore never reaches a tally, and rule F's voters are the live lock holders the rule states.
 
 ### 5.7 The stale rebuilt copy's example lay outside the tolerance it assumed
 Resolved. The weakness (a walk copying an object while a commit the lost store applied is unapplied elsewhere) was

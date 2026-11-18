@@ -566,9 +566,15 @@ class Tx( trs: TransactionRecoveryState,
       RequirementsLocker.lock(transactionId, requirements, objects, lockedWrites, recovered)
 
   /** The transaction is known to be resolved, though this Tx has not been told the outcome: its prepare arrived
-    * after the resolution did. Its vote cannot affect the outcome, so it takes no locks.
+    * after the resolution did, which the host's status cache recorded. Its vote cannot affect the outcome, so it takes
+    * no locks, and status queries are answered with the outcome (statusForExpiry), as the store answers them with no Tx.
     */
-  def outcomeDecided(): Unit = outcomeKnown = true
+  def outcomeDecided(committed: Boolean): Unit =
+    outcomeKnown = true
+    cachedOutcome = Some(committed)
+
+  /** The outcome outcomeDecided was given: the host's status cache had it when this Tx was created */
+  private var cachedOutcome: Option[Boolean] = None
 
   /** Whether this transaction holds requirement locks on this store's objects */
   def holdsLocks: Boolean = locked
@@ -1666,16 +1672,25 @@ class Tx( trs: TransactionRecoveryState,
     if oresolution.isEmpty && frozen then
       saveUndurableVote()
     val commitVoteSaving = !muted && disposition == TransactionDisposition.VoteCommit && !voteDurable
-    if oresolution.nonEmpty || (frozen && allObjectsLoaded && !commitVoteSaving) || mutedForGood then
+    if oresolution.nonEmpty || cachedOutcome.nonEmpty || (frozen && allObjectsLoaded && !commitVoteSaving) ||
+      mutedForGood then
       net.sendTransactionMessage(TxStatusResponse(m.from, storeId, transactionId, m.requestUUID, Some(statusForExpiry)))
 
   /** This Tx's state as a status reply reports it, and as its own expiry round counts it. A commit vote counts only
-    * once durable (voteDurable): an expiry commit counting it relies on its lock surviving a crash
+    * once durable (voteDurable): an expiry commit counting it relies on its lock surviving a crash. Unresolved here
+    * with an outcome from the status cache (outcomeDecided), it reports that outcome, as the cache now holds it (a
+    * finalization recorded there since included), so an observer adopts it
     */
   def statusForExpiry: TxStatusResponse.TxStatus =
     val amnesiac = muted && frontend.mayHaveForgottenUndecided(txd.startTimestamp)
     val nonHolder = muted && frontend.belowForgetFloor(txd) && !amnesiac
-    TxStatusResponse.TxStatus(txStatus, ofinalized.nonEmpty, late = lateOutcome, holdsAcceptorState = !nonHolder,
+    val (status, finalized, late) = cachedOutcome match
+      case Some(committed) if txStatus == TransactionStatus.Unresolved =>
+        statusCache.getStatus(transactionId).filter(_.status != TransactionStatus.Unresolved) match
+          case Some(e) => (e.status, e.finalized, e.late)
+          case None => (if committed then TransactionStatus.Committed else TransactionStatus.Aborted, false, false)
+      case _ => (txStatus, ofinalized.nonEmpty, lateOutcome)
+    TxStatusResponse.TxStatus(status, finalized, late = late, holdsAcceptorState = !nonHolder,
       accepted = if muted then None else acceptor.persistentState.accepted.map(_._2),
       votedCommit = !muted && disposition == TransactionDisposition.VoteCommit && voteDurable,
       amnesiac = amnesiac)

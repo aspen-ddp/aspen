@@ -96,7 +96,7 @@
   unresolved Tx answers only once frozen (past expiry by its own clock: it promises and accepts
   nothing more, `Tx.frozen`) and its objects are loaded, or muted for good, so the state it reports is final: a frozen
   Tx decides no vote and sends none (`Tx.determineDisposition`, `Tx.sendDelayedPrepare`), so one still undecided then
-  (waiting on an in-flight commit, a collision or its client's prepare) is a final non-voter; before that, and for a Tx muted only for starting too far ahead (it may yet join), it is silent. With no
+  (waiting on an in-flight commit, a collision or its client's prepare) is a final non-voter; before that, and for a Tx muted only for starting too far ahead (it may yet join), it is silent. A Tx created from a cached outcome (`Tx.outcomeDecided`) answers at once with the outcome as the cache now holds it, and keeps it in its own expiry round's reply, so it is adopted. With no
   Tx but a non-Unresolved status-cache entry it
   replies with that entry. With neither it replies `status = None` ("unknown") only when the start is below its forget
   floor (`belowForgetFloor(HLCTimestamp)`), which makes the answer permanent; above the floor it stays silent, as it

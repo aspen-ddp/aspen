@@ -6641,6 +6641,43 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       backend.get(oid1).get.data.size shouldBe 0
   }
 
+  test("a Tx created from a cached outcome answers status requests with that outcome") {
+    withExpiryFrontend: (frontend, _, net, _, _, _, statusCache) =>
+      // The resolution reached this store before its prepare did: recorded in the cache, then a Tx created from it
+      frontend.receiveTransactionMessage(TxResolved(storeId, peer1, txid1, committed = true, late = false,
+        proof = false))
+      val txd = expiringTxd(List(overwrite(op1)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.transactions(txid1).holdsLocks shouldBe false
+      net.sentTx = Nil
+
+      // Its state is no longer what decides: the outcome is, at once, as the store would answer with no Tx
+      frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
+      statusResponses(net).map(_.status.map(s => (s.status, s.finalized, s.late))) shouldBe
+        List(Some((TransactionStatus.Committed, false, false)))
+
+      // A finalization recorded in the cache meanwhile is reported, as the cache would report it
+      net.sentTx = Nil
+      statusCache.updateStatus(txid1, TransactionStatus.Committed, finalized = true)
+      frontend.receiveTransactionMessage(statusRequest(txd.startTimestamp))
+      statusResponses(net).map(_.status.map(s => (s.status, s.finalized, s.late))) shouldBe
+        List(Some((TransactionStatus.Committed, true, false)))
+  }
+
+  test("an expiring Tx created from a cached outcome adopts it without waiting on its peers") {
+    withExpiryFrontend: (frontend, backend, net, _, lookup, clock, _) =>
+      frontend.receiveTransactionMessage(TxResolved(storeId, peer1, txid1, committed = true, late = false,
+        proof = false))
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+
+      // No peer replied: its own reply carries the outcome, as a peer's would
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+      frontend.transactions(txid1).status shouldBe TransactionStatus.Committed
+      lookup.requests shouldBe Nil
+  }
+
   test("after expiry, a later prepare for T creates no Tx") {
     withExpiryFrontend: (frontend, _, net, crl, _, clock, _) =>
       val txd = expiringTxd(List(DataUpdate(op1, ObjectRevision(txid2), DataUpdateOperation.Overwrite)))

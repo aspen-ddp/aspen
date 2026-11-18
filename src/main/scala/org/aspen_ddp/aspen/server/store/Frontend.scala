@@ -1164,10 +1164,13 @@ class Frontend(val storeId: StoreId,
     round.decided = false
     round.countdown = round.interval
     round.interval = math.min(round.interval * 2, MaxExpiryQueryInterval)
-    // Its own state, frozen like its peers' (it is past expiry). Never an outcome: one it already knows is what its
-    // peers are asked to confirm or end (ExpiryTally.decide's `known`)
-    round.replies = Map(storeId -> Some(tx.statusForExpiry.copy(status = TransactionStatus.Unresolved,
-      finalized = false, late = false)))
+    // Its own state, frozen like its peers' (it is past expiry). Never an outcome it knows from its resolution: that is
+    // what its peers are asked to confirm or end (ExpiryTally.decide's `known`). An outcome it has only from the status
+    // cache (Tx.outcomeDecided) is kept, so it adopts it as it would from a peer
+    val own = tx.statusForExpiry
+    round.replies = Map(storeId -> Some(
+      if tx.knownOutcome.nonEmpty then own.copy(status = TransactionStatus.Unresolved, finalized = false, late = false)
+      else own))
     val txd = tx.txd
     // Every store of the transaction, since any outcome-bearing reply decides; only the primary pool's count otherwise
     (txd.allDataStores - storeId).foreach: to =>
@@ -1739,7 +1742,7 @@ class Frontend(val storeId: StoreId,
     known.foreach { _ =>
       // A muted Tx takes no part, a cached outcome included
       if !muted then
-        tx.outcomeDecided()
+        tx.outcomeDecided(known.get.status == TransactionStatus.Committed)
     }
     pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
   }

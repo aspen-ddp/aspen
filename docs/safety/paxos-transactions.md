@@ -817,7 +817,9 @@ an unresolved Tx answers only once its reported state is final: frozen with its 
 expiry round counts its own vote, only after a CRL save holding the vote completed (`Tx.voteDurable`; a recovered vote
 is durable), and an unresolved commit voter whose save is still in flight is silent until it completes. Rules A and F
 count each `votedCommit` as a voter holding T's locks, so the vote and its locks must survive a crash. A resolved Tx
-answers at once. A store without a Tx answers from a non-`Unresolved`
+answers at once, and so does a Tx created from a cached outcome (`Tx.outcomeDecided`, which holds no locks): it reports
+that outcome as the cache now holds it, in its own expiry round too, so it is adopted (rule 1) and its vote is never
+counted. A store without a Tx answers from a non-`Unresolved`
 cache entry; a rebuilt store for T before its `acceptorSince` answers `amnesiac` (with any cached outcome); otherwise it
 answers `None` ("unknown") only if T is below its floor, which makes the answer permanent, and stays silent above it
 (`Frontend.receiveStatusRequestWithoutTx`). A store still loading its CRL holds the request with every other message.

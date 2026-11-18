@@ -61,6 +61,7 @@ behind a read that never completes. This change adds an opt-in read timeout. Exi
 
 ## Left to the builder (my calls)
 
-- The timeout bounds the object read, measured from when the driver begins. IDA resolution (the pool cache) is not
-  bounded.
+- The timeout is one deadline over IDA resolution and the object read (added after review). Only the timed
+  caller's wait on an uncached pool's load is bounded: that load is shared with untimed callers of getStoragePool,
+  so it is never failed by a timeout, and it fills the cache once the stores answer.
 - The name of the new `ReadDriver` method.

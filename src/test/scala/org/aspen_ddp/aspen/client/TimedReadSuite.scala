@@ -2,7 +2,8 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, ObjectId}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId}
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.scalatest.compatible.Assertion
 
 import java.util.UUID
@@ -47,3 +48,24 @@ class TimedReadSuite extends IntegrationTestSuite:
       an [IllegalArgumentException] should be thrownBy client.withReadTimeout(d)
     Future.successful(succeed)
   }
+
+  /** Fails the test instead of hanging it when `f` does not complete within `limit` */
+  private def within[T](limit: FiniteDuration, what: String)(f: Future[T]): Future[T] =
+    Future.firstCompletedOf(List(f, client.after(limit).map(_ => fail(s"$what did not complete within $limit"))))
+
+  atest("a timed read bounds the pool lookup too, and an untimed load of the same pool is not failed by it") {
+    // A pool the client has not loaded: its state can only be read through the silenced bootstrap stores
+    val unloadedPool = PoolId(new UUID(9, 9))
+    val ptr = KeyValueObjectPointer(ObjectId(new UUID(9, 10)), unloadedPool)
+    net.readSilencedStores = allStores
+    val untimedLoad = client.getStoragePool(unloadedPool)
+    for
+      _ <- within(5.seconds, "the timed read")(timesOut("read", client.withReadTimeout(100.millis).read(ptr)))
+      _ = untimedLoad.isCompleted should be (false)
+      _ = net.readSilencedStores = Set()
+      // The pool does not exist, so the shared load ends with whatever says so, never with the timed read's timeout
+      outcome <- within(5.seconds, "the untimed pool load")(untimedLoad.transform(t => scala.util.Success(t)))
+    yield
+      outcome.failed.toOption.collect { case e: ReadTimeout => e } should be (None)
+  }
+

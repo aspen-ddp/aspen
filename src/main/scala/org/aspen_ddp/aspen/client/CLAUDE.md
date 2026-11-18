@@ -9,8 +9,10 @@
 - Reads are untimed: they retry until they restore the object or fail fatally. `withReadTimeout(d)` returns an
   `ObjectReader` (`internal/TimedObjectReader`) whose every read method fails with `ReadTimeout` after `d` and stops
   retrying. `ReadTimeout` is not an `InvalidObject` (it proves nothing about existence) and `readOptional` does not
-  swallow it. `Duration.Inf` returns the client; non-positive or non-finite durations are refused. The timeout bounds
-  the object read, not IDA resolution. For callers that must not wait forever (repair scans, rebuild walks); the
+  swallow it. `Duration.Inf` returns the client; non-positive or non-finite durations are refused. The timeout is one
+  deadline over IDA resolution (an uncached pool's load) and the object read; only the caller's wait on the pool
+  load is bounded, since `getStoragePool` shares that load with untimed callers and must never fail it with a
+  timeout (`BaseAspenClient.resolveIdaWithin`). For callers that must not wait forever (repair scans, rebuild walks); the
   usage example is `UsageGuide.md` "Timed reads", kept compiling by `examples/TimedReadsSuite`
 
 ### IDA data operations

@@ -27,8 +27,8 @@ import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 import org.aspen_ddp.aspen.compute.systemtask.{NewSystemTaskAdded, SystemTaskExecutorService, SystemTaskMessage, SystemTaskServiceState}
 
 import java.util.UUID
-import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS}
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS, NANOSECONDS}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
 private object Namespaces:
   val Pool = "pool"
@@ -112,8 +112,8 @@ abstract class BaseAspenClient(
     read(pointer, comment, Duration.Inf)
 
   private[client] def read(pointer: DataObjectPointer, comment: String, timeout: Duration): Future[DataObjectState] =
-    resolveIda(pointer).flatMap { ida =>
-      rmgr.read(pointer, ida, comment, timeout = timeout).map(_.asInstanceOf[DataObjectState])
+    resolveIdaWithin(pointer, timeout).flatMap { (ida, remaining) =>
+      rmgr.read(pointer, ida, comment, timeout = remaining).map(_.asInstanceOf[DataObjectState])
     }
 
   override def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] =
@@ -121,8 +121,8 @@ abstract class BaseAspenClient(
 
   private[client] def read(pointer: KeyValueObjectPointer, comment: String,
                            timeout: Duration): Future[KeyValueObjectState] =
-    resolveIda(pointer).flatMap { ida =>
-      rmgr.read(pointer, ida, comment, timeout = timeout).map(_.asInstanceOf[KeyValueObjectState])
+    resolveIdaWithin(pointer, timeout).flatMap { (ida, remaining) =>
+      rmgr.read(pointer, ida, comment, timeout = remaining).map(_.asInstanceOf[KeyValueObjectState])
     }
 
   override def readKeys(pointer: KeyValueObjectPointer, keys: List[Key], comment: String): Future[KeyValueObjectState] =
@@ -130,8 +130,8 @@ abstract class BaseAspenClient(
 
   private[client] def readKeys(pointer: KeyValueObjectPointer, keys: List[Key], comment: String,
                                timeout: Duration): Future[KeyValueObjectState] =
-    resolveIda(pointer).flatMap { ida =>
-      rmgr.read(pointer, ida, comment, readType = KeySet(keys), timeout = timeout).map(_.asInstanceOf[KeyValueObjectState])
+    resolveIdaWithin(pointer, timeout).flatMap { (ida, remaining) =>
+      rmgr.read(pointer, ida, comment, readType = KeySet(keys), timeout = remaining).map(_.asInstanceOf[KeyValueObjectState])
     }
 
   override def readKeyRange(pointer: KeyValueObjectPointer, startKey: Key, endKey: Key, ordering: KeyOrdering,
@@ -140,8 +140,8 @@ abstract class BaseAspenClient(
 
   private[client] def readKeyRange(pointer: KeyValueObjectPointer, startKey: Key, endKey: Key, ordering: KeyOrdering,
                                    comment: String, timeout: Duration): Future[KeyValueObjectState] =
-    resolveIda(pointer).flatMap { ida =>
-      rmgr.read(pointer, ida, comment, readType = KeyRange(startKey, endKey, ordering), timeout = timeout)
+    resolveIdaWithin(pointer, timeout).flatMap { (ida, remaining) =>
+      rmgr.read(pointer, ida, comment, readType = KeyRange(startKey, endKey, ordering), timeout = remaining)
         .map(_.asInstanceOf[KeyValueObjectState])
     }
 
@@ -150,15 +150,38 @@ abstract class BaseAspenClient(
 
   private[client] def readMetadata(pointer: ObjectPointer, comment: String,
                                    timeout: Duration): Future[MetadataObjectState] =
-    resolveIda(pointer).flatMap { ida =>
-      rmgr.read(pointer, ida, comment, readType = MetadataOnly(), timeout = timeout).map(_.asInstanceOf[MetadataObjectState])
+    resolveIdaWithin(pointer, timeout).flatMap { (ida, remaining) =>
+      rmgr.read(pointer, ida, comment, readType = MetadataOnly(), timeout = remaining).map(_.asInstanceOf[MetadataObjectState])
     }
 
-  /** Resolves the IDA and requires range read support */
-  private def resolveAppendableIda(pointer: DataObjectPointer): Future[IDA & AppendableIDA] =
-    resolveIda(pointer).flatMap:
-      case ida: (IDA & AppendableIDA) => Future.successful(ida)
-      case ida => Future.failed(new RangeReadNotSupported(pointer, ida))
+  /** Resolves the IDA within `timeout`, as resolveIdaWithin, and requires range read support */
+  private def resolveAppendableIda(pointer: DataObjectPointer,
+                                   timeout: Duration): Future[(IDA & AppendableIDA, Duration)] =
+    resolveIdaWithin(pointer, timeout).flatMap:
+      case (ida: (IDA & AppendableIDA), remaining) => Future.successful((ida, remaining))
+      case (ida, _) => Future.failed(new RangeReadNotSupported(pointer, ida))
+
+  /** The pointer's IDA, and what is left of `timeout` for the object read: a timed read has one deadline for both.
+    * Only the caller's wait is bounded. The pool load behind resolveIda is shared by every caller of
+    * getStoragePool, untimed ones included, so it is never failed by a timeout: it carries on and fills the cache
+    * once the stores answer. A resolved (cached) IDA and an untimed read take no timer
+    */
+  private def resolveIdaWithin(pointer: ObjectPointer, timeout: Duration): Future[(IDA, Duration)] =
+    val resolving = resolveIda(pointer)
+    timeout match
+      case fd: FiniteDuration if !resolving.isCompleted =>
+        val started = System.nanoTime()
+        val p = Promise[(IDA, Duration)]()
+        val timer = backgroundTaskManager.schedule(fd)(p.tryFailure(new ReadTimeout(pointer)))
+        resolving.onComplete: result =>
+          timer.cancel()
+          val remaining = fd - FiniteDuration(System.nanoTime() - started, NANOSECONDS)
+          if remaining <= Duration.Zero then
+            p.tryFailure(new ReadTimeout(pointer))
+          else
+            p.tryComplete(result.map(ida => (ida, remaining)))
+        p.future
+      case _ => resolving.map(ida => (ida, timeout))
 
   /** Reads several ranges plus a tail with one ByteRanges request, so every piece comes from the same revision.
     * `ranges` are (offset, length) pairs in logical coordinates and `tail` gives the number of slice tail bytes
@@ -167,14 +190,14 @@ abstract class BaseAspenClient(
   private def readByteRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)], tail: (IDA & AppendableIDA) => Int,
                              comment: String, timeout: Duration): Future[DataObjectRangesState] =
     // Resolved first so that an empty list still fails for an IDA without range reads
-    resolveAppendableIda(pointer).flatMap { ida =>
+    resolveAppendableIda(pointer, timeout).flatMap { (ida, remaining) =>
       if ranges.exists((offset, length) => offset < 0 || length < 0) then
         Future.failed(new IllegalArgumentException(s"Invalid ranges: $ranges"))
       else
         val sliceRanges = ranges.map: (offset, length) =>
           val (start, end) = ida.sliceRangeFor(offset, length)
           (start, end - start)
-        rmgr.read(pointer, ida, comment, readType = ByteRanges(sliceRanges, tail(ida)), timeout = timeout)
+        rmgr.read(pointer, ida, comment, readType = ByteRanges(sliceRanges, tail(ida)), timeout = remaining)
           .map(_.asInstanceOf[DataObjectRangesState])
     }
 
@@ -187,14 +210,14 @@ abstract class BaseAspenClient(
     if offset < 0 || length.exists(_ < 0) then
       Future.failed(new IllegalArgumentException(s"Invalid range: offset $offset length $length"))
     else
-      resolveAppendableIda(pointer).flatMap { ida =>
+      resolveAppendableIda(pointer, timeout).flatMap { (ida, remaining) =>
         // An open ended range is requested directly in slice coordinates so that no end can overflow
         val readType = length match
           case Some(n) =>
             val (start, end) = ida.sliceRangeFor(offset, n)
             ByteRanges(List((start, end - start)), 0)
           case None => ByteRanges(List((ida.sliceOffsetFor(offset), Int.MaxValue)), 0)
-        rmgr.read(pointer, ida, comment, readType = readType, timeout = timeout).map: os =>
+        rmgr.read(pointer, ida, comment, readType = readType, timeout = remaining).map: os =>
           trimRange(os.asInstanceOf[DataObjectRangesState].ranges.head, offset, length)
       }
 

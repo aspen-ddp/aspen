@@ -28,13 +28,13 @@ import scala.annotation.tailrec
   * transaction (`tryChargeLoaded`, A3). An accepted gap: a retransmitted prepare arriving past the mark while the
   * store awaits its crl_save.log state is dropped until recovery recreates the transaction.
   *
-  * Lanes (cross-document-review X5, G10): a new transaction is admitted only below its receiving store's tier's
-  * ceiling (`AdmissionTier`): 3/4 of the limit for data pools, 7/8 for metadata pools, the whole limit for the bootstrap
-  * pool. Finalization depends only upward: a data transaction's marker batch writes trees in a metadata pool, a
-  * metadata transaction's in the bootstrap pool, and a bootstrap transaction's marker about the bootstrap pool tracks
-  * no missed updates (MissedUpdateFinalizationAction.limitTracking). So lower-tier load on a shared device never
-  * takes the headroom a higher tier's finalization needs. The tier is the receiving store's own pool's, so nothing in
-  * the description is trusted for it. Residual: finalizers in the same tier (TKVL split, join, tail removal) can still
+  * Lanes (cross-document-review 3, CRL admission lanes): a new transaction is admitted only below its receiving store's
+  * tier's ceiling (`AdmissionTier`): 3/4 of the limit for data pools, 7/8 for metadata pools, the whole limit for the
+  * bootstrap pool. Finalization depends only upward: a data transaction's marker batch writes trees in a metadata pool,
+  * a metadata transaction's in the bootstrap pool, and a bootstrap transaction's marker about the bootstrap pool tracks
+  * no missed updates (MissedUpdateFinalizationAction.limitTracking). So lower-tier load on a shared device never takes
+  * the headroom a higher tier's finalization needs. The tier is the receiving store's own pool's, so nothing in the
+  * description is trusted for it. Residual: finalizers in the same tier (TKVL split, join, tail removal) can still
   * stall if that tier's own traffic fills its lane on every device of the pool.
   */
 final class CrlAdmission(initialLimitBytes: Long):
@@ -89,7 +89,7 @@ final class CrlAdmission(initialLimitBytes: Long):
       total.addAndGet(-bytes)
 
   /** Charges `bytes`, which `storeId`'s entries hold in the CRL, without a check and retained for it: the device's
-    * CRL is opened holding them, whether or not the store loads (crash-recovery-log F8) */
+    * CRL is opened holding them, whether or not the store loads (crash-recovery-log 6, admission) */
   def chargeRetained(storeId: StoreId, bytes: Long): Unit =
     if bytes > 0 then
       charge(bytes)

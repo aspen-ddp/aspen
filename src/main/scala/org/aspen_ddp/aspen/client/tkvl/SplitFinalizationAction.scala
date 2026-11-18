@@ -49,7 +49,7 @@ class SplitFinalizationAction(val client: AspenClient,
         *    the action completes without a transaction
         *  - any other read failure: the attempt fails and is retried. A read straight after resolution can precede
         *    the stores applying the split; its commit voters then answer `AllocationPending`, which proves nothing,
-        *    and the read waits for them to apply it (transaction-requirements Q-N5)
+        *    and the read waits for them to apply it (transaction-requirements 9.4)
         *  - its entry is already present with this pointer: an earlier run added it
         *  - otherwise a checked insert, with a lock on the new node's revision as just read
         *

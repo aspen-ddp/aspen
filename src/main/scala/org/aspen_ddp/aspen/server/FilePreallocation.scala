@@ -12,7 +12,7 @@ import java.nio.file.StandardOpenOption
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Creates files whose every block is allocated, so later writes inside them never allocate and cannot fail with
- *  ENOSPC (the CRL's stream files: crash-recovery-log F7).
+ *  ENOSPC (the CRL's stream files: crash-recovery-log AS7, 5.1).
  *
  *  On Linux the blocks are reserved with fallocate(2), mode 0, called through FFM: O(extents), nothing written. ext4
  *  keeps reserved clusters for converting the unwritten extents this leaves on their first write, so that conversion

@@ -45,8 +45,8 @@ trait RepairTarget:
   /** Whether the store may still join a transaction started at `start`: it is at or above the store's forget floor
     * (Frontend.forgetFloorMillis), so a replayed prepare may yet create a Tx for it there. A UnackedCommits entry for
     * such a transaction is left for a later pass: a Tx created after the scan's `holdsTransaction` check could apply
-    * the entry's transaction late after its reconcile, and the scan would then delete the entry (transaction-recovery
-    * R-N9). Below the floor no new Tx for it can appear. Callable from any thread. False for a store not hosted here,
+    * the entry's transaction late after its reconcile, and the scan would then delete the entry (repair-process
+    * 5.4). Below the floor no new Tx for it can appear. Callable from any thread. False for a store not hosted here,
     * whose repair fails with StoreNotHosted anyway, and by default (test targets)
     */
   def mayJoinTransaction(storeId: StoreId, start: HLCTimestamp): Boolean = false

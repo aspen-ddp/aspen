@@ -149,10 +149,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       //----------------------
       // Deleted Stores
       //
-      // An offline store whose entry is gone from this device is no longer owned here: a transfer out completed, or
-      // its rebuild was re-placed onto another device (Rebuild F12). Its copy is retired, not deleted: it and its
-      // CRL state are kept in pending-delete until the store is Active on the device its pool names (StoreCopies).
-      // For a completed transfer that is already so, and the check the retire asks for deletes it.
+      // An offline store whose entry is gone from this device is no longer owned here: a transfer out completed, or its
+      // rebuild was re-placed onto another device (rebuild-process 4.2). Its copy is retired, not deleted: it and its
+      // CRL state are kept in pending-delete until the store is Active on the device its pool names (StoreCopies). For
+      // a completed transfer that is already so, and the check the retire asks for deletes it.
       //
       // A served store whose entry is absent is a copy put at the store path by hand: every path that serves a store
       // has its entry first. It is taken out of service (marked, closed, offline), and the check that follows
@@ -362,7 +362,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         entry.status == StorageDeviceState.StoreStatus.Rebuilding
       ).toList.sortBy(_._1.poolIndex).foreach: (storeId, entry) =>
         ctx.rebuilds.startRebuild(local, storeId, entry.rebuildEpisode)
-      // Rebuild work for stores no longer Rebuilding here (re-placed elsewhere, Rebuild F12)
+      // Rebuild work for stores no longer Rebuilding here (re-placed elsewhere, rebuild-process 4.2)
       ctx.rebuilds.abandonUnlisted(local, remote)
 
       //----------------------

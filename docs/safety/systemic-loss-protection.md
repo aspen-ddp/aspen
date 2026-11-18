@@ -242,8 +242,8 @@ brings it up to date.
 
 1. **No other incarnation ever served.** The store's device entry is still Rebuilding under the episode its
    declaration started, the pool still names this device, and no loss was accepted (`acceptLoss`). An entry that
-   has flipped Active, or been re-placed (Rebuild F12), means a rebuilt copy may have joined transactions. Two
-   incarnations' states are then both live, and the old one must never return.
+   has flipped Active, or been re-placed (rebuild-process 4.2, R4), means a rebuilt copy may have joined
+   transactions. Two incarnations' states are then both live, and the old one must never return.
 2. **The data copy is whole.** It is the copy that was declared, from its path or from
    `pending-delete/<store-dir>-<uuid>`, untouched since. Its `incarnation` file must be the copy's own.
 3. **Its complete CRL state is in hand**, and the software that will load it can read it (the fixed release, when the

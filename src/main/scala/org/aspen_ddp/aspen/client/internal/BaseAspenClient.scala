@@ -537,10 +537,10 @@ abstract class BaseAspenClient(
         deviceId
 
   /** Runs a create whose id is chosen outside the retry. After an attempt that committed but was reported
-    * TransactionOutcomeUnknown, a tree already mapping `id` holds that attempt's own object (Todo 5.10): nothing is
-    * staged, so the empty transaction succeeds, and `created` is the result. Otherwise the retry would fail with
-    * KeyAlreadyExists, which reads as a name or id someone else took. A first attempt that finds the id taken still
-    * fails that way */
+    * TransactionOutcomeUnknown, a tree already mapping `id` holds that attempt's own object (paxos-transactions 10.11):
+    * nothing is staged, so the empty transaction succeeds, and `created` is the result. Otherwise the retry would fail
+    * with KeyAlreadyExists, which reads as a name or id someone else took. A first attempt that finds the id taken
+    * still fails that way */
   private def runIdempotentCreate[T](tree: MetadataTree, id: UUID, created: => Future[T])(
       prepare: Transaction => Future[T]): Future[T] =
     given ExecutionContext = clientContext
@@ -840,7 +840,7 @@ abstract class BaseAspenClient(
 
     // One task id for every attempt. A retry after an attempt that committed but was reported Unknown finds its own
     // task enrolled, or the device already tombstoned by it, and succeeds rather than enrolling a second task or
-    // failing with DeviceAlreadyFailed (Todo 5.10)
+    // failing with DeviceAlreadyFailed (paxos-transactions 10.11)
     val taskId = UUID.randomUUID()
     val retry = StopRetrying.collisionRetry()
     transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>

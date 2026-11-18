@@ -75,7 +75,7 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     f.complete.value should be (Some(scala.util.Success(())))
   }
 
-  // Ruling 8 (revised 2026-11-17): an action that never settles (one retrying through an outage) does not hold up the
+  // An action that never settles (one retrying through an outage) does not hold up the
   // marker, so the stores that missed the transaction are repaired meanwhile
   test("an action that never settles does not keep the marker from executing, and complete waits for it") {
     val stuck = new StubAction

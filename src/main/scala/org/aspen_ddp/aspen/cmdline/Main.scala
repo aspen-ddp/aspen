@@ -2604,7 +2604,8 @@ object Main {
                                   .exists(_.status == StorageDeviceState.StoreStatus.Rebuilding)
                                 if rebuilding then
                                   // Nothing is served from a store being rebuilt, so moving it cannot take the pool
-                                  // below its redundancy floor: its rebuild starts afresh on the target (Rebuild F12)
+                                  // below its redundancy floor: its rebuild starts afresh on the target
+                                  // (rebuild-process 4.2)
                                   println(s"Store $storeName is being rebuilt: re-placing its rebuild on the target")
                                   client.replaceRebuild(storeId, targetDeviceId).map(Right(_))
                                 else if force then

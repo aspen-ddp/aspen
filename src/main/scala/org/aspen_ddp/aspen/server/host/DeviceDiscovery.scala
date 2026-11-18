@@ -646,7 +646,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             // A growth raises the limit the stores admit against; registered before any store loads
             crl.onAdmissionLimitRaised(sds.admission.raiseLimit)
             // Everything the CRL holds is counted, retained for its store, before any store loads: a store that loads
-            // counts its own afresh, and the entries of one that does not are copied forward all the same (F8)
+            // counts its own afresh, and the entries of one that does not are copied forward all the same
+            // (crash-recovery-log 6.1)
             crl.recoveredBytesByStore.foreach((storeId, bytes) => sds.admission.chargeRetained(storeId, bytes))
             // On the control context. Ignored unless sds is still the device loaded (DeviceShutdown.crlFailed)
             crl.failed.foreach(t => ctx.shutdown.crlFailed(sds, t))

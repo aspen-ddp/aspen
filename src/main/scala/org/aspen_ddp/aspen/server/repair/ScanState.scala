@@ -35,7 +35,7 @@ object ScanState:
     * scan doubles toward the cap. A failed scan passes foundEntries = false: a failed read says
     * nothing about whether the store is damaged, and retrying hard against a pool that cannot be
     * read is exactly the load this service exists to bound. A scan cut off by its deadline passes
-    * whether it had seen an entry (RepairService.scanOne, repair F9).
+    * whether it had seen an entry (RepairService.scanOne, repair-process 4.2).
     */
   def advance(prev: ScanState, now: Long, foundEntries: Boolean,
               policy: RepairPolicy, rand: Random): ScanState =

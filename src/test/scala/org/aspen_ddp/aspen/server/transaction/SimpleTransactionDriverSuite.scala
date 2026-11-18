@@ -103,7 +103,7 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
     resolvedSentTo(messenger) shouldBe empty
   }
 
-  // Ruling 7: a driver whose own mark is in flight finalizes on another driver's TxFinalized at once. Retransmitting
+  // A driver whose own mark is in flight finalizes on another driver's TxFinalized at once. Retransmitting
   // non-late TxResolved meanwhile could reach a replay's fresh Tx after the status cache forgot the transaction
   test("a driver whose mark was handed off sends no TxResolved after another driver's TxFinalized") {
     val (driver, messenger, tasks) = resolvedDriver(handedOff = Set(ds2))
@@ -132,7 +132,8 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
     tasks.fireAll()
     (driver, messenger, tasks)
 
-  // Paxos F5: a restarted or replacement leader driver reusing (1, L) would be a second proposer with the first one's id
+  // transaction-recovery 4.3: a restarted or replacement leader driver reusing (1, L) would be a second proposer with
+  // the first one's id
   test("only the designated leader's first driver starts at the initial proposal") {
     val (_, first, _) = startedDriver(ds0, TransactionDriver.Start(initialProposal = true))
     preparedAt(first) shouldBe Set(ProposalId(1, 0))
@@ -149,7 +150,7 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
     preparedAt(recovery) shouldBe Set(ProposalId(4, 1))
   }
 
-  // Paxos F4: the retransmit timer sends the current Accept itself; a learn-only driver must not
+  // paxos-transactions 7.6: the retransmit timer sends the current Accept itself; a learn-only driver must not
   test("a learn-only driver's retransmits send prepares, never an Accept of an adopted value") {
     val otherPool = PoolId(java.util.UUID.randomUUID())
     val otherObj = DataObjectPointer(ObjectId(java.util.UUID.randomUUID()), otherPool, Array[Byte]())
@@ -169,7 +170,7 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
     preparedAt(messenger) should not be empty
   }
 
-  // Ruling 31: Store.close shuts its drivers down. A timer already firing must not restart the retry loop
+  // Store.close shuts its drivers down. A timer already firing must not restart the retry loop
   test("a shut-down driver whose timer fires anyway sends nothing and schedules nothing") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()

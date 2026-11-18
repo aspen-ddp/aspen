@@ -71,17 +71,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.3  Stale finding ids and inaccuracies in module CLAUDE.md files: P-W5 and agent reports                  [S]
-     Old safety-doc ids (F*, Q-N*, R-N*, X*, G*, Todo n.m) cited in server/transaction/CLAUDE.md,
-     server/store/CLAUDE.md, server/crl/CLAUDE.md, server/repair/CLAUDE.md, client/internal/transaction/
-     CLAUDE.md, and in scaladoc (SimpleCRL, CrlAdmission, StreamWriter, FilePreallocation, LogEntry, Tx,
-     Frontend): replace with document + section topic. server/store/CLAUDE.md: lane argument is now
-     cross-document-review.md section 3; RepairSlotOccupied and amnesiac reply are section 2. Also:
-     - client/internal/transaction/CLAUDE.md says there is no time horizon (wrong: 20 s horizon, forget floor);
-       it also says a silent store is marked for every hosted object (lock-only objects are excluded).
-     - server/repair/CLAUDE.md ScanTimedOut bullet mentions an orphan pass / confirmOrphans (gone).
-     - server/crl/CLAUDE.md: say readStoreState serves loads, transfers and drops from memory.
-
 7.4  Stale scaladoc and code comments                                                                      [S]
      MissedUpdateMarker.writeBatch (head chunk may itself be None);
      UnackedCommitEntry (lists every changed object, not only traceless ones); RepairPolicy

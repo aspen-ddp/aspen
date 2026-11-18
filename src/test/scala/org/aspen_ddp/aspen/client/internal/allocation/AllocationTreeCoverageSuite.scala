@@ -9,8 +9,8 @@ import org.aspen_ddp.aspen.server.store.backend.{FsifConfig, MapBackend, RocksDB
 
 import scala.concurrent.{ExecutionContext, Future}
 
-/** Every live object a store holds is listed in its pool's AllocationTree (Rebuild F17). The tree is the only way a
-  * rebuild finds the objects to restore, and repair takes absence from it as a sign of deletion, so an allocation
+/** Every live object a store holds is listed in its pool's AllocationTree (rebuild-process 7). The tree is the only way
+  * a rebuild finds the objects to restore, and repair takes absence from it as a sign of deletion, so an allocation
   * path that recorded no entry would lose objects on the next rebuild.
   */
 class AllocationTreeCoverageSuite extends IntegrationTestSuite:

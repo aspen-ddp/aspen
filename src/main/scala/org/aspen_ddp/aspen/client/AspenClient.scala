@@ -480,9 +480,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     yield
       poolId
       
-  /** Lets the rebuild of `storeId` finish past objects no peer can supply (Rebuild F15). Sets `acceptLoss` on the
-   *  store's Rebuilding entry on the device its pool names, and nudges that device's host. The rebuild's next pass
-   *  that ends with objects still unreadable records each in the pool's ErrorTree against the store, so repair
+  /** Lets the rebuild of `storeId` finish past objects no peer can supply (rebuild-process 5.5). Sets
+   *  `acceptLoss` on the store's Rebuilding entry on the device its pool names, and nudges that device's
+   *  host. The rebuild's next pass that ends with objects still unreadable records each in the pool's ErrorTree against
+   *  the store, so repair
    *  restores it if it ever becomes readable, and finishes. Fails with StoreNotRebuilding unless the entry is
    *  Rebuilding. The flip that promotes the store clears the flag. Only a collision is retried. */
   def acceptRebuildLoss(storeId: StoreId): Future[Unit] =
@@ -509,10 +510,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
     fStaged.map(sendBestEffortHostMessage)
 
-  /** Re-places a store being rebuilt onto `destinationId` (Rebuild F12): its rebuild there starts afresh, and the
-   *  one on its current device is abandoned. The remedy for a destination that is out of space, co-locates the pool's
-   *  stores, or sits on suspect media. One transaction removes the store's Rebuilding entry from its current device,
-   *  writes a Rebuilding entry on the destination, and repoints the pool (and, for a bootstrap-pool store, the
+  /** Re-places a store being rebuilt onto `destinationId` (rebuild-process 4.2): its rebuild there starts afresh, and
+   *  the one on its current device is abandoned. The remedy for a destination that is out of space, co-locates the
+   *  pool's stores, or sits on suspect media. One transaction removes the store's Rebuilding entry from its current
+   *  device, writes a Rebuilding entry on the destination, and repoints the pool (and, for a bootstrap-pool store, the
    *  radicle's bootstrap config), as FailedStorageDeviceDurableTask.moveStore does. Both hosts are nudged: the old
    *  one's reconcile cancels its rebuild and deletes its staging copy, the new one's starts the rebuild.
    *
@@ -524,7 +525,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
     // After an attempt that committed but was reported TransactionOutcomeUnknown, the retry finds the pool naming the
     // destination and the destination Rebuilding, and succeeds with that attempt's nudges rather than failing with
-    // InvalidDestination (Todo 5.10)
+    // InvalidDestination (paxos-transactions 10.11)
     val retry = StopRetrying.collisionRetry()
     @volatile var staged: List[CheckStorageDevice] = Nil
     // The new Rebuilding episode, one for every attempt, so a retry recognizes its own commit by it
@@ -594,7 +595,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     // One transfer id for every attempt. After an attempt that committed but was reported
     // TransactionOutcomeUnknown, the retry finds the source TransferringOut under this id, or the
     // pool already naming the destination once the transfer has finished, and succeeds with the
-    // same nudge rather than failing with StoreNotActive or InvalidDestination (Todo 5.10)
+    // same nudge rather than failing with StoreNotActive or InvalidDestination (paxos-transactions 10.11)
     val transferId = UUID.randomUUID()
     val retry = StopRetrying.collisionRetry()
     val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
@@ -698,7 +699,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
     // As in transferStore: only a collision is retried. An attempt that committed but was reported
     // TransactionOutcomeUnknown leaves nothing outstanding, so the retry stages nothing; it then
-    // reports that attempt's rollback and sends its nudges (Todo 5.10)
+    // reports that attempt's rollback and sends its nudges (paxos-transactions 10.11)
     val retry = StopRetrying.collisionRetry()
     @volatile var staged: List[CheckStorageDevice] = Nil
     val fStaged: Future[List[CheckStorageDevice]] = transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
@@ -921,7 +922,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   private[aspen] def receiveClientResponse(msg: ClientResponse): Unit
 
   /** The allocations `stores` hold unfinalized, once `needed` of them have answered (`CurrentAllocationsRequest`,
-   *  Rebuild F10). Resends until then; fails with `CurrentAllocationsQuery.Abandoned` once `stopWhen` holds */
+   *  rebuild-process 5.3). Resends until then; fails with `CurrentAllocationsQuery.Abandoned` once `stopWhen` holds */
   private[aspen] def currentAllocations(stores: List[StoreId], needed: Int, stopWhen: () => Boolean)
     : Future[Map[StoreId, List[org.aspen_ddp.aspen.common.network.PendingAllocation]]]
 
@@ -973,8 +974,8 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *
    *  The task id is fresh by default. A caller whose own guards would not stop a retry from enrolling again passes
    *  `taskId`, chosen outside its retry closure: once the registry holds it (an attempt that committed but was
-   *  reported TransactionOutcomeUnknown), nothing is staged, so the retry does not enroll a second task (Todo 5.10).
-   *  That costs a registry read, so it is opt-in. */
+   *  reported TransactionOutcomeUnknown), nothing is staged, so the retry does not enroll a second task
+   *  (paxos-transactions 10.11). That costs a registry read, so it is opt-in. */
   def prepareSystemDurableTask(taskTypeUUID: UUID,
                                initialState: Map[Key, Array[Byte]],
                                pinned: Boolean = false,

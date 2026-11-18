@@ -88,7 +88,8 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     cache.getStatus(txid).get.late shouldBe true
   }
 
-  // Updates are monotone (Ruling 30): a later write of the same transaction never loses what an earlier one recorded
+  // Updates are monotone (paxos-transactions 10.6): a later write of the same transaction never loses what an earlier
+  // one recorded
 
   test("the finalized flag is sticky") {
     val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), maxEntries = 100)
@@ -114,8 +115,9 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     cache.getStatus(txid) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed, true, true))
   }
 
-  // X3: a store's Tx created before the transaction was finalized elsewhere on the host, then resolved by a delayed
-  // non-late TxResolved, used to overwrite the finalized late entry, so the finalized relay answered a replay non-late
+  // paxos-transactions 10.6: a store's Tx created before the transaction was finalized elsewhere on the host, then
+  // resolved by a delayed non-late TxResolved, used to overwrite the finalized late entry, so the finalized relay
+  // answered a replay non-late
   test("the X3 sequence of writes keeps the entry finalized and late") {
     val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), maxEntries = 100)
     val txid = TransactionId(new UUID(0, 1))
@@ -132,7 +134,7 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), maxEntries = 100)
     val txid = TransactionId(new UUID(0, 1))
     cache.updateStatus(txid, TransactionStatus.Committed, finalized = true, late = true)
-    cache.updateStatus(txid, TransactionStatus.Aborted) // a stray TxResolved of a later round (paxos F2)
+    cache.updateStatus(txid, TransactionStatus.Aborted) // a stray TxResolved of a later round
     cache.updateStatus(txid, TransactionStatus.Aborted, finalized = true)
     cache.getStatus(txid) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed, true, true))
   }
@@ -141,7 +143,7 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     val cache = new TransactionStatusCache(FiniteDuration(1, HOURS), maxEntries = 100)
     val txid = TransactionId(new UUID(0, 1))
     cache.updateStatus(txid, TransactionStatus.Aborted, finalized = true)
-    cache.updateStatus(txid, TransactionStatus.Committed) // the abort decided again as a commit (P-N4)
+    cache.updateStatus(txid, TransactionStatus.Committed) // the abort decided again as a commit
     cache.getStatus(txid) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed, finalized = false))
     cache.updateStatus(txid, TransactionStatus.Committed, finalized = true)
     cache.getStatus(txid) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed, finalized = true))

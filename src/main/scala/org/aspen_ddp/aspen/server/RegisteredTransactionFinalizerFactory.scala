@@ -15,8 +15,8 @@ object RegisteredTransactionFinalizerFactory {
 
   /** Runs a committed transaction's finalization actions. Every action, the MissedUpdateFinalizationAction (the
     * marker) included, executes at once and in parallel, so the stores that missed the transaction are marked for
-    * repair whatever the other actions do, even while one of them retries for a long time (Ruling 8, revised
-    * 2026-11-17). `complete` covers all of them, and `cancel` cancels all of them.
+    * repair whatever the other actions do, even while one of them retries for a long time (transaction-recovery 4.4).
+    * `complete` covers all of them, and `cancel` cancels all of them.
     *
     * Invariant: a durable UnackedCommits entry implies the transaction committed, and nothing more: the other actions
     * may still be running, or may have failed, to be run again by a fresh finalizer. What implies that every action is

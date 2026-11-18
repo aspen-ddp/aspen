@@ -49,9 +49,9 @@ object Frontend {
     */
   val MissingDataWait: Duration = Duration(5, SECONDS)
 
-  /** How long a repair reconcile may wait for its object to settle (RepairSnapshot.awaitSettle, repair F8). Checked
-    * on the store's heartbeat, so a parked repair that never sees its object settle answers stale up to a heartbeat
-    * period later
+  /** How long a repair reconcile may wait for its object to settle (RepairSnapshot.awaitSettle, repair-process 8.2).
+    * Checked on the store's heartbeat, so a parked repair that never sees its object settle answers stale up to a
+    * heartbeat period later
     */
   val RepairSettleWait: FiniteDuration = FiniteDuration(1, SECONDS)
 
@@ -75,8 +75,8 @@ object Frontend {
     * joins a transaction only if it started at most this long after the host's clock when the store first saw it. An
     * old incarnation stopped before its rebuild began, so every transaction it joined started before its rebuilt
     * store's acceptor-since time, whatever the client's clock, provided this bound plus the skew between the hosts'
-    * clocks stays under RebuildingStore.AcceptorSinceMargin (paxos P-N2). It also bounds how far timestamps that
-    * clients ratchet their HLCs from can run ahead of the hosts' clocks
+    * clocks stays under RebuildingStore.AcceptorSinceMargin (paxos-transactions 10.10). It also bounds how far
+    * timestamps that clients ratchet their HLCs from can run ahead of the hosts' clocks
     */
   val MaxStartLead: FiniteDuration = TransactionHorizon.MaxStartLead
 
@@ -251,8 +251,9 @@ class Frontend(val storeId: StoreId,
     * JoinCeiling.Step then refuses only what started before the host went down plus about that much). Plus
     * RebuildingStore.AcceptorSinceMargin instead while the store's arrival from another host (a transfer in, an
     * adoption) is less than that margin before the load: it may have joined such a transaction on that host, whose
-    * clock may lead this one's by up to the skew the margin also covers (paxos P-N2). A restart within the margin of
-    * the arrival keeps it, as the restarted store may still have forgotten one
+    * clock may lead this one's by up to the skew the margin also covers
+    * (paxos-transactions 10.10). A restart within the margin of the arrival keeps it, as the restarted store may
+    * still have forgotten one
     */
   val loadFloorMillis: Long =
     val margin = RebuildingStore.AcceptorSinceMargin.toMillis
@@ -280,7 +281,7 @@ class Frontend(val storeId: StoreId,
 
   /** T started before this rebuilt store's acceptor (acceptorSince): its old incarnation may have promised or
     * accepted in T, and that state was lost without T being decided. For T's expiry the store is then never a
-    * non-holder, whatever it holds now: it may be the only other holder of a chosen value (cross-document review G1)
+    * non-holder, whatever it holds now: it may be the only other holder of a chosen value (cross-document-review 2.2)
     */
   def mayHaveForgottenUndecided(startTimestamp: HLCTimestamp): Boolean = acceptorSince.exists(startTimestamp < _)
 
@@ -316,8 +317,8 @@ class Frontend(val storeId: StoreId,
   def recoveryPending: Boolean = awaitingCrl
 
   /** The allocations in this store's pool held by transactions it has not seen finalized and not seen abort, for a
-    * rebuilding peer (Rebuild F10). None while the CRL is still loading: transactions it does not know yet may be
-    * among them. A committed transaction stays held until TxFinalized, which comes only once its
+    * rebuilding peer (rebuild-process 5.3). None while the CRL is still loading: transactions it does not know yet
+    * may be among them. A committed transaction stays held until TxFinalized, which comes only once its
     * AllocationFinalizationAction has recorded the objects in the AllocationTree, so an allocation that may still be
     * missing from the tree is listed by every store that holds its transaction
     */
@@ -465,7 +466,7 @@ class Frontend(val storeId: StoreId,
     */
   def poisonObject(oid: ObjectId): Unit = failedCommits += oid
 
-  // ---- Quarantine (transaction-requirements F5 residual, Todo 2.16) ----
+  // ---- Quarantine (transaction-requirements 8.5) ----
 
   /** A quarantined object: see quarantine.
     *
@@ -636,8 +637,8 @@ class Frontend(val storeId: StoreId,
     */
   private val committing = scala.collection.mutable.HashMap[ObjectId, List[ObjectState]]()
 
-  /** A repair reconcile waiting for its object to settle (RepairSnapshot.awaitSettle, repair F8), until `until`
-    * (wallClockMillis)
+  /** A repair reconcile waiting for its object to settle (RepairSnapshot.awaitSettle, repair-process 8.2),
+    * until `until` (wallClockMillis)
     */
   private final class ParkedRepair(val snapshot: RepairSnapshot, val read: ClientObjectState,
                                    val p: Promise[ReconcileResult], val until: Long)
@@ -698,8 +699,10 @@ class Frontend(val storeId: StoreId,
     */
   private final class AllocationRecord(var tx: Tx, var objects: Set[ObjectId], var concluded: Boolean)
 
-  /** Transactions that allocate objects here and may still hold their updates in the CRL (R-N13), by txid and by object.
-    * Empty for every object no unconcluded allocation covers, so an ordinary deletion consults nothing else */
+  /** Transactions that allocate objects here and may still hold their updates in the CRL (crash-recovery-log 3.4),
+    * by txid and by object. Empty for every object no unconcluded allocation covers, so an ordinary deletion consults
+    * nothing else
+    */
   private val allocationRecords = scala.collection.mutable.HashMap[TransactionId, AllocationRecord]()
   private val allocationsOf = scala.collection.mutable.HashMap[ObjectId, Set[TransactionId]]()
 
@@ -733,7 +736,7 @@ class Frontend(val storeId: StoreId,
 
   /** Runs `proceed` once no CRL state of a transaction allocating `oid` here holds its update durably: the store is
     * about to delete `oid` from its backend, and a restart that recovered the update would allocate the object again
-    * over the deletion (transaction-recovery R-N13). An unconcluded allocation's state is saved again without it
+    * over the deletion (crash-recovery-log 3.4). An unconcluded allocation's state is saved again without it
     * (Tx.persistWithoutUpdateOf); a concluded one's deletion or stub only has to be durable (whenDurable). Inline when
     * no allocation covers `oid`, which is every deletion but one soon after its object's allocation
     */
@@ -993,7 +996,7 @@ class Frontend(val storeId: StoreId,
     * below the forget floor, so a prepare for it creates no Tx (receivePrepare: refused, or ignored when the host's
     * status cache knows T finalized), and with none held no Tx for T can arise here again: the stub can suppress
     * nothing. This bounds the stubs by their rate times the horizon plus the margin, whether or not repair scans run
-    * (crash-recovery-log F22, repair RP-N6, Todo 4.6). An UnackedCommits entry left without its stub is harmless: no
+    * (crash-recovery-log 3.6). An UnackedCommits entry left without its stub is harmless: no
     * Tx is left to apply through it, and the scan's reconcile is exact
     */
   private def expireStubs(now: Long): Unit =
@@ -1135,7 +1138,7 @@ class Frontend(val storeId: StoreId,
     * hold T loses nothing by asking.
     *
     * A Tx held only to decide its applied stub (Tx.forgetLookupPending) asks nothing: past the margin it is forgotten
-    * without one (Tx.forgetWithoutStubPastExpiry, R-N10), and its lookup is dropped
+    * without one (Tx.forgetWithoutStubPastExpiry, transaction-recovery 5.4), and its lookup is dropped
     */
   def expiryHeartbeat(): Unit =
     val now = wallClockMillis()
@@ -1458,9 +1461,10 @@ class Frontend(val storeId: StoreId,
     // Before the backend commit: a synchronous backend completes inside it
     txCommits.getOrElseUpdate(txid, new TxCommits(0, false, false)).outstanding += 1
     txCommitsInFlight(os.objectId) = txCommitsInFlight.getOrElse(os.objectId, 0) + 1
-    // A deletion reaches the backend only once no allocation's CRL state can bring the object back (R-N13). Until then
-    // it is in flight like any commit: reads, snapshots and transactions see the deletion. A store stopped or closed
-    // meanwhile never issues it, and keeps this transaction's CRL state, so a reload applies the deletion again
+    // A deletion reaches the backend only once no allocation's CRL state can bring the object back
+    // (crash-recovery-log 3.4). Until then it is in flight like any commit: reads, snapshots and transactions see the
+    // deletion. A store stopped or closed meanwhile never issues it, and keeps this transaction's CRL state, so a
+    // reload applies the deletion again
     if deletes then
       awaitAllocationsDurable(os.objectId)(() => if !stopped && !closed then backend.commit(cs, txid))
     else
@@ -1591,7 +1595,7 @@ class Frontend(val storeId: StoreId,
     *
     * The triggers (Tx.issueCommits, Tx.objectLoadFailed) are a commit voter that cannot hold the update it voted for:
     * its locks are gone, so without the update a conflicting transaction could count this store's commit vote against
-    * the committed one (transaction-requirements F5, F6).
+    * the committed one (transaction-requirements 8.5).
     */
   def failStop(reason: String): Unit =
     if !stopped then
@@ -1697,7 +1701,7 @@ class Frontend(val storeId: StoreId,
       // The rebuilt store's mute (acceptorSince) keeps its semantics: its muted Tx may still prove the commit.
       // Below the floor a resolved, unfinalized cache entry creates no Tx either (a finalized one was ignored above):
       // the host's cache is shared, so another store's Tx may have written it after this store forgot T, and a Tx
-      // created here could then apply T again once this store's applied stub has expired (Todo 4.6)
+      // created here could then apply T again once this store's applied stub has expired (paxos-transactions 10.2)
       if !beforeAcceptor && belowForgetFloor(m.txd) then
         refusePrepare(m)
       else
@@ -1972,7 +1976,7 @@ class Frontend(val storeId: StoreId,
     * There is nothing to read first: the object is gone everywhere else, so there is no state to compare against.
     * Refused (RepairDeleteDeferred) while the object is in use here, as reconcile refuses: a backend read in flight
     * could otherwise answer, and cache, the state being deleted, and a commit or transaction on it would race the
-    * deletion (repair F6). While the backend removal is outstanding the object counts as deleting, as for a
+    * deletion (repair-process 9.2). While the backend removal is outstanding the object counts as deleting, as for a
     * transaction's deletion, so reads, snapshots and transactions get the answer the backend will give. The cache is
     * evicted for the same reason `commit` evicts it when a refcount reaches zero.
     */
@@ -2006,7 +2010,7 @@ class Frontend(val storeId: StoreId,
     logger.trace(s"Loading object for Tx: ${transaction.transactionId}. Object: $objectId")
 
     // An object the transaction allocates is read like any other: the store may already hold it (a replayed
-    // allocation, transaction-requirements F11), and the transaction must then see that state and refuse to overwrite
+    // allocation, transaction-requirements 9.4), and the transaction must then see that state and refuse to overwrite
     // it. Only a backend miss gives the fresh state (readCompleted)
     stateForTransaction(objectId) match
       case Some(os) =>

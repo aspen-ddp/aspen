@@ -37,7 +37,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       transactionHorizon = Duration(3, SECONDS))
 
   /** The prefer-abort test waits out the missing-data wait of every store its recovery driver prepares: a short one
-    * keeps it fast (Ruling 9). Other tests keep the default, which no step of theirs should reach
+    * keeps it fast. Other tests keep the default, which no step of theirs should reach
     */
   private val reDrivenAbortTest = "an aborted data-less transaction re-driven by a recovered commit vote aborts again"
 
@@ -277,7 +277,8 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       xAfterReplay <- client.read(x)
     yield
       // Every store refuses the replay. Before the forget floor, checked afresh, T failed x's revision and no object
-      // showed its update: every store voted abort, and the replay aborted a committed transaction (paxos F2)
+      // showed its update: every store voted abort, and the replay aborted a committed transaction (paxos-transactions
+      // 10.10)
       withClue("every store of x still holds T2's overwrite: "):
         (0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(ObjectRevision(t2)))
       xAfterReplay.revision shouldBe ObjectRevision(t2)
@@ -358,7 +359,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))
       yAfter.contents.get(k).map(_.value.bytes.toSeq) shouldBe Some(Seq[Byte](3))
 
-  // Cross-document G11: a store that gets a driver's data-less prepare before its client's prepare (prefer-abort,
+  // paxos-transactions 6.2: a store that gets a driver's data-less prepare before its client's prepare (prefer-abort,
   // Tx.awaitingClientPrepare). Since the forget floor a replay is refused outright, so this order arises end to end
   // only in a live transaction, whose client prepare to a store is slower than the leader driver's. Here the leader's
   // driver retransmits, as a host's does (HostOptions.leaderRetransmits), so its data-less prepares reach stores 3 and 4
@@ -559,7 +560,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       yAfterReplay.contents.keySet should not contain k
       entries.forall(i => bFrontend(i).exists(_.hasAppliedStub(t))) shouldBe true
 
-  // Transaction-recovery R-N7 (cross-document X13, G13): a second driver's host crashing after its marker handed
+  // transaction-recovery 5.4: a second driver's host crashing after its marker handed
   // entries off and before its TxFinalized reached the stores leaves entries with no stub, possibly at a whole pool.
   // The single-host TestNetwork cannot run that driver on another host; this builds the state its crash leaves (every
   // store applied and forgot T, holds an entry and no stub), which is what decides the outcome. Under the forget floor

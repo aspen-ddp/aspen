@@ -244,7 +244,7 @@ object SimpleCRL extends Logging:
   private val warnedCopyOnWrite = new AtomicBoolean(false)
 
   /** Creates the stream files of a new CRL, preallocated at their full size (FilePreallocation), so no CRL write ever
-    * allocates a block and a full device cannot fail one with ENOSPC (crash-recovery-log F7). Each is written as
+    * allocates a block and a full device cannot fail one with ENOSPC (crash-recovery-log 5.1). Each is written as
     * `<name>.tmp` and renamed into place, and the directory is forced once all are: only then does the writer start.
     * So a `.tmp` file left at open means a creation that never finished and wrote no entry, and it starts over.
     * A copy-on-write file system allocates on every overwrite, which no preallocation prevents: warned once. */
@@ -465,7 +465,7 @@ class SimpleCRL private (streamsDir: os.Path,
     else
       streams(tpl._1.number) = new Stream(tpl._1, crlId, writer, UUID.randomUUID(), 0)
 
-  // The open writes nothing (crash-recovery-log F16): each recovered record's newest durable form is its last-built
+  // The open writes nothing (crash-recovery-log 5.7): each recovered record's newest durable form is its last-built
   // form, its pieces pinned in livePieces by the verified entry holding each (Recovery.entryHolding), as if this
   // instance had written them. So the first entry's oldestEntryNeeded is no newer than any of them: every entry
   // recovery read them from is walked again. The last durable entry kept the ring's invariant (the stream after the
@@ -510,7 +510,7 @@ class SimpleCRL private (streamsDir: os.Path,
   @volatile private var closed = false
 
   // The promises of the Future-returning calls not answered yet. A death fails them with CrlFailed, a shutdown with
-  // CrlClosed, so no caller waits on a CRL that will never answer (crash-recovery-log F9). Handler-style completions
+  // CrlClosed, so no caller waits on a CRL that will never answer (crash-recovery-log 5.10). Handler-style completions
   // (save, saveAppliedStub, whenDurable) are never run after either: nothing that waits on one, a vote above all, may
   // proceed without the write
   private val pending = java.util.concurrent.ConcurrentHashMap.newKeySet[Promise[?]]()
@@ -664,7 +664,7 @@ class SimpleCRL private (streamsDir: os.Path,
 
         case DropStore(storeId, completionHandler) =>
           // Read and deleted in one step: what any earlier request saved is dropped, nothing a later one saves
-          // (crash-recovery-log F12). A save in this same entry cancels the deletion, as it is the store loaded again
+          // (crash-recovery-log C14). A save in this same entry cancels the deletion, as it is the store loaded again
           val ids = (transactions.keysIterator ++ stubs.keysIterator).filter(_.storeId == storeId)
             .map(_.transactionId).toList.distinct
           onDeleteTransactions(storeId, ids, resavable = true, completionHandler)
@@ -945,7 +945,7 @@ class SimpleCRL private (streamsDir: os.Path,
     val txid = TxId(state.storeId, transactionId)
     // Deleted in an unwritten entry: the save is skipped but still reports success once the deletion is durable. No
     // record is created for it: readStoreState would report it live, and it would save a state whose admission was
-    // already released (crash-recovery-log F4, W1b). Every deletion removes the id from `transactions` too, so no
+    // already released (crash-recovery-log C9, W1b). Every deletion removes the id from `transactions` too, so no
     // record exists here
     if skippedAfterFinalDeletion(txid, completionHandler) then
       startWrite()
@@ -1022,7 +1022,7 @@ class SimpleCRL private (streamsDir: os.Path,
   override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
     tracked(p => GetRecoveryState(storeId, state => p.trySuccess(state)))
 
-  /** One request on the CRL thread, so it drops exactly what was saved before it (crash-recovery-log F12) */
+  /** One request on the CRL thread, so it drops exactly what was saved before it (crash-recovery-log C14) */
   override def dropStore(storeId: StoreId): Future[Unit] =
     tracked(p => DropStore(storeId, () => p.trySuccess(())))
 

@@ -19,10 +19,10 @@ import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
-/** Todo 5.10: a retried call whose earlier attempt committed but was reported TransactionOutcomeUnknown recognizes its
-  * own commit. Each test has the stores commit the call's transaction while the client is told Unknown
-  * (TestNetwork.reportCommitAsUnknown), and checks the call ends as it would have had the client heard Committed:
-  * the same result, nothing done twice, no false error
+/** paxos-transactions 10.11 (retried unknowns): a retried call whose earlier attempt committed but was reported
+  * TransactionOutcomeUnknown recognizes its own commit. Each test has the stores commit the call's transaction while
+  * the client is told Unknown (TestNetwork.reportCommitAsUnknown), and checks the call ends as it would have had the
+  * client heard Committed: the same result, nothing done twice, no false error
   */
 class CommittedUnknownRetrySuite extends IntegrationTestSuite:
 

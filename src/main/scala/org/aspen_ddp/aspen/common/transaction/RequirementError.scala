@@ -46,7 +46,7 @@ case class ObjectQuarantined() extends RequirementError
 case class InheritedVoteLock() extends RequirementError
 
 /** A transaction allocates an object this store already holds (in memory or in its backend): a replayed allocation,
-  * which must not overwrite the live object (transaction-requirements F11). Purely local, like RequirementCheckFailure.
+  * which must not overwrite the live object (transaction-requirements 9.4). Purely local, like RequirementCheckFailure.
   */
 case class ObjectExists() extends RequirementError
 
@@ -63,7 +63,8 @@ case class UnflaggedDelete() extends RequirementError
 
 /** A KeyValueUpdate with no required revision, no content lock and no allocation of its object deletes a key it holds
   * no KeyRevision on, or changes the object's minimum, maximum, left or right. TransactionBuilder refuses such an
-  * update (BlindKeyValueWrite); the store refuses it too (repair F4, F11). Purely local, like RequirementCheckFailure.
+  * update (BlindKeyValueWrite); the store refuses it too (transaction-requirements 2.5). Purely local, like
+  * RequirementCheckFailure.
   */
 case class BlindWrite() extends RequirementError
 

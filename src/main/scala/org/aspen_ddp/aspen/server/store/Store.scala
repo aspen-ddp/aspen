@@ -121,16 +121,18 @@ class Store(val storageDeviceId: StorageDeviceId,
       driver.receiveTxResolved(TxResolved(storeId, storeId, txd.transactionId, committed = true, late = false,
         proof = false))
 
-  /** Stops the store's transaction drivers first (Ruling 31): left running, their timers would keep re-preparing
+  /** Stops the store's transaction drivers first (paxos-transactions 7.5): left running, their timers would keep
+    * re-preparing
     * transactions for a store that is gone. Drivers on other stores, and their heartbeat recovery, take over
     */
   def close(): Future[Unit] =
     shutdownDrivers()
     frontend.close()
 
-  /** Stops and drops every transaction driver of this store (Ruling 31). `close` calls it; so does a reload that
+  /** Stops and drops every transaction driver of this store. `close` calls it; so does a reload that
     * replaces this store over the same backend without closing it (StoreRouter.install). A finalizer already running
-    * is not cancelled: it completes its idempotent actions and its TxFinalized still follows them (Todo 6.3)
+    * is not cancelled: it completes its idempotent actions and its TxFinalized still follows them
+    * (paxos-transactions 7.5)
     */
   def shutdownDrivers(): Unit =
     val drivers = transactionDrivers.values
@@ -142,7 +144,7 @@ class Store(val storageDeviceId: StorageDeviceId,
   private val finalizationStallReport = new FinalizationStallReport(storeId)
 
   /** The committed transactions this store's drivers have not finalized `TransactionDriver.FinalizationStallAfter` or
-    * longer after resolving them (the finalization stall metric; Todo 4.9)
+    * longer after resolving them (the finalization stall metric)
     */
   def stalledFinalizations(now: Long = System.nanoTime()): List[FinalizationStall] =
     transactionDrivers.values.flatMap(_.finalizationStall(now)).toList
@@ -189,19 +191,20 @@ class Store(val storageDeviceId: StorageDeviceId,
 
   /** Starts a driver for `txd`, unless one runs or the store's CRL state is still being loaded
     * (Frontend.recoveryPending): a recovered Tx may be among it, and the driver must start above what its acceptor
-    * promised or accepted (TransactionDriver.Start.highestSeen, paxos F5).
+    * promised or accepted (TransactionDriver.Start.highestSeen, paxos-transactions P2).
     *
-    * A recovered unresolved commit vote is driven at once, before its UnackedCommits lookup answers (Todo 4.4, R-N3;
-    * this replaces Ruling 20's wait). The wait guarded against a driver without the entry's proof deciding abort on
-    * the fresh votes of stores that had finalized and forgotten the transaction. The forget floor closed that: a store
-    * that forgot T refuses its prepares, or answers from its status cache, so Paxos chooses abort only from real
-    * acceptor state, and never once commit was chosen (paxos 10.10). The Tx still accepts no abort before a lookup
-    * finds no entry. A lookup that finds the entry later hands the proof to the running driver (giveProof)
+    * A recovered unresolved commit vote is driven at once, before its UnackedCommits lookup answers
+    * (paxos-transactions 6.4). Waiting for the lookup is unnecessary: it would only guard against a driver without
+    * the entry's proof deciding abort on the fresh votes of stores that had finalized and forgotten the transaction.
+    * The forget floor closes that: a store that forgot T refuses its prepares, or answers from its status cache, so
+    * Paxos chooses abort only from real acceptor state, and never once commit was chosen (paxos-transactions 10.10).
+    * The Tx still accepts no abort before a lookup finds no entry. A lookup that finds the entry later hands the
+    * proof to the running driver (giveProof)
     *
     * @param initialProposal the client's prepare is creating the transaction at its designated leader: this is the
     *                        leader's first driver for it, which keeps the prepare's initial proposal (1, L). Every
     *                        other driver starts above round 1 and above what this store's acceptor promised or
-    *                        accepted (TransactionDriver.Start, paxos F5)
+    *                        accepted (TransactionDriver.Start, paxos-transactions P2)
     */
   def driveTransaction(txd: TransactionDescription, initialProposal: Boolean = false): Unit = {
     if (!transactionDrivers.contains(txd.transactionId) && !frontend.recoveryPending) {
@@ -314,7 +317,8 @@ class Store(val storageDeviceId: StorageDeviceId,
         // client's prepare once the clocks catch up. The client's retransmission starts the driver then. Nor is one
         // started below the store's forget floor for a transaction it does not hold: the Frontend refuses the prepare
         // (or ignores it, its finalized outcome cached), and a driver could only run rounds with stores
-        // that may have forgotten the transaction. An outcome cached but not finalized is driven on purpose (R-F16):
+        // that may have forgotten the transaction. An outcome cached but not finalized is driven on purpose
+        // (paxos-transactions 10.2):
         // its deciding driver ran on another host, and if it died this takes over without waiting for an idle Tx
         val refused = frontend.belowForgetFloor(m.txd) && !frontend.transactions.contains(m.txd.transactionId)
         if (notFinalized && m.txd.primaryObject.poolId == storeId.poolId && m.txd.designatedLeaderUID == storeId.poolIndex

@@ -178,7 +178,7 @@ object Host:
   val TransferOutRecheckDelay: Duration = Duration(10, SECONDS)
 
   /** How long after a store's first failed rebuild pass or failed flip its device is checked again, which resumes
-   *  the rebuild (Rebuild F5, F11). Each further failure of the same store doubles it, up to RebuildRetryMaxDelay.
+   *  the rebuild (rebuild-process 5.7). Each further failure of the same store doubles it, up to RebuildRetryMaxDelay.
    *  See StoreRebuilds.scheduleRebuildRetry. */
   val RebuildRetryInitialDelay: FiniteDuration = FiniteDuration(30, SECONDS)
   val RebuildRetryMaxDelay: FiniteDuration = FiniteDuration(30, MINUTES)

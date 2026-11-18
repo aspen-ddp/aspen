@@ -7,14 +7,15 @@ import java.nio.file.{Files, StandardOpenOption}
 import java.nio.file.attribute.BasicFileAttributes
 
 /** The exclusive lock a SimpleCRL holds on `<crl dir>/lock` while it is open, so no second writer, in this process or
- *  another, interleaves its entries with ours (CRL F10). Acquired before the stream files are read and released once
- *  the writer has closed them.
+ *  another, interleaves its entries with ours (crash-recovery-log 5.1). Acquired before the stream files are read and
+ *  released once the writer has closed them.
  *
  *  The OS lock is a POSIX record lock, which belongs to the process, and Linux drops every such lock a process holds on
  *  a file when the process closes any descriptor of it. A second opener in this process must therefore never open the
  *  lock file: `held` (keyed by the file's identity, so another path to the same file is caught too) refuses it first,
  *  and every acquire and release runs under `held`'s monitor, so no create or open of the file overlaps a lock held
- *  here. The lock fences only openers that take it: two hosts mounting one shared device need real fencing (SL M9). */
+ *  here. The lock fences only openers that take it: two hosts mounting one shared device need real fencing
+ *  (crash-recovery-log AS3). */
 final class CrlLock private (key: AnyRef, channel: FileChannel, lock: FileLock):
   private var released = false
 

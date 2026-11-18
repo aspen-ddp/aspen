@@ -165,7 +165,7 @@ class ExpiryTallySuite extends AnyFunSuite with Matchers:
   // ---- Commit (A, B, F) ----
 
   test("commit accepts beyond width - writeThreshold and commit voters at the read threshold commit"):
-    // G1: the leader, which also accepted commit, was rebuilt; store 4 never heard of T
+    // cross-document-review 2.2: the leader, which also accepted commit, was rebuilt; store 4 never heard of T
     ExpiryTally.decide(txd, Map(primary(0) -> amnesiac, primary(1) -> acceptedCommit, primary(2) -> acceptedCommit,
       primary(3) -> acceptedCommit, primary(4) -> unknown)) shouldBe Decision.Commit
     // Two accepts suffice (any quorum that chose abort would include one of them); a voter need not have accepted

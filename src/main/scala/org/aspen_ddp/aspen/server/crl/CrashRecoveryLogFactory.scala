@@ -37,7 +37,7 @@ class CrlClosed extends Exception("The CRL is shut down")
 
 /** Thrown by openCRL when the CRL's files hold other than what was written: an entry recovery needs fails its checksums,
  *  or an intact entry newer than the last one recovery found exists. The CRL cannot be recovered, as with any other
- *  failure to recover it, but the cause is named apart so corruption can be counted (Todo 3.1) */
+ *  failure to recover it, but the cause is named apart so corruption can be counted */
 class CrlCorrupt(reason: String) extends Exception(s"CRL is corrupt: $reason")
 
 /** Thrown by openCRL when the CRL's stream files do not match the sizing the CRL recorded when it was created, or that

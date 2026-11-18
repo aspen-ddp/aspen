@@ -112,7 +112,7 @@ object Tx:
     *        bit 1 - have accepted proposal
     *        bit 2 - accepted boolean value (only valid if bit 1 is set)
     *        bits 3-4 - the saved TransactionStatus: 0 Unresolved, 1 Committed, 2 Aborted. Recovery restores it, so a
-    *                   crash returns the status readStoreState does (crash-recovery-log F14)
+    *                   crash returns the status readStoreState does (crash-recovery-log C15)
     *    object_updates: 4-byte-count, num_updates * (16:objuuid + FileLocation))
     */
   def writeStatic(bb: ByteBuffer, id: TxId, form: TxForm, pieces: Vector[Piece]): Unit =

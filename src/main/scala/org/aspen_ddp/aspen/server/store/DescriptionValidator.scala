@@ -4,7 +4,8 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.*
 
-/** The store's copy of the rules TransactionBuilder applies to a description (transaction-requirements F7, Q-N4).
+/** The store's copy of the rules TransactionBuilder applies to a description (transaction-requirements 2.5,
+  * store-side validation).
   * A store votes from the description, and a description built without the builder (an older or buggy client, a
   * tool) could otherwise break what the vote relies on:
   *

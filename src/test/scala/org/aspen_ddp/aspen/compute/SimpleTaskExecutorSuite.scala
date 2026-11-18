@@ -158,7 +158,7 @@ class SimpleTaskExecutorSuite extends IntegrationTestSuite:
       .shouldBe(true)
       rootAfter.contents.size shouldBe 1
 
-  // transaction-requirements Q-N6: concurrent allocations at one executor would all update the executor object at
+  // Concurrent allocations at one executor would all update the executor object at
   // the same cached revision, and all but one collide and retry. They run one at a time instead
   atest("concurrent task allocations at one executor each commit on their first attempt"):
     given ExecutionContext = executionContext

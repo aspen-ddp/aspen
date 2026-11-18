@@ -60,15 +60,15 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
         if cause == RemovalCause.SIZE then recordSizeEviction(txid))
       .build[TransactionId, Entry]()
 
-  /** Records what is known of `txid`. Monotone, atomically (Ruling 30): `finalized` and `late` are sticky, and a
-    * resolved status (Committed or Aborted) never reverts to Unresolved. Several stores of a host write the same
-    * entry, and a write from one that learned less (a Tx created, or a delayed non-late resolution) must not erase
-    * what another recorded: the finalized relay (Store) reports from it.
+  /** Records what is known of `txid`. Monotone, atomically (paxos-transactions 10.6): `finalized` and `late` are
+    * sticky, and a resolved status (Committed or Aborted) never reverts to Unresolved. Several stores of a host write
+    * the same entry, and a write from one that learned less (a Tx created, or a delayed non-late resolution) must not
+    * erase what another recorded: the finalized relay (Store) reports from it.
     *
     * Opposite outcomes should never arise (transaction horizon, 2026-11-13): no store joins a transaction it may have
     * forgotten (Frontend.forgetFloorMillis), so a forgotten transaction is never decided again by a later round. One that
-    * does arise is a split decision (once paxos F2, a false abort of a commit; P-N4, an abort decided again as a
-    * commit): it is logged as an error and counted (splitDecisions). Committed wins, because a commit is what the
+    * does arise is a split decision (a false abort of a commit, or an abort decided again as a
+    * commit; P19): it is logged as an error and counted (splitDecisions). Committed wins, because a commit is what the
     * stores hold and nothing rolls it back. An abort never replaces a commit, and the flags describe the outcome they
     * came with: an abort's `finalized` and `late` do not pass to a commit that replaces it. Otherwise the relay would
     * spread the abort as finalized, or report a commit still being finalized as late, so that its driver skipped the
@@ -93,7 +93,7 @@ class TransactionStatusCache(cacheDuration: FiniteDuration = FiniteDuration(30, 
   }
 
   /** Logs a split decision of `txid` as an error and counts it (splitDecisions). Called by the cache itself on an
-    * opposite outcome, and by Txs and drivers of the host that are given a conflicting second outcome (paxos F11)
+    * opposite outcome, and by Txs and drivers of the host that are given a conflicting second outcome (P19)
     */
   def recordSplitDecision(txid: TransactionId, detail: String): Unit =
     splitDecisionCount.incrementAndGet()

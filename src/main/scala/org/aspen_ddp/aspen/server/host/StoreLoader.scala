@@ -101,9 +101,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           router.markOffline(storeCfg.storeId)
           sds.offlineStores += storeCfg.storeId
         else if os.exists(potentialStoreFile / RebuildingStore.RebuildCompleteMarkerFile) then
-          // A finished rebuild whose flip may not have committed (a crash between the move and the flip, Rebuild F4).
-          // The rebuild's completion removes the marker and loads it once the flip commits; for an entry already
-          // Active, the reconcile does (DeviceReconciler)
+          // A finished rebuild whose flip may not have committed (a crash between the move and the flip,
+          // rebuild-process 5.7). The rebuild's completion removes the marker and loads it once the flip commits; for
+          // an entry already Active, the reconcile does (DeviceReconciler)
           logger.info("Skipping load of rebuilt store awaiting its device entry's flip out of Rebuilding. " +
                       s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
           router.markOffline(storeCfg.storeId)
@@ -592,7 +592,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         val store = entry.store
         // isWriteFrozen may be read from any thread
         if store.backend.isWriteFrozen then
-          // The close abandons the held writes as a crash would (Ruling 27): they were never
+          // The close abandons the held writes as a crash would: they were never
           // acknowledged, so the CRL state (in the device CRL, or saved below) keeps their data, and
           // acknowledged commits are durable in the store's journal. It completes without waiting for space.
           logger.warn(s"Closing store $storeId while its device is out of space: its held writes are " +

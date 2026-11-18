@@ -75,9 +75,9 @@ class Tx( trs: TransactionRecoveryState,
   private var collisions: List[TransactionId] = Nil
   private var txStatus = trs.status
   /** A recovered Tx restores the resolution its saved status records: a prepare or accept after the resolution saves
-    * the Tx again with it (transaction-recovery R-F6). Its commit is then applied, or its abort's state deleted, as soon
-    * as its objects load (completeLoad), rather than waiting for its driver to learn the outcome again. A live Tx
-    * always starts unresolved
+    * the Tx again with it (paxos-transactions 6.4, recovered votes). Its commit is then applied, or its abort's state
+    * deleted, as soon as its objects load (completeLoad), rather than waiting for its driver to learn the outcome
+    * again. A live Tx always starts unresolved
     */
   private var oresolution: Option[Boolean] = trs.status match
     case TransactionStatus.Committed => Some(true)
@@ -136,10 +136,10 @@ class Tx( trs: TransactionRecoveryState,
 
   /** Durably removes `objectId`'s update from this transaction's CRL state, then runs `onDurable` on the store's
     * executor. The store is deleting the object, which this transaction allocated: a restart must not find the update
-    * and allocate the object again over the deletion (transaction-recovery R-N13). The in-memory drop after the commits
-    * persist (allObjectCommitsComplete) writes nothing, so this saves the state again without it, keeping the other
-    * objects' updates, which a failed backend commit may still need. A transaction that never saved has nothing to
-    * remove. The save is a later request than every earlier save of the state, so it supersedes them
+    * and allocate the object again over the deletion (transaction-requirements 9.4). The in-memory drop after the
+    * commits persist (allObjectCommitsComplete) writes nothing, so this saves the state again without it, keeping the
+    * other objects' updates, which a failed backend commit may still need. A transaction that never saved has nothing
+    * to remove. The save is a later request than every earlier save of the state, so it supersedes them
     */
   def persistWithoutUpdateOf(objectId: ObjectId)(onDurable: () => Unit): Unit =
     droppedUpdates += objectId
@@ -244,11 +244,12 @@ class Tx( trs: TransactionRecoveryState,
     finalized(true)
     frontend.forget(this)
 
-  /** A forget-lookup unanswered once T is past the horizon plus the expiry margin (Frontend.expiryHeartbeat; Todo 4.4,
-    * R-N10). The lookup only decides the applied stub, which keeps a replay from applying T again here. Past the
-    * forget floor this store refuses every prepare for T it does not hold, so no later Tx for T can arise to apply
-    * through the entry, and the stub could suppress nothing: the Tx is forgotten without one rather than waiting on
-    * the metadata group. The entry is left for the repair scan; an entry with no stub is harmless at a store that saw T
+  /** A forget-lookup unanswered once T is past the horizon plus the expiry margin (Frontend.expiryHeartbeat;
+    * paxos-transactions 10.10). The lookup only decides the applied stub, which keeps a replay from applying T again
+    * here. Past the forget floor this store refuses every prepare for T it does not hold, so no later Tx for T can
+    * arise to apply through the entry, and the stub could suppress nothing: the Tx is forgotten without one rather than
+    * waiting on the metadata group. The entry is left for the repair scan; an entry with no stub is harmless at a store
+    * that saw T
     */
   def forgetWithoutStubPastExpiry(): Unit =
     if forgetLookupPending then
@@ -411,13 +412,13 @@ class Tx( trs: TransactionRecoveryState,
     * determineDisposition). A driver's prepare that merely overtakes the client's therefore never aborts a healthy
     * transaction. A Tx recovered with a vote answers with that vote. A Tx recovered without one stays undecided once
     * loaded, so a retransmit of its client's prepare is still checked, but it does not hold back its answer to a
-    * driver (answerPrepare, paxos-transactions P-N7): its transaction was in flight when the store crashed, its driver
+    * driver (answerPrepare, paxos-transactions 6.2): its transaction was in flight when the store crashed, its driver
     * needs this acceptor's promise, and any value it accepted, at once, and an abort vote is always safe. Checked only
     * as prepares arrive, since a vote is of use only to a driver that is still asking for it.
     *
     * The wait runs from the Tx's creation, not from the client's last retransmit: a store never sees the retransmits
     * that are lost, and the first one it sees ends the wait. So a live client whose prepares to this store are all lost
-    * for longer than `missingDataWait` gets this store's abort vote and retries (P-N8, by design).
+    * for longer than `missingDataWait` gets this store's abort vote and retries (paxos-transactions 6.2, by design).
     */
   private def awaitingClientPrepare: Boolean =
     disposition == TransactionDisposition.Undetermined && !muted && !clientPrepared && !outcomeKnown &&
@@ -459,7 +460,7 @@ class Tx( trs: TransactionRecoveryState,
 
   /** Object data adopted from a later prepare (adoptObjectUpdates) is not yet durable in the CRL. A commit waits for
     * it: one applied first, then a crash before its backend commit completes, would recover the Tx without the data
-    * (paxos F14, P13). Set only on the late-data path: a Tx created by a client prepare starts with its data
+    * (P13). Set only on the late-data path: a Tx created by a client prepare starts with its data
     */
   private var adoptedDataUnsaved: Boolean = false
 
@@ -673,7 +674,7 @@ class Tx( trs: TransactionRecoveryState,
 
   /** Objects this transaction allocates whose load found the store's existing state rather than a fresh one: a
     * replayed allocation. Every requirement on them fails (RequirementsChecker.check, ObjectExists), so the replay
-    * never overwrites the live object (transaction-requirements F11)
+    * never overwrites the live object (transaction-requirements 9.4)
     */
   private var allocatedOver: Set[ObjectId] = Set()
 
@@ -683,7 +684,7 @@ class Tx( trs: TransactionRecoveryState,
   /** This store voted to commit the allocation of `objectId` and has not applied it: its fresh state is known only to
     * this transaction, so a client read misses. The store answers `AllocationPending` rather than `ObjectNotFound`
     * (Frontend.backendReadComplete; it parks the read until this is false, Frontend.parkAllocationRead), so a read
-    * straight after the allocation commits cannot prove the object deleted (transaction-requirements Q-N5). Once
+    * straight after the allocation commits cannot prove the object deleted (transaction-requirements 9.4). Once
     * doCommit starts, the in-flight commit's state is served
     */
   def allocationUnapplied(objectId: ObjectId): Boolean =
@@ -729,7 +730,7 @@ class Tx( trs: TransactionRecoveryState,
 
     // A recovered commit vote takes its locks only on the objects that load (RequirementsLocker.lock). A failure other
     // than ObjectNotFound may be transient, and a later load of the object would then find no lock: a conflicting
-    // transaction could vote commit on it while this vote stands (transaction-requirements F6). A store whose writes
+    // transaction could vote commit on it while this vote stands (transaction-requirements 10.5). A store whose writes
     // are frozen (a full device) must keep serving instead: the object is poisoned, so every later transaction on it
     // votes abort until the store reloads, as after a failed backend commit
     if recovered && disposition == TransactionDisposition.VoteCommit && err != ReadError.ObjectNotFound then
@@ -1370,7 +1371,7 @@ class Tx( trs: TransactionRecoveryState,
       else if m.committed || !holdAbort(m) then
         resolved(m.committed)
 
-  /** An outcome opposite to the one this Tx already holds is a split decision (paxos F11): logged as an error and
+  /** An outcome opposite to the one this Tx already holds is a split decision (P19): logged as an error and
     * counted by the host status cache. The Tx keeps what it holds, as before
     */
   private def reportConflictingOutcome(kind: String, committed: Boolean, from: StoreId): Unit =
@@ -1393,7 +1394,7 @@ class Tx( trs: TransactionRecoveryState,
     else
       reportLateOutcome("TxFinalized", m.from)
       updateLastEvent()
-      // Remembered until the CRL state would be deleted, which may wait for backend commits (Ruling 1)
+      // Remembered until the CRL state would be deleted, which may wait for backend commits (crash-recovery-log 3.6)
       if m.committed && !m.late && m.owed.contains(storeId) then
         stubDue = true
       if provenCommitted then
@@ -1438,11 +1439,12 @@ class Tx( trs: TransactionRecoveryState,
     *  - Otherwise (an abort vote, no vote, a muted Tx, or an abort already learned): applies nothing.
     * The Tx concludes itself: the Frontend forgets it here, not on the message.
     *
-    * Applied stubs (docs/superpowers/specs/2026-11-09-replay-pins-addendum-design.md, A) close the residual of Rulings
-    * 17 and 32: a store that cast a counted commit vote and acknowledged after errorTimeout has an entry until its
-    * repair scan reconciles it, but it wrote a stub when it forgot T, so a replayed client prepare reaching it with a
-    * passing commit vote applies nothing. What remains is a store named in `owed` that never received that TxFinalized
-    * and holds no Tx for T: it never saw T, at most width - writeThreshold of the pool, which repair restores
+    * Applied stubs (docs/superpowers/specs/2026-11-09-replay-pins-addendum-design.md, A, transaction-recovery 5.4)
+    * close the residual of a stale entry: a store that cast a counted commit vote and acknowledged after errorTimeout
+    * has an entry until its repair scan reconciles it, but it wrote a stub when it forgot T, so a replayed client
+    * prepare reaching it with a passing commit vote applies nothing. What remains is a store named in `owed` that never
+    * received that TxFinalized and holds no Tx for T: it never saw T, at most width - writeThreshold of the pool, which
+    * repair restores
     */
   private def lateCommit(): Unit =
     lateOutcome = true

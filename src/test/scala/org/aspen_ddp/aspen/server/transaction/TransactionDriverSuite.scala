@@ -150,7 +150,7 @@ object TransactionDriverSuite {
     def cancel(): Unit = cancelled = true
 
   /** Hands out a new StepFinalizer per create, planning the next set of `plans` (empty once they run out). A create
-    * whose plan is None throws, as a host lacking an action's type does (transaction-recovery F1)
+    * whose plan is None throws, as a host lacking an action's type does (transaction-recovery 4.4)
     */
   class StepFactory(plans: Option[Set[StoreId]]*) extends TransactionFinalizer.Factory:
     private var remaining = plans.toList
@@ -184,8 +184,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
   private def accepts(messenger: TMessenger): List[TxAccept] = messenger.messages.collect { case a: TxAccept => a }
 
-  // Paxos F7: a Tx resolved before it voted answers Undetermined. Counted as aborts, two of them make commit look
-  // impossible for a width-3, threshold-2 object, though they are no votes at all
+  // paxos-transactions 7.2: a Tx resolved before it voted answers Undetermined. Counted as aborts, two of them make
+  // commit look impossible for a width-3, threshold-2 object, though they are no votes at all
   test("Undetermined replies are no votes: they never make the tally propose abort") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
@@ -211,7 +211,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, true), (ds1, true), (ds2, true))
   }
 
-  // Paxos F8: the tally stopped at the first object short of answers, even when another object could no longer commit
+  // paxos-transactions 7.2: the tally stopped at the first object short of answers, even when another object could no
+  // longer commit
   test("an object that can no longer commit decides abort though another object is short of answers") {
     val otherPool = PoolId(java.util.UUID.randomUUID())
     val otherObj = DataObjectPointer(ObjectId(java.util.UUID.randomUUID()), otherPool)
@@ -231,7 +232,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       accepts(messenger).map(a => (a.to, a.value)).toSet shouldBe Set((ds0, false), (ds1, false), (ds2, false))
   }
 
-  // Rebuild F6: one commit vote, one abort vote and a silent store leave the outcome to the silent store. The driver
+  // One commit vote, one abort vote and a silent store leave the outcome to the silent store. The driver
   // never proposes abort on it: expiry rule E ends the Tx instead
   test("an undecided tally never proposes abort") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
@@ -283,7 +284,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     accepts(messenger).filter(!_.value) shouldBe Nil
   }
 
-  // Paxos F4: proposer ids are pool indexes, so a store of another pool with the leader's index would share its ids
+  // paxos-transactions 7.6: proposer ids are pool indexes, so a store of another pool with the leader's index would
+  // share its ids
   test("a driver on a secondary-pool store is learn-only: no proposal and no Accept, but it learns the outcome") {
     val otherPool = PoolId(java.util.UUID.randomUUID())
     val otherObj = DataObjectPointer(ObjectId(java.util.UUID.randomUUID()), otherPool, Array[Byte]())
@@ -311,7 +313,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     accepts(messenger) shouldBe Nil
   }
 
-  // Paxos F11
+  // paxos-transactions 10.6, status cache
   test("a conflicting TxResolved or TxFinalized after a resolution is reported and changes nothing") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
@@ -426,8 +428,9 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       TxAccept(ds2, ds0, txd.transactionId, ProposalId(1, 0), value = true)))
   }
 
-  // paxos F12: the local proposal outlives its round, so the tally does not run again after a round change. The new
-  // round's quorum must still send its Accept at once, not wait for a periodic retransmit (this driver has no timer)
+  // paxos-transactions 7.3: the local proposal outlives its round, so the tally does not run again after a round
+  // change. The new round's quorum must still send its Accept at once, not wait for a periodic retransmit (this driver
+  // has no timer)
   test("after a round change, the new round's prepare quorum sends its Accept at once, and only once") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
@@ -1143,8 +1146,8 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     } should be (true)
   }
 
-  // Ruling 29: a proof means commit was chosen at some ballot c, and every value accepted at c or higher is commit. An
-  // accepted abort can only predate c, so a post-proof quorum reporting no accepted commit is memoryless
+  // paxos-transactions 10.5: a proof means commit was chosen at some ballot c, and every value accepted at c or higher
+  // is commit. An accepted abort can only predate c, so a post-proof quorum reporting no accepted commit is memoryless
   test("a proof holder whose post-proof quorum reports only an older accepted abort resolves late and sends no abort") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
@@ -1476,7 +1479,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     finalizer.cancelled should be (false)
   }
 
-  // transaction-recovery F2 / R-N2: finalization has a failure path. A failed finalizer is started again from scratch
+  // paxos-transactions 7.7: finalization has a failure path. A failed finalizer is started again from scratch
   // after a backoff; the transaction is never finalized without its actions
   test("a failed finalizer is started again after a backoff, and TxFinalized waits for one that completes") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)

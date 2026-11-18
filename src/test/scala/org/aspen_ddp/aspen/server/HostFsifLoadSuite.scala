@@ -418,7 +418,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.getStoreIds should contain(storeId)
       val backend = fsif(host).lastBackend.get
       fsif(host).deviceFull = true
-      // A repair allocates an unmapped ext (Ruling 18); its journal batch hits ENOSPC and freezes the store
+      // A repair allocates an unmapped ext; its journal batch hits ENOSPC and freezes the store
       val id = ObjectId(new UUID(1, 2))
       val ptr = DataObjectPointer(id, storeId.poolId, java.nio.ByteBuffer.allocate(4).putInt(0).array())
       val md = Metadata(ObjectRevision(TransactionId(new UUID(3, 4))), ObjectRefcount(1, 1), HLCTimestamp(1))

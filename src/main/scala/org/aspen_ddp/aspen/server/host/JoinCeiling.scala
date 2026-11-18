@@ -9,10 +9,11 @@ import scala.concurrent.duration.*
 import scala.util.{Failure, Success, Try}
 
 /** The host's join ceiling: a durable upper bound, in milliseconds of the host's wall clock, on the start of every
-  * transaction any of its stores has joined (cross-document review G4, Todo 6.4). A store joins a transaction it does
-  * not hold only if it started below the ceiling already persisted (`mayJoin`, Frontend.startsTooFarAhead), and the
-  * host keeps the ceiling ahead of every start a store may join (now plus MaxStartLead) by renewing it in the
-  * background (`renew`, every RenewPeriod, to now plus MaxStartLead plus Step). It only ever rises.
+  * transaction any of its stores has joined (paxos-transactions 10.10, cross-document-review 2.2). A store joins a
+  * transaction it does not hold only if it started below the ceiling already persisted (`mayJoin`,
+  * Frontend.startsTooFarAhead), and the host keeps the ceiling ahead of every start a store may join (now plus
+  * MaxStartLead) by renewing it in the background (`renew`, every RenewPeriod, to now plus MaxStartLead plus Step). It
+  * only ever rises.
   *
   * What it buys: a store loaded again on this host never joined a transaction started at or above the ceiling its
   * previous life ran under, so its forget floor need not reach past that ceiling (`boundAtLoad`, Frontend.loadFloorMillis).

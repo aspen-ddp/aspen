@@ -33,11 +33,11 @@ class AllocationFinalizationAction(val client: AspenClient,
     * `AllocationPending`, not `ObjectNotFound`, and the read waits for them to apply it (BaseReadDriver re-reads such
     * a store, which parks the re-read): a live object is never taken to be gone (skipping its entry would lose it on
     * repair and rebuild). Residual: an object already below
-    * writeThreshold live copies reads as deleted and gets no entry; it was unreadable already (repair-process F5).
+    * writeThreshold live copies reads as deleted and gets no entry; it was unreadable already.
     *
     * Neither the insert of an absent key (`DoesNotExist`) nor the lock is a pin, so the transaction is marked
     * replay-safe: once the object is deleted its revision lock fails, so a replay or a later run never leaves an
-    * orphan entry (transaction-requirements Q-N5). The lock is shared (Q-N6): it fails on a deleted or changed object
+    * orphan entry (transaction-requirements 9.4). The lock is shared: it fails on a deleted or changed object
     * just as an exclusive one does, and two runs of the action (a leader's and a recovery driver's finalizer) do not
     * collide on it. It still collides with a concurrent write of the object, whose writer retries.
     */

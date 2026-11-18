@@ -758,7 +758,7 @@ SimpleCRL (implemented: `SimpleCRL.writeHead`, `entryFor`, `onSaveTransaction`, 
   change). So an entry's size is fixed when its requests are added, and only shrinks after (a deletion that removes a
   same-entry save).
 - **W1b, a deletion is final across every unwritten entry.** A save of a transaction whose final deletion lies in any
-  unwritten entry, not only the newest, is skipped and creates no record (`LogEntry.deletesFinally`, 5.8, F4). Its
+  unwritten entry, not only the newest, is skipped and creates no record (`LogEntry.deletesFinally`, 5.8). Its
   handler runs once that deletion is durable: on the newest unwritten entry, or, when only the entry in flight
   deletes it, through `afterInFlight` at that write's completion.
 - **W2, evacuation first.** When the oldest unwritten entry, the *head* `h`, does not fit the rest of the active stream

@@ -300,10 +300,10 @@ class TransactionBuilder(
   /** Stores apply a blind key Insert last-writer-wins on (timestamp, revision), so a lagging store or a crash
     * re-apply cannot regress a later write of the key (KVObjectState.insertWins). A Delete leaves no tombstone and
     * object-level parts carry no timestamp, so the same cannot be done for them. Unless it is the initial content of
-    * an object this transaction allocates (transaction-requirements F1), an update must not delete a key without a
+    * an object this transaction allocates (transaction-requirements 2.5), an update must not delete a key without a
     * KeyRevision on it, a required revision or a content lock, and must not change an object-level part without a
-    * required revision: only that moves the revision a repair proof locks (repair F11). Stores refuse the same
-    * writes (RequirementsChecker, BlindWrite).
+    * required revision: only that moves the revision a repair proof locks (repair-process 1.2, Q8). Stores refuse the
+    * same writes (RequirementsChecker, BlindWrite).
     */
   private def refuseBlindWrites(kvu: KVUpdate): Unit =
     if kvu.requiredRevision.isEmpty && !allocatingObjects.exists(_.id == kvu.pointer.id) then
@@ -393,7 +393,7 @@ class TransactionBuilder(
   }
 
   /** Also adds the object's AllocationFinalizationAction, so no allocation is built without the action that records
-    * it in its pool's AllocationTree: the tree is what repair and rebuild find objects by (Rebuild F17)
+    * it in its pool's AllocationTree: the tree is what repair and rebuild find objects by (rebuild-process 7)
     */
   def addAllocatingObject(objectPtr: ObjectPointer): Unit = synchronized {
     if !allocatingObjects.contains(objectPtr) then

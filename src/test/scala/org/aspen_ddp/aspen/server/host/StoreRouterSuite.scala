@@ -227,7 +227,7 @@ object StoreRouterSuite:
     while !cond && System.nanoTime() < deadline do Thread.sleep(1)
     assert(cond)
 
-  /** Records every driver it creates and whether it was shut down (Ruling 31: Store.close stops them) */
+  /** Records every driver it creates and whether it was shut down (Store.close stops them) */
   private class RecordingDriverFactory extends TransactionDriver.Factory:
     val created = new ConcurrentLinkedQueue[RecordingDriver]()
 
@@ -764,7 +764,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     drivers.created.size should be(before + 1)
     drivers.created.asScala.last
 
-  // Todo 6.3 (G3): a transfer out (closeForTransferOut: extractCrl) and a shutdown or relinquish (closeForShutdown,
+  // A transfer out (closeForTransferOut: extractCrl) and a shutdown or relinquish (closeForShutdown,
   // which closeStoresToRelinquish uses) both close through handleClose, so Store.close stops the store's drivers
   for (what, extractCrl) <- List(("a transfer out", true), ("a shutdown or relinquish", false)) do
     test(s"the close of $what shuts the store's transaction drivers down"):
@@ -778,7 +778,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
         await(fx.ctx.loader.closeStore(s0, extractCrl = extractCrl))
         driver.stopped should be(true)
 
-  // Todo 6.3 (G3): a reload over a loaded store that reuses its backend (TestNetwork.restartStore) skips Store.close,
+  // A reload over a loaded store that reuses its backend (TestNetwork.restartStore) skips Store.close,
   // which would close the shared backend; its drivers must still stop, as they would in the crash it stands for
   test("a reload over a loaded store that reuses its backend shuts the old store's drivers down"):
     val s0 = StoreId(poolId, 0)

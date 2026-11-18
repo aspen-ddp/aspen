@@ -39,7 +39,7 @@ class StreamWriter(val maxSizeInBytes: Long,
   private val queue = new LinkedBlockingQueue[WriterThread.Command]()
 
   // The files exist, preallocated at their full size (SimpleCRL.createStreams, a growth's preallocation): a write
-  // never allocates, so it cannot fail with ENOSPC (crash-recovery-log F7)
+  // never allocates, so it cannot fail with ENOSPC (crash-recovery-log 5.1)
   private def open(path: os.Path): FileChannel =
     // FileChannel rather than os-lib: os-lib cannot open with DSYNC
     val channel = FileChannel.open(path.toNIO,

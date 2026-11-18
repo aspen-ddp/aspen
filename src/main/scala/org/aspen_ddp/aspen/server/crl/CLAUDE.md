@@ -2,8 +2,8 @@
 - Similar to a write-ahead-log in traditional databases
 - Stores the state necessary for Paxos as well as the TransactionDescription, commit/abort vote, and object data
 - A record's saved `TransactionStatus` is persisted (bits 3-4 of the static record's Paxos mask byte), so disk
-  recovery returns the status `readStoreState` and `crl_save.log` do (safety F14). A recovered Tx restores a saved
-  resolution from it (`Tx.oresolution`, transaction-recovery R-F6)
+  recovery returns the status `readStoreState` and `crl_save.log` do (crash-recovery-log C15). A recovered Tx restores a
+  saved resolution from it (`Tx.oresolution`, transaction-recovery 7.2)
 - Only read at application startup to recover in-progress transactions
 - Takes advantage of the fact that Transactions are typically very short-lived so their state usually does not need to
   be retained for long
@@ -93,31 +93,34 @@
   before it was stamped while they were pinned. A deleted record's save in the same unwritten entry is taken out of it
   (`LogEntry.deleteTx`), so it is never pinned
 - A failed open shuts its writer down before throwing, so a retry never runs two writers over the same files
-- An open writes nothing (safety F16): recovery returns each live record with the pieces its newest static record
-  names, each with the serial of the verified entry holding it (`Recovery.entryHolding`; a stub: its anchor in the
-  newest entry holding it, `Recovery.RecoveredTx`/`RecoveredStub`), and the constructor pins them in `LivePieces` as
+- An open writes nothing (crash-recovery-log 5.7): recovery returns each live record with the pieces its newest static
+  record names, each with the serial of the verified entry holding it (`Recovery.entryHolding`; a stub: its anchor in
+  the newest entry holding it, `Recovery.RecoveredTx`/`RecoveredStub`), and the constructor pins them in `LivePieces` as
   if it had written them (they are the image's last-built forms). The next rotations evacuate them from there. Do not
   reintroduce an open-time re-save
 - An open CRL holds an exclusive lock on `crl/lock` (`simple/CrlLock`), from before its files are read until its writer
   has closed them; a second opener, in this process or another, gets `CrlLocked` and touches nothing. Never open
   the lock file elsewhere: closing any descriptor of it drops the process's POSIX lock, which is why in-process
-  openers are refused by a registry first. It does not fence shared-storage double mounts (safety SL M9)
-- A transfer out reads a store's state (`readStoreState`, which leaves it live) and removes it with
+  openers are refused by a registry first. It does not fence shared-storage double mounts (crash-recovery-log AS3)
+- `readStoreState` answers from the CRL thread's in-memory live records and stubs (`onGetRecoveryState`), never from
+  the stream files, and leaves them live. Store loads (`StoreRouter`), transfers out (`StoreTransfers`,
+  `StoreLoader` extraction) and the save that precedes a drop (`StoreCopies`) all read this way
+- A transfer out reads a store's state (`readStoreState`) and removes it with
   `deleteTransactions` only once its `crl_save.log` is durable: entries leave the log only through a written deletion
 - `dropStore` is one CRL-thread request (`DropStore`): it deletes what the store holds when processed, so every
-  earlier save is dropped and no later one (safety F12). Its transaction deletions, like a stub save's, are
+  earlier save is dropped and no later one (crash-recovery-log C14). Its transaction deletions, like a stub save's, are
   cancellable (`LogEntry.deleteTxUnlessResaved`): a same-id save later in the same unwritten entry is written. Every
   other deletion is final within its entry
 - Stream files are preallocated at creation (`SimpleCRL.createStreamsIfNew`, `server.FilePreallocation`): `fallocate`
   through FFM on Linux, zero-fill elsewhere or on `EOPNOTSUPP`. A CRL write never allocates, so a full device cannot
-  fail one (safety F7). Each file is written as `<n>.crl.tmp`, renamed, and the directory forced before the writer
-  starts: a `.tmp` at open is a creation that wrote nothing, and it starts over. A `<ringSize>.crl` or
+  fail one (crash-recovery-log 5.1). Each file is written as `<n>.crl.tmp`, renamed, and the directory forced before the
+  writer starts: a `.tmp` at open is a creation that wrote nothing, and it starts over. A `<ringSize>.crl` or
   `<ringSize>.crl.tmp` the ring does not list is a growth that never committed: removed at open with a warning
-  (`removeUncommittedGrowth`, run before that creation rule), but only when every listed stream exists and no other
-  file is unlisted. Otherwise, as for any other unlisted stream file, the open is `CrlSizingMismatch` and removes
-  nothing: removing it beside missing streams could leave none, and a new empty CRL would be created under live
-  stores. `StreamWriter` opens existing files only. Copy-on-write file systems (btrfs, ZFS) allocate on every
-  overwrite whatever the preallocation, so a full device can stop the CRL there: the creation warns once
+  (`removeUncommittedGrowth`, run before that creation rule), but only when every listed stream exists and no other file
+  is unlisted. Otherwise, as for any other unlisted stream file, the open is `CrlSizingMismatch` and removes nothing:
+  removing it beside missing streams could leave none, and a new empty CRL would be created under live stores.
+  `StreamWriter` opens existing files only. Copy-on-write file systems (btrfs, ZFS) allocate on every overwrite whatever
+  the preallocation, so a full device can stop the CRL there: the creation warns once
 - A failed CRL (its thread or its writer died; one path: the writer's death kills the CRL thread) answers nothing:
   every pending and later Future fails with `CrlFailed` (`SimpleCRL.tracked`), `failed` completes and
   `onThreadDeath` runs once. Save completions never run, so no vote follows. The host unloads the device until it
@@ -134,17 +137,17 @@
   handler delays every later one on the device. One that throws fails the CRL (`HandlerFailed`). `BackendTiming`
   logs the `crl write` and `crl handlers` stages. Tests hold a written entry unacknowledged with
   `entryWrittenForTest` (`SimpleCRLSuite.holdEntryOf`), never with a blocking handler
-- `admissionLimitBytes` (SimpleCRL: `(n − 2) · S/2 − S/16` for `n` streams of `S` bytes, 15S/16 at 4 streams: with
-  it every evacuation fits and every head is written within `n − 1` rotations, safety 6.1) sizes the device's
+- `admissionLimitBytes` (SimpleCRL: `(n − 2) · S/2 − S/16` for `n` streams of `S` bytes, 15S/16 at 4 streams: with it
+  every evacuation fits and every head is written within `n − 1` rotations, safety 6.1) sizes the device's
   `CrlAdmission`, which drops prepares for unseen transactions past it. It rises with each committed growth
   (`onAdmissionLimitRaised`, `CrlAdmission.raiseLimit`). Lanes (`AdmissionTier`, the store's pool's, persisted in its
-  StoreConfig): data stores admit below 3/4 of it, metadata stores below 7/8, bootstrap stores up to it, so the
-  marker batches each tier's finalization needs keep headroom (safety X5, G10). `Stream.writeEntry`'s `require`
-  stays the fail-stop backstop. The admission counts everything the CRL holds from the device's open
-  (`recoveredBytesByStore`, `CrlAdmission.recoveredBytes`), retained per store until the store loads and has counted
-  its own, or its entries leave the CRL: records of stores that do not load are evacuated too (safety F8). The
-  Frontend and store loader keep every save charged (safety 6.1, A1-A4: late data checked, reload swaps, loaded
-  state checked by `tryChargeLoaded`, no save after a release)
+  StoreConfig): data stores admit below 3/4 of it, metadata stores below 7/8, bootstrap stores up to it, so the marker
+  batches each tier's finalization needs keep headroom (cross-document-review 3, CRL admission lanes).
+  `Stream.writeEntry`'s `require` stays the fail-stop backstop. The admission counts everything the CRL holds from the
+  device's open (`recoveredBytesByStore`, `CrlAdmission.recoveredBytes`), retained per store until the store loads and
+  has counted its own, or its entries leave the CRL: records of stores that do not load are evacuated too
+  (crash-recovery-log 6, admission). The Frontend and store loader keep every save charged (safety 6.1, A1-A4: late data
+  checked, reload swaps, loaded state checked by `tryChargeLoaded`, no save after a release)
 - `maxTransactionBytes` (SimpleCRL: `T = S/2 − EntryOverheadReserve`, 8 KiB; trait default unlimited): the most bytes,
   as `CrlAdmission` counts them, one store's transaction may hold. `Frontend.admitPrepare` drops a prepare past it
   unsaved, with no reply (`PrepareAdmission.Oversized`, `server/store/CLAUDE.md`), so every entry stays within
@@ -152,15 +155,15 @@
   10.20). Such a transaction can never commit on the store; the client sees `TransactionOutcomeUnknown`
 - Deletions are final across every unwritten entry, the one in flight included (W1b): a save of an id any of them
   deletes is skipped, and its handler runs once the deletion is durable. It creates no live record
-  (`LogEntry.deletesFinally`, `SimpleCRL.skippedAfterFinalDeletion`): `readStoreState` would report it live (safety
-  F4), and it would save a state whose admission was released. When only the entry in flight deletes the id, the
-  handler waits in `afterInFlight`. The exceptions are deletions a stub's save or a `dropStore` made, which a later
-  save in the same entry cancels
+  (`LogEntry.deletesFinally`, `SimpleCRL.skippedAfterFinalDeletion`): `readStoreState` would report it live
+  (crash-recovery-log C9), and it would save a state whose admission was released. When only the entry in flight deletes
+  the id, the handler waits in `afterInFlight`. The exceptions are deletions a stub's save or a `dropStore` made, which
+  a later save in the same entry cancels
 - `dropTransactionObjectData` writes nothing: it only flags the live record, so saves made after it leave the data
   out. Saves already queued keep it (their forms are frozen), and so does the last-built form: an evacuation carries
   the dropped data, pinned, until a later save's entry is built. Until then a restart, and `readStoreState`, still
   return the data. A store that needs the data durably gone saves the state without it (`Tx.persistWithoutUpdateOf`);
-  a save's update count change writes every piece again, the txd included (W4; transaction-recovery R-N13)
+  a save's update count change writes every piece again, the txd included (W4; transaction-recovery 7.4)
 - `whenDurable(storeId, handler)` (`Barrier`): runs the handler once every request queued before it is durable: on
   the newest unwritten entry holding anything, sealed ones included (`newestUnwritten`); after the write in flight
   if no unwritten entry holds anything (`afterInFlight`); else at once. It orders a write outside the CRL (a backend

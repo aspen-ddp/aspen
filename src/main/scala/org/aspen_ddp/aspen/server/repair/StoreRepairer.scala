@@ -58,7 +58,7 @@ object SweepResult:
 /** One scan's (or sweep's) cancellation and progress, shared with whoever runs it (RepairService). A scan cut off by
   * its deadline keeps running in the background, since a hung read cannot be interrupted: `cancel` makes it stop at
   * the next entry or node, and skip the work that only a scan that ran to its end may do (pruning DeferralState).
-  * So the store's DeferralState can be kept for its next scan (repair F9). `sawEntries` is
+  * So the store's DeferralState can be kept for its next scan (repair-process 8.1). `sawEntries` is
   * whether the scan had reached any entry by then: a scan cut off while working through a backlog is not quiet.
   * Safe to use from any thread.
   */
@@ -83,9 +83,9 @@ final class ScanControl:
   * whose copy is busy with an outstanding write. Nor does it reset the count: on a hot object stale and lock-deferred
   * passes alternate, and only a complete pass shows the locks are gone. Stale passes are counted on their own
   * (`recordStale`): after `StoreRepairer.ParkAfterStalePasses` of them the store is asked to wait for the object to
-  * settle before reconciling (RepairSnapshot.awaitSettle, repair F8), and keeps being asked until a complete pass, so
-  * a parked pass that meets a lock is followed by another parked pass rather than by a stale one. Together these let
-  * a hot object's lock deferrals reach a proof. Safe to call from any thread.
+  * settle before reconciling (RepairSnapshot.awaitSettle, repair-process 8.2), and keeps being asked until a complete
+  * pass, so a parked pass that meets a lock is followed by another parked pass rather than by a stale one. Together
+  * these let a hot object's lock deferrals reach a proof. Safe to call from any thread.
   */
 final class DeferralState:
 
@@ -437,7 +437,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
 
         if target.mayJoinTransaction(storeId, errorEntry.missedTimestamp) then
           // As for UnackedCommits entries: a replay may still create a Tx for the missed transaction here and apply
-          // it after this entry's reconcile, and the entry would be gone (transaction-recovery R-N9)
+          // it after this entry's reconcile, and the entry would be gone (repair-process 5.4)
           logger.debug(s"Deferring error entry of $objectId on $storeId: the store may still join its transaction")
           counts.deferred.incrementAndGet()
           Future.unit
@@ -506,7 +506,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           if target.mayJoinTransaction(storeId, entry.timestamp) then
             // A replay may still create a Tx for T here, after the holdsTransaction check above, and apply T late
             // through this entry once its reconcile is done: deleting the entry then would leave that apply
-            // unrepaired (transaction-recovery R-N9). Below the store's forget floor no new Tx for T can appear
+            // unrepaired (repair-process 5.4). Below the store's forget floor no new Tx for T can appear
             logger.debug(s"Deferring UnackedCommits entry of $txid on $storeId: the store may still join it")
             counts.deferred.incrementAndGet()
             Future.unit
@@ -556,8 +556,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
 
   /** Repairs an object of an entry old enough (errorEntryMayBeDeleted) that the allocation tree does not list.
     * Absence alone does not prove a deletion: the allocating transaction's AllocationFinalizationAction may simply be
-    * late (repair F5), and deleting the slice of a live object would leave the store short with no record of it. So
-    * the object is read through its pool:
+    * late (repair-process 9.2), and deleting the slice of a live object would leave the store short with no record of
+    * it. So the object is read through its pool:
     *  - a read that proves it is not live (InvalidObject.provesDeletion) drops it from the store;
     *  - a read that restores it shows it live: it is reconciled as if the tree listed it;
     *  - anything else (a read that times out, a corrupted object, a failure that proves nothing) leaves the entry.
@@ -586,8 +586,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
         case None => Future.successful(false)
 
   /** Repairs an object of an entry that the allocation tree lists. The listing outlives a deletion until its
-    * DeletionFinalizationAction runs, so the repair's read may find the object deleted (repair F15). A read that
-    * proves it (InvalidObject.provesDeletion) is evidence enough whatever the tree says, as in repairAbsent: the
+    * DeletionFinalizationAction runs, so the repair's read may find the object deleted (repair-process 9.2). A read
+    * that proves it (InvalidObject.provesDeletion) is evidence enough whatever the tree says, as in repairAbsent: the
     * object is dropped from the store. A read that fails with InvalidObject short of a proof, or times out
     * (ObjectReadTimeout), leaves the entry for a later pass. True when the entry's work on the object is done.
     */
@@ -612,10 +612,10 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     case dp: DataObjectPointer => reader.read(dp)
 
   /** The store's slot for `ptr`, a live object (just read), holds `occupant` (Backend.RepairSlotOccupied): FSIF slot
-    * reuse over a missed delete of the occupant (cross-document-review X6, rebuild F18). Two live objects never share
-    * a slot, so the occupant is dead; it is dropped once the allocation tree does not list it either, by an
-    * id-checked repairDelete. The repair of `ptr` is left stale, so its entry stays and the next pass installs it.
-    * A listed occupant is an inconsistency nothing here can settle: it is logged and left.
+    * reuse over a missed delete of the occupant (repair-process 6.5, rebuild-process 12 FS6). Two live objects never
+    * share a slot, so the occupant is dead; it is dropped once the allocation tree does not list it either, by an
+    * id-checked repairDelete. The repair of `ptr` is left stale, so its entry stays and the next pass installs it. A
+    * listed occupant is an inconsistency nothing here can settle: it is logged and left.
     */
   private def dropOccupant(storeId: StoreId, ptr: ObjectPointer, occupant: ObjectId): Future[Unit] =
     for
@@ -784,8 +784,8 @@ object StoreRepairer:
   val ObjectReadTimeout: FiniteDuration = 15.seconds
 
   /** Consecutive stale passes after which a repair asks the store to wait for the object to settle before
-    * reconciling it (RepairSnapshot.awaitSettle, repair F8). A stale pass is usually a commit that happened to be in
-    * flight, which the next pass misses, so waiting is kept for an object whose copy stays busy
+    * reconciling it (RepairSnapshot.awaitSettle, repair-process 8.2). A stale pass is usually a commit that happened to
+    * be in flight, which the next pass misses, so waiting is kept for an object whose copy stays busy
     */
   val ParkAfterStalePasses: Int = 3
 
@@ -830,10 +830,10 @@ object StoreRepairer:
     * a live object, leaving the store silently short a slice with no record of it.
     *
     * The read decides, and the gate only paces it: a read just after an allocation commits cannot prove the object
-    * deleted, since a commit voter that has not applied it answers AllocationPending (transaction-requirements Q-N5).
-    * The gate compares this host's HLC with the entry's (the marker transaction's start, another host's), so clock
-    * skew moves it by at most the skew plus MaxStartLead either way, and safety does not rest on it (G8). Repair is
-    * not latency sensitive: waiting costs one more pass.
+    * deleted, since a commit voter that has not applied it answers AllocationPending (transaction-requirements 9.4).
+    * The gate compares this host's HLC with the entry's (the marker transaction's start, another host's), so clock skew
+    * moves it by at most the skew plus MaxStartLead either way, and safety does not rest on it (repair-process 9.2).
+    * Repair is not latency sensitive: waiting costs one more pass.
     *
     * A future dated entry yields a negative age and is therefore ineligible, which is what we
     * want -- clock skew is not evidence that anything was deleted.

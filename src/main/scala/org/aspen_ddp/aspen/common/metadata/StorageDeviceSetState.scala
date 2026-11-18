@@ -215,7 +215,7 @@ final case class StorageDeviceSetState(
               client.getStorageDeviceSetState,
               id => freeSpaceOfOperational(client, id),
               rng).map: chosen =>
-                // Rebuild F12: soft exclusion lets a set with too few devices co-locate the pool's stores
+                // rebuild-process 4.2: soft exclusion lets a set with too few devices co-locate the pool's stores
                 if poolDevices.contains(chosen) then
                   scribe.error(s"REBUILD CO-LOCATED: store $storeId is placed on device " +
                     s"${chosen.uuid}, which already holds another store of its pool, for want of any other device " +

@@ -167,7 +167,7 @@ abstract class BaseReadDriver(
           false
       case Right(_) => false
 
-    // A commit voter that has not applied the object's allocation (transaction-requirements Q-N5). Not an answer: the
+    // A commit voter that has not applied the object's allocation (transaction-requirements 9.4). Not an answer: the
     // allocation applies, or aborts and the store then answers ObjectNotFound. A threshold of such replies must not
     // end the read, or a client told its allocation committed (from the stores' votes, before any applied it) could
     // not read its own new object. The store parks the re-read until the allocation applies (Frontend.parkAllocationRead)

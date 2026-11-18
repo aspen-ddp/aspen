@@ -16,7 +16,7 @@ import scala.concurrent.Future
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 import scala.util.{Failure, Success, Try}
 
-/** Learn-only drivers (paxos F4) end to end, on the TestNetwork's lockstep hosts.
+/** Learn-only drivers (paxos-transactions 7.6) end to end, on the TestNetwork's lockstep hosts.
   *
   * A store outside the transaction's primary pool drives without proposing: its proposer id, a pool index, could
   * equal a primary store's. When it alone heard the client and the designated leader is unreachable, its prepares

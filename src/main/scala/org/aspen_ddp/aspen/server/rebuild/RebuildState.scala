@@ -22,7 +22,7 @@ import scala.util.control.NonFatal
  *  the walk could not read; the checkpoint advances past them so one unreadable object cannot
  *  wedge the walk forever, and they are retried at the end of the pass. `pendingAllocations` are
  *  every allocation the pool's other stores listed as unfinalized at the peer query of any pass so
- *  far (Rebuild F10): a resume sweeps them again, since one finalized meanwhile may have its tree
+ *  far (rebuild-process 5.3): a resume sweeps them again, since one finalized meanwhile may have its tree
  *  entry behind `lastRestoredKey`, where no walk looks. Pointers are hex-encoded `ObjectPointer`s. `episode` is the
  *  Rebuilding episode that wrote it (StoreEntry.rebuildEpisode, absent for None): a rebuild resumes only its own
  *  episode's checkpoint, so one left by an earlier Rebuilding episode of the store is discarded.

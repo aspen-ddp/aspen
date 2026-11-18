@@ -1795,8 +1795,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       os.list(storeDir).toSet should be(filesBefore)
 
   atest("a rebuilt store carrying the rebuild-complete marker is not loaded at startup"):
-    // Rebuild F4: a crash between the rebuild's move into place and its flip. The tree still says Rebuilding, so
-    // the copy must not serve; the rebuild's completion loads it once the flip commits.
+    // rebuild-process 10: a crash between the rebuild's move into place and its flip. The tree still says Rebuilding,
+    // so the copy must not serve; the rebuild's completion loads it once the flip commits.
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))

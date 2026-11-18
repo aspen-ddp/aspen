@@ -37,12 +37,12 @@ object TransactionDriver {
     *
     * @param initialProposal the driver is the designated leader's first for the transaction: the one its client's
     *                        prepare creates, at the proposal id that prepare carries, `(1, L)`. Every other driver starts
-    *                        at round 2 or higher (paxos F5): a restarted or replacement leader reusing `(1, L)` would be
-    *                        a second proposer with the first one's id, and a delayed Accept of the first could flip
-    *                        acceptors that hold the second's value
+    *                        at round 2 or higher (paxos-transactions 7.5): a restarted or replacement leader reusing
+    *                        `(1, L)` would be a second proposer with the first one's id, and a delayed Accept of the
+    *                        first could flip acceptors that hold the second's value
     * @param highestSeen     the highest proposal id this store's own acceptor promised or accepted for the transaction.
     *                        A driver that does not start at the initial proposal starts above it
-    * @param onSplitDecision called with a conflicting second outcome (paxos F11), to log it as an error and count it.
+    * @param onSplitDecision called with a conflicting second outcome (P19), to log it as an error and count it.
     *                        A store passes its host status cache's TransactionStatusCache.recordSplitDecision; the
     *                        default only logs
     */
@@ -135,11 +135,11 @@ abstract class TransactionDriver(
   protected val proposer: Proposer = new Proposer(storeId.poolIndex, ida.width, ida.writeThreshold)
   start.highestSeen.foreach(proposer.updateHighestProposalId)
 
-  /** Only the primary pool's stores propose (paxos F4, transaction-recovery F11). The proposer id is the store's pool
-    * index, so a store of another pool with the same index would be a second proposer with the same ids, and an
-    * acceptor accepts an equal id with any value. A driver on any other store is learn-only: it sends prepares, whose
-    * replies (and the status-cache relays they draw) tell it the outcome, and it resolves, proves late and finalizes
-    * as any driver does, but it never sets a proposal and never sends an Accept. Its prepares do not count as
+  /** Only the primary pool's stores propose (paxos-transactions 7.6, learn-only drivers). The proposer id is the
+    * store's pool index, so a store of another pool with the same index would be a second proposer with the same ids,
+    * and an acceptor accepts an equal id with any value. A driver on any other store is learn-only: it sends prepares,
+    * whose replies (and the status-cache relays they draw) tell it the outcome, and it resolves, proves late and
+    * finalizes as any driver does, but it never sets a proposal and never sends an Accept. Its prepares do not count as
     * activity at the primary stores (Tx.receivePrepare), so one of them still takes the transaction over when idle
     */
   val mayPropose: Boolean = storeId.poolId == txd.primaryObject.poolId
@@ -208,7 +208,8 @@ abstract class TransactionDriver(
 
   /** A store proved the commit (a `TxResolved` with `proof = true`): this driver never proposes abort, adopts only an
     * accepted commit, and resolves late once a prepare quorum of the current round reports no accepted commit
-    * (Ruling 29), but only while T is inside the horizon by this host's clock (`Start.pastHorizon`). See `resolveLate`
+    * (paxos-transactions 10.5), but only while T is inside the horizon by this host's clock (`Start.pastHorizon`). See
+    * `resolveLate`
     */
   private var holdsProof: Boolean = false
 
@@ -222,7 +223,8 @@ abstract class TransactionDriver(
 
   private var shouldSendAcceptMessages: Boolean = false
 
-  /** This round's prepare quorum has queued its Accept: later promises of the round queue no second batch (paxos F12) */
+  /** This round's prepare quorum has queued its Accept: later promises of the round queue no second batch
+    * (paxos-transactions 7.3) */
   private var acceptQueuedThisRound: Boolean = false
   private var clientResolved: Option[TransactionResolved] = None
   private var clientFinalized: Option[TransactionFinalized] = None
@@ -232,7 +234,7 @@ abstract class TransactionDriver(
   def designatedLeader: Boolean = mayPropose && txd.designatedLeaderUID == storeId.poolIndex
 
   /** Reports a conflicting second outcome (Start.onSplitDecision), which logs it as an error. Under the horizon none
-    * should ever arise (paxos F11)
+    * should ever arise (P19)
     */
   private def splitDecision(detail: String): Unit =
     start.onSplitDecision(txd.transactionId, s"driver on store $storeId: $detail")
@@ -407,11 +409,11 @@ abstract class TransactionDriver(
           if (isValidAcceptor(msg.from))
             proposer.receivePromise(paxos.Promise(msg.from.poolIndex, msg.proposalId, promise.lastAccepted))
 
-          // A proof holder (Ruling 29) adopts only an accepted commit of the current, post-proof round: commit was
-          // chosen at some ballot c and every value accepted at c or higher is commit, so an accepted abort predates c.
-          // A quorum reporting no accepted commit is memoryless and resolves late, inside the horizon only (see
-          // resolveLate): past it the proof holder waits for a TxFinalized or an accepted commit, or is stopped with
-          // its store's Tx (Store.removeExpiredDrivers). Neither case uses the vote tally,
+          // A proof holder (paxos-transactions 10.5) adopts only an accepted commit of the current, post-proof round:
+          // commit was chosen at some ballot c and every value accepted at c or higher is commit, so an accepted abort
+          // predates c. A quorum reporting no accepted commit is memoryless and resolves late, inside the horizon only
+          // (see resolveLate): past it the proof holder waits for a TxFinalized or an accepted commit, or is stopped
+          // with its store's Tx (Store.removeExpiredDrivers). Neither case uses the vote tally,
           // which picks only a local proposal (a proof holder needs none, and the prover never votes, so the tally
           // could wait forever); Proposer.commitProven makes the proposal commit or none
           if (holdsProof && !resolved && !start.pastHorizon() && proposer.prepareQuorumWithoutAcceptedCommit)
@@ -420,10 +422,10 @@ abstract class TransactionDriver(
             shouldSendAcceptMessages = mayPropose
           else if (mayPropose && !holdsProof && proposer.prepareQuorumReached && !proposer.haveLocalProposal) {
 
-            // Every object is classified, none skipped (paxos F8). Votes never change, so an object that can no
-            // longer reach its write threshold of commit votes, whatever the silent stores say, makes abort certain
-            // however many answers other objects still lack. An object is undecided while it has fewer than its write
-            // threshold of commit votes and could still reach it
+            // Every object is classified, none skipped (paxos-transactions 7.2). Votes never change, so an object that
+            // can no longer reach its write threshold of commit votes, whatever the silent stores say, makes abort
+            // certain however many answers other objects still lack. An object is undecided while it has fewer than its
+            // write threshold of commit votes and could still reach it
             var abortCertain = false
             var undecided = false
 
@@ -433,8 +435,8 @@ abstract class TransactionDriver(
               val objIDA = txd.poolIDAMap(ptr.poolId)
 
               (0 until objIDA.width).foreach { poolIndex =>
-                // Undetermined is no vote (paxos F7): a Tx resolved before it voted answers so, and counting it as
-                // an abort could let a later round propose abort over write-threshold real commit votes
+                // Undetermined is no vote (paxos-transactions 7.2): a Tx resolved before it voted answers so, and
+                // counting it as an abort could let a later round propose abort over write-threshold real commit votes
                 peerDispositions.get(StoreId(ptr.poolId, poolIndex.toByte)).foreach {
                   case TransactionDisposition.Undetermined => ()
                   case TransactionDisposition.VoteCommit => nCommitVotes += 1
@@ -462,9 +464,9 @@ abstract class TransactionDriver(
               queueAcceptMessages()
             }
           } else if (mayPropose && !holdsProof && proposer.prepareQuorumReached && !acceptQueuedThisRound) {
-            // A later round (paxos F12). The local proposal outlives the round it was set in: votes never change, so
-            // the tally would decide the same again. Proposer.proposalValue still prefers an accepted value the new
-            // quorum reports. Without this the Accept would wait for the next periodic retransmit
+            // A later round (paxos-transactions 7.3). The local proposal outlives the round it was set in: votes never
+            // change, so the tally would decide the same again. Proposer.proposalValue still prefers an accepted value
+            // the new quorum reports. Without this the Accept would wait for the next periodic retransmit
             queueAcceptMessages()
           }
       }
@@ -548,16 +550,17 @@ abstract class TransactionDriver(
       if ((resolved || finalized) && resolvedValue != msg.committed && !(msg.committed && msg.late))
         splitDecision(s"TxFinalized(committed = ${msg.committed}) from ${msg.from} after the outcome $resolvedValue")
       if (resolved && resolvedValue && !msg.committed) {
-        // Committed wins, as in the status cache (Ruling 30): the stores hold the commit and nothing rolls it back, so
+        // Committed wins, as in the status cache (P19): the stores hold the commit and nothing rolls it back, so
         // this driver keeps finalizing it rather than spreading the abort
       } else if (msg.committed && msg.late)
         resolveLate()
       else {
-        // Ruling 7: finalizes at once, inside the status-cache window, never waiting for this driver's own mark. The
-        // cancel comes first: a marker not yet handed off then writes nothing, and one already handed off is not
-        // recalled and lists the stores it may still write (handedOffStores), whatever that write's outcome. So the
-        // TxFinalized this driver sends lists every store that may get an entry from either driver. A stub may then be
-        // written before its entry is durable; the repair scan allows for that (addendum Ruling 8)
+        // Finalizes at once (transaction-recovery 5.4), inside the status-cache window, never waiting for this driver's
+        // own mark. The cancel comes first: a marker not yet handed off then writes nothing, and one already handed off
+        // is not recalled and lists the stores it may still write (handedOffStores), whatever that write's outcome. So
+        // the TxFinalized this driver sends lists every store that may get an entry from either driver. A stub may then
+        // be written before its entry is durable; the repair scan allows for that (transaction-recovery 5.4, applied
+        // stubs)
         finalizer.foreach( _.cancel() )
         val planned = if msg.committed then handedOffStores else Set[StoreId]()
         onFinalized(msg.committed, msg.owed ++ planned)
@@ -689,11 +692,11 @@ abstract class TransactionDriver(
   /** Resolves a late commit: one this driver reaches only after the transaction was finalized and forgotten
     * (docs/superpowers/specs/2026-11-09-replay-pins-design.md, 1b and 1c). Reached on:
     *  - a proof (`TxResolved` with `proof = true`) held together with a prepare quorum of valid acceptors, in a round
-    *    started after the proof arrived, none of whose promises carries an accepted commit (Ruling 29). The proof
-    *    shows the commit was chosen at some ballot c, so a quorum Q accepted it before the proof was sent, and so
-    *    before any post-proof prepare. Every value accepted at c or higher is commit, so a reported accepted abort
-    *    predates c and shows nothing of Q's acceptance. That quorum intersects the responding one, so some acceptor in
-    *    Q forgot the transaction. An acceptor forgets a
+    *    started after the proof arrived, none of whose promises carries an accepted commit (paxos-transactions 10.5).
+    *    The proof shows the commit was chosen at some ballot c, so a quorum Q accepted it before the proof was sent,
+    *    and so before any post-proof prepare. Every value accepted at c or higher is commit, so a reported accepted
+    *    abort predates c and shows nothing of Q's acceptance. That quorum intersects the responding one, so some
+    *    acceptor in Q forgot the transaction. An acceptor forgets a
     *    committed transaction only on TxFinalized, or on a late commit, which follows it (Tx.unackedCommitFound
     *    applies an owed update but keeps the Tx until then, as Tx.unackedCommitNotOwed does for a recovered vote,
     *    applying nothing); a rebuilt one is muted and does not answer. The mute
@@ -746,7 +749,7 @@ abstract class TransactionDriver(
 
   /** Creates and starts the finalizer. Must hold the lock.
     *
-    * Finalization has a failure path (transaction-recovery F1, F2): a finalizer that cannot be created, or whose
+    * Finalization has a failure path (paxos-transactions 7.7): a finalizer that cannot be created, or whose
     * `complete` fails (an action gave up, such as a missed-update marker write failing with a
     * TransactionCreationError), is logged at error and started again from scratch after a backoff
     * (`finalizerRetryDelay`), until one completes, the driver is finalized another way, or it shuts down. The actions
@@ -809,8 +812,8 @@ abstract class TransactionDriver(
     * (Tx.lateCommit). Finding its UnackedCommits entry (Tx.unackedCommitFound) applies the update but does not forget
     * it, nor does finding one of another incarnation (Tx.unackedCommitNotOwed), which applies nothing. So everything the first finalizer to complete writes, in every pool, is durable before any voter forgets the
     * transaction. A second driver finalized by its TxFinalized does not wait for its own cancelled mark: entries that
-    * mark had already handed off may land after its TxFinalized, which lists their stores (Ruling 7); so may those of
-    * this driver's own failed finalizers, whose stores its TxFinalized lists too (`failedHandedOff`). A
+    * mark had already handed off may land after its TxFinalized, which lists their stores (transaction-recovery 5.4);
+    * so may those of this driver's own failed finalizers, whose stores its TxFinalized lists too (`failedHandedOff`). A
     * muted Tx (Frontend.forgetMuted) and a prover (Tx.proveCommitted) are dropped without TxFinalized, but neither
     * voted commit. Tx.unackedCommitFound, Tx.unackedCommitNotOwed (for a recovered or expiring vote) and
     * Tx.proveCommitted record nothing in the host's status cache, so a

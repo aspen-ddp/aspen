@@ -560,7 +560,7 @@ class FsifFaultSuite extends FileBasedTests:
       h.crash()
       h.readData(ptr(1, oid(1))) shouldBe bytes(30, 1).toList
 
-  // ---- Ruling 27: closing a frozen store abandons its held I/O as a crash would ----
+  // ---- Closing a frozen store abandons its held I/O as a crash would ----
 
   /** Awaits `f` without running retry rounds: a close must not need space to return */
   private def awaitNoRetry[A](h: Harness, f: Future[A]): A =

@@ -1086,14 +1086,12 @@ transaction eventually resolves without operator action given a healthy quorum.
 
 ## Open weaknesses
 
-### P-W5. Stale finding-id references in server/transaction/CLAUDE.md and Backlog.txt (CONFIRMED; documentation)
-Mechanism: `server/transaction/CLAUDE.md` cites "paxos F4", "F5", "F7", "F8", "F11", "F12", "F14" and section 10.10.
-Those finding ids no longer exist in this document; 10.10 still holds the horizon argument. `Backlog.txt` (Mid Term, "Why
-there is no per-commit watchdog") says "the driver of an undecided transaction proposes abort past the horizon plus the
-expiry margin (about 22 s), and expiry discards the waiting Txs". That path was removed: an undecided tally never
-proposes abort (P7a), and the waiting Txs end by expiry rules A-G (a frozen undecided Tx is a non-voter).
-Trigger / scenario: a reader following the references.
-Consequence: dangling references and a wrong account of how a hung commit ends.
-Suggested fix: refer to this document by section topic (7.2 tally, 7.5/7.6 drivers, P19 split decisions, P13 adopted
-data), and correct the Backlog sentence.
+### P-W5. Stale account of a hung commit in Backlog.txt (CONFIRMED; documentation)
+Mechanism: `Backlog.txt` (Mid Term, "Why there is no per-commit watchdog") says "the driver of an undecided
+transaction proposes abort past the horizon plus the expiry margin (about 22 s), and expiry discards the waiting Txs".
+That path was removed: an undecided tally never proposes abort (P7a), and the waiting Txs end by expiry rules A-G (a
+frozen undecided Tx is a non-voter).
+Trigger / scenario: a reader following the Backlog entry.
+Consequence: a wrong account of how a hung commit ends.
+Suggested fix: correct the Backlog sentence (Todo 7.5).
 Effort: S   Priority: 7

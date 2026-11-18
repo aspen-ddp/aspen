@@ -448,8 +448,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     tx.lastEventTime should be > firstEvent
   }
 
-  // Paxos F4: a secondary-pool store's driver is learn-only. Its retransmits must not keep a transaction whose
-  // designated leader is offline from looking idle at the primary stores, or none would take it over
+  // paxos-transactions 7.6: a secondary-pool store's driver is learn-only. Its retransmits must not keep a transaction
+  // whose designated leader is offline from looking idle at the primary stores, or none would take it over
   test("prepares and heartbeats from a learn-only driver do not reset a transaction's idle time") {
     val (frontend, _, _) = mkFrontend()
     val txd = mktxd()
@@ -467,7 +467,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     tx.lastEventTime should be > firstEvent
   }
 
-  // Paxos F11
+  // paxos-transactions 10.6, status cache
   test("an outcome opposite to the one a Tx holds is counted as a split decision, and the Tx keeps its own") {
     val backend = new MapBackend(storeId)
     val statusCache = new TransactionStatusCache()
@@ -701,8 +701,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
   }
 
-  // paxos F14: adopted data must be durable in the CRL before the commit that needs it starts its backend write, or a
-  // crash in between recovers the Tx without it (P13)
+  // paxos-transactions 8: adopted data must be durable in the CRL before the commit that needs it starts its backend
+  // write, or a crash in between recovers the Tx without it (P13)
   private def savedWithData(crl: TestCrl): Boolean = crl.savedStates.exists(_.objectUpdates.exists(_.objectId == oid1))
 
   test("a commit held for data applies the late client data only once a save holding that data is durable") {
@@ -1014,7 +1014,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.receiveTransactionMessage(TxResolved(storeId, recoveryDriver, txid1, committed = true, late = false,
       proof = false))
 
-    // An acceptor forgets only on TxFinalized or a late outcome (Ruling 16)
+    // An acceptor forgets only on TxFinalized or a late outcome (cross-document-review 5.2)
     frontend.transactions.contains(txid1) shouldBe true
     crl.txDel shouldBe false
     statusCache.getStatus(txid1).map(_.status).forall(_ == TransactionStatus.Unresolved) shouldBe true
@@ -1045,7 +1045,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, net)
 
-  // paxos-transactions P-N7: the wait for the client's prepare is for live transactions only
+  // paxos-transactions 6.2: the wait for the client's prepare is for live transactions only
   test("a recovered undecided Tx answers a driver's prepare at once, with an abort vote and what it accepted") {
     val accepted = (ProposalId(2, 2), true)
     val (frontend, net) = recoveredUndecided(PersistentState(Some(accepted._1), Some(accepted)))
@@ -1062,7 +1062,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("a recovered Tx whose acceptor accepted a value does not prove, and promises what it accepted") {
-    // Ruling 16: only a memoryless acceptor proves. An accept has no disposition guard, so an undecided Tx may hold one
+    // cross-document-review 5.2: only a memoryless acceptor proves. An accept has no disposition guard, so an undecided
+    // Tx may hold one
     val accepted = (ProposalId(2, 2), true)
     val backend = new MapBackend(storeId)
     val os = new ObjectState(oid1, Metadata(provenRev, ObjectRefcount(1, 1), HLCTimestamp(100)), ObjectType.Data,
@@ -1075,7 +1076,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val crl = new TestCrl:
       override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
     val net = new TestNet
-    // No vote and no client prepare, but recovered: it does not wait for the client's prepare (P-N7)
+    // No vote and no client prepare, but recovered: it does not wait for the client's prepare (paxos-transactions 6.2)
     val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
 
@@ -1507,7 +1508,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   //
   // The start timestamp is the client's. A store takes part only in a transaction started no more than MaxStartLead
   // ahead of its host's wall clock, so a transaction an old incarnation joined started before its rebuilt store's
-  // acceptor-since time, whatever the client's clock (paxos P-N2).
+  // acceptor-since time, whatever the client's clock (cross-document-review 2.2).
 
   private def ahead(d: FiniteDuration): HLCTimestamp = HLCTimestamp((System.currentTimeMillis() + d.toMillis) << 16)
 
@@ -1681,7 +1682,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   // A store that arrived from another host (a transfer in, an adoption) may have joined there, and forgotten, a
   // transaction started up to MaxStartLead ahead of that host's clock, which may lead this one's: the load raises the
-  // floor to the load plus AcceptorSinceMargin, which covers the lead and the skew between hosts (paxos P-N2)
+  // floor to the load plus AcceptorSinceMargin, which covers the lead and the skew between hosts (cross-document-review
+  // 2.2)
   private val margin: Long = RebuildingStore.AcceptorSinceMargin.toMillis
 
   test("a store that arrived from another host refuses transactions started inside AcceptorSinceMargin after its load") {
@@ -1720,7 +1722,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.loadFloorMillis shouldBe loaded + lead
   }
 
-  // The host's join ceiling (JoinCeiling, cross-document review G4): a store's previous life on this host joined no
+  // The host's join ceiling (JoinCeiling, paxos-transactions 10.10): a store's previous life on this host joined no
   // transaction started at or above the ceiling it ran under, so the load floor goes no higher than that ceiling
 
   /** A join ceiling the host's previous process persisted at `persisted`, renewed by `clock` as the host's startup
@@ -1827,7 +1829,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("a prepare below the floor with a resolved, unfinalized status-cache entry is refused") {
     // The host's cache is shared: another store's Tx may have written the entry after this store forgot T. A Tx
-    // created here could apply T again once this store's applied stub had expired (Todo 4.6)
+    // created here could apply T again once this store's applied stub had expired (transaction-recovery 5.4)
     val statusCache = new TransactionStatusCache(wallClockMillis = () => floorNow)
     statusCache.updateStatus(txid1, TransactionStatus.Committed)
     val admission = new CrlAdmission(1024 * 1024)
@@ -2345,7 +2347,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     stops() shouldBe Nil
   }
 
-  // ---- The store validates the description before voting (transaction-requirements F7, Q-N4; DescriptionValidator) ----
+  // ---- The store validates the description before voting (paxos-transactions 6.5; DescriptionValidator) ----
 
   /** lockFixture whose Frontend knows its pool's IDA */
   def validatingFixture(): (Frontend, MapBackend, TestNet) =
@@ -3238,7 +3240,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     kvKeys(backend) should not contain k(2)
     frontend.transactions(unackedTxid).provesCommitToItsDriver shouldBe true
-    // Ruling 9: still live, its CRL and acceptor state kept until TxFinalized. Ruling 12: no status cache entry
+    // Still live, its CRL and acceptor state kept until TxFinalized. No status cache entry
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
     crl.deleted should not contain (unackedTxid)
     statusCache.getStatus(unackedTxid).map(_.status).forall(_ == TransactionStatus.Unresolved) shouldBe true
@@ -3609,7 +3611,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       finalized = true, late = true))
   }
 
-  // ---- Store incarnation (Todo 2.12, Rebuild N3): an entry applies only at the incarnation it names ----
+  // ---- Store incarnation (cross-document-review 2.2): an entry applies only at the incarnation it names ----
 
   private val incarnationA = StoreIncarnation(new UUID(0xA, 1))
   private val incarnationB = StoreIncarnation(new UUID(0xB, 1))
@@ -3636,7 +3638,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lockedWriteTransactions(frontend, net, op1) shouldBe empty
 
   test("a replay at a rebuilt store applies nothing through an entry for the store's earlier incarnation") {
-    // The N3 reproduction: the rebuilt store (incarnation B) inherited the entry its earlier incarnation A was owed.
+    // The reproduction: the rebuilt store (incarnation B) inherited the entry its earlier incarnation A was owed.
     // Its acceptorSince is earlier than T's start, so the replayed client prepare is not muted and votes commit
     val statusCache = new TransactionStatusCache()
     val since = HLCTimestamp((System.currentTimeMillis() - 60000) << 16)
@@ -3827,8 +3829,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("a late commit of an applied Tx whose lookup never answers is forgotten without a stub once past expiry") {
-    // R-N10 (Todo 4.4): the case-3 lookup only decides the stub. Past the horizon the forget floor refuses every new Tx
-    // for T here, so a stub could suppress nothing, and the Tx need not wait for the metadata group
+    // transaction-recovery 7.5: the case-3 lookup only decides the stub. Past the horizon the forget floor refuses
+    // every new Tx for T here, so a stub could suppress nothing, and the Tx need not wait for the metadata group
     withExpiryFrontend: (frontend, backend, net, crl, lookup, clock, statusCache) =>
       val txd = expiringTxd(List(overwrite(op1)))
       frontend.receiveTransactionMessage(clientPrepare(txd))
@@ -3859,7 +3861,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       crl.stubsSaved shouldBe Nil
   }
 
-  // ---- Applied stub expiry (Frontend.expireStubs, Todo 4.6) ----
+  // ---- Applied stub expiry (Frontend.expireStubs; transaction-recovery 5.4) ----
   //
   // Past the horizon plus the expiry margin no prepare for T creates a Tx here, so a stub held for T, with no Tx for T
   // held, can suppress nothing: the store drops it at heartbeat, whether or not a repair scan ever runs
@@ -3976,7 +3978,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("a late TxResolved for an unknown transaction is cached as finalized, committed and late") {
-    // A late outcome implies the transaction was finalized, as the Tx paths record it (Ruling 18)
+    // A late outcome implies the transaction was finalized, as the Tx paths record it
     val statusCache = new TransactionStatusCache()
     val (frontend, _, _, _, _) = lateFixture(statusCache)
     lateCommit(frontend, finalized = false)
@@ -4065,7 +4067,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("applying through a found entry writes a stub") {
-    // A recovered commit vote: kept until TxFinalized (Ruling 9), which writes the stub though it lists no one
+    // A recovered commit vote: kept until TxFinalized, which writes the stub though it lists no one
     val (frontend, backend, _, crl, lookup) = unackedFixture()
     lookup.answer(unackedTxid, lookup.own)
     kvKeys(backend) should not contain k(2)
@@ -4157,7 +4159,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     kvKeys(backend) should contain (k(2))
     // Its TxCommitted reports the object it did not change, so a driver's finalizer marks it for repair
     committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid2))
-    // Still an acceptor: it is forgotten only on TxFinalized, as a recovered vote that found its entry is (Ruling 9)
+    // Still an acceptor: it is forgotten only on TxFinalized, as a recovered vote that found its entry is
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
     frontend.transactions(unackedTxid).provesCommitToItsDriver shouldBe true
     lockedWriteTransactions(frontend, net, kvPtr) should not contain (unackedTxid)
@@ -4360,7 +4362,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     cache.sizeInBytes shouldBe 0
   }
 
-  // ---- Replayed allocations (transaction-requirements F11, cross-document X11) ----
+  // ---- Replayed allocations (transaction-requirements 9.4) ----
 
   /** txid's allocation of the data object `ptr`, as TransactionBuilder makes it */
   def allocateData(txid: TransactionId, ptr: DataObjectPointer): TransactionDescription =
@@ -4380,7 +4382,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     stored.data.getByteArray shouldBe Array[Byte](1)
   }
 
-  // transaction-requirements Q-N5: the finalizer, and the client that learned the commit from the votes, read a new
+  // transaction-requirements 9.4: the finalizer, and the client that learned the commit from the votes, read a new
   // object as soon as its allocation resolves, possibly before the stores apply it. A commit voter's fresh state is
   // known only to its Tx, so the read misses; answering ObjectNotFound there would let a read of a live, committed
   // object prove it deleted. The read is parked until the allocation applies (or aborts), and then answered
@@ -4527,7 +4529,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     stops() shouldBe Nil
   }
 
-  // ---- Recovered transactions whose objects fail to load (transaction-recovery R-F17) ----
+  // ---- Recovered transactions whose objects fail to load (transaction-recovery 7.2) ----
 
   test("a recovered commit vote whose object is not found applies nothing, reports it, and quarantines nothing") {
     // ObjectNotFound for an object the vote does not allocate: before the crash the store applied T and a later
@@ -4731,7 +4733,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.repairs shouldBe 0
   }
 
-  // Repair F8: a repair asked to wait for its object to settle parks while the object is busy
+  // repair-process 7: a repair asked to wait for its object to settle parks while the object is busy
   test("a repair asked to wait for its object to settle installs once the in-flight commit completes") {
     val (frontend, backend, _, net) = commitWindowFixture()
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
@@ -4797,7 +4799,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.repairs shouldBe 0
   }
 
-  // Repair F6: a missed deletion's repair must not race a read, a commit or a transaction on the object
+  // repair-process 7: a missed deletion's repair must not race a read, a commit or a transaction on the object
   def refusedRepairDelete(frontend: Frontend, oid: ObjectId): Boolean =
     val completion = Promise[Unit]()
     frontend.deleteObjectForRepair(oid, ObjectPointer.EmptyArray, completion)
@@ -5056,7 +5058,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       case other => throw new AssertionError(s"Expected txid1's entry, got $other")
   }
 
-  // ---- A deletion is ordered after its allocation's CRL data is durably gone (R-N13, Todo 2.17) ----
+  // ---- A deletion is ordered after its allocation's CRL data is durably gone (crash-recovery-log 3.4) ----
 
   /** Removes an object whose commit sets its refcount to 0, as the RocksDB and FSIF backends do (MapBackend keeps the
     * zero-refcount state, which a recovered allocation's load would find and refuse) */
@@ -5364,7 +5366,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set(),
       startTimestamp = HLCTimestamp.now))
     frontend.transactions.contains(txid2) shouldBe false
-    // Another driver's TxFinalized (Ruling 3), or a retransmit, lists this store: the Tx holding the commit is forgotten
+    // Another driver's TxFinalized, or a retransmit, lists this store: the Tx holding the commit is forgotten
     frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false,
       owed = Set(storeId), startTimestamp = HLCTimestamp.now))
     crl.stubsSaved shouldBe Nil
@@ -5706,7 +5708,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     admission.admittedBytes shouldBe 0
   }
 
-  // Cross-document-review X5: data transactions filling a shared device must not block the marker batches, on the
+  // crash-recovery-log 6: data transactions filling a shared device must not block the marker batches, on the
   // device's metadata-pool stores, that those transactions finalize with
   test("past the data lane a data store drops a new prepare while a metadata store on the device admits one") {
     val admission = new CrlAdmission(800)
@@ -6241,7 +6243,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     statusOf(frontend, net, txd) shouldBe List(Some(false))
   }
 
-  // Cross-document review G1. Replication(3, 2): read threshold 2, width - writeThreshold 1
+  // cross-document-review 2.2. Replication(3, 2): read threshold 2, width - writeThreshold 1
   test("an expiring commit voter whose peers accepted commit decides commit, applies it and has it finalized") {
     var finalizing: List[TransactionId] = Nil
     withExpiryFrontendAdmitting(CrlAdmission.Unlimited, txd => finalizing ::= txd.transactionId):
@@ -6306,7 +6308,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       net.sentTx shouldBe empty
   }
 
-  // Cross-document review G1: the rebuilt store's old incarnation may have accepted in a transaction started before
+  // cross-document-review 2.2: the rebuilt store's old incarnation may have accepted in a transaction started before
   // its acceptor, and lost that state undecided. Counted as a non-holder, it could make the last holders of a chosen
   // commit discard it at expiry (HorizonIntegrationSuite "holders of a chosen commit keep it past expiry ...")
   test("a Tx muted at a rebuilt store answers holdsAcceptorState = true: its old incarnation may have held T") {
@@ -6496,9 +6498,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Unresolved)
   }
 
-  // Paxos F4: a secondary-pool store's driver is learn-only, so when no primary store is reachable its Tx ends by
-  // expiry. Its own pool's answers decide too: with both peers unknown, its object's update is held by one store, below
-  // the pool's read threshold
+  // paxos-transactions 7.6: a secondary-pool store's driver is learn-only, so when no primary store is reachable its Tx
+  // ends by expiry. Its own pool's answers decide too: with both peers unknown, its object's update is held by one
+  // store, below the pool's read threshold
   test("a secondary-pool commit voter whose pool peers answer unknown is discarded once a lookup finds no entry") {
     withExpiryFrontend: (frontend, _, net, crl, lookup, clock, _) =>
       val txd = expiringTxd(List(overwrite(op1), DataUpdate(otherPtr, rev0, DataUpdateOperation.Overwrite)))

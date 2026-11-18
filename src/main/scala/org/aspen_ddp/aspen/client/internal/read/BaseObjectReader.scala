@@ -115,7 +115,7 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
             case Left(CommonReadError.ObjectNotFound) => (t._1 + 1, t._2)
             case Left(CommonReadError.CorruptedObject) => (t._1, t._2 + 1)
             // StoreNotFound says nothing of the object, and AllocationPending is a commit voter that has not applied
-            // the object's allocation yet (transaction-requirements Q-N5): neither is an absence. BaseReadDriver
+            // the object's allocation yet (transaction-requirements 9.4): neither is an absence. BaseReadDriver
             // re-reads both rather than delivering them, so a read never ends on them
             case Left(_) => t
             case Right(_) => t
@@ -135,7 +135,7 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
 
     // Object timestamps are not monotone in commit order: a refcount update, or a KeyValue update without a required
     // revision, advances a store's timestamp but not its revision, so a store that missed the latest revision can
-    // report the highest timestamp (repair-process F12). The revision is therefore chosen by count alone. Every
+    // report the highest timestamp (repair-process 1.2, Q3). The revision is therefore chosen by count alone. Every
     // consistentRestoreThreshold is a majority, so at most one revision can reach it, and the result is the one the
     // read returns had the other stores answered later. Until one does, no revision is chosen.
     val matchingStoreStates = allStoreStates.groupBy(_.revision).valuesIterator

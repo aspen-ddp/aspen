@@ -164,7 +164,7 @@ trait CrashRecoveryLog {
 
   /** Forgets the object data of `txid`'s state, in memory only: nothing is written, so a restart may still recover
     * the data until the state is next saved or deleted. A store that needs the data durably gone saves the state
-    * without it (Tx.persistWithoutUpdateOf; transaction-recovery R-N13) */
+    * without it (Tx.persistWithoutUpdateOf; transaction-recovery 7.4) */
   def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit
 
   /** Runs `handler` once every request of `storeId`'s queued before this call is durable, on the CRL's completion thread. A
@@ -198,7 +198,7 @@ trait CrashRecoveryLog {
     * unservable (`rebuild-required`) or know it is not here. Only the entries held when it is called are dropped:
     * entries saved after the call, by the store loaded again (transferred back), are kept, however long the drop
     * takes. The default reads through readStoreState and then deletes, for CRLs that keep nothing on disk: a same-id
-    * save between the two would be deleted. SimpleCRL drops in one request on its thread (crash-recovery-log F12). */
+    * save between the two would be deleted. SimpleCRL drops in one request on its thread (crash-recovery-log C14). */
   def dropStore(storeId: StoreId): Future[Unit] =
     readStoreState(storeId).flatMap(state => deleteTransactions(storeId, state.entryIds))(
       using scala.concurrent.ExecutionContext.parasitic)
@@ -232,7 +232,7 @@ trait CrashRecoveryLog {
   /** What the CRL held for each store when it was opened, as CrlAdmission counts it (`CrlAdmission.recoveredBytes`).
     * The device's admission is charged for all of it at open, retained for each store until the store loads (and
     * counts its own afresh) or its entries leave the CRL: the records of stores that do not load are copied forward
-    * like any other (crash-recovery-log F8). The default holds none, for CRLs that keep nothing on disk. */
+    * like any other (crash-recovery-log 6, admission). The default holds none, for CRLs that keep nothing on disk. */
   def recoveredBytesByStore: Map[StoreId, Long] = Map()
 
   /** Completes, with the cause, if the CRL fails: its thread or its writer died. Nothing is written from then on, and

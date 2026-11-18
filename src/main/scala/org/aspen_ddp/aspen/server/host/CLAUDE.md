@@ -21,9 +21,10 @@
   inline and otherwise posts `BackendOpened`. A rebuild's staging store opens through the same opener (passed by
   `StoreRebuildFactory.createRebuild`). The host and the rebuild see only `Backend.hasFailed`/`isWriteFrozen`,
   `BackendStateLost` and `Backend.isOutOfSpace`; only `DefaultBackendOpener` names concrete backends
-- Store creation is atomic (`BackendOpener.create`, `server.store.backend.StoreCreation`, safety SL X14):
-  `startOpen` with `create` (only `StoreRebuilds.createNewStore`) builds the store in `<device>/creating/` and
-  renames it to its path before opening it, so a store directory exists only complete and `open` never creates.
+- Store creation is atomic (`BackendOpener.create`, `server.store.backend.StoreCreation`,
+  systemic-loss-protection 4.1, D5): `startOpen` with `create` (only `StoreRebuilds.createNewStore`) builds the
+  store in `<device>/creating/` and renames it to its path before opening it, so a store directory exists only
+  complete and `open` never creates.
   A failed create, out of space included, leaves nothing at the path and is not put in `storesAwaitingSpace`: its
   entry stays Initializing and the next device check creates it again. `DeviceDiscovery` deletes `creating/` when
   it loads a device. Bootstrap (`cmdline`) creates its stores the same way (`DefaultBackendOpener.createStore`)
@@ -32,8 +33,8 @@
   install and after close the backend and directory belong to the control side, which otherwise reads only
   `storeId`, `path`, `crlSaveFile` and the thread-safe `hasFailed`/`isWriteFrozen`. `release` frees the slot.
   Every exit (transfer out, shutdown, relinquish, fail-stop, failed CRL load) runs `Store.close`, which stops the
-  store's drivers (Ruling 31); a reload over a loaded store reusing its backend skips the close but calls
-  `Store.shutdownDrivers` (cross-document G3). A new exit path must do one or the other
+  store's drivers; a reload over a loaded store reusing its backend skips the close but calls
+  `Store.shutdownDrivers` (cross-document-review 2.2). A new exit path must do one or the other
 - Store identity: `StoreLoader` passes `StoreIncarnationFile.loadOrCreate(backend.path, storeId)` to the Store, creating
   the `incarnation` file on first load (`server/store/CLAUDE.md`)
 - Load time and the forget floor (`server/store/CLAUDE.md`): every Store `StoreLoader` builds records its load
@@ -46,7 +47,7 @@
   (`StoreLoader.newStores`: a `startOpen` with `create`, made only by `StoreRebuilds.createNewStore` for a new pool's
   store with no directory yet). It has never served, so it records no load and joins at once. Tests set load times
   through `Host.Seams.storeLoadedAt`
-- Join ceiling (`JoinCeiling`, cross-document G4, Todo 6.4): `Host` keeps a durable upper bound on the start of every
+- Join ceiling (`JoinCeiling`, paxos-transactions 10.10): `Host` keeps a durable upper bound on the start of every
   transaction its stores joined. It is one file, `<host-root>/join-ceiling`, written with `DurableFiles`. The bound is
   renewed once at construction, then every `RenewPeriod` (250 ms) on the host's `ec`, to now + `MaxStartLead` +
   `Step` (1 s), and only ever rises. Stores join only below the persisted value (`mayJoin`), so a same-host reload
@@ -188,9 +189,9 @@
 - A failed rebuild pass or a permanently failed flip never re-checks its own device at once, which would restart the
   same store in a spin: it re-checks the other devices (the slot is host-wide) and schedules a backoff re-check of its
   own (`StoreRebuilds.scheduleRebuildRetry`: `Host.RebuildRetryInitialDelay` 30 s, doubled per failure of the store in
-  a row up to `RebuildRetryMaxDelay` 30 min, reset when a flip settles; Rebuild F5, F11). Tests drive it with
+  a row up to `RebuildRetryMaxDelay` 30 min, reset when a flip settles; rebuild-process 5.7). Tests drive it with
   `ControlFixture.runRebuildRetries`
-- Re-placement (Rebuild F12): `AspenClient.replaceRebuild` (`transfer-store` on a Rebuilding store) moves a
+- Re-placement (rebuild-process 4.2): `AspenClient.replaceRebuild` (`transfer-store` on a Rebuilding store) moves a
   Rebuilding entry to another device and repoints the pool, under a new rebuild episode
   (`server/rebuild/CLAUDE.md`). The reconcile's `StoreRebuilds.abandonUnlisted` cancels a rebuild running for a store
   no longer Rebuilding on its device, or Rebuilding there under another episode (`rebuildEpisodes`; its completion

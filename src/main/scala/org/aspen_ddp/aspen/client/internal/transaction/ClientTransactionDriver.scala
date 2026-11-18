@@ -54,7 +54,7 @@ class ClientTransactionDriver(
 
   def shutdown(): Unit = {}
 
-  /** An outcome opposite to the one already reached is a split decision (paxos F11) and is logged as an error.
+  /** An outcome opposite to the one already reached is a split decision (P19) and is logged as an error.
     * TransactionManager keeps a driver until it is `stopped`, so a leader's abort after a completion from commit votes
     * reaches here and is logged; once stopped by the leader's outcome the driver is forgotten, and a later conflicting
     * outcome is left to the stores and their drivers to detect

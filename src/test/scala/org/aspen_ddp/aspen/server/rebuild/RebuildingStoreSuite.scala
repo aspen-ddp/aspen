@@ -113,7 +113,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // The staging directory and its checkpoint are gone once the store is whole.
       os.exists(dev / RebuildingStore.RebuildDirectory / storeId.directoryName) should be(false)
       os.exists(finalPath / RebuildState.stateFilename) should be(false)
-      // Moved in carrying the marker that keeps it offline until its flip commits (Rebuild F4)
+      // Moved in carrying the marker that keeps it offline until its flip commits (rebuild-process 2.2)
       os.exists(finalPath / RebuildingStore.RebuildCompleteMarkerFile) should be(true)
       // A StoreConfig is written up front, so the moved directory is loadable.
       StoreConfig.loadStoreConfig(finalPath / StoreConfig.configFilename).storeId should
@@ -469,8 +469,8 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
   atest("a final directory no rebuild finished fails the rebuild and is left in place"):
     given ExecutionContext = executionContext
     val dev = deviceDir()
-    // Rebuild F3: a leftover of an earlier tenancy, no rebuild-complete marker. StoreRebuilds retires such a
-    // directory before starting a rebuild; the rebuild itself must not take it for a finished one.
+    // rebuild-process 4.1 (T12): a leftover of an earlier tenancy, no rebuild-complete marker. StoreRebuilds retires
+    // such a directory before starting a rebuild; the rebuild itself must not take it for a finished one.
     val leftover = dev / storeId.directoryName
     os.makeDir.all(leftover)
     os.write.over(leftover / "data", "stale")

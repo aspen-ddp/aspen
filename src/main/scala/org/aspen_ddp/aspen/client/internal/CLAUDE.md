@@ -19,12 +19,13 @@
   `BaseAspenClient`'s read bodies take the timeout; the public `ObjectReader` methods pass `Duration.Inf`
 - A stale pointer or cached state of a deleted object can neither read nor revive it, even through a store that
   missed the deletion (a zombie slice): ids are never reused, every requirement on a missing or refcount-0 object
-  fails `MissingObject`, and zombies are short of both thresholds (safety cross-document G7)
+  fails `MissingObject`, and zombies are short of both thresholds (cross-document-review 2.6)
 - A read chooses the revision `consistentRestoreThreshold` (always a majority) replies hold, whatever its timestamp,
   at object level (`BaseObjectReader.getStoreStates`) and per key (`KeyValueObjectReader.resolve`): timestamps are not
   monotone in commit order (a refcount or revision-less KV update raises a stale store's timestamp; blind key writes
   commit out of timestamp order). The restored timestamp is the max over the matching stores. A key is deleted only
-  when no revision can still reach the threshold and no store holds the lock of any segment's revision (repair F12)
+  when no revision can still reach the threshold and no store holds the lock of any segment's revision (repair-process
+  1.2, Q4)
 - `InvalidObject.provesDeletion` counts only `ObjectNotFound`/`ObjectMismatch` replies (or a consistent majority at
   refcount 0). `StoreNotFound` and `AllocationPending` (a commit voter that has not applied the object's allocation,
   `server/store/CLAUDE.md`) prove nothing. `BaseReadDriver` does not even hand either to the object reader: it

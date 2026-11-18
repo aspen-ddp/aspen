@@ -295,7 +295,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(objects(oid1).exclusiveWaitUntil == now + window)
   }
 
-  // transaction-requirements F13: only a writer that fails on nothing but the shared holders opens the window
+  // transaction-requirements 8.3: only a writer that fails on nothing but the shared holders opens the window
   test("a writer at a stale revision reports the mismatch and opens no exclusive preference window") {
     val objects = sharedLockFixture()
     RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects, Map())
@@ -1375,8 +1375,8 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       lockThenCheckKV(kvObjectWithKey(), other(tx1), relink(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
   }
 
-  // Repair F4 and F11: a blind Delete leaves no trace for a repair snapshot, and a blind object-level change does not
-  // move the revision a repair proof locks. The store refuses them, as TransactionBuilder does
+  // repair-process 1.2 (Q8): a blind Delete leaves no trace for a repair snapshot, and a blind object-level change does
+  // not move the revision a repair proof locks. The store refuses them, as TransactionBuilder does
   test("a key Delete with no KeyRevision on its key, and no required revision or content lock, is refused") {
     KVTx(tx1, Nil, List(Delete(kk1))).check(kvObjectWithKey()) shouldBe Map(oid1 -> BlindWrite())
     // A KeyRevision on another key does not cover it
@@ -1389,7 +1389,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("an object-level operation with no required revision is refused, even under a content lock") {
     KVTx(tx1, Nil, List(SetRight(Array[Byte](1)))).check(kvObjectWithKey()) shouldBe Map(oid1 -> BlindWrite())
     KVTx(tx1, Nil, List(SetMax(kk9))).check(kvObjectWithKey()) shouldBe Map(oid1 -> BlindWrite())
-    // A content lock does not move the revision a repair proof locks (repair F11)
+    // A content lock does not move the revision a repair proof locks
     val locked = KeyValueUpdate(kp1, None, Some(KeyValueUpdate.FullContentLock(List(KeyRevision(kk1, rev1)))), Nil)
     RequirementsChecker.check(tx1, HLCTimestamp.now, List(locked), kvObjectWithKey(),
       Map(oid1 -> kvData(List(SetMax(kk9)))), nanoTime = () => 0L)._1 shouldBe Map(oid1 -> BlindWrite())

@@ -225,8 +225,8 @@ class RepairService(client: AspenClient,
       case t: ScanTimedOut =>
         // The cut-off scan stops at its next entry and prunes nothing, so the store keeps its DeferralState: lock
         // deferral counts carry over to the next scan, which a proof needs when scans keep timing out. A scan cut off
-        // while working through entries found some, and the store stays at the floor: its backlog is what made it
-        // slow. One that had reached none (its pool's trees unreadable) backs off like a failed scan (repair F9)
+        // while working through entries found some, and the store stays at the floor: its backlog is what made it slow.
+        // One that had reached none (its pool's trees unreadable) backs off like a failed scan (repair-process 4.2)
         scanControl.cancel()
         logger.warn(s"Repair scan of $storeId failed: $t")
         scanControl.sawEntries

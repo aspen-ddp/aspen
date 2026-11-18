@@ -39,7 +39,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private var rebuildDevices: Map[StoreId, StorageDeviceId] = Map()
   // The Rebuilding episode each one in rebuildingStores runs for (StoreEntry.rebuildEpisode)
   private var rebuildEpisodes: Map[StoreId, Option[UUID]] = Map()
-  // Rebuilds cancelled because their entry left their device (abandonUnlisted, Rebuild F12)
+  // Rebuilds cancelled because their entry left their device (abandonUnlisted, rebuild-process 4.2)
   private var abandonedRebuilds: Set[StoreId] = Set()
   // Completed when the rebuild of each store in rebuildingStores has released its slot, its
   // outcome acted on. What a shutdown waits on for the rebuilds it cancels.
@@ -54,13 +54,14 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   // (systemic-loss-protection.md S3).
   private var droppingCrlState: Set[StoreId] = Set()
 
-  // Rebuild F5, F11: by store, how many passes or flips have failed in a row, and the stores with a retry scheduled
+  // rebuild-process 5.7, retry backoff: by store, how many passes or flips have failed in a row, and the stores
+  // with a retry scheduled
   private var rebuildFailures: Map[StoreId, Int] = Map()
   private var scheduledRebuildRetries: Set[StoreId] = Set()
 
-  // Rebuild F7: stores this class marked offline in the router for a Rebuilding entry, by device. A store rebuilt on
-  // a device that never held it is not loaded, so without the mark this host would answer UnknownStore/StoreNotFound
-  // for it, and readers would re-send at once, for the whole rebuild.
+  // rebuild-process 6.2: stores this class marked offline in the router for a Rebuilding entry, by device. A store
+  // rebuilt on a device that never held it is not loaded, so without the mark this host would answer
+  // UnknownStore/StoreNotFound for it, and readers would re-send at once, for the whole rebuild.
   private var silenced: Map[StoreId, StorageDeviceId] = Map()
 
   /** The stores marked offline for their Rebuilding entry */
@@ -192,7 +193,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  `AdoptOffline`, `Discard`) additionally re-check this device, to start the next store queued
    *  behind the slot just freed. A failed walk and a permanently failed flip do not, since that
    *  re-check would restart the same store at once: they schedule a backoff re-check instead
-   *  (scheduleRebuildRetry, Rebuild F5, F11).
+   *  (scheduleRebuildRetry, rebuild-process 5.7).
    *
    *  A slot is taken from the start of a lost store's discard (`droppingCrlState`), not only once its walk runs, and
    *  passes straight from the discard to the rebuild: otherwise one pass would discard every marked store on the
@@ -204,7 +205,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  (rebuild-process.md 5.1).
    */
   def startRebuild(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Unit =
-    // Silent from the first reconcile that sees the entry, a store queued for a slot included (Rebuild F7)
+    // Silent from the first reconcile that sees the entry, a store queued for a slot included (rebuild-process 6.2)
     if !silenced.contains(storeId) then
       ctx.router.markOffline(storeId)
       silenced += storeId -> local.storageDeviceId
@@ -351,7 +352,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                              s"loaded, and the device entry still says Rebuilding. Retrying with a backoff", t)
               finally
                 release()
-                // Not this device at once: its reconcile restarts the rebuild, which flips again (Rebuild F11)
+                // Not this device at once: its reconcile restarts the rebuild, which flips again (rebuild-process 5.7)
                 recheckOtherDevices()
                 scheduleRebuildRetry(local.storageDeviceId, storeId)
 
@@ -382,7 +383,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           // resumes rather than restarting. That check is not immediate: this device is excluded
           // from the re-check here, because a rebuild that fails in well under a millisecond --
           // an unreadable checkpoint, a pool that cannot be read -- would spin through tree reads
-          // and WARN lines forever. It comes from scheduleRebuildRetry's backoff (Rebuild F5). The
+          // and WARN lines forever. It comes from scheduleRebuildRetry's backoff (rebuild-process 5.7). The
           // other devices are re-checked because the slot just freed is host-wide and may be
           // what a queued rebuild elsewhere is waiting on.
           try
@@ -392,7 +393,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             recheckOtherDevices()
             scheduleRebuildRetry(local.storageDeviceId, storeId)
 
-  /** Rebuild F12. Retires the rebuild work on `local` for stores whose entry on it is no longer Rebuilding: re-placed
+  /** Retires the rebuild work on `local` for stores whose entry on it is no longer Rebuilding: re-placed
    *  elsewhere by AspenClient.replaceRebuild, or gone for another reason. A rebuild still running for one, or for an
    *  earlier episode of an entry still Rebuilding here (re-placed away and back since it started), is cancelled; its
    *  completion checks the device again, which starts the current episode. A staging directory for one with no rebuild running is
@@ -415,7 +416,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           abandonedRebuilds += storeId
           sr.cancel()
 
-    // A store queued for a slot whose entry left before its rebuild started (Rebuild F7)
+    // A store queued for a slot whose entry left before its rebuild started (rebuild-process 6.2)
     silenced.foreach: (storeId, deviceId) =>
       if deviceId == local.storageDeviceId && !listed(storeId) && !rebuildingStores.contains(storeId) then
         unsilence(storeId, clear = true)
@@ -436,9 +437,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           try os.remove.all(dir)
           catch case t: Throwable => logger.warn(s"Failed to delete $dir. Retrying at a later check. Error: $t")
 
-  /** Forgets the Rebuild F7 offline mark of `storeId`. With `clear`, for a store the tree no longer puts here, the
-   *  router mark is removed too, so the host answers UnknownStore for it again, unless a device's offlineStores
-   *  holds the store: that mark belongs to another path (a shutdown, transfer or lost CRL). */
+  /** Forgets the offline mark (rebuild-process 6.2) of `storeId`. With `clear`, for a store the tree no longer puts
+   *  here, the router mark is removed too, so the host answers UnknownStore for it again, unless a device's
+   *  offlineStores holds the store: that mark belongs to another path (a shutdown, transfer or lost CRL). */
   private def unsilence(storeId: StoreId, clear: Boolean): Unit =
     if silenced.contains(storeId) then
       silenced -= storeId
@@ -446,7 +447,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         ctx.router.clearOffline(storeId)
 
   /** Checks `deviceId` again after a backoff, so a store whose rebuild pass or flip failed is retried without waiting
-   *  for the periodic sweep (an hour) and without spinning (Rebuild F5, F11). The first delay is
+   *  for the periodic sweep (an hour) and without spinning (rebuild-process 5.7). The first delay is
    *  Host.RebuildRetryInitialDelay, doubled for each failure of the store in a row, up to Host.RebuildRetryMaxDelay;
    *  a settled flip resets it. At most one is scheduled per store. The check is an ordinary reconcile: a device
    *  unloaded meanwhile, or an entry that has left Rebuilding, does nothing. */
@@ -504,7 +505,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                      s"offline until a later check of its device. Error: $t")
         false
 
-  /** Rebuild F3. A directory at the path of a store being rebuilt here that carries neither the rebuild-complete
+  /** A directory at the path of a store being rebuilt here that carries neither the rebuild-complete
    *  marker of this `episode` (a finished rebuild awaiting its flip) nor rebuild-required (a lost copy
    *  discardLostStore clears) was not produced by this rebuild: a leftover of an earlier tenancy of the store on this
    *  device (a transferred-away copy whose delete failed and whose marker was lost, or a copy finished for an earlier
@@ -674,7 +675,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
           // the control-context onComplete; the prepare closure's combinators run on the control thread
           // A Rebuilding entry found after an attempt that committed but was reported TransactionOutcomeUnknown is
-          // this request's own, so the rebuild is started now rather than at the next periodic check (Todo 5.10).
+          // this request's own, so the rebuild is started now rather than at the next periodic check.
           // Starting it is idempotent should the entry be another writer's
           val retry = StopRetrying.collisionRetry()
           // One episode for every attempt, so a retry recognizes its own commit by it

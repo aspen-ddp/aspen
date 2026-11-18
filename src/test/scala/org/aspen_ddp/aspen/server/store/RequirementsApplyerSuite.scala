@@ -219,7 +219,7 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     assert(o.data.getByteArray sameElements Array[Byte](1, 2, 3))
   }
 
-  // Blind writes (todo 2.2: Req F1, F2, F4, CRL F13, R-F4, Rebuild N1)
+  // Blind writes (transaction-requirements 2.5, structural rules)
 
   // Wall-clock milliseconds: the low 16 bits of an HLCTimestamp are its logical counter
   private def wall(ms: Long): HLCTimestamp = HLCTimestamp(ms << 16)

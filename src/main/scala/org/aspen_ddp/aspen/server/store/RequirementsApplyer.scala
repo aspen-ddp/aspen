@@ -110,9 +110,9 @@ object RequirementsApplyer extends Logging {
 
     var failedObjects: Set[ObjectId] = Set()
 
-    // Object timestamps are monotone (transaction-requirements F4). A revision-moving update's check already rejects
-    // an object timestamp later than the transaction's (ObjectTimestampError); blind KeyValue and Refcount updates
-    // have no such check, and a late one must not lower the timestamp
+    // Object timestamps are monotone (transaction-requirements 9.3). A revision-moving update's check already rejects
+    // an object timestamp later than the transaction's (ObjectTimestampError); blind KeyValue and Refcount updates have
+    // no such check, and a late one must not lower the timestamp
     def later(current: HLCTimestamp): HLCTimestamp = if current > timestamp then current else timestamp
 
     // Filter out all non-object requirements and any objects not fit for accepting tx changes

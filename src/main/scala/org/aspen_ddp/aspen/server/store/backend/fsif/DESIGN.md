@@ -164,9 +164,9 @@ table:
 | otherwise | journaled |
 
 For `repair`, `allocating` is `slot < 0`. A repair allocates an unmapped X and never overwrites a different
-occupant (Ruling 18). Over a different occupant it fails with `RepairSlotOccupied(objectId, occupant)` instead of a
+occupant. Over a different occupant it fails with `RepairSlotOccupied(objectId, occupant)` instead of a
 plain `ObjectMismatch`, so the repairer can drop the occupant once the AllocationTree no longer lists it
-(cross-document-review X6).
+(cross-document-review 2.4, repair and transactions).
 
 **Journaled** (`journaled`, `appendDelta`).
 - **Update of the current occupant:** append `Delta(X, slot, header, ranges)`. The ranges come from `rangesOf`:
@@ -342,7 +342,7 @@ would succeed without writing them. A data force that fails with ENOSPC therefor
 
 A data force failure that is **not** ENOSPC is fail-stop.
 
-**Closing a frozen store** (`close`, `abandonHeld`, Ruling 27). Held I/O is abandoned exactly as a crash would
+**Closing a frozen store** (`close`, `abandonHeld`). Held I/O is abandoned exactly as a crash would
 abandon it, and the close waits only for I/O already in flight. Abandoned commits never complete. That is safe:
 - held commits were never acknowledged, and Tx keeps them in the CRL;
 - acknowledged Deltas are in the journal and replay at recovery;
@@ -372,7 +372,7 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
 - `rebuildFlush` forces data, appends and forces the buffered Mappings (durable-before-map), then runs a
   checkpoint.
 - Both throw an out-of-space `IOException` when the store is frozen, or becomes frozen before a step completes
-  (`throwIfFrozen`, `freezeWaiters`). They also throw after `rebuildLost` (Ruling 21). `RebuildingStore` latches
+  (`throwIfFrozen`, `freezeWaiters`). They also throw after `rebuildLost` (2.12). `RebuildingStore` latches
   that as `REBUILD OUT OF SPACE`. It never waits for space.
 
 ### 2.13 Host integration
@@ -391,7 +391,7 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
   | out of space | leave offline; `storesAwaitingSpace` retries every device scan with exponential backoff capped at `SpaceRetryCap` (5 min). A failed create left nothing at the path, so it is not retried here: its entry is still Initializing and the next device check creates it again |
   | any other failure | logged; the store is not loaded and not marked |
 
-- **No create on open** (safety SL X14, 2026-11-16; supersedes Ruling 23's `fsif-initialized` marker). A missing
+- **No create on open** (systemic-loss-protection 4.1, row D5; 2.3 creation). A missing
   store directory, or one whose FSIF files are all absent or empty (`FsifRecovery.isBlank`), is `StoreLost` (L0):
   creation is atomic, so such a directory lost its store. Every other directory is recovered.
 - **onFatal** posts `BackendFailed`. The routes are listed in section 4.2.
@@ -489,7 +489,7 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
     Otherwise a crash would pair index s+1 with a journal that lacks that record.
 - **Where:**
   - `advanceCheckpoint` `Draining` requires `oldTail.isCompleted && journal.idle` before `writeNextHeader`.
-  - The new writer exists only after header s+1 is forced (Ruling 19).
+  - The new writer exists only after header s+1 is forced.
   - `Applying` requires `unappliedBySeq` to have no seq below s+1.
   - `Barrier` waits for `lastAppend`.
 - **Tests:** `FsifCheckpointSuite` "Ruling 19: ...", "a journal-s Delta cancelled by a later delete holds the
@@ -682,8 +682,8 @@ correlated loss.
   the device CRL; the rebuild's retire renames it to `lost-crl-state.log` in the retired copy. Entries left in the
   device CRL are saved and dropped by that retire, after the marker is durable.
 - **Transfer out** (`StoreTransfers.startOut`):
-  - a store already marked whose entry is TransferringOut is returned to rebuild (Ruling 25,
-    `StoreTransfers.returnLostTransferToRebuild`);
+  - a store already marked whose entry is TransferringOut is returned to rebuild
+    (`StoreTransfers.returnLostTransferToRebuild`);
   - a close that fails with `StoreFailedOnClose` is never shipped, and its transfer is aborted;
   - a store marked while it closed is likewise never shipped.
 

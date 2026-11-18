@@ -526,7 +526,8 @@ class MainSuite extends AnyFunSuite with Matchers:
         val storeId = StoreId(PoolId.InitialMetadataPoolId, i.toByte)
         val cfg = StoreConfig.loadStoreConfig(devDir / storeId.toString / StoreConfig.configFilename)
         cfg.storeId shouldBe storeId
-        // Its admission lane reserves room for its marker batches above data traffic (CrlAdmission, X5)
+        // Its admission lane reserves room for its marker batches above data traffic (CrlAdmission, crash-recovery-log
+        // 6)
         cfg.admissionTier shouldBe AdmissionTier.Metadata
         val bootstrapId = StoreId(PoolId.BootstrapPoolId, i.toByte)
         StoreConfig.loadStoreConfig(devDir / bootstrapId.toString / StoreConfig.configFilename)

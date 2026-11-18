@@ -7,7 +7,7 @@ import scala.util.control.NonFatal
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
 import scribe.Logging
 
-/** Creates store directories atomically, for every backend (safety SL X14).
+/** Creates store directories atomically, for every backend (systemic-loss-protection 4.1, row D5).
  *
  *  A store directory reaches its final path only complete: the backend's files, initialized and closed, and its
  *  `StoreConfig`, all durable. It is built in a scratch directory under the device's `creating/` and renamed into

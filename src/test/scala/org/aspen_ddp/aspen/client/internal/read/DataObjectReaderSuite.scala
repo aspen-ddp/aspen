@@ -136,8 +136,9 @@ class DataObjectReaderSuite extends AnyFunSuite with Matchers {
   }
 
   test("InvalidObject proves a deletion only when more than width - writeThreshold stores say they lack the object") {
-    // Repair F5: StoreRepairer acts on an object absent from the allocation tree only with this proof. A committed
-    // live object is on at least writeThreshold stores, so more absence replies than the rest cannot come from one
+    // repair-process 8.3: StoreRepairer acts on an object absent from the allocation tree only with this proof. A
+    // committed live object is on at least writeThreshold stores, so more absence replies than the rest cannot come
+    // from one
     def invalid(r: TestReader): InvalidObject = r.result match
       case Some(Left(e: InvalidObject)) => e
       case other => fail(s"expected InvalidObject, got $other")
@@ -168,7 +169,7 @@ class DataObjectReaderSuite extends AnyFunSuite with Matchers {
     wide.receiveReadResponse(err(2, ReadError.StoreNotFound))
     invalid(wide).provesDeletion should be (true)
 
-    // transaction-requirements Q-N5: a commit voter that has not applied the allocation yet answers AllocationPending,
+    // transaction-requirements 9.4: a commit voter that has not applied the allocation yet answers AllocationPending,
     // which is no absence. Read straight after the allocation commits, the object is not proven deleted
     val pending = TestReader(3, 2)
     pending.receiveReadResponse(err(0, ReadError.AllocationPending))

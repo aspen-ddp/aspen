@@ -10,5 +10,5 @@
   `SharedRevisionLock` on the object as read, so a replay or a run after its deletion fails its lock and leaves no
   orphan. It skips the entry only when the read proves the deletion (`InvalidObject.provesDeletion`). Any other read
   failure is retried. Read straight after resolution, the object's commit voters answer `AllocationPending` until they
-  apply it (transaction-requirements Q-N5); the read waits for that (`client/internal/CLAUDE.md`). Residual: an
+  apply it (transaction-requirements 9.4); the read waits for that (`client/internal/CLAUDE.md`). Residual: an
   object already below writeThreshold live copies reads as deleted and gets no entry

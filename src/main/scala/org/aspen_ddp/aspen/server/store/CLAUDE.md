@@ -4,7 +4,7 @@
   stubs, status cache): `server/transaction/CLAUDE.md`. Read both when changing `Frontend` or `Tx`
 - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
   non-object requirements)
-- The description itself is checked before the vote (`DescriptionValidator`, transaction-requirements F7, Q-N4). The
+- The description itself is checked before the vote (`DescriptionValidator`, transaction-requirements 2.5). The
   store's own pool entry in `poolIDAMap` must be its pool's IDA (`StoreConfig.ida`, written at store creation, passed
   as `Frontend.poolIDA`; `None` skips the check, tests only), so each pool's stores guard their own thresholds. The
   primary object must be referenced, with its pool's IDA, the most failure-tolerant pool, and a leader among its
@@ -28,30 +28,30 @@
   a writer that collides with held shared locks makes new shared lockers collide meanwhile, so it gets in on its
   retry. `RequirementsChecker.check` opens it only for a transaction blocked by nothing but shared holders at this
   store; the shared collision is raised after the requirement's own checks, so another failure (a stale revision)
-  is what gets reported, and such a writer opens no window (transaction-requirements F13)
+  is what gets reported, and such a writer opens no window (transaction-requirements 4)
 - A KeyValue update's operations lock what they write, as requirements do (`KVWrites`): each key an
   Insert or Delete names (an absent key through `absentKeyLocks`, shared with `DoesNotExist`/`MayExist`), and the
   whole object for a min/max/left/right change. Concurrent blind writes of one key collide
-- Apply is order-independent for what the builder lets through (transaction-requirements F1, F2, F4): every key
-  Insert is last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`; `encodedSizeAfter`
-  uses the same rule). A superseded Insert is a no-op, not a skip: no report and no fail-stop. The object timestamp
-  is the max of its value and the transaction's. No tombstones, so `TransactionBuilder` refuses blind key deletes
-  and blind object-level ops (`BlindKeyValueWrite`), and stores refuse them too (`RequirementsChecker.refuseBlindWrites`,
-  `BlindWrite`, at vote and apply re-check): unless the transaction allocates the object, a key Delete needs a
-  `KeyRevision` on its key, a required revision or a content lock, and a min/max/left/right change a required revision
-  (a content lock does not move the revision a repair proof locks; repair F4, F11). A re-apply (a recovered commit
-  vote, or one applying through its UnackedCommits entry) never writes back a key deleted since: see Quarantine
-- Allocations (transaction-requirements F11): an object in `txd.allocatingObjects` is loaded like any other (cache,
+- Apply is order-independent for what the builder lets through (transaction-requirements 9.3): every key Insert is
+  last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`; `encodedSizeAfter` uses the same
+  rule). A superseded Insert is a no-op, not a skip: no report and no fail-stop. The object timestamp is the max of its
+  value and the transaction's. No tombstones, so `TransactionBuilder` refuses blind key deletes and blind object-level
+  ops (`BlindKeyValueWrite`), and stores refuse them too (`RequirementsChecker.refuseBlindWrites`, `BlindWrite`, at vote
+  and apply re-check): unless the transaction allocates the object, a key Delete needs a `KeyRevision` on its key, a
+  required revision or a content lock, and a min/max/left/right change a required revision (a content lock does not move
+  the revision a repair proof locks; repair-process 1.2, Q8). A re-apply (a recovered commit vote, or one applying
+  through its UnackedCommits entry) never writes back a key deleted since: see Quarantine
+- Allocations (transaction-requirements 9.4): an object in `txd.allocatingObjects` is loaded like any other (cache,
   `deleting`, backend read). Only a backend miss gives the fresh `Allocating` state (`Tx.allocationLoaded`). An
   existing state goes into `Tx.allocatedOver`, and every requirement on it fails with `ObjectExists`, at vote and at
   the apply re-check, so a replayed allocation never overwrites a live object. `appliedBy` counts such an object at
   T's own revision as applied. Residual: no tombstones, so an id whose deletion has persisted can be allocated again
-  (an orphan slice, Todo 2.9)
+  (an orphan slice)
 - A fresh `Allocating` state is known only to its Tx (`retain(shared = false)`), so a client read misses it. On a
   backend miss for a client read, a store that holds a Tx with a commit vote on the object's allocation, not yet
   applied (`Tx.allocationUnapplied`: no `doCommit` yet, not known aborted), answers `AllocationPending`, not
   `ObjectNotFound` (`Frontend.allocationPending`; it scans the held transactions, misses only). A read straight after
-  the allocation commits therefore cannot prove the object deleted (transaction-requirements Q-N5). The read is
+  the allocation commits therefore cannot prove the object deleted (transaction-requirements 9.4). The read is
   parked rather than answered (`parkAllocationRead`, Parked reads below), and the client re-reads a store that answers
   `AllocationPending` anyway. Once `doCommit` starts, the in-flight state is served, and a client read's backend
   miss that completes after that (its load was in flight when the commit applied) serves that state rather than
@@ -81,34 +81,36 @@
   whose client-chosen start timestamp leads the host's wall clock (`wallClockMillis`, not the JVM-wide HLC, which the
   host's own client ratchets) by more; the designated leader does not drive it (`Store`). The client's retransmission
   is answered once the clock catches up. This is what makes the `acceptorSince` mute independent of client clocks
-  (paxos P-N2), and it caps how far stored timestamps, and so client HLCs, run ahead of the hosts
-- Current allocations (`CurrentAllocationsRequest`, Rebuild F10; `StoreRouter` routes it to the store's executor):
-  `Frontend.currentAllocations` lists, for every held Tx neither finalized nor known aborted, the objects it allocates
-  in this store's pool, and whether it is known committed. Silent while the CRL loads (`awaitingCrl`): it may hold
-  transactions it does not know yet. A committed Tx is held until TxFinalized, after its AllocationFinalizationAction,
-  so every allocation whose AllocationTree entry may still be missing is listed by each store holding it. The reply
-  also carries `Frontend.heldVotes`: each held Tx with outcome unknown, not muted, whose vote is commit or undecided,
-  with its objects in this pool (a rebuilt store's inherited votes)
-- Status query (`TxStatusRequest`, carrying the transaction's `startTimestamp`; horizon design section 2): every
-  store with a final state answers. A store with a Tx replies with `Tx.statusForExpiry`: status, finalized, late,
+  (paxos-transactions 10.10), and it caps how far stored timestamps, and so client HLCs, run ahead of the hosts
+- Current allocations (`CurrentAllocationsRequest`, rebuild-process 5.3; `StoreRouter` routes it to the store's
+  executor): `Frontend.currentAllocations` lists, for every held Tx neither finalized nor known aborted, the objects it
+  allocates in this store's pool, and whether it is known committed. Silent while the CRL loads (`awaitingCrl`): it may
+  hold transactions it does not know yet. A committed Tx is held until TxFinalized, after its
+  AllocationFinalizationAction, so every allocation whose AllocationTree entry may still be missing is listed by each
+  store holding it. The reply also carries `Frontend.heldVotes`: each held Tx with outcome unknown, not muted, whose
+  vote is commit or undecided, with its objects in this pool (a rebuilt store's inherited votes)
+- Status query (`TxStatusRequest`, carrying the transaction's `startTimestamp`; horizon design section 2): every store
+  with a final state answers. A store with a Tx replies with `Tx.statusForExpiry`: status, finalized, late,
   `holdsAcceptorState` (false only for a Tx muted for good below the floor), its latest `accepted` value and
   `votedCommit` (only once the vote's CRL save is durable; a commit voter whose save is in flight is silent). An
-  unresolved Tx answers only once frozen (past expiry by its own clock: it promises and accepts
-  nothing more, `Tx.frozen`) and its objects are loaded, or muted for good, so the state it reports is final: a frozen
-  Tx decides no vote and sends none (`Tx.determineDisposition`, `Tx.sendDelayedPrepare`), so one still undecided then
-  (waiting on an in-flight commit, a collision or its client's prepare) is a final non-voter; before that, and for a Tx muted only for starting too far ahead (it may yet join), it is silent. A Tx created from a cached outcome (`Tx.outcomeDecided`) answers at once with the outcome as the cache now holds it, and keeps it in its own expiry round's reply, so it is adopted. With no
-  Tx but a non-Unresolved status-cache entry it
-  replies with that entry. With neither it replies `status = None` ("unknown") only when the start is below its forget
-  floor (`belowForgetFloor(HLCTimestamp)`), which makes the answer permanent; above the floor it stays silent, as it
-  could still join the transaction. A rebuilt store, for T started before its `acceptorSince`
-  (`mayHaveForgottenUndecided`), replies `amnesiac` (with a cached outcome if any), never "unknown": its old
-  incarnation may have accepted T (cross-document G1). How the replies decide: `server/transaction/CLAUDE.md`, Expiry
+  unresolved Tx answers only once frozen (past expiry by its own clock: it promises and accepts nothing more,
+  `Tx.frozen`) and its objects are loaded, or muted for good, so the state it reports is final: a frozen Tx decides no
+  vote and sends none (`Tx.determineDisposition`, `Tx.sendDelayedPrepare`), so one still undecided then (waiting on an
+  in-flight commit, a collision or its client's prepare) is a final non-voter; before that, and for a Tx muted only for
+  starting too far ahead (it may yet join), it is silent. A Tx created from a cached outcome (`Tx.outcomeDecided`)
+  answers at once with the outcome as the cache now holds it, and keeps it in its own expiry round's reply, so it is
+  adopted. With no Tx but a non-Unresolved status-cache entry it replies with that entry. With neither it replies
+  `status = None` ("unknown") only when the start is below its forget floor (`belowForgetFloor(HLCTimestamp)`), which
+  makes the answer permanent; above the floor it stays silent, as it could still join the transaction. A rebuilt store,
+  for T started before its `acceptorSince` (`mayHaveForgottenUndecided`), replies `amnesiac` (with a cached outcome if
+  any), never "unknown": its old incarnation may have accepted T (cross-document-review 2.2). How the replies decide:
+  `server/transaction/CLAUDE.md`, Expiry
 - Forget floor (`Frontend.forgetFloorMillis`, transaction horizon design section 1): a prepare for a transaction the
   store does not hold (no Tx; a finalized status-cache entry has it ignored instead) whose start is below the floor is
-  refused, a resolved but unfinalized cache entry included (Todo 4.6: the host's cache is shared, so another store's Tx
-  may have written it after this store forgot T, whose applied stub may have expired): no Tx, no promise, vote, reply or
-  CRL save, its admission released, a warning with the lag for a client's prepare (at most once per `RefusalLogPeriod`,
-  10 s, with the count held back). The floor is the latest of `wallClockMillis() - horizon`
+  refused, a resolved but unfinalized cache entry included (paxos-transactions 10.2: the host's cache is shared, so
+  another store's Tx may have written it after this store forgot T, whose applied stub may have expired): no Tx, no
+  promise, vote, reply or CRL save, its admission released, a warning with the lag for a client's prepare (at most once
+  per `RefusalLogPeriod`, 10 s, with the count held back). The floor is the latest of `wallClockMillis() - horizon`
   (`TransactionHorizon.Horizon`, 20 s, threaded Host → DeviceControl → StoreLoader → Store → Frontend), the store's load
   on this host plus `MaxStartLead` (`loadedAtMillis`, taken when the Frontend is built: every restart, adoption and
   transfer-in builds a new Store through `StoreLoader`; the lead because before its load the store may have joined, and
@@ -116,19 +118,19 @@
   `StoreRebuilds.createNewStore`, has never served and records no load; a load less than
   `RebuildingStore.AcceptorSinceMargin` after the store's arrival from another host, recorded durably in
   `StoreLoader.ArrivedAtFile` by a transfer in or an adoption and passed as `arrivedAt`, adds that 10 s margin instead,
-  since it joined there by a clock that may lead this host's by up to the P-N2 skew; otherwise the load part is
-  lowered to the host's join ceiling the store's previous life ran under, if lower, but never below a past arrival
-  plus the margin: `Frontend.joinCeiling`, `server/host/CLAUDE.md`), and the status cache's
+  since it joined there by a clock that may lead this host's by up to the inter-host skew (paxos-transactions 10.10);
+  otherwise the load part is lowered to the host's join ceiling the store's previous life ran under, if lower, but never
+  below a past arrival plus the margin: `Frontend.joinCeiling`, `server/host/CLAUDE.md`), and the status cache's
   `evictionWatermarkMillis` (which adds the lead too). A Tx the store holds (recovered ones included) is unaffected; a
   prepare whose outcome the cache knows creates a Tx that learns it only above the floor (resolved), and is ignored when
   finalized (the relay). An `acceptorSince` mute is checked first and keeps its muted, possibly proving Tx. The
   designated leader starts no driver for a prepare below the floor it does not hold (`Store`), but does start one when
-  the cache holds an outcome not yet finalized: the fast takeover of a dead remote driver (R-F16, by design). A store therefore never
-  rejoins a transaction it may have forgotten; for up to the horizon after a load it looks offline to transactions
-  started before the load plus `MaxStartLead`. Accepted cost: on a single host, or after most of a pool's stores
-  restart, such transactions end `TransactionOutcomeUnknown` at about 22 s and are retried. With the join ceiling,
-  after a restart longer than about 3 s, that covers only what started before the host went down plus about 3 s.
-  Stores written by bootstrap are not exempt from the load floor (and a first load on a host has no ceiling)
+  the cache holds an outcome not yet finalized: the fast takeover of a dead remote driver (paxos-transactions 10.2, by
+  design). A store therefore never rejoins a transaction it may have forgotten; for up to the horizon after a load it
+  looks offline to transactions started before the load plus `MaxStartLead`. Accepted cost: on a single host, or after
+  most of a pool's stores restart, such transactions end `TransactionOutcomeUnknown` at about 22 s and are retried. With
+  the join ceiling, after a restart longer than about 3 s, that covers only what started before the host went down plus
+  about 3 s. Stores written by bootstrap are not exempt from the load floor (and a first load on a host has no ceiling)
 - Join ceiling gate (`Frontend.startsTooFarAhead`, `JoinCeiling.mayJoin`): an unknown transaction started at or above
   the host's persisted join ceiling is muted as one started too far ahead (warned as a renewal fallen behind), and its
   designated leader does not drive it. It joins once a renewal passes its start
@@ -162,54 +164,52 @@
   store is rebuilt as a failed backend is. Never for a full device: a write-frozen store poisons the object instead
   (`poisonObject`, the `BackendCommitFailed` rule) and keeps serving. Every fail-stop is a lost-store declaration
   (Backlog: correlated declarations)
-- Deletion after allocation (transaction-recovery R-N13, Todo 2.17): a recovered allocating commit vote treats a
-  backend miss as "not yet applied" and creates the object from its CRL data, so a deletion must never reach the
-  backend while an allocation's CRL state still durably holds the object's update. `allocationRecords`/
-  `allocationsOf` index the Txs that allocate objects here (registered at both Tx creations) until their CRL state's
-  deletion or stub is durable (`allocationConcluded`, at `concludeTransactionState`, `deleteTransactionState`,
-  `recordAppliedStub`, `forgetMuted`, then a `whenDurable`). `awaitAllocationsDurable` holds a deletion's
-  `backend.commit` (`commit` with refcount 0) and `backend.repairDelete` until each covering allocation's state is
-  saved without the object's update (`Tx.persistWithoutUpdateOf`, which also covers a forgotten Tx whose state the
-  CRL keeps for a failed commit) or, once concluded, its deletion is durable. The deletion's bookkeeping is
-  synchronous, so it is served as in flight meanwhile; a store stopped or closed first never issues it and keeps the
-  deleting transaction's CRL state. Inline for every object no unconcluded allocation covers. MapBackend keeps a
-  refcount-0 state rather than removing it, unlike RocksDB and FSIF, so its tests see no miss: the R-N13 tests use a
-  removing MapBackend
-- Quarantine (`Frontend.quarantine`, transaction-requirements.md 8.5): a commit vote whose apply re-check fails may
-  have been overtaken by a later commit applied over its locks, invalidated under them, or, if recovered, superseded
-  before the crash (10.5a), and the store does not tell these apart. Each changed object it could not apply is quarantined, except one the backend missed and the
-  Tx allocates (`allocatedHere`: no copy, no lost lock; one whose data was dropped was applied and then deleted, which
-  no read verifies), which is reported (R-F17). Before the apply, a re-apply (recovered, or through an UnackedCommits
-  entry: `Tx.appliesThroughEntry`) also leaves out and quarantines every object on which it would insert a key now
-  absent while the object's timestamp is past T's start (`RequirementsApplyer.mayReinsertDeletedKeys`): T may have
-  inserted it and a later transaction deleted it, and the re-check would pass again (transaction-requirements.md
-  10.5c). The object is never counted as skipped, so it is quarantined once. Every
-  transaction on a quarantined object votes abort
-  (`ObjectQuarantined`), and committed ones apply nothing to it and report it. Repair is not held off, unlike
-  `commitFailed`. The store asks its host to verify the object (`QuarantineVerifier`, Host →
-  `RepairService.verifyObject`, bounded by `VerifyDeadline`, 30 s). It clears once `StoreRepairer.verifyObject` reports the copy complete against a
-  read at least the transaction's start. Otherwise it retries at heartbeat, 1 doubling to
-  `MaxQuarantineRetryInterval` (60) heartbeats. In memory only: the quarantining transaction's CRL state, object data
-  included, is kept until it clears (`concludeTransactionState` defers a finalization or stub to
-  `verificationComplete`), so a reloaded store quarantines again. Nothing is written for it
+- Deletion after allocation (crash-recovery-log 3.4): a recovered allocating commit vote treats a backend miss as "not
+  yet applied" and creates the object from its CRL data, so a deletion must never reach the backend while an
+  allocation's CRL state still durably holds the object's update. `allocationRecords`/ `allocationsOf` index the Txs
+  that allocate objects here (registered at both Tx creations) until their CRL state's deletion or stub is durable
+  (`allocationConcluded`, at `concludeTransactionState`, `deleteTransactionState`, `recordAppliedStub`, `forgetMuted`,
+  then a `whenDurable`). `awaitAllocationsDurable` holds a deletion's `backend.commit` (`commit` with refcount 0) and
+  `backend.repairDelete` until each covering allocation's state is saved without the object's update
+  (`Tx.persistWithoutUpdateOf`, which also covers a forgotten Tx whose state the CRL keeps for a failed commit) or, once
+  concluded, its deletion is durable. The deletion's bookkeeping is synchronous, so it is served as in flight meanwhile;
+  a store stopped or closed first never issues it and keeps the deleting transaction's CRL state. Inline for every
+  object no unconcluded allocation covers. MapBackend keeps a refcount-0 state rather than removing it, unlike RocksDB
+  and FSIF, so its tests see no miss: the deletion-after-allocation tests use a removing MapBackend
+- Quarantine (`Frontend.quarantine`, transaction-requirements.md 8.5): a commit vote whose apply re-check fails may have
+  been overtaken by a later commit applied over its locks, invalidated under them, or, if recovered, superseded before
+  the crash (10.5a), and the store does not tell these apart. Each changed object it could not apply is quarantined,
+  except one the backend missed and the Tx allocates (`allocatedHere`: no copy, no lost lock; one whose data was dropped
+  was applied and then deleted, which no read verifies), which is reported (transaction-requirements 8.5). Before the
+  apply, a re-apply (recovered, or through an UnackedCommits entry: `Tx.appliesThroughEntry`) also leaves out and
+  quarantines every object on which it would insert a key now absent while the object's timestamp is past T's start
+  (`RequirementsApplyer.mayReinsertDeletedKeys`): T may have inserted it and a later transaction deleted it, and the
+  re-check would pass again (transaction-requirements.md 10.5c). The object is never counted as skipped, so it is
+  quarantined once. Every transaction on a quarantined object votes abort (`ObjectQuarantined`), and committed ones
+  apply nothing to it and report it. Repair is not held off, unlike `commitFailed`. The store asks its host to verify
+  the object (`QuarantineVerifier`, Host → `RepairService.verifyObject`, bounded by `VerifyDeadline`, 30 s). It clears
+  once `StoreRepairer.verifyObject` reports the copy complete against a read at least the transaction's start. Otherwise
+  it retries at heartbeat, 1 doubling to `MaxQuarantineRetryInterval` (60) heartbeats. In memory only: the quarantining
+  transaction's CRL state, object data included, is kept until it clears (`concludeTransactionState` defers a
+  finalization or stub to `verificationComplete`), so a reloaded store quarantines again. Nothing is written for it
 - Ranged-write/append deltas are read through `EncodedAppendDelta`, which parses only the header and region table
   and XORs straight from the encoded buffer, so checking and applying never copy the delta
 
 #### Backpressure (`CrlAdmission`, one per device, shared by its stores)
-- A store admits a prepare for a transaction it has not seen (not admitted or recovered by its Frontend, nor
-  finalized in the host-wide status cache) for its description, object data and CRL record, and drops it silently
-  while the device's admitted bytes are at or past its lane's ceiling (`Frontend.admissionTier`, from
-  `StoreConfig.admissionTier`): 3/4 of the limit (`SimpleCRL.admissionLimitBytes`) for data pools,
-  7/8 for metadata pools, the whole limit for the bootstrap pool. Marker batches are always a tier above what they
-  finalize, so lower-tier load never blocks them (safety X5, G10). Object data arriving later for an admitted
-  transaction is charged once per object, only below the lane's ceiling (`tryAdmit`); past it the prepare is dropped
-  as `Full` and the client retransmits (crash-recovery-log 6.1, A1). Everything else (data-less prepares of known
-  transactions, accepts, resolutions, finalizations, heartbeats, status requests) is handled. Bytes are released
-  when the entry is deleted or a Tx is forgotten without one; a Tx waiting on an in-flight commit keeps its
+- A store admits a prepare for a transaction it has not seen (not admitted or recovered by its Frontend, nor finalized
+  in the host-wide status cache) for its description, object data and CRL record, and drops it silently while the
+  device's admitted bytes are at or past its lane's ceiling (`Frontend.admissionTier`, from
+  `StoreConfig.admissionTier`): 3/4 of the limit (`SimpleCRL.admissionLimitBytes`) for data pools, 7/8 for metadata
+  pools, the whole limit for the bootstrap pool. Marker batches are always a tier above what they finalize, so
+  lower-tier load never blocks them (crash-recovery-log 6.1; cross-document-review 3, capacity). Object data arriving
+  later for an admitted transaction is charged once per object, only below the lane's ceiling (`tryAdmit`); past it the
+  prepare is dropped as `Full` and the client retransmits (crash-recovery-log 6.1, A1). Everything else (data-less
+  prepares of known transactions, accepts, resolutions, finalizations, heartbeats, status requests) is handled. Bytes
+  are released when the entry is deleted or a Tx is forgotten without one; a Tx waiting on an in-flight commit keeps its
   admission. A closing or replaced store moves its bytes into what the device retains for it
-  (`Frontend.retainAdmissions`). Recovered transactions are counted without a check (`admitRecovered`, data
-  included), and only then is what was retained for the store released (`recoverState`, A2: a swap, never a gap).
-  Accepted gap: a retransmit past the mark while a store awaits its crl_save.log is dropped
+  (`Frontend.retainAdmissions`). Recovered transactions are counted without a check (`admitRecovered`, data included),
+  and only then is what was retained for the store released (`recoverState`, A2: a swap, never a gap). Accepted gap: a
+  retransmit past the mark while a store awaits its crl_save.log is dropped
 - No save without a charge (A4): an abort whose CRL state was deleted at resolution (`Tx.stateDeleted`) stays in
   `transactions` until `TxFinalized` with no admission; it saves nothing more, answering a prepare or accept with a
   `TxResolved` of the abort, and adopts no late data. `Tx.saveState` requires it
@@ -234,29 +234,30 @@
 #### Backends (`backend/`)
 - A backend's commit completion must mean durable: the CRL deletes a committed transaction's record once the backend
   commit completes. RocksDB writes synced, FSIF completes at the journal force. `MapBackend` is memory only and gives
-  no durability (crash-recovery-log F17); it is for tests, and no opener constructs it
+  no durability (crash-recovery-log 3.4); it is for tests, and no opener constructs it
 - Pluggable: RocksDB, in-memory Map, and FSIF (`backend/fsif`, a flat file of fixed-size segments located by a
   4-byte storePointer, with a journal and checkpointed index; design in `backend/fsif/DESIGN.md`). FSIF freezes
   writes on ENOSPC and keeps serving reads. A repair write never overwrites a different occupant of its slot: it
   fails with `backend.RepairSlotOccupied(objectId, occupant)`, which the repairer uses to drop a dead occupant
-  (cross-document-review X6). FSIF pools allocate through `FsifIndexAllocationStrategy`
+  (cross-document-review 2.4, repair and transactions). FSIF pools allocate through `FsifIndexAllocationStrategy`
   (`client/internal/allocation/CLAUDE.md`)
 - Opening is backend-neutral (`BackendOpener`; only `DefaultBackendOpener` names concrete backends): see
   `server/host/CLAUDE.md`
-- Creation is atomic for every backend (`StoreCreation`, safety SL X14): `BackendOpener.create` builds the store,
-  backend initialized and closed plus its config, in a scratch directory under `<device>/creating/`, forces the
-  tree and renames it to the store's path. Open never creates: FSIF throws `StoreLost` for a missing directory or
-  blank files, RocksDB `RocksDBStateLost` when `CURRENT` is missing, so a store that lost its files is rebuilt, never
-  served empty. A new backend must keep both rules: create only in `init`, and treat an absent or empty store as lost
+- Creation is atomic for every backend (`StoreCreation`, systemic-loss-protection 4.1, row D5): `BackendOpener.create`
+  builds the store, backend initialized and closed plus its config, in a scratch directory under `<device>/creating/`,
+  forces the tree and renames it to the store's path. Open never creates: FSIF throws `StoreLost` for a missing
+  directory or blank files, RocksDB `RocksDBStateLost` when `CURRENT` is missing, so a store that lost its files is
+  rebuilt, never served empty. A new backend must keep both rules: create only in `init`, and treat an absent or empty
+  store as lost
 - `Reconcile` (exact repair install): `server/repair/CLAUDE.md`; `ReconcileResult.changed` is true only when the
   install was applied (every deferred, stale or no-op path reports false)
-- Parked repairs (repair F8): a reconcile whose `RepairSnapshot.awaitSettle` is set, finding its object unsettled (a
-  commit or repair write in flight or held, a failed commit, a deletion, holding for recovery), waits in
+- Parked repairs (repair-process 8.2): a reconcile whose `RepairSnapshot.awaitSettle` is set, finding its object
+  unsettled (a commit or repair write in flight or held, a failed commit, a deletion, holding for recovery), waits in
   `parkedRepairs` (at most one per object, a newer one answers the older stale) instead of answering stale.
-  `commitTurnFree` runs it before telling any waiting transaction, so at a settled moment before the next commit
-  starts, and `releaseHeldMessages` runs all of them when holding ends. It runs once, through `reconcileForRepair`
-  with `awaitSettle` off. Past `Frontend.RepairSettleWait` (1 s, `expireParkedRepairs` on the store heartbeat) it
-  answers stale. Fail-stop and close fail it
+  `commitTurnFree` runs it before telling any waiting transaction, so at a settled moment before the next commit starts,
+  and `releaseHeldMessages` runs all of them when holding ends. It runs once, through `reconcileForRepair` with
+  `awaitSettle` off. Past `Frontend.RepairSettleWait` (1 s, `expireParkedRepairs` on the store heartbeat) it answers
+  stale. Fail-stop and close fail it
 - Parked reads (client 1-RTT commit design section 5): a client read whose `Read.awaitCommit` names a transaction
   holding a write lock on the object's in-memory state (`lockedWriteTransactions`) is parked (`parkRead`, keyed by
   object and `readUUID`: a resent read replaces its entry) instead of answered: the client knows that transaction
@@ -275,6 +276,6 @@
   discard, so `ObjectNotFound`). At `parkedReadWait` it is answered `AllocationPending` if still pending, which the
   client re-reads at once; at `MaxParkedReads` it is answered `AllocationPending` at once
 - `deleteObjectForRepair` refuses (`Frontend.RepairDeleteDeferred`) while the store holds for recovered transactions or
-  the object has a pending backend read, a commit, repair write or deletion in flight, or a transaction referencing
-  it (repair F6); while its backend removal is outstanding the object counts in `deleting`, so reads, snapshots and
-  transactions get `ObjectNotFound`
+  the object has a pending backend read, a commit, repair write or deletion in flight, or a transaction referencing it
+  (repair-process 9.2); while its backend removal is outstanding the object counts in `deleting`, so reads, snapshots
+  and transactions get `ObjectNotFound`

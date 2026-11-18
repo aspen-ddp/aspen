@@ -42,14 +42,15 @@ object RebuildingStore:
   val PendingDeleteDirectory = "pending-delete"
 
   /** In a store directory a rebuild produced, from just before its move into place until its tree entry leaves
-   *  Rebuilding. Written durably by finish in staging, so it is at the store's path the moment the directory is.
-   *  Its content is the rebuild's episode (StoreEntry.rebuildEpisode; empty for None). It says two things. The
-   *  directory is this rebuild's output: start() takes a directory at the store's path for a finished rebuild only
-   *  when it carries the marker of the current episode (any other one, a copy finished for an earlier Rebuilding
-   *  episode included, is retired as a lost copy by StoreRebuilds.startRebuild, Rebuild F3). And the store is not
-   *  in service yet: StoreLoader.tryLoadStore leaves it offline, so a crash between the move and the flip cannot have a restart serve it as a blank acceptor while
-   *  the tree still says Rebuilding (Rebuild F4). Removed once the flip commits (StoreRebuilds), or by the
-   *  reconcile for an Active entry after a crash between the flip and the removal (DeviceReconciler) */
+   *  Rebuilding. Written durably by finish in staging, so it is at the store's path the moment the directory is. Its
+   *  content is the rebuild's episode (StoreEntry.rebuildEpisode; empty for None). It says two things. The directory is
+   *  this rebuild's output: start() takes a directory at the store's path for a finished rebuild only when it carries
+   *  the marker of the current episode (any other one, a copy finished for an earlier Rebuilding episode included, is
+   *  retired as a lost copy by StoreRebuilds.startRebuild, rebuild-process 2.2). And the store is not in service yet:
+   *  StoreLoader.tryLoadStore leaves it offline, so a crash between the move and the flip cannot have a restart serve
+   *  it as a blank acceptor while the tree still says Rebuilding (rebuild-process 2.2). Removed once the flip commits
+   *  (StoreRebuilds), or by the reconcile for an Active entry after a crash between the flip and the removal
+   *  (DeviceReconciler) */
   val RebuildCompleteMarkerFile = "rebuild-complete"
 
   /** The content of the rebuild-complete marker of `episode` */
@@ -225,7 +226,7 @@ class RebuildingStore(client: AspenClient,
   private var lastKey: Option[Key] = None
   private var failed: List[ObjectId] = Nil
   /** Every allocation the peers listed at the query of this pass or an earlier one, kept across resumes by the
-   *  checkpoint (Rebuild F10). Set by runPass before the walk */
+   *  checkpoint (rebuild-process 5.3). Set by runPass before the walk */
   private var listedAllocations: Map[TransactionId, PendingAllocation] = Map()
 
   /** Abort latch: when a fatal condition fires (out of space or too many failures), we record
@@ -340,8 +341,8 @@ class RebuildingStore(client: AspenClient,
       _ = synchronized:
             backend = opened
       // Before the walk: an allocation the lost store acknowledged is either listed by a peer at the first pass's
-      // query, or was finalized before it, so its entry is in the tree ahead of every walk (Rebuild F10). What an
-      // earlier pass listed is swept again: finalized since, its entry may have landed behind the checkpoint. Every
+      // query, or was finalized before it, so its entry is in the tree ahead of every walk (rebuild-process 5.3). What
+      // an earlier pass listed is swept again: finalized since, its entry may have landed behind the checkpoint. Every
       // checkpoint carries the union, so the walk never advances durably past what was listed
       queried <- queryPeers(pstate.ida)
       pending = synchronized:
@@ -410,7 +411,7 @@ class RebuildingStore(client: AspenClient,
                                            (e.pointers ++ p.pointers).distinctBy(_.id)))
 
   /** The allocations this pool's other stores hold unfinalized, by transaction, once `width - writeThreshold + 1` of
-   *  them have answered (Rebuild F10).
+   *  them have answered (rebuild-process 5.3).
    *
    *  A committed transaction is held by at least `writeThreshold` of its commit voters in this pool until TxFinalized,
    *  which comes only after its AllocationFinalizationAction recorded its objects. The lost store may have been one of
@@ -435,9 +436,9 @@ class RebuildingStore(client: AspenClient,
           scala.util.Failure(synchronized(abortCause).getOrElse(RebuildCancelled(storeId)))
         case scala.util.Failure(err) => scala.util.Failure(err)
 
-  /** Restores the objects of the allocations the peers listed before this pass's walk or an earlier pass's (Rebuild
-   *  F10), directly rather than through the tree, whose entries may not land until their transactions finalize, and
-   *  may then land behind the walk. Each round asks the peers again:
+  /** Restores the objects of the allocations the peers listed before this pass's walk or an earlier pass's
+   *  (rebuild-process 5.3), directly rather than through the tree, whose entries may not land until their transactions
+   *  finalize, and may then land behind the walk. Each round asks the peers again:
    *  - still listed, unresolved: wait for its resolution
    *  - still listed, committed: restore each object. Any read failure is retried, since while the transaction is held
    *    its commit may not have applied yet, which reads like a deletion
@@ -783,12 +784,12 @@ class RebuildingStore(client: AspenClient,
           logger.warn(s"Rebuild of $storeId: could not read whether its losses are accepted: $t")
           false
 
-  /** Rebuild F15. Finishes past objects no peer can supply, once an operator has accepted their loss. Each is
+  /** Finishes past objects no peer can supply, once an operator has accepted their loss. Each is
    *  recorded in the pool's ErrorTree as missed by this store (missed at HLCTimestamp.Zero, so it never displaces a
    *  newer mark), durably before the store is promoted: repair restores it if it ever becomes readable, and the
    *  entry is the record of the loss until then. An object no longer in the allocation tree was deleted and needs
    *  none; an entry whose pointer cannot be decoded names nothing to restore and is logged. A failed mark fails the
-   *  pass, which is retried. */
+   *  pass, which is retried (rebuild-process 5.5). */
   private def recordAcceptedLoss(ids: List[ObjectId]): Future[Unit] =
     val pool = client.getStoragePool(storeId.poolId)
     val fmarks = Future.sequence(ids.map: objectId =>

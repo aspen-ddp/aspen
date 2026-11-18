@@ -39,7 +39,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit,
   * journalBound), by `rebuildFlush`, or by `checkpointNow`), each step re-runnable from its start:
   *  1. Snapshot the map as of the last record appended to journal s; later records are buffered. Once every
   *     journal-s batch is durable, header s+1 is written and forced into the other journal file, and only then does a
-  *     new writer take the buffered records (Ruling 19: no record of s+1 is durable unless all of s is).
+  *     new writer take the buffered records (DESIGN.md 3.7: no record of s+1 is durable unless all of s is).
   *  2. Wait until every journal-s Delta is forced in place (a data force covering its write has succeeded) or
   *     cancelled, and until everything appended so far (which includes any record that cancelled one) is durable.
   *  3. Write index s+1 into the other index file and force it.
@@ -107,9 +107,9 @@ class FsifBackend(val storeId: StoreId,
   @volatile private var fatal: Option[Throwable] = None
   private val quiescers = mutable.ArrayBuffer[Promise[Unit]]()
   /** Copy-on-write targets that grew the slot count and are not yet forced. Recovery bounds every slot by
-    * max(forced data size / stride, 1 + highest indexed slot) + the Mappings it replays (Ruling 12), and such a slot
-    * is counted by none of these until its force. So a journaled allocation into any higher slot (whose data is not
-    * forced) waits for it before appending its Mapping (`afterTailCows`).
+    * max(forced data size / stride, 1 + highest indexed slot) + the Mappings it replays (DESIGN.md 3.6), and
+    * such a slot is counted by none of these until its force. So a journaled allocation into any higher slot (whose
+    * data is not forced) waits for it before appending its Mapping (`afterTailCows`).
     */
   private val tailCows = mutable.TreeSet[Int]()
   private val awaitingTail = mutable.ArrayBuffer[(Int, () => Unit)]()
@@ -166,7 +166,7 @@ class FsifBackend(val storeId: StoreId,
   // ---- Close, owned by serial ----
   /** close() has been called */
   private var closing = false
-  /** Closing while frozen: held I/O is abandoned as in a crash (Ruling 27). Nothing new is issued, held operations
+  /** Closing while frozen: held I/O is abandoned as in a crash (DESIGN.md 2.10). Nothing new is issued, held operations
     * are never retried or completed, and the store stays frozen; close waits only for io already in flight.
     */
   private var abandoned = false
@@ -184,7 +184,7 @@ class FsifBackend(val storeId: StoreId,
     */
   private var appendSeq: Long = recovered.seq
   private var checkpoint: Option[Checkpoint] = None
-  /** Records appended while a checkpoint switches journals (Ruling 19), released into the new writer in order */
+  /** Records appended while a checkpoint switches journals (DESIGN.md 3.7), released into the new writer in order */
   private val switchBuffer = mutable.ArrayBuffer[(List[JournalRecord], Promise[Unit])]()
   /** The Future of the most recent append. Batches complete in order, so it completing means every earlier append
     * (to the same writer) is durable.
@@ -325,8 +325,8 @@ class FsifBackend(val storeId: StoreId,
     p.future
 
   /** Completes once nothing is outstanding (as `quiesce`), then closes the files. A store frozen by ENOSPC (or that
-    * freezes while closing) does not wait for space (Ruling 27): its held I/O is abandoned exactly as a crash would
-    * abandon it, and the close waits only for io already in flight. That is safe: held commits were never
+    * freezes while closing) does not wait for space (DESIGN.md 2.10): its held I/O is abandoned exactly as a
+    * crash would abandon it, and the close waits only for io already in flight. That is safe: held commits were never
     * acknowledged (Tx keeps their data in the CRL), acknowledged Deltas are durable in the journal and replay at
     * recovery, and a held checkpoint, copy-on-write or move step re-runs or is moot at recovery. Abandoned commits,
     * repairs and repairDeletes never complete: after a close the host no longer routes this store's completions, and
@@ -391,7 +391,7 @@ class FsifBackend(val storeId: StoreId,
   /** Rebuild only: the store is not live, so nothing else touches X's slot. Writes the segment in place on the
     * calling thread and buffers the Mapping for `rebuildFlush`. Throws IllegalArgumentException on an invalid pointer
     * or a slice larger than a segment, and an out-of-space IOException while writes are frozen or if the write itself
-    * hits ENOSPC (Ruling 21: RebuildingStore handles it; the store does not wait for space).
+    * hits ENOSPC (DESIGN.md 2.12: RebuildingStore handles it; the store does not wait for space).
     */
   override def rebuildWrite(pointer: ObjectPointer, objectType: ObjectType.Value, metadata: Metadata,
                             data: DataBuffer): Unit =
@@ -431,7 +431,7 @@ class FsifBackend(val storeId: StoreId,
 
   /** Forces `data`, then appends and forces the buffered Mappings (durable-before-map), then checkpoints. Throws an
     * out-of-space IOException if `data`'s force hits ENOSPC, or if the store is frozen before the Mappings are durable
-    * or the checkpoint has finished (Ruling 21). Mappings already appended then stay held and land once space
+    * or the checkpoint has finished (DESIGN.md 2.12). Mappings already appended then stay held and land once space
     * returns. A force failure may have dropped rebuild writes not yet mapped, so after one this incarnation throws
     * on every later rebuildWrite and rebuildFlush.
     */
@@ -606,7 +606,7 @@ class FsifBackend(val storeId: StoreId,
     writesInFlight > 0 || readsInFlight > 0 || cowIo > 0 || compactionIo > 0 || dataForceInFlight ||
       checkpoint.exists(_.ioInFlight) || journal.busy
 
-  /** Ruling 27: a close of a frozen store abandons everything held. Called on serial once both hold. */
+  /** A close of a frozen store (DESIGN.md 2.10) abandons everything held. Called on serial once both hold. */
   private def abandonHeld(): Unit =
     if !abandoned then
       logger.warn(s"FSIF store $storeId: closing while out of space; abandoning ${heldOps.size + retryingOps.size} " +
@@ -1044,7 +1044,7 @@ class FsifBackend(val storeId: StoreId,
   // ---- Journal appends and checkpoints ----
 
   /** Every journal append goes through here. While a checkpoint switches journals, records wait in `switchBuffer`
-    * until the new journal's header is forced and the old writer is idle (Ruling 19).
+    * until the new journal's header is forced and the old writer is idle (DESIGN.md 3.7).
     */
   private def appendRecords(records: List[JournalRecord]): Future[Unit] =
     val f =
@@ -1220,8 +1220,8 @@ class FsifBackend(val storeId: StoreId,
     finally file.close()
 
   /** Runs one checkpoint step on io, then `next` on serial. ENOSPC holds the step, which the retry round re-runs
-    * from its start; any other failure is fail-stop (Ruling 15). A success that arrives after a fatal error is handed
-    * to `discard`.
+    * from its start; any other failure is fail-stop (DESIGN.md 2.11). A success that arrives after a fatal error is
+    * handed to `discard`.
     */
   private def checkpointIo[A](cp: Checkpoint, discard: A => Unit = (_: A) => ())(work: => A)(next: A => Unit): Unit =
     val step = () => work
@@ -1284,9 +1284,9 @@ class FsifBackend(val storeId: StoreId,
     val id = state.objectId
     val slot = index.slots(x)
     val occupant = index.ids(x)
-    // Ruling 18: Frontend repairs a missed allocation with allocating = false, so a repair allocates an unmapped X.
+    // Frontend repairs a missed allocation with allocating = false, so a repair allocates an unmapped X.
     // A repair never overwrites a different occupant: it reports the occupant (RepairSlotOccupied), and the repairer
-    // drops it through repairDelete once the allocation tree no longer lists it (cross-document-review X6).
+    // drops it through repairDelete once the allocation tree no longer lists it (cross-document-review 2.4).
     val allocating = if repairing then slot < 0 else state.allocating
     if abandoned then
       () // released from behind a gate after an abandoning close: never completes, as if the store had crashed
@@ -1715,7 +1715,7 @@ object FsifBackend:
 
   /** Opens the existing store in `path`. Never creates: a store directory exists only once its store was created
     * (StoreCreation), so a missing directory, or one whose FSIF files are all absent or empty (FsifRecovery.isBlank),
-    * lost its store and throws StoreLost (safety SL X14), with nothing written.
+    * lost its store and throws StoreLost (systemic-loss-protection 4.1, row D5), with nothing written.
     *
     * @throws FsifRecovery.StoreLost if the store's acknowledged state cannot be recovered
     * @throws java.io.IOException    on an I/O error, including running out of space (FsifIo.isOutOfSpace)

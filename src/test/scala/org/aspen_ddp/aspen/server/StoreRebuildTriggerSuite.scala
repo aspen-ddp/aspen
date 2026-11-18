@@ -160,7 +160,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       oneRebuilding = deviceState(deviceA, Map(active, rebuilding(storeN(1))))
       _ = second.success(oneRebuilding)
       // deviceA is not in the tree, so the flip fails permanently: the re-check that frees the slot for store 1 is
-      // the backoff retry (Rebuild F11)
+      // the backoff retry
       _ <- yieldUntil(scheduler(host).pending.contains(Host.RebuildRetryInitialDelay))
       _ = runRebuildRetries(host)
       _ <- yieldUntil(factory.created.size == 2)
@@ -325,8 +325,8 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(storeDir) should be(false)
 
   atest("a directory no rebuild produced at a Rebuilding store's path is retired before the rebuild starts"):
-    // Rebuild F3: a leftover of an earlier tenancy of the store on this device, with neither marker. It must not be
-    // taken for a finished rebuild; it is kept in pending-delete like any lost copy, and the store rebuilt.
+    // rebuild-process 4.1 (T12): a leftover of an earlier tenancy of the store on this device, with neither marker. It
+    // must not be taken for a finished rebuild; it is kept in pending-delete like any lost copy, and the store rebuilt.
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
@@ -577,7 +577,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).loadStoreByIdRequests.exists(_._1 == realDeviceId) should be(false)
       // Store directory should be discarded
       os.exists(storePath) should be(false)
-      // Nothing puts the store here any more, so its offline mark is gone (Rebuild F7)
+      // Nothing puts the store here any more, so its offline mark is gone
       host.control.router.offlineStores should not contain storeN(0)
       host.control.rebuilds.silencedStores should not contain storeN(0)
 

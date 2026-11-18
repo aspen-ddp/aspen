@@ -97,8 +97,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
       net.sentTx.collect { case f: TxFinalized => f } shouldBe Nil
   }
 
-  // X3 (Ruling 30): a sibling store's delayed resolution no longer downgrades the host's finalized entry, so the relay
-  // still answers a replayed prepare with a late, finalized commit
+  // paxos-transactions 10.6: a sibling store's delayed resolution no longer downgrades the host's finalized entry, so
+  // the relay still answers a replayed prepare with a late, finalized commit
   test("a sibling store's delayed resolution does not downgrade a finalized late entry") {
     val statusCache = new TransactionStatusCache()
     val (sibling, _, _) = mkStore(peer, statusCache, Duration(40, SECONDS))
@@ -157,7 +157,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
       TransactionDriver.noErrorRecoveryFactory.create(ec, storeId, messenger, backgroundTasks, txd, finalizerFactory,
         start)
 
-  // Paxos F5
+  // transaction-recovery 4.3, proposal ids
   test("only a client prepare creating the transaction at its leader starts a driver at the initial proposal") {
     val factory = new RecordingFactory
     val (store, _, _) = mkStore(leader, new TransactionStatusCache(), Duration(40, SECONDS), driverFactory = factory)
@@ -241,7 +241,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     var batched: List[TxMessage] = Nil
     override def sendTransactionMessages(msg: List[TxMessage]): Unit = batched = batched ++ msg
 
-  // Rebuild F6, paxos F8: a commit vote, an abort vote and a silent third store. Before expiry the driver's tally
+  // paxos-transactions 7.2: a commit vote, an abort vote and a silent third store. Before expiry the driver's tally
   // waits for the silent store. Past it both voters are frozen (they promise and accept nothing more). The expiry tally
   // still holds while the third store is silent (ExpiryTally rule G): it may have voted commit, which with the leader's
   // vote is Replication(3, 2)'s write threshold, so a client may have learned commit from the votes. (Under the old
@@ -297,7 +297,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     crl.deleted should contain (txid1)
   }
 
-  // Ruling 31: a closed store's drivers would otherwise keep re-preparing its transactions from their timers
+  // A closed store's drivers would otherwise keep re-preparing its transactions from their timers
   test("closing a store stops its transaction drivers") {
     val tasks = new org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriverSuite.ManualTasks(ExecutionContext.global)
     val factory = org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver.factory(100.milliseconds, 3.seconds)
@@ -351,7 +351,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     crl.deleted shouldBe List(txid1)
   }
 
-  // ---- Ruling 15: a recovered commit vote that found its UnackedCommits entry proves the commit to its own driver ----
+  // ---- A recovered commit vote that found its UnackedCommits entry proves the commit (transaction-recovery 7.5) ----
 
   /** Records the driver's batched sends too, which TestNet drops */
   private class RecordingNet extends TestNet:
@@ -433,7 +433,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     promise(store, 2, p, None)
 
     net.sentTx.collect { case a: TxAccept => a.value } shouldBe Nil
-    // The proof started a post-proof round (Ruling 6), whose promises are what count
+    // The proof started a post-proof round, whose promises are what count
     p should not be initialProposal
     net.sentTx.collect { case f: TxFinalized => (f.committed, f.late) }.distinct shouldBe List((true, true))
     finalizer.created shouldBe 0
@@ -534,7 +534,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.hasTransactions shouldBe false
   }
 
-  // ---- Recovered commit votes are driven at once (Todo 4.4, R-N3; Ruling 20's wait for the first lookup is gone) ----
+  // ---- Recovered commit votes are driven at once (transaction-recovery 7.5) ----
 
   test("a recovered vote whose lookup is unanswered or failing is driven at once, and an entry found later gives its running driver the proof") {
     val (store, net, finalizer, lookup, _) = recoveredVoteStore()
@@ -581,7 +581,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.frontend.transactions(foundTxid).status shouldBe TransactionStatus.Committed
   }
 
-  // ---- Driver traffic while a recovered Tx loads (transaction-recovery R-F18) ----
+  // ---- Driver traffic while a recovered Tx loads (transaction-recovery 7.3) ----
 
   /** A MapBackend whose reads complete only on deliver */
   private class DeferredReadBackend(id: StoreId) extends MapBackend(id):
@@ -620,7 +620,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     tasks.fireAll() // The driver's first send
     val prepares = net.sentTx.collect { case p: TxPrepare => p }
     prepares.map(_.to).toSet shouldBe Set(storeId, leader, peer)
-    // Above the promise recovered from the CRL, which the Tx knows before its objects load (paxos F5)
+    // Above the promise recovered from the CRL, which the Tx knows before its objects load (paxos-transactions 6.4)
     prepares.foreach(_.proposalId should be > promised)
 
     def fromOwnTx: List[TxMessage] = net.sentTx.filter:

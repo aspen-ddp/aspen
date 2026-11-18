@@ -84,7 +84,7 @@ class SimpleTaskExecutor(val client: AspenClient,
     * revision (cached, and refreshed after a collision), which pins the transaction: the new key alone
     * (`DoesNotExist`) would not. Completes with the object and its revision once allocated.
     *
-    * Allocations run one at a time (transaction-requirements Q-N6): concurrent ones would all update the executor
+    * Allocations run one at a time: concurrent ones would all update the executor
     * object at the same cached revision, and all but one would collide and retry, O(n^2) attempts for n of them. Each
     * starts once the previous one has committed and moved the cached revision. Collisions with other processes'
     * executors on the same object are left to the retry strategy's backoff.
@@ -97,7 +97,7 @@ class SimpleTaskExecutor(val client: AspenClient,
   private def allocateTaskNow(): Future[(DurableTaskPointer, ObjectRevision)] =
     // One key for every attempt. An attempt that committed but was reported TransactionOutcomeUnknown leaves it in the
     // executor object, which onFail re-reads anyway; the retry then returns that attempt's task object instead of
-    // allocating another (Todo 5.10). Its pointer is the key's value
+    // allocating another (paxos-transactions 10.11). Its pointer is the key's value
     val taskKey = Key(UUID.randomUUID())
     @volatile var committed: Option[KeyValueObjectPointer] = None
 

@@ -9,17 +9,19 @@
   (`server/store/DescriptionValidator`): `KeyValueUpdate.pinned` when the update writes a key it carries a
   `KeyRevision` on, and `TransactionDescription.replaySafe`. The builder's check is `Pins.declared` over the flagged
   requirements, the same test the stores apply.
-  So a forgotten transaction replayed by a delayed prepare cannot gather a write threshold of commit votes, and there
-  is no time horizon. A refcount-0 object is `MissingObject` for every requirement. Design:
+  So a forgotten transaction replayed by a delayed prepare cannot gather a write threshold of commit votes. The
+  stores also bound joining by time: a 20 s transaction horizon (`common.transaction.TransactionHorizon`) and a forget
+  floor refuse a prepare for a transaction a store may have forgotten (paxos-transactions 10.10; the details are in
+  `server/transaction/CLAUDE.md`). A refcount-0 object is `MissingObject` for every requirement. Design:
   `docs/superpowers/specs/2026-11-09-replay-pins-design.md`
-- Blind writes (`TransactionBuilder.refuseBlindWrites`, transaction-requirements F1), except in an allocated object's
+- Blind writes (`TransactionBuilder.refuseBlindWrites`, transaction-requirements 2.5), except in an allocated object's
   initial content: a key Delete needs that key's `KeyRevision` (`Exists` is not enough), a required revision or a
   content lock; a min/max/left/right change needs a required revision (a content lock does not move the revision a
-  repair proof locks, repair F11). It fails with `BlindKeyValueWrite`, even when replay-safe, and stores refuse the
-  same writes (`BlindWrite`). Blind Inserts are allowed: stores apply them last-writer-wins, but keep nothing to order
-  a delete or an object-level change by
+  repair proof locks; repair-process 1.2, Q8). It fails with `BlindKeyValueWrite`, even when replay-safe, and stores
+  refuse the same writes (`BlindWrite`). Blind Inserts are allowed: stores apply them last-writer-wins, but keep nothing
+  to order a delete or an object-level change by
 - `TransactionBuilder.addAllocatingObject` adds the object's `AllocationFinalizationAction` itself, once per object, so
-  every allocation records its AllocationTree entry, which repair and rebuild find objects by (rebuild F17).
+  every allocation records its AllocationTree entry, which repair and rebuild find objects by (rebuild-process 7).
   `ObjectAllocator` does not add it
 - UnackedCommits (`StoragePoolState.UnackedCommitsTreeKey`, `UnackedCommitEntry.key(store, txid)`): for every
   committed transaction, the finalizer writes `UnackedCommitEntry(timestamp, incarnation, objects)` for each counted commit voter
@@ -29,19 +31,22 @@
   never erases a known value); a store that never answered the driver gets `None`, as does one that reported two
   different incarnations (`TransactionDriver.recordIncarnation`: recorded as unknown for good). Value:
   `[timestamp:8][incarnation:16][count:4][pointers]`; the incarnation is the store's
-  `StoreIncarnation` UUID, the zero UUID meaning `None` (unknown), copied into every chunk. `MissedUpdateFinalizationAction` runs in parallel with the other actions (Ruling 8,
-  revised 2026-11-17), so an entry durable means T committed, not that the other actions are
-  done: only TxFinalized (sent once a finalizer completed every action) implies that
+  `StoreIncarnation` UUID, the zero UUID meaning `None` (unknown), copied into every chunk.
+  `MissedUpdateFinalizationAction` runs in parallel with the other actions (transaction-recovery 4.4), so an entry
+  durable means T committed, not that the other actions are done: only TxFinalized (sent once a finalizer completed
+  every action) implies that
 - `MissedUpdateFinalizationAction` disables missed-update tracking on an ErrorTree write only when the transaction
   references the pool the entry is about (in practice the bootstrap pool)
-- A store that misses `errorTimeout` (2 s) is marked in its pool's ErrorTree for every object it hosts that the
-  transaction changes (a lock changes nothing, so there is nothing to repair and the object's timestamp would not
-  catch up). A client's `MissedUpdateMarker` writes one batch per pool at a time and merges waiting entries by key,
-  so a slow spell makes batches larger rather than adding colliding writes. Repair: `server/repair/CLAUDE.md`
+- A store that misses `errorTimeout` (2 s) is marked in its pool's ErrorTree for every object it hosts except the
+  lock-only ones (`TransactionDescription.lockOnlyObjects`: objects the transaction only locks and never changes;
+  there is nothing to repair, and the object's timestamp would not catch up). A store that reported commit errors is
+  marked only for the objects it reported, again minus the lock-only ones. A client's `MissedUpdateMarker` writes one
+  batch per pool at a time and merges waiting entries by key, so a slow spell makes batches larger rather than adding
+  colliding writes. Repair: `server/repair/CLAUDE.md`
 - ErrorTree entry: key `[poolIndex:1][objectId:16]`, value `[missedTimestamp:8][objectType:1][storePointer]`
   (`encodeErrorEntry`; type 0 Data, 1 KeyValue, 2 unknown). With the tree's pool these rebuild the object's pointer
-  (`ErrorEntry.pointer`), which repair needs to read an object the AllocationTree no longer lists (repair F5). The type
-  is unknown only for a commit error on an object the transaction does not reference (not reachable today)
+  (`ErrorEntry.pointer`), which repair needs to read an object the AllocationTree no longer lists (repair-process 2.2).
+  The type is unknown only for a commit error on an object the transaction does not reference (not reachable today)
 - Marker entries only move forward: its puts are conditional checked inserts (`TKVLInsert.replaces`). An ErrorTree
   mark replaces a held one only for a later `missedTimestamp`, and an older one writes the held value again: that
   moves the entry's revision, so a repair whose read predates the older miss's commit (transactions can commit out of

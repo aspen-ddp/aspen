@@ -452,7 +452,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val i2 = SimpleCRL(tdir, 3, 1024*1024)
 
-    // The open writes nothing: the next entry is the one after the last written (crash-recovery-log F16)
+    // The open writes nothing: the next entry is the one after the last written (crash-recovery-log 5.7)
     assert(i2.crl.currentEntrySerialNumber == 1)
 
     assert(i2.trsList.length == 1)
@@ -1411,7 +1411,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val completed = Set(queue.poll(5, TimeUnit.SECONDS), queue.poll(5, TimeUnit.SECONDS))
     assert(completed == Set("save", "late save"))
 
-    // The skipped save leaves no live record behind (F4): nothing is reported for the store, and once the only other
+    // The skipped save leaves no live record behind: nothing is reported for the store, and once the only other
     // transaction is deleted no entry is needed any more
     assert(i.crl.getFullRecoveryState(storeId).isEmpty)
     i.crl.deleteTransaction(storeId2, transactionId2)
@@ -1620,7 +1620,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val ous = (0 until numUpdates).map(i => ObjectUpdate(ObjectId(new UUID(9, i)), DataBuffer(Array[Byte](1, 2, 3)))).toList
     (tid, TransactionRecoveryState(storeId, d.serialize(), ous, disp, status, pax))
 
-  // ===== Entry checksums (crash-recovery-log F5, F19) =====
+  // ===== Entry checksums (crash-recovery-log C7) =====
 
   private def headerAt(file: os.Path, offset: Int): LogEntry.EntryHeader =
     LogEntry.loadHeader(ByteBuffer.wrap(os.read.bytes(file), offset, LogEntry.StaticEntryHeaderSize).slice())
@@ -2172,7 +2172,7 @@ class SimpleCRLSuite extends FileBasedTests {
     i2.crl.shutdown()
   }
 
-  // ---- An open writes nothing (crash-recovery-log F16) ----
+  // ---- An open writes nothing (crash-recovery-log 5.7) ----
 
   private def streamBytes(dir: os.Path, n: Int): IndexedSeq[Array[Byte]] =
     (0 until n).map(i => os.read.bytes(dir / s"$i.crl"))
@@ -2369,7 +2369,7 @@ class SimpleCRLSuite extends FileBasedTests {
     droppedPiecesStayPinnedUntilSaved(saveAfterDrop = false)
   }
 
-  // ---- dropStore is one request (crash-recovery-log F12) ----
+  // ---- dropStore is one request (crash-recovery-log 2, dropStore) ----
 
   /** Holds the CRL thread until the returned latch is counted down */
   private def holdCrlThread(crl: SimpleCRL): CountDownLatch =
@@ -2420,7 +2420,7 @@ class SimpleCRLSuite extends FileBasedTests {
     saveAfterDrop(writeInFlight = true)
   }
 
-  // ---- Durability of object data drops and barriers (transaction-recovery R-N13) ----
+  // ---- Durability of object data drops and barriers (crash-recovery-log 5.9, barriers) ----
 
   test("a drop alone writes nothing: a restart recovers the object data") {
     val queue = new LinkedBlockingQueue[String]()

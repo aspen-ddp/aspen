@@ -375,7 +375,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
   }
 
   // A commit voter that has not applied the object's allocation answers AllocationPending (transaction-requirements
-  // Q-N5): the allocation will apply, or abort and the store then answers ObjectNotFound. Neither the reply nor a
+  // 9.4): the allocation will apply, or abort and the store then answers ObjectNotFound. Neither the reply nor a
   // threshold of them ends the read, which would fail a read of an object the client was just told it allocated
   test("an AllocationPending reply re-reads that store at once and never ends the read") {
     val m = new RecordingClient

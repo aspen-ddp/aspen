@@ -25,8 +25,8 @@ object Backend:
     Iterator.iterate(t)(_.getCause).takeWhile(_ != null).take(8).exists(matches)
 
 /** A repair's write of `objectId` failed because the store's slot for it holds a different object, `occupant` (FSIF
-  * slot reuse over a missed delete: cross-document-review X6). The repair never overwrites an occupant: the repairer
-  * drops it once the allocation tree no longer lists it, and the next pass installs `objectId`
+  * slot reuse over a missed delete; cross-document-review 2.4). The repair never overwrites an occupant: the
+  * repairer drops it once the allocation tree no longer lists it, and the next pass installs `objectId`
   */
 final class RepairSlotOccupied(val objectId: ObjectId, val occupant: ObjectId)
   extends Exception(s"Repair of $objectId: its slot holds $occupant")

@@ -205,8 +205,8 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
             result should matchPattern { case Failure(_: TransactionOutcomeUnknown) => }
       _ <- eventually("the status cache forgot T", clock = true)(cachedStatus(tx.id).isEmpty)
       // A stale retransmit of T's prepares. Before the horizon the stores re-decided it from scratch: the refcount no
-      // longer matches, nothing proves the commit, and T aborted (paxos F2). Now every store is past its forget floor
-      // for T and refuses it: no Tx, no vote, no outcome
+      // longer matches, nothing proves the commit, and T aborted (paxos-transactions 10.10). Now every store is past
+      // its forget floor for T and refuses it: no Tx, no vote, no outcome
       _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id && !isClientPrepare(tx.id)(m)
       _ = leaderLast(prepares).foreach(net.deliverTransactionMessage)
       _ = withClue("no store joins T again: ")(holders(tx.id) shouldBe Set())
@@ -265,9 +265,9 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       _ = holders(tx.id) shouldBe Set()
       // The host's last write of T's status-cache entry was before now
       forgottenAt = wallMillis()
-      // Inside the horizon, but after the old status cache (7 heartbeats) would have forgotten T, a delayed duplicate of
-      // T's client prepares reaches every store. Stores that forgot the abort voted commit afresh, and T committed (P-N4
-      // path 3). Now the cache outlasts the horizon: the stores still know T aborted
+      // Inside the horizon, but after the old status cache (7 heartbeats) would have forgotten T, a delayed duplicate
+      // of T's client prepares reaches every store. Stores that forgot the abort voted commit afresh, and T committed.
+      // Now the cache outlasts the horizon: the stores still know T aborted
       _ <- clockPast(forgottenAt + 8 * testHostOptions.heartbeatPeriod.toMillis)
       known = cachedStatus(tx.id)
       _ = net.recordTxMessage = isOutcome(tx.id)
@@ -421,7 +421,7 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](3)
 
   test("holders of a chosen commit apply it past expiry though a rebuilt store forgot it"):
-    // Cross-document review G1 (X2 x expiry). T's commit is chosen by stores 0-3 and reported to the client, but no
+    // cross-document-review 2.2: T's commit is chosen by stores 0-3 and reported to the client, but no
     // store learns it: its leader, store 0, alone on its host, loses its host and its CRL before it finalizes. Store
     // 0 is rebuilt, blank, and promoted at once; store 4 never hears of T. Past the horizon stores 1-3, the only
     // holders left, cannot form a quorum and ask their peers. Counting the rebuilt store as a non-holder would make
@@ -562,8 +562,8 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       _ <- eventually("the moved stores passed their load floors", clock = false)(moved.forall(i => net.loadFloorPassed(sid(i))))
     yield hosts
 
-  // Cross-document review G4 (Todo 6.4): a host's join ceiling (JoinCeiling) bounds what its stores joined before it
-  // went down, so once restarted they join what started since, rather than refusing everything started before their
+  // paxos-transactions 10.10 (join ceiling): a host's join ceiling (JoinCeiling) bounds what its stores joined before
+  // it went down, so once restarted they join what started since, rather than refusing everything started before their
   // load plus MaxStartLead. Without it both tests fail: the restarted stores refuse the transaction
 
   test("a restarted host's stores join a transaction started while it was down, which needs them to commit"):

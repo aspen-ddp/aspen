@@ -34,7 +34,7 @@
   nothing in the client's status cache
 - Retry is the default for both: `StopRetrying.unlessCollision` retries aborted and unknown. An Unknown may have
   committed, so a retry re-runs `prepare` against what that attempt wrote. **A retry closure must recognize its own
-  committed attempt** rather than redo the work or fail on it (Todo 5.10, paxos-transactions 10.11): use
+  committed attempt** rather than redo the work or fail on it (paxos-transactions 10.11): use
   `StopRetrying.collisionRetry()` and, only when `mayHaveCommitted`, accept this call's own post-state (identified by
   an id or key chosen outside the closure) as success, staging nothing so the empty transaction succeeds. Post-commit
   announcements made from `tx.result` must then be made by the attempt that finds the work done, since the committed
@@ -42,4 +42,4 @@
   enrollments that a caller's own guards would not stop pass a fixed `taskId` to `prepareSystemDurableTask`
 - `SimpleTaskExecutor.allocateTask` uses one key per allocation, so a retry after an Unknown returns the committed
   attempt's task object. Its allocations run one at a time per executor, so they do not collide on the executor
-  object's cached revision (Q-N6). `DiskCatalog.deleteContents` maps unknown to `Fenced`
+  object's cached revision. `DiskCatalog.deleteContents` maps unknown to `Fenced`

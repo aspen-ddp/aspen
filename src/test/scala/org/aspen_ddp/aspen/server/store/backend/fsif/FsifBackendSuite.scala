@@ -375,7 +375,7 @@ class FsifBackendSuite extends FileBasedTests:
     h.readData(p).toList shouldBe bytes(100, 1).toList
 
   test("repair at an ext held by a different object fails naming the occupant, and succeeds once it is dropped"):
-    // cross-document-review X6: the repairer drops the occupant named by RepairSlotOccupied, then installs
+    // repair-process 6.5: the repairer drops the occupant named by RepairSlotOccupied, then installs
     val h = new Harness
     h.commitOk(alloc(ptr(4, oid(40)), bytes(30, 1), 1))
     def occupied(r: Try[Unit]): Unit = r match

@@ -285,12 +285,12 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
                         s"check of the device will try again. Error: $t")
 
   /** Takes a loaded device whose CRL has failed (CrashRecoveryLog.failed: its thread or its writer died) out of
-   *  service: none of its stores can vote again, and every call on the CRL fails (crash-recovery-log F9). The directory
-   *  is disowned so no scan loads it again, its stores are closed and gossiped offline, and the device and its CRL are
-   *  unloaded. Nothing is written: the files hold what the CRL wrote before it failed, so the host's restart
-   *  recovers them as after a crash. Not reloaded before that: a CRL failing again would loop, and repeated open
-   *  failures end in a lost CRL (DeviceDiscovery.CrlOpenAttempts). Nor is the device declared Failed in the tree,
-   *  which would rebuild every store it holds (safety SL, Todo 3.1).
+   *  service: none of its stores can vote again, and every call on the CRL fails (crash-recovery-log 5.10). The
+   *  directory is disowned so no scan loads it again, its stores are closed and gossiped offline, and the device and
+   *  its CRL are unloaded. Nothing is written: the files hold what the CRL wrote before it failed, so the host's
+   *  restart recovers them as after a crash. Not reloaded before that: a CRL failing again would loop, and repeated
+   *  open failures end in a lost CRL (DeviceDiscovery.CrlOpenAttempts). Nor is the device declared Failed in the tree,
+   *  which would rebuild every store it holds (rebuild-process 3: nothing declares a device Failed automatically).
    *
    *  Rebuilds and transfers on the device are not cancelled: their CRL calls and store loads now fail, and a restart
    *  resumes them from what they left on disk, as after a crash. */

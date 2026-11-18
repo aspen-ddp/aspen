@@ -49,7 +49,7 @@ class SimpleTransactionDriver(executionContext: ExecutionContext,
   private var sendCount = 0
 
   // Only the designated leader's first driver keeps the initial proposal (1, L) its client's prepare carries: any other
-  // starts above round 1 and above what its own acceptor promised (TransactionDriver.Start, paxos F5)
+  // starts above round 1 and above what its own acceptor promised (TransactionDriver.Start, paxos-transactions 7.5)
   if !(designatedLeader && start.initialProposal) then nextRound()
 
   /** Set by shutdown: a timer already firing neither sends nor schedules again */

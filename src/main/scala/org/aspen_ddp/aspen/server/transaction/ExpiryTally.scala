@@ -157,8 +157,8 @@ object ExpiryTally:
     * ExpiryTallyConsistencySuite checks this exhaustively over the states the protocol can produce, stores that forgot
     * T included, and that no observer commits over a chosen abort.
     *
-    * Liveness with every store replied and none amnesiac (rebuild F6): every store is a commit voter or a provable
-    * non-voter, so either every pool has `vc >= t` (A) or some pool has `vc < t = vc + k + s` (E).
+    * Liveness with every store replied and none amnesiac (rebuild-process 6.4): every store is a commit voter or a
+    * provable non-voter, so either every pool has `vc >= t` (A) or some pool has `vc < t = vc + k + s` (E).
     */
   private def decideUnknown(txd: TransactionDescription,
                             replies: Map[StoreId, Option[TxStatusResponse.TxStatus]]): Decision =

@@ -111,7 +111,7 @@ class SplitFinalizationActionSuite extends IntegrationTestSuite:
       tState.contents.contains(k5) shouldBe false
       tState.revision shouldBe tBefore.revision
 
-  // transaction-requirements Q-N5: the action runs as soon as the split resolves, and its read of the new node can
+  // transaction-requirements 9.4: the action runs as soon as the split resolves, and its read of the new node can
   // precede the stores applying it. They answer AllocationPending, which proves nothing, so the action retries rather
   // than taking the node to be gone and leaving it unindexed. Here the node's stores hear the outcome of its
   // allocation only when the test delivers it

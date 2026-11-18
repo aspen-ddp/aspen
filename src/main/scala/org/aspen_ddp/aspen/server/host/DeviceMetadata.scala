@@ -207,7 +207,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
     // process that reports nothing at all.
     //
     // After an attempt that committed but was reported TransactionOutcomeUnknown, the retry finds the pool already
-    // repointed. That attempt's tx.result failed, so its announcements are made by the retry (Todo 5.10)
+    // repointed. That attempt's tx.result failed, so its announcements are made by the retry
     val retry = StopRetrying.collisionRetry()
 
     /** Once the pool names the destination: the source host deletes its copy, the rebalancer learns the transfer is
@@ -399,7 +399,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
                              episode: Option[UUID],
                              gossipStoreOnline: StoreId => Unit): Future[RebuildOutcome] =
     // An attempt that committed but was reported TransactionOutcomeUnknown leaves the entry Active, and its
-    // tx.result, which gossips the store online, failed. The retry gossips it instead (Todo 5.10)
+    // tx.result, which gossips the store online, failed. The retry gossips it instead
     val retry = StopRetrying.collisionRetry()
     client.transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
       for
@@ -526,7 +526,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
         List(Insert(HostState.StateKey, hs.encode())))
 
     // An attempt that committed but was reported TransactionOutcomeUnknown leaves the device owned here, which the
-    // retry recognizes as its own adoption rather than a change by someone else (Todo 5.10). Its disk-side steps
+    // retry recognizes as its own adoption rather than a change by someone else. Its disk-side steps
     // (markRebuildRequired) ran before that commit and are idempotent; the re-read state is what it wrote
     val retry = StopRetrying.collisionRetry()
     client.transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>

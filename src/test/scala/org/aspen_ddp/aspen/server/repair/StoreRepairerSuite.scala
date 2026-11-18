@@ -104,7 +104,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
           tx.commit().map(_ => ())
 
   /** Removes the object's allocationTree entry, standing in for an AllocationFinalizationAction that has yet to run
-    * (repair F5): the object is live, and only its record is missing
+    * (repair-process 8.3): the object is live, and only its record is missing
     */
   private def forgetAllocation(objectId: ObjectId): Future[Unit] =
     val key = Key(objectId.toBytes)
@@ -423,10 +423,11 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       result.repaired shouldBe 0
       stillThere shouldBe true
 
-  // G8: the age gate compares the repairing host's HLC with the marker transaction's, so a repairer whose clock runs
-  // ahead opens it early. It only paces: the read decides, and a committed allocation its stores have not applied yet
-  // reads as AllocationPending, never as a deletion: the read waits for the allocation to apply (the stores park it)
-  // and then finds the object live. An age of zero is the gate a fast enough repairing clock sees
+  // repair-process 13, clock skew: the age gate compares the repairing host's HLC with the marker transaction's, so a
+  // repairer whose clock runs ahead opens it early. It only paces: the read decides, and a committed allocation its
+  // stores have not applied yet reads as AllocationPending, never as a deletion: the read waits for the allocation to
+  // apply (the stores park it) and then finds the object live. An age of zero is the gate a fast enough repairing clock
+  // sees
   test("an entry past the age gate whose allocation has committed but not yet applied is kept, not deleted (G8)"):
     @volatile var allocating: Option[TransactionId] = None
     @volatile var held: List[TxResolved] = Nil
@@ -484,7 +485,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       p.failure(new RepairSlotOccupied(os.pointer.id, occupant))
 
   test("a repair over a foreign occupant the allocation tree does not list drops the occupant and keeps the entry"):
-    // cross-document-review X6: a missed delete of the occupant left it in the slot the repaired object now has
+    // repair-process 6.5: a missed delete of the occupant left it in the slot the repaired object now has
     val occupant = ObjectId(new UUID(21, 21))
     val target = occupiedTarget(occupant)
     val repairer = StoreRepairer(client, target)
@@ -569,7 +570,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       stillThere shouldBe true
 
   test("a deletion the store defers while the object is in use keeps the entry for a later pass"):
-    // Repair F6: Frontend.deleteObjectForRepair refuses while a read, commit or transaction is on the object
+    // repair-process 7: Frontend.deleteObjectForRepair refuses while a read, commit or transaction is on the object
     val objectId = ObjectId(new UUID(11, 12))
     var refuse = true
     var deletes = 0
@@ -1246,7 +1247,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
 
   private def hasStub(i: Int, txid: TransactionId): Boolean = storeFrontend(i).hasAppliedStub(txid)
 
-  // A store expires its stubs itself (Frontend.expireStubs, Todo 4.6): the scan reads and drops none
+  // A store expires its stubs itself (Frontend.expireStubs; transaction-recovery 5.4): the scan reads and drops none
   test("deleting an UnackedCommits entry leaves the store's stub for it"):
     val repairer = StoreRepairer(client, SeamTarget())
     for
@@ -1339,7 +1340,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
 
   // A silent voter has an errorTree mark for every object its UnackedCommits entry names (the marker marks every store
   // that sent no TxCommitted). The errorTree pass's completed repair already covers the entry, so the UnackedCommits
-  // pass does not read and reconcile the object a second time (repair-process RP-N3)
+  // pass does not read and reconcile the object a second time (repair-process 5.3)
   test("a UnackedCommits entry whose objects the errorTree pass repaired is deleted without reconciling them again"):
     @volatile var target: Option[ObjectId] = None
     val reconciles = java.util.concurrent.atomic.AtomicInteger(0)
@@ -1418,7 +1419,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
 
   // A replay may create a Tx for T at a store whose floor T is still above, after the scan's holdsTransaction check,
   // and apply T late through the entry once its reconcile is done. Deleting the entry then would leave that apply
-  // unrepaired (transaction-recovery R-N9), so the entry waits until no new Tx for T can appear
+  // unrepaired (repair-process 5.4), so the entry waits until no new Tx for T can appear
   test("a UnackedCommits entry whose transaction the store may still join is left for a later pass"):
     val target = SeamTarget()
     val repairer = StoreRepairer(client, target)
@@ -1511,7 +1512,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       stored(2, dataPtr.id) shouldBe None
       remaining shouldBe empty
 
-  // Cross-document-review G7: a client keeps a deleted object's pointer and the last state it read (an application's
+  // cross-document-review 2.6: a client keeps a deleted object's pointer and the last state it read (an application's
   // own pointer, amoebafs's cached inode or segment, a TKVL cached node), while one store missed the deletion and
   // still serves a live copy, a zombie slice. Nothing the client can build from that state reads or revives the
   // object: every store that applied the deletion fails each requirement on it (MissingObject), and the zombies are
@@ -1599,9 +1600,8 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     yield
       held shouldBe defined
 
-  // Repair F15: a deleted object whose allocation entry has not been removed yet failed its repair read with
-  // InvalidObject on every pass (logged at error) until the entry was gone and 60 s old. A read that proves the
-  // deletion now drops the slice whether or not the allocation tree still lists the object
+  // A deleted object whose allocation entry has not been removed yet fails its repair read with InvalidObject. A
+  // read that proves the deletion drops the slice whether or not the allocation tree still lists the object
   test("an errorTree entry for a deleted object the allocation tree still lists deletes it from the store"):
     for
       dataPtr <- sharedDataObject()
@@ -1639,8 +1639,8 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       stored(2, dataPtr.id) shouldBe None
       remaining shouldBe empty
 
-  // Repair F5: an object absent from the allocation tree may be live, its AllocationFinalizationAction late. Before
-  // Todo 2.6 an aged entry then dropped the store's live slice; now a read decides, and it is repaired instead
+  // repair-process 8.3: an object absent from the allocation tree may be live, its AllocationFinalizationAction
+  // late. A read decides, not the entry's age, and the object is repaired instead of dropped
   test("an aged errorTree entry for a live object the allocation tree does not list repairs it, not deletes it"):
     val repairer = StoreRepairer(client, SeamTarget())
     for

@@ -54,8 +54,8 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     markTask = None
   }
 
-  /** The stores the hand-off planned UnackedCommits entries for (Ruling 7), set with `handedOff` whatever the write's
-    * outcome; empty before, and for good if cancelled first
+  /** The stores the hand-off planned UnackedCommits entries for (transaction-recovery 5.4), set with `handedOff`
+    * whatever the write's outcome; empty before, and for good if cancelled first
     */
   private var planned: Set[StoreId] = Set()
 
@@ -259,8 +259,8 @@ object MissedUpdateFinalizationAction extends RegisteredTypeFactory with Finaliz
     *
     * With the pool (the tree's) and the ObjectId (the key), the type and storePointer rebuild the object's pointer
     * (ErrorEntry.pointer). Repair needs it to read an object absent from the allocation tree, which is the only other
-    * place the pointer is kept: the read is what tells a deletion from an allocation recorded late (repair F5). The
-    * type is unknown only for a commit error on an object the transaction does not reference, which
+    * place the pointer is kept: the read is what tells a deletion from an allocation recorded late (repair-process
+    * 2.2). The type is unknown only for a commit error on an object the transaction does not reference, which
     * RequirementsChecker never reports
     */
   def encodeErrorEntry(missedTimestamp: HLCTimestamp, objectType: Option[ObjectType.Value],

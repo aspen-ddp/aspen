@@ -46,7 +46,8 @@ object KVObjectState {
   /** Whether an Insert by the transaction writing `revision` at `timestamp` replaces `existing`: last writer wins on
     * (timestamp, revision). Equal is the same transaction applying again, which writes the same value. An Insert a
     * later one has superseded is a no-op, so a store that applies sequential writes of a key out of order (a lagging
-    * store, or a crash re-apply of a recovered vote) converges with the others (transaction-requirements F1, F2).
+    * store, or a crash re-apply of a recovered vote) converges with the others
+    * (transaction-requirements 9.3).
     * A checked Insert (KeyRevision, DoesNotExist, a required object revision) always wins: its check rejects a key
     * written later, and the client's HLC puts the transaction after the state it read.
     */

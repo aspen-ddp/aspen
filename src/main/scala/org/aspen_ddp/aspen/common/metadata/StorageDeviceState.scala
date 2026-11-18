@@ -46,8 +46,8 @@ object StorageDeviceState:
    *  and the destination's TransferringIn entries. It is carried in the on-disk transfer markers
    *  so a copy left behind by an earlier, aborted transfer is never mistaken for this one's. */
   /** `acceptLoss` is set by an operator, only on a Rebuilding entry (AspenClient.acceptRebuildLoss): the rebuild may
-   *  finish past objects the pool cannot supply, recording each in the ErrorTree (Rebuild F15). Every write of an
-   *  entry by setStoreEntry clears it, so an acceptance covers one rebuild. */
+   *  finish past objects the pool cannot supply, recording each in the ErrorTree (rebuild-process 5.5). Every write of
+   *  an entry by setStoreEntry clears it, so an acceptance covers one rebuild. */
   /** On a Rebuilding entry `transferId` is the rebuild episode instead: a fresh UUID written by every transition
    *  into Rebuilding (setRebuilding). The rebuild records it in its checkpoint and its rebuild-complete marker, so
    *  staging or a finished copy left by an earlier Rebuilding episode of the store is never resumed or promoted

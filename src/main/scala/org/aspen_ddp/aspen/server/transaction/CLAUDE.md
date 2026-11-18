@@ -16,24 +16,25 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - A Tx's object data is dropped from its CRL state once its commits persist, in memory only (`crl/CLAUDE.md`). A
   deletion of an object the Tx allocated first re-saves the state without that object's update
   (`persistWithoutUpdateOf`, `droppedUpdates`; later saves leave it out too), so a restart cannot allocate it again
-  over the deletion (R-N13; `server/store/CLAUDE.md`, Deletion after allocation)
+  over the deletion (transaction-requirements 9.4; `server/store/CLAUDE.md`, Deletion after allocation)
 - Finalization failure path (`TransactionDriver.startFinalizer`): a finalizer that cannot be created, or whose
   `complete` fails, is logged at error and started again from scratch after a backoff (1 s doubling to 60 s) until
   one completes, the driver finalizes another way, or it shuts down. Never finalize without the actions: the marker's
   entries are what repair and owed stores rely on. TxFinalized's `owed` includes the planned stores of failed
   finalizers (`failedHandedOff`). An action that gives up must fail its `complete`, never leave it pending
   An action whose type cannot be created (user jar missing, version skew) is a failed action: the marker still runs,
-  and the transaction stays unfinalized, alarmed, until a driver that has the type finalizes it (safety X8)
-- Marker order (Ruling 8, revised 2026-11-17; `RegisteredTransactionFinalizerFactory.Finalizer`): every action,
+  and the transaction stays unfinalized, alarmed, until a driver that has the type finalizes it (transaction-recovery
+  10.3)
+- Marker order (transaction-recovery 4.4; `RegisteredTransactionFinalizerFactory.Finalizer`): every action,
   the missed-update marker included, executes at once, so an action failing or retrying through an outage never keeps
   the missed stores unmarked. `complete` waits for every action, then fails with the first failure.
   An action whose type cannot be loaded, or whose factory throws, is a failed action (`Finalizer.of`), not a failed
   finalizer creation
-- Stall alarm (Todo 4.9): a committed transaction its driver has not finalized `FinalizationStallAfter` (60 s) after
-  resolving it is a stall (`TransactionDriver.finalizationStall`; `Store.stalledFinalizations` is the metric). Each
-  store logs one `FINALIZATION STALLED` error line a minute while it has any (`FinalizationStallReport`). Stalls are
-  by design: an action failing every attempt, a metadata outage blocking the marker (R-F14), an entry too large for
-  a tiny node (repair-process 13.0b)
+- Stall alarm (paxos-transactions 7.7): a committed transaction its driver has not finalized `FinalizationStallAfter`
+  (60 s) after resolving it is a stall (`TransactionDriver.finalizationStall`; `Store.stalledFinalizations` is the
+  metric). Each store logs one `FINALIZATION STALLED` error line a minute while it has any (`FinalizationStallReport`).
+  Stalls are by design: an action failing every attempt, a metadata outage blocking the marker (transaction-recovery
+  10.3), an entry too large for a tiny node (repair-process 13, large UnackedCommits entries)
 - If the refcount of the object is set to zero, it is deleted
 
 #### Paxos
@@ -45,27 +46,27 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - The CRL stores the persistent state Paxos requires (`server/crl/CLAUDE.md`)
 - The driver tallies each object's votes from its own pool's stores. `Undetermined` (a Tx resolved before it voted)
   is no vote: it counts neither as a reply nor as an abort. A round whose votes cannot decide proposes an accepted
-  value its promise quorum reports (paxos F7)
-- Every object is classified (paxos F8): commit-certain (`c >= t`), abort-certain (`w - a < t`) or undecided. Any
-  abort-certain object decides abort at once; all commit-certain decides commit. An undecided tally only waits (silence
-  may be transient): a driver never proposes abort on it, since a client may learn commit from stores' votes. Expiry
-  ends such a Tx (the expiry rules A-G below). A proposed abort (abort-certain tally) is an ordinary Paxos proposal
-  (paxos-transactions P7a): an accepted value in the quorum still wins
+  value its promise quorum reports (paxos-transactions 7.2)
+- Every object is classified (paxos-transactions 7.2): commit-certain (`c >= t`), abort-certain (`w - a < t`) or
+  undecided. Any abort-certain object decides abort at once; all commit-certain decides commit. An undecided tally only
+  waits (silence may be transient): a driver never proposes abort on it, since a client may learn commit from stores'
+  votes. Expiry ends such a Tx (the expiry rules A-G below). A proposed abort (abort-certain tally) is an ordinary Paxos
+  proposal (paxos-transactions P7a): an accepted value in the quorum still wins
 - Proposer ids are pool indexes, so only the primary pool's stores propose (`TransactionDriver.mayPropose`). A driver on
   any other store is learn-only: it sends prepares and resolves, proves late and finalizes from what it hears, but sets
   no proposal and sends no Accept. A Tx counts prepares and heartbeats as driver activity only from a primary-pool
   sender (`Tx.fromProposer`), so a learn-only driver's retransmits never stop a primary store taking over an idle
-  transaction; with no primary store reachable, the Tx ends by expiry (paxos F4)
+  transaction; with no primary store reachable, the Tx ends by expiry (paxos-transactions 7.6)
 - Only the designated leader's first driver, the one its client's prepare creating the Tx starts
   (`Store.driveTransaction(initialProposal = true)`), keeps the initial proposal `(1, L)`. Every other driver starts
   at round 2 or higher, above the highest id its own acceptor promised or accepted (`TransactionDriver.Start`,
-  `Tx.highestProposal`; paxos F5)
+  `Tx.highestProposal`; paxos-transactions 7.5)
 - The local proposal is sticky across rounds (votes are immutable), so a later round skips the tally: its first
-  prepare quorum queues the Accept at once (`queueAcceptMessages`, `acceptQueuedThisRound`; paxos F12)
+  prepare quorum queues the Accept at once (`queueAcceptMessages`, `acceptQueuedThisRound`; paxos-transactions 7.3)
 - A conflicting second outcome (split decision) is logged as an error and counted in the host status cache's
   `splitDecisions` (`TransactionStatusCache.recordSplitDecision`) by the cache itself, the Tx (`receiveResolved`,
   `receiveFinalized`) and the driver (`Start.onSplitDecision`); each keeps its first outcome, and a driver that resolved
-  commit ignores an abort `TxFinalized` (paxos F11). A store drops a driver on `TxFinalized` only if the driver is
+  commit ignores an abort `TxFinalized` (P19). A store drops a driver on `TxFinalized` only if the driver is
   then finalized (`isFinalized`); one that ignored it stays until its own `TxFinalized`
 
 #### Proofs and late resolution
@@ -84,17 +85,17 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - Driver prepares are prefer-abort (`fromClient == false`): a Tx with no vote and no client prepare never checks
   requirements on one. It proves at once if it can (`appliedBy`), else withholds its whole response until the data, a
   client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes: then it votes abort
-  (`NoClientPrepare`). The 5 s run from the Tx's creation, not a client retransmit (P-N8). End to end (G11):
+  (`NoClientPrepare`). The 5 s run from the Tx's creation, not a client retransmit (paxos-transactions 6.2). End to end:
   ReplayIntegrationSuite's driver-first test, whose leader driver retransmits (`TestNetwork.HostOptions.leaderRetransmits`;
   by default TestNetwork's leader driver never sends prepares). A Tx recovered without a
-  vote does not wait for a driver: it votes abort and promises at once (P-N7), but stays undecided after load so a
-  client retransmit that arrives first is still checked. This holds for data-less transactions too, so their late
-  resolution may take 5 s longer. A vote
+  vote does not wait for a driver: it votes abort and promises at once (paxos-transactions 6.2), but stays undecided
+  after load so a client retransmit that arrives first is still checked. This holds for data-less transactions too, so
+  their late resolution may take 5 s longer. A vote
   given stands, but later data is still used to apply a commit. Adopted data is saved to the CRL first: the commit
-  waits for that save (`Tx.adoptedDataUnsaved`, `saveAdoptedData`; paxos F14). A delayed duplicate client prepare of an aborted
-  transaction cannot commit it: every store that took part remembers the abort for longer than it would join T, and
-  refuses T past its forget floor (below)
-- Description validation (transaction-requirements F7, Q-N4): a client-prepared Tx checks its description once,
+  waits for that save (`Tx.adoptedDataUnsaved`, `saveAdoptedData`; P13). A delayed duplicate client prepare of an
+  aborted transaction cannot commit it: every store that took part remembers the abort for longer than it would join T,
+  and refuses T past its forget floor (below)
+- Description validation (transaction-requirements 2.5): a client-prepared Tx checks its description once,
   before its requirements (`DescriptionValidator`, `Tx.invalidDescription`). A refusal votes abort for every object
   (`InvalidDescription`, a non-object error, never waited out) and logs a warning. The check covers its pool's IDA
   (`Frontend.poolIDA`), the primary object and leader, one update per object, and the pin rule. It runs at vote only,
@@ -116,7 +117,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - A recovered unresolved commit vote looks its entry up (`UnackedCommitLookup`, from the
   Host) once loaded and again before accepting any abort. It is driven at once (no driver only while the CRL loads,
   `Frontend.recoveryPending`): under the forget floor no store that forgot T answers a driver, so Paxos cannot choose
-  abort over a chosen commit (Todo 4.4, R-N3; Ruling 20's wait is gone). A found entry proves the commit to its own
+  abort over a chosen commit (paxos-transactions 6.4, 10.10). A found entry proves the commit to its own
   driver, at its start or, if one already runs, through `Frontend.onCommitProven` -> `Store.giveProof`; the Tx applies
   its saved update locally, logs
   it at info and stays until TxFinalized, writing no status-cache entry (a Tx holding a late commit that finds its
@@ -141,14 +142,15 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   its own (`applyNothing` still writes one already owed: `stubDue`). A forget-lookup (`forgetLookupHeld`, T already
   applied here) writes its stub as for any found entry; one still unanswered once T is past the horizon plus the
   expiry margin is forgotten as finalized without a stub (`Tx.forgetWithoutStubPastExpiry`, from
-  `Frontend.expiryHeartbeat`; R-N10): the floor then refuses every new Tx for T, so the stub could suppress nothing. A found entry of any incarnation is never taken as absent.
-  The entry is left for the repair scan, whose reconcile installs the committed state
+  `Frontend.expiryHeartbeat`; paxos-transactions 10.10): the floor then refuses every new Tx for T, so the stub could
+  suppress nothing. A found entry of any incarnation is never taken as absent. The entry is left for the repair scan,
+  whose reconcile installs the committed state
 - A recovered Tx whose saved status is resolved (re-saved by a prepare or accept after the resolution) restores it
   into `oresolution`. It takes no locks and needs no lookup: once its objects load it applies the commit with the
   recovered re-check rules, or deletes the abort's state, then waits for TxFinalized as a live resolved Tx does
 - Coverage: entries exist only for unacknowledged counted voters (every silent store when the voters are unknown).
   These reach the write threshold, so uncounted voters and non-voters are repaired by their ErrorTree marks alone
-  (transaction-recovery F13/F15). Any narrowing of entries must keep this rule
+  (transaction-recovery 5.3). Any narrowing of entries must keep this rule
 
 #### Expiry (transaction horizon design, section 2)
 - A Tx still unfinalized past the horizon plus the expiry margin (`Frontend.expiryMargin`: `MaxStartLead` +
@@ -158,7 +160,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   heartbeat (`Frontend.expiryHeartbeat`) it sends `TxStatusRequest` to every other store of T, at once, then after 1,
   2, 4 and every 8 heartbeats. Each round has a fresh `requestUUID` and counts only its own replies, plus the Tx's own
   acceptor state (a muted Tx holds none)
-- Freeze (`Tx.frozen`, cross-document G1): once T is past expiry by the store's own clock, its Tx promises and
+- Freeze (`Tx.frozen`, paxos-transactions 10.10): once T is past expiry by the store's own clock, its Tx promises and
   accepts nothing more, as if offline, which Paxos allows. Derived from the clock, so a reload cannot thaw it. An
   unresolved Tx answers a status request only once frozen with its objects loaded (or muted for good), so every state a
   tally counts is final: a vote never changes and nothing more is accepted. A frozen Tx decides no vote
@@ -205,7 +207,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   whose missed-update marks repair the stores that never applied it.
   No two observers reach a commit and a discard: reported states are final, so observers differ only in which stores
   are silent to them, and a store silent to one observer only adds to the other's `vc + s` / `vc + k + s`. With every
-  store replied and none amnesiac (rebuild F6) either A or E fires.
+  store replied and none amnesiac (rebuild-process 6.4) either A or E fires.
   A Tx that knows its outcome passes it (`known`): rule 1 then adopts only a finalized or late commit of a known
   commit, and otherwise it concludes once more than `w - t` primary stores are non-holders (no acceptor state and not
   amnesiac: a commit is forgotten only at TxFinalized), or holds
@@ -219,8 +221,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   status cache alone (no outcome is known). An expiring commit vote also holds an abort for a lookup, as a recovered
   one does, and its store drives it meanwhile, as it does a recovered one
 - Why a rebuilt store must count as amnesiac, never as having nothing: its acceptor state was lost with T undecided,
-  so with one store that never heard of T it once made the last holders of a chosen commit discard it (cross-document
-  G1; HorizonIntegrationSuite "holders of a chosen commit apply it past expiry though a rebuilt store forgot it")
+  so with one store that never heard of T it once made the last holders of a chosen commit discard it (rebuild-process
+  6.4, cross-document-review 2.1; HorizonIntegrationSuite "holders of a chosen commit apply it past expiry though a
+  rebuilt store forgot it")
 - A driver of a transaction past the horizon plus the margin that has no outcome is stopped and removed once its
   store holds no Tx for it (`Store.removeExpiredDrivers`). A driver with an outcome keeps running its finalization
 - Rejoin invariant: once a store discards T, its floor makes it refuse every later prepare for T: a discarded
@@ -241,7 +244,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   a stub may precede its entry. A commit at a store with a stub applies nothing; a non-late one reports its objects in
   `objectCommitErrors`. The store drops a stub itself (`Frontend.expireStubs`, at heartbeat) once T is past the
   horizon plus the expiry margin and it holds no Tx for T (live, deferred, awaiting backend commits or a quarantine):
-  below the floor no prepare creates a Tx for T, so the stub can suppress nothing (Todo 4.6, CRL F22). A queue
+  below the floor no prepare creates a Tx for T, so the stub can suppress nothing (crash-recovery-log 3.6). A queue
   ordered by expiry (`stubExpiry`, stale entries skipped) means a heartbeat looks only at the stubs due, and a stub a
   Tx keeps past its expiry waits in `heldStubs` without blocking the rest. Stubs are so
   bounded by their rate times ~30 s whatever the repair scans do; the scan neither reads nor drops them. An entry with
@@ -252,7 +255,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   object whose key T inserts was deleted since is quarantined, not re-inserted);
   otherwise the entry's reconcile installs the committed state, since repair leaves the entry until the store can no
   longer join T
-  (`server/repair/CLAUDE.md`; transaction-recovery Todo 2.9 re-assessment)
+  (`server/repair/CLAUDE.md`; transaction-recovery 5.4)
 - A Tx finalized while its commit is held for its turn defers concluding its state (`Frontend.finalizationDeferred`).
   Every deferring Tx of the txid (a replay's too) is listed, and the state is deleted or stubbed only by the call that
   empties the list; a stub owed meanwhile passes to every listed Tx
@@ -284,7 +287,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   (the relay reports it late) and finalization evidence (a prepare for a transaction the store does not hold is
   ignored), so an entry must never be wrong or downgraded. Its retention is not relied on: a lost entry's transaction
   is below the forget floor
-- `TransactionStatusCache.updateStatus` keeps Committed over an opposite outcome (Ruling 30). Under the horizon an
+- `TransactionStatusCache.updateStatus` keeps Committed over an opposite outcome (P19). Under the horizon an
   opposite outcome should never arise: one that does is logged as an error ("Split decision") and counted
   (`splitDecisions`)
 - `AbortVoteReport` logs a host's abort votes by failed requirement once a second while they happen

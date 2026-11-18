@@ -695,7 +695,8 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
         case _ => false
       .shouldBe(true)
 
-  // Monotone entries (repair F10): writes by separate markers, as by two clients, a re-run finalizer or a replay
+  // Monotone entries (repair-process 2.6): writes by separate markers, as by two clients, a re-run finalizer or a
+  // replay
 
   atest("an older miss marked after a newer one keeps the newer mark and writes it again"):
     val objectId = ObjectId(UUID.randomUUID())
@@ -806,7 +807,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil))
     fa.handedOffStores shouldBe empty
     fa.markMissedUpdates()
-    // The planned set is known from the hand-off, before the write lands (Ruling 7)
+    // The planned set is known from the hand-off, before the write lands
     fa.handedOffStores shouldBe Set(net.storeId2)
 
     // The store whose entry is being written now reports in
@@ -817,9 +818,9 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     for _ <- fa.complete yield
       fa.handedOffStores shouldBe Set(net.storeId2)
 
-  // R-N7 variant 2: a mark of several pools whose write fails part way (one pool's batch committed, another gave up)
+  // A mark of several pools whose write fails part way (one pool's batch committed, another gave up)
   // fails as a whole. The planned set still lists every store, cancelled or not, and the action fails, so its driver
-  // starts the finalizer again (transaction-recovery F2)
+  // starts the finalizer again (paxos-transactions 7.7)
   for cancelAfter <- List(false, true) do
     atest(s"a partially failed mark still lists every planned store (cancelled after hand-off: $cancelAfter)"):
       val txd = refcountTxd(pointerWith(Array[Byte](7, 5)))

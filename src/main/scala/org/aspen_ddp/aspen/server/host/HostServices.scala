@@ -74,7 +74,7 @@ class HostServices(ctx: DeviceControl) extends Logging:
                 // the control-context foreach; the prepare closure's combinators run on the control thread
                 // A root already present is used, not replaced: it is this host's own from an attempt that
                 // committed but was reported TransactionOutcomeUnknown, or a concurrent initializer's. Allocating
-                // another under DoesNotExist would abort at the stores on every retry (Todo 5.10). Nothing is staged
+                // another under DoesNotExist would abort at the stores on every retry. Nothing is staged
                 // then, and the empty transaction succeeds
                 ctx.client.transactUntilSuccessful { tx =>
                   ctx.client.read(hostPtr).flatMap: currentHostKvos =>

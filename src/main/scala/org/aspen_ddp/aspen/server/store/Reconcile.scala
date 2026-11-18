@@ -18,10 +18,10 @@ import org.aspen_ddp.aspen.common.store.StoreId
   * @param proven set by the repairer: parts a committed proof transaction showed the read to be current on
   *               (RepairProofs). The locks the read reports on them are ignored; the store's own locks still defer
   *               them
-  * @param awaitSettle set by the repairer once the object's repair has been stale for several passes (repair F8): a
-  *                    store whose object is unsettled (a commit or repair write in flight, or held for recovery)
-  *                    parks the reconcile until the object settles, up to Frontend.RepairSettleWait, instead of
-  *                    answering stale at once
+  * @param awaitSettle set by the repairer once the object's repair has been stale for several passes
+  *                    (repair-process 8.2): a store whose object is unsettled (a commit or repair write in flight,
+  *                    or held for recovery) parks the reconcile until the object settles, up to
+  *                    Frontend.RepairSettleWait, instead of answering stale at once
   */
 final case class RepairSnapshot(objectId: ObjectId, revision: ObjectRevision, refcount: ObjectRefcount,
                                 timestamp: HLCTimestamp, keyRevisions: Map[Key, ObjectRevision],
@@ -156,8 +156,8 @@ object Reconcile:
       // refcount change advances the timestamp without the revision, so equal timestamps with differing revisions
       // mean the store missed a data write: the revision, not the timestamp, decides. A read older than the store
       // with a differing revision is not proof the store caught up: the store may have missed a data write and
-      // applied a later refcount update the read's responders have yet to apply (repair F13). It is left for a later
-      // pass, which reads once they have
+      // applied a later refcount update the read's responders have yet to apply (repair-process 6.3). It is left for a
+      // later pass, which reads once they have
       val (data, dataStale) =
         if locks.objectLevel || read.revision == current.revision then
           (None, false)

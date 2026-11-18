@@ -103,7 +103,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
       audit.built.flatMap(_.description.requirements) should contain (SharedRevisionLock(ptr, updated.revision))
 
   // A run after the object's deletion: the read proves it deleted, so no entry is recorded and no orphan is left
-  // (transaction-requirements Q-N5). A run that reads it before the stores apply the allocation retries instead
+  // (transaction-requirements 9.4). A run that reads it before the stores apply the allocation retries instead
   // (FrontendSuite "a read of an allocation voted for but not applied answers AllocationPending")
   atest("a run after the object's deletion records no entry"):
     for
@@ -125,7 +125,7 @@ class AllocationFinalizationActionSuite extends IntegrationTestSuite:
   // The allocating transaction's own action runs as soon as it resolves. Its stores have not applied the allocation
   // yet when it reads (here they never hear the outcome until the test delivers it): each answers AllocationPending,
   // which proves nothing, so the action retries and records nothing meanwhile. Taking the miss as a deletion would
-  // skip the entry; recording it without a lock would leave an orphan on a later run (transaction-requirements Q-N5)
+  // skip the entry; recording it without a lock would leave an orphan on a later run (transaction-requirements 9.4)
   atest("the action retries until the stores apply the allocation, then records the entry under a lock"):
     @volatile var target: Option[TransactionId] = None
     val held = new java.util.concurrent.ConcurrentLinkedQueue[TxMessage]()

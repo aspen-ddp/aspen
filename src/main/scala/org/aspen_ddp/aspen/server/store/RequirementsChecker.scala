@@ -25,7 +25,7 @@ object RequirementsChecker extends Logging {
     * @param nanoTime Clock for the exclusive preference window
     * @param allocatedOver Objects the transaction allocates whose load found an existing state (in memory or in the
     *                 backend) rather than a fresh one. A replayed allocation must never overwrite a live object
-    *                 (transaction-requirements F11), so every requirement on them fails with ObjectExists
+    *                 (transaction-requirements 9.4), so every requirement on them fails with ObjectExists
     * @param allocating The objects the transaction allocates (TransactionDescription.allocatingObjects). Their initial
     *                 content is the one KeyValue update that may be blind (see BlindWrite)
     * @return Tuple of object specific errors and a list of non-object errors
@@ -52,9 +52,9 @@ object RequirementsChecker extends Logging {
       * initial content), a key Delete needs a KeyRevision on its key, a required revision or a content lock, and a
       * change of min, max, left or right needs a required revision. A blind Delete leaves no tombstone and
       * object-level parts carry no timestamp, so neither can be ordered against other writes, and repair cannot see
-      * them: a no-op blind Delete leaves no trace for its snapshot (repair F4), and an object-level change that does
-      * not move the revision escapes a repair proof's ExclusiveRevisionLock (repair F11). Enforced here too so a
-      * client that bypasses the builder cannot issue one
+      * them: a no-op blind Delete leaves no trace for its snapshot and an object-level change that does not move the
+      * revision escapes a repair proof's ExclusiveRevisionLock (repair-process 1.2, Q8; transaction-requirements 2.5).
+      * Enforced here too so a client that bypasses the builder cannot issue one
       */
     def refuseBlindWrites(r: KeyValueUpdate, ops: List[KeyValueOperation]): Unit =
       val oid = r.objectPointer.id
@@ -246,7 +246,7 @@ object RequirementsChecker extends Logging {
     // The exclusive preference window: new shared lockers back off so that this transaction gets in on its retry. Only
     // for a transaction blocked by nothing but held shared locks here; one that fails on anything else (a stale
     // revision, another lock, a non-object error) could not commit after the holders release, so it would only starve
-    // shared lockers (transaction-requirements F13)
+    // shared lockers (transaction-requirements 4, exclusive preference window)
     val onlySharedBlocked = sharedBlocked.nonEmpty && nonObjectErrors.isEmpty && objectErrors.forall { (oid, err) =>
       sharedBlocked.get(oid).exists(holder => err == TransactionCollision(holder))
     }

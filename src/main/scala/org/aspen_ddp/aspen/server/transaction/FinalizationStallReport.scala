@@ -22,7 +22,7 @@ object FinalizationStallReport:
   /** The most stalled transactions a report names besides the oldest */
   val MaxListed = 10
 
-/** The finalization stall alarm of one store (Todo 4.9; transaction-recovery R-N2, F14; repair-process 13.0b).
+/** The finalization stall alarm of one store (paxos-transactions 7.7, finalization failures).
   * Finalization stalls by design while an action fails on every attempt or the marker cannot write: the driver retries
   * with backoff and never finalizes without its actions. The store passes its drivers' stalls at every heartbeat, and
   * this returns a `FINALIZATION STALLED` line for it to log at error at most once per `Every`, while stalls exist. A

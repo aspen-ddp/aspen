@@ -89,7 +89,7 @@ class LogEntry(image: Image) extends Logging:
     // Deletions are final (deletesFinally). A save of a transaction deleted earlier in an unwritten entry is a timing
     // artifact and is skipped, but it still reports success once the delete is durable. SimpleCRL never adds such a
     // save here: it queues only the handler, since readStoreState would report the record live (crash-recovery-log
-    // F4, W1b).
+    // C9, W1b).
     //
     // A deletion made by a stub's save or a dropStore (deleteTxUnlessResaved) is not final: a save after it is a new
     // state of the transaction (live beside the stub, or of the store loaded again). The save cancels that deletion,
@@ -291,7 +291,7 @@ object LogEntry:
   ///   body_crc - 4: CRC32C of the dynamic and static data, through the trailing UUID (not the padding)
   ///   header_crc - 4: CRC32C of the header bytes before it
   ///
-  /// Recovery takes nothing from an entry whose checksums fail (Recovery, crash-recovery-log F5)
+  /// Recovery takes nothing from an entry whose checksums fail (Recovery, crash-recovery-log C6, C7)
   ///
   /// Static data: transactions, applied stubs (TxId and start timestamp each), transaction deletions, applied stub
   /// deletions (TxId each), stream UUID

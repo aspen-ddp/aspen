@@ -51,13 +51,15 @@
   store quarantined (`server/store/CLAUDE.md`, Quarantine): `repairUpdate` with the quarantining transaction's start as
   `minTimestamp`, proofs allowed, keyed `verifyDeferralKey` (prefix 3, kept by `DeferralState.retain`). It reads and
   deletes no entry, so the ownership fence and `mayJoinTransaction` do not apply. `complete` clears the quarantine
-- After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes in a row, `RepairProofs` commits a no-op
+- After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes since the last complete one, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
 - A proof cannot help a `stale` pass (the store's own copy is busy or changed), so stale passes escalate by waiting
   (repair F8): `DeferralState.recordStale` counts them per entry, and from `StoreRepairer.ParkAfterStalePasses` (3)
   on the repair sets `RepairSnapshot.awaitSettle`, so the store parks the reconcile until the object settles (up to
-  1 s; `server/store/CLAUDE.md`). Every `proofAfterDeferrals` stale passes in a row log a warning. The bootstrap
-  sweep (no proofs) neither counts nor parks
+  1 s; `server/store/CLAUDE.md`). Every `proofAfterDeferrals` stale passes log a warning. Only a complete pass resets
+  either count: a stale pass neither counts toward nor resets the lock-deferral count, and a lock-deferred pass keeps
+  the stale count, so parking continues once started. A hot object alternating busy and locked passes so reaches a
+  proof (repair-process 8.1). The bootstrap sweep (no proofs) neither counts nor parks
 - The completion gate (`read.timestamp >= missedTimestamp`) is sound (repair F3, X7): object timestamps never
   decrease, and a copied one (Reconcile, rebuild) is a read's, the max over the stores matching its revision, so a
   read that reflects the missed transaction passes it. A whole-object KeyValue pass that defers a locked key still

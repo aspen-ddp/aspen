@@ -346,7 +346,7 @@ repairUpdate(store, ptr, minTimestamp, entryKey, policy, deferral, allowProof):
   if allowProof && passes >= policy.proofAfterDeferrals:
       proven = prove(os, first)                    -- section 8
       if proven nonEmpty: result = reconcile(snap.copy(proven = proven), os); deferral.afterProof(entryKey, result)
-  if allowProof: deferral.recordStale(entryKey, result)   -- warns every proofAfterDeferrals stale passes in a row
+  if allowProof: deferral.recordStale(entryKey, result)   -- warns every proofAfterDeferrals stale passes
 ```
 
 `snapshotForRepair` gives `RepairSnapshot.of(state)` for a served state, `missing` for an object being deleted, and
@@ -486,7 +486,7 @@ is stale, so the entry stays and the next pass installs. A listed occupant is lo
 | M13 | Compare-and-delete on the entry's revision; every mark rewrites the entry | `deleteEntryIfUnchanged`, `MissedUpdateMarker.writeBatch` | Dropping an entry a mark rewrote after the read, older marks included |
 | M14 | Completion requires the read to be at least as new as the entry's timestamp | `repairUpdate` | Dropping an entry when the read cannot reflect the miss |
 | M15 | Proof transactions for persistently locked parts | `RepairProofs` | Waiting forever on a hot lock |
-| M16 | Parking a persistently stale repair until the object settles | `Frontend.parkRepair` | Retrying forever an object always busy at install |
+| M16 | Parking a persistently stale repair until the object settles, until a complete pass; stale passes keep the lock-deferral count | `Frontend.parkRepair`, `DeferralState.record`/`recordStale` | Retrying forever an object always busy at install, or alternating busy and locked |
 | M17 | Absence from the AllocationTree is not a deletion; only `InvalidObject.provesDeletion` drops a slice | `StoreRepairer.repairAbsent`, `repairListed` | Deleting the slice of a live object whose allocation is recorded late |
 | M18 | Ownership fence; `StoreNotHosted`; `abandoned` | `OwnershipFence`; `StoreRouter` | A departed or superseded copy consuming entries |
 | M19 | A failed backend write keeps the entry | `Frontend.repairWriteComplete` | Dropping an entry when the install did not reach disk |
@@ -502,11 +502,16 @@ In memory, one per store, kept across scans by `RepairService` and dropped when 
 (`StoreRepairer.DeferralState`). Keys: `errorDeferralKey(key, entry revision)` (prefix 0), `unackedDeferralKey(key,
 objectId)` (prefix 1), `sweepDeferralKey(nodeId)` (prefix 2), `verifyDeferralKey(objectId)` (prefix 3).
 
-- `record(entryKey, result)` counts consecutive passes that deferred something by a lock (`deferredKeys` non-empty or
-  `objectLevelDeferred`). A pass that defers nothing by a lock (complete, or only stale) forgets the entry and returns
-  0. When the pass was neither object-level deferred nor stale, `only` is set to the deferred keys, and the next pass
-  reconciles only those.
-- `recordStale` counts consecutive stale passes separately; a non-stale pass resets it.
+- `record(entryKey, result)` counts the passes since the entry's last complete pass that deferred something by a lock
+  (`deferredKeys` non-empty or `objectLevelDeferred`). A complete pass forgets the entry and returns 0. A pass that is
+  only stale returns 0 and keeps the count as it is: on a hot object stale and lock-deferred passes alternate, and
+  only a complete pass shows the locks are gone. It sets `only` to None, so the next pass reconciles the whole
+  object. When the pass was neither object-level deferred nor stale, `only` is set to the deferred keys, and the next
+  pass reconciles only those. `afterProof` follows the same rules, keeping the count.
+- `recordStale` counts stale passes separately. Only a complete pass resets it: a lock-deferred pass keeps it, so
+  once parking (8.2) has started for an entry it continues until a complete pass. A parked pass that meets a lock is
+  then followed by another parked pass, not by a stale one, and an object busy at every unparked install reaches a
+  proof in about `ParkAfterStalePasses + proofAfterDeferrals` passes.
 - `retain` (a completed scan) forgets entry keys the scan did not touch; sweep and verification keys are kept.
   `retainSweep` (a complete sweep walk) prunes sweep keys. A host restart forgets everything; the next pass reconciles
   whole objects and restarts the counts. Because an ErrorTree deferral key includes the entry's revision, a rewritten
@@ -515,7 +520,8 @@ objectId)` (prefix 1), `sweepDeferralKey(nodeId)` (prefix 2), `verifyDeferralKey
 ### 8.2 Parking (persistently stale objects)
 
 A proof cannot help a stale result (the store's own copy is busy or changed). After `ParkAfterStalePasses` (3) stale
-passes in a row, the repair sets `RepairSnapshot.awaitSettle`. An unsettled store then parks the reconcile
+passes since the entry's last complete pass, the repair sets `RepairSnapshot.awaitSettle`, and keeps setting it until a
+complete pass (8.1). An unsettled store then parks the reconcile
 (`Frontend.parkRepair`; at most one per object, a newer one replacing an older, which answers stale) instead of
 answering stale. `commitTurnFree` runs it first, at the one moment the object is settled, before any waiting
 transaction is told; the end of holding retries every parked repair too. It runs once, through the ordinary
@@ -782,21 +788,4 @@ background. Tracked in Backlog.txt (the fix there, timed reads mapped to deferra
 
 ## 14. Open weaknesses
 
-### RP-W2. A stale pass resets the lock-deferral count, so a hot object can alternate and never reach a proof (PLAUSIBLE; liveness)
-Mechanism: an unsettled object answers `ReconcileResult(Set(), false, stale = true)` before any locks are computed
-(`Frontend.reconcile`), and `DeferralState.record` forgets the entry on any result without lock deferral, resetting the
-proof count to 0. `recordStale` resets the stale count on any non-stale pass. Parking (`awaitSettle`, after 3 stale
-passes) produces a settled reconcile, which on a hot object usually reports locks (count 1) and resets the stale count;
-the next pass, not parked, meets a commit in flight again and resets the lock count.
-Trigger / scenario: S is behind on a KeyValue object written continuously (a hot TKVL node, a counter): each pass meets
-either a commit in flight at install (stale) or a key or object lock in the read (deferred). Sequence: stale, stale,
-stale, parked -> locked (1), stale (0), stale, stale, parked -> locked (1), ... `proofAfterDeferrals` (10) consecutive
-lock-deferred passes never occur.
-Consequence: the entry is never removed while the object stays hot. Parked passes do install unlocked parts, so S's
-copy converges except for parts locked at those instants, but the entry costs a full read and a reconcile at the
-30 s floor indefinitely, and parts locked at every parked pass stay behind.
-Suggested fix: do not reset the lock-deferral count on a stale pass, only on a complete or lock-free settled pass;
-or, once parking has started for an entry, keep parking (do not reset `awaitSettle`) until a pass is complete. Test:
-FrontendSuite/StoreRepairerSuite driving an object with a commit in flight on alternate passes and a lock on the rest;
-the entry must reach a proof.
-Effort: S   Priority: 4
+None.

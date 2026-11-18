@@ -1169,7 +1169,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       remaining shouldBe empty
       deferral.size shouldBe 0
 
-  test("a pass that is not stale resets an entry's stale count"):
+  test("a complete pass resets an entry's stale count, and a lock-deferred one keeps it"):
     Future.successful:
       val deferral = DeferralState()
       val key = Key(Array[Byte](1, 2, 3))
@@ -1178,6 +1178,9 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       deferral.recordStale(key, stale) shouldBe 2
       deferral.staleCount(key) shouldBe 2
       deferral.recordStale(key, ReconcileResult(Set(k0), false, stale = false)) shouldBe 0
+      withClue("a repair that started waiting for the object goes on waiting: "):
+        deferral.staleCount(key) shouldBe 2
+      deferral.recordStale(key, ReconcileResult(Set(), false, stale = false)) shouldBe 0
       deferral.staleCount(key) shouldBe 0
       deferral.recordStale(key, stale) shouldBe 1
       deferral.clear(key)
@@ -1767,6 +1770,46 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       (0 until net.stores.size).foreach(i => storeKeys(i, kvPtr) shouldBe Set(k0))
       remaining shouldBe empty
       deferral.deferredKeys(entryKey) shouldBe None
+
+  test("a hot object alternating stale and lock-deferred passes still reaches a proof (RP-W2)"):
+    // Store 2's copy is busy at every install the store does not wait out, and k2 is locked whenever it settles.
+    // Stale passes neither count toward the proof nor reset its count, and once parking starts it continues until a
+    // complete pass, so the parked, lock-deferred passes run up to the proof
+    @volatile var proofs = 0
+    val target = new SeamTarget:
+      override def reconcile(storeId: StoreId, snapshot: RepairSnapshot, read: ClientObjectState,
+                             p: Promise[ReconcileResult]): Unit =
+        if storeId == sid(2) && !snapshot.awaitSettle then p.success(ReconcileResult(Set(), false, stale = true))
+        else super.reconcile(storeId, snapshot, read, p)
+    val repairer = StoreRepairer(client, target, testingOnlyOnProof = (_, _, _) => proofs += 1)
+    val deferral = DeferralState()
+    for
+      (kvPtr, entryKey) <- lockedKeyScenario(target)
+      _ <- passes(StoreRepairer.ParkAfterStalePasses + RepairPolicy.Default.proofAfterDeferrals, 2, repairer, deferral)
+      remaining <- unackedEntries(2)
+    yield
+      proofs shouldBe 1
+      storeKeys(2, kvPtr) shouldBe Set(k0)
+      remaining shouldBe empty
+      deferral.size shouldBe 0
+      deferral.staleCount(entryKey) shouldBe 0
+
+  test("a stale pass neither counts toward nor resets an entry's lock deferrals"):
+    Future.successful:
+      val deferral = DeferralState()
+      val key = Key(Array[Byte](1, 2, 3))
+      val locked = ReconcileResult(Set(k0), false, stale = false)
+      val stale = ReconcileResult(Set(), false, stale = true)
+      deferral.record(key, locked) shouldBe 1
+      deferral.deferredKeys(key) shouldBe Some(Set(k0))
+      withClue("a stale pass does not count: "):
+        deferral.record(key, stale) shouldBe 0
+      withClue("a stale pass left something undone, so the next pass reconciles the whole object: "):
+        deferral.deferredKeys(key) shouldBe None
+      deferral.record(key, locked) shouldBe 2
+      deferral.record(key, ReconcileResult(Set(), false, stale = false)) shouldBe 0
+      deferral.size shouldBe 0
+      deferral.record(key, locked) shouldBe 1
 
   test("an aborted proof leaves the key deferred for a later pass"):
     // On the proof's pass, k2 is written between the read and the proof: the proof requires k2 absent, as the read

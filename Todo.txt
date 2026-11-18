@@ -66,11 +66,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
      broader than stated: any object below its read threshold or a key that stays NotRestorable stalls the scan
      the same way; update the Backlog text. Do the bounded read once for both consumers.
 
-4.5  A stale repair pass resets the lock-deferral count; a hot object never reaches a proof: RP-W2         [S]
-     PLAUSIBLE. DeferralState.record forgets on any non-lock result, and parking resets the stale count, so
-     stale/parked/locked alternation never reaches proofAfterDeferrals. Fix: do not reset the lock count on a
-     stale pass (or keep parking once started until a complete pass).
-
 
 PRIORITY 5: performance and hygiene
 -----------------------------------

@@ -78,19 +78,23 @@ final class ScanControl:
   *
   * Keyed per entry and object (StoreRepairer.errorDeferralKey, unackedDeferralKey). Only parts deferred by a lock
   * count: `deferredKeys` and `objectLevelDeferred`, the latter including a refcount deferred under an object lock. A
-  * pass that is only `stale` defers nothing by a lock: the object is retried on the next pass, but the pass neither
-  * counts toward `RepairPolicy.proofAfterDeferrals` nor triggers a proof, since a proof cannot help an object whose
-  * copy is busy with an outstanding write. Stale passes are counted on their own (`recordStale`): after
-  * `StoreRepairer.ParkAfterStalePasses` in a row the store is asked to wait for the object to settle before
-  * reconciling (RepairSnapshot.awaitSettle, repair F8). Safe to call from any thread.
+  * pass that is only `stale` defers nothing by a lock: the object is retried whole on the next pass, but the pass
+  * neither counts toward `RepairPolicy.proofAfterDeferrals` nor triggers a proof, since a proof cannot help an object
+  * whose copy is busy with an outstanding write. Nor does it reset the count: on a hot object stale and lock-deferred
+  * passes alternate, and only a complete pass shows the locks are gone. Stale passes are counted on their own
+  * (`recordStale`): after `StoreRepairer.ParkAfterStalePasses` of them the store is asked to wait for the object to
+  * settle before reconciling (RepairSnapshot.awaitSettle, repair F8), and keeps being asked until a complete pass, so
+  * a parked pass that meets a lock is followed by another parked pass rather than by a stale one. Together these let
+  * a hot object's lock deferrals reach a proof. Safe to call from any thread.
   */
 final class DeferralState:
 
   private var entries: Map[Key, DeferralState.Deferral] = Map()
   private var stalePasses: Map[Key, Int] = Map()
 
-  /** Records whether one pass's final result was stale. Returns the count of consecutive stale passes, this one
-    * included, or 0 when it was not stale (the count then resets)
+  /** Records whether one pass's final result was stale. Returns the count of stale passes since the last complete
+    * one, this one included, or 0 when it was not stale. A complete pass resets the count; a lock-deferred one keeps
+    * it, so a repair that has started waiting for the object to settle goes on waiting
     */
   def recordStale(entryKey: Key, result: ReconcileResult): Int = synchronized:
     if result.stale then
@@ -98,19 +102,25 @@ final class DeferralState:
       stalePasses += entryKey -> count
       count
     else
-      stalePasses -= entryKey
+      if result.complete then stalePasses -= entryKey
       0
 
-  /** Consecutive stale passes of the entry's object so far */
+  /** Stale passes of the entry's object since its last complete pass */
   def staleCount(entryKey: Key): Int = synchronized(stalePasses.getOrElse(entryKey, 0))
 
-  /** Records one pass's reconciliation of the entry's object. Returns the count of consecutive passes in which
-    * something was deferred by a lock, this one included. It resets, and the entry is forgotten, when a pass defers
-    * nothing by a lock (it is complete, or only stale): 0 is returned then.
+  /** Records one pass's reconciliation of the entry's object. Returns the count of passes in which something was
+    * deferred by a lock since the last complete one, this one included, or 0 when this pass deferred nothing by a lock.
+    * A complete pass resets the count and forgets the entry. A pass that is only stale keeps the count as it is (it
+    * triggers no proof), and the next pass reconciles the whole object.
     */
   def record(entryKey: Key, result: ReconcileResult): Int = synchronized:
-    if result.deferredKeys.isEmpty && !result.objectLevelDeferred then
+    if result.complete then
       entries -= entryKey
+      0
+    else if result.deferredKeys.isEmpty && !result.objectLevelDeferred then
+      entries.get(entryKey) match
+        case Some(d) => entries += entryKey -> d.copy(only = None)
+        case None => ()
       0
     else
       val count = entries.get(entryKey).map(_.count).getOrElse(0) + 1
@@ -120,11 +130,11 @@ final class DeferralState:
       count
 
   /** Records the result of the reconcile that followed a proof on the same pass, in place of that pass's pre-proof
-    * result: the count is kept (the pass was already counted), the entry is forgotten if nothing is left deferred by a
-    * lock, and otherwise the next pass reconciles only what is still deferred
+    * result: the count is kept (the pass was already counted), the entry is forgotten if the result is complete, and
+    * otherwise the next pass reconciles only what is still deferred, or the whole object after a stale result
     */
   def afterProof(entryKey: Key, result: ReconcileResult): Unit = synchronized:
-    if result.deferredKeys.isEmpty && !result.objectLevelDeferred then
+    if result.complete then
       entries -= entryKey
     else
       entries.get(entryKey).foreach: d =>
@@ -641,7 +651,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       taken <- snapshot.future
       // Narrowing to the deferred keys serves proofs. Without them (the sweep) every pass reconciles the whole object:
       // a later untracked write the store missed records nothing, so `complete` must mean the whole copy matches
-      // An object stale for several passes in a row has a busy copy here: the store waits for it to settle
+      // An object stale for several passes since its last complete one has a busy copy here: the store waits for it
+      // to settle
       snap = taken.copy(only = if allowProof then deferral.deferredKeys(entryKey) else None,
                         awaitSettle = allowProof && deferral.staleCount(entryKey) >= ParkAfterStalePasses)
       // A full read: only full reads report the stores' locks
@@ -665,7 +676,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       if allowProof then
         val stale = deferral.recordStale(entryKey, result)
         if stale >= policy.proofAfterDeferrals && stale % policy.proofAfterDeferrals == 0 then
-          logger.warn(s"Repair of object ${ptr.id} on store $storeId has been stale for $stale passes in a row: its " +
+          logger.warn(s"Repair of object ${ptr.id} on store $storeId has been stale for $stale passes: its " +
                       s"copy there stays busy, or changes under every install")
       if result.complete then
         // A sweep's node that was already converged is the common case

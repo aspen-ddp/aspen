@@ -548,10 +548,12 @@ written, so a restart recovers them as after a crash.
 ## 6. Admission and backpressure
 
 `CrlAdmission` (`S/crl/CrlAdmission.scala`) is one atomic byte counter per device, with limit
-`crl.admissionLimitBytes`. For a SimpleCRL ring of `n` streams of `S` bytes the limit is `(n − 2) · S / 2`: `S` for
-the minimum of 4 streams, `9 · S` for 20. The per-transaction bound `crl.maxTransactionBytes` is
-`T = S/2 − 8192` (`SimpleCRL.EntryOverheadReserve`). 6.1 proves that these keep every entry writable, and states the
-one assumption the proof cannot discharge.
+`crl.admissionLimitBytes`, and `crl.maxTransactionBytes` bounds one store's transaction. For a SimpleCRL ring of `n`
+streams of `S` bytes, 6.1 sets the limit SimpleCRL must give at `(n − 2) · S/2 − S/16`: `15S/16` for the minimum of
+4 streams, `9S − S/16` for 20. The per-transaction bound is `T = S/2 − 8192` (`SimpleCRL.EntryOverheadReserve`). 6.1
+proves that, with the rules it lists, these keep every entry writable, and it states the one assumption the proof
+cannot discharge. Its rules are requirements: W1-W6 and S1 are SimpleCRL's (Task 5 phase B), A1-A4 the Frontend's and
+the store loader's (phase C). The bullets below describe admission with those rules met.
 
 - **New transactions.** `Frontend.admitPrepare` admits a prepare for a transaction it has not seen only while the
   total is below its store's tier ceiling (`AdmissionTier`, the store's pool's, persisted in its StoreConfig): 3/4 of
@@ -563,16 +565,18 @@ one assumption the proof cannot discharge.
   admission, so one admission may cross the ceiling by its own size, at most `T`.
 - **Oversized.** A prepare that would make its transaction's counted bytes on the store exceed `T`, with data already
   counted for an admitted one, is dropped the same way and charges nothing (`PrepareAdmission.Oversized`).
-- **Late data** of an admitted transaction (`chargeData`) is charged only while the total is below the store's tier
-  ceiling, as a new transaction is; otherwise the prepare is dropped and the client retransmits (rule A1, 6.1).
-- **Charged without a check:** stubs (`chargeStubs`), recovered transactions (`admitRecovered`), and at device open
-  everything the CRL holds, per store (`recoveredBytesByStore`, `chargeRetained`). A store's recovery counts its
-  recovered state before what was retained for it is released (rule A2, 6.1).
-- **Loaded state** (`loadStore`, from a `crl_save.log`) is charged before it is saved, only while the total plus its
-  bytes stays at most `limit + T`, and a state holding a transaction counted above `T` is refused (rule A3, 6.1).
+- **Late data** of an admitted transaction (`chargeData` from `admitPrepare`) must be charged only while the total is
+  below the store's tier ceiling, as a new transaction is, and the prepare dropped otherwise (A1).
+- **Charged without a check:** stubs (`chargeStubs`), recovered transactions (`admitRecovered`, its `chargeData`
+  included: that data is already in the CRL), and at device open everything the CRL holds, per store
+  (`recoveredBytesByStore`, `chargeRetained`). A loading store's recovery must count its recovered state before what
+  was counted for it is released (A2).
+- **Loaded state** (`loadStore`, from a `crl_save.log`) must be charged atomically before it is saved, only while the
+  total plus its bytes stays at most `limit + T` (A3).
 - **Released** when the record is deleted (`deleteTransactionState`, `concludeTransactionState`), when a Tx is
   forgotten without reaching the CRL, or, for a transaction replaced by a stub, once the stub is durable. A stub's
-  charge is released when it expires (`dropAppliedStub`).
+  charge is released when it expires (`dropAppliedStub`). A store replaced by a reload releases all its admissions
+  (`StoreRouter.install`, `releaseAllAdmissions`) once the replacing store has counted the same records (A2).
 - **Retained.** A closing store keeps its bytes counted for it (`CrlAdmission.retain`) until its entries leave the CRL
   (`releaseRetained` after an extraction's deletion, a `dropStore`, a leftover drop) or it loads again and counts its
   own. Records of stores that never load on this run are therefore counted from the open while they are evacuated.
@@ -585,51 +589,83 @@ unloads the device until restart and leaves the files recoverable.
 
 ### 6.1 Why the limit keeps every entry writable
 
-**Notation.** `S` is the stream size, a multiple of 4096; `n ≥ 3` the ring size; `T = S/2 − 8192`;
-`H = 118`, an entry's fixed bytes (header 102, trailing stream UUID 16). An entry whose records and deletions take
-`c` bytes is `H + c` rounded up to a multiple of 4096. A stream's *used* bytes are the sizes of the entries written to
-it since it was last entered, at most `S`.
+**Notation.** `S` is the stream size; `n ≥ 3` the ring size; `T = S/2 − 8192`; `H = 118`, an entry's fixed bytes
+(header 102, trailing stream UUID 16). An entry whose records and deletions take `c` bytes is `H + c` rounded up to a
+multiple of 4096. A stream's *used* bytes are the sizes of the entries written to it since it was last entered, at
+most `S`.
 
-**Rules.** The proof uses each of these. W1 and W2 are the rotation scheme; W3-W6 and A1-A3 are what makes it provable.
+**Rules.** The proof uses each of these. W1 and W2 are the rotation scheme; the others are what makes it provable.
 
+SimpleCRL (Task 5 phase B):
+
+- **S1, aligned streams.** `SimpleCRL.apply` refuses a stream size that is not a multiple of 4096.
 - **W1, bounded entries.** No entry other than an evacuation entry exceeds `MaxEntryBytes = S/2`. Adding a save, stub
-  or deletion that would push the newest unsealed entry past it seals that entry and opens another; a request's
+  or deletion that would push the newest unwritten entry past it seals that entry and opens another; a request's
   deletions may span entries, with its handler on the last; a stub and the deletion it makes stay in one entry.
   Sealed entries are written in order, one write in flight. Saves, stubs, deletions, barriers and handlers go to the
-  newest unsealed entry. A lone record always fits: its
-  counted bytes are at most `T` (Oversized), and `T + H` rounded up to 4 KiB is below `S/2`.
+  newest unwritten entry. A lone record always fits: its counted bytes are at most `T` (Oversized), and `T + H`
+  rounded up to 4 KiB is below `S/2`.
+- **W1a, entries are frozen.** An entry writes only the forms its own requests gave. When a save is added, the entry
+  takes a snapshot of the record: a reference to the save's immutable `TransactionRecoveryState`, whether its update
+  data is kept, and the set of pieces it must write (none when the record's pieces are already written and its update
+  count is unchanged). A later save of the same record goes to the newest unwritten entry with its own snapshot, and
+  never changes an older entry's. At its build the entry writes its snapshots' pieces and static records, naming each
+  already-written piece where it lies then (an evacuation may have moved it; the static record's size does not
+  change). So an entry's size is fixed when its requests are added, and only shrinks after (a deletion that removes a
+  same-entry save).
+- **W1b, a deletion is final across every unwritten entry.** A save of a transaction whose final deletion lies in any
+  unwritten entry, not only the newest, is skipped and creates no record (`LogEntry.deletesFinally`, 5.8, F4). Its
+  handler runs once that deletion is durable.
 - **W2, evacuation first.** When the oldest unwritten entry, the *head* `h`, does not fit the rest of the active stream
   `X`, the writer enters `Y = successor(X)` at offset 0 and first writes an evacuation entry `E` carrying every image
   record (below) homed in `Z = successor(Y)`. Once `E` is durable, `h` is written in `Y` if `|E| + |h| ≤ S`;
   otherwise the writer enters `Z` the same way. With nothing homed in `Z`, no `E` is needed and `h` fits.
-- **W3, the durable image.** Every record keeps its *last-built form* (the form its newest built static record gives:
-  the transaction state as of that build, or the stub) until an entry superseding it is built: the entry holding its
-  next static record, or its deletion. Exactly the pieces of last-built forms are pinned in `LivePieces`. This extends
+- **W3, the durable image.** Every record keeps its *last-built form*, the snapshot (W1a) of the last built entry
+  holding it, apart from its current in-memory state, until an entry superseding it is built: the entry holding its
+  next snapshot, or its deletion. Exactly the pieces of last-built forms are pinned in `LivePieces`. This extends
   5.3's rule for relocated and dropped pieces to deletions and update-count changes: a deleted record's pieces are
   unpinned when the entry holding its deletion is built, not when the deletion is requested, and until then an
   evacuation carries it like any other record.
-- **W4, one home per record.** A build that changes a transaction's update count writes its txd again too, not only
-  its updates (`Tx.state_=` forgets the txd piece with the update pieces). So every record's image pieces lie in one
-  entry, its *home*, which holds a static record of it no smaller than the last-built one.
-- **W5, evacuation writes nothing new.** An evacuation entry writes, for each record it carries, a form naming only
-  pieces already written (relocated into it if they were in `Z`, else where they lie), with a static record no larger
-  than the last-built one: the last-built form always qualifies; so does the current form when the update count is
-  unchanged. It writes no pending data and no deletion.
+- **W4, one home per record.** A snapshot whose update count differs from the record's previous snapshot writes the
+  txd again too, not only the updates. So every record's image pieces lie in one entry, its *home*, which holds a
+  static record of it no smaller than the last-built one.
+- **W5, evacuation writes nothing new.** An evacuation entry writes, for each record it carries, its last-built form,
+  naming the pieces that were in `Z` at their new locations and the others where they lie. It writes no pending
+  state, no new piece and no deletion.
 - **W6, fail-stop.** A head not written after `n − 1` rotations in a row means an assumption below was broken: the CRL
   fails (5.10) instead of rotating on. The files are recoverable as after a crash.
-- **A1, late data is checked.** Data arriving for an admitted transaction is charged only while the total is below
-  the store's tier ceiling, and dropped (`Full`) otherwise.
-- **A2, recovery counts before the retained charge is released.** A loading store's recovered state is charged before
-  `releaseRetained` releases what its last close (or the device's open) kept for it.
-- **A3, loaded state is checked.** `loadStore`'s state is charged before it is saved, only while the total plus its
-  bytes is at most `limit + T`, and refused if one of its transactions counts above `T`.
 
-**Why W3 is needed even without rotations.** With entries queued (W1), an entry built after a deletion request but
-before the entry holding the deletion would otherwise stamp `oldestEntryNeeded` past the deleted record's pieces. A
-crash then recovers from an entry that names the record live (its deletion is not durable) while recovery's walk
-stops short of its pieces: `BrokenEntryChain`, or, for a stub replacing a transaction, the transaction's state lost
-before the stub is durable. The same holds for an update-count change whose new form waits behind a second rotation:
-its old pieces in `Z` are needed until the new form is built.
+Frontend and store loader (phase C):
+
+- **A1, late data is checked.** Data arriving in a prepare for an admitted transaction is charged only while the total
+  is below the store's tier ceiling, and the prepare is dropped (`Full`) otherwise. `admitRecovered`'s `chargeData` is
+  exempt: it counts data the CRL already holds, which the retained charge counted until then.
+- **A2, nothing live is uncounted across a reload.** A loading store's recovered state is charged before what was
+  counted for its records is released: what its last close or the device's open retained (`releaseRetained` at
+  `StoreLoader`'s install) and the admissions of a store the reload replaces (`releaseAllAdmissions` at
+  `StoreRouter.install`). Both follow the deferred recovery's count, not the install.
+- **A3, loaded state is checked.** `loadStore`'s state is charged before it is saved, in one atomic check-and-charge on
+  `CrlAdmission` (a compare-and-set loop like `tryAdmit`) that succeeds only if the total plus its bytes is at most
+  `limit + T`. The charge is retained for the store, so its recovery's own count replaces it under A2: a swap, not an
+  addition. A refused load leaves the store offline with its `crl_save.log` kept and is retried later. A state that can
+  never fit (its bytes above `limit + T`, or one transaction counted above `T`, as a store moved from a larger CRL may
+  hold) is not retried: its save file is treated as lost (`crlSaveFileLost`) and the store is rebuilt. A transfer does
+  not choose a destination whose CRL cannot take the state.
+- **A4, no save without a charge.** A Tx saves to the CRL only while its transaction holds an admission record
+  (`Frontend.admitted`, or a retained or recovered charge). Two paths must keep it: `admitPrepare`'s admission of a
+  prepare for a known transaction (`transactions.contains`), which charges nothing, and an aborted Tx after
+  `deleteTransactionState` released its admission while the Tx stays in `transactions`, where a later Paxos message
+  would save it again, a re-save after the deletion. A Tx whose charge is released saves nothing more and answers no
+  message that needs a save; a prepare for a known transaction with no record is admitted only as a new one.
+
+**Why W1a and W3 are needed even without rotations.** With entries queued (W1), an entry built after a deletion
+request but before the entry holding the deletion would otherwise stamp `oldestEntryNeeded` past the deleted record's
+pieces. A crash then recovers from an entry that names the record live (its deletion is not durable) while recovery's
+walk stops short of its pieces: `BrokenEntryChain`, or, for a stub replacing a transaction, the transaction's state
+lost before the stub is durable. The same holds for an update-count change whose new form waits behind a second
+rotation: its old pieces in `Z` are needed until the new form is built. And an entry that built a record's current
+state rather than its snapshot would write a form charged after the entry was sealed (late data arriving after a
+release), and could grow past `S/2` after it was sealed.
 
 **Definitions.**
 
@@ -676,14 +712,15 @@ static record is) and dropped records (static record 63) never grow. ∎
 `Z_j = Y_{j+1}` (`Z_{n−1} = X`). `Y_1` lies empty of the image: it was evacuated when `X` was entered, and pieces are
 written only into the active stream. Each `Z_j` lies empty of the image once `E_j` is durable, so each `Y_j` is entered
 holding nothing pinned (W3: a pending count change or deletion keeps its pieces in the image and they are carried
-too). Between rotations nothing is built but evacuation entries, so `F` does not change: an evacuation rewrites forms
-no larger (W5), a deletion or save request changes the image only when its entry is built. Rotations 1 to `n − 1`
-evacuate distinct streams, and a record carried into `Y_j` is not carried again before `n − 1` rotations, so the
-records carried by `E_1, …, E_{n−1}` are disjoint: their footprints `c_j` sum to at most `F`.
+too). Between rotations nothing is built but evacuation entries, so `F` does not change: an evacuation rewrites the
+last-built forms (W5), a deletion or save request changes the image only when its entry is built. Rotations 1 to
+`n − 1` evacuate distinct streams, and a record carried into `Y_j` is not carried again before `n − 1` rotations, so
+the records carried by `E_1, …, E_{n−1}` are disjoint: their footprints `c_j` sum to at most `F`.
 
-Rotation `j` fails to place `h` only if `|E_j| > S − |h|`. Both sides are multiples of 4096 (`|h|` is an entry size,
-`S` a multiple of 4096), so `|E_j| ≥ S − |h| + 4096`, while `|E_j| ≤ H + c_j + 4095`. Hence `c_j > S − |h| − H ≥
-S/2 − H`, using `|h| ≤ S/2` (W1). If all `n − 1` rotations fail, `F ≥ Σ c_j > (n − 1)(S/2 − H)`, a contradiction. ∎
+`|h|` is fixed: by W1a it was settled when `h` was sealed, at most `S/2`, and nothing added later changes it. Rotation
+`j` fails to place `h` only if `|E_j| > S − |h|`. Both sides are multiples of 4096 (`|h|` is an entry size, `S` a
+multiple of 4096 by S1), so `|E_j| ≥ S − |h| + 4096`, while `|E_j| ≤ H + c_j + 4095`. Hence `c_j > S − |h| − H ≥
+S/2 − H`. If all `n − 1` rotations fail, `F ≥ Σ c_j > (n − 1)(S/2 − H)`, a contradiction. ∎
 
 The bound needs only the head; entries behind it are each a new instance of the lemma. Every rotation writes an
 evacuation entry that fits (Lemma A), so `Stream.writeEntry`'s `require` is never reached; a broken bound shows as
@@ -694,55 +731,64 @@ rotations that never place the head, which W6 turns into a failed CRL.
 `TxFinalized` naming the store owed for a transaction it never held or already deleted), or saved with
 `keepAdmission` (the replaced state's charge stays with a newer Tx).
 
-*Proof.* Assume, as the Frontend does today, that every save is preceded by the charge of the data it carries, and
-that a record's charge is released only after its deletion (or its stub's save) is queued: so a release seen by an
-admission precedes, in the CRL's queue, every save that admission allows.
+*Proof.* By A4 every save is preceded by a charge of the data it carries, held while the save is unwritten; a record's
+charge is released only after its deletion (or its stub's save) is queued, so a release seen by an admission
+precedes, in the CRL's queue, every save that admission allows.
 
 *(1) A charge covers every image record at one moment.* Consider a build, and let `t_0` be when the last request
-processed before it was queued. A record built in an entry at or before this one, with no deletion processed yet, was
-charged before its save was queued and is released only after its deletion is queued, after `t_0`. A record whose
-deletion is processed but unbuilt (it is in the image by W3) went to a later, unsealed entry: every save built so far
-was queued before that deletion, so before its release. So at `t_g`, the earliest of `t_0` and the releases of the
-records deleted but not built, every image record is charged, each by its own charge, at least its footprint.
+processed before it was queued. By W1a, an entry builds only snapshots its own requests took, all processed before it
+was sealed; an evacuation builds snapshots an earlier entry built. A record built in an entry at or before this one,
+with no deletion processed yet, was charged before the request giving its form was queued and is released only after
+its deletion is queued, after `t_0`. A record whose deletion is processed but unbuilt (it is in the image by W3): the
+deletion went to the newest unwritten entry, later than every entry built so far, so every snapshot built so far was
+taken by a request queued before that deletion, so before its release. So at `t_g`, the earliest of `t_0` and the
+releases of the records deleted but not built, every image record is charged, each by its own charge, at least its
+footprint.
 
-*(2) The covered total stays below `limit + T + 41 · N`.* Let the covered total be the device total less each
-stub charge whose replaced state's charge is still held, and less the second count of a recovered state while both
-its retained charge and its store's own count are held (A2). By event: a checked charge (a new transaction, late data
-under A1) sees the total, which is at least the covered total, below `limit`, and adds at most `T`; a loaded state
-(A3) keeps the total at most `limit + T`; a replacing stub's charge is excluded until its state's release, which then
-lowers the covered total by that state's charge (at least 63) less 41; an unoffset stub adds 41 and its expiry
-removes it; a recovery's swap changes nothing (A2); every other release lowers it. So the covered total less
-`41 ·` (unoffset stubs outstanding) stays at most `limit + T`: each event keeps it, and at the device's open the
-covered total is the footprint of the recovered image, the durable image of the previous run, which that run's last
-durable build bounded the same way (its stubs are still outstanding).
+*(2) The covered total stays at most `limit + T + 41 · N`.* Let the covered total be the device total less each
+stub charge whose replaced state's charge is still held, and less the second count of a store's records while both
+the charge its loading recovery made and the one it replaces are held (A2, A3). By event: a checked charge (a new
+transaction, late data under A1) sees the total, which is at least the covered total, below `limit`, and adds at most
+`T`; a loaded state's check-and-charge (A3) keeps the total at most `limit + T`; a replacing stub's charge is excluded
+until its state's release, which then lowers the covered total by that state's charge (at least 63) less 41; an
+unoffset stub adds 41 and its expiry removes it; a reload's swap changes nothing (A2); every other release lowers it.
+So the covered total less `41 ·` (unoffset stubs outstanding) stays at most `limit + T`: each event keeps it, and at
+the device's open the covered total is the footprint of the recovered image, the durable image of the previous run.
+That run's last durable build bounded it the same way. A stub recovered at open, charged by `chargeStubs` with nothing
+offsetting it, counts toward `N` if it was unoffset before the crash; one whose replaced state's release offset it
+before the crash already lies within `limit + T` there, since that release lowered the covered total by more than 41.
 
 *(3)* At `t_g` every image record is charged by a distinct charge: a durable replacing stub by its replaced state's
 charge (at least 63, the state is out of the image), anything else by its own. So `F` is at most the covered total at
 `t_g`. ∎
 
 Without A1, late data is charged after any number of data-less admissions made below the ceiling: `F` reaches
-`limit + k · T`. Without A2, other stores admit into the gap between the release of a loading store's retained bytes
-and its recovery's count, up to that store's recovered bytes. Without A3, a store moved from a device with a larger
-CRL can hold more than this whole CRL.
+`limit + k · T`. Without A2, other stores admit into the gap between the release of a loading store's charges and its
+recovery's count, up to that store's recovered bytes. Without A3, a store moved from a device with a larger CRL can
+hold more than this whole CRL. Without A4, a save after a release is uncharged. Without W1a, the counterexample above
+puts late data charged after a release into an entry sealed before it.
 
-**The limit.** With `limit = (n − 2) · S/2`, Lemma C gives `F ≤ (n − 1) · S/2 − 8192 + 41 · N`, and Lemma B needs
-`F ≤ (n − 1) · S/2 − 118 · (n − 1)`. So every head is written within `n − 1` rotations whenever
+**The limit.** With `limit = (n − 2) · S/2 − S/16`, Lemma C gives `F ≤ (n − 1) · S/2 − S/16 − 8192 + 41 · N`, and
+Lemma B needs `F ≤ (n − 1) · S/2 − 118 · (n − 1)`. So every head is written within `n − 1` rotations whenever
 
-    41 · N ≤ 8192 − 118 · (n − 1)
+    41 · N ≤ S/16 + 8192 − 118 · (n − 1)
 
-that is, at most 191 unoffset stubs outstanding at 4 streams and 145 at 20. In the form "live bytes at most
-`(n − 2) · S/2 + T + unchecked charges`", the unchecked charges this leaves are the unoffset stubs, and the room for
-them is what `EntryOverheadReserve` keeps beyond the `n − 1` evacuation headers. A ring of 3 streams (accepted by
-`SimpleCRL.apply`, refused by `CrlSizingDefaults.resolve`) is covered by the same proof: limit `S/2`, 2 rotations,
-room for 194 unoffset stubs.
+that is, at most about `S/656` unoffset stubs outstanding: 102491 at 4 streams of 64 MiB and 102445 at 20; 1789 and
+1743 for 1 MiB streams. In the form "live bytes at most `(n − 2) · S/2 + T + unchecked charges`", the unchecked charges
+this leaves are the unoffset stubs, and the room for them is the `S/16` reserve plus what `EntryOverheadReserve` keeps
+beyond the `n − 1` evacuation headers. The limit is `15S/16` at 4 streams, above the `S/2` floor. A ring of 3 streams
+(accepted by `SimpleCRL.apply`, refused by `CrlSizingDefaults.resolve`) is covered by the same proof: limit `7S/16`,
+2 rotations, room for 1792 unoffset stubs at 1 MiB.
 
 **What is not proven.** `N` has no structural bound: an unoffset stub cannot be refused (the store must remember that
 it holds the transaction's update), and a device that drops prepares under load is exactly the one that later receives
-owed `TxFinalized`s for the transactions that committed without it. Past the margin the CRL fails at W6 and recovers at
-restart; nothing is lost. Making the bound unconditional needs either a reserve, `limit = (n − 2) · S/2 − R` with
-room for `(R + 8192 − 118 · (n − 1)) / 41` unoffset stubs (`R ≤ S/2` keeps the limit at least `S/2` at 4 streams), or a
-transaction-protocol change that checks an unoffset stub's charge and leaves its `TxFinalized` unhandled when the CRL
-is full.
+owed `TxFinalized`s for the transactions that committed without it. The reserve makes the assumption quantitative, not
+unconditional. Past the margin the CRL fails at W6; nothing is lost and a restart recovers it. Liveness after that
+restart is an assumption too: the unwritten entries, deletions included, are gone, so the recovered image is the
+durable one, and the bound holds again once `N` is back within the margin. Unoffset stubs expire at their
+transaction's start plus the horizon and expiry margin (`Frontend.expireStubs`), so it is, unless new ones keep
+arriving faster; until then each restart may fail again at W6. An unconditional bound needs a transaction-protocol
+change that checks an unoffset stub's charge and leaves its `TxFinalized` unhandled when the CRL is full.
 
 ---
 
@@ -867,7 +913,8 @@ Past the bound, which only unoffset stubs beyond 6.1's margin can reach, the hea
 rotations and the CRL fails (W6, 10.7) rather than rotating on: the unwritten entries were never acknowledged, so the
 files hold a consistent CRL and a restart recovers it. Their deletions are lost with them, so the recovered live set
 may be larger than before the failure; the reloaded stores delete those records again as their transactions
-conclude.
+conclude. That the restarted CRL makes progress is an assumption: it holds once the unoffset stubs, which expire,
+are back within the margin, and until then each restart may fail again (6.1, "What is not proven").
 
 **10.6 A slow or hung `DSYNC`.** Entries are strictly serial, so every vote on the device waits. The pending entry
 grows with arriving saves, bounded by admission for new transactions. Clients retransmit; transactions past their

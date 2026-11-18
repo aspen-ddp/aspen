@@ -2799,15 +2799,14 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.requestGrowth()
     nextRaise(raised)
     awaitAttemptsEnded(i.crl, 1)
+    // At the cap a request is refused where it is made: no attempt starts
     i.crl.requestGrowth()
-    awaitAttemptsEnded(i.crl, 2)
+    assert(!i.crl.growthBusyForTest)
+    assert(i.crl.growthAttemptsEndedForTest == 1)
     assert(raised.isEmpty)
     assert(i.crl.numStreams == 5)
     assert(recordedRing().size == 5)
     assert(!os.exists(tdir / "5.crl") && !os.exists(tdir / "5.crl.tmp"))
-    // The refusal backs off: a request now is ignored
-    i.crl.requestGrowth()
-    assert(!i.crl.growthBusyForTest)
     i.crl.shutdown()
 
     // A ring already at its cap, or growth disabled, runs no growth thread, and a request does nothing
@@ -3032,6 +3031,40 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(recordedRing() == Vector(0, 1, 2, 3))
     assert(recoveredById(r)(x._1).objectUpdates == x._2.objectUpdates)
     r.crl.shutdown()
+  }
+
+  test("A growth inside its preallocation at shutdown is interrupted, not waited for (growthDuringShutdown)") {
+    val inStep = new CountDownLatch(1)
+    val never = new CountDownLatch(1)
+    val i = openGrowing()
+    // Stands for a long zero-fill: blocks interruptibly inside the step, holding the growth's file lock
+    i.crl.inPreallocationForTest = () =>
+      inStep.countDown()
+      never.await()
+    i.crl.requestGrowth()
+    assert(inStep.await(10, TimeUnit.SECONDS))
+    val shutdown = new CountDownLatch(1)
+    new Thread(() => { i.crl.shutdown(); shutdown.countDown() }).start()
+    assert(shutdown.await(10, TimeUnit.SECONDS), "shutdown waited for the preallocation")
+    eventually("the growth thread outlived the CRL")(!i.crl.growthThreadAliveForTest)
+    assert(growthLeftovers().isEmpty)
+    val r = openGrowing()
+    assert(r.crl.numStreams == 4)
+    r.crl.shutdown()
+  }
+
+  test("A write to a stream the writer does not know kills the writer instead of completing unwritten") {
+    val died = new LinkedBlockingQueue[Throwable]()
+    val files = streams(1)
+    files.foreach((_, f) => FilePreallocation.preallocate(f, 4096 * 2))
+    val writer = new StreamWriter(4096 * 2, files, t => died.put(t))
+    val completed = new AtomicBoolean(false)
+    writer.write(StreamId(7), 0, Array(ByteBuffer.allocate(16)), () => completed.set(true))
+    assert(died.poll(10, TimeUnit.SECONDS).isInstanceOf[IllegalStateException])
+    assert(!completed.get)
+    val closed = new CountDownLatch(1)
+    writer.shutdown(() => closed.countDown())
+    assert(closed.await(10, TimeUnit.SECONDS))
   }
 
   test("Growth requested of a CRL that died does nothing") {

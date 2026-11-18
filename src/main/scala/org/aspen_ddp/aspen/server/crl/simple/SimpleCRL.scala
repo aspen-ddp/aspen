@@ -374,8 +374,8 @@ class SimpleCRL private (streamsDir: os.Path,
 
   private val limitListeners = new CopyOnWriteArrayList[Long => Unit]()
 
-  /** Held by the growth thread across each step that touches the directory, and by stopGrowth to set
-    * `growthStopped`: once it is set no growth step runs, so nothing is written after the lock is released */
+  /** Held by the growth thread across each step that touches the directory, which runs only while `growthStopped` is
+    * unset. stopGrowth sets it and then takes the lock, so once stopGrowth returns no growth step runs or will run */
   private val growthFileLock = new Object
   @volatile private var growthStopped = false
 
@@ -384,6 +384,10 @@ class SimpleCRL private (streamsDir: os.Path,
   private val growthRequests = new Semaphore(0)
   @volatile private var growthAllowedAt: Long = System.nanoTime()
   private val growthAttemptsEnded = new AtomicInteger(0)
+  private val loggedGrowthCap = new AtomicBoolean(false)
+
+  /** Tests only: runs inside the preallocation step, before the file is created */
+  @volatile private[simple] var inPreallocationForTest: () => Unit = () => ()
 
   /** A GrowthReady waiting for the rotation in progress to place its head (commitGrowthWhenQuiescent). CRL thread */
   private var pendingGrowth: Option[Int] = None
@@ -397,11 +401,14 @@ class SimpleCRL private (streamsDir: os.Path,
       t.setDaemon(true)
       Some(t)
 
-  /** Stops the growth thread: it is interrupted, and runs no further step. Waits for at most the step it is in */
+  /** Stops the growth thread: no further step runs, and the step in progress is interrupted. Then waits for that
+    * step to unwind, which the interrupt makes prompt: a zero-fill or a force through a FileChannel aborts with
+    * ClosedByInterruptException (the preallocation removes its file), a wait throws InterruptedException. A
+    * fallocate is one system call and not interruptible, but allocates without writing */
   private def stopGrowth(): Unit =
-    growthFileLock.synchronized:
-      growthStopped = true
+    growthStopped = true
     growthThread.foreach(_.interrupt())
+    growthFileLock.synchronized(())
 
   /** Shuts the writer down, releasing the lock once it has closed the stream files and before `completionHandler`.
     * Growth stops first, so no growth step runs after the lock is released: a growth in flight is abandoned, and
@@ -757,8 +764,7 @@ class SimpleCRL private (streamsDir: os.Path,
     val file = streamsDir / s"$n.crl"
     try
       if n >= growth.maxStreams then
-        logger.warn(s"CRL in $streamsDir is full and at its stream cap ($n, crl-max-streams): not growing")
-        endGrowthAttempt(backOff = true)
+        endGrowthAttempt(backOff = false) // requestGrowth refuses these: it read the ring size before a commit
       else
         val capacity = growth.capacity()
         val free = growth.freeSpace()
@@ -767,12 +773,13 @@ class SimpleCRL private (streamsDir: os.Path,
           logger.warn(s"CRL in $streamsDir is full, but a stream of $maxSizeInBytes bytes would leave $free bytes " +
             s"free below ${growth.minFreePercent}% of $capacity (crl-min-free-percent): not growing")
           endGrowthAttempt(backOff = true)
-        else if growthStep(FilePreallocation.preallocate(tmp, maxSizeInBytes)) &&
+        else if growthStep({ inPreallocationForTest(); FilePreallocation.preallocate(tmp, maxSizeInBytes) }) &&
                 growthStep({ os.move(tmp, file, atomicMove = true); DurableFiles.syncDirectory(streamsDir) }) then
           ioQueue.put(GrowthReady(n))
         // Otherwise growth stopped: the attempt is abandoned, and the next open removes what it left
     catch
       case _: InterruptedException => () // Stopped: abandoned
+      case NonFatal(_) if growthStopped => () // Interrupted by the stop (ClosedByInterruptException): abandoned
       case NonFatal(e) =>
         logger.warn(s"CRL growth in $streamsDir failed. Retrying no sooner than ${growth.retryAfter}", e)
         // Nothing was handed to the CRL thread, so `<n>.crl` is unlisted
@@ -785,9 +792,12 @@ class SimpleCRL private (streamsDir: os.Path,
         endGrowthAttempt(backOff = true)
 
   override def requestGrowth(): Unit =
-    if growthThread.nonEmpty && !growthStopped && System.nanoTime() - growthAllowedAt >= 0 &&
-       growthBusy.compareAndSet(false, true) then
-      growthRequests.release()
+    if growthThread.nonEmpty && !growthStopped then
+      if ringSize >= growth.maxStreams then
+        if loggedGrowthCap.compareAndSet(false, true) then
+          logger.warn(s"CRL in $streamsDir is full and at its stream cap ($ringSize, crl-max-streams): not growing")
+      else if System.nanoTime() - growthAllowedAt >= 0 && growthBusy.compareAndSet(false, true) then
+        growthRequests.release()
 
   override def onAdmissionLimitRaised(f: Long => Unit): Unit = limitListeners.add(f)
 

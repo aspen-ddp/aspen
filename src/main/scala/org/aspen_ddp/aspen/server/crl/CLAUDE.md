@@ -45,11 +45,14 @@
   (`commitGrowthWhenQuiescent`: no rotation between its evacuation and its head, so W6's count runs over one ring):
   `crl/sizing` rewritten with `n` right after the active stream, then `StreamWriter.addStream`, then the
   `onAdmissionLimitRaised` listeners with the new `admissionLimitBytes`. The sizing rewrite must stay the last step
-  that touches the files: `removeUncommittedGrowth` relies on it. A refusal or failure logs, removes what it created
-  and ignores requests for `retryAfter` (10 s); it never fails the CRL, except a sizing rewrite whose rename landed
-  and whose directory force fails twice (whether the new ring is durable is then unknown). Shutdown and death stop
-  the growth thread under `growthFileLock` before the CRL lock is released: a growth in flight is abandoned at its
-  next step, never waited for, and its leftovers are removed at the next open
+  that touches the files: `removeUncommittedGrowth` relies on it. At the cap `requestGrowth` refuses at once and logs
+  it once. A refused or failed attempt logs, removes what it created and ignores requests for `retryAfter` (10 s); it
+  never fails the CRL, with two fail-stop exceptions after the rename of the new sizing: its directory force failing
+  twice (whether the new ring is durable is then unknown), and `addStream` failing to open the committed file. A
+  restart opens whichever ring is on disk. Shutdown and death set `growthStopped`, interrupt the growth thread and
+  then take `growthFileLock`, before the CRL lock is released: the step in progress aborts (a zero-fill or force
+  with ClosedByInterruptException; a fallocate is one call), no later step runs, and the leftovers are removed at the
+  next open. `StreamWriter` dies of a write to a stream it does not know rather than completing it unwritten
 - One CRL per storage device, in `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`), opened by
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
 - Sizing keys in the device config are all optional (`CrlSizingDefaults.resolve`, from the capacity of the file

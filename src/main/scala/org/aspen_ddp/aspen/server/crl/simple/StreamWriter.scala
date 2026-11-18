@@ -74,10 +74,12 @@ class StreamWriter(val maxSizeInBytes: Long,
     while !exitLoop do
       queue.take() match
         case w: WriterThread.Write =>
-          streams.get(w.streamId).foreach: channel =>
-            channel.position(w.offset)
-            writeFully(channel, w.buffers)
-            w.onWriteComplete()
+          // A write to a stream the writer does not know would complete unwritten: the writer dies of it instead
+          val channel = streams.getOrElse(w.streamId,
+            throw IllegalStateException(s"CRL write to unknown stream ${w.streamId.number}"))
+          channel.position(w.offset)
+          writeFully(channel, w.buffers)
+          w.onWriteComplete()
 
         case WriterThread.AddStream(streamId, channel) =>
           streams += streamId -> channel

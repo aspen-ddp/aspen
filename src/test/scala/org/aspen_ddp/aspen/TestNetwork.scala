@@ -460,6 +460,9 @@ class TestNetwork(executionContext: ExecutionContext,
           recordRead(r)
           observeRead(r)
         case _ => ()
+      msg match
+        case r: Read => noteSilencedObjectRead(r)
+        case _ => ()
       handleEvents()
       if !crashed(hostFor(msg.toStore)) then
         hostFor(msg.toStore).receiveClientRequest(msg)
@@ -870,13 +873,36 @@ class TestNetwork(executionContext: ExecutionContext,
       readSilencedStores = previous
       result
 
+  /** Objects whose reads never complete: every ReadResponse to a Read of one of them is dropped, whatever store sends
+   *  it. Unlike readSilencedStores this leaves every other object of the pool readable (the allocation tree, say) */
+  @volatile var readSilencedObjects: Set[ObjectId] = Set()
+
+  /** readUUIDs of the Reads sent for readSilencedObjects */
+  private var silencedReadIds: Set[UUID] = Set()
+
+  private def noteSilencedObjectRead(r: Read): Unit =
+    if readSilencedObjects.contains(r.objectPointer.id) then
+      synchronized { silencedReadIds += r.readUUID }
+
+  private def isSilencedObjectRead(rr: ReadResponse): Boolean = synchronized(silencedReadIds.contains(rr.readUUID))
+
+  /** Runs `f` with every read of `ids` left unanswered, restoring the previous set whether `f` succeeds or fails.
+   *  A read sent meanwhile stays unanswered after `f` ends: only reads sent later are answered */
+  def withObjectReadsSilenced[T](ids: Set[ObjectId])(f: => Future[T]): Future[T] =
+    given ExecutionContext = executionContext
+    val previous = readSilencedObjects
+    readSilencedObjects = ids
+    f.transform: result =>
+      readSilencedObjects = previous
+      result
+
   // -------------------------------------------------------------------------------
 
   /** Client responses to drop, as a test chooses (a client never hearing a transaction's outcome, say) */
   @volatile var dropClientResponse: ClientResponse => Boolean = _ => false
 
   override def sendClientResponse(msg: ClientResponse): Unit = msg match {
-    case rr: ReadResponse if readSilencedStores.contains(rr.fromStore) =>
+    case rr: ReadResponse if readSilencedStores.contains(rr.fromStore) || isSilencedObjectRead(rr) =>
       handleEvents()
 
     case _ if dropClientResponse(msg) =>

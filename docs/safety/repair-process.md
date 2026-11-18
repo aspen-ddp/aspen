@@ -745,11 +745,15 @@ but the object was unreadable already.
 ### 12.8 An object whose read never completes
 
 A read of an object below its read threshold, or of a key that stays `NotRestorable`, or of an allocation held
-indefinitely (ExpiryTally rule G), never completes. The store's scan
-stops at that entry until the deadline cancels it; the next scan stops at the same entry (the walk always starts at
-the range's head), so later entries of the store are not repaired, and each scan leaves one read retrying in the
-background. Tracked in Todo.txt 4.3: timed reads (`client.withReadTimeout`) exist, and mapping a `ReadTimeout` to
-deferral covers every cause above once the scan uses them.
+indefinitely (ExpiryTally rule G; the store parks the `AllocationPending` re-read, `Frontend.parkAllocationRead`),
+gets no answer. The scan's object reads are timed (`client.withReadTimeout(StoreRepairer.ObjectReadTimeout)`, 15 s):
+such a read fails with `ReadTimeout` and stops its driver, and the entry is deferred as for an `InvalidObject` short
+of a deletion proof (`repairListed`; `repairAbsent` defers on any failure that proves nothing). The scan goes on to
+the store's later entries, so each stuck object costs one bounded wait per scan and leaves no read behind. More than
+`ScanDeadline / ObjectReadTimeout` (6) stuck objects at the head of a store's range still use up its scan before the
+later entries; the tree reads (`foreachInRange`, `allocationTree.get`) are not timed, and a metadata pool short of
+its read threshold stalls the scan until the deadline. `verifyObject`'s read times out before `VerifyDeadline`, and
+the quarantining store retries at heartbeat.
 
 ### 12.9 More scenarios
 
@@ -769,7 +773,8 @@ deferral covers every cause above once the scan uses them.
 
 - **Bootstrap tree sweep staleness window** (Backlog.txt): a bootstrap store whose scans come back clean backs off to
   the 15 min cap, so a missed untracked write to the bootstrap pool's own trees can stay unhealed that long.
-- **Head-of-line blocking on an unreadable object** (Todo.txt 4.3; 12.8).
+- **Head-of-line blocking on many unreadable objects** (12.8): each costs one `ObjectReadTimeout` per scan, so more
+  than six at the head of a store's range use up its scan; tree reads are untimed and bounded only by the deadline.
 - **Traceless follow-ups** (Backlog.txt "Traceless commits follow-ups"): UnackedCommits entries are per transaction,
   so a voter that keeps missing `errorTimeout` grows the tree.
 - **Large UnackedCommits entries**: a `NodeSizeExceeded` for a node too small for one object's chunk is permanent; the

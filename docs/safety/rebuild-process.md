@@ -258,7 +258,7 @@ ErrorTree entries there, so the earlier episode's copy of every object is stale 
   entry and node read.
 * `restoreObject` decodes the stored `ObjectPointer` inside one `try`, so an undecodable pointer is a failed object,
   not a silently skipped one. Entries of another pool are skipped; keys that are not 16 bytes are logged and skipped.
-  `restore` does a full `client.read`, then `ObjectState.getRebuildDataForStore(storeId)` (re-encodes the object and
+  `restore` does a full read through `client.withReadTimeout(ObjectReadTimeout)` (30 s), then `ObjectState.getRebuildDataForStore(storeId)` (re-encodes the object and
   takes this store's slice; a partial KV state yields none) and `Backend.rebuildWrite` with the read's revision,
   refcount and timestamp.
 * Locked copies: a read ignores the write locks of transactions it does not know committed, and the one store that
@@ -274,7 +274,11 @@ ErrorTree entries there, so the earlier episode's copy of every object is stale 
   For `t <= r`, losing a store that held T before its peers applied it is beyond the pool's tolerance (`CLAUDE.md`,
   read threshold). Marks also land for locks that change nothing (an exclusive lock-only requirement) or for
   transactions that abort; each costs one repair read, on the rebuild's path, not the transaction's.
-* A per-object read failure is recorded in `failed` and the checkpoint advances past it. More than
+* A per-object read failure is recorded in `failed` and the checkpoint advances past it. A read that gets no answer
+  (its pool below `r` with the missing stores silent, an allocation a commit voter parks, `Frontend.parkAllocationRead`)
+  fails with `ReadTimeout` after `ObjectReadTimeout` and stops its driver: it is one such failure, so it holds the
+  walk, the host's rebuild slot (`rebuildingStores`) and a cancel for at most that long. The same bound covers the
+  sweep's reads (5.3: the object stays pending for the next round) and the retries (5.4). More than
   `RebuildState.MaxFailedObjects` (10,000) failures latch an abort. An out-of-space error (`Backend.isOutOfSpace`,
   ENOSPC or EDQUOT) latches an abort and logs `REBUILD OUT OF SPACE`. A cancel latches `RebuildCancelled`.
 * Checkpoint: every `CheckpointInterval` (1,000) restored objects, `backend.rebuildFlush()` **then**
@@ -543,8 +547,12 @@ is never repaired (5.2's locked copies are marked for this reason).
   checkpoint intact; a smaller pool's walk finishes and `retryFailures` fails the pass. Either way the staging copy,
   checkpoint and Rebuilding entry stay, and the backoff re-check resumes. `accept-rebuild-loss` lets a pass finish
   past objects still unreadable at its end (5.5).
-* Peers that are **silent** make reads hang: the read driver retransmits forever, the sequential walk stops on that
-  object, and the rebuild holds its slot until the peers return (RB-W4).
+* Peers that are **silent** make reads time out (`ObjectReadTimeout`, 5.2): each is a failed object, so the walk goes
+  on, `MaxFailedObjects` and the backoff re-check engage as for error replies, and a cancel ends the pass within one
+  timeout. A pool whose objects all time out costs one timeout per object until the abort; the host's other
+  rebuilds wait at most that long for its slot. The allocation-tree reads (the walk's node reads, the retries'
+  `allocationTree.get`) and the pool lookup are not timed: they read the metadata pool, and a metadata pool short of
+  `r` stalls the rebuild (FS14).
 * Two stores of one pool rebuilding at once each read the other as missing. With Replication(3,2) neither can read
   anything (`r = 2` of one live store), so both wait until a store with data returns. With Reed-Solomon, both complete
   while `w - 2 >= r`. The concurrency bound is per host (`maxConcurrentRebuilds`), not per pool.
@@ -626,7 +634,8 @@ flushed key and its failed list; the pass resumes there. If staging recovery thr
 discarded with the checkpoint and the next pass starts over.
 
 **FS2 Source peer fails mid-walk.** With `r` peers still answering, only latency changes. With fewer, a read whose
-missing peers are silent hangs (RB-W4); one whose peers answer with errors fails and is retried at the end of the pass.
+missing peers are silent times out and one whose peers answer with errors fails; either is retried at the end of the
+pass.
 No wrong data is written either way.
 
 **FS3 A second store of the pool is lost during the rebuild.** Replication(3,2): one live store, below `r`; every
@@ -698,24 +707,6 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 ---
 
 ## Open weaknesses
-
-### RB-W4. A walk or sweep read that never completes holds the rebuild slot, and a cancel cannot end it (CONFIRMED; liveness)
-Mechanism: `client.read` never times out (`SimpleReadDriver` retransmits with backoff for ever; `BaseObjectReader
-.restore` concludes only once `r` replies match or enough errors arrive). The walk is sequential and checks the abort
-latch only between entries, so `cancel()` latches but `complete` stays pending; the slot (`rebuildingStores`) is
-released only on completion. `DeviceShutdown.awaitShutdownWork` gives up after `shutdownWorkTimeout` (60 s) and shuts
-the device down with the staging backend still open; `abandonUnlisted`'s cancel never takes effect, so its staging
-copy is never deleted in this process. The same holds for a sweep read of a committed allocation that a commit voter
-parks (`Frontend.parkAllocationRead`).
-Trigger / scenario: a pool loses a second store to silence while one of its stores rebuilds (FS3), or two rebuilds on
-one host each sit in such a pool. With `maxConcurrentRebuilds = 2`, every other rebuild on the host, in healthy pools
-too, waits until the silent stores return.
-Consequence: rebuilds of healthy pools stall behind unhealthy ones; the 10,000-failure abort and its backoff never
-engage; a shutdown proceeds with staging open.
-Suggested fix (Todo.txt 4.3): use timed reads (`client.withReadTimeout`, now available) for the rebuild's reads: a timed-out read is a failed object (so the
-`MaxFailedObjects` abort and the backoff take over), and the driver stops. Alternatively complete the pass's future on
-cancel without awaiting the in-flight read and close the backend once that read ends.
-Effort: M   Priority: 4
 
 ### RB-W5. A markerless directory at a store path the tree does not list is loaded and served (PLAUSIBLE; stale replica)
 Mechanism: `StoreLoader.tryLoadStore` loads any directory with a `config.yaml` and no marker, without reading the tree,

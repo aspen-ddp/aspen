@@ -145,6 +145,12 @@ object RebuildingStore:
   /** Length of an allocation-tree key that names an object: the raw bytes of an ObjectId. */
   val ObjectIdKeyLength: Int = 16
 
+  /** How long the rebuild waits on one object read. A read that has not completed by then fails with ReadTimeout and
+   *  sends nothing more, and its object is a failed one, as for a read the peers answer with errors: retried at the
+   *  end of the pass (or, in the sweep, at the next round). Long enough for any healthy read, so only an object that
+   *  cannot be restored now (its pool below the read threshold, an allocation parked past expiry) times out */
+  val ObjectReadTimeout: FiniteDuration = FiniteDuration(30, SECONDS)
+
   /** The failure of a rebuild stopped by `cancel()`. */
   case class RebuildCancelled(storeId: StoreId) extends Exception(s"Rebuild of $storeId was cancelled")
 
@@ -178,12 +184,18 @@ class RebuildingStore(client: AspenClient,
                         * horizon is the longest any host uses */
                       horizon: FiniteDuration = TransactionHorizon.Horizon,
                       /** How long the sweep waits before recording what is unsettled (PendingWaitLimit) */
-                      pendingWaitLimit: FiniteDuration = RebuildingStore.PendingWaitLimit)
+                      pendingWaitLimit: FiniteDuration = RebuildingStore.PendingWaitLimit,
+                      /** How long one object read may take before the object counts as failed (ObjectReadTimeout) */
+                      objectReadTimeout: FiniteDuration = RebuildingStore.ObjectReadTimeout)
   extends StoreRebuild with Logging:
 
   import RebuildingStore.*
 
   private given ExecutionContext = client.clientContext
+
+  /** Every object read of the walk, the sweep and the retries: a read that never completes would hold the walk, the
+   *  host's rebuild slot and a cancel (ObjectReadTimeout) */
+  private val reader = client.withReadTimeout(objectReadTimeout)
 
   private val stagingPath = devicePath / RebuildDirectory / storeId.directoryName
   private val finalPath = devicePath / storeId.directoryName
@@ -510,8 +522,9 @@ class RebuildingStore(client: AspenClient,
    *
    *  foreach swallows a failing fn -- it logs and continues -- so read failures are recorded
    *  here instead. The checkpoint advances past them, so a read failure cannot wedge the walk
-   *  forever, and they are retried at the end of the pass. (A read that never returns can still
-   *  stall the walk and hold its Host rebuild slot; that is a known gap.)
+   *  forever, and they are retried at the end of the pass. A read that gets no answer fails with
+   *  ReadTimeout after `objectReadTimeout` and is one such failure, so it holds the walk, the
+   *  Host rebuild slot and a cancel for at most that long.
    */
   private def restoreObject(node: KeyValueListNode,
                             key: Key,
@@ -616,8 +629,8 @@ class RebuildingStore(client: AspenClient,
         throw new Exception(s"Unsupported object type for rebuild: $ptr")
 
     val fos = ptr match
-      case p: KeyValueObjectPointer => client.read(p)
-      case p: DataObjectPointer => client.read(p)
+      case p: KeyValueObjectPointer => reader.read(p)
+      case p: DataObjectPointer => reader.read(p)
 
     fos.flatMap: os =>
       val (objectType, metadata) = metadataOf(os)

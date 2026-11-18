@@ -53,19 +53,7 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.3  Reads with no timeout stall the rebuild walk/sweep and the repair scan: RB-W4                       [M]
-     CONFIRMED. A never-completing client.read holds a rebuild slot and cancel cannot end it; healthy pools'
-     rebuilds stall behind it. The repair scan stalls the same way: its object reads (StoreRepairer.readObject)
-     wait forever on an allocation held past expiry (ExpiryTally rule G: the store parks the AllocationPending
-     re-read until the allocation applies or aborts, Frontend.parkAllocationRead), on any object below its read
-     threshold, or on a key that stays NotRestorable. The store's sequential scan stops at that entry until the
-     scan deadline cuts it off, every later scan stops at the same entry (later ErrorTree and UnackedCommits
-     entries go unrepaired), and each scan leaks a background read that keeps retransmitting.
-     Timed reads are implemented (client.withReadTimeout, see client/CLAUDE.md): a timed-out read fails
-     ReadTimeout and stops its driver, so nothing leaks. What remains is switching the consumers to them: the
-     rebuild walk/sweep treats a ReadTimeout as a failed object; repair maps it to the existing defer path (entry
-     kept for a later pass, as for InvalidObject short of a deletion proof), so a stuck object costs one bounded
-     wait per scan. Document it in server/repair/CLAUDE.md and server/rebuild/CLAUDE.md.
+(no open items)
 
 
 PRIORITY 5: performance and hygiene

@@ -2,8 +2,8 @@ package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.common.metadata.HostId
 
-import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, KeyValueObjectState, ReadLocks, StoragePool,
-                                   Transaction, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, KeyValueObjectState, ReadLocks, ReadTimeout,
+                                   StoragePool, Transaction, ObjectState as ClientObjectState}
 import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateFinalizationAction, UnackedCommitEntry}
 import org.aspen_ddp.aspen.client.tkvl.{KeyValueListNode, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.HLCTimestamp
@@ -191,10 +191,15 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                     /** Test seam: told the parts each proof run proved */
                     testingOnlyOnProof: (StoreId, ObjectPointer, ReadLocks) => Unit = (_, _, _) => (),
                     /** Test seam: sees an entry deletion's transaction just before it commits */
-                    testingOnlyBeforeEntryDelete: (PoolId, Transaction) => Unit = (_, _) => ())
+                    testingOnlyBeforeEntryDelete: (PoolId, Transaction) => Unit = (_, _) => (),
+                    /** How long one object read may take before its entry is deferred (ObjectReadTimeout) */
+                    objectReadTimeout: FiniteDuration = StoreRepairer.ObjectReadTimeout)
                    (using ec: ExecutionContext) extends Logging:
 
   import StoreRepairer.*
+
+  /** Every object read of a repair: a read that never completes would hold the scan at its entry (ObjectReadTimeout) */
+  private val reader = client.withReadTimeout(objectReadTimeout)
 
   /** One scan's fence: whether the pool's entry for the store still names this host and device. An entry delete
     * awaits it first (`deleteIfStillOwned`). The read is shared by every delete within `ownershipRecheck` of it, and
@@ -583,8 +588,8 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
   /** Repairs an object of an entry that the allocation tree lists. The listing outlives a deletion until its
     * DeletionFinalizationAction runs, so the repair's read may find the object deleted (repair F15). A read that
     * proves it (InvalidObject.provesDeletion) is evidence enough whatever the tree says, as in repairAbsent: the
-    * object is dropped from the store. A read that fails with InvalidObject short of a proof leaves the entry for a
-    * later pass. True when the entry's work on the object is done.
+    * object is dropped from the store. A read that fails with InvalidObject short of a proof, or times out
+    * (ObjectReadTimeout), leaves the entry for a later pass. True when the entry's work on the object is done.
     */
   private def repairListed(storeId: StoreId, ptr: ObjectPointer, minTimestamp: HLCTimestamp, entryKey: Key,
                            policy: RepairPolicy, deferral: DeferralState): Future[Boolean] =
@@ -598,10 +603,13 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           logger.info(s"Deferring repair of ${ptr.id} on $storeId: a read of it neither restores it nor proves it " +
                       s"deleted: $e")
           Future.successful(false)
+        case _: ReadTimeout =>
+          logger.info(s"Deferring repair of ${ptr.id} on $storeId: its read did not complete within $objectReadTimeout")
+          Future.successful(false)
 
   private def readObject(ptr: ObjectPointer): Future[ClientObjectState] = ptr match
-    case kp: KeyValueObjectPointer => client.read(kp)
-    case dp: DataObjectPointer => client.read(dp)
+    case kp: KeyValueObjectPointer => reader.read(kp)
+    case dp: DataObjectPointer => reader.read(dp)
 
   /** The store's slot for `ptr`, a live object (just read), holds `occupant` (Backend.RepairSlotOccupied): FSIF slot
     * reuse over a missed delete of the occupant (cross-document-review X6, rebuild F18). Two live objects never share
@@ -766,6 +774,14 @@ object StoreRepairer:
 
   /** How long a scan may rely on one read of the pool's entry for its store before an entry delete reads it again */
   val OwnershipRecheck: FiniteDuration = 1.second
+
+  /** How long a scan waits on one object read before deferring its entry. A read that has not completed by then fails
+    * with ReadTimeout and sends nothing more, and the entry is left for a later pass, as for a read that neither
+    * restores the object nor proves it deleted. Long enough for any healthy read, so only an object that cannot be
+    * restored now (below its read threshold, an allocation parked past expiry, a key that stays NotRestorable) times
+    * out, and short enough that such an object costs a fraction of a scan (RepairService.ScanDeadline)
+    */
+  val ObjectReadTimeout: FiniteDuration = 15.seconds
 
   /** Consecutive stale passes after which a repair asks the store to wait for the object to settle before
     * reconciling it (RepairSnapshot.awaitSettle, repair F8). A stale pass is usually a commit that happened to be in

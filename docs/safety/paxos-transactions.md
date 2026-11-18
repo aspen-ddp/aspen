@@ -1048,8 +1048,8 @@ transaction eventually resolves without operator action given a healthy quorum.
 * **Slow client clocks.** A client clock more than 20 s slow has its transactions refused.
 * **Undecidable transactions.** Rule G with every store replied holds T, its locks and its CRL state indefinitely,
   logged `UNDECIDABLE TRANSACTION`. Reached only after rebuilds or forgotten stores reach a primary quorum with a
-  lock-only primary object, or a lock-only pool with too few live commit voters. A held allocation also stalls repair
-  scans (Todo.txt 4.3, repair scan stalls on an unreadable object).
+  lock-only primary object, or a lock-only pool with too few live commit voters. A repair read of a held allocation times
+  out, and its entry is deferred at every scan (repair-process.md 12.8).
 * **Data lost at expiry.** Rule D with `dataLost` discards a T that may have committed, because its update is held by
   fewer than the read threshold of a changed pool (rebuilds beyond `t - r` of the commit voters).
 * **C-then-F divergence.** One store may discard by C over an abort accepted by fewer than a quorum while another later

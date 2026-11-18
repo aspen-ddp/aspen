@@ -19,6 +19,7 @@ import org.aspen_ddp.aspen.server.store.backend.rocksdb.BufferedConsistentRocksD
 import java.nio.ByteBuffer
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.duration.*
 import scala.util.Try
 
 /** Exercises the walk against a real RocksDB backend on a temp directory, driven by the
@@ -681,6 +682,48 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       saved.failedObjects should be(List(ids.head))
       // The checkpoint advanced past it: one unreadable object cannot wedge the walk forever.
       saved.lastRestoredKey should not be None
+
+  /** Fails the test instead of hanging it when `f` does not complete within `limit` (real time) */
+  private def within[T](limit: FiniteDuration, what: String)(f: Future[T]): Future[T] =
+    given ExecutionContext = executionContext
+    Future.firstCompletedOf(List(f, client.after(limit).map(_ => fail(s"$what did not complete within $limit"))))
+
+  atest("an object whose read never completes is a failed object, and the rebuild does not stall"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    for
+      ids <- populate(20)
+      _ <- net.waitForTransactionsToComplete()
+      outcome <- net.withObjectReadsSilenced(Set(ids.head)):
+        val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                          checkpointInterval = 5, objectReadTimeout = 200.millis)
+        within(10.seconds, "the rebuild")(rebuild.complete.transform(scala.util.Success.apply))
+    yield
+      outcome.isFailure should be(true)
+      os.exists(dev / storeId.directoryName) should be(false)
+      val saved = RebuildState.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
+      saved.failedObjects should be(List(ids.head))
+      saved.lastRestoredKey should not be None
+
+  atest("a cancel ends a rebuild whose walk waits on a read that never completes"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    var rebuildRef: RebuildingStore = null
+    for
+      ids <- populate(5)
+      _ <- net.waitForTransactionsToComplete()
+      silenced = ids.toSet
+      // Cancelled once the walk has sent its first read of a silenced object, so the walk is waiting on it
+      _ = net.observeRead = r =>
+            if silenced.contains(r.objectPointer.id) && rebuildRef != null then rebuildRef.cancel()
+      outcome <- net.withObjectReadsSilenced(silenced):
+        rebuildRef = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                         objectReadTimeout = 200.millis)
+        within(10.seconds, "the cancelled rebuild")(rebuildRef.complete.transform(scala.util.Success.apply))
+      _ = net.observeRead = _ => ()
+    yield
+      outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
+      os.exists(dev / storeId.directoryName) should be(false)
 
   atest("MaxFailedObjects cap prevents the store from moving into place"):
     given ExecutionContext = executionContext

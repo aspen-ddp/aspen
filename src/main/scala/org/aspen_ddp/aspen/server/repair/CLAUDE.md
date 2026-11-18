@@ -77,6 +77,12 @@
   on only for a proven deletion. A listed object's repair read can find it deleted too (its DeletionFinalizationAction
   not yet run): `repairListed` drops it on the same proof, with no age gate, and defers on an `InvalidObject` short of
   one (repair F15)
+- Timed object reads: `readObject` goes through `client.withReadTimeout(objectReadTimeout)` (default
+  `StoreRepairer.ObjectReadTimeout`, 15 s, well under `ScanDeadline`). An object that cannot be restored now (below
+  its read threshold, an allocation parked past expiry, a key that stays `NotRestorable`) fails with `ReadTimeout`
+  and its entry is deferred (`repairListed`, and `repairAbsent`'s catch-all), so it costs one bounded wait per scan
+  and the scan goes on to later entries. Tree reads (`foreachInRange`, `allocationTree.get`) stay untimed; the scan
+  deadline bounds them. A `verifyObject` read times out before its `VerifyDeadline`; its store retries at heartbeat
 - A repair write that meets a foreign occupant of the object's slot (`backend.RepairSlotOccupied`, FSIF slot reuse
   over a missed delete) drops the occupant with an id-checked `repairDelete` once the AllocationTree does not list it.
   The object was just read live, and two live objects never share a slot. The entry stays (stale), and the next pass

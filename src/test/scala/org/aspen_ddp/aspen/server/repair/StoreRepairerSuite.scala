@@ -22,7 +22,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
-import scala.concurrent.duration.{Duration, SECONDS}
+import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS, SECONDS}
 import scala.concurrent.{Future, Promise}
 
 class StoreRepairerSuite extends IntegrationTestSuite:
@@ -190,6 +190,35 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       result.repaired shouldBe 1
       result.deferred shouldBe 0
       stillThere shouldBe false
+
+  /** Fails the test instead of hanging it when `f` does not complete within `limit` (real time) */
+  private def within[T](limit: FiniteDuration, what: String)(f: Future[T]): Future[T] =
+    Future.firstCompletedOf(List(f, client.after(limit).map(_ => fail(s"$what did not complete within $limit"))))
+
+  test("an entry whose object read never completes is deferred, and the scan goes on to later entries"):
+    val target = RecordingTarget(List(storeId))
+    val repairer = StoreRepairer(client, target, objectReadTimeout = FiniteDuration(200, MILLISECONDS))
+    for
+      stuck <- allocateObjectPointer()
+      healthy <- allocateObjectPointer()
+      stuckState <- client.read(stuck)
+      healthyState <- client.read(healthy)
+      _ <- seedErrorEntry(stuck.id, Array[Byte](1), stuckState.timestamp)
+      _ <- seedErrorEntry(healthy.id, Array[Byte](2), healthyState.timestamp)
+      first <- net.withObjectReadsSilenced(Set(stuck.id)):
+                 within(FiniteDuration(10, SECONDS), "the scan")(repairer.scan(storeId, RepairPolicy.Default))
+      stuckKept <- errorEntryExists(stuck.id)
+      healthyKept <- errorEntryExists(healthy.id)
+      second <- repairer.scan(storeId, RepairPolicy.Default)
+      stuckKeptAfter <- errorEntryExists(stuck.id)
+    yield
+      first.repaired shouldBe 1
+      first.deferred shouldBe 1
+      withClue("the stuck object's entry stays for a later pass: ")(stuckKept shouldBe true)
+      healthyKept shouldBe false
+      withClue("once its object reads again, a later scan repairs it: "):
+        second.repaired shouldBe 1
+        stuckKeptAfter shouldBe false
 
   test("a store whose pool records it on another host is not scanned, so its entries stay for that host"):
     val target = RecordingTarget(List(storeId))

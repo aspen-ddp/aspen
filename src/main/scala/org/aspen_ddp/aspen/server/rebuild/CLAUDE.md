@@ -51,6 +51,11 @@
   `HLCTimestamp.Zero`), durably before `finish`, and the pass finishes with a `REBUILD ACCEPTED LOSS` error line;
   repair restores the slice if the object becomes readable. A failed mark fails the pass. The `MaxFailedObjects`
   abort is not lifted by an acceptance
+- Timed object reads (rebuild-process.md 5.2): every object read of the walk, the sweep and `retryFailures` goes
+  through `client.withReadTimeout(objectReadTimeout)` (default `ObjectReadTimeout`, 30 s). A `ReadTimeout` is a
+  failed object like any other read failure: the walk records it and moves on (toward `MaxFailedObjects`), the sweep
+  keeps it pending for the next round, and a cancel takes effect within one timeout. Tree-node reads (the walk itself,
+  `allocationTree.get`) and the pool lookup stay untimed: they read the metadata pool, whose loss stalls the rebuild
 - Placement alarms (Rebuild F12): `REBUILD CO-LOCATED` (the selection had to share a device with the pool),
   `REBUILD OUT OF SPACE`, and a warning for a store with no recorded usage. The remedy for either is re-placement,
   `transfer-store` on the Rebuilding store (`server/host/CLAUDE.md`)

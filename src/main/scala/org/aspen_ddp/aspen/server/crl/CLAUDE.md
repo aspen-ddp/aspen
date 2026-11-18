@@ -122,6 +122,10 @@
   every pending and later Future fails with `CrlFailed` (`SimpleCRL.tracked`), `failed` completes and
   `onThreadDeath` runs once. Save completions never run, so no vote follows. The host unloads the device until it
   restarts (`DeviceShutdown.crlFailed`, `server/host/CLAUDE.md`), and the restart recovers the files as after a crash
+- A shut down CRL (`shutdown()`) answers nothing more either: on its `Shutdown` the CRL thread waits for the
+  completion thread to run every handler already handed over, sets `closed`, then fails every pending tracked Future
+  with `CrlClosed`, and every later one fails with it too. Handlers of unwritten (and in-flight) entries never run.
+  Callers treat it as a retryable failure (a drop or deletion waiting on an unloaded device frees its slot)
 - Completion handlers (save, stub, deletion, `whenDurable`) run on the CRL's **completion thread**
   (`SimpleCRL.completions`), never on the writer or CRL thread (safety `crash-recovery-log.md` C2). At each
   `WriteComplete` the CRL thread issues the next entry first, then hands over the written entry's handlers and its

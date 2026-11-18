@@ -62,7 +62,7 @@ store; an applied stub is a `TransactionId` with its transaction's start `HLCTim
 | `storesWithEntries(): Future[Set[StoreId]]` | Stores with live entries, stub-only stores included. |
 | `recoveredBytesByStore` | What the open recovered for each store, as admission counts it (section 6). |
 | `failed: Future[Throwable]` | Completes, with the cause, if the CRL dies (5.10). |
-| `shutdown()` | Blocks until the CRL's thread and writer have stopped and its files are closed. Handlers already handed to the completion thread may still finish after it returns. Idempotent. |
+| `shutdown()` | Blocks until the CRL's thread and writer have stopped and its files are closed. Handlers already handed to the completion thread run first; every Future not answered by then, and every later one, fails with `CrlClosed` (5.10). Idempotent. |
 | `admissionLimitBytes` | The device's admission limit (section 6): `(n − 2) · S/2 − S/16` in SimpleCRL, for `n` streams of `S` bytes. |
 | `maxTransactionBytes` | The most bytes, as admission counts them, one store's transaction may hold: `S/2 − 8192` in SimpleCRL. A prepare past it is dropped unsaved (section 6, Oversized). |
 | `requestGrowth()` | Asks for more room; cheap, idempotent, from any thread. SimpleCRL adds one stream if its growth policy allows (5.11). |
@@ -589,9 +589,15 @@ that one, in the entry being written, or already durable, and entries are writte
 
 ### 5.10 Shutdown and death
 
-`shutdown()` queues `Shutdown` behind earlier requests; the CRL thread passes it to the writer, which drains the
-write in flight, closes the channels, releases the lock and signals. The unwritten entries, sealed and newest, are
-discarded; none of their handlers has run (C3). Futures of requests not yet written are never completed (CRL-W5).
+`shutdown()` queues `Shutdown` behind earlier requests. The CRL thread lets the completion thread run every handler
+already handed to it (durable entries are answered as such), then marks the CRL closed, fails every pending tracked
+Future with `CrlClosed` and passes the shutdown to the writer, which drains the write in flight, closes the channels,
+releases the lock and signals. The unwritten entries, sealed and newest, are discarded, as is the in-flight entry's
+completion: none of their handlers runs (C3), so no vote follows. Every later tracked call fails with `CrlClosed`
+(`closed` is set before the pending Futures are failed, and `tracked` adds its promise before checking it, the same
+handshake as `dead`). So a caller waiting on a drop, a deletion or a read (`StoreRebuilds.droppingCrlState`,
+`DeviceReconciler.crlDropsRunning`, a transfer's extraction) always hears back and frees what it holds; a drop or
+deletion that failed this way is retried by a later check.
 
 The CRL has one death path. A writer that throws (an I/O error) closes its channels and queues `WriterDied`, and a
 completion handler that throws queues `HandlerFailed` (the rest of its batch does not run); the CRL thread throws
@@ -1166,17 +1172,4 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-### CRL-W5. `shutdown()` leaves pending Futures uncompleted forever (CONFIRMED mechanism; PLAUSIBLE trigger; liveness)
-Mechanism: `SimpleCRL`'s `Shutdown` case shuts the writer down and returns; only the death path calls `failPending`,
-and `dead` stays false, so every tracked Future not yet answered (`readStoreState`, `deleteTransactions`,
-`dropStore`, `storesWithEntries`, `loadStore`) and every later call never completes; `whenDurable` handlers in the
-discarded entry never run.
-Trigger / scenario: a device is unloaded (`DeviceShutdown.unloadDevice`) while a `discardLostStore` drop, a leftover
-drop or an extraction is pending on its CRL. Their `onComplete` never runs, so `StoreRebuilds.droppingCrlState` and
-`DeviceReconciler.crlDropsRunning` keep the store until the process restarts.
-Consequence: callbacks and promises leak; if the same device is loaded again in the process, that store's discard
-(and so its rebuild) never starts until a restart. Today a device unloaded in-process is normally reloaded only after
-a restart, which limits the effect.
-Suggested fix: on `Shutdown`, fail every pending tracked promise (and every later call) with a `CrlClosed` error,
-as death does with `CrlFailed`.
-Effort: S   Priority: 5
+(no open weaknesses)

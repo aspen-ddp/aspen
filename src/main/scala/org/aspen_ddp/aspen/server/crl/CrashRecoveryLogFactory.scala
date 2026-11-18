@@ -31,6 +31,10 @@ class CrlLocked(crlDir: os.Path)
  *  died of `cause`, and nothing more is written. The files hold what was written before, so a restart recovers it */
 class CrlFailed(val cause: Throwable) extends Exception(s"The CRL has failed: $cause", cause)
 
+/** The failure of every Future a CRL returns once it is shut down (CrashRecoveryLog.shutdown) and has not answered:
+ *  whatever its unwritten entries held is discarded unwritten, as at a crash, and nothing more is written */
+class CrlClosed extends Exception("The CRL is shut down")
+
 /** Thrown by openCRL when the CRL's files hold other than what was written: an entry recovery needs fails its checksums,
  *  or an intact entry newer than the last one recovery found exists. The CRL cannot be recovered, as with any other
  *  failure to recover it, but the cause is named apart so corruption can be counted (Todo 3.1) */

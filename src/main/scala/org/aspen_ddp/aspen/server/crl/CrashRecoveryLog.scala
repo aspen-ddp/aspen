@@ -207,7 +207,9 @@ trait CrashRecoveryLog {
     * on disk. */
   def storesWithEntries(): Future[Set[StoreId]] = Future.successful(Set())
 
-  /** Stops the CRL's threads. Blocks until they have stopped */
+  /** Stops the CRL's threads. Blocks until they have stopped. What was not yet written is discarded, as at a crash:
+    * every Future it returned and had not answered, and every later one, fails with CrlClosed; handler-style
+    * completions (save, saveAppliedStub, whenDurable) of discarded requests never run */
   def shutdown(): Unit = ()
 
   /** How many bytes of live state the CRL admits */

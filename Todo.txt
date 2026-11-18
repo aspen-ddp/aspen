@@ -59,9 +59,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.4  CRL shutdown() leaves pending Futures uncompleted: CRL-W5                                             [S]
-     CONFIRMED mechanism. droppingCrlState / crlDropsRunning keep a store until process restart. Fix: fail
-     every pending and later call with CrlClosed.
+(no open items)
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

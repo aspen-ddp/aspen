@@ -6,11 +6,11 @@ import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
 import org.aspen_ddp.aspen.server.store.backend.BackendTiming
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlConfigInvalid,
-  CrlFailed, CrlLocked, CrlMissing, CrlSizingDefaults, CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
+  CrlClosed, CrlFailed, CrlLocked, CrlMissing, CrlSizingDefaults, CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
 import scribe.Logging
 
 import java.util.UUID
-import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, Executors, LinkedBlockingQueue, Semaphore}
+import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, Executors, LinkedBlockingQueue, Semaphore, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.collection.immutable.HashMap
 import scala.concurrent.{Future, Promise}
@@ -505,16 +505,22 @@ class SimpleCRL private (streamsDir: os.Path,
   @volatile private var dead = false
   private val death = Promise[Throwable]()
 
-  // The promises of the Future-returning calls not answered yet. A death fails them, so no caller waits on a dead CRL
-  // (crash-recovery-log F9). Handler-style completions (save, saveAppliedStub) are never run after a death: nothing
-  // that waits on one, a vote above all, may proceed without the write
+  // The CRL thread has taken the Shutdown: nothing it is asked from now on is answered, and the unwritten entries are
+  // discarded. Set before the Shutdown fails `pending`
+  @volatile private var closed = false
+
+  // The promises of the Future-returning calls not answered yet. A death fails them with CrlFailed, a shutdown with
+  // CrlClosed, so no caller waits on a CRL that will never answer (crash-recovery-log F9). Handler-style completions
+  // (save, saveAppliedStub, whenDurable) are never run after either: nothing that waits on one, a vote above all, may
+  // proceed without the write
   private val pending = java.util.concurrent.ConcurrentHashMap.newKeySet[Promise[?]]()
 
-  private def failPending(): Unit =
-    pending.forEach(p => p.tryFailure(CrlFailed(cause)))
+  private def failPending(error: () => Throwable): Unit =
+    pending.forEach(p => p.tryFailure(error()))
 
-  /** Queues `request(p)` and returns `p`'s future, failed with CrlFailed if the CRL is or becomes dead first. Added
-    * before `dead` is checked: either the dying thread's failPending finds `p`, or this check sees the death */
+  /** Queues `request(p)` and returns `p`'s future, failed with CrlFailed if the CRL is or becomes dead first, or with
+    * CrlClosed if it is or becomes shut down first. Added before `dead` and `closed` are checked: either the dying or
+    * shutting-down thread's failPending finds `p`, or this check sees the death or the shutdown */
   private def tracked[T](request: Promise[T] => ActionRequest): Future[T] =
     val p = Promise[T]()
     pending.add(p)
@@ -522,6 +528,8 @@ class SimpleCRL private (streamsDir: os.Path,
     ioQueue.put(request(p))
     if dead then
       p.tryFailure(CrlFailed(cause))
+    else if closed then
+      p.tryFailure(CrlClosed())
     p.future
 
   private val ioThread = new Thread {
@@ -531,7 +539,7 @@ class SimpleCRL private (streamsDir: os.Path,
         logger.error("CRL thread died", t)
         cause = t
         dead = true
-        failPending()
+        failPending(() => CrlFailed(cause))
         // Nothing takes the Shutdown that shutdown() queues now, so the shutdown is completed here: the files are
         // closed and the latch counted down once the writer finishes what it holds. Without it the device could not
         // be loaded again (its path stays in closingCrls) and the host's stop would wait forever.
@@ -708,6 +716,12 @@ class SimpleCRL private (streamsDir: os.Path,
         case RunOnCrlThread(f) => f()
 
         case Shutdown(completionHandler) =>
+          // Every handler already handed over runs first (they must not block), so what is durable is answered as
+          // such; everything else, unwritten or in flight, is never answered and fails with CrlClosed
+          completions.shutdown()
+          completions.awaitTermination(Long.MaxValue, TimeUnit.NANOSECONDS)
+          closed = true
+          failPending(() => CrlClosed())
           shutdownWriter(completionHandler)
           return
 
@@ -1031,7 +1045,8 @@ class SimpleCRL private (streamsDir: os.Path,
 
   override def failed: Future[Throwable] = death.future
 
-  /** Idempotent: a later call waits for the first one's shutdown, as a second Shutdown would find no thread */
+  /** Idempotent: a later call waits for the first one's shutdown, as a second Shutdown would find no thread. Every
+    * Future not answered by then, and every later one, fails with CrlClosed (CRL thread, `Shutdown`) */
   override def shutdown(): Unit =
     if shutdownRequested.compareAndSet(false, true) then
       ioQueue.put(Shutdown(() => shutdownComplete.countDown()))

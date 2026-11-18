@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation
 import org.aspen_ddp.aspen.server.FilePreallocationSuite
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlConfigInvalid, CrlCorrupt, CrlFailed, CrlLocked, CrlMissing, CrlSizingMismatch, StoreRecoveryState,
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlClosed, CrlConfigInvalid, CrlCorrupt, CrlFailed, CrlLocked, CrlMissing, CrlSizingMismatch, StoreRecoveryState,
   TransactionRecoveryState}
 
 import java.nio.ByteBuffer
@@ -890,17 +890,22 @@ class SimpleCRLSuite extends FileBasedTests {
     SimpleCRL(tdir, 3, 8192).crl.shutdown()
   }
 
-  /** Every Future-returning call of a failed CRL fails with CrlFailed, whether queued before the death or after */
-  private def assertFailsFast(crl: CrashRecoveryLog): Unit =
+  /** Whether `f` completes, within 10 s, failed with an `E` */
+  private def failsWith[E <: Throwable](f: scala.concurrent.Future[?])(using ct: scala.reflect.ClassTag[E]): Boolean =
+    Await.ready(f, 10.seconds).value.get.failed.toOption.exists(ct.runtimeClass.isInstance)
+
+  /** Every Future-returning call of a failed (CrlFailed) or shut down (CrlClosed) CRL fails with an `E`, whether
+    * queued before the death or shutdown or after */
+  private def assertFailsFast[E <: Throwable](crl: CrashRecoveryLog)(using scala.reflect.ClassTag[E]): Unit =
     def failsFast(f: => scala.concurrent.Future[?]): Unit =
-      val result = Await.ready(f, 10.seconds).value.get
-      assert(result.failed.toOption.exists(_.isInstanceOf[CrlFailed]), s"expected CrlFailed, got $result")
+      val result = f
+      assert(failsWith[E](result), s"expected ${summon[scala.reflect.ClassTag[E]]}, got ${result.value}")
     failsFast(crl.readStoreState(storeId))
     failsFast(crl.deleteTransactions(storeId, List(transactionId)))
     failsFast(crl.storesWithEntries())
     failsFast(crl.dropStore(storeId))
     failsFast(crl.loadStore(storeId2, StoreRecoveryState(List(trsValidTxd2), Map(transactionId2 -> stubStart))))
-    assertThrows[CrlFailed](crl.getFullRecoveryState(storeId))
+    assertThrows[E](crl.getFullRecoveryState(storeId))
 
   test("A CRL whose completion handler threw fails every call, reports the death once and recovers on reopen") {
     val died = new LinkedBlockingQueue[Throwable]()
@@ -912,7 +917,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     assert(Await.result(i.crl.failed, 10.seconds) eq err)
     Await.ready(pendingRead, 10.seconds)
-    assertFailsFast(i.crl)
+    assertFailsFast[CrlFailed](i.crl)
     assert(died.poll(10, TimeUnit.SECONDS) eq err)
     assert(died.poll(100, TimeUnit.MILLISECONDS) == null, "the death was reported twice")
 
@@ -932,7 +937,7 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(Await.result(i.crl.failed, 10.seconds).isInstanceOf[IllegalArgumentException])
     val r = Await.ready(queuedBehind, 10.seconds).value.get
     assert(r.failed.toOption.exists(_.isInstanceOf[CrlFailed]))
-    assertFailsFast(i.crl)
+    assertFailsFast[CrlFailed](i.crl)
     assertShutdownReturns(i.crl)
   }
 
@@ -2556,6 +2561,27 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(bDone.poll(50, TimeUnit.MILLISECONDS) == null)
     handlerRelease.countDown()
     assert(bDone.poll(10, TimeUnit.SECONDS) == "b")
+    i.crl.shutdown()
+  }
+
+  test("A shutdown fails every call it leaves unanswered, and every later one, with CrlClosed (CRL-W5)") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    val held = holdWriter(i.crl, (transactionId, trsValidTxd))
+    // Both wait in the next entry, unwritten while the writer is held: the shutdown discards it. The save gives the
+    // drop something to delete (a drop of nothing completes at once)
+    i.crl.save(transactionId2, trsValidTxd2, () => ())
+    val deleted = i.crl.deleteTransactions(storeId, List(transactionId))
+    val dropped = i.crl.dropStore(storeId2)
+    val shutDown = new CountDownLatch(1)
+    val t = new Thread(() => { i.crl.shutdown(); shutDown.countDown() })
+    t.setDaemon(true)
+    t.start()
+    // Failed at once, not only once the writer has finished
+    assert(failsWith[CrlClosed](deleted))
+    assert(failsWith[CrlClosed](dropped))
+    held.release.countDown()
+    assert(shutDown.await(10, TimeUnit.SECONDS))
+    assertFailsFast[CrlClosed](i.crl)
     i.crl.shutdown()
   }
 

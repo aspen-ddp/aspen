@@ -96,7 +96,7 @@ global pool; SimpleCRL overrides it.
 - **C6 (entry atomicity).** An entry is taken whole or not at all. Its header carries a CRC32C of the header
   (`header_crc`) and one of the body through the trailing UUID (`body_crc`), and the stream UUID appears in the header
   and as the last 16 bytes of the static region (`LogEntry.createEntryBuffers`, `StreamReader.readHeader`,
-  `StreamReader.bodyIntact`).
+  `StreamReader.bodyIntact`). The header also bears the CRL's id, so only this CRL's writes are entries (5.2).
 - **C7 (only the in-flight write may be torn).** Recovery drops the newest entry if its body fails its checksum: that
   can only be the write in flight at a crash, which no handler acknowledged. Any other failed checksum, and any
   intact entry newer than the newest one found, throws `CrlCorrupt` (5.7).
@@ -310,10 +310,11 @@ A CRL is `crl/sizing`, `crl/lock`, and `numStreams` files `0.crl ... N-1.crl`, e
    lock file's identity before it opens any descriptor: closing any descriptor of the file would drop the process's
    lock. The lock is released once the writer has closed the stream files (shutdown, a failed open, or death). It does
    not fence two hosts mounting one shared device.
-2. `recordedSizing`: an existing `sizing` file gives the sizing (at least 2 streams, else `CrlSizingMismatch`). With
-   no `sizing` file, stream files mean `CrlSizingMismatch`; no stream files mean a new CRL, whose requested sizing is
-   written durably (`DurableFiles.write`) before any stream file. A `sizing` file with no stream files is a creation
-   that crashed before them, and its sizing stands.
+2. `recordedSizing`: an existing `sizing` file gives the sizing and the CRL id (at least 2 streams and a `crl-id`,
+   else `CrlSizingMismatch`). With no `sizing` file, stream files mean `CrlSizingMismatch`; no stream files mean a
+   new CRL, whose requested sizing and a new random CRL id are written durably (`DurableFiles.write`) before any
+   stream file. A `sizing` file with no stream files is a creation that crashed before them, and its sizing and id
+   stand.
 3. `createStreamsIfNew`: a leftover `*.crl.tmp` means a creation that never finished: it and any stream files are
    removed and creation starts over. With no stream files, each is preallocated as `<n>.crl.tmp`
    (`FilePreallocation.preallocate`: `fallocate(2)` mode 0 through FFM on Linux, zero-fill elsewhere or on
@@ -333,11 +334,12 @@ to the next stream, **recycles** it (new random stream UUID, write offset 0; in 
 
 ### 5.2 Entry format
 
-Header (`LogEntry`, `StaticEntryHeaderSize` = 86 bytes, big-endian):
+Header (`LogEntry`, `StaticEntryHeaderSize` = 102 bytes, big-endian):
 
 | Field | Bytes |
 |-------|-------|
 | stream UUID | 16 |
+| CRL id (`SimpleCRL.Sizing.crlId`) | 16 |
 | entry serial number | 8 |
 | oldestEntryNeeded (serial) | 8 |
 | previous entry location (stream 2, offset 8, length 4) | 14 |
@@ -360,6 +362,15 @@ bit 0 promise present, bit 1 accepted present, bit 2 accepted value, bits 3-4 st
 
 A save of an existing transaction costs only its static record; its txd and data are written once and referenced by
 location from every later record. Every entry is at least 4 KiB and every write is a `DSYNC`.
+
+**Object data never passes for an entry.** Old cycles leave raw object payloads in the streams, and recovery probes
+them at 4 KiB boundaries (5.7). `StreamReader.readHeader` takes a header for an entry only if it bears the CRL id
+recorded in `sizing`, a random UUID chosen at creation that never leaves the device. A payload shaped like an entry,
+whether crafted by a client or an innocent image of another Aspen CRL (a nested Aspen, a backup of `crl.lost-*`),
+bears another id and is skipped like any other non-entry bytes. An image of this same CRL stored on its own device
+does bear the id, but every entry in it is older than the CRL's newest: serials only rise, across opens too (the next
+entry takes the last one's serial plus one). So it can never be mistaken for a newer entry. What remains is a forger
+who has learned the id, which means read access to the device itself.
 
 ### 5.3 In-memory structures and threads
 
@@ -438,7 +449,8 @@ loads (section 6).
    whose only entry is a torn head (a rotation write in flight at a crash) yields to the stream before it.
 2. **Nothing newer.** `newerIntactEntry` scans the active stream past the last entry, and all of the next stream, for
    an intact entry of any cycle with a higher serial, hopping intact headers by their size and anything else by
-   4 KiB. A hit throws `CrlCorrupt`: a corrupt entry hides a newer one (mid-stream rot, or a rotted head hiding the
+   4 KiB. An intact header bears this CRL's id (5.2), so object data in those regions is never a hit. A hit throws
+   `CrlCorrupt`: a corrupt entry hides a newer one (mid-stream rot, or a rotted head hiding the
    real active stream).
 3. **Walk.** From the last entry, follow `previous entry` links, loading each entry's static region into a
    `RecoveringState`, until reaching the last entry's `oldestEntryNeeded`. Each step must reach an entry of its
@@ -723,29 +735,6 @@ holding stores either state is a lost CRL (`CrlMissing`, 4).
 ---
 
 ## Open weaknesses
-
-### CRL-W1. Recovery takes object data for evidence of corruption (PLAUSIBLE; systemic loss)
-Mechanism: `Recovery.recover` calls `StreamReader.newerIntactEntry` on the active stream from the next write offset
-and on the whole next stream. In regions that are not intact headers it probes every 4 KiB boundary with
-`readHeader`, which accepts any bytes whose `header_crc` matches, whose stream UUID is non-zero and equals the UUID
-16 bytes before the claimed body end, and whose sizes fit; `bodyIntact` then checks a CRC over bytes the header
-itself describes. None of this is secret or tied to this CRL: `newerIntactEntry` deliberately ignores the stream's
-cycle UUID. Those probed regions are the previous cycle's (or the torn in-flight entry's) dynamic data, which holds
-raw object payloads written by `LogEntry.createEntryBuffers` (`allocate(ou.data.asReadOnlyBuffer())`). A payload
-containing a well-formed entry with a high serial at a 4 KiB file boundary makes the scan throw `CrlCorrupt`.
-Trigger / scenario: (a) a client writes objects whose content is a crafted CRL entry (header, matching trailing UUID,
-both CRCs, serial 2^62), repeated at many phases or over many writes so one lands 4 KiB-aligned in a CRL file;
-(b) innocently, a VDisk or object holding an image of another Aspen device's CRL (a nested Aspen, a backup of
-`crl.lost-*`), whose inner entries are 4 KiB aligned. On the next restart, if the aligned copy lies past the last
-entry of the active stream (inside the old cycle's partial entry that the scan steps through) or past the end of the
-next stream's last cycle, recovery throws.
-Consequence: the device's CRL is declared lost (`openDeviceCrl`): every store on it is marked `rebuild-required` and
-rebuilt. Repeatable by a tenant against every device holding its replicas, so it can push pools toward the
-correlated-loss pattern.
-Suggested fix: make entries unforgeable by content: record a random CRL id in `crl/sizing` at creation and include
-it in every header (or seed both CRCs with it), and have `readHeader` reject headers without it. Add a test that
-writes object data containing a valid foreign entry and reopens.
-Effort: S   Priority: 3
 
 ### CRL-W2. One large transaction kills the CRL of every device it touches (CONFIRMED; liveness)
 Mechanism: `Frontend.admitPrepare` checks only that the device total is below the tier ceiling before admitting, and

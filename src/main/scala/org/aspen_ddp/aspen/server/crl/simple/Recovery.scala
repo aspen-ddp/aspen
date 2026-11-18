@@ -39,8 +39,9 @@ object Recovery extends Logging:
   /** A live applied stub, with its anchor and the serial number of the newest entry holding it */
   case class RecoveredStub(id: TxId, start: HLCTimestamp, anchor: StreamLocation, entrySerialNumber: Long)
 
-  def recover(files: List[(StreamId, os.Path)]): Result =
-    val readers = files.sortBy(_._1.number).map(t => StreamReader(t._1, t._2)).toArray
+  /** @param crlId the id the CRL recorded at its creation (SimpleCRL.Sizing): only headers bearing it are entries */
+  def recover(files: List[(StreamId, os.Path)], crlId: UUID): Result =
+    val readers = files.sortBy(_._1.number).map(t => StreamReader(t._1, t._2, crlId)).toArray
     try recover(readers)
     finally readers.foreach(_.close())
 

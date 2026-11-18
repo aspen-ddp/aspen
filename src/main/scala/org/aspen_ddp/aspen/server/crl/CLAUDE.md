@@ -14,7 +14,8 @@
 - One CRL per storage device, in `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`), opened by
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
 - Sizing (`crl-num-streams`, `crl-max-file-size-mb`, both required in the device config) is fixed when the device's
-  CRL is created and recorded durably in `crl/sizing` (`SimpleCRL.SizingFile`) before any stream file. An existing
+  CRL is created and recorded durably in `crl/sizing` (`SimpleCRL.SizingFile`) before any stream file, with the
+  CRL's random id (`Sizing.crlId`). An existing
   CRL always opens with its recorded sizing, whatever the config asks (a warning is logged), so config edits and
   default changes are harmless. `SimpleCRL.apply` throws `CrlSizingMismatch` for stream files without a readable
   sizing file or of another count or size than recorded. That is damage or a hand edit, never declared a lost CRL:
@@ -26,7 +27,9 @@
 - Each entry header carries CRC32Cs of the header and of the body (`LogEntry`). Recovery drops a torn newest entry
   (only the write in flight at a crash can be torn) and throws `CrlCorrupt` for any other failed checksum, or when an
   intact entry newer than the last one found exists in that stream or the next. Data is read only from entries
-  the walk verified. All-zero regions are not entries
+  the walk verified. All-zero regions are not entries. Every header bears the CRL id from `crl/sizing`, and
+  `StreamReader.readHeader` takes no other header for an entry: the old-cycle object data that the newer-entry scan
+  probes at 4 KiB boundaries can never pass for an entry, whether crafted or an image of another CRL
 - A failed open shuts its writer down before throwing, so a retry never runs two writers over the same files
 - An open writes nothing (safety F16): recovery returns each live record with the locations its newest static record
   names and the serial of the oldest verified entry holding any of them (a stub: its anchor in the newest entry

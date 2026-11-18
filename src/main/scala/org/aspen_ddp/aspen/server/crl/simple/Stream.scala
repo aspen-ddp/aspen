@@ -5,6 +5,7 @@ import scribe.Logging
 import java.util.UUID
 
 class Stream(val streamId: StreamId,
+             val crlId: UUID,
              val streamWriter: StreamWriter,
              private var currentUUID: UUID,
              initialNextEntryOffset: Long) extends Logging:
@@ -30,7 +31,7 @@ class Stream(val streamId: StreamId,
     val entryLocation = StreamLocation(streamId, nextWriteOffset, entry.entrySize.toInt)
     val entrySize = entry.entrySize
 
-    val buffers = entry.createEntryBuffers(nextWriteOffset, currentUUID, streamId)
+    val buffers = entry.createEntryBuffers(nextWriteOffset, crlId, currentUUID, streamId)
 
     streamWriter.write(streamId, nextWriteOffset, buffers, () =>
       entry.runCompletionHandlers()

@@ -102,6 +102,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     stubDeletions += txid
 
   def createEntryBuffers(startingOffset: Long,
+                         crlId: UUID,
                          streamUUID: UUID,
                          streamId: StreamId): Array[ByteBuffer] =
 
@@ -114,6 +115,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     val hbuff = ByteBuffer.wrap(harr)
 
     Tx.putUUID(hbuff, streamUUID)
+    Tx.putUUID(hbuff, crlId)
     hbuff.putLong(entrySerialNumber)
     hbuff.putLong(oldestEntryNeeded)
     Tx.putStreamLocation(hbuff, previousEntryLocation)
@@ -181,7 +183,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
 object LogEntry:
 
-  val StaticEntryHeaderSize: Int = 16 + 8 + 8 + 14 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4
+  val StaticEntryHeaderSize: Int = 16 + 16 + 8 + 8 + 14 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4
 
   private val BodyCrcOffset: Int = StaticEntryHeaderSize - 8
   private val HeaderCrcOffset: Int = StaticEntryHeaderSize - 4
@@ -198,6 +200,9 @@ object LogEntry:
 
   /// Entry Header
   ///   stream_uuid - 16
+  ///   crl_id - 16: the id of the CRL that wrote the entry (SimpleCRL.Sizing.crlId). A header bearing another id is not
+  ///     an entry of this CRL, so object data in its streams (a crafted entry, an image of another CRL) never passes
+  ///     for one
   ///   entry_serial_number - 8
   ///   oldest_entry_needed - 8
   ///   prev_entry_file_location - 14 (2 + 8 + 4)
@@ -215,6 +220,7 @@ object LogEntry:
   /// Static data: transactions, applied stubs (TxId and start timestamp each), transaction deletions, applied stub
   /// deletions (TxId each), stream UUID
   case class EntryHeader(streamUUID: UUID,
+                         crlId: UUID,
                          entrySerialNumber: Long,
                          oldestEntryNeeded: Long,
                          previousEntryStreamLocation: StreamLocation,
@@ -245,6 +251,7 @@ object LogEntry:
 
   def loadHeader(hbuff: ByteBuffer): EntryHeader =
     val streamUUID = Tx.getUUID(hbuff)
+    val crlId = Tx.getUUID(hbuff)
     val entrySerialNumber = hbuff.getLong()
     val oldestEntryNeeded = hbuff.getLong()
     val previousEntryLocation = Tx.getStreamLocation(hbuff)
@@ -256,7 +263,7 @@ object LogEntry:
     val numStubDeletions = hbuff.getInt()
     val bodyCrc = hbuff.getInt()
 
-    EntryHeader(streamUUID, entrySerialNumber, oldestEntryNeeded, previousEntryLocation, dynamicDataSize,
+    EntryHeader(streamUUID, crlId, entrySerialNumber, oldestEntryNeeded, previousEntryLocation, dynamicDataSize,
       staticDataSize, numTransactions, numTxDeletions, numStubs, numStubDeletions, bodyCrc)
 
 

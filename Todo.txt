@@ -45,13 +45,9 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 PRIORITY 3: systemic loss protection
 ------------------------------------
 
-(The correlated false "store lost" design item remains in Backlog.txt. The items below are independent S/M fixes.)
+(The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.3  CRL recovery accepts forged entries from object payloads: CRL-W1                                      [S]
-     PLAUSIBLE. StreamReader.newerIntactEntry probes 4 KiB boundaries of old-cycle data, which holds raw object
-     bytes; a crafted (or nested-Aspen) entry with a high serial makes recovery throw CrlCorrupt and the device's
-     CRL is declared lost (every store rebuilt). Tenant-triggerable against every device holding its replicas.
-     Fix: random CRL id in crl/sizing, included in every header (or seeding the CRCs); readHeader rejects others.
+(no open items)
 
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)

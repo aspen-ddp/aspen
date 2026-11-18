@@ -14,7 +14,7 @@ object StreamReader:
 
   private val CrcChunkSize: Int = 1024 * 1024
 
-class StreamReader(val streamId: StreamId, val filePath: os.Path):
+class StreamReader(val streamId: StreamId, val filePath: os.Path, val crlId: UUID):
   import StreamReader.*
 
   private val ochannel: Option[FileChannel] =
@@ -49,9 +49,11 @@ class StreamReader(val streamId: StreamId, val filePath: os.Path):
       readFully(offset, buff)
       Tx.getUUID(buff)
 
-  /** The header at `offset` if it is intact: its checksum matches, its stream UUID is not zero (a zero-filled region is
-    * not an entry, crash-recovery-log F19), the entry fits in the file, and its trailing UUID matches the header's.
-    * Says nothing of its body (bodyIntact) or of which cycle of the stream wrote it */
+  /** The header at `offset` if it is intact: its checksum matches, it bears this CRL's id, its stream UUID is not zero
+    * (a zero-filled region is not an entry), the entry fits in the file, and its trailing UUID matches the header's.
+    * The id is what keeps object data, which old cycles leave in the streams, from passing for an entry: bytes shaped
+    * like one (crafted, or an image of another CRL) bear another id. Says nothing of its body (bodyIntact) or of
+    * which cycle of the stream wrote it */
   def readHeader(entryOffset: Long): Option[LogEntry.EntryHeader] =
     if ochannel.isEmpty || entryOffset < 0 || entryOffset + LogEntry.StaticEntryHeaderSize > fileSize then
       None
@@ -65,7 +67,7 @@ class StreamReader(val streamId: StreamId, val filePath: os.Path):
         val fits = h.dynamicDataSize >= 0 && h.staticDataSize >= 16 &&
           h.dynamicDataSize <= fileSize && h.staticDataSize <= fileSize &&
           entryOffset + h.entrySize <= fileSize
-        if h.streamUUID == ZeroUUID || !fits || readUUID(entryOffset + h.trailingUUIDOffset) != h.streamUUID then
+        if h.crlId != crlId || h.streamUUID == ZeroUUID || !fits || readUUID(entryOffset + h.trailingUUIDOffset) != h.streamUUID then
           None
         else
           Some(h)

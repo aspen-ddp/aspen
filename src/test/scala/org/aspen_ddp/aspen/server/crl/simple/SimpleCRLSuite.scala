@@ -53,6 +53,9 @@ object SimpleCRLSuite:
 
   val updateLocations = Some((ou1.objectId, ou1Loc) :: (ou2.objectId, ou2Loc) :: Nil)
 
+  /** The CRL id of the streams the tests here write directly */
+  val crlId = new UUID(0xc71, 1)
+
   val stream0 = StreamId(0)
   val stream1 = StreamId(1)
   val stream2 = StreamId(2)
@@ -87,6 +90,9 @@ class SimpleCRLSuite extends FileBasedTests {
 
   /** The start timestamp the stubs here carry: a fixed one, so recovered states compare equal */
   private val stubStart = HLCTimestamp(0x5eed0000L)
+
+  /** The id the CRL in `dir` recorded at its creation */
+  def recordedId(dir: os.Path): UUID = SimpleCRL.Sizing.decode(os.read(dir / SimpleCRL.SizingFile)).get.crlId
 
   def streams(numStreams: Int): List[(StreamId, os.Path)] =
     var lst: List[(StreamId, os.Path)] = Nil
@@ -457,7 +463,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val tx = Tx(txid, trs, None, None)
 
     val le = LogEntry(StreamLocation.Null, 0, 0)
-    val stream = new Stream(stream0, streamWriter, UUID.randomUUID(), 0)
+    val stream = new Stream(stream0, crlId, streamWriter, UUID.randomUUID(), 0)
 
     le.addTx(tx, completionHandler)
 
@@ -477,7 +483,7 @@ class SimpleCRLSuite extends FileBasedTests {
     streamWriter.shutdown(() => stopped.countDown())
     stopped.await()
 
-    val r = Recovery.recover(streams(1))
+    val r = Recovery.recover(streams(1), crlId)
 
     assert(r.trsList.length == 1)
     assert(r.activeStreamId == stream0)
@@ -497,7 +503,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val tx = Tx(txid, trs, None, None)
     val le = LogEntry(StreamLocation.Null, 0, 0)
-    val stream = new Stream(stream0, streamWriter, UUID.randomUUID(), 0)
+    val stream = new Stream(stream0, crlId, streamWriter, UUID.randomUUID(), 0)
 
     le.addTx(tx, completionHandler)
 
@@ -510,7 +516,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     streamWriter.shutdown()
 
-    val r = Recovery.recover(streams(1))
+    val r = Recovery.recover(streams(1), crlId)
 
     assert(r.trsList.length == 1)
     assert(r.activeStreamId == stream0)
@@ -523,7 +529,7 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("Recovery without log files") {
-    val r = Recovery.recover(Nil)
+    val r = Recovery.recover(Nil, crlId)
 
     assert(r.trsList.length == 0)
     assert(r.activeStreamId == stream0)
@@ -728,7 +734,8 @@ class SimpleCRLSuite extends FileBasedTests {
 
   test("Creating a CRL records its sizing before any stream file") {
     SimpleCRL(tdir, 4, 1024 * 1024).crl.shutdown()
-    assert(SimpleCRL.Sizing.decode(os.read(tdir / SimpleCRL.SizingFile)) == Some(SimpleCRL.Sizing(4, 1024 * 1024)))
+    val recorded = SimpleCRL.Sizing.decode(os.read(tdir / SimpleCRL.SizingFile))
+    assert(recorded.map(r => (r.numStreams, r.maxSizeInBytes)) == Some((4, 1024 * 1024)))
     assert(os.list(tdir).filter(_.ext == "crl").map(_.last).toSet == Set("0.crl", "1.crl", "2.crl", "3.crl"))
   }
 
@@ -746,7 +753,7 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("A sizing file without stream files is a CRL whose creation crashed: it is created with that sizing") {
-    os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(4, 1024 * 1024).encode)
+    os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(4, 1024 * 1024, UUID.randomUUID()).encode)
     val i = SimpleCRL(tdir, 3, 2 * 1024 * 1024)
     assert(i.crl.admissionLimitBytes == 1024 * 1024 / 2)
     i.crl.shutdown()
@@ -760,15 +767,15 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(!os.exists(tdir / SimpleCRL.SizingFile))
     os.write(tdir / SimpleCRL.SizingFile, "garbage")
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
-    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(1, 1024 * 1024).encode)
+    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(1, 1024 * 1024, UUID.randomUUID()).encode)
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
   }
 
   test("Stream files disagreeing with the recorded sizing are a sizing mismatch") {
     SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
-    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(4, 1024 * 1024).encode)
+    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(4, 1024 * 1024, UUID.randomUUID()).encode)
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
-    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(3, 2 * 1024 * 1024).encode)
+    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(3, 2 * 1024 * 1024, UUID.randomUUID()).encode)
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
   }
 
@@ -1354,7 +1361,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     // Corrupt the trailing UUID of the second entry in stream 0
     val streamFile = tdir / "0.crl"
-    val reader = StreamReader(StreamId(0), streamFile)
+    val reader = StreamReader(StreamId(0), streamFile, recordedId(tdir))
     val Some(entry0Header) = reader.readEntry(0): @unchecked
     val entry1Start = entry0Header.entrySize
     val Some(entry1Header) = reader.readEntry(entry1Start): @unchecked
@@ -1413,7 +1420,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
 
     val streamWriter = newWriter(4096 * 1000, 1)
-    val stream = new Stream(stream0, streamWriter, UUID.randomUUID(), 0)
+    val stream = new Stream(stream0, crlId, streamWriter, UUID.randomUUID(), 0)
 
     val tx1 = Tx(txid, trs, None, None)
     val tx2 = Tx(txid2, trs2, None, None)
@@ -1427,7 +1434,7 @@ class SimpleCRLSuite extends FileBasedTests {
     queue.take()
     streamWriter.shutdown()
 
-    val r = Recovery.recover(streams(1))
+    val r = Recovery.recover(streams(1), crlId)
 
     assert(r.trsList.length == 1)
     assert(r.trsList.head.storeId == storeId2)
@@ -1522,6 +1529,69 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.shutdown()
     assert(headerAt(dir / "0.crl", 4096).entrySerialNumber == headerAt(dir / "0.crl", 0).entrySerialNumber + 1)
 
+  /** The bytes of a well-formed entry holding B, with serial number `serial`, as CRL `id` writes it under
+    * `streamUUID` */
+  private def entryImage(serial: Long, streamUUID: UUID, id: UUID): Array[Byte] =
+    val le = LogEntry(StreamLocation.Null, serial, serial)
+    le.addTx(Tx(txid2, trs2, None, None), () => ())
+    val out = new java.io.ByteArrayOutputStream()
+    le.createEntryBuffers(0, id, streamUUID, stream0).foreach: b =>
+      val a = new Array[Byte](b.remaining())
+      b.get(a)
+      out.write(a)
+    out.toByteArray
+
+  test("Object data holding a well-formed foreign entry with a high serial number does not fail recovery") {
+    val queue = new LinkedBlockingQueue[String]()
+    val streamWriter = newWriter(4096 * 8, 1)
+    val stream = new Stream(stream0, crlId, streamWriter, UUID.randomUUID(), 0)
+
+    // A's object data places a forged entry, serial 2^62, at offset 8192 of the stream
+    val forged = entryImage(1L << 62, UUID.randomUUID(), UUID.randomUUID())
+    val dataStart = LogEntry.StaticEntryHeaderSize + txdata.size
+    val payload = new Array[Byte](8192 - dataStart + forged.length)
+    System.arraycopy(forged, 0, payload, 8192 - dataStart, forged.length)
+    val a = TransactionRecoveryState(storeId, txdata,
+      List(ObjectUpdate(ObjectId(new UUID(0, 9)), DataBuffer(payload))), disp, status, pax)
+    val le = LogEntry(StreamLocation.Null, 0, 0)
+    le.addTx(Tx(txid, a, None, None), () => queue.put(""))
+    stream.writeEntry(le, () => ())
+    queue.take()
+
+    // The stream's next cycle: its only entry covers the first page, leaving A's payload behind it
+    stream.recycleStream()
+    val le2 = LogEntry(StreamLocation.Null, 1, 1)
+    le2.addTx(Tx(txid2, trs2, None, None), () => queue.put(""))
+    stream.writeEntry(le2, () => ())
+    queue.take()
+    val stopped = new CountDownLatch(1)
+    streamWriter.shutdown(() => stopped.countDown())
+    stopped.await()
+
+    val r = Recovery.recover(streams(1), crlId)
+    assert(r.trsList.map(_.storeId) == List(storeId2))
+  }
+
+  test("A header is an entry only if it bears the reader's CRL id") {
+    val f = tdir / "image.crl"
+    os.write(f, entryImage(5, UUID.randomUUID(), crlId))
+    val own = StreamReader(stream0, f, crlId)
+    val other = StreamReader(stream0, f, UUID.randomUUID())
+    try
+      assert(own.readHeader(0).map(_.entrySerialNumber) == Some(5L))
+      assert(other.readHeader(0).isEmpty)
+      assert(other.newerIntactEntry(0, 0).isEmpty)
+    finally
+      own.close()
+      other.close()
+  }
+
+  test("A sizing file without a CRL id is unreadable: a sizing mismatch") {
+    SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
+    os.write.over(tdir / SimpleCRL.SizingFile, "num-streams: 3\nmax-size-in-bytes: 1048576\n")
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+  }
+
   test("A flipped byte in a needed entry's txd, object data or static record fails the open with CrlCorrupt") {
     val h = LogEntry.StaticEntryHeaderSize
     val txdSize = trsValidTxd.serializedTxd.size
@@ -1591,7 +1661,7 @@ class SimpleCRLSuite extends FileBasedTests {
   test("Zero-filled stream files open as an empty CRL that writes from the start of stream 0") {
     val size = 4096L * 3
     // As a creation that recorded its sizing and crashed once its files were allocated
-    os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(3, size).encode)
+    os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(3, size, UUID.randomUUID()).encode)
     for n <- 0 until 3 do
       os.write(tdir / s"$n.crl", new Array[Byte](size.toInt))
     val i = SimpleCRL(tdir, 3, size)
@@ -2113,7 +2183,7 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(queue.poll(10, TimeUnit.SECONDS) == "barrier")
     // Read from the files while the CRL is still open: the deletion is durable
     val files = (0 until 3).map(n => (StreamId(n), tdir / s"$n.crl")).toList
-    assert(Recovery.recover(files).trsList.isEmpty)
+    assert(Recovery.recover(files, recordedId(tdir)).trsList.isEmpty)
     i.crl.shutdown()
   }
 

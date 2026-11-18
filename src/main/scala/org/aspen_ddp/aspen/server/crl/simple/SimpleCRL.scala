@@ -71,14 +71,16 @@ object SimpleCRL extends Logging:
       SimpleCRL(dir, config.crlNumStreams, config.crlFileSizeMb * 1024L * 1024L, onThreadDeath,
         mustExist = holdsStores).crl
 
-  /** The CRL's own record of its sizing, written durably when it is created, before any stream file. The sizing is
-   *  fixed then: an existing CRL is always opened with the sizing it recorded, whatever it is asked for, so a change
-   *  of the device config or of the code defaults cannot make it unopenable */
+  /** The CRL's own record of its sizing and id, written durably when it is created, before any stream file. The
+   *  sizing is fixed then: an existing CRL is always opened with the sizing it recorded, whatever it is asked for, so
+   *  a change of the device config or of the code defaults cannot make it unopenable */
   val SizingFile = "sizing"
 
-  /** The sizing a CRL was created with */
-  case class Sizing(numStreams: Int, maxSizeInBytes: Long):
-    def encode: String = s"num-streams: $numStreams\nmax-size-in-bytes: $maxSizeInBytes\n"
+  /** The sizing a CRL was created with, and its id: a random UUID chosen then, which every entry header bears
+   *  (LogEntry). Recovery takes only headers bearing it for entries, so object data in the streams, which nobody
+   *  outside the device can make bear an id it never sees, cannot pass for one */
+  case class Sizing(numStreams: Int, maxSizeInBytes: Long, crlId: UUID):
+    def encode: String = s"num-streams: $numStreams\nmax-size-in-bytes: $maxSizeInBytes\ncrl-id: $crlId\n"
 
   object Sizing:
     /** None if `text` is not a sizing file's content */
@@ -89,7 +91,8 @@ object SimpleCRL extends Logging:
       for
         n <- fields.get("num-streams").flatMap(_.toIntOption)
         m <- fields.get("max-size-in-bytes").flatMap(_.toLongOption)
-      yield Sizing(n, m)
+        id <- fields.get("crl-id").flatMap(v => scala.util.Try(UUID.fromString(v)).toOption)
+      yield Sizing(n, m, id)
 
   /** @param numStreams     the stream count of a CRL created by this call. An existing CRL keeps its recorded count
     * @param maxSizeInBytes the stream size of a CRL created by this call. An existing CRL keeps its recorded size
@@ -114,7 +117,7 @@ object SimpleCRL extends Logging:
     try
       if mustExist && streamFiles(streamsDir).isEmpty then
         throw CrlMissing(streamsDir)
-      val sizing = recordedSizing(streamsDir, Sizing(numStreams, maxSizeInBytes))
+      val sizing = recordedSizing(streamsDir, numStreams, maxSizeInBytes)
       val files: List[(StreamId, os.Path)] = (0 until sizing.numStreams).map(i =>
         (StreamId(i), streamsDir / s"$i.crl")
       ).toList
@@ -122,11 +125,12 @@ object SimpleCRL extends Logging:
       createStreamsIfNew(streamsDir, files.map(_._2), sizing.maxSizeInBytes)
       checkSizing(streamsDir, files.map(_._2).toSet, sizing.maxSizeInBytes)
 
-      val r = Recovery.recover(files)
+      val r = Recovery.recover(files, sizing.crlId)
 
       InitialCRLState(
         new SimpleCRL(
           sizing.maxSizeInBytes,
+          sizing.crlId,
           files,
           r,
           onThreadDeath,
@@ -141,25 +145,26 @@ object SimpleCRL extends Logging:
     if os.isDir(streamsDir) then os.list(streamsDir).filter(_.ext == "crl").toSet else Set[os.Path]()
 
   /** The sizing `streamsDir`'s CRL recorded. A directory with neither a SizingFile nor stream files is a new CRL: it
-    * records `requested` first. A SizingFile with no stream files is a creation that crashed before them: its sizing
-    * stands. Stream files without a readable SizingFile throw CrlSizingMismatch */
-  private def recordedSizing(streamsDir: os.Path, requested: Sizing): Sizing =
+    * records the requested sizing and a new random id first. A SizingFile with no stream files is a creation that
+    * crashed before them: its sizing and id stand. Stream files without a readable SizingFile throw CrlSizingMismatch */
+  private def recordedSizing(streamsDir: os.Path, numStreams: Int, maxSizeInBytes: Long): Sizing =
     val file = streamsDir / SizingFile
     if os.exists(file) then
       val recorded = Sizing.decode(os.read(file)).filter(_.numStreams >= 2).getOrElse:
         throw CrlSizingMismatch(streamsDir, s"its $SizingFile file is unreadable")
-      if recorded != requested then
+      if recorded.numStreams != numStreams || recorded.maxSizeInBytes != maxSizeInBytes then
         logger.warn(s"The CRL in $streamsDir was created with ${recorded.numStreams} streams of " +
-                    s"${recorded.maxSizeInBytes} bytes, not the ${requested.numStreams} of " +
-                    s"${requested.maxSizeInBytes} configured. Opening it with the sizing it was created with")
+                    s"${recorded.maxSizeInBytes} bytes, not the $numStreams of $maxSizeInBytes configured. " +
+                    s"Opening it with the sizing it was created with")
       recorded
     else if streamFiles(streamsDir).nonEmpty then
       throw CrlSizingMismatch(streamsDir, s"it holds stream files but no $SizingFile file")
     else
       // A rotation copies the next stream's live data into the one it recycles, which needs a second stream
-      require(requested.numStreams >= 2, s"A CRL needs at least 2 streams, not ${requested.numStreams}")
-      DurableFiles.write(file, requested.encode)
-      requested
+      require(numStreams >= 2, s"A CRL needs at least 2 streams, not $numStreams")
+      val created = Sizing(numStreams, maxSizeInBytes, UUID.randomUUID())
+      DurableFiles.write(file, created.encode)
+      created
 
   private val warnedCopyOnWrite = new AtomicBoolean(false)
 
@@ -196,6 +201,7 @@ object SimpleCRL extends Logging:
           throw CrlSizingMismatch(streamsDir, s"${f.last} is ${os.size(f)} bytes, expected $maxSizeInBytes")
 
 class SimpleCRL private (val maxSizeInBytes: Long,
+                         crlId: UUID,
                          files: List[(StreamId, os.Path)],
                          r: Recovery.Result,
                          onThreadDeath: Throwable => Unit,
@@ -240,10 +246,10 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   files.foreach: tpl =>
     if tpl._1 == r.activeStreamId then
-      streams(tpl._1.number) = new Stream(r.activeStreamId, writer,
+      streams(tpl._1.number) = new Stream(r.activeStreamId, crlId, writer,
         r.currentStreamUUID, r.initialNextEntryOffset)
     else
-      streams(tpl._1.number) = new Stream(tpl._1, writer, UUID.randomUUID(), 0)
+      streams(tpl._1.number) = new Stream(tpl._1, crlId, writer, UUID.randomUUID(), 0)
 
   // The open writes nothing (crash-recovery-log F16): each recovered record keeps the locations its newest durable
   // static record names, queued by the oldest entry holding any of them, as if this instance had written them. The

@@ -192,7 +192,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
                                   owner: HostId = HostId.BootstrapHostId): os.Path =
     val dir = writeDevice(hostRoot, name, deviceId, owner = Some(owner))
     os.write.over(dir / StorageDeviceConfig.configFilename,
-      StorageDeviceConfig(deviceId, systemId, crlFileSizeMb = 1).yamlConfig)
+      StorageDeviceConfig(deviceId, systemId, crlFileSizeMb = Some(1)).yamlConfig)
     dir
 
   /** A real Host, which opens RocksDB backends and its devices' CRLs through `crlFactory`, over `hostRoot` */
@@ -1699,7 +1699,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       leftInCrl should be(Set())
       heldOnDisk(deviceDir, storeId) should be(Set())
 
-  /** Opens a device whose CRL was created with 3 streams of 1 MB, holding a store, with `config` instead. A change of
+  /** Opens a device whose CRL was created with 4 streams of 1 MB, holding a store, with `config` instead. A change of
    *  config (or of the code defaults it once took) must neither lose the CRL nor resize it */
   private def resizedCrlDevice(config: StorageDeviceConfig => StorageDeviceConfig): Future[org.scalatest.Assertion] =
     val hostRoot = newHostDir()
@@ -1710,7 +1710,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     def files = os.list(crlDir).filter(_.ext == "crl").map(f => f.last -> os.size(f)).toSet
     val oldFiles = files
     os.write.over(deviceDir / StorageDeviceConfig.configFilename,
-      config(StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = 1)).yamlConfig)
+      config(StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = Some(1))).yamlConfig)
     val factory = newFactory()
     val host = newCrlHost(hostRoot, factory)
 
@@ -1721,14 +1721,11 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       factory.opened.head.admissionLimitBytes should be(1024 * 1024 / 2)
       files should be(oldFiles)
 
-  atest("a device CRL opened with fewer configured streams than it was created with keeps its own sizing"):
-    resizedCrlDevice(_.copy(crlNumStreams = 2))
-
   atest("a device CRL opened with more configured streams than it was created with keeps its own sizing"):
-    resizedCrlDevice(_.copy(crlNumStreams = 4))
+    resizedCrlDevice(_.copy(crlNumStreams = Some(5)))
 
   atest("a device CRL opened with another configured file size than it was created with keeps its own sizing"):
-    resizedCrlDevice(_.copy(crlFileSizeMb = 2))
+    resizedCrlDevice(_.copy(crlFileSizeMb = Some(2)))
 
   /** A device holding a store whose CRL `damage` leaves disagreeing with the sizing it recorded: refused on every
    *  scan, never declared lost, and loaded once `repair` restores it */

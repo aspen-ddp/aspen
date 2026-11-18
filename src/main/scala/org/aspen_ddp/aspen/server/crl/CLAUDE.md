@@ -13,7 +13,10 @@
   recycled), so a torn rotation write only ever overwrites entries no recovery needs. Needs at least 2 streams
 - One CRL per storage device, in `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`), opened by
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
-- Sizing (`crl-num-streams`, `crl-max-file-size-mb`, both required in the device config) is fixed when the device's
+- Sizing keys in the device config are all optional (`CrlSizingDefaults.resolve`, from the capacity of the file
+  system holding the device): `crl-num-streams` 4 (also the minimum; fewer is refused), `crl-max-file-size-mb`
+  capacity / 2048 rounded down to 4 KiB, at least 64 MiB, `crl-max-streams` 20, `crl-min-free-percent` 5 (the last two
+  are growth bounds, read at each open). Stream count and size are fixed when the device's
   CRL is created and recorded durably in `crl/sizing` (`SimpleCRL.SizingFile`) before any stream file, with the
   CRL's random id (`Sizing.crlId`). An existing
   CRL always opens with its recorded sizing, whatever the config asks (a warning is logged), so config edits and

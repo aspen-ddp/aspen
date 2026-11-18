@@ -30,24 +30,23 @@ class StorageDeviceConfigSuite extends AnyFunSuite with Matchers:
     finally
       os.remove(f)
 
-  test("CRL sizing round-trips, and a config missing either key fails rather than taking a code default"):
-    val sized = sample.copy(crlNumStreams = 5, crlFileSizeMb = 2)
+  test("CRL sizing round-trips, and a config without any crl key parses with all four None"):
+    val sized = sample.copy(crlNumStreams = Some(5), crlFileSizeMb = Some(2), crlMaxStreams = Some(9),
+      crlMinFreePercent = Some(7))
     val f = os.temp(prefix = "aspen-storage-device-crl", suffix = ".yaml")
     try
       os.write.over(f, sized.yamlConfig)
       StorageDeviceConfig.loadStorageDeviceConfig(f) should be(sized)
-      val ids = s"storage-device-id: $zero\naspen-system-id: $zero\n"
-      for keys <- List("", "crl-num-streams: 3\n", "crl-max-file-size-mb: 300\n") do
-        os.write.over(f, ids + keys)
-        an[Exception] should be thrownBy StorageDeviceConfig.loadStorageDeviceConfig(f)
+      os.write.over(f, s"storage-device-id: $zero\naspen-system-id: $zero\n")
+      val cfg = StorageDeviceConfig.loadStorageDeviceConfig(f)
+      (cfg.crlNumStreams, cfg.crlFileSizeMb, cfg.crlMaxStreams, cfg.crlMinFreePercent) should be(
+        (None, None, None, None))
     finally
       os.remove(f)
 
   test("doc-comment example config parses correctly"):
     val docExampleYaml = """storage-device-id: 00000000-0000-0000-0000-000000000000
 aspen-system-id: 00000000-0000-0000-0000-000000000000
-crl-num-streams: 3
-crl-max-file-size-mb: 300
 """
 
     val f = os.temp(prefix = "aspen-storage-device-docexample", suffix = ".yaml")
@@ -57,8 +56,8 @@ crl-max-file-size-mb: 300
 
       cfg.storageDeviceId should be(StorageDeviceId(zero))
       cfg.aspenSystemId should be(zero)
-      cfg.crlNumStreams should be(3)
-      cfg.crlFileSizeMb should be(300)
+      cfg.crlNumStreams should be(None)
+      cfg.crlFileSizeMb should be(None)
 
       StorageDeviceConfig(StorageDeviceId(zero), zero).yamlConfig should be(docExampleYaml)
     finally

@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlFailed, CrlLocked,
-  CrlMissing, CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
+  CrlMissing, CrlSizingDefaults, CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
 import scribe.Logging
 
 import java.util.UUID
@@ -71,7 +71,8 @@ object SimpleCRL extends Logging:
     def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
       val dir = CrashRecoveryLog.deviceCrlDir(devicePath)
       os.makeDir.all(dir)
-      SimpleCRL(dir, config.crlNumStreams, config.crlFileSizeMb * 1024L * 1024L, onThreadDeath,
+      val sizing = CrlSizingDefaults.resolve(config, devicePath.toIO.getTotalSpace)
+      SimpleCRL(dir, sizing.numStreams, sizing.streamBytes, onThreadDeath,
         mustExist = holdsStores).crl
 
   /** The CRL's own record of its sizing and id, written durably when it is created, before any stream file. The

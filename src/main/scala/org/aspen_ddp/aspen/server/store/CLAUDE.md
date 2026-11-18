@@ -213,6 +213,10 @@
 - No save without a charge (A4): an abort whose CRL state was deleted at resolution (`Tx.stateDeleted`) stays in
   `transactions` until `TxFinalized` with no admission; it saves nothing more, answering a prepare or accept with a
   `TxResolved` of the abort, and adopts no late data. `Tx.saveState` requires it
+- `Full` asks the CRL to grow: `admitPrepare` calls `crl.requestGrowth()` for both Full cases (a new transaction past the
+  tier ceiling, late data past it, A1), never for `Admitted` or `Oversized`. `CrlAdmission`'s limit is an `AtomicLong`
+  raised only upward (`raiseLimit`, from the CRL thread after a growth commit); `limitBytes`, `ceiling`, `tryAdmit`,
+  `full` and `tryChargeLoaded` read the current value, so the retransmitted prepare meets the raised lane
 - Oversized prepares (CRL-W2): `Frontend.admitPrepare` returns `PrepareAdmission` (`Admitted`, `Full`, `Oversized`)
   and `Store.receiveTransactionMessage` drops both non-admitted kinds the same way: no reply, no vote, no CRL write.
   `Oversized`: the transaction's counted bytes (for an admitted one, its bytes plus the uncounted data the prepare

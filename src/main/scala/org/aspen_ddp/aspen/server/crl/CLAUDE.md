@@ -45,7 +45,9 @@
   (`commitGrowthWhenQuiescent`: no rotation between its evacuation and its head, so W6's count runs over one ring):
   `crl/sizing` rewritten with `n` right after the active stream, then `StreamWriter.addStream`, then the
   `onAdmissionLimitRaised` listeners with the new `admissionLimitBytes`. The sizing rewrite must stay the last step
-  that touches the files: `removeUncommittedGrowth` relies on it. At the cap `requestGrowth` refuses at once and logs
+  that touches the files: `removeUncommittedGrowth` relies on it. `DeviceFactory.openCRL` builds the `GrowthPolicy` from the `CrlSizing` it resolved (capacity and free space from
+  `getTotalSpace` / `getUsableSpace` of the device path); `DeviceDiscovery` registers `sds.admission.raiseLimit` as the
+  listener right after constructing the device state, and `Frontend.admitPrepare` calls `requestGrowth` on every `Full`. At the cap `requestGrowth` refuses at once and logs
   it once. A refused or failed attempt logs, removes what it created and ignores requests for `retryAfter` (10 s); it
   never fails the CRL, with two fail-stop exceptions after the rename of the new sizing: its directory force failing
   twice (whether the new ring is durable is then unknown), and `addStream` failing to open the committed file. A

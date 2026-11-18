@@ -96,8 +96,11 @@ object SimpleCRL extends Logging:
       val sizing =
         if os.exists(dir / SizingFile) then CrlSizingDefaults.resolveExisting(config, capacity)
         else CrlSizingDefaults.resolve(config, capacity)
+      // Free space is read at each growth attempt, from the file system holding the CRL
+      val growth = GrowthPolicy(sizing.maxStreams, sizing.minFreePercent,
+        () => devicePath.toIO.getTotalSpace, () => devicePath.toIO.getUsableSpace)
       SimpleCRL(dir, sizing.numStreams, sizing.streamBytes, onThreadDeath,
-        mustExist = holdsStores).crl
+        mustExist = holdsStores, growth = growth).crl
 
   /** The CRL's own record of its sizing and id, written durably when it is created, before any stream file. The
    *  sizing is fixed then: an existing CRL is always opened with the sizing it recorded, whatever it is asked for, so

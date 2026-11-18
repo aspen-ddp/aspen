@@ -19,7 +19,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig,
   StorageDeviceManager, StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlCorrupt,
+import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlCorrupt,
   StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.crl.simple.{Recovery, SimpleCRL}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome,
@@ -77,6 +77,8 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
     inner.dropTransactionObjectData(storeId, txid)
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = inner.deleteTransaction(storeId, txid)
   override def admissionLimitBytes: Long = inner.admissionLimitBytes
+  override def requestGrowth(): Unit = inner.requestGrowth()
+  override def onAdmissionLimitRaised(f: Long => Unit): Unit = inner.onAdmissionLimitRaised(f)
   override def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =
     inner.deleteTransactions(storeId, txids)
   override def storesWithEntries(): Future[Set[StoreId]] = inner.storesWithEntries()
@@ -235,8 +237,9 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         Thread.sleep(1)
       round.flatMap(_ => pumpLoop(host, condition, rounds, deadline, done + 1)(round))
 
-  private def overwriteTxd(id: TransactionId, leader: Byte, pool: PoolId = poolId): TransactionDescription =
-    val p = DataObjectPointer(oid, pool, Array[Byte]())
+  private def overwriteTxd(id: TransactionId, leader: Byte, pool: PoolId = poolId,
+                           objectId: ObjectId = oid): TransactionDescription =
+    val p = DataObjectPointer(objectId, pool, Array[Byte]())
     // MaxStartLead ahead of the host's clock now: no earlier than the forget floor of the stores this host loaded
     // before it was built (Frontend.forgetFloorMillis: a store refuses a transaction started before its load plus
     // MaxStartLead), and never further ahead of the host's clock than MaxStartLead, so not muted
@@ -1773,3 +1776,52 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         saved = os.read(crlDir / SimpleCRL.SizingFile)
         os.remove(crlDir / SimpleCRL.SizingFile),
       crlDir => os.write(crlDir / SimpleCRL.SizingFile, saved))
+
+  atest("A device whose CRL lane fills grows its CRL and admits more"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    // Streams of 1 MiB, a ring of 4 that may grow to 5
+    os.write.over(deviceDir / StorageDeviceConfig.configFilename,
+      StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = Some(1), crlMaxStreams = Some(5)).yamlConfig)
+    createCrl(deviceDir)
+    val storeDir = writeStoreDir(deviceDir)
+    // One object per transaction, so none collides with another
+    val oids = (0 until 6).map(i => ObjectId(new UUID(77, i)))
+    val data = new Array[Byte](150000)
+    def prepare(host: Host, i: Int): Unit =
+      host.receiveTransactionMessage(TxPrepare(storeId, net.storeId0,
+        overwriteTxd(TransactionId(new UUID(78, i)), 1, objectId = oids(i)), ProposalId.initialProposal(1),
+        List(ObjectUpdate(oids(i), DataBuffer(data))), true))
+    val initial = new RocksDBBackend(storeDir, storeId, ExecutionContext.global)
+    oids.foreach: o =>
+      initial.bootstrapAllocate(o, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
+        DataBuffer(Array[Byte](0)))
+    for
+      _ <- initial.close()
+      host = newCrlHost(hostRoot, newFactory())
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      admission = host.control.devices.devices(deviceA).admission
+      ceiling = admission.ceiling(AdmissionTier.Data)
+      before = admission.limitBytes
+      // Five transactions take the data lane past its ceiling
+      _ = (0 until 5).foreach(prepare(host, _))
+      _ <- pumpUntil(host, admission.full(AdmissionTier.Data))
+      _ = admission.full(AdmissionTier.Data) should be(true)
+      admittedFull = admission.admittedBytes
+      // The sixth is refused, which asks the CRL to grow
+      _ = prepare(host, 5)
+      _ <- pumpUntil(host, admission.limitBytes > before)
+      crlDir = CrashRecoveryLog.deviceCrlDir(deviceDir)
+      // The retransmission meets the raised limit
+      _ = prepare(host, 5)
+      _ <- pumpUntil(host, admission.admittedBytes > admittedFull)
+      _ <- host.control.router.loaded(storeId).backend.close()
+    yield
+      admission.admittedBytes - admittedFull should be > 150000L
+      // (n - 2) * S / 2 - S / 16 for n = 5 streams of 1 MiB
+      admission.limitBytes should be(3L * (1L << 20) / 2 - (1L << 20) / 16)
+      admission.limitBytes should be > before
+      admission.ceiling(AdmissionTier.Data) should be > ceiling
+      os.exists(crlDir / "4.crl") should be(true)
+      os.exists(crlDir / "5.crl") should be(false)

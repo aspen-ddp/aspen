@@ -88,6 +88,9 @@
   after its recovery has counted its records (`Frontend.recoverState`); a reload over a loaded store retains the old
   store's admissions on the shared executor (`StoreRouter.install`), and the new store's CRL read is issued behind
   every save the old one made (crash-recovery-log 6.1, A2)
+- `DeviceDiscovery` registers `crl.onAdmissionLimitRaised(sds.admission.raiseLimit)` right after constructing the device
+  state, before any store loads: a CRL growth raises the device's admission limit (raise-only, thread-safe) for all its
+  stores
 - A `crl_save.log` state is charged before `loadStore` saves it (`CrlAdmission.tryChargeLoaded`, at most the limit
   plus one transaction, A3), after the Store is built and before install, retained for the store. Refused, the store
   is left offline, its file kept, and retried every device scan through `storesAwaitingSpace` (one warning per

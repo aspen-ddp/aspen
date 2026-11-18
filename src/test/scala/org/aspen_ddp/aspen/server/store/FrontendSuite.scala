@@ -121,6 +121,10 @@ object FrontendSuite {
 
     var txSaved = false
     var txDel = false
+    /** How many times admission asked the CRL to grow */
+    var growthRequests = 0
+
+    override def requestGrowth(): Unit = growthRequests += 1
     var aDrop = false
     var deleted: List[TransactionId] = Nil
     var dropped: List[TransactionId] = Nil
@@ -5619,6 +5623,29 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     store.frontend.admitPrepare(dataPrepare(ledTxd(txid1, List(overwrite(op1))))) shouldBe PrepareAdmission.Full
     admission.admittedBytes shouldBe 100
+  }
+
+  test("growthRequested: Full asks the CRL to grow, Admitted and Oversized do not") {
+    val admission = new CrlAdmission(1024 * 1024)
+    val crl = new SmallTxCrl
+    val (store, _, _) = admissionStore(admission, crl)
+    val small = dataPrepare(ledTxd(txid1, List(overwrite(op1))))
+    val txid4 = TransactionId(new UUID(0, 12))
+
+    store.frontend.admitPrepare(small) shouldBe PrepareAdmission.Admitted
+    crl.growthRequests shouldBe 0
+    store.frontend.admitPrepare(oversized(dataPrepare(ledTxd(txid2, List(overwrite(op1)))))) shouldBe
+      PrepareAdmission.Oversized
+    crl.growthRequests shouldBe 0
+
+    // A new transaction past the ceiling, and late data past it (A1), each ask once
+    val dataLess = small.copy(objectUpdates = Nil, fromClient = false)
+    store.frontend.admitPrepare(dataLess.copy(txd = ledTxd(txid3, List(overwrite(op1))))) shouldBe PrepareAdmission.Admitted
+    admission.charge(admission.ceiling(AdmissionTier.Data) - admission.admittedBytes)
+    store.frontend.admitPrepare(dataPrepare(ledTxd(txid4, List(overwrite(op1))))) shouldBe PrepareAdmission.Full
+    crl.growthRequests shouldBe 1
+    store.frontend.admitPrepare(dataPrepare(ledTxd(txid3, List(overwrite(op1))))) shouldBe PrepareAdmission.Full
+    crl.growthRequests shouldBe 2
   }
 
   // CRL admission rule A1 (crash-recovery-log 6.1): late data is checked against the lane as a new transaction is

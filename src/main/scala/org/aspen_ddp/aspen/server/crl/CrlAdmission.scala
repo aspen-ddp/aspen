@@ -37,11 +37,22 @@ import scala.annotation.tailrec
   * the description is trusted for it. Residual: finalizers in the same tier (TKVL split, join, tail removal) can still
   * stall if that tier's own traffic fills its lane on every device of the pool.
   */
-final class CrlAdmission(val limitBytes: Long):
+final class CrlAdmission(initialLimitBytes: Long):
   private val total = new AtomicLong(0)
+  // Raised by the CRL thread when the CRL grows, read by every store executor: an AtomicLong that only increases
+  private val limit = new AtomicLong(initialLimitBytes)
+
+  /** The current admission limit */
+  def limitBytes: Long = limit.get
+
+  /** Raises the limit to `bytes`; a lower value is ignored, so a late or repeated notification cannot shrink it */
+  def raiseLimit(bytes: Long): Unit =
+    limit.accumulateAndGet(bytes, math.max(_, _))
 
   /** The total below which a new transaction of `tier` is admitted */
-  def ceiling(tier: AdmissionTier): Long = limitBytes - tier.reserveParts * (limitBytes / tier.reserveDivisor)
+  def ceiling(tier: AdmissionTier): Long =
+    val l = limitBytes
+    l - tier.reserveParts * (l / tier.reserveDivisor)
 
   /** Admits `bytes` if the total admitted is below the ceiling of `tier` */
   @tailrec
@@ -94,7 +105,8 @@ final class CrlAdmission(val limitBytes: Long):
     * are left out of the check too; a retain landing after the read only makes it stricter. One compare-and-set, as
     * tryAdmit: no admission between the check and the charge */
   def tryChargeLoaded(storeId: StoreId, bytes: Long, slack: Long): Boolean =
-    val max = if limitBytes > Long.MaxValue - slack then Long.MaxValue else limitBytes + slack
+    val l = limitBytes
+    val max = if l > Long.MaxValue - slack then Long.MaxValue else l + slack
     val own = retainedBytes(storeId)
     @tailrec
     def attempt(): Boolean =

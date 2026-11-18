@@ -28,6 +28,16 @@ class CrlAdmissionSuite extends AnyFunSuite with Matchers:
     a.release(250)
     a.tryAdmit(1, AdmissionTier.Data) shouldBe true
 
+  test("raiseLimit only raises the limit, and ceilings follow it"):
+    val l = 800L
+    val a = new CrlAdmission(l)
+    a.raiseLimit(2 * l)
+    a.limitBytes shouldBe 2 * l
+    a.ceiling(AdmissionTier.Data) shouldBe 2 * l - 2 * l / 4
+    a.raiseLimit(l)
+    a.limitBytes shouldBe 2 * l
+    a.ceiling(AdmissionTier.Data) shouldBe 2 * l - 2 * l / 4
+
   test("an unlimited admission admits every tier"):
     val a = CrlAdmission.Unlimited
     AdmissionTier.values.foreach: t =>

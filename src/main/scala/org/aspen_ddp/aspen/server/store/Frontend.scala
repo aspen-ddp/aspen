@@ -1284,6 +1284,13 @@ class Frontend(val storeId: StoreId,
     * reaches it through missed-update repair, and the data-less admission is released by the usual paths
     */
   def admitPrepare(m: TxPrepare): PrepareAdmission =
+    val result = checkAdmission(m)
+    // A full lane asks the CRL to grow (idempotent, any thread); the retransmitted prepare meets the raised limit
+    if result == PrepareAdmission.Full then
+      crl.requestGrowth()
+    result
+
+  private def checkAdmission(m: TxPrepare): PrepareAdmission =
     val txid = m.txd.transactionId
     admitted.get(txid) match
       case Some(a) =>

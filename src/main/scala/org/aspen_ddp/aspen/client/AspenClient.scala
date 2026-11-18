@@ -78,6 +78,16 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   def shutdown(): Unit = ()
 
+  /** A reader whose reads give up after `timeout`, failing with ReadTimeout and sending no further requests.
+    *
+    * Reads are untimed by default: they retry until they restore the object or fail fatally, so a partition or
+    * downed hosts only delay them. A timed reader is for a caller that must not wait forever, and has every read
+    * method of the client. A ReadTimeout is not an InvalidObject: the object may well exist. The timeout bounds the
+    * object read itself, not the resolution of its pool's IDA. `Duration.Inf` returns this client; any other
+    * duration must be finite and positive (IllegalArgumentException otherwise).
+    */
+  def withReadTimeout(timeout: scala.concurrent.duration.Duration): ObjectReader
+
   def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState]
 
   def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState]

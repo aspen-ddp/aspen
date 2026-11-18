@@ -18,6 +18,10 @@ trait ReadDriver {
   /** Called to abandon the read. This calls should cancel all activity scheduled for the future */
   def shutdown(): Unit
 
+  /** Called when a timed read's timeout expires (ReadManager.read). Fails an incomplete read with ReadTimeout and
+    * stops it as completion does, so it sends no further requests. Does nothing once the read is complete */
+  def timeOut(): Unit
+
   /** Returns True when all stores have been heard from */
   def receiveReadResponse(response:ReadResponse): Boolean
 }

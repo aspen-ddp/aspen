@@ -84,12 +84,16 @@ class ReadManager(val client: ReadDriverClient, val driverFactory: ReadDriver.Fa
 
   /** Creates a ReadDriver from the passed-in factory function and returns a Future to the eventual result.
     *
+    * A finite `timeout` bounds the read: once it expires, an incomplete read fails with ReadTimeout, its driver
+    * stops (ReadDriver.timeOut) and the read is released. An infinite one, the default, schedules nothing: the read
+    * retries until it completes.
     */
   def read(
             objectPointer: ObjectPointer,
             ida: IDA,
             comment: String,
-            readType: ReadType = FullObject()
+            readType: ReadType = FullObject(),
+            timeout: Duration = Duration.Inf
             ): Future[ObjectState] = {
 
     val readUUID = UUID.randomUUID()
@@ -99,6 +103,12 @@ class ReadManager(val client: ReadDriverClient, val driverFactory: ReadDriver.Fa
     synchronized { outstandingReads += (readUUID -> driver) }
 
     driver.begin()
+
+    if timeout.isFinite then
+      val timer = client.backgroundTaskManager.schedule(timeout):
+        driver.timeOut()
+        synchronized { outstandingReads -= readUUID }
+      driver.readResult.onComplete(_ => timer.cancel())(using ExecutionContext.parasitic)
 
     driver.readResult
   }

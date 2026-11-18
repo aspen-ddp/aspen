@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.read
 
 import java.util.UUID
-import org.aspen_ddp.aspen.client.{DataObjectRangeState, DataObjectRangesState, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState, ReadDriverClient, ReadError}
+import org.aspen_ddp.aspen.client.{DataObjectRangeState, DataObjectRangesState, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState, ReadDriverClient, ReadError, ReadTimeout}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{Read, ReadResponse}
@@ -110,6 +110,14 @@ abstract class BaseReadDriver(
   def shutdown(): Unit = {}
 
   protected def onComplete(): Unit = ()
+
+  def timeOut(): Unit = synchronized {
+    if !promise.isCompleted then
+      logger.info(s"Read UUID $readUUID: Timed out reading object ${objectPointer.id}")
+      reportIfSlow("timed out")
+      promise.failure(new ReadTimeout(objectPointer))
+      onComplete()
+  }
 
   /** Sends a Read request to the specified store. */
   protected def sendReadRequestNoLogMessage(dataStoreId: StoreId): Unit = {

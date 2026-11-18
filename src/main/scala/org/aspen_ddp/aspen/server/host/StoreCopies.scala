@@ -38,7 +38,9 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
    *   1. the `rebuild-required` marker, which keeps the copy from ever being loaded, shipped or adopted as clean;
    *   2. its CRL state saved in the copy as RebuildingStore.LostCrlStateFile: an existing one is kept (a crash left
    *      it), else the copy's `crl_save.log` is renamed to it (it already holds the state, which a transfer-out
-   *      close deleted from the device CRL), else the store's device-CRL entries are read and saved;
+   *      close deleted from the device CRL; any entries the device CRL still holds for the store, after a crash
+   *      before that deletion, are first saved beside it as RebuildingStore.LostCrlEntriesFile), else the store's
+   *      device-CRL entries are read and saved;
    *   3. the store's device-CRL entries dropped (CrashRecoveryLog.dropStore): a store loaded or rebuilt onto this
    *      device later would recover them otherwise;
    *   4. the directory renamed into the device's pending-delete directory.
@@ -66,8 +68,13 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
             if os.exists(lostState) then
               Future.unit
             else if os.exists(saveFile) then
-              DurableFiles.move(saveFile, lostState)
-              Future.unit
+              // The device CRL may hold the state too (a crash between the save file and its entries' deletion), and
+              // the file may be what was found unusable: those entries are kept beside it, durably before the move
+              val entries = storePath / RebuildingStore.LostCrlEntriesFile
+              local.crl.readStoreState(storeId).map: trs =>
+                if !trs.isEmpty && !os.exists(entries) then
+                  CrashRecoveryLog.saveStoreState(storeId, trs, entries)
+                DurableFiles.move(saveFile, lostState)
             else
               local.crl.readStoreState(storeId).map(trs => CrashRecoveryLog.saveStoreState(storeId, trs, lostState))
           saved.flatMap(_ => local.crl.dropStore(storeId))

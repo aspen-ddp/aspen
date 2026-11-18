@@ -145,7 +145,9 @@
   **retired** (`StoreCopies.retire`), each step durable before the next:
   1. the `rebuild-required` marker is written;
   2. its CRL state is saved into the copy's `lost-crl-state.log`. A file already there is kept. Otherwise the copy's
-     `crl_save.log` is renamed to that name, or else the store's device-CRL entries are read and saved;
+     `crl_save.log` is renamed to that name (with any device-CRL entries the store still has, after a crash before
+     a transfer out deleted them, saved beside it first as `lost-crl-entries.log`: the file may be what was found
+     unusable), or else the store's device-CRL entries are read and saved;
   3. `CrashRecoveryLog.dropStore` removes the entries from the device CRL;
   4. the copy is renamed to `<device>/pending-delete/<store-dir>-<uuid>`.
 

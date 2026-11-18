@@ -988,6 +988,36 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       keptWhileRebuilding should be(true)
       deletedOnceActive should be(true)
 
+  atest("a copy retired with an unusable crl_save.log keeps the device CRL's entries beside it"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      // A crash between a transfer out's save file and the deletion of its entries, then the file found unusable
+      // (D3): the device CRL's entries are a second copy of the state, and may be the only readable one
+      _ = os.write.over(Backend.crlSaveFile(storeDir), "damaged")
+      _ = os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
+      restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
+      copies = pendingCopies(deviceDir)
+      kept = copies.map(c => CrashRecoveryLog.loadValidStoreState(c / RebuildingStore.LostCrlEntriesFile, storeId))
+      saveFileKept = copies.map(c => os.read(c / RebuildingStore.LostCrlStateFile))
+      leftInCrl = held(second.opened.head, storeId)
+      _ = second.shutdownAll()
+    yield
+      copies.size should be(1)
+      saveFileKept should be(List("damaged"))
+      kept.map(_.map(_.transactions.map(_.txd.transactionId))) should be(List(Right(List(txid))))
+      leftInCrl should be(Set())
+
   atest("a pending-delete copy of a store rebuilt on another device goes once that device has it Active"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()

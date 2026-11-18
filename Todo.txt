@@ -65,8 +65,7 @@ PRIORITY 5: performance and hygiene
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
 
-6.1  Open questions left by the review                                                                      [S-M]
-     - Safe manual reinstatement procedure for a falsely declared store (systemic-loss open question 2).
+(no open items)
 
 
 PRIORITY 7: documentation corrections

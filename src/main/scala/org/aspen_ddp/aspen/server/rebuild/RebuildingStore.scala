@@ -67,6 +67,11 @@ object RebuildingStore:
    *  before they are dropped from the device CRL, which a rebuild onto the same device would otherwise recover */
   val LostCrlStateFile = "lost-crl-state.log"
 
+  /** In a store directory being discarded whose crl_save.log became its LostCrlStateFile: the entries the device CRL
+   *  also held for the store, saved before they are dropped. A crash between a transfer out's save file and the
+   *  deletion of its entries leaves both, and the save file may be the one found unusable (systemic-loss D3) */
+  val LostCrlEntriesFile = "lost-crl-entries.log"
+
   /** In a rebuilt store's directory: the HLC timestamp from which its Paxos acceptor state is complete
    *  (Frontend.acceptorSince). Written by finish before the store moves into place, and kept for good (a network
    *  transfer carries it with the directory). The old incarnation stopped before the rebuild began, and joined only

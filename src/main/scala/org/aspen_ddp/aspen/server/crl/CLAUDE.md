@@ -10,7 +10,8 @@
 - Implemented as a series of fixed-size, write-only files that are continually recycled.
 - Functions similar to a circular buffer. Invariant: the stream after the active one holds no needed entry. A rotation
   recycles that stream and copies forward, into its first entry, the live data of the stream after it (the next to be
-  recycled), so a torn rotation write only ever overwrites entries no recovery needs. Needs at least 2 streams.
+  recycled), so a torn rotation write only ever overwrites entries no recovery needs. `SimpleCRL.apply` creates no
+  CRL of fewer than 2 streams (a recorded sizing of fewer is unreadable); device configs ask for at least 4.
   "After" is the ring order recorded in `crl/sizing` (`Sizing.ring`, `ring: 0,2,1`; `Sizing.successor`), not numeric
   order: rotation and `Recovery`'s newer-intact-entry check of the next stream both follow it. Stream files are
   `<n>.crl` for `n` in `0 until ringSize`; a growth will insert the next number after the active stream, and its
@@ -58,8 +59,11 @@
   fail one (safety F7). Each file is written as `<n>.crl.tmp`, renamed, and the directory forced before the writer
   starts: a `.tmp` at open is a creation that wrote nothing, and it starts over. A `<ringSize>.crl` or
   `<ringSize>.crl.tmp` the ring does not list is a growth that never committed: removed at open with a warning
-  (`removeUncommittedGrowth`, run before that creation rule). Any other unlisted stream file is `CrlSizingMismatch`.
-  `StreamWriter` opens existing files only. Copy-on-write file systems (btrfs, ZFS) allocate on overwrite anyway: the open warns once
+  (`removeUncommittedGrowth`, run before that creation rule), but only when every listed stream exists and no other
+  file is unlisted. Otherwise, as for any other unlisted stream file, the open is `CrlSizingMismatch` and removes
+  nothing: removing it beside missing streams could leave none, and a new empty CRL would be created under live
+  stores. `StreamWriter` opens existing files only. Copy-on-write file systems (btrfs, ZFS) allocate on overwrite
+  anyway: the open warns once
 - A failed CRL (its thread or its writer died; one path: the writer's death kills the CRL thread) answers nothing:
   every pending and later Future fails with `CrlFailed` (`SimpleCRL.tracked`), `failed` completes and
   `onThreadDeath` runs once. Save completions never run, so no vote follows. The host unloads the device until it

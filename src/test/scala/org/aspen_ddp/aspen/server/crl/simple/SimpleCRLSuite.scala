@@ -1715,6 +1715,47 @@ class SimpleCRLSuite extends FileBasedTests {
     assertThrows[CrlCorrupt](SimpleCRL(tdir, 3, 1024 * 1024))
   }
 
+  test("A growth leftover beside missing or unlisted streams is a sizing mismatch, and nothing is removed") {
+    val size = 4096L * 3
+    SimpleCRL(tdir, 3, size).crl.shutdown()
+    // The listed streams gone: removing 3.crl would leave none, and an empty CRL would be created under live stores
+    (0 until 3).foreach(n => os.remove(tdir / s"$n.crl"))
+    os.write(tdir / "3.crl", new Array[Byte](size.toInt))
+    for mustExist <- List(true, false) do
+      assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, size, mustExist = mustExist))
+      assert(os.list(tdir).filter(_.ext == "crl").map(_.last).toSet == Set("3.crl"))
+    // One listed stream missing
+    os.remove(tdir / "3.crl")
+    os.remove(tdir / SimpleCRL.SizingFile)
+    SimpleCRL(tdir, 3, size).crl.shutdown()
+    os.remove(tdir / "1.crl")
+    os.write(tdir / "3.crl.tmp", new Array[Byte](size.toInt))
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, size))
+    assert(os.exists(tdir / "3.crl.tmp"))
+    // Every listed stream present, but another unlisted one beside the leftover
+    os.write(tdir / "1.crl", new Array[Byte](size.toInt))
+    os.write(tdir / "5.crl", new Array[Byte](size.toInt))
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, size))
+    assert(os.exists(tdir / "3.crl.tmp") && os.exists(tdir / "5.crl"))
+  }
+
+  test("Recovery's newer-entry check of the next stream follows the ring, not the next number") {
+    // Ring 0,2,1: the stream after 0 is 2. A corrupt head of stream 2 with an intact entry after it must fail the
+    // open. Checking stream 1, all zeros, would roll back silently to stream 0's entries
+    val size = 4096L * 3
+    val y = mkTx(2, 2)
+    val i = SimpleCRL(tdir, 3, size, ringForTest = Some(Vector(0, 2, 1).map(StreamId(_))))
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    while i.crl.currentStreamNumber == 0 do
+      saveAndWait(i.crl, y._1, y._2)
+    saveAndWait(i.crl, transactionId3, trsValidTxd4)
+    settle(i.crl)
+    assert(i.crl.currentStreamNumber == 2)
+    i.crl.shutdown()
+    flip(tdir / "2.crl", 0)
+    assertThrows[CrlCorrupt](SimpleCRL(tdir, 3, size))
+  }
+
   test("A corrupt head of the active stream fails the open instead of recovering from the stream before it") {
     val size = 4096L * 3
     val y = mkTx(2, 2)

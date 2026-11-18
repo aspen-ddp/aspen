@@ -150,7 +150,7 @@ object SimpleCRL extends Logging:
       ).toList
 
       // Before createStreamsIfNew, which would take a growth's `.crl.tmp` for an unfinished creation
-      removeUncommittedGrowth(streamsDir, sizing.numStreams)
+      removeUncommittedGrowth(streamsDir, files.map(_._2).toSet)
       createStreamsIfNew(streamsDir, files.map(_._2), sizing.maxSizeInBytes)
       checkSizing(streamsDir, files.map(_._2).toSet, sizing.maxSizeInBytes)
 
@@ -223,14 +223,24 @@ object SimpleCRL extends Logging:
 
   /** A growth creates stream `<ringSize>` as `<ringSize>.crl.tmp`, renames it to `<ringSize>.crl`, and only then
     * commits it by rewriting the SizingFile with the new ring. Either file beside a ring that does not list it is a
-    * growth that crashed before its commit: it holds no entry, and is removed */
-  private def removeUncommittedGrowth(streamsDir: os.Path, ringSize: Int): Unit =
-    for name <- List(s"$ringSize.crl", s"$ringSize.crl.tmp") do
-      val f = streamsDir / name
-      if os.exists(f) then
-        logger.warn(s"The CRL in $streamsDir holds $name, a growth that never committed. Removing it")
+    * growth that crashed before its commit: it holds no entry, and is removed. A growth runs only on a CRL whose
+    * `listed` streams all exist, so a leftover beside any other set of files is damage, not a crash: it is
+    * CrlSizingMismatch, and nothing is removed. Removing it there could leave no stream files, and a new, empty CRL
+    * would be created under the device's stores */
+  private def removeUncommittedGrowth(streamsDir: os.Path, listed: Set[os.Path]): Unit =
+    val ringSize = listed.size
+    val leftovers = List(s"$ringSize.crl", s"$ringSize.crl.tmp").map(streamsDir / _).filter(os.exists(_))
+    if leftovers.nonEmpty then
+      val others = os.list(streamsDir).filter(f => f.ext == "crl" || f.last.endsWith(".crl.tmp")).toSet --
+        leftovers -- listed
+      if others.nonEmpty || !listed.forall(os.exists(_)) then
+        throw CrlSizingMismatch(streamsDir, s"it holds ${leftovers.map(_.last).mkString(", ")}, an uncommitted " +
+          s"growth, beside ${(streamFiles(streamsDir) -- leftovers).map(_.last).toList.sorted.mkString(", ")}, " +
+          s"not the $ringSize streams its ring lists")
+      leftovers.foreach: f =>
+        logger.warn(s"The CRL in $streamsDir holds ${f.last}, a growth that never committed. Removing it")
         os.remove(f)
-        DurableFiles.syncDirectory(streamsDir)
+      DurableFiles.syncDirectory(streamsDir)
 
   /** A directory with no stream files is a new CRL. Otherwise its files must be exactly `expected`, each
     * `maxSizeInBytes` long (createStreamsIfNew creates them at that size) */

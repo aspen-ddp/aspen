@@ -66,8 +66,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
 
 6.1  Open questions left by the review                                                                      [S-M]
-     - RARS objects built by appends/ranged writes: verify the rebuild's ida.encode of the full restored data
-       yields the backend's per-store slice layout.
      - RebuildState.removeAll calls os.remove on possibly missing files: confirm it cannot throw.
      - A store transferred back onto a device: can leftover CRL entries of its earlier incarnation survive and be
        recovered as its own? (crash-recovery-log open question 1.)

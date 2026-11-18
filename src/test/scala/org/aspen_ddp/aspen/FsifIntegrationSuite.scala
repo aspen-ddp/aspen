@@ -239,8 +239,10 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
         val next = tx.append(pos, DataBuffer(chunk))
         tx.commit().map(_ => next)
 
+  /** The content after `writes`, zero filling any gap a write past the end leaves */
   private def applyWrites(content: Array[Byte], writes: List[RangedWrite]): Array[Byte] =
-    val result = content.clone()
+    val end = (content.length :: writes.map(w => w.offset + w.data.length)).max
+    val result = java.util.Arrays.copyOf(content, end)
     writes.foreach(w => System.arraycopy(w.data, 0, result, w.offset, w.data.length))
     result
 
@@ -445,11 +447,27 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
       storesShouldBeFsifOnDisk()
       succeed
 
+  /** Commits `writes` to `dp` in one transaction */
+  private def rangedWrite(dp: DataObjectPointer, writes: List[RangedWrite]): Future[Unit] =
+    for
+      state <- client.readRangedWriteState(dp, writes)
+      tx = client.newTransaction()
+      _ = tx.rangedWrites(state, writes)
+      _ <- tx.commit()
+    yield ()
+
   atest("an FSIF store whose recovery finds it lost is rebuilt through the rebuild path"):
+    // The object is built by an allocation, appends and ranged writes (one spanning a row of the IDA's 192 stream
+    // bytes, one extending the object across a row boundary), so the rebuild's encode of the restored content must
+    // give the very slice layout the deltas built on the other stores: the reads that force the rebuilt slice into
+    // every decode, unrepaired, show it does
     val rnd = new Random(4)
     val first = chunkOf(rnd, 3000)
     val chunks = List.fill(10)(chunkOf(rnd, 1 + rnd.nextInt(300)))
-    val expected = first ++ chunks.reduce(_ ++ _)
+    val appended = first ++ chunks.reduce(_ ++ _)
+    val writes = List(RangedWrite(150, chunkOf(rnd, 100)), RangedWrite(appended.length - 20, chunkOf(rnd, 300)))
+    val expected = applyWrites(appended, writes)
+    val writesAfter = List(RangedWrite(1000, chunkOf(rnd, 400)))
     val small = chunkOf(rnd, 100)
     val more = List.fill(3)(chunkOf(rnd, 1 + rnd.nextInt(300)))
     val lost = 0
@@ -459,6 +477,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
       other <- allocate(small)
       start <- client.readAppendPosition(dp)
       _ <- appendAll(start, chunks)
+      _ <- rangedWrite(dp, writes)
       // The rebuild walks the allocation tree, which a finalization action fills after each allocation commits
       pool <- client.getStoragePool(poolId)
       _ <- awaitCondition("both objects to be in the allocation tree"):
@@ -483,7 +502,12 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
       _ <- readsWithStoresDown(other, small, mustServe = Set(lost), repairFirst = false)
       pos <- client.readAppendPosition(dp)
       _ <- appendAll(pos, more)
+      // Repaired first: until its inherited votes clear (about the horizon after the pass), the rebuilt store votes
+      // abort and misses these commits. Deltas applied to an encoded slice equal a fresh encode (AppendDeltaSuite,
+      // RandomAccessReedSolomonSuite), and the rebuilt slice is one
       _ <- readsWithStoresDown(dp, expected ++ more.reduce(_ ++ _), mustServe = Set(lost))
+      _ <- rangedWrite(dp, writesAfter)
+      _ <- readsWithStoresDown(dp, applyWrites(expected ++ more.reduce(_ ++ _), writesAfter), mustServe = Set(lost))
     yield
       sawRebuilding should be(true)
       storesShouldBeFsifOnDisk()

@@ -260,7 +260,11 @@ ErrorTree entries there, so the earlier episode's copy of every object is stale 
   not a silently skipped one. Entries of another pool are skipped; keys that are not 16 bytes are logged and skipped.
   `restore` does a full read through `client.withReadTimeout(ObjectReadTimeout)` (30 s), then `ObjectState.getRebuildDataForStore(storeId)` (re-encodes the object and
   takes this store's slice; a partial KV state yields none) and `Backend.rebuildWrite` with the read's revision,
-  refcount and timestamp.
+  refcount and timestamp. For an object built by appends or ranged writes the re-encode is the very slice its peers
+  hold: every IDA's layout depends only on the content, and the stores apply those updates as deltas that, the codes
+  being linear, leave exactly a fresh encode's slices (`AppendDeltaSuite`, `RandomAccessReedSolomonSuite`; end to end,
+  FsifIntegrationSuite's lost-store rebuild of a RandomAccessReedSolomon object, read through the rebuilt slice
+  unrepaired).
 * Locked copies: a read ignores the write locks of transactions it does not know committed, and the one store that
   applied such a T may be the lost one, whose acknowledgment left T's finalizer nothing to mark. So when any reply of
   the read reported a write lock (`ObjectState.readLocks`), `restore` marks the object in the ErrorTree against this

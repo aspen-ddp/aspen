@@ -10,7 +10,12 @@
 - Implemented as a series of fixed-size, write-only files that are continually recycled.
 - Functions similar to a circular buffer. Invariant: the stream after the active one holds no needed entry. A rotation
   recycles that stream and copies forward, into its first entry, the live data of the stream after it (the next to be
-  recycled), so a torn rotation write only ever overwrites entries no recovery needs. Needs at least 2 streams
+  recycled), so a torn rotation write only ever overwrites entries no recovery needs. Needs at least 2 streams.
+  "After" is the ring order recorded in `crl/sizing` (`Sizing.ring`, `ring: 0,2,1`; `Sizing.successor`), not numeric
+  order: rotation and `Recovery`'s newer-intact-entry check of the next stream both follow it. Stream files are
+  `<n>.crl` for `n` in `0 until ringSize`; a growth will insert the next number after the active stream, and its
+  rewrite of `crl/sizing` is the commit point. A sizing file whose ring is missing or not a permutation of
+  `0 until num-streams` is unreadable. Tests reach other rings with `SimpleCRL.apply`'s `ringForTest` (creation only)
 - One CRL per storage device, in `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`), opened by
   `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
 - Sizing keys in the device config are all optional (`CrlSizingDefaults.resolve`, from the capacity of the file
@@ -51,8 +56,10 @@
 - Stream files are preallocated at creation (`SimpleCRL.createStreamsIfNew`, `server.FilePreallocation`): `fallocate`
   through FFM on Linux, zero-fill elsewhere or on `EOPNOTSUPP`. A CRL write never allocates, so a full device cannot
   fail one (safety F7). Each file is written as `<n>.crl.tmp`, renamed, and the directory forced before the writer
-  starts: a `.tmp` at open is a creation that wrote nothing, and it starts over. `StreamWriter` opens existing files
-  only. Copy-on-write file systems (btrfs, ZFS) allocate on overwrite anyway: the open warns once
+  starts: a `.tmp` at open is a creation that wrote nothing, and it starts over. A `<ringSize>.crl` or
+  `<ringSize>.crl.tmp` the ring does not list is a growth that never committed: removed at open with a warning
+  (`removeUncommittedGrowth`, run before that creation rule). Any other unlisted stream file is `CrlSizingMismatch`.
+  `StreamWriter` opens existing files only. Copy-on-write file systems (btrfs, ZFS) allocate on overwrite anyway: the open warns once
 - A failed CRL (its thread or its writer died; one path: the writer's death kills the CRL thread) answers nothing:
   every pending and later Future fails with `CrlFailed` (`SimpleCRL.tracked`), `failed` completes and
   `onThreadDeath` runs once. Save completions never run, so no vote follows. The host unloads the device until it

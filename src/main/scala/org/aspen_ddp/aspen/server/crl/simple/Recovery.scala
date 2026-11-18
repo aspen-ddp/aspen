@@ -39,13 +39,14 @@ object Recovery extends Logging:
   /** A live applied stub, with its anchor and the serial number of the newest entry holding it */
   case class RecoveredStub(id: TxId, start: HLCTimestamp, anchor: StreamLocation, entrySerialNumber: Long)
 
-  /** @param crlId the id the CRL recorded at its creation (SimpleCRL.Sizing): only headers bearing it are entries */
-  def recover(files: List[(StreamId, os.Path)], crlId: UUID): Result =
+  /** @param crlId the id the CRL recorded at its creation (SimpleCRL.Sizing): only headers bearing it are entries
+    * @param ring  the order the streams are written in (SimpleCRL.Sizing.ring), a permutation of `files`' ids */
+  def recover(files: List[(StreamId, os.Path)], crlId: UUID, ring: Vector[StreamId]): Result =
     val readers = files.sortBy(_._1.number).map(t => StreamReader(t._1, t._2, crlId)).toArray
-    try recover(readers)
+    try recover(readers, ring)
     finally readers.foreach(_.close())
 
-  private def recover(readers: Array[StreamReader]): Result =
+  private def recover(readers: Array[StreamReader], ring: Vector[StreamId]): Result =
     val rs = LogEntry.RecoveringState(HashMap(), Set())
     var activeStreamId = StreamId(0)
     var initialNextEntrySerialNumber: Long = 0
@@ -72,8 +73,8 @@ object Recovery extends Logging:
 
       // Only the write in flight at a crash can be torn, so an intact entry newer than the last one means an entry
       // before it is corrupt: in this stream past the last entry, or in the next stream, whose corrupt head would
-      // hide a cycle newer than this stream's
-      List((streamIndex, nextWriteEntryOffset), ((streamIndex + 1) % readers.length, 0L)).foreach: (i, from) =>
+      // hide a cycle newer than this stream's. The next stream is the ring's successor, not the next number
+      List((streamIndex, nextWriteEntryOffset), (StreamId.successor(ring, streamId).number, 0L)).foreach: (i, from) =>
         readers(i).newerIntactEntry(from, lastEntry.entrySerialNumber).foreach: (offset, h) =>
           throw CrlCorrupt(s"stream $i holds an intact entry at $offset with serial number " +
                                  s"${h.entrySerialNumber}, newer than the last one recovery found, " +

@@ -483,7 +483,7 @@ class SimpleCRLSuite extends FileBasedTests {
     streamWriter.shutdown(() => stopped.countDown())
     stopped.await()
 
-    val r = Recovery.recover(streams(1), crlId)
+    val r = Recovery.recover(streams(1), crlId, Vector(stream0))
 
     assert(r.trsList.length == 1)
     assert(r.activeStreamId == stream0)
@@ -516,7 +516,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     streamWriter.shutdown()
 
-    val r = Recovery.recover(streams(1), crlId)
+    val r = Recovery.recover(streams(1), crlId, Vector(stream0))
 
     assert(r.trsList.length == 1)
     assert(r.activeStreamId == stream0)
@@ -529,7 +529,7 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("Recovery without log files") {
-    val r = Recovery.recover(Nil, crlId)
+    val r = Recovery.recover(Nil, crlId, Vector())
 
     assert(r.trsList.length == 0)
     assert(r.activeStreamId == stream0)
@@ -753,7 +753,7 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("A sizing file without stream files is a CRL whose creation crashed: it is created with that sizing") {
-    os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(4, 1024 * 1024, UUID.randomUUID()).encode)
+    os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing.inOrder(4, 1024 * 1024, UUID.randomUUID()).encode)
     val i = SimpleCRL(tdir, 3, 2 * 1024 * 1024)
     assert(i.crl.admissionLimitBytes == 1024 * 1024 / 2)
     i.crl.shutdown()
@@ -767,16 +767,75 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(!os.exists(tdir / SimpleCRL.SizingFile))
     os.write(tdir / SimpleCRL.SizingFile, "garbage")
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
-    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(1, 1024 * 1024, UUID.randomUUID()).encode)
+    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing.inOrder(1, 1024 * 1024, UUID.randomUUID()).encode)
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
   }
 
   test("Stream files disagreeing with the recorded sizing are a sizing mismatch") {
     SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
-    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(4, 1024 * 1024, UUID.randomUUID()).encode)
+    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing.inOrder(4, 1024 * 1024, UUID.randomUUID()).encode)
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
-    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(3, 2 * 1024 * 1024, UUID.randomUUID()).encode)
+    os.write.over(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing.inOrder(3, 2 * 1024 * 1024, UUID.randomUUID()).encode)
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+  }
+
+  test("A CRL created with a ring out of numeric order rotates and recovers in ring order") {
+    val size = 4096L * 3
+    val ring = Vector(0, 2, 1).map(StreamId(_))
+    var i = SimpleCRL(tdir, 3, size, ringForTest = Some(ring))
+    // A record saved once in stream 0 is copied forward by the rotations that follow the ring, not numeric order
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    def live(states: List[TransactionRecoveryState]) =
+      states.map(s => (s.storeId, s.serializedTxd, s.objectUpdates, s.paxosAcceptorState)).sortBy(_._1.poolIndex)
+    val expected = live(List(trsValidTxd, trsValidTxd2))
+    for (from, to) <- List((0, 2), (2, 1), (1, 0)) do
+      var saves = 0
+      while i.crl.currentStreamNumber != to do
+        assert(i.crl.currentStreamNumber == from)
+        saveAndWait(i.crl, transactionId2, trsValidTxd2)
+        settle(i.crl)
+        saves += 1
+        assert(saves < 10, s"no rotation from stream $from to $to")
+      i.crl.shutdown()
+      i = SimpleCRL(tdir, 3, size)
+      assert(i.crl.currentStreamNumber == to)
+      assert(live(i.trsList) == expected)
+    i.crl.shutdown()
+    assert(SimpleCRL.Sizing.decode(os.read(tdir / SimpleCRL.SizingFile)).map(_.ring) == Some(ring))
+  }
+
+  test("Sizing without a ring line is unreadable") {
+    SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
+    val text = os.read(tdir / SimpleCRL.SizingFile)
+    assert(text.linesIterator.contains("ring: 0,1,2"))
+    os.write.over(tdir / SimpleCRL.SizingFile, text.linesIterator.filterNot(_.startsWith("ring:")).mkString("\n"))
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+    // Nor is a ring that is not a permutation of the streams
+    for bad <- List("0,1,1", "0,1", "0,1,3", "0,1,2,3") do
+      os.write.over(tdir / SimpleCRL.SizingFile, text.replace("ring: 0,1,2", s"ring: $bad"))
+      assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
+  }
+
+  test("A stream file numbered past the ring is an uncommitted growth: removed at open") {
+    val size = 4096L * 3
+    val i = SimpleCRL(tdir, 3, size)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    i.crl.shutdown()
+    for leftover <- List("3.crl", "3.crl.tmp") do
+      os.write(tdir / leftover, new Array[Byte](size.toInt))
+      val i2 = SimpleCRL(tdir, 3, size)
+      assert(!os.exists(tdir / leftover))
+      assert(i2.trsList.map(_.storeId) == List(storeId))
+      i2.crl.shutdown()
+      assert(os.list(tdir).filter(_.ext == "crl").map(_.last).toSet == Set("0.crl", "1.crl", "2.crl"))
+  }
+
+  test("Any other unlisted stream file is a sizing mismatch") {
+    val size = 4096L * 3
+    SimpleCRL(tdir, 3, size).crl.shutdown()
+    os.write(tdir / "5.crl", new Array[Byte](size.toInt))
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, size))
+    assert(os.exists(tdir / "5.crl"))
   }
 
   test("A CRL whose thread died has released its lock once its shutdown returns") {
@@ -1448,7 +1507,7 @@ class SimpleCRLSuite extends FileBasedTests {
     queue.take()
     streamWriter.shutdown()
 
-    val r = Recovery.recover(streams(1), crlId)
+    val r = Recovery.recover(streams(1), crlId, Vector(stream0))
 
     assert(r.trsList.length == 1)
     assert(r.trsList.head.storeId == storeId2)
@@ -1582,7 +1641,7 @@ class SimpleCRLSuite extends FileBasedTests {
     streamWriter.shutdown(() => stopped.countDown())
     stopped.await()
 
-    val r = Recovery.recover(streams(1), crlId)
+    val r = Recovery.recover(streams(1), crlId, Vector(stream0))
     assert(r.trsList.map(_.storeId) == List(storeId2))
   }
 
@@ -1602,7 +1661,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
   test("A sizing file without a CRL id is unreadable: a sizing mismatch") {
     SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
-    os.write.over(tdir / SimpleCRL.SizingFile, "num-streams: 3\nmax-size-in-bytes: 1048576\n")
+    os.write.over(tdir / SimpleCRL.SizingFile, "num-streams: 3\nmax-size-in-bytes: 1048576\nring: 0,1,2\n")
     assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, 1024 * 1024))
   }
 
@@ -1675,7 +1734,7 @@ class SimpleCRLSuite extends FileBasedTests {
   test("Zero-filled stream files open as an empty CRL that writes from the start of stream 0") {
     val size = 4096L * 3
     // As a creation that recorded its sizing and crashed once its files were allocated
-    os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing(3, size, UUID.randomUUID()).encode)
+    os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing.inOrder(3, size, UUID.randomUUID()).encode)
     for n <- 0 until 3 do
       os.write(tdir / s"$n.crl", new Array[Byte](size.toInt))
     val i = SimpleCRL(tdir, 3, size)
@@ -2197,7 +2256,7 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(queue.poll(10, TimeUnit.SECONDS) == "barrier")
     // Read from the files while the CRL is still open: the deletion is durable
     val files = (0 until 3).map(n => (StreamId(n), tdir / s"$n.crl")).toList
-    assert(Recovery.recover(files, recordedId(tdir)).trsList.isEmpty)
+    assert(Recovery.recover(files, recordedId(tdir), files.map(_._1).toVector).trsList.isEmpty)
     i.crl.shutdown()
   }
 

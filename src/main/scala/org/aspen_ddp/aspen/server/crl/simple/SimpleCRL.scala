@@ -86,12 +86,26 @@ object SimpleCRL extends Logging:
 
   /** The sizing a CRL was created with, and its id: a random UUID chosen then, which every entry header bears
    *  (LogEntry). Recovery takes only headers bearing it for entries, so object data in the streams, which nobody
-   *  outside the device can make bear an id it never sees, cannot pass for one */
-  case class Sizing(numStreams: Int, maxSizeInBytes: Long, crlId: UUID):
-    def encode: String = s"num-streams: $numStreams\nmax-size-in-bytes: $maxSizeInBytes\ncrl-id: $crlId\n"
+   *  outside the device can make bear an id it never sees, cannot pass for one.
+   *
+   *  `ring` is the order the streams are written in: rotation and recovery's next-stream check follow it, not the
+   *  stream numbers. Stream `<n>.crl` exists for each `n` in `0 until ring.size`; a growth inserts a new number after
+   *  the active stream, so the ring need not be in numeric order. Rewriting this file is a growth's commit point */
+  case class Sizing(ring: Vector[StreamId], maxSizeInBytes: Long, crlId: UUID):
+    def numStreams: Int = ring.size
+
+    /** The stream written after `s` */
+    def successor(s: StreamId): StreamId = StreamId.successor(ring, s)
+
+    def encode: String = s"num-streams: $numStreams\nmax-size-in-bytes: $maxSizeInBytes\ncrl-id: $crlId\n" +
+      s"ring: ${ring.map(_.number).mkString(",")}\n"
 
   object Sizing:
-    /** None if `text` is not a sizing file's content */
+    /** A sizing whose ring is in numeric order, as a CRL is created */
+    def inOrder(numStreams: Int, maxSizeInBytes: Long, crlId: UUID): Sizing =
+      Sizing(Vector.tabulate(numStreams)(StreamId(_)), maxSizeInBytes, crlId)
+
+    /** None if `text` is not a sizing file's content, or its ring is not a permutation of `0 until num-streams` */
     def decode(text: String): Option[Sizing] =
       val fields = text.linesIterator.map(_.split(":", 2)).collect:
         case Array(k, v) => k.trim -> v.trim
@@ -100,7 +114,9 @@ object SimpleCRL extends Logging:
         n <- fields.get("num-streams").flatMap(_.toIntOption)
         m <- fields.get("max-size-in-bytes").flatMap(_.toLongOption)
         id <- fields.get("crl-id").flatMap(v => scala.util.Try(UUID.fromString(v)).toOption)
-      yield Sizing(n, m, id)
+        numbers <- fields.get("ring").map(_.split(",", -1).toVector.map(_.trim.toIntOption))
+        if numbers.forall(_.isDefined) && numbers.flatten.sorted == (0 until n)
+      yield Sizing(numbers.flatten.map(StreamId(_)), m, id)
 
   /** @param numStreams     the stream count of a CRL created by this call. An existing CRL keeps its recorded count
     * @param maxSizeInBytes the stream size of a CRL created by this call. An existing CRL keeps its recorded size
@@ -114,31 +130,35 @@ object SimpleCRL extends Logging:
     * @param mustExist the CRL must already exist (its device holds stores). With no stream files in `streamsDir`
     *                  (only a SizingFile or unfinished `.crl.tmp` files at most), CrlMissing is thrown instead of a
     *                  new CRL being created, and nothing in `streamsDir` is written.
+    * @param ringForTest the ring of a CRL created by this call, a permutation of `0 until numStreams`, in place of
+    *                    numeric order: lets tests reach rings only a growth makes. An existing CRL keeps its ring
     */
   def apply(streamsDir: os.Path,
             numStreams: Int,
             maxSizeInBytes: Long,
             onThreadDeath: Throwable => Unit = _ => (),
-            mustExist: Boolean = false): InitialCRLState =
+            mustExist: Boolean = false,
+            ringForTest: Option[Vector[StreamId]] = None): InitialCRLState =
     // Held from before the files are read until the writer has closed them. A failed open releases it
     val lock = CrlLock.acquire(streamsDir)
     try
       if mustExist && streamFiles(streamsDir).isEmpty then
         throw CrlMissing(streamsDir)
-      val sizing = recordedSizing(streamsDir, numStreams, maxSizeInBytes)
+      val sizing = recordedSizing(streamsDir, numStreams, maxSizeInBytes, ringForTest)
       val files: List[(StreamId, os.Path)] = (0 until sizing.numStreams).map(i =>
         (StreamId(i), streamsDir / s"$i.crl")
       ).toList
 
+      // Before createStreamsIfNew, which would take a growth's `.crl.tmp` for an unfinished creation
+      removeUncommittedGrowth(streamsDir, sizing.numStreams)
       createStreamsIfNew(streamsDir, files.map(_._2), sizing.maxSizeInBytes)
       checkSizing(streamsDir, files.map(_._2).toSet, sizing.maxSizeInBytes)
 
-      val r = Recovery.recover(files, sizing.crlId)
+      val r = Recovery.recover(files, sizing.crlId, sizing.ring)
 
       InitialCRLState(
         new SimpleCRL(
-          sizing.maxSizeInBytes,
-          sizing.crlId,
+          sizing,
           files,
           r,
           onThreadDeath,
@@ -155,7 +175,8 @@ object SimpleCRL extends Logging:
   /** The sizing `streamsDir`'s CRL recorded. A directory with neither a SizingFile nor stream files is a new CRL: it
     * records the requested sizing and a new random id first. A SizingFile with no stream files is a creation that
     * crashed before them: its sizing and id stand. Stream files without a readable SizingFile throw CrlSizingMismatch */
-  private def recordedSizing(streamsDir: os.Path, numStreams: Int, maxSizeInBytes: Long): Sizing =
+  private def recordedSizing(streamsDir: os.Path, numStreams: Int, maxSizeInBytes: Long,
+                             ringForTest: Option[Vector[StreamId]]): Sizing =
     val file = streamsDir / SizingFile
     if os.exists(file) then
       val recorded = Sizing.decode(os.read(file)).filter(_.numStreams >= 2).getOrElse:
@@ -170,7 +191,11 @@ object SimpleCRL extends Logging:
     else
       // A rotation copies the next stream's live data into the one it recycles, which needs a second stream
       require(numStreams >= 2, s"A CRL needs at least 2 streams, not $numStreams")
-      val created = Sizing(numStreams, maxSizeInBytes, UUID.randomUUID())
+      val created = ringForTest match
+        case None => Sizing.inOrder(numStreams, maxSizeInBytes, UUID.randomUUID())
+        case Some(ring) =>
+          require(ring.map(_.number).sorted == (0 until numStreams), s"$ring is not a ring of $numStreams streams")
+          Sizing(ring, maxSizeInBytes, UUID.randomUUID())
       DurableFiles.write(file, created.encode)
       created
 
@@ -196,6 +221,17 @@ object SimpleCRL extends Logging:
       streams.foreach(f => os.move(tmpOf(f), f, atomicMove = true))
       DurableFiles.syncDirectory(streamsDir)
 
+  /** A growth creates stream `<ringSize>` as `<ringSize>.crl.tmp`, renames it to `<ringSize>.crl`, and only then
+    * commits it by rewriting the SizingFile with the new ring. Either file beside a ring that does not list it is a
+    * growth that crashed before its commit: it holds no entry, and is removed */
+  private def removeUncommittedGrowth(streamsDir: os.Path, ringSize: Int): Unit =
+    for name <- List(s"$ringSize.crl", s"$ringSize.crl.tmp") do
+      val f = streamsDir / name
+      if os.exists(f) then
+        logger.warn(s"The CRL in $streamsDir holds $name, a growth that never committed. Removing it")
+        os.remove(f)
+        DurableFiles.syncDirectory(streamsDir)
+
   /** A directory with no stream files is a new CRL. Otherwise its files must be exactly `expected`, each
     * `maxSizeInBytes` long (createStreamsIfNew creates them at that size) */
   private def checkSizing(streamsDir: os.Path, expected: Set[os.Path], maxSizeInBytes: Long): Unit =
@@ -208,14 +244,16 @@ object SimpleCRL extends Logging:
         if os.size(f) != maxSizeInBytes then
           throw CrlSizingMismatch(streamsDir, s"${f.last} is ${os.size(f)} bytes, expected $maxSizeInBytes")
 
-class SimpleCRL private (val maxSizeInBytes: Long,
-                         crlId: UUID,
+class SimpleCRL private (sizing: SimpleCRL.Sizing,
                          files: List[(StreamId, os.Path)],
                          r: Recovery.Result,
                          onThreadDeath: Throwable => Unit,
                          lock: CrlLock) extends CrashRecoveryLog with Logging:
 
   import SimpleCRL._
+
+  val maxSizeInBytes: Long = sizing.maxSizeInBytes
+  private val crlId: UUID = sizing.crlId
 
   val numStreams: Int = files.size
 
@@ -354,16 +392,14 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   private def writeCurrentLogEntry(): Unit =
     if !streams(currentStream).canWriteEntry(currentLogEntry) then
-      currentStream += 1
-      if currentStream == streams.length then
-        currentStream = 0
+      currentStream = sizing.successor(StreamId(currentStream)).number
 
       // The stream recycled now holds nothing needed: the previous rotation copied its live data forward. This entry
       // copies forward the live data of the next stream to be recycled, so a torn write here, or there at the next
       // rotation, overwrites only entries no recovery needs. The last durable entry's oldestEntryNeeded never points
       // into the stream after the active one
       val recycled = StreamId(currentStream)
-      val nextToRecycle = StreamId((currentStream + 1) % streams.length)
+      val nextToRecycle = sizing.successor(recycled)
       streams(currentStream).recycleStream()
       def copyForward(record: Record)(add: => Unit): Unit =
         val inRecycled = record.closeStream(recycled)

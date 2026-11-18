@@ -71,10 +71,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.2  Architecture.md contention rules do not match the driver: P-W4                                        [S]
-     Abort needs more than w - t abort votes; no-commit-vote does not abort (the tally waits); no timestamps are
-     compared. Replace with the abort-certain / commit-certain / undecided classification and the collision wait.
-
 7.3  Stale finding ids and inaccuracies in module CLAUDE.md files: P-W5 and agent reports                  [S]
      Old safety-doc ids (F*, Q-N*, R-N*, X*, G*, Todo n.m) cited in server/transaction/CLAUDE.md,
      server/store/CLAUDE.md, server/crl/CLAUDE.md, server/repair/CLAUDE.md, client/internal/transaction/

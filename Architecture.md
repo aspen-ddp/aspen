@@ -178,18 +178,25 @@ A client that cannot learn the outcome within the horizon fails the commit with 
 One reason transactions are intended to commit/abort as fast as possible is that once a DataStore 
 votes to commit a transaction, the objects it hosts are locked to that transaction until the 
 transaction completes with a commit/abort decision. If two transactions simultaneously try to update 
-the same object, only one of them will receive a VoteCommit. When contention is encountered, an 
-Optimistic Concurrency Control solution is used with the following set of rules:
+the same object, a DataStore grants VoteCommit to at most one of them: the other sees a collision with the lock
+holder, which is an ordinary VoteAbort. There is one exception. If the transaction builds on the holder (it requires
+the revision the holder writes, and the holder still holds its locks), the DataStore withholds its vote until the
+holder releases its locks, then checks the requirements again. Past `Tx.CollisionWait` (500 ms, checked at the store's
+1 s heartbeat) it stops waiting and votes abort. A withheld vote takes no locks, so waits cannot form cycles.
 
-1. If success is impossible due to Abort votes by width – write-threshold stores, abort.
-2. If a write-threshold number of stores granted permission, commit.
-3. If no store granted commit permission, abort.
-4. Examine the timestamps of the other transactions for which stores granted commit permission. 
-   Continue if this transaction has the lowest timestamp. Otherwise, abort.
+A driver tallies the votes per object, against the `w` (width) and `t` (write threshold) of the object's pool, with
+`c` commit votes and `a` abort votes from the current round:
 
-Combined with an exponential backoff mechanism for retransmitting messages, this approach ensures 
-that transactions eventually conclude. However, transaction contention can be expensive to resolve so 
-applications should be designed to avoid it in the common case.
+1. Abort-certain, `w - a < t`: the object can no longer reach `t` commit votes. Any abort-certain object makes the
+   proposal abort, so abort needs more than `w - t` abort votes on some object.
+2. Commit-certain, `c >= t`, on every object: the proposal is commit.
+3. Otherwise the tally is undecided and the driver waits. A store that is silent, or answers `Undetermined` (it
+   learned the outcome before voting), casts no vote, so a lack of commit votes alone never aborts. A promise quorum
+   that reports an accepted value lets the round re-propose it.
+
+No timestamps are compared. Votes are immutable and only accumulate, so drivers that see the same votes propose the
+same value. An undecided tally never proposes abort, however long it waits; such a transaction ends by expiry
+(above). Contention is expensive to resolve, so applications should be designed to avoid it in the common case.
 
 ### Finalization Actions
 In addition to the content mentioned in the previous section, TransactionDescriptions also carry a 

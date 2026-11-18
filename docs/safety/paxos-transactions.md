@@ -1086,20 +1086,6 @@ transaction eventually resolves without operator action given a healthy quorum.
 
 ## Open weaknesses
 
-### P-W4. Architecture.md's contention rules do not match the driver (CONFIRMED; documentation)
-Mechanism: `Architecture.md` ("Transactions", the Optimistic Concurrency Control list) says: abort when abort votes by
-"width - write-threshold stores" make success impossible; abort if no store granted commit; otherwise compare the
-timestamps of competing transactions and continue only with the lowest. The code (`TransactionDriver.receiveTxPrepareResponse`)
-decides abort only when more than `w - t` stores of some object's pool voted abort (`w - a < t`). It never aborts
-because no store voted commit (silence and `Undetermined` are no votes, and an undecided tally waits). It compares no
-timestamps: a collision is an ordinary abort vote, except the bounded wait for a lock holder the transaction builds on
-(`Tx.awaitableHolders`).
-Trigger / scenario: a reader reasoning from Architecture.md about contention or abort latency.
-Consequence: wrong expectations; no runtime effect.
-Suggested fix: replace the list with the abort-certain / commit-certain / undecided classification of 7.2 and the
-collision-wait rule.
-Effort: S   Priority: 7
-
 ### P-W5. Stale finding-id references in server/transaction/CLAUDE.md and Backlog.txt (CONFIRMED; documentation)
 Mechanism: `server/transaction/CLAUDE.md` cites "paxos F4", "F5", "F7", "F8", "F11", "F12", "F14" and section 10.10.
 Those finding ids no longer exist in this document; 10.10 still holds the horizon argument. `Backlog.txt` (Mid Term, "Why

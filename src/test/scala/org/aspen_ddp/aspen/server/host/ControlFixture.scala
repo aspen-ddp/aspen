@@ -444,7 +444,8 @@ trait ControlFixture:
                                   deviceId: StorageDeviceId,
                                   sysId: UUID = systemId,
                                   owner: Option[HostId] = Some(HostId.BootstrapHostId)): Unit =
-    os.write.over(deviceDir / StorageDeviceConfig.configFilename, StorageDeviceConfig(deviceId, sysId, crlFileSizeMb = Some(1)).yamlConfig)
+    os.write.over(deviceDir / StorageDeviceConfig.configFilename,
+      StorageDeviceConfig(deviceId, sysId, crlFileSizeMb = Some(1)).yamlConfig)
     owner.foreach(DeviceMarkers.writeOwningHost(deviceDir, _))
 
   private final class Rig(val seams: RecordingSeams, val scheduler: ManualControlScheduler)

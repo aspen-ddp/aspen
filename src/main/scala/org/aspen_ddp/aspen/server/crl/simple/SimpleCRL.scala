@@ -71,7 +71,11 @@ object SimpleCRL extends Logging:
     def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
       val dir = CrashRecoveryLog.deviceCrlDir(devicePath)
       os.makeDir.all(dir)
-      val sizing = CrlSizingDefaults.resolve(config, devicePath.toIO.getTotalSpace)
+      val capacity = devicePath.toIO.getTotalSpace
+      // Only a CRL being created is held to the config: an existing one opens as recorded whatever it says
+      val sizing =
+        if os.exists(dir / SizingFile) then CrlSizingDefaults.resolveExisting(config, capacity)
+        else CrlSizingDefaults.resolve(config, capacity)
       SimpleCRL(dir, sizing.numStreams, sizing.streamBytes, onThreadDeath,
         mustExist = holdsStores).crl
 

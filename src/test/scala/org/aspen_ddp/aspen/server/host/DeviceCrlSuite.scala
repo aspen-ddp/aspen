@@ -1721,6 +1721,12 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       factory.opened.head.admissionLimitBytes should be(1024 * 1024 / 2)
       files should be(oldFiles)
 
+  atest("a device CRL opened with fewer configured streams than the minimum keeps its own sizing"):
+    resizedCrlDevice(_.copy(crlNumStreams = Some(3)))
+
+  atest("a device CRL opened with an invalid maximum stream count keeps its own sizing"):
+    resizedCrlDevice(_.copy(crlMaxStreams = Some(2), crlMinFreePercent = Some(101)))
+
   atest("a device CRL opened with more configured streams than it was created with keeps its own sizing"):
     resizedCrlDevice(_.copy(crlNumStreams = Some(5)))
 

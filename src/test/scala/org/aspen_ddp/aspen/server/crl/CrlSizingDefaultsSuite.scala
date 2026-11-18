@@ -39,3 +39,10 @@ class CrlSizingDefaultsSuite extends AnyFunSuite with Matchers:
   test("a free percentage above 100 is refused"):
     an[IllegalArgumentException] should be thrownBy
       CrlSizingDefaults.resolve(base.copy(crlMinFreePercent = Some(101)), 1L << 40)
+
+  test("an existing CRL's config never throws: invalid growth bounds disable growth"):
+    val bad = base.copy(crlNumStreams = Some(3), crlMaxStreams = Some(2), crlMinFreePercent = Some(101))
+    val s = CrlSizingDefaults.resolveExisting(bad, 1L << 40)
+    s.maxStreams should be(0)
+    s.minFreePercent should be(100)
+    CrlSizingDefaults.resolveExisting(base, 1L << 40).maxStreams should be(20)

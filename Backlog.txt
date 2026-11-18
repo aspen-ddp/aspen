@@ -56,8 +56,9 @@ Isolate every device's I/O, and detect and handle hung devices
       or a false positive must not be able to cause a system-wide outage.
   - Why there is no per-commit watchdog (Todo 4.2, transaction-requirements F12, decided 2026-11-15):
     - The hang is not incorrect, and existing recovery tolerates it. A store with a commit in flight withholds its
-      vote only on that object. The other stores still vote, the driver of an undecided transaction proposes abort
-      past the horizon plus the expiry margin (about 22 s), and expiry discards the waiting Txs.
+      vote only on that object. The other stores still vote; a transaction left undecided by the withheld vote is
+      never aborted by its driver (an undecided tally only waits), and once it is past the horizon plus the expiry
+      margin its waiting Txs end by the expiry rules A-G (`ExpiryTally`, server/transaction/CLAUDE.md "Expiry").
     - No timeout works for every backend: compaction can make a commit legitimately slow by a large factor.
     - `BackendCommitFailed` is sticky until the store reloads (`Frontend.failedCommits`), so a watchdog using it
       would poison an object over one slow compaction. If a per-object signal is ever wanted, it must be non-sticky:
@@ -259,9 +260,6 @@ Need a mechanism to handle "out of space" errors
   - Could set up "spillover stores"
     - Dedicated to hosting data for full stores
     - Lots of implications though, will require some thought
-  - A late prepare arriving after the finalized status-cache entry expired can create a fresh Tx whose CRL save
-    replaces a failed commit's retained entry (possibly without object data), and an abort of that Tx deletes it.
-    The ErrorTree mark still covers it.
 
 Mint per-client certificates for the CLI and other client applications
   - Intentional technical debt: every client currently shares the single

@@ -70,7 +70,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  before the copy leaves the store's path, so this is a safety net: for a directory removed by hand, or for
    *  entries a crash left behind when the drop came after the directory went. Left there, they would be copied forward forever, uncounted by admission, and
    *  recovered if the store ever came back. The CRL is what is read, not a list kept in memory, so a restart forgets
-   *  nothing. A store transferred back has its entry, and so its entries are its own once more.
+   *  nothing. A store that comes back before they are dropped has its entry, so they are not dropped here; it arrives
+   *  with its crl_save.log, and its load drops them before saving the file (StoreLoader.awaitCrlLoad).
    *
    *  The directory and loaded checks run when the CRL's answer arrives, in the same control task that starts the
    *  drop: a store that lands on the device has its directory before anything saves entries for it. A failed drop is

@@ -1703,6 +1703,38 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       leftInCrl should be(Set())
       heldOnDisk(deviceDir, storeId) should be(Set())
 
+  atest("a store loaded from its crl_save.log does not recover entries an earlier tenancy left in the device CRL"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      // The copy that held txid left its path without a retire (removed by hand), and the store came back before any
+      // reconcile saw it unlisted: a copy whose save file holds its whole current state, in which txid is long gone
+      _ = os.remove.all(storeDir)
+      _ <- writeRocksStore(deviceDir, storeId)
+      _ = CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState(), Backend.crlSaveFile(storeDir))
+      heldBefore = heldOnDisk(deviceDir, storeId)
+      restarted = newCrlHost(hostRoot, second)
+      // The save file goes once its state is in the CRL, just before the store recovers from it
+      _ <- pumpUntil(restarted, restarted.control.router.loaded.contains(storeId) &&
+                                !os.exists(Backend.crlSaveFile(storeDir)))
+      _ <- pumpUntil(restarted, false, rounds = 50)
+      crl = second.opened.head
+      leftInCrl = held(crl, storeId)
+      recoveredTx = restarted.control.router.loaded(storeId).frontend.transactions.contains(txid)
+      _ = second.shutdownAll()
+    yield
+      heldBefore should be(Set(txid))
+      recoveredTx should be(false)
+      leftInCrl should be(Set())
+      heldOnDisk(deviceDir, storeId) should be(Set())
+
   /** Opens a device whose CRL was created with 4 streams of 1 MB, holding a store, with `config` instead. A change of
    *  config (or of the code defaults it once took) must neither lose the CRL nor resize it */
   private def resizedCrlDevice(config: StorageDeviceConfig => StorageDeviceConfig): Future[org.scalatest.Assertion] =

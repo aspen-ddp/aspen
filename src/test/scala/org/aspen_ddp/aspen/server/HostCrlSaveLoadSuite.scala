@@ -225,6 +225,10 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
       if failing then throw new IllegalStateException("injected recovery failure")
       else super.getFullRecoveryState(storeId)
+    // The default drop reads through getFullRecoveryState: the fault is injected into recovery only. A store loaded
+    // from its crl_save.log drops its device-CRL entries first, and these tests hold none to drop
+    override def dropStore(storeId: StoreId): Future[Unit] =
+      if failing then Future.unit else super.dropStore(storeId)
 
   /** The store's backend holding the object, in a directory of its own, with no crl_save.log */
   private def storeInDir(): (MapBackend, os.Path) =

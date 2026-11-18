@@ -91,6 +91,9 @@
 - `DeviceDiscovery` registers `crl.onAdmissionLimitRaised(sds.admission.raiseLimit)` right after constructing the device
   state, before any store loads: a CRL growth raises the device's admission limit (raise-only, thread-safe) for all its
   stores
+- A store loaded from its `crl_save.log` first drops whatever the device CRL holds for it (`StoreLoader.awaitCrlLoad`):
+  the file is its whole state, and anything else there is a copy of part of it or an earlier tenancy's leftover,
+  never to be recovered as its own (crash-recovery-log 3.3 step 4)
 - A `crl_save.log` state is charged before `loadStore` saves it (`CrlAdmission.tryChargeLoaded`, at most the limit
   plus one transaction, A3), after the Store is built and before install, retained for the store. Refused, the store
   is left offline, its file kept, and retried every device scan through `storesAwaitingSpace` (one warning per

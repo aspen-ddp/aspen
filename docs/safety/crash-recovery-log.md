@@ -201,12 +201,19 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
    saves nothing in between. A throw while reading or recovering fail-stops the store (`Host.StoreFailStopped`).
 4. With a save file: its state is first charged to the device's admission, checked (`CrlAdmission.tryChargeLoaded`,
    section 6.1 A3); a state that does not fit now leaves the store offline with its file kept, retried at the device
-   scans, and one that never can is treated as an unusable file (step 2). Then `crl.loadStore` saves every record
-   into the device CRL, then `StoreRouter.crlLoaded` removes the
+   scans, and one that never can is treated as an unusable file (step 2). Then `crl.dropStore` drops whatever the
+   device CRL holds for the store, durably, and `crl.loadStore` saves every record of the file into it
+   (`StoreLoader.awaitCrlLoad`), then `StoreRouter.crlLoaded` removes the
    file durably (`DurableFiles.remove`) and only then recovers. A crash between "records durable in the device CRL"
    and "file removed" loads the same records again under the same ids, which is harmless: the store served nothing in
    between. A failed `loadStore` unloads the store (`handleUnloadFailed`), which drops whatever reached the CRL
-   (`closeUnloaded(dropDurably = true)`): the file is still the whole state.
+   (`closeUnloaded(dropDurably = true)`): the file is still the whole state. The file is always the store's whole
+   state (a load removes it, so the store has served nowhere since it was written), and the device CRL can hold
+   only a copy of part of it (10.11, or a crashed earlier load) or entries an earlier tenancy of the store left on
+   this device, whose copy left its path without a retire (removed by hand) before the safety net
+   (`dropLeftoverCrlState`) could drop them. Recovered as the store's own, such entries would rejoin transactions it
+   has since forgotten, and a stale commit vote would find its own UnackedCommits entry (a transfer keeps the
+   incarnation) and apply again. The drop first is why neither can happen.
 5. Recovered transactions are counted into the device's admission without a limit check (`Frontend.admitRecovered`),
    as are recovered stubs (`chargeStubs`). Only then is what was retained for the store released: the share the
    device's open, its last close, step 4's charge or a replaced store retained (`Frontend.recoverState`, section 6.1
@@ -1098,7 +1105,7 @@ close completes. A restart loads the store normally and recovers from the device
 
 **10.11 Transfer-out, crash after `crl_save.log` is durable, before the deletion is durable.** The records are in both
 places, identical, because the store served nothing in between. The restart finds the save file and loads from it:
-`loadStore` re-saves under the same ids, the file is removed durably, then the store recovers. If the deletion became
+the load drops the device CRL's copies, `loadStore` saves the file's records again, the file is removed durably, then the store recovers. If the deletion became
 durable first, the save file is the only copy; the destination validates the staged copy before promotion
 (`loadValidStoreState`, while the source still holds the state).
 

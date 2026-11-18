@@ -66,8 +66,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
 
 6.1  Open questions left by the review                                                                      [S-M]
-     - A store transferred back onto a device: can leftover CRL entries of its earlier incarnation survive and be
-       recovered as its own? (crash-recovery-log open question 1.)
      - Safe manual reinstatement procedure for a falsely declared store (systemic-loss open question 2).
 
 

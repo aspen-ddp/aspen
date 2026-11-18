@@ -487,7 +487,15 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         router.recoverDeferred(store)
         p.success(())
       case Some(trs) =>
-        store.crl.loadStore(storeId, trs).onComplete:
+        // The save file is the store's whole state: it has served nowhere since the file was written (a load removes
+        // the file), so whatever the device CRL holds for it is a copy of part of the file (a crash before the
+        // extraction's deletion, or during an earlier load) or left by an earlier tenancy of the store on this device
+        // whose copy left its path without a retire, which must never be recovered as its own. Dropped first, durably,
+        // so no save of the file meets the drop
+        val loaded =
+          try store.crl.dropStore(storeId).flatMap(_ => store.crl.loadStore(storeId, trs))
+          catch case NonFatal(t) => Future.failed(t)
+        loaded.onComplete:
           case Success(_) =>
             // Recovered on the store's executor (StoreRouter.crlLoaded)
             router.crlLoaded(store, store.backend.crlSaveFile, p)

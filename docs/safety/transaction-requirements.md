@@ -130,8 +130,7 @@ revision; for a KV update without one, any current key carrying revision txid; a
 at revision txid. Traceless: `RefcountUpdate`, the locks, a KV update that only deletes or changes object-level
 fields, and one whose Inserts were all superseded. The UnackedCommits fallback does not depend on traces: the
 finalizer writes an entry for every counted commit voter that did not acknowledge, whatever its change
-(`client/internal/transaction/MissedUpdateFinalizationAction`). `TransactionDescription.tracelessObjects` still exists
-but no code calls it.
+(`client/internal/transaction/MissedUpdateFinalizationAction`).
 
 `apply` itself runs `check(applying = true)` first and skips every object with an error (`Result.skippedReasons`).
 An exception while applying an object marks it `failed`: the caller discards its in-memory state (`Frontend.discard`)

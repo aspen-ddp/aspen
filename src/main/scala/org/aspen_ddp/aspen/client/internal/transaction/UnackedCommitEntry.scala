@@ -8,10 +8,11 @@ import org.aspen_ddp.aspen.common.objects.{Key, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 
-/** A UnackedCommits tree value: a store missed a transaction whose change to `objects` leaves nothing for
-  * repair to compare (a refcount change, or a key delete), so the transaction's start `timestamp` and
-  * the pointers, which keep their store pointers, are recorded for the store's repair. `incarnation` is the
-  * incarnation of the store's data that missed it, None when unknown (encoded as the zero UUID).
+/** A UnackedCommits tree value: a store cast a commit vote on a committed transaction and had not acknowledged
+  * applying it when the transaction was finalized. `objects` lists every object of the store the transaction
+  * changes, traced or traceless, with their store pointers; with the transaction's start `timestamp` they are
+  * recorded for the store's repair and for a recovered commit vote's lookup. `incarnation` is the incarnation of
+  * the store whose vote counted, None when unknown (encoded as the zero UUID).
   */
 final case class UnackedCommitEntry(timestamp: HLCTimestamp, incarnation: Option[StoreIncarnation],
                                     objects: List[ObjectPointer]):

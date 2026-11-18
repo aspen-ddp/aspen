@@ -17,9 +17,11 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   * @param scanIntervalFloor            fastest a single store is scanned
   * @param scanIntervalCap              slowest a single store is scanned, reached by repeated
   *                                     doubling after clean scans
-  * @param minErrorEntryAgeForDeletion  how long an errorTree entry must sit before its object's
-  *                                     absence from the allocationTree is taken as proof of
-  *                                     deletion
+  * @param minErrorEntryAgeForDeletion  how long an errorTree or UnackedCommits entry must sit before its
+  *                                     object's absence from the allocationTree leads to a read
+  *                                     of the object (StoreRepairer.repairAbsent). Absence alone
+  *                                     never deletes: only a read failing
+  *                                     InvalidObject.provesDeletion drops the slice
   * @param proofAfterDeferrals          consecutive passes a repair entry's object may have parts deferred by a lock
   *                                     before the scan proves them with a transaction instead of waiting for the
   *                                     lock to clear (RepairProofs)

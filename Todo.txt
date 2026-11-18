@@ -71,12 +71,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.4  Stale scaladoc and code comments                                                                      [S]
-     MissedUpdateMarker.writeBatch (head chunk may itself be None);
-     UnackedCommitEntry (lists every changed object, not only traceless ones); RepairPolicy
-     .minErrorEntryAgeForDeletion (age paces a read; only InvalidObject.provesDeletion deletes);
-     TransactionDescription.tracelessObjects has no caller (remove).
-
 7.5  Stale text in Backlog.txt                                                                              [S]
      "Why there is no per-commit watchdog" (an undecided driver never proposes abort; waiting Txs end by expiry
      rules A-G); the out-of-space sub-item about a late prepare after cache expiry is obsolete (receivePrepare

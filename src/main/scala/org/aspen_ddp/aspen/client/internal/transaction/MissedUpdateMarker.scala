@@ -162,9 +162,11 @@ class MissedUpdateMarker(client: AspenClient,
     // An entry too large for half a node (a transaction changing many objects on one store) is written as chunks,
     // each a complete entry for some of its objects, head first under the entry's own key (UnackedCommitEntry.chunks).
     // A (store, transaction) entry means the same whoever writes it, so a held one is kept: rewriting it would move
-    // its revision under a repair scan's delete (StoreRepairer.deleteEntryIfUnchanged), which would then fail. Its
-    // incarnation may differ: a takeover marker that heard no incarnation may write `None` chunks next to chunks the
-    // original marker tagged. Harmless: a lookup reads only the head chunk, and repair reads the objects themselves
+    // its revision under a repair scan's delete (StoreRepairer.deleteEntryIfUnchanged), which would then fail. Each
+    // chunk key keeps its first writer's value, so a takeover marker that heard no incarnation may leave `None` on any
+    // chunk, the head included, beside chunks the original marker tagged. A lookup reads only the head chunk, so it
+    // may find `None` where the counted vote's incarnation was known; a store holding its own commit vote applies
+    // through a `None` entry as through its own (Frontend.unackedLookupComplete). Repair reads the objects themselves
     def unackedInserts(maxEntrySize: Int): List[TKVLInsert] = unacked.flatMap: t =>
       t.entry.chunks(maxEntrySize).zipWithIndex.map: (chunk, i) =>
         TKVLInsert(UnackedCommitEntry.key(t.store, t.transactionId, i), Value(chunk.encode), replaces = Some(_ => None))

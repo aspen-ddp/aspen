@@ -120,8 +120,9 @@ The premises other subsystems take from this:
   committed, applies over other transactions' locks at the stores that voted abort on it.
 * A repair write never overwrites a different occupant of an FSIF slot (`RepairSlotOccupied`); the repairer drops a
   dead occupant with an id-checked `repairDelete`, only when the AllocationTree does not list it.
-* A failed repair write discards the in-memory state of the object (`Frontend.repairWriteComplete` -> `discard`),
-  which is also the state any lock holder references (X-W1).
+* A failed repair write restores the fields it changed to the settled pre-repair state, the backend's
+  (`Frontend.repairWriteComplete`), keeping the instance lock holders reference, so their committed apply holds. A
+  repair of an object the store did not hold discards its state.
 
 ### 2.5 Allocations
 
@@ -237,25 +238,4 @@ closes it: a copy read under a write lock is marked in the ErrorTree.
 
 ## Open weaknesses
 
-### X-W1. A failed repair write invalidates the state a live commit voter has locked, and the store fail-stops (PLAUSIBLE; systemic loss, spurious lost-store declaration)
-Mechanism: `Frontend.reconcile` treats an object as settled when no commit, repair write, failed commit or deletion is
-in flight and the loaded copy is the referenced instance; it does not refuse an object some Tx holds locks on, it
-defers the locked parts (`reconcileSettled` adds `os.lockedKeys`/`objectLevelLocked`). So a KeyValue object whose key
-k1 a live commit voter V has locked can have other keys installed into that same referenced `ObjectState`. If the
-backend's repair write fails, `repairWriteComplete` calls `discard(objectId)`, which marks the referenced state
-`reloadRequired`. V still references it (`stateForTransaction` keeps a discarded state with lock holders). When V's
-commit applies, `RequirementsChecker.loaded` throws `StaleObjectState`, the object is skipped, and `Tx.issueCommits`,
-for a live voter, fail-stops the store with `INVARIANT VIOLATION` (no invariant was violated). A recovered voter
-quarantines the object instead; every new transaction on the object votes abort (`StaleObjectState`) until V resolves.
-Trigger / scenario: store S is behind on KeyValue object X (an ErrorTree entry); a live transaction V holds a key lock
-on X at S; S's repair pass installs other keys and `backend.repair` fails without the backend fail-stopping (FSIF
-`SliceTooLarge`, `InvalidPointer` or `ObjectMismatch`/`RepairSlotOccupied`; an I/O error makes FSIF fail-stop anyway,
-and RocksDB repair writes do not fail this way). V then commits. The trigger set is narrow today; any backend that
-reports a non-fatal repair failure widens it.
-Consequence: a healthy store is declared lost and rebuilt over one failed background write; the declaration counts
-against the pool's failure budget (systemic-loss-protection.md).
-Suggested fix: on a failed repair write, restore the in-memory state to the snapshot it was built from (keep the
-pre-repair copy, or install the plan into a copy and swap it in only on success) instead of discarding a state that
-lock holders reference; or refuse a reconcile write while the object has any lock holder (rare, costs a later pass).
-Test: FrontendSuite with a backend whose `repair` fails, a live commit voter holding a key lock, then its commit.
-Effort: S   Priority: 3
+None.

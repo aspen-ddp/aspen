@@ -255,11 +255,13 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 
 #### Commit delivery, lost messages, status cache
 - A commit voter unlocks before applying (`Tx.doCommit`). An applied object is still ordered by the in-flight
-  commit marker, but one it cannot apply would leave its counted vote standing for neither, so the store
-  fail-stops (`server/store/CLAUDE.md`, Fail-stop), logging an `INVARIANT VIOLATION` for a live voter (F10). A
-  recovered voter whose re-check fails quarantines the object until repair verifies it, and so does any re-apply
-  (recovered or through its entry) that would write back a key deleted since (`Tx.quarantining`;
-  `server/store/CLAUDE.md`, Quarantine)
+  commit marker, but one it cannot apply would leave its counted vote standing for neither. An apply that throws
+  fail-stops the store (`server/store/CLAUDE.md`, Fail-stop). A voter, live or recovered, whose re-check fails on a
+  changed object quarantines it until repair verifies it, and so does any re-apply (recovered or through its entry)
+  that would write back a key deleted since (`Tx.quarantining`; `server/store/CLAUDE.md`, Quarantine). A later
+  commit that does not depend on the voter, applied first over its locks, causes it legitimately; a live voter logs
+  it at error, naming the transaction each object now shows (where two conflicting commits would surface). A
+  lock-only object that fails the re-check is skipped and reported only
 - A commit decision can overtake the data too. The store holds the commit until the data, a client's prepare, or
   TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
   if the data beat the finalizer's `errorTimeout` (2 s). Stores that miss it are marked in the ErrorTree

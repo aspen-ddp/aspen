@@ -47,18 +47,6 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt. The items below are independent S/M fixes.)
 
-3.2  Live-voter apply fail-stop fires without a real violation: Q-W1, X-W1 (and Backlog 5.8)               [M]
-     Q-W1 CONFIRMED: Tx.issueCommits fail-stops whenever a live commit voter's re-check skips any object,
-     lock-only ones included; a later non-conflicting commit applied first (fence takeover, allocator follow-up,
-     repair proofs incl. RepairProofs.proveRefcount, refcount changes) triggers it, possibly at w - t stores of a
-     pool at once. X-W1 PLAUSIBLE: a failed backend repair write discards the referenced ObjectState a live voter
-     holds locked; the voter's apply throws StaleObjectState and the store fail-stops. Fix together: quarantine
-     the object instead of fail-stopping (covers Backlog 5.8), never fail-stop on a lock-only object, and on a
-     failed repair write restore the pre-repair state instead of discard. Keep logging lock-only re-check
-     failures (a rebuilt store's inherited votes now prevent the conflict that once surfaced there, so a failure
-     is a new bug). Correct server/store/CLAUDE.md and server/transaction/
-     CLAUDE.md ("where two conflicting commits surface").
-
 3.3  CRL recovery accepts forged entries from object payloads: CRL-W1                                      [S]
      PLAUSIBLE. StreamReader.newerIntactEntry probes 4 KiB boundaries of old-cycle data, which holds raw object
      bytes; a crafted (or nested-Aspen) entry with a high serial makes recovery throw CrlCorrupt and the device's
@@ -126,8 +114,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 ------------------------------------------------------------------
 
 6.1  Open questions left by the review                                                                      [S-M]
-     - X-W1 (3.2): is any non-fatal FSIF repair failure (other than RepairSlotOccupied) reachable for an object
-       held in memory? If not, X-W1 is latent (priority 5).
      - A Tx created from a resolved cache entry (outcomeDecided) votes without locks and reports Unresolved
        (contradiction X 5.6): harmless for safety; check the liveness cost (adopt turned into hold).
      - RARS objects built by appends/ranged writes: verify the rebuild's ida.encode of the full restored data

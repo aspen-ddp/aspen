@@ -151,14 +151,14 @@
   release when a commit is applied in memory: the in-flight marker orders followers. After a failed backend commit
   every transaction on that object votes abort (`BackendCommitFailed`) until the store reloads. Objects a
   transaction only checks or locks get no backend commit, so concurrent `SharedRevisionLock` holders never wait
-- Fail-stop (`Frontend.failStop`, transaction-requirements F5/F6): a commit voter has dropped its locks before it
-  applies, so one that cannot hold the update it voted for fail-stops the store. That covers an apply that throws, a
-  live voter's failed apply re-check, and a recovered commit vote whose object fails to load with anything but
-  `ObjectNotFound`. A live voter's failed re-check is logged as an `INVARIANT VIOLATION` naming the transaction
-  whose update each object now shows: a committed apply ignores other transactions' locks, which alone is normal (the
-  holder usually aborts) and not reported, so this is where two conflicting commits surface (transaction-requirements
-  F10; Backlog 5.8: repair the object instead). A recovered voter's failed re-check quarantines the object instead
-  (below). A fail-stopped store drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
+- Fail-stop (`Frontend.failStop`, transaction-requirements.md 8.5): a commit voter has dropped its locks before it
+  applies, so one that cannot hold the update it voted for must not serve as if it did. An apply that throws, and a
+  recovered commit vote whose object fails to load with anything but `ObjectNotFound`, fail-stop the store. A failed
+  apply re-check, live or recovered, quarantines the object instead (below): a committed apply ignores other
+  transactions' locks, so a later commit that does not depend on the voter can be applied first (fence takeover,
+  allocator follow-up, repair proof, refcount change), which the store cannot tell from two conflicting commits. A
+  live voter logs it at error, naming the transaction whose update each object now shows; this is where two
+  conflicting commits would surface. A lock-only object that fails the re-check is skipped and reported only. A fail-stopped store drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
   store is rebuilt as a failed backend is. Never for a full device: a write-frozen store poisons the object instead
   (`poisonObject`, the `BackendCommitFailed` rule) and keeps serving. Every fail-stop is a lost-store declaration
   (Backlog: correlated declarations)
@@ -175,15 +175,15 @@
   deleting transaction's CRL state. Inline for every object no unconcluded allocation covers. MapBackend keeps a
   refcount-0 state rather than removing it, unlike RocksDB and FSIF, so its tests see no miss: the R-N13 tests use a
   removing MapBackend
-- Quarantine (`Frontend.quarantine`, transaction-requirements F5, Todo 2.16): a recovered commit vote whose apply
-  re-check fails may have been superseded before the crash (10.5a) or invalidated under its locks, and the store does
-  not tell these apart. Each changed object it could not apply is quarantined, except one the backend missed and the
+- Quarantine (`Frontend.quarantine`, transaction-requirements.md 8.5): a commit vote whose apply re-check fails may
+  have been overtaken by a later commit applied over its locks, invalidated under them, or, if recovered, superseded
+  before the crash (10.5a), and the store does not tell these apart. Each changed object it could not apply is quarantined, except one the backend missed and the
   Tx allocates (`allocatedHere`: no copy, no lost lock; one whose data was dropped was applied and then deleted, which
   no read verifies), which is reported (R-F17). Before the apply, a re-apply (recovered, or through an UnackedCommits
   entry: `Tx.appliesThroughEntry`) also leaves out and quarantines every object on which it would insert a key now
   absent while the object's timestamp is past T's start (`RequirementsApplyer.mayReinsertDeletedKeys`): T may have
   inserted it and a later transaction deleted it, and the re-check would pass again (transaction-requirements.md
-  10.5c). The object is never counted as skipped, so a live Tx applying through its entry does not fail-stop. Every
+  10.5c). The object is never counted as skipped, so it is quarantined once. Every
   transaction on a quarantined object votes abort
   (`ObjectQuarantined`), and committed ones apply nothing to it and report it. Repair is not held off, unlike
   `commitFailed`. The store asks its host to verify the object (`QuarantineVerifier`, Host →

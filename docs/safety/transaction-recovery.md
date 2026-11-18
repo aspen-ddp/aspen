@@ -472,8 +472,8 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
 * A recovered voter whose re-check fails on an object it changes (superseded before the crash, or invalidated under
   its lost locks) quarantines the object (`Frontend.quarantine`): every transaction on it votes abort until repair
   verifies the copy against a read at least T's start. An allocation the backend missed is reported instead (no copy,
-  no lost lock). A live voter's failed re-check, or any apply that throws, fail-stops the store (an `INVARIANT
-  VIOLATION` for a live voter).
+  no lost lock). A live voter's failed re-check quarantines the same way; any apply that throws fail-stops the store
+  (transaction-requirements.md 8.5).
 * The CRL's drop of applied object data (`Tx.allObjectCommitsComplete`, `CrashRecoveryLog.dropTransactionObjectData`)
   is in memory only, so a crash can recover a Tx with data it already applied. For allocations this matters: a
   deletion of an object an unconcluded Tx allocated here waits (`Frontend.awaitAllocationsDurable`) until that Tx's

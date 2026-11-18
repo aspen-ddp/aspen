@@ -1054,22 +1054,29 @@ class Tx( trs: TransactionRecoveryState,
     }
 
     // A commit voter that cannot hold the update it voted for has already dropped its locks (doCommit): its vote, which
-    // may count towards the write threshold, would then stand for neither. So the store fail-stops (Frontend.failStop)
-    // when an apply threw, and when a live voter's apply re-check fails: it has held its locks since its own check, so
-    // the state changed under them (transaction-requirements F5). An earlier failed backend commit poisons the object
-    // instead (failedHere: every later transaction on it votes abort).
+    // may count towards the write threshold, would then stand for neither. A live or recovered voter is treated alike.
     //
-    // A recovered vote's re-check may fail legitimately: before the crash the store applied the update and a later
-    // transaction built on it superseded it (10.5a). That cannot be told from a state invalidated under the recovered
-    // locks, so the object is quarantined instead (Frontend.quarantine): every transaction on it votes abort, as the
-    // lost lock would have made them, until repair shows the store's copy matches a read of the object at least as new
-    // as this transaction. That is what repair requires to drop an ErrorTree entry for it, so the store is then as good
-    // as one that missed the transaction and was repaired. Only changed objects: a lock-only one has no update to lose.
-    // An object already quarantined is quarantined by this vote too, so its bound covers this transaction.
+    // An apply that threw fail-stops the store (Frontend.failStop): its in-memory state is corrupt.
+    //
+    // A changed object whose apply re-check fails is quarantined (Frontend.quarantine): every transaction on it votes
+    // abort, as the lost lock would have made them, until repair shows the store's copy matches a read of the object at
+    // least as new as this transaction. That is what repair requires to drop an ErrorTree entry for it, so the store is
+    // then as good as one that missed the transaction and was repaired; the object is reported, so the finalizer marks
+    // the store. The failure has legitimate causes the store cannot tell from a violation: a committed transaction that
+    // does not depend on this one applied first, over this vote's locks (an apply ignores other transactions' locks,
+    // RequirementsChecker.check), its outcome having arrived first (a fence takeover, an allocator's follow-up write, a
+    // repair proof, a refcount change); the state was invalidated under the locks (Frontend.discard); or, for a
+    // recovered vote, the store applied the update before the crash and a later transaction superseded it. A live
+    // voter logs it as a possible invariant violation, naming the transaction the object now shows. An object already
+    // quarantined is quarantined by this vote too, so its bound covers this transaction.
     // Not an allocation the backend missed (allocatedHere): the store holds no copy of it, so no lock was lost, and
     // every other transaction on it misses and votes abort. A recovered allocation fails its apply only without its
     // data, which the CRL drops once the update is applied: the object was applied and later deleted, which a read
-    // can never verify, so a quarantine would never clear (transaction-recovery F17). It is reported instead
+    // can never verify, so a quarantine would never clear. It is reported instead.
+    //
+    // A lock-only object whose re-check fails has no update to lose: it is skipped, logged and reported. A later commit
+    // applied first explains it (a fence takeover over a block commit's
+    // SharedRevisionLock); a rebuilt store's inherited votes keep a lost vote's lock, so that is no longer a cause.
     //
     // A re-apply that may write back a key deleted since (mayReinsert) is quarantined too, live or recovered: the
     // store cannot tell whether it applied the update and a later transaction deleted the key, or never applied it.
@@ -1080,35 +1087,27 @@ class Tx( trs: TransactionRecoveryState,
         frontend.quarantine(pointerOf(oid), txd.startTimestamp, transactionId,
           "it would insert a key a later transaction may have deleted")
     if disposition == TransactionDisposition.VoteCommit then
-      if recovered then
-        val threw = result.failed -- notApplied
-        if threw.nonEmpty then
-          frontend.failStop(s"Tx $transactionId voted commit but its update of objects $threw threw")
-        else
-          val invalidated = (result.uncommittable -- alreadyApplied -- notApplied)
-            .filter(oid => changed.contains(oid) && objects.contains(oid) && !allocatedHere.contains(oid))
-          val toQuarantine = invalidated ++ quarantinedHere
-          if toQuarantine.nonEmpty then
-            quarantining ++= toQuarantine
-            toQuarantine.foreach: oid =>
-              frontend.quarantine(pointerOf(oid), txd.startTimestamp, transactionId,
-                result.skippedReasons.get(oid).map(_.toString).getOrElse("already quarantined"))
+      val threw = result.failed -- notApplied
+      if threw.nonEmpty then
+        frontend.failStop(s"Tx $transactionId voted commit but its update of objects $threw threw")
       else
-        // Invariant violation: a committed transaction applied over this vote's locks (an apply ignores other
-        // transactions' locks, RequirementsChecker.check) conflicts with this one, which committed too (R2), or the
-        // state changed under the locks. The override alone is not reported: its lock holder normally aborts
-        // (transaction-requirements F10). Naming the update each object now shows identifies the other transaction
-        val threw = result.failed -- notApplied
-        val unapplied = result.skipped -- alreadyApplied -- notApplied
-        if threw.nonEmpty then
-          frontend.failStop(s"Tx $transactionId voted commit but its update of objects $threw threw")
-        else if unapplied.nonEmpty then
-          val shows = unapplied.toList.map: oid =>
-            val now = objects.get(oid).map(_.metadata.revision.lastUpdateTxUUID.toString).getOrElse("not loaded")
-            s"$oid (${result.skippedReasons.get(oid).map(_.toString).getOrElse("not applied")}; now shows Tx $now)"
-          frontend.failStop(s"INVARIANT VIOLATION: Tx $transactionId voted commit and committed, but its requirements " +
-            s"no longer hold on objects ${shows.mkString(", ")}: two conflicting transactions committed, or the " +
-            s"state changed under its locks (transaction-requirements F5, F10)")
+        def shows(oid: ObjectId): String =
+          val now = objects.get(oid).map(_.metadata.revision.lastUpdateTxUUID.toString).getOrElse("not loaded")
+          s"${result.skippedReasons.get(oid).map(_.toString).getOrElse("not applied")}; now shows Tx $now"
+        val skipped = result.uncommittable -- alreadyApplied -- notApplied
+        val invalidated = skipped.filter(oid => changed.contains(oid) && objects.contains(oid) &&
+          !allocatedHere.contains(oid))
+        if !recovered && invalidated.nonEmpty then
+          logger.error(s"Tx $transactionId on store $storeId voted commit and committed, but its requirements no " +
+            s"longer hold on objects ${invalidated.toList.map(oid => s"$oid (${shows(oid)})").mkString(", ")}: a " +
+            s"commit applied first over its locks, the state changed under them, or two conflicting transactions " +
+            s"committed. Quarantined")
+        val toQuarantine = invalidated ++ quarantinedHere
+        if toQuarantine.nonEmpty then
+          quarantining ++= toQuarantine
+          toQuarantine.foreach: oid =>
+            frontend.quarantine(pointerOf(oid), txd.startTimestamp, transactionId,
+              if invalidated.contains(oid) then shows(oid) else "already quarantined")
 
     val uncommittable = result.uncommittable -- alreadyApplied
 

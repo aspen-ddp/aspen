@@ -1,25 +1,6 @@
 Backlog
 =======
 
---- Moved from Safety Work List ---
-
-5.8  Committed apply over a commit voter's lock: Req F10                                                   [L]
-     Scenario: commit voter B holds requirement locks at a store. A conflicting transaction A collides there (votes
-     abort) but commits on other stores' votes, and its apply ignores B's locks (RequirementsChecker.check with
-     applying = true; checkKVRequirements(ignoreLocks = true)). That override is normal and is not reported by
-     itself: B usually lost elsewhere and has not yet learned its abort, and locks are coarser than requirements, so
-     both may commit legitimately (FrontendSuite "a commit held behind an in-flight commit ..."). The real violation is
-     B also committing with its requirements broken (an R2 failure or state changed under its locks). It is caught
-     at B's apply re-check (Tx.issueCommits): a live voter fail-stops the whole store (Frontend.failStop, then a
-     rebuild), and a recovered voter quarantines the object. The skipped object's current revision is logged at warn.
-     Question (decided 2026-11-15 to be out of scope for the safety list): fail-stopping the whole store for one object
-     is probably overkill. Consider marking only the affected object as needing repair (quarantine-like: vote abort on
-     it, report it, verify against a read at least T's start) and keeping the store. This must be argued carefully:
-     B's counted commit vote stands for an update the store does not hold, so the object must never back another
-     commit vote until repaired. Check the interaction with the write threshold, repair proofs and the correlated
-     lost-store declarations item (3.1). Also consider naming it an invariant violation in the log and naming the
-     transaction whose update the object now shows.
-
 --- Near term ---
 
 Bootstrap tree sweep staleness window (accepted 2026-11-14, revisit). Writes to the bootstrap pool's own

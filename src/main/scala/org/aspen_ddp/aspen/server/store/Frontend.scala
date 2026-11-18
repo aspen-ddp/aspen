@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, CurrentAllocationsReply, CurrentAllocationsRequest, HeldVote, PendingAllocation, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
-import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectType, ReadError, ReadType}
+import org.aspen_ddp.aspen.common.objects.{Key, Metadata, ObjectId, ObjectPointer, ObjectType, ReadError, ReadType, Value}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrlAdmission, StoreRecoveryState,
@@ -30,6 +30,12 @@ object Frontend {
     * deletion in flight, or a transaction holding it): the repair keeps its entry and tries again on a later pass
     */
   final class RepairDeleteDeferred(message: String) extends Exception(message)
+
+  /** The fields of a loaded object a repair write changes, as they were before it: metadata, data and, for a KeyValue
+    * object, its bounds and the prior entry of every key the repair installs or deletes (repairWriteComplete)
+    */
+  private final case class PreRepairState(metadata: Metadata, data: DataBuffer,
+    kv: Option[(Option[Key], Option[Key], Option[Value], Option[Value], Map[Key, Option[ValueState]])])
 
   /** How long a store withholds its vote from drivers' prepares while waiting for a client's object data.
     * Several client retransmissions long, since the only cost of a late abort is a client retry.
@@ -478,10 +484,11 @@ class Frontend(val storeId: StoreId,
     */
   @volatile private[aspen] var testingOnlyQuarantines: Int = 0
 
-  /** Quarantines an object a recovered commit vote could not apply its committed update to (Tx.issueCommits). Before
-    * the crash the store may have applied it and a later transaction superseded it, or the state may have been
-    * invalidated under the recovered locks: the vote then counts with neither its lock nor its update. The store does
-    * not tell these apart. A re-apply (recovered, or through an UnackedCommits entry) that would insert a key now absent
+  /** Quarantines an object a commit vote, live or recovered, could not apply its committed update to
+    * (Tx.issueCommits): a committed transaction that does not depend on it applied first over its locks, the state was
+    * invalidated under them, or, for a recovered vote, the store applied the update before the crash and a later
+    * transaction superseded it. The vote then counts with neither its lock nor its update. The store does not tell
+    * these apart. A re-apply (recovered, or through an UnackedCommits entry) that would insert a key now absent
     * on an object a later transaction reached is quarantined too, applied nothing: the key may have been deleted since
     * (RequirementsApplyer.mayReinsertDeletedKeys). Every transaction on the object votes abort, as the lock would have made it, and committed
     * ones apply nothing to it (reported, so their finalizers mark the store for repair), until a verification
@@ -491,7 +498,7 @@ class Frontend(val storeId: StoreId,
     *
     * In memory only: the quarantining transaction's CRL state, object data included, is kept until the quarantine
     * clears (concludeTransactionState), so a reloaded store recovers it, fails the same re-check, and quarantines the
-    * object again. Nothing is written for this. It declares no lost store, unlike the fail-stop a live voter gets
+    * object again. Nothing is written for this. It declares no lost store
     */
   def quarantine(pointer: ObjectPointer, minTimestamp: HLCTimestamp, txid: TransactionId, reason: String): Unit =
     val oid = pointer.id
@@ -2021,6 +2028,12 @@ class Frontend(val storeId: StoreId,
     if plan.changesNothing then
       p.success(plan.result)
     else
+      // What a failed write restores (repairWriteComplete). Only the fields the plan changes: a locked key's ValueState
+      // is deferred, so never replaced
+      val prior = loaded.map: os =>
+        val touched = plan.installs.keySet ++ plan.deletes
+        PreRepairState(os.metadata, os.data, os.kvState.map(kvs =>
+          (kvs.min, kvs.max, kvs.left, kvs.right, touched.map(key => key -> kvs.content.get(key)).toMap)))
       val os = loaded.getOrElse(
         new ObjectState(read.pointer.id, Metadata.Zeroed, read.pointer.objectType, DataBuffer.Empty))
       os.kvState.foreach { kvs =>
@@ -2053,7 +2066,7 @@ class Frontend(val storeId: StoreId,
       txCommitsInFlight(objectId) = txCommitsInFlight.getOrElse(objectId, 0) + 1
       val done = Promise[Unit]()
       done.future.onComplete { result =>
-        post(() => repairWriteComplete(os, result.isSuccess))
+        post(() => repairWriteComplete(os, result.isSuccess, prior))
         p.complete(result.map(_ => plan.result.copy(changed = true)))
       }(using scala.concurrent.ExecutionContext.parasitic)
       backend.repair(CommitState(read.pointer, os.metadata, os.objectType, os.data), done)
@@ -2061,18 +2074,37 @@ class Frontend(val storeId: StoreId,
   /** A repair's backend write of `os` completed: its state is no longer held in memory for the write, and the
     * transactions waiting behind it may proceed.
     *
-    * A failed write leaves memory ahead of the backend, so the state is only discarded: the next use reloads the
-    * pre-repair state from the backend, and the repair's promise fails, so its entry is kept for a later pass. Unlike
-    * a failed transaction commit it is not recorded in failedCommits, so later transactions on the object are not
-    * refused: no transaction relied on the repaired state being durable
+    * A failed write leaves memory ahead of the backend, so the fields the repair changed are restored to `prior`, the
+    * loaded state it was planned on. That state was settled, so it is the backend's, and while the write was in
+    * flight no transaction locked, checked or applied to the object (it counts as an in-flight commit). The instance
+    * stays the one served and the one lock holders reference: discarding it would fail their committed apply
+    * (StaleObjectState). A repair of an object the store did not hold (`prior` empty) discards its state instead. The
+    * repair's promise fails, so its entry is kept for a later pass. Unlike a failed transaction commit it is not
+    * recorded in failedCommits, so later transactions on the object are not refused: no transaction relied on the
+    * repaired state being durable
     */
-  private def repairWriteComplete(os: ObjectState, succeeded: Boolean): Unit =
+  private def repairWriteComplete(os: ObjectState, succeeded: Boolean, prior: Option[PreRepairState]): Unit =
     val objectId = os.objectId
     committingComplete(os)
     release(os)
     if !succeeded then
-      logger.warn(s"Store $storeId: repair write of object $objectId failed. Its state is reloaded from the backend")
-      discard(objectId)
+      prior match
+        case Some(pre) =>
+          logger.warn(s"Store $storeId: repair write of object $objectId failed. Its pre-repair state is restored")
+          os.metadata = pre.metadata
+          os.data = pre.data
+          for kvs <- os.kvState; (min, max, left, right, entries) <- pre.kv do
+            kvs.min = min
+            kvs.max = max
+            kvs.left = left
+            kvs.right = right
+            kvs.content = entries.foldLeft(kvs.content): (content, entry) =>
+              entry match
+                case (key, Some(vs)) => content + (key -> vs)
+                case (key, None) => content - key
+        case None =>
+          logger.warn(s"Store $storeId: repair write of object $objectId failed. Its state is reloaded from the backend")
+          discard(objectId)
     val n = txCommitsInFlight.getOrElse(objectId, 1) - 1
     if n == 0 then
       txCommitsInFlight.remove(objectId)

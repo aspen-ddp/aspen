@@ -589,9 +589,9 @@ every prepare response, retransmits included: write amplification, not a safety 
 * `Tx.doCommit`: release the locks, then either apply nothing (an applied stub for T, or `notOwedHere`: T's changed
   objects reported in `objectCommitErrors`, so a non-late finalizer marks the store for repair) or `issueCommits`:
   `RequirementsApplyer.apply` re-checks the requirements with `applying = true`, skipping objects that already show T,
-  one backend commit per changed object, and `TxCommitted` when all complete. A live commit voter whose re-check fails,
-  or whose apply throws, fail-stops the store (`Frontend.failStop`, logged `INVARIANT VIOLATION`); a recovered one whose
-  re-check fails quarantines the object until repair verifies it (`Frontend.quarantine`). Objects whose earlier backend
+  one backend commit per changed object, and `TxCommitted` when all complete. A commit voter whose apply throws
+  fail-stops the store (`Frontend.failStop`); one, live or recovered, whose re-check fails on a changed object
+  quarantines the object until repair verifies it (`Frontend.quarantine`, transaction-requirements.md 8.5). Objects whose earlier backend
   commit failed, or that are quarantined, are not applied and are reported.
 * **Forgetting a committed T.** Where its CRL record would be deleted (after `TxFinalized` and its backend commits), it
   is replaced by an applied stub if an UnackedCommits entry may name this store: `TxFinalized` listed it in `owed`, or
@@ -1075,7 +1075,6 @@ transaction eventually resolves without operator action given a healthy quorum.
   state someone else produced, but only after an Unknown. Durable tasks enrolled by a larger transaction
   (`UpdateAllocationGroupUsageTask`, `FsifReleaseIndicesTask`, `MigratePoolToSetDurableTask`) mint a task id per attempt;
   their callers' own guards keep a retry from enrolling again.
-* **Committed apply over a commit voter's lock** fail-stops the whole store (Backlog.txt, item 5.8).
 
 ---
 

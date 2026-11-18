@@ -179,8 +179,9 @@ object SimpleCRL extends Logging:
                              ringForTest: Option[Vector[StreamId]]): Sizing =
     val file = streamsDir / SizingFile
     if os.exists(file) then
-      val recorded = Sizing.decode(os.read(file)).filter(_.numStreams >= 2).getOrElse:
-        throw CrlSizingMismatch(streamsDir, s"its $SizingFile file is unreadable")
+      val recorded = Sizing.decode(os.read(file)).filter(s => s.numStreams >= 3 && s.maxSizeInBytes % 4096 == 0)
+        .getOrElse:
+          throw CrlSizingMismatch(streamsDir, s"its $SizingFile file is unreadable")
       if recorded.numStreams != numStreams || recorded.maxSizeInBytes != maxSizeInBytes then
         logger.warn(s"The CRL in $streamsDir was created with ${recorded.numStreams} streams of " +
                     s"${recorded.maxSizeInBytes} bytes, not the $numStreams of $maxSizeInBytes configured. " +
@@ -189,8 +190,10 @@ object SimpleCRL extends Logging:
     else if streamFiles(streamsDir).nonEmpty then
       throw CrlSizingMismatch(streamsDir, s"it holds stream files but no $SizingFile file")
     else
-      // A rotation copies the next stream's live data into the one it recycles, which needs a second stream
-      require(numStreams >= 2, s"A CRL needs at least 2 streams, not $numStreams")
+      // The admission limit, (n − 2) · S/2 − S/16, needs a third stream (crash-recovery-log 6.1). The proof that every
+      // entry is written rests on whole 4 KiB pages: S and every entry are multiples of 4096 (S1)
+      require(numStreams >= 3, s"A CRL needs at least 3 streams, not $numStreams")
+      require(maxSizeInBytes % 4096 == 0, s"A CRL's stream size must be a multiple of 4096, not $maxSizeInBytes")
       val created = ringForTest match
         case None => Sizing.inOrder(numStreams, maxSizeInBytes, UUID.randomUUID())
         case Some(ring) =>
@@ -267,10 +270,14 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
 
   val numStreams: Int = files.size
 
-  /** Half a stream: when the ring recycles a stream, everything live is at most half a stream, so the copy-forward of
-    * the next stream's live data always fits. Stream.writeEntry's require stays as the backstop
-    */
-  override def admissionLimitBytes: Long = maxSizeInBytes / 2
+  /** The most an entry other than an evacuation may hold (crash-recovery-log 6.1, W1): a request that would push the
+    * newest unwritten entry past it seals that entry. A lone transaction, at most maxTransactionBytes, always fits */
+  val maxEntryBytes: Long = maxSizeInBytes / 2
+
+  /** `(n − 2) · S/2 − S/16` for `n` streams of `S` bytes (crash-recovery-log 6.1, "The limit"): with it, every
+    * evacuation fits an empty stream and every sealed entry is written within `n − 1` rotations, as long as the
+    * unoffset stubs outstanding stay within the `S/16` reserve's margin. Past that the CRL fails (W6) */
+  override def admissionLimitBytes: Long = (numStreams - 2) * maxSizeInBytes / 2 - maxSizeInBytes / 16
 
   /** Half a stream, less EntryOverheadReserve for the headers of the entry that holds it, so one transaction's entry
     * always fits in a stream. A larger one would kill the CRL at Stream.writeEntry's require (CRL-W2)
@@ -283,21 +290,51 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
   private val writer = StreamWriter(maxSizeInBytes, files, t => ioQueue.put(WriterDied(t)))
   private var currentStream: Int = r.activeStreamId.number
 
-  /** The serials of the entries holding every piece live records' newest static records name: its oldest is
-    * oldestEntryNeeded, which each entry stamps when its buffers are built (LogEntry.createEntryBuffers) */
+  /** The serials of the entries holding every piece of the image: its oldest is oldestEntryNeeded, which each entry
+    * stamps when its buffers are built (LogEntry.createEntryBuffers) */
   private val livePieces = new LivePieces
 
-  private var currentLogEntry: LogEntry = new LogEntry(r.initialPreviousEntryLocation,
-    r.initialNextEntrySerialNumber, livePieces)
+  /** The durable image (crash-recovery-log 6.1, W3): what evacuations carry */
+  private val image = new Image(livePieces)
+
+  /** The newest unwritten entry, not yet sealed: requests are added to it. `currentEntryNumber` counts the entries
+    * opened, so a record can tell whether its newest form is in this one (LiveTx.latestEntry) without holding on to
+    * an entry once it is written */
+  private var currentLogEntry: LogEntry = new LogEntry(image)
+  private var currentEntryNumber: Long = 0
+
+  /** Seals the newest entry: it queues behind the other sealed ones, and a new one takes requests */
+  private def seal(): Unit =
+    sealedEntries.enqueue(currentLogEntry)
+    currentLogEntry = new LogEntry(image)
+    currentEntryNumber += 1
+
+  /** Sealed entries, oldest first, written in order one at a time (W1). The head is the entry written next */
+  private val sealedEntries = scala.collection.mutable.Queue[LogEntry]()
+
+  /** The entry whose write is in flight, if any: unwritten, so its deletions are final for later saves (W1b) */
+  private var inFlight: Option[LogEntry] = None
+
+  /** The serial number and previous-entry link the next entry built takes */
+  private var nextSerial: Long = r.initialNextEntrySerialNumber
+  private var previousEntryLocation: StreamLocation = r.initialPreviousEntryLocation
+
+  /** Rotations since a head was last written (W6) */
+  private var rotationsWithoutHead: Int = 0
+
   private val streams: Array[Stream] = new Array[Stream](files.length)
 
-  private var transactions: HashMap[TxId, Tx] = new HashMap()
+  /** The live transactions as saved: readStoreState's view. A deleted one leaves at once, though the image keeps
+    * it until its deletion's entry is built */
+  private var transactions: HashMap[TxId, LiveTx] = new HashMap()
 
-  /** Applied stubs: entries apart from transactions, under the same ids (StoreRecoveryState) */
-  private var stubs: HashMap[TxId, Stub] = new HashMap()
+  /** Applied stubs, with their start timestamps: entries apart from transactions, under the same ids
+    * (StoreRecoveryState) */
+  private var stubs: HashMap[TxId, HLCTimestamp] = new HashMap()
 
   private var writeInProgress = false
-  /** Barriers queued while the current entry was empty and a write was in progress: they run once it completes */
+  /** Barriers and skipped saves queued while no unwritten entry but the one in flight held anything: they run once
+    * its write completes */
   private var afterInFlight: List[() => Unit] = Nil
 
   /** Shuts the writer down, releasing the lock once it has closed the stream files and before `completionHandler` */
@@ -313,25 +350,25 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
     else
       streams(tpl._1.number) = new Stream(tpl._1, crlId, writer, UUID.randomUUID(), 0)
 
-  // The open writes nothing (crash-recovery-log F16): each recovered record keeps the pieces its newest durable
-  // static record names, each pinned in livePieces by the verified entry holding it (Recovery.entryHolding), as if
-  // this instance had written them. So the first entry's oldestEntryNeeded is no newer than any of them: every entry
+  // The open writes nothing (crash-recovery-log F16): each recovered record's newest durable form is its last-built
+  // form, its pieces pinned in livePieces by the verified entry holding each (Recovery.entryHolding), as if this
+  // instance had written them. So the first entry's oldestEntryNeeded is no newer than any of them: every entry
   // recovery read them from is walked again. The last durable entry kept the ring's invariant (the stream after the
-  // active one holds nothing needed), so the next rotation's copy-forward finds and moves them as the instance before
+  // active one holds nothing needed), so the next rotation's evacuation finds and moves them as the instance before
   // the crash would have. A failed open shuts its writer down: the caller may open the same files again
   try
     r.txs.foreach: t =>
-      val tx = new Tx(t.id, t.state)
       require(t.updatePieces.size == t.state.objectUpdates.size)
-      tx.txdPiece = Some(t.txdPiece)
-      tx.updatePieces = t.updatePieces.map(Some(_))
-      tx.pieces.foreach(p => livePieces.add(p.serial))
-      transactions += (tx.id -> tx)
+      val built = BuiltTx(TxForm(t.state, keepUpdates = true), t.txdPiece +: t.updatePieces)
+      built.pieces.foreach(p => livePieces.add(p.serial))
+      image.txs += t.id -> built
+      val tx = new LiveTx(t.state)
+      tx.latest = built.form
+      transactions += (t.id -> tx)
     r.stubs.foreach: s =>
-      val stub = new Stub(s.id, s.start)
-      stub.anchor = Some(s.anchor)
       livePieces.add(s.anchor.serial)
-      stubs += (stub.id -> stub)
+      image.stubs += s.id -> BuiltStub(s.start, s.anchor)
+      stubs += (s.id -> s.start)
   catch case t: Throwable =>
     val closed = new CountDownLatch(1)
     shutdownWriter(() => closed.countDown())
@@ -339,7 +376,7 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
     throw t
 
   override val recoveredBytesByStore: Map[StoreId, Long] =
-    val byStore = transactions.valuesIterator.map(tx => tx.id.storeId -> CrlAdmission.recoveredBytes(tx.state)) ++
+    val byStore = transactions.iterator.map((id, tx) => id.storeId -> CrlAdmission.recoveredBytes(tx.state)) ++
       stubs.keysIterator.map(id => id.storeId -> CrlAdmission.AppliedStubBytes)
     byStore.toList.groupMapReduce(_._1)(_._2)(_ + _)
 
@@ -389,50 +426,101 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
   }
   ioThread.start()
 
-  def currentEntrySerialNumber: Long = currentLogEntry.entrySerialNumber
+  /** The serial number the next entry built takes */
+  def currentEntrySerialNumber: Long = nextSerial
 
   def currentStreamNumber: Int = currentStream
 
   /** As the next entry would stamp it if built now, its own pieces aside (they are no older) */
-  def oldestEntryNeeded: Long = livePieces.oldest.getOrElse(currentLogEntry.entrySerialNumber)
+  def oldestEntryNeeded: Long = livePieces.oldest.getOrElse(nextSerial)
+
+  /** Tests only, on the CRL thread (runOnCrlThread): how many sealed entries wait to be written */
+  private[simple] def sealedEntryCount: Int = sealedEntries.size
+
+  /** The newest unwritten entry holding anything, which handlers and barriers attach to: it is written after every
+    * request queued before them */
+  private def newestUnwritten: Option[LogEntry] =
+    if !currentLogEntry.isEmpty then Some(currentLogEntry) else sealedEntries.lastOption
+
+  /** The newest unwritten entry, sealed first if `size` (its size with the request added) would take it past
+    * maxEntryBytes. An empty entry takes any request: a lone record always fits a stream (maxTransactionBytes) */
+  private def entryFor(size: LogEntry => Long): LogEntry =
+    if !currentLogEntry.isEmpty && size(currentLogEntry) > maxEntryBytes then
+      seal()
+    currentLogEntry
+
+  /** Runs `handler` once every request queued before it is durable */
+  private def whenWritten(handler: () => Unit): Unit =
+    newestUnwritten match
+      case Some(entry) => entry.addCompletionHandler(handler)
+      case None if writeInProgress => afterInFlight = handler :: afterInFlight
+      case None => handler()
 
   private def startWrite(): Unit =
-    if !writeInProgress && !currentLogEntry.isEmpty then
-      writeCurrentLogEntry()
+    if !writeInProgress then
+      if sealedEntries.isEmpty && !currentLogEntry.isEmpty then
+        seal()
+      if sealedEntries.nonEmpty then
+        writeHead()
 
-  private def writeCurrentLogEntry(): Unit =
-    if !streams(currentStream).canWriteEntry(currentLogEntry) then
+  /** Writes the head in the active stream if it fits there. Otherwise rotates (W2): enters the successor at offset 0
+    * and first writes an evacuation entry carrying every record of the image lying in the stream after it, the next
+    * to be entered. The head waits for that write and tries again: beside the evacuation, or after another rotation */
+  private def writeHead(): Unit =
+    val head = sealedEntries.head
+    // Can never fit: only a lone record past maxTransactionBytes, which admission drops, is this large (CRL-W2)
+    require(head.entrySize <= maxSizeInBytes, s"CRL entry of ${head.entrySize} bytes is larger than a stream")
+    if streams(currentStream).canWriteEntry(head) then
+      sealedEntries.dequeue()
+      rotationsWithoutHead = 0
+      issue(head)
+    else
+      // W6: within the admission limit every head is written within n − 1 rotations (crash-recovery-log 6.1, Lemma
+      // B). More means its assumption broke; rotating on would only spin, with every deletion stuck behind the head
+      if rotationsWithoutHead >= numStreams - 1 then
+        throw IllegalStateException(s"CRL entry of ${head.entrySize} bytes not written after ${numStreams - 1} " +
+          s"rotations in a row (n − 1 for $numStreams streams): the live data exceeds what the ring holds, the " +
+          s"bound of crash-recovery-log 6.1")
+      rotationsWithoutHead += 1
       currentStream = sizing.successor(StreamId(currentStream)).number
 
-      // The stream recycled now holds nothing needed: the previous rotation copied its live pieces forward. This
-      // entry copies forward the live pieces of the next stream to be recycled, so a torn write here, or there at the
-      // next rotation, overwrites only entries no recovery needs. Only the pieces in those streams move; a record's
-      // others stay where they are, in streams written after the next one to be recycled, and its static record is
-      // rewritten here naming both. Once this entry is built no live piece is in the next stream, so its stamped
-      // oldestEntryNeeded never points there. Until it is durable the entry before it, stamped while the moved pieces
-      // were pinned, is the one a recovery starts from
-      val recycled = StreamId(currentStream)
-      val nextToRecycle = sizing.successor(recycled)
+      // The stream entered now holds nothing of the image: the previous rotation evacuated it. This rotation's
+      // evacuation carries the image's records lying in the next stream to be entered, so a torn write here, or there
+      // at the next rotation, overwrites only entries no recovery needs. Only the pieces in those streams move; a
+      // record's others stay where they are, in streams written after the next one to be entered, and its static
+      // record is rewritten here naming both. Once this entry is built no piece of the image is in the next stream,
+      // so its stamped oldestEntryNeeded never points there. Until it is durable the entry before it, stamped while
+      // the moved pieces were pinned, is the one a recovery starts from
+      val entered = StreamId(currentStream)
+      val nextToEnter = sizing.successor(entered)
       streams(currentStream).recycleStream()
-      def copyForward(record: Record)(add: => Unit): Unit =
-        val inRecycled = record.piecesIn(recycled)
-        val inNext = record.piecesIn(nextToRecycle)
-        if inRecycled then
-          logger.error(s"CRL entry ${record.id} still had data in recycled stream $recycled. Copying it forward")
-        if inRecycled || inNext then
-          record.unlocate(recycled)
-          record.unlocate(nextToRecycle)
-          add
-      transactions.valuesIterator.foreach(tx => copyForward(tx)(currentLogEntry.addTx(tx, () => ())))
-      stubs.valuesIterator.foreach(stub => copyForward(stub)(currentLogEntry.addStub(stub, () => ())))
+      val moved = Set(entered, nextToEnter)
+      val evacuation = new LogEntry(image)
+      def lyingIn(id: TxId, pieces: Iterable[Piece]): Boolean =
+        if pieces.exists(_.location.streamId == entered) then
+          logger.error(s"CRL entry $id still had data in entered stream $entered. Evacuating it")
+        pieces.exists(p => moved.contains(p.location.streamId))
+      image.txs.foreach: (id, built) =>
+        if lyingIn(id, built.pieces) then
+          evacuation.addTx(id, TxEvacuation(built, moved), () => ())
+      image.stubs.foreach: (id, built) =>
+        if lyingIn(id, List(built.anchor)) then
+          evacuation.addStub(id, built.start, () => ())
+      if evacuation.isEmpty then
+        writeHead()
+      else
+        // An evacuation is no larger than what the stream it empties held (crash-recovery-log 6.1, Lemma A)
+        issue(evacuation)
 
+  private def issue(entry: LogEntry): Unit =
     writeInProgress = true
-    logger.trace(s"CRL beginning write for entry ${currentLogEntry.entrySerialNumber}")
-    val location = streams(currentStream).writeEntry(currentLogEntry, () => {
-      ioQueue.put(WriteComplete(currentLogEntry.entrySerialNumber))
+    inFlight = Some(entry)
+    val serial = nextSerial
+    logger.trace(s"CRL beginning write for entry $serial")
+    previousEntryLocation = streams(currentStream).writeEntry(entry, serial, previousEntryLocation, () => {
+      ioQueue.put(WriteComplete(serial))
     })
-    val nextEntrySerialNumber = currentLogEntry.entrySerialNumber+1
-    currentLogEntry = new LogEntry(location, nextEntrySerialNumber, livePieces)
+    nextSerial += 1
 
   private def crlThread(): Unit =
     while true do
@@ -464,20 +552,16 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
           logger.trace(s"CRL write complete for entry serial number: ${serialNumber}")
 
           writeInProgress = false
+          inFlight = None
           val barriers = afterInFlight.reverse
           afterInFlight = Nil
           barriers.foreach(_())
           startWrite()
 
         case Barrier(handler) =>
-          // Every earlier request is in the current entry, in the entry being written, or already durable
-          if !currentLogEntry.isEmpty then
-            currentLogEntry.addCompletionHandler(handler)
-            startWrite()
-          else if writeInProgress then
-            afterInFlight = handler :: afterInFlight
-          else
-            handler()
+          // Every earlier request is in an unwritten entry, in the entry being written, or already durable
+          whenWritten(handler)
+          startWrite()
 
         case GetRecoveryState(storeId, completion) =>
           onGetRecoveryState(storeId, completion)
@@ -491,9 +575,9 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
           shutdownWriter(completionHandler)
           return
 
-  /** All in the current entry, with the handler, before its write starts: the handler then runs once every deletion is
-    * durable. `resavable` deletions are cancelled by a save of the same id later in the entry
-    * (LogEntry.deleteTxUnlessResaved) */
+  /** Each id's deletions go to the newest unwritten entry, which is sealed when they would overflow it (W1), and the
+    * handler to the last: it runs once every deletion is durable. `resavable` deletions are cancelled by a save of the
+    * same id later in their entry (LogEntry.deleteTxUnlessResaved) */
   private def onDeleteTransactions(storeId: StoreId, transactionIds: List[TransactionId], resavable: Boolean,
                                    completionHandler: () => Unit): Unit =
     if transactionIds.isEmpty then
@@ -501,14 +585,13 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
     else
       transactionIds.foreach: transactionId =>
         val txid = TxId(storeId, transactionId)
+        val entry = entryFor(_.entrySizeWith(2 * TxId.StaticSize))
         if resavable then
-          currentLogEntry.deleteTxUnlessResaved(txid)
+          entry.deleteTxUnlessResaved(txid)
         else
-          currentLogEntry.deleteTx(txid)
-        transactions.get(txid).foreach(_.forget(livePieces))
+          entry.deleteTx(txid)
         transactions -= txid
-        currentLogEntry.deleteStub(txid)
-        stubs.get(txid).foreach(_.forget(livePieces))
+        entry.deleteStub(txid)
         stubs -= txid
       currentLogEntry.addCompletionHandler(completionHandler)
       startWrite()
@@ -518,71 +601,93 @@ class SimpleCRL private (sizing: SimpleCRL.Sizing,
                                  completion: StoreRecoveryState => Unit
                                 ): Unit =
     completion(StoreRecoveryState(
-      transactions.valuesIterator.filter(_.id.storeId == storeId).map(_.state).toList,
-      stubs.valuesIterator.filter(_.id.storeId == storeId).map(s => s.id.transactionId -> s.start).toMap))
+      transactions.valuesIterator.filter(_.state.storeId == storeId).map(_.state).toList,
+      stubs.iterator.filter(_._1.storeId == storeId).map((id, start) => id.transactionId -> start).toMap))
 
   /** Replaces the transaction state held for the id, if any, in the same entry: its deletion and the stub are durable
-    * together */
+    * together (W1) */
   private def onSaveAppliedStub(storeId: StoreId, transactionId: TransactionId, start: HLCTimestamp,
                                 completionHandler: () => Unit): Unit =
     val txid = TxId(storeId, transactionId)
-    transactions.get(txid).foreach: tx =>
-      tx.forget(livePieces)
+    val replaces = transactions.contains(txid)
+    val entry = entryFor(_.entrySizeWith(Stub.StaticSize + (if replaces then TxId.StaticSize else 0)))
+    if replaces then
       transactions -= txid
-      currentLogEntry.deleteTxUnlessResaved(txid)
-    val stub = stubs.get(txid) match
-      case Some(stub) => stub
-      case None =>
-        val stub = new Stub(txid, start)
-        stubs += (txid -> stub)
-        stub
-    currentLogEntry.addStub(stub, completionHandler)
+      entry.deleteTxUnlessResaved(txid)
+    val held = stubs.getOrElse(txid, start)
+    stubs += (txid -> held)
+    entry.addStub(txid, held, completionHandler)
     startWrite()
 
   private def onDeleteAppliedStub(storeId: StoreId, transactionId: TransactionId): Unit =
     val txid = TxId(storeId, transactionId)
-    stubs.get(txid).foreach: stub =>
-      stub.forget(livePieces)
+    if stubs.contains(txid) then
       stubs -= txid
-      currentLogEntry.deleteStub(txid)
+      entryFor(_.entrySizeWith(TxId.StaticSize)).deleteStub(txid)
       startWrite()
+
+  /** Whether an unwritten entry, the one in flight included, deletes `txid` finally (W1b). The save is then skipped,
+    * creating no record, and `completionHandler` runs once that deletion is durable */
+  private def skippedAfterFinalDeletion(txid: TxId, completionHandler: () => Unit): Boolean =
+    if currentLogEntry.deletesFinally(txid) || sealedEntries.exists(_.deletesFinally(txid)) then
+      whenWritten(completionHandler)
+      true
+    else if inFlight.exists(_.deletesFinally(txid)) then
+      afterInFlight = completionHandler :: afterInFlight
+      true
+    else
+      false
 
   private def onSaveTransaction(transactionId: TransactionId,
                       state: TransactionRecoveryState,
                       completionHandler: () => Unit): Unit =
     val txid = TxId(state.storeId, transactionId)
-    // Deleted earlier in this unwritten entry: the save is skipped but still reports success once the deletion is
-    // durable (LogEntry.addTx). No record is created for it: one that is never written would pin oldestEntryNeeded
-    // until the ring wraps over it, and be reported live by readStoreState (crash-recovery-log F4). Every deletion
-    // removes the id from `transactions` too, so no record exists here
-    if currentLogEntry.deletesFinally(txid) then
-      currentLogEntry.addCompletionHandler(completionHandler)
+    // Deleted in an unwritten entry: the save is skipped but still reports success once the deletion is durable. No
+    // record is created for it: one that is never written would pin oldestEntryNeeded until the ring wraps over it,
+    // and be reported live by readStoreState (crash-recovery-log F4, W1b). Every deletion removes the id from
+    // `transactions` too, so no record exists here
+    if skippedAfterFinalDeletion(txid, completionHandler) then
       startWrite()
       return
-    val tx = transactions.get(txid) match
-      case Some(tx) => tx
-      case None =>
-        val tx = new Tx(txid, state)
-        transactions += (tx.id -> tx)
-        tx
+    val existing = transactions.get(txid)
+    val form = TxForm(state, keepUpdates = existing.forall(_.keepObjectUpdates))
 
-    // A Tx started by a driver's data-less prepare saves again once a client's prepare supplies the data. A changed
-    // update count forgets the update pieces (Tx.state_=), which stay pinned until this entry is built
+    // The entry takes this form as of now (W1a). It writes the pieces when the record has none yet, when the form it
+    // replaces in the same entry was to write them, or when the update count changes (W4: the txd too, so every
+    // record's pieces lie in one entry). Otherwise it names those an earlier entry wrote or will write
+    def saveInCurrent(): TxSave = existing match
+      case None => TxSave(form, writesPieces = true)
+      case Some(tx) =>
+        val inherits = tx.latestEntry == currentEntryNumber && tx.latestWritesPieces
+        val countChanged = form.keepUpdates && form.updateCount != tx.latest.updateCount
+        TxSave(form, inherits || countChanged)
+
+    val entry = entryFor(_.entrySizeWith(txid, saveInCurrent()))
+    val save = saveInCurrent()
+
+    val tx = existing.getOrElse:
+      val tx = new LiveTx(state)
+      transactions += (txid -> tx)
+      tx
     tx.state = state
+    tx.latest = form
+    tx.latestWritesPieces = save.writesPieces
+    tx.latestEntry = currentEntryNumber
 
-    logger.trace(s"CRL adding transaction ${tx.id} to log entry ${currentLogEntry.entrySerialNumber}")
-    currentLogEntry.addTx(tx, completionHandler)
+    logger.trace(s"CRL adding transaction $txid to the newest unwritten entry")
+    entry.addTx(txid, save, completionHandler)
     startWrite()
 
   private def onDeleteTransaction(storeId: StoreId, transactionid: TransactionId): Unit =
     val txid = TxId(storeId, transactionid)
-    currentLogEntry.deleteTx(txid)
-    transactions.get(txid).foreach(_.forget(livePieces))
+    entryFor(_.entrySizeWith(TxId.StaticSize)).deleteTx(txid)
     transactions -= txid
     startWrite()
 
+  /** Writes nothing: forms taken from now on leave the data out. Forms already taken keep it, and so does the
+    * last-built form, which an evacuation carries, until the record's next form is built (W1a, W5) */
   private def onDropTransactionObjectData(storeId: StoreId, transactionid: TransactionId): Unit =
-    transactions.get(TxId(storeId, transactionid)).foreach(_.dropTransactionObjectData())
+    transactions.get(TxId(storeId, transactionid)).foreach(_.keepObjectUpdates = false)
 
   def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = blockingRead(storeId).transactions
 

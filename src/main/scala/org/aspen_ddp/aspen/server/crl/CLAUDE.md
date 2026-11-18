@@ -8,13 +8,29 @@
 - Takes advantage of the fact that Transactions are typically very short-lived so their state usually does not need to
   be retained for long
 - Implemented as a series of fixed-size, write-only files that are continually recycled.
-- Functions similar to a circular buffer. Invariant: the stream after the active one holds no needed entry. A rotation
-  recycles that stream and copies forward, into its first entry, the live pieces of the stream after it (the next to
-  be recycled), so a torn rotation write only ever overwrites entries no recovery needs. A record's pieces (a Tx's txd
-  and each object update, a stub's anchor: `simple.Piece`, a location and the serial of the entry holding it) are
-  located one by one: a rotation moves only those in the evacuated streams (`Record.piecesIn`/`unlocate`) and rewrites
-  the record's static record naming the moved and unmoved ones. `SimpleCRL.apply` creates no
-  CRL of fewer than 2 streams (a recorded sizing of fewer is unreadable); device configs ask for at least 4.
+- Functions similar to a circular buffer. Invariant: the stream after the active one holds no needed entry. The
+  rules below are proven in safety `crash-recovery-log.md` 6.1 (W1-W6, S1); keep them when changing SimpleCRL:
+  - Bounded entries (W1): a request that would push the newest unwritten entry past `maxEntryBytes` (S/2) seals it;
+    sealed entries queue (`sealedEntries`) and are written in order, one write in flight. Deletions of one request may
+    span entries, handler on the last; a stub and the deletion it makes share one. Handlers and barriers go to the
+    newest unwritten entry (`whenWritten`). Serial, previous link and offset are given at the build
+  - Frozen entries (W1a): an entry holds each save's `TxForm` (immutable state + keep-data flag) taken when the save
+    was added, with whether it writes the pieces (`TxSave.writesPieces`) or names those an earlier entry wrote. A later
+    save never changes an earlier entry. Never build an entry from a record's current state
+  - The durable image (W3, `simple.Image`): each record's last-built form (`BuiltTx`, `BuiltStub`) and its pieces
+    (`simple.Piece`: location + serial of the entry holding it), changed only by an entry's build
+    (`LogEntry.createEntryBuffers`). It is kept apart from the live records (`transactions` of `LiveTx`, `stubs`),
+    which `readStoreState` reads and a deletion leaves at once: a deleted record stays in the image, pinned and
+    evacuated, until its deletion's entry is built
+  - One home per record (W4): an update-count change writes the txd again too, so a record's pieces lie in one entry
+  - Evacuation first (W2, W5): when the head does not fit, the writer enters the successor at offset 0 and first
+    writes an evacuation entry (`TxEvacuation`) carrying, in their last-built forms, the image's records with pieces in
+    the stream after it; then the head, beside it or after another rotation (`SimpleCRL.writeHead`). An evacuation
+    writes no pending state, piece or deletion, and always fits (Lemma A)
+  - Fail-stop (W6): a head not written after `n − 1` rotations in a row throws on the CRL thread (the CRL fails);
+    a head larger than a stream fails it at once
+  - `SimpleCRL.apply` creates no CRL of fewer than 3 streams or a stream size not a multiple of 4096 (S1; a recorded
+    sizing like that is unreadable); device configs ask for at least 4.
   "After" is the ring order recorded in `crl/sizing` (`Sizing.ring`, `ring: 0,2,1`; `Sizing.successor`), not numeric
   order: rotation and `Recovery`'s newer-intact-entry check of the next stream both follow it. Stream files are
   `<n>.crl` for `n` in `0 until ringSize`; a growth will insert the next number after the active stream, and its
@@ -42,18 +58,18 @@
   the walk verified. All-zero regions are not entries. Every header bears the CRL id from `crl/sizing`, and
   `StreamReader.readHeader` takes no other header for an entry: the old-cycle object data that the newer-entry scan
   probes at 4 KiB boundaries can never pass for an entry, whether crafted or an image of another CRL
-- `oldestEntryNeeded` is the oldest serial in `simple.LivePieces`, a counted index of the entries holding every piece
-  a live record's newest static record names (recovery reads pieces only from entries its walk verified). A piece's
-  serial is added when the entry writing it builds its buffers (`LogEntry.createEntryBuffers`, which also stamps the
-  entry's `oldestEntryNeeded`), and removed when the entry holding the record's next static record is built (the piece
-  was relocated or its data dropped: `Record.unpinReleased`) or the record is deleted (`Record.forget`). Removing it
-  only at that build is what keeps a torn entry safe: the entry before it was stamped while the piece was pinned. A
-  deleted record's save still in the unwritten entry is taken out of it (`LogEntry.deleteTx`), so it is never pinned
+- `oldestEntryNeeded` is the oldest serial in `simple.LivePieces`, a counted index of the entries holding the pieces
+  of the image (recovery reads pieces only from entries its walk verified). At an entry's build its new pieces are
+  added, the pieces its forms supersede (relocated, old count, dropped) and its deleted records' pieces are removed,
+  and then it stamps `oldestEntryNeeded`. Removing them only at that build is what keeps a torn entry safe: the entry
+  before it was stamped while they were pinned. A deleted record's save in the same unwritten entry is taken out of it
+  (`LogEntry.deleteTx`), so it is never pinned
 - A failed open shuts its writer down before throwing, so a retry never runs two writers over the same files
 - An open writes nothing (safety F16): recovery returns each live record with the pieces its newest static record
   names, each with the serial of the verified entry holding it (`Recovery.entryHolding`; a stub: its anchor in the
   newest entry holding it, `Recovery.RecoveredTx`/`RecoveredStub`), and the constructor pins them in `LivePieces` as
-  if it had written them. The next rotation copies them forward from there. Do not reintroduce an open-time re-save
+  if it had written them (they are the image's last-built forms). The next rotations evacuate them from there. Do not
+  reintroduce an open-time re-save
 - An open CRL holds an exclusive lock on `crl/lock` (`simple/CrlLock`), from before its files are read until its writer
   has closed them; a second opener, in this process or another, gets `CrlLocked` and touches nothing. Never open
   the lock file elsewhere: closing any descriptor of it drops the process's POSIX lock, which is why in-process
@@ -78,27 +94,28 @@
   every pending and later Future fails with `CrlFailed` (`SimpleCRL.tracked`), `failed` completes and
   `onThreadDeath` runs once. Save completions never run, so no vote follows. The host unloads the device until it
   restarts (`DeviceShutdown.crlFailed`, `server/host/CLAUDE.md`), and the restart recovers the files as after a crash
-- `admissionLimitBytes` (SimpleCRL: half a stream, so a recycled stream's live copy-forward always fits) sizes the
+- `admissionLimitBytes` (SimpleCRL: `(n − 2) · S/2 − S/16` for `n` streams of `S` bytes, 15S/16 at 4 streams: with
+  it every evacuation fits and every head is written within `n − 1` rotations, safety 6.1) sizes the
   device's `CrlAdmission`, which drops prepares for unseen transactions past it. Lanes (`AdmissionTier`, the store's
   pool's, persisted in its StoreConfig): data stores admit below 3/4 of it, metadata stores below 7/8, bootstrap
   stores up to it, so the marker batches each tier's finalization needs keep headroom (safety X5, G10). `Stream.writeEntry`'s `require` stays
   the fail-stop backstop. The admission counts everything the CRL holds from the device's open
   (`recoveredBytesByStore`, `CrlAdmission.recoveredBytes`), retained per store until the store loads and counts its
-  own, or its entries leave the CRL: records of stores that do not load are copied forward too (safety F8)
+  own, or its entries leave the CRL: records of stores that do not load are evacuated too (safety F8)
 - `maxTransactionBytes` (SimpleCRL: half a stream less `EntryOverheadReserve`, 8 KiB; trait default unlimited): the
   most bytes, as `CrlAdmission` counts them, one store's transaction may hold. `Frontend.admitPrepare` drops a prepare
   past it unsaved (`PrepareAdmission.Oversized`, `server/store/CLAUDE.md`), so no entry outgrows a stream and trips
   `Stream.writeEntry`'s `require`, which would kill the CRL (CRL-W2)
-- Deletions are final within an entry: a save of an id the unwritten entry already deletes is skipped, and its
-  handler runs once the deletion is durable. It creates no live record (`LogEntry.deletesFinally`): an unwritten one
-  would pin `oldestEntryNeeded` until recovery broke on the wrap. The exceptions are deletions a stub's save or a
-  `dropStore` made, which a later save cancels
-- `dropTransactionObjectData` writes nothing: it only flags the in-memory record, so the next rewrite of the record
-  (a save, a copy-forward) leaves the data out. The dropped update pieces stay located and pinned until that rewrite's
-  entry is built (the last durable static record still names them), and a rotation evacuating their stream rewrites
-  the record for them. Until then a restart, and `readStoreState`, still return the data. A
-  store that needs the data durably gone saves the state without it (`Tx.persistWithoutUpdateOf`); a save's update
-  count change forgets the record's update pieces (`Tx.state_=`), keeping its txd piece (transaction-recovery R-N13)
+- Deletions are final across every unwritten entry, the one in flight included (W1b): a save of an id any of them
+  deletes is skipped, and its handler runs once the deletion is durable. It creates no live record
+  (`LogEntry.deletesFinally`, `SimpleCRL.skippedAfterFinalDeletion`): an unwritten one would pin `oldestEntryNeeded`
+  until recovery broke on the wrap, and save a state whose admission was released. The exceptions are deletions a
+  stub's save or a `dropStore` made, which a later save in the same entry cancels
+- `dropTransactionObjectData` writes nothing: it only flags the live record, so saves made after it leave the data
+  out. Saves already queued keep it (their forms are frozen), and so does the last-built form: an evacuation carries
+  the dropped data, pinned, until a later save's entry is built. Until then a restart, and `readStoreState`, still
+  return the data. A store that needs the data durably gone saves the state without it (`Tx.persistWithoutUpdateOf`);
+  a save's update count change writes every piece again, the txd included (W4; transaction-recovery R-N13)
 - `whenDurable(storeId, handler)` (`Barrier`): runs the handler once every request queued before it is durable: on
   the current entry if it holds anything, after the write in flight if the current entry is empty
   (`afterInFlight`), else at once. It orders a write outside the CRL (a backend deletion) after a deletion, which has
@@ -107,7 +124,7 @@
 - Applied stubs (`StoreRecoveryState`, `saveAppliedStub`/`deleteAppliedStub`): a (store, txid) entry meaning the store
   holds that transaction's update, with the transaction's start timestamp (`Stub.StaticSize`: TxId + 8 B), by which the
   store expires it (`Frontend.expireStubs`). A namespace apart from transaction state (own header counts and deletion
-  list in each `LogEntry`), copied forward like a transaction (`Stub.anchor`); a stub's save replaces the transaction's
+  list in each `LogEntry`), evacuated like a transaction (`BuiltStub.anchor`); a stub's save replaces the transaction's
   state in the same entry. `readStoreState`, `crl_save.log`, `loadStore`, `deleteTransactions` and `dropStore` carry
   both. Charged to CrlAdmission without a check (`AppliedStubBytes`, 41), by the Frontend: never refused, but counted,
   and released when the store expires the stub

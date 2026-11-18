@@ -21,8 +21,8 @@ class Stream(val streamId: StreamId,
     nextWriteOffset + entry.entrySize <= streamWriter.maxSizeInBytes
 
 
-  // Writes entry to the stream and returns its location
-  def writeEntry(entry: LogEntry, onWriteComplete: () => Unit): StreamLocation =
+  /** Writes `entry` to the stream as entry `serial`, linking to `previous`, and returns its location */
+  def writeEntry(entry: LogEntry, serial: Long, previous: StreamLocation, onWriteComplete: () => Unit): StreamLocation =
     if !canWriteEntry(entry) then
       logger.error(s"FAILED TO WRITE CRL LOG ENTRY. Max Size ${streamWriter.maxSizeInBytes}. Offset $nextWriteOffset. Entry Size: ${entry.entrySize}")
 
@@ -31,7 +31,7 @@ class Stream(val streamId: StreamId,
     val entryLocation = StreamLocation(streamId, nextWriteOffset, entry.entrySize.toInt)
     val entrySize = entry.entrySize
 
-    val buffers = entry.createEntryBuffers(nextWriteOffset, crlId, currentUUID, streamId)
+    val buffers = entry.createEntryBuffers(serial, previous, nextWriteOffset, crlId, currentUUID, streamId)
 
     streamWriter.write(streamId, nextWriteOffset, buffers, () =>
       entry.runCompletionHandlers()

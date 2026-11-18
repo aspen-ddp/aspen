@@ -287,6 +287,7 @@ class SimpleCRLSuite extends FileBasedTests {
     queue.take()
     assert(i.crl.currentStreamNumber == 1)
 
+    // The rotation into stream 2 writes its evacuation of stream 0 (the first transaction's pieces) before the save
     i.crl.save(transactionId2, trsValidTxd, completionHandler)
     queue.take()
     assert(i.crl.currentStreamNumber == 2)
@@ -295,14 +296,19 @@ class SimpleCRLSuite extends FileBasedTests {
     queue.take()
     assert(i.crl.currentStreamNumber == 2)
 
+    // Stream 2 holds the evacuation and two saves: this one rotates into stream 0
     i.crl.save(transactionId2, trsValidTxd, completionHandler)
     queue.take()
-    assert(i.crl.currentStreamNumber == 2)
+    assert(i.crl.currentStreamNumber == 0)
 
     i.crl.save(transactionId2, trsValidTxd, completionHandler)
     i.crl.deleteTransaction(storeId, transactionId2)
     queue.take()
-    assert(i.crl.currentStreamNumber == 0)
+    // The deletion is in the entry after the save's: stream 0 (the evacuation and two saves) has no room for it, so it
+    // rotates into stream 1. Waited for, since it is written only once the save's write completes
+    i.crl.whenDurable(storeId, () => queue.put("deleted"))
+    assert(queue.take() == "deleted")
+    assert(i.crl.currentStreamNumber == 1)
 
     // The save's completion handler can fire before the delete has been written, and shutdown
     // does not flush an unwritten entry. Requests are processed in order, so a save that completes
@@ -460,23 +466,21 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val streamWriter = newWriter(4096 * 1000, 1)
 
-    val tx = Tx(txid, trs)
-
-    // One index for both entries, as SimpleCRL keeps: the second entry's oldestEntryNeeded is the first, which holds
-    // the transaction's pieces
-    val live = new LivePieces
-    val le = LogEntry(StreamLocation.Null, 0, live)
+    // One image for both entries, as SimpleCRL keeps: the second entry names the pieces the first wrote, so its
+    // oldestEntryNeeded is the first
+    val image = new Image(new LivePieces)
+    val le = LogEntry(image)
     val stream = new Stream(stream0, crlId, streamWriter, UUID.randomUUID(), 0)
 
-    le.addTx(tx, completionHandler)
+    le.addTx(txid, TxSave(TxForm(trs, keepUpdates = true), writesPieces = true), completionHandler)
 
-    val entry1Location = stream.writeEntry(le, () => ())
+    val entry1Location = stream.writeEntry(le, 0, StreamLocation.Null, () => ())
 
-    val le2 = LogEntry(entry1Location, 1, live)
+    val le2 = LogEntry(image)
 
-    le2.addTx(tx, completionHandler)
+    le2.addTx(txid, TxSave(TxForm(trs, keepUpdates = true), writesPieces = false), completionHandler)
 
-    val entry2Location = stream.writeEntry(le2, () => ())
+    val entry2Location = stream.writeEntry(le2, 1, entry1Location, () => ())
 
     // Both entries durable, and the writer stopped, before recovery reads the stream: one take left the second
     // entry's write in flight while recovery read it
@@ -504,13 +508,12 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val streamWriter = newWriter(4096*1000, 1)
 
-    val tx = Tx(txid, trs)
-    val le = LogEntry(StreamLocation.Null, 0, new LivePieces)
+    val le = LogEntry(new Image(new LivePieces))
     val stream = new Stream(stream0, crlId, streamWriter, UUID.randomUUID(), 0)
 
-    le.addTx(tx, completionHandler)
+    le.addTx(txid, TxSave(TxForm(trs, keepUpdates = true), writesPieces = true), completionHandler)
 
-    val entryLocation = stream.writeEntry(le, () => ())
+    val entryLocation = stream.writeEntry(le, 0, StreamLocation.Null, () => ())
 
     assert(entryLocation.streamId == stream0)
     assert(entryLocation.offset == 0)
@@ -539,15 +542,14 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("Tx Static Save & Load with ObjectUpdate data") {
-    val tx = Tx(txid, trs.copy(status = TransactionStatus.Committed))
-    tx.txdPiece = Some(Piece(txdLoc, 0))
-    tx.updatePieces = Vector(Some(Piece(ou1Loc, 0)), Some(Piece(ou2Loc, 0)))
+    val form = TxForm(trs.copy(status = TransactionStatus.Committed), keepUpdates = true)
+    val pieces = Vector(Piece(txdLoc, 0), Piece(ou1Loc, 0), Piece(ou2Loc, 0))
 
     val buffer = new Array[Byte](4096 * 5)
 
-    assert(tx.dynamicDataSize == 0)
+    assert(TxSave(form, writesPieces = false).dynamicDataSize == 0)
 
-    tx.writeStaticEntry(ByteBuffer.wrap(buffer))
+    Tx.writeStatic(ByteBuffer.wrap(buffer), txid, form, pieces)
 
     val ltx = Tx.loadTx(ByteBuffer.wrap(buffer))
 
@@ -560,14 +562,13 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("Tx Static Save & Load without ObjectUpdate data") {
-    val tx = Tx(txid, trs, keepObjectUpdates = false)
-    tx.txdPiece = Some(Piece(txdLoc, 0))
+    val form = TxForm(trs, keepUpdates = false)
 
     val buffer = new Array[Byte](4096 * 5)
 
-    assert(tx.dynamicDataSize == 0)
+    assert(TxSave(form, writesPieces = false).dynamicDataSize == 0)
 
-    tx.writeStaticEntry(ByteBuffer.wrap(buffer))
+    Tx.writeStatic(ByteBuffer.wrap(buffer), txid, form, Vector(Piece(txdLoc, 0)))
 
     val ltx = Tx.loadTx(ByteBuffer.wrap(buffer))
 
@@ -753,7 +754,7 @@ class SimpleCRLSuite extends FileBasedTests {
     for (n, size) <- List((2, 1024L * 1024), (4, 1024L * 1024), (3, 2L * 1024 * 1024)) do
       val i2 = SimpleCRL(tdir, n, size)
       assert(i2.trsList.map(_.storeId) == List(storeId))
-      assert(i2.crl.admissionLimitBytes == 1024 * 1024 / 2)
+      assert(i2.crl.admissionLimitBytes == 1024 * 1024 * 7 / 16)
       i2.crl.shutdown()
     assert(os.list(tdir).filter(_.ext == "crl").map(_.last).toSet == Set("0.crl", "1.crl", "2.crl"))
   }
@@ -761,7 +762,7 @@ class SimpleCRLSuite extends FileBasedTests {
   test("A sizing file without stream files is a CRL whose creation crashed: it is created with that sizing") {
     os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing.inOrder(4, 1024 * 1024, UUID.randomUUID()).encode)
     val i = SimpleCRL(tdir, 3, 2 * 1024 * 1024)
-    assert(i.crl.admissionLimitBytes == 1024 * 1024 / 2)
+    assert(i.crl.admissionLimitBytes == 1024 * 1024 * 15 / 16)
     i.crl.shutdown()
     assert(os.list(tdir).filter(_.ext == "crl").size == 4)
   }
@@ -1239,17 +1240,18 @@ class SimpleCRLSuite extends FileBasedTests {
     queue.take()
     assert(i.crl.currentStreamNumber == 2)
 
-    // Fill stream 2 (3 entries)
-    for _ <- 1 to 2 do
+    // Entering stream 2 evacuated stream 0 first: both transactions' pieces, in an entry of their own at its head
+    val evacuation = headerAt(tdir / "2.crl", 0)
+    assert(evacuation.numTransactions == 2)
+    assert(evacuation.numDeletedTransactions == 0)
+    assert(evacuation.dynamicDataSize ==
+      trsValidTxd.serializedTxd.size + trsValidTxd.objectUpdates.map(_.data.size).sum +
+      trsValidTxd2.serializedTxd.size + trsValidTxd2.objectUpdates.map(_.data.size).sum)
+
+    // Wrap to stream 0, whose rotation evacuates stream 1: it holds neither
+    while i.crl.currentStreamNumber != 0 do
       i.crl.save(transactionId, trsValidTxd, completionHandler)
       queue.take()
-    assert(i.crl.currentStreamNumber == 2)
-
-    // Wrap to stream 0: triggers recycling, copying forward both tx1 and tx2
-    // (both had dynamic data in stream 0)
-    i.crl.save(transactionId, trsValidTxd, completionHandler)
-    queue.take()
-    assert(i.crl.currentStreamNumber == 0)
 
     i.crl.shutdown()
 
@@ -1501,15 +1503,12 @@ class SimpleCRLSuite extends FileBasedTests {
     val streamWriter = newWriter(4096 * 1000, 1)
     val stream = new Stream(stream0, crlId, streamWriter, UUID.randomUUID(), 0)
 
-    val tx1 = Tx(txid, trs)
-    val tx2 = Tx(txid2, trs2)
-
-    val le = LogEntry(StreamLocation.Null, 0, new LivePieces)
-    le.addTx(tx1, () => ())
-    le.addTx(tx2, () => ())
+    val le = LogEntry(new Image(new LivePieces))
+    le.addTx(txid, TxSave(TxForm(trs, keepUpdates = true), writesPieces = true), () => ())
+    le.addTx(txid2, TxSave(TxForm(trs2, keepUpdates = true), writesPieces = true), () => ())
     le.deleteTx(txid)
 
-    stream.writeEntry(le, () => queue.put(""))
+    stream.writeEntry(le, 0, StreamLocation.Null, () => queue.put(""))
     queue.take()
     streamWriter.shutdown()
 
@@ -1611,10 +1610,10 @@ class SimpleCRLSuite extends FileBasedTests {
   /** The bytes of a well-formed entry holding B, with serial number `serial`, as CRL `id` writes it under
     * `streamUUID` */
   private def entryImage(serial: Long, streamUUID: UUID, id: UUID): Array[Byte] =
-    val le = LogEntry(StreamLocation.Null, serial, new LivePieces)
-    le.addTx(Tx(txid2, trs2), () => ())
+    val le = LogEntry(new Image(new LivePieces))
+    le.addTx(txid2, TxSave(TxForm(trs2, keepUpdates = true), writesPieces = true), () => ())
     val out = new java.io.ByteArrayOutputStream()
-    le.createEntryBuffers(0, id, streamUUID, stream0).foreach: b =>
+    le.createEntryBuffers(serial, StreamLocation.Null, 0, id, streamUUID, stream0).foreach: b =>
       val a = new Array[Byte](b.remaining())
       b.get(a)
       out.write(a)
@@ -1632,16 +1631,16 @@ class SimpleCRLSuite extends FileBasedTests {
     System.arraycopy(forged, 0, payload, 8192 - dataStart, forged.length)
     val a = TransactionRecoveryState(storeId, txdata,
       List(ObjectUpdate(ObjectId(new UUID(0, 9)), DataBuffer(payload))), disp, status, pax)
-    val le = LogEntry(StreamLocation.Null, 0, new LivePieces)
-    le.addTx(Tx(txid, a), () => queue.put(""))
-    stream.writeEntry(le, () => ())
+    val le = LogEntry(new Image(new LivePieces))
+    le.addTx(txid, TxSave(TxForm(a, keepUpdates = true), writesPieces = true), () => queue.put(""))
+    stream.writeEntry(le, 0, StreamLocation.Null, () => ())
     queue.take()
 
     // The stream's next cycle: its only entry covers the first page, leaving A's payload behind it
     stream.recycleStream()
-    val le2 = LogEntry(StreamLocation.Null, 1, new LivePieces)
-    le2.addTx(Tx(txid2, trs2), () => queue.put(""))
-    stream.writeEntry(le2, () => ())
+    val le2 = LogEntry(new Image(new LivePieces))
+    le2.addTx(txid2, TxSave(TxForm(trs2, keepUpdates = true), writesPieces = true), () => queue.put(""))
+    stream.writeEntry(le2, 1, StreamLocation.Null, () => ())
     queue.take()
     val stopped = new CountDownLatch(1)
     streamWriter.shutdown(() => stopped.countDown())
@@ -1895,21 +1894,32 @@ class SimpleCRLSuite extends FileBasedTests {
       r.crl.shutdown()
 
     var largestRotation = 0
+    var evacuatedFirst = false
     for (stream, before, after) <- rotations.reverse do
-      val changed = (0 until (size / sector).toInt).filter: s =>
-        !java.util.Arrays.equals(before(stream), s * sector, (s + 1) * sector, after(stream), s * sector, (s + 1) * sector)
-      assert(changed.nonEmpty)
-      largestRotation = largestRotation.max(changed.size)
-      // Sectors 0..n-1 of the new entry persisted, and the rest not; or every sector but the first (old head intact)
-      def torn(newSectors: Set[Int]): IndexedSeq[Array[Byte]] =
-        val bytes = before(stream).clone()
-        newSectors.foreach(s => System.arraycopy(after(stream), s * sector, bytes, s * sector, sector))
-        before.updated(stream, bytes)
-      for n <- 0 until changed.size do
-        recoversXandY(torn(changed.take(n).toSet), s"rotation into $stream, first $n of ${changed.size} sectors")
-      recoversXandY(torn(changed.drop(1).toSet), s"rotation into $stream, all but its first sector")
-    // Some rotation copied X forward
+      // A rotation writes its evacuation, then the pending entry once the evacuation is durable: each write is torn
+      // on its own, over the stream as the writes before it left it
+      val writes = currentCycle(after(stream)).map((o, h) => (o, h.entrySize.toInt))
+      assert(writes.nonEmpty)
+      evacuatedFirst ||= writes.size > 1
+      writes.zipWithIndex.foreach: (extent, k) =>
+        val (start, length) = extent
+        val base = before(stream).clone()
+        System.arraycopy(after(stream), 0, base, 0, start)
+        val changed = (start / sector until (start + length) / sector).filter: s =>
+          !java.util.Arrays.equals(base, s * sector, (s + 1) * sector, after(stream), s * sector, (s + 1) * sector)
+        assert(changed.nonEmpty)
+        largestRotation = largestRotation.max(changed.size)
+        // Sectors 0..n-1 of the new entry persisted, and the rest not; or every sector but the first (old head intact)
+        def torn(newSectors: Set[Int]): IndexedSeq[Array[Byte]] =
+          val bytes = base.clone()
+          newSectors.foreach(s => System.arraycopy(after(stream), s * sector, bytes, s * sector, sector))
+          before.updated(stream, bytes)
+        for n <- 0 until changed.size do
+          recoversXandY(torn(changed.take(n).toSet), s"rotation into $stream, write $k, first $n of ${changed.size} sectors")
+        recoversXandY(torn(changed.drop(1).toSet), s"rotation into $stream, write $k, all but its first sector")
+    // Some rotation evacuated X before writing the pending entry
     assert(largestRotation > 1)
+    assert(evacuatedFirst)
   }
 
   test("An open of a CRL whose live set is more than a stream recovers it without writing") {
@@ -2230,9 +2240,9 @@ class SimpleCRLSuite extends FileBasedTests {
 
   private val pieceStreamSize = 4096L * 4
 
-  /** A (storeId) with its txd in the entry the rotation into stream 0 wrote (it was in stream 1, which that rotation
-    * evacuates) and its two 1500-byte updates in entry `eU` of stream 2, the oldest stream. Returns A and `eU` */
-  private def txdNewerThanUpdates(crl: SimpleCRL, fill: Filler): ((TransactionId, TransactionRecoveryState), Long) =
+  /** A (storeId) saved data-less (its txd only, in stream 1), then with two 1500-byte updates in entry `eU` of
+    * stream 2, the oldest stream once the fillers reach stream 0. Returns A and `eU` */
+  private def countChanged(crl: SimpleCRL, fill: Filler): ((TransactionId, TransactionRecoveryState), Long) =
     val (aId, a0) = mkTx(1, 0)
     val a = a0.copy(objectUpdates = List(1, 2).map(k =>
       ObjectUpdate(ObjectId(new UUID(9, k)), DataBuffer(Array.fill[Byte](1500)(k.toByte)))))
@@ -2250,30 +2260,33 @@ class SimpleCRLSuite extends FileBasedTests {
     val files = (0 until 3).map(n => (StreamId(n), tdir / s"$n.crl")).toList
     Recovery.recover(files, recordedId(tdir), files.map(_._1).toVector).trsList.filter(_.storeId == storeId)
 
-  test("A rotation copies forward only the pieces in the evacuated stream") {
+  test("An update-count change writes the txd again beside the updates (W4)") {
     val crl = SimpleCRL(tdir, 3, pieceStreamSize).crl
     val fill = Filler(crl)
-    val ((_, a), _) = txdNewerThanUpdates(crl, fill)
-    // The rotation into stream 0 wrote A's txd and at most the filler that triggered it, not A's updates
-    val evacuation = headerAt(tdir / "0.crl", 0)
-    assert(evacuation.dynamicDataSize >= a.serializedTxd.size)
-    assert(evacuation.dynamicDataSize <= a.serializedTxd.size + trs2.serializedTxd.size)
+    val ((_, a), eU) = countChanged(crl, fill)
+    // Every piece of A lies in the entry that built the new count: the data-less form's txd in stream 1 was not reused
+    val files = (0 until 3).map(n => (StreamId(n), tdir / s"$n.crl")).toList
+    val recovered = Recovery.recover(files, recordedId(tdir), files.map(_._1).toVector).txs.filter(_.id.storeId == storeId)
+    assert(recovered.map(t => (t.txdPiece +: t.updatePieces).map(_.serial).toSet) == List(Set(eU)))
+    assert(recovered.map(_.txdPiece.location.streamId) == List(stream2))
+    // So the rotation into stream 0, which evacuated stream 1, carried nothing of A
+    assert(headerAt(tdir / "0.crl", 0).dynamicDataSize < a.serializedTxd.size)
     crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, pieceStreamSize)
-    val recovered = i2.trsList.filter(_.storeId == storeId)
-    assert(recovered.map(_.serializedTxd) == List(a.serializedTxd))
-    assert(recovered.map(_.objectUpdates) == List(a.objectUpdates))
+    val reopened = i2.trsList.filter(_.storeId == storeId)
+    assert(reopened.map(_.serializedTxd) == List(a.serializedTxd))
+    assert(reopened.map(_.objectUpdates) == List(a.objectUpdates))
     i2.crl.shutdown()
   }
 
-  /** A's updates are in the oldest entry needed when its object data is dropped. They stay pinned until A's next
-    * static record is built, by a save (`rewriteBySave`) or by the rotation that evacuates their stream: until then
-    * the last durable static record names them, and a crash recovers them */
-  private def droppedPiecesStayPinnedUntilRewrite(rewriteBySave: Boolean): Unit =
+  /** A's pieces lie in entry `eU`. Dropping its object data writes nothing: its last-built form keeps the updates,
+    * pinned, and an evacuation of their stream carries them (W5), until a save builds a form without them
+    * (`saveAfterDrop`). Until then the last durable static record names them, and a crash recovers them */
+  private def droppedPiecesStayPinnedUntilSaved(saveAfterDrop: Boolean): Unit =
     val crl = SimpleCRL(tdir, 3, pieceStreamSize).crl
     val fill = Filler(crl)
-    val ((aId, a), eU) = txdNewerThanUpdates(crl, fill)
+    val ((aId, a), eU) = countChanged(crl, fill)
     assert(crl.oldestEntryNeeded == eU)
 
     crl.dropTransactionObjectData(storeId, aId)
@@ -2282,39 +2295,40 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(crl.oldestEntryNeeded == eU)
     assert(recoverNow().map(_.objectUpdates) == List(a.objectUpdates))
 
-    if rewriteBySave then
+    if saveAfterDrop then
       saveAndWait(crl, aId, a)
       settle(crl)
-      assert(crl.oldestEntryNeeded > eU)
+      // The new form leaves the updates out; it names the txd where it lies
       assert(recoverNow().map(_.objectUpdates) == List(Nil))
 
-    // Up to the wrap: the rotation into 1 evacuates stream 2, the one into 2 evacuates stream 0, back into 0
-    var evacuated = false
+    // Up to the wrap: the rotation into 1 evacuates stream 2, the one into 2 evacuates stream 0, back into 0. The
+    // save above may itself have rotated into 1
+    val updates = if saveAfterDrop then Nil else a.objectUpdates
+    var evacuated = crl.currentStreamNumber == 1
     for stream <- List(1, 2, 0) do
       while crl.currentStreamNumber != stream do
         fill.next()
         evacuated ||= crl.currentStreamNumber == 1
-        val rewritten = rewriteBySave || evacuated
-        if rewritten then
+        if evacuated then
           assert(crl.oldestEntryNeeded > eU)
         else
           assert(crl.oldestEntryNeeded == eU)
         val now = recoverNow()
         assert(now.map(_.serializedTxd) == List(a.serializedTxd))
-        assert(now.map(_.objectUpdates) == List(if rewritten then Nil else a.objectUpdates))
+        assert(now.map(_.objectUpdates) == List(updates))
     crl.shutdown()
 
     val i2 = SimpleCRL(tdir, 3, pieceStreamSize)
     assert(i2.trsList.filter(_.storeId == storeId).map(t => (t.serializedTxd, t.objectUpdates)) ==
-      List((a.serializedTxd, Nil)))
+      List((a.serializedTxd, updates)))
     i2.crl.shutdown()
 
-  test("Dropped pieces stay pinned until a save rewrites the record") {
-    droppedPiecesStayPinnedUntilRewrite(rewriteBySave = true)
+  test("Dropped pieces stay pinned until a save builds a form without them") {
+    droppedPiecesStayPinnedUntilSaved(saveAfterDrop = true)
   }
 
-  test("Dropped pieces stay pinned until the evacuation of their stream rewrites the record") {
-    droppedPiecesStayPinnedUntilRewrite(rewriteBySave = false)
+  test("An evacuation carries dropped data until the record is saved again (W5)") {
+    droppedPiecesStayPinnedUntilSaved(saveAfterDrop = false)
   }
 
   // ---- dropStore is one request (crash-recovery-log F12) ----
@@ -2425,5 +2439,262 @@ class SimpleCRLSuite extends FileBasedTests {
       i.crl.whenDurable(storeId, () => queue.put(s"b$n"))
       assert(queue.poll(10, TimeUnit.SECONDS) == s"b$n")
     i.crl.shutdown()
+  }
+
+  // ===== Bounded entries and evacuation-first rotations (crash-recovery-log 6.1) =====
+
+  /** The entries of a stream's current cycle, with their offsets: from offset 0, while their headers are intact and
+    * carry the head's stream UUID */
+  private def currentCycle(bytes: Array[Byte]): List[(Int, LogEntry.EntryHeader)] =
+    def header(offset: Int) = LogEntry.loadHeader(ByteBuffer.wrap(bytes, offset, LogEntry.StaticEntryHeaderSize).slice())
+    if !LogEntry.headerIntact(bytes.slice(0, LogEntry.StaticEntryHeaderSize)) then
+      Nil
+    else
+      val uuid = header(0).streamUUID
+      Iterator.iterate(0)(o => o + header(o).entrySize.toInt)
+        .takeWhile: o =>
+          o < bytes.length && LogEntry.headerIntact(bytes.slice(o, o + LogEntry.StaticEntryHeaderSize)) &&
+            header(o).streamUUID == uuid
+        .map(o => (o, header(o))).toList
+
+  private val ringStreamSize = 64 * 1024L
+
+  /** Transaction `n` of storeId with one update of `bytes` bytes */
+  private def sized(n: Long, bytes: Int): (TransactionId, TransactionRecoveryState) =
+    val (tid, t) = mkTx(n, 0)
+    (tid, t.copy(objectUpdates = List(ObjectUpdate(ObjectId(new UUID(9, n)), DataBuffer(Array.fill[Byte](bytes)(n.toByte))))))
+
+  /** A completion handler that blocks the writer thread, once it runs, until `release` is counted down: every request
+    * queued meanwhile is processed into unwritten entries, and the files hold exactly the entries written so far */
+  private class Hold:
+    val reached = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
+    val handler: () => Unit = () =>
+      reached.countDown()
+      release.await(10, TimeUnit.SECONDS)
+    def awaitReached(): Unit = assert(reached.await(10, TimeUnit.SECONDS))
+
+  /** Saves `t` with a handler that holds the writer, once that save's entry is written */
+  private def holdWriter(crl: SimpleCRL, t: (TransactionId, TransactionRecoveryState)): Hold =
+    val hold = new Hold
+    crl.save(t._1, t._2, hold.handler)
+    hold.awaitReached()
+    hold
+
+  /** `f` evaluated on the CRL thread, after every request queued before */
+  private def onCrl[T](crl: SimpleCRL)(f: => T): T =
+    val q = new LinkedBlockingQueue[Option[T]]()
+    crl.runOnCrlThread(() => q.put(Some(f)))
+    q.poll(10, TimeUnit.SECONDS).get
+
+  /** The CRL's files in `tdir` as they are now, copied to a directory of their own: a crash at this moment */
+  private def crashImage(name: String, numStreams: Int): os.Path =
+    val dir = tdir / name
+    os.makeDir(dir)
+    (SimpleCRL.SizingFile :: (0 until numStreams).map(n => s"$n.crl").toList).foreach(f => os.copy(tdir / f, dir / f))
+    dir
+
+  /** storeId's recovered transactions (Filler's, of storeId2, carry no valid txd) */
+  private def recoveredById(r: SimpleCRL.InitialCRLState): Map[TransactionId, TransactionRecoveryState] =
+    r.trsList.filter(_.storeId == storeId).map(t => t.txd.transactionId -> t).toMap
+
+  test("Pending saves larger than half a stream are cut into entries that each fit") {
+    val i = SimpleCRL(tdir, 4, ringStreamSize)
+    val h = sized(100, 100)
+    val hold = holdWriter(i.crl, h)
+    // 40 saves of 2 KiB each, as admission counts them: more than a stream in all
+    val dataBytes = 2048 - CrlAdmission.TxOverheadBytes.toInt - CrlAdmission.ObjectUpdateOverheadBytes.toInt -
+      mkTx(1, 0)._2.serializedTxd.size
+    val saves = (1 to 40).map(n => sized(n, dataBytes))
+    val done = new LinkedBlockingQueue[TransactionId]()
+    saves.foreach(t => i.crl.save(t._1, t._2, () => done.put(t._1)))
+    // All processed while the writer is held: queued in sealed entries behind the newest
+    assert(onCrl(i.crl)(i.crl.sealedEntryCount) >= 2)
+    hold.release.countDown()
+    assert((1 to 40).map(_ => done.poll(10, TimeUnit.SECONDS)).toSet == saves.map(_._1).toSet)
+    i.crl.shutdown()
+
+    val entries = (0 until 4).flatMap(n => currentCycle(os.read.bytes(tdir / s"$n.crl")))
+    assert(entries.size > 3)
+    entries.foreach((_, e) => assert(e.entrySize <= ringStreamSize / 2))
+    val r = SimpleCRL(tdir, 4, ringStreamSize)
+    assert(recoveredById(r).view.mapValues(_.objectUpdates).toMap ==
+      (saves :+ h).map(t => t._1 -> t._2.objectUpdates).toMap)
+    r.crl.shutdown()
+  }
+
+  test("A rotation writes its evacuation before the pending saves") {
+    val i = SimpleCRL(tdir, 4, ringStreamSize)
+    val fill = Filler(i.crl)
+    val x = sized(1, 10000)
+    saveAndWait(i.crl, x._1, x._2) // In stream 0, which the rotation into stream 3 evacuates
+    List(1, 2, 3).foreach(fill.until)
+    val head = currentCycle(os.read.bytes(tdir / "3.crl"))
+    val (_, evacuation) = head.head
+    // Its own entry: X's pieces and no pending request, which follows it in the next entry
+    assert(evacuation.numTransactions == 1)
+    assert(evacuation.numDeletedTransactions == 0)
+    assert(evacuation.dynamicDataSize == x._2.serializedTxd.size + 10000)
+    assert(head.size >= 2)
+    assert(head(1)._2.entrySerialNumber == evacuation.entrySerialNumber + 1)
+    assert(head(1)._2.numTransactions + head(1)._2.numDeletedTransactions > 0)
+    i.crl.shutdown()
+
+    val r = SimpleCRL(tdir, 4, ringStreamSize)
+    assert(recoveredById(r)(x._1).objectUpdates == x._2.objectUpdates)
+    r.crl.shutdown()
+  }
+
+  test("The admission limit is (n - 2) * S/2 - S/16: 15S/16 for 4 streams, 9S - S/16 for 20") {
+    for (n, expected) <- List((4, ringStreamSize * 15 / 16), (20, 9 * ringStreamSize - ringStreamSize / 16)) do
+      val dir = tdir / s"streams-$n"
+      val i = SimpleCRL(dir, n, ringStreamSize)
+      assert(i.crl.admissionLimitBytes == expected)
+      i.crl.shutdown()
+  }
+
+  test("A new CRL's streams are a multiple of 4096 bytes, and at least 3 (S1)") {
+    assertThrows[IllegalArgumentException](SimpleCRL(tdir, 4, ringStreamSize + 512))
+    assertThrows[IllegalArgumentException](SimpleCRL(tdir, 2, ringStreamSize))
+    assert(!os.exists(tdir / SimpleCRL.SizingFile))
+    SimpleCRL(tdir, 3, ringStreamSize).crl.shutdown()
+  }
+
+  test("A save after its record's form was sealed takes a form of its own: the sealed entry is unchanged (W1a)") {
+    val i = SimpleCRL(tdir, 4, ringStreamSize)
+    val hold = holdWriter(i.crl, sized(100, 100))
+    val (aId, a0) = mkTx(1, 0) // A's data-less prepare
+    val a = sized(1, 3000)._2  // and its late data
+    val f1 = sized(2, 20000)
+    val f2 = sized(3, 20000)
+    val inE1 = new Hold
+    i.crl.save(aId, a0, inE1.handler)
+    i.crl.save(f1._1, f1._2, () => ())
+    i.crl.save(f2._1, f2._2, () => ()) // Seals A0 and F1's entry, E1
+    val done = new LinkedBlockingQueue[String]()
+    i.crl.save(aId, a, () => done.put("a"))
+    assert(onCrl(i.crl)(i.crl.sealedEntryCount) == 1)
+
+    // E1 as built from the forms its own requests took: A's data-less form beside F1
+    val probe = LogEntry(new Image(new LivePieces))
+    probe.addTx(TxId(storeId, aId), TxSave(TxForm(a0, keepUpdates = true), writesPieces = true), () => ())
+    probe.addTx(TxId(storeId, f1._1), TxSave(TxForm(f1._2, keepUpdates = true), writesPieces = true), () => ())
+
+    hold.release.countDown()
+    inE1.awaitReached()
+    val crash = crashImage("after-e1", 4)
+    inE1.release.countDown()
+    assert(done.poll(10, TimeUnit.SECONDS) == "a")
+    i.crl.shutdown()
+
+    val stream0 = currentCycle(os.read.bytes(tdir / "0.crl"))
+    val (_, e1) = stream0(1)
+    assert(e1.numTransactions == 2)
+    assert(e1.entrySize == probe.entrySize)
+
+    // A crash after E1 recovers the data-less form, the end the one with the data
+    val r1 = SimpleCRL(crash, 4, ringStreamSize)
+    assert(recoveredById(r1)(aId).objectUpdates == Nil)
+    assert(recoveredById(r1)(aId).serializedTxd == a0.serializedTxd)
+    assert(recoveredById(r1)(f1._1).objectUpdates == f1._2.objectUpdates)
+    r1.crl.shutdown()
+    val r2 = SimpleCRL(tdir, 4, ringStreamSize)
+    assert(recoveredById(r2)(aId).objectUpdates == a.objectUpdates)
+    r2.crl.shutdown()
+  }
+
+  test("A save after a final deletion in an older unwritten entry is skipped and reports success (W1b)") {
+    val i = SimpleCRL(tdir, 4, ringStreamSize)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    val hold = holdWriter(i.crl, sized(100, 100))
+    val f1 = sized(2, 20000)
+    val f2 = sized(3, 20000)
+    i.crl.save(f1._1, f1._2, () => ())
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.save(f2._1, f2._2, () => ()) // Seals the entry holding the deletion
+    val done = new LinkedBlockingQueue[String]()
+    i.crl.save(transactionId, trsValidTxd, () => done.put("skipped"))
+    assert(onCrl(i.crl)(i.crl.sealedEntryCount) == 1)
+    // No record was created for it
+    assert(!readState(i.crl, storeId).transactions.exists(_.txd.transactionId == transactionId))
+
+    hold.release.countDown()
+    assert(done.poll(10, TimeUnit.SECONDS) == "skipped")
+    assert(!readState(i.crl, storeId).transactions.exists(_.txd.transactionId == transactionId))
+    i.crl.shutdown()
+    val r = SimpleCRL(tdir, 4, ringStreamSize)
+    assert(!recoveredById(r).contains(transactionId))
+    r.crl.shutdown()
+  }
+
+  test("A save after a final deletion in the entry in flight is skipped and reports success once it completes (W1b)") {
+    val i = SimpleCRL(tdir, 4, ringStreamSize)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    // The deletion's entry is written, and its write held from completing by the handler of a save beside it
+    val first = holdWriter(i.crl, sized(100, 100))
+    val hold = new Hold
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.save(sized(101, 100)._1, sized(101, 100)._2, hold.handler)
+    first.release.countDown()
+    hold.awaitReached()
+    val done = new LinkedBlockingQueue[String]()
+    i.crl.save(transactionId, trsValidTxd, () => done.put("skipped"))
+    assert(!readState(i.crl, storeId).transactions.exists(_.txd.transactionId == transactionId))
+    assert(done.poll(50, TimeUnit.MILLISECONDS) == null)
+    hold.release.countDown()
+    assert(done.poll(10, TimeUnit.SECONDS) == "skipped")
+    i.crl.shutdown()
+    val r = SimpleCRL(tdir, 4, ringStreamSize)
+    assert(!recoveredById(r).contains(transactionId))
+    r.crl.shutdown()
+  }
+
+  test("A deleted record stays pinned until its deletion's entry is built: a crash before it recovers it (W3)") {
+    val i = SimpleCRL(tdir, 4, ringStreamSize)
+    saveAndWait(i.crl, transactionId, trsValidTxd) // X, in the oldest entry needed
+    val h = sized(100, 100)
+    val hold = holdWriter(i.crl, h)
+    val f1 = sized(2, 20000)
+    val f2 = sized(3, 20000)
+    val inE2 = new Hold
+    i.crl.save(f1._1, f1._2, inE2.handler)
+    i.crl.save(f2._1, f2._2, () => ()) // Seals F1's entry
+    i.crl.deleteTransaction(storeId, transactionId) // Behind it
+    assert(onCrl(i.crl)(i.crl.sealedEntryCount) == 1)
+
+    hold.release.countDown()
+    // F1's entry is durable and the deletion's is not: X's state must still be recoverable
+    inE2.awaitReached()
+    val crash = crashImage("before-deletion", 4)
+    inE2.release.countDown()
+    val barrier = new LinkedBlockingQueue[String]()
+    i.crl.whenDurable(storeId, () => barrier.put(""))
+    assert(barrier.poll(10, TimeUnit.SECONDS) == "")
+    i.crl.shutdown()
+
+    val r1 = SimpleCRL(crash, 4, ringStreamSize)
+    assert(recoveredById(r1).keySet == Set(transactionId, h._1, f1._1))
+    assert(recoveredById(r1)(transactionId).objectUpdates == trsValidTxd.objectUpdates)
+    r1.crl.shutdown()
+    val r2 = SimpleCRL(tdir, 4, ringStreamSize)
+    assert(recoveredById(r2).keySet == Set(h._1, f1._1, f2._1))
+    r2.crl.shutdown()
+  }
+
+  test("A head not written within n - 1 rotations fails the CRL instead of rotating on (W6)") {
+    val i = SimpleCRL(tdir, 4, ringStreamSize)
+    // Saved without admission: live records of 20 KB each come to more than the ring holds
+    val saves = (1 to 16).map(n => sized(n, 20000))
+    saves.foreach(t => i.crl.save(t._1, t._2, () => ()))
+    val cause = Await.result(i.crl.failed, 10.seconds)
+    assert(cause.isInstanceOf[IllegalStateException], cause)
+    assert(cause.getMessage.contains("not written after 3 rotations"))
+    assertShutdownReturns(i.crl)
+
+    // The files hold what was written, as after a crash
+    val r = SimpleCRL(tdir, 4, ringStreamSize)
+    assert(r.trsList.nonEmpty)
+    recoveredById(r).foreach((tid, t) => assert(saves.toMap.get(tid).map(_.objectUpdates) == Some(t.objectUpdates)))
+    r.crl.shutdown()
   }
 }

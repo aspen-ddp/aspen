@@ -1459,8 +1459,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- storeA.backend.close()
       _ <- storeB.backend.close()
     yield
-      // 1 MB CRL files: half of one
-      limitA should be(512L * 1024)
+      // 4 CRL files of 1 MB: (4 - 2) halves of one, less a sixteenth
+      limitA should be(15L * 1024 * 1024 / 16)
       (devices(deviceA).admission ne devices(deviceB).admission) should be(true)
       droppedA should be(true)
       factory.opened.find(_.devicePath == dirA).get.firstSave.isCompleted should be(false)
@@ -1718,7 +1718,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(marker(storeDir)) should be(false)
       os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.head
-      factory.opened.head.admissionLimitBytes should be(1024 * 1024 / 2)
+      factory.opened.head.admissionLimitBytes should be(15L * 1024 * 1024 / 16)
       files should be(oldFiles)
 
   atest("a device CRL opened with fewer configured streams than the minimum keeps its own sizing"):

@@ -2,14 +2,14 @@ package org.aspen_ddp.aspen.server.crl.simple
 
 import scala.collection.mutable
 
-/** The serial numbers of the entries holding the pieces (a txd, an object update, a stub's anchor) that live records'
-  * newest static records name, counted per serial. Its oldest serial is the CRL's oldestEntryNeeded: recovery walks
-  * back to it and reads pieces only from the entries it walked (Recovery.entryHolding), so no piece a durable static
-  * record names may lie in an older entry. Owned by the CRL thread.
+/** The serial numbers of the entries holding the pieces (a txd, an object update, a stub's anchor) of the durable
+  * image, the records' last-built forms (Image), counted per serial. Its oldest serial is the CRL's oldestEntryNeeded:
+  * recovery walks back to it and reads pieces only from the entries it walked (Recovery.entryHolding), so no piece a
+  * durable static record names may lie in an older entry. Owned by the CRL thread.
   *
-  * A serial is added when the entry writing its piece builds its buffers (LogEntry.createEntryBuffers), and removed
-  * when the entry holding the record's next static record is built (the piece was relocated or dropped) or the record
-  * is deleted (SimpleCRL) */
+  * Filled at open with the recovered pieces, then changed only when an entry builds its buffers
+  * (LogEntry.createEntryBuffers): the serials of the pieces it writes are added, and those of the pieces its forms
+  * supersede or its deletions take out of the image are removed */
 final class LivePieces:
   private val counts = mutable.TreeMap[Long, Int]()
 

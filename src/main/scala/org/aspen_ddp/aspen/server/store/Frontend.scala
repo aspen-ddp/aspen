@@ -944,7 +944,7 @@ class Frontend(val storeId: StoreId,
     * afresh, never through the record of the state being replaced.
     *
     * The stub is charged to the device's admission without a check (CrlAdmission.AppliedStubBytes), so it is never
-    * dropped or held back, while new prepares feel its bytes: the CRL's copy-forward carries stubs too. It carries the
+    * dropped or held back, while new prepares feel its bytes: the CRL's evacuations carry stubs too. It carries the
     * transaction's start (`start`), by which expireStubs drops it, releasing the charge; retained at close until the
     * store's entries leave the CRL.
     *

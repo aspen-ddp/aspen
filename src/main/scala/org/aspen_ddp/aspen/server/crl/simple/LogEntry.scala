@@ -9,18 +9,38 @@ import java.util.UUID
 import java.util.zip.CRC32C
 import scala.collection.immutable.HashMap
 
-/** @param livePieces the CRL's live-piece index: the pieces this entry writes are added to it, and the pieces its
-  *                   records forgot are removed, when its buffers are built (createEntryBuffers) */
-class LogEntry(val previousEntryLocation: StreamLocation,
-               val entrySerialNumber: Long,
-               livePieces: LivePieces) extends Logging:
+/** What an entry writes for one transaction */
+sealed trait TxWrite:
+  def form: TxForm
+  def dynamicDataSize: Long
+
+/** A save's form (crash-recovery-log 6.1, W1a). `writesPieces`: the entry writes the form's txd and kept updates.
+  * Otherwise it names the pieces of the record's last-built form where they lie at its build: an earlier entry wrote
+  * them (FIFO, so it is built first), and an evacuation may have moved them since */
+final case class TxSave(form: TxForm, writesPieces: Boolean) extends TxWrite:
+  def dynamicDataSize: Long = if writesPieces then form.piecesSize else 0
+
+/** An evacuation's copy of a record's last-built form (W5): its pieces lying in `streams` are written again, the
+  * others named where they lie. Nothing pending is written. Built at once, so `built` is the image's form then */
+final case class TxEvacuation(built: BuiltTx, streams: Set[StreamId]) extends TxWrite:
+  def form: TxForm = built.form
+  def dynamicDataSize: Long =
+    built.pieces.iterator.filter(p => streams.contains(p.location.streamId)).foldLeft(0L)(_ + _.location.length)
+
+/** One entry, sealed (W1) once it holds as much as SimpleCRL lets it. Its size is fixed by what is added to it: its
+  * serial number, previous entry and offset are given only when it is built (createEntryBuffers), since entries
+  * queued ahead of it, evacuations among them, take theirs first.
+  *
+  * @param image the CRL's durable image: building the entry applies its forms and deletions to it, and to the pieces
+  *              it pins */
+class LogEntry(image: Image) extends Logging:
   import LogEntry._
 
   private var completionHandlers: List[() => Unit] = Nil
-  private var txs: HashMap[TxId, Tx] = new HashMap()
+  private var txs: HashMap[TxId, TxWrite] = new HashMap()
   private var txDeletions: List[TxId] = Nil
   private var txDelSet: Set[TxId] = Set()
-  private var stubs: HashMap[TxId, Stub] = new HashMap()
+  private var stubs: HashMap[TxId, HLCTimestamp] = new HashMap()
   private var stubDeletions: Set[TxId] = Set()
   /** Transactions whose deletion in this entry a later save cancels (deleteTxUnlessResaved): made by a stub's save or
     * a dropStore, and by no final deletion */
@@ -35,7 +55,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
 
   def staticDataSize: Long =
-    txs.valuesIterator.foldLeft(0L)((s, tx) => s + tx.staticDataSize)
+    txs.valuesIterator.foldLeft(0L)((s, tx) => s + tx.form.staticSize)
     + TxId.StaticSize * txDeletions.length
     + Stub.StaticSize * stubs.size
     + TxId.StaticSize * stubDeletions.size
@@ -44,31 +64,39 @@ class LogEntry(val previousEntryLocation: StreamLocation,
   def dynamicDataSize: Long =
     txs.valuesIterator.foldLeft(0L)((s, t) => s + t.dynamicDataSize)
 
-  def entrySize: Long =
-    val base = StaticEntryHeaderSize + dynamicDataSize + staticDataSize
-    val nPadBytes = padTo4k(base)
-    base + nPadBytes
+  def entrySize: Long = padded(StaticEntryHeaderSize + dynamicDataSize + staticDataSize)
+
+  /** Its size with `bytes` more content */
+  def entrySizeWith(bytes: Long): Long = padded(StaticEntryHeaderSize + dynamicDataSize + staticDataSize + bytes)
+
+  /** Its size once `save` of `txid` is added, replacing any form of it already here */
+  def entrySizeWith(txid: TxId, save: TxWrite): Long =
+    val replaced = txs.get(txid).fold(0L)(w => w.form.staticSize + w.dynamicDataSize)
+    entrySizeWith(save.form.staticSize + save.dynamicDataSize - replaced)
+
+  /** The form of `txid` this entry writes, if any */
+  def txWrite(txid: TxId): Option[TxWrite] = txs.get(txid)
 
   def runCompletionHandlers(): Unit = completionHandlers.foreach(ch => ch())
 
-  def addTx(tx: Tx, completionHandler: () => Unit): Unit =
+  def addTx(txid: TxId, save: TxWrite, completionHandler: () => Unit): Unit =
     // Do not check if txs already contains the transaction. Allow the duplicate insert so we queue
     // the completion handler for the subsequent insert attempts.
     //
-    // Deletions are final (deletesFinally). A save of a transaction deleted earlier in this same entry is a timing
-    // artifact and is skipped, but it still reports success once the entry (and thus the delete) is durable.
-    // SimpleCRL never creates a record for such a save: it queues only the handler (addCompletionHandler), since a
-    // record that is never written would pin oldestEntryNeeded and be reported as live (crash-recovery-log F4).
+    // Deletions are final (deletesFinally). A save of a transaction deleted earlier in an unwritten entry is a timing
+    // artifact and is skipped, but it still reports success once the delete is durable. SimpleCRL never adds such a
+    // save here: it queues only the handler, since a record that is never written would pin oldestEntryNeeded and be
+    // reported as live (crash-recovery-log F4).
     //
     // A deletion made by a stub's save or a dropStore (deleteTxUnlessResaved) is not final: a save after it is a new
     // state of the transaction (live beside the stub, or of the store loaded again). The save cancels that deletion,
     // so it is written; recovery takes the newest save
-    if resavable.contains(tx.id) then
-      resavable -= tx.id
-      txDelSet -= tx.id
-      txDeletions = txDeletions.filterNot(_ == tx.id)
-    if !deletesFinally(tx.id) then
-      txs += (tx.id -> tx)
+    if resavable.contains(txid) then
+      resavable -= txid
+      txDelSet -= txid
+      txDeletions = txDeletions.filterNot(_ == txid)
+    if !deletesFinally(txid) then
+      txs += (txid -> save)
     completionHandlers = completionHandler :: completionHandlers
 
   /** True when this entry deletes `txid` and a save of it would not cancel the deletion: the save is skipped (addTx) */
@@ -79,9 +107,8 @@ class LogEntry(val previousEntryLocation: StreamLocation,
   def addCompletionHandler(completionHandler: () => Unit): Unit =
     completionHandlers = completionHandler :: completionHandlers
 
-  /** A save of `txid` already in this entry is taken out: its record is deleted, and SimpleCRL has unpinned its pieces
-    * (Record.forget), so none may be located here and pinned again. Recovery would skip it beside the deletion
-    * anyway */
+  /** A save of `txid` already in this entry is taken out: its record is deleted. Recovery would skip it beside the
+    * deletion anyway. Saves of it in older entries stay: they are built first, and this deletion supersedes them */
   def deleteTx(txid: TxId): Unit =
     txs -= txid
     txDeletions = txid :: txDeletions
@@ -98,29 +125,38 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
   /** Unlike a transaction's save, a stub's save after its deletion in this entry is written: the newer of the two
     * wins, so an entry never holds both for one id */
-  def addStub(stub: Stub, completionHandler: () => Unit): Unit =
-    stubDeletions -= stub.id
-    stubs += (stub.id -> stub)
+  def addStub(txid: TxId, start: HLCTimestamp, completionHandler: () => Unit): Unit =
+    stubDeletions -= txid
+    stubs += (txid -> start)
     completionHandlers = completionHandler :: completionHandlers
 
   def deleteStub(txid: TxId): Unit =
     stubs -= txid
     stubDeletions += txid
 
-  def createEntryBuffers(startingOffset: Long,
+  /** Builds the entry's buffers, as entry `entrySerialNumber` linking to `previousEntryLocation`, and applies it to
+    * the image: each form it writes becomes its record's last-built form, each deletion takes its record out. The
+    * pieces it writes are pinned, and the pieces its forms or deletions supersede unpinned, before oldestEntryNeeded is
+    * stamped. Until this entry is durable, the last durable one, stamped while the superseded pieces were pinned, still
+    * covers them */
+  def createEntryBuffers(entrySerialNumber: Long,
+                         previousEntryLocation: StreamLocation,
+                         startingOffset: Long,
                          crlId: UUID,
                          streamUUID: UUID,
                          streamId: StreamId): Array[ByteBuffer] =
 
     val dynDataSize = dynamicDataSize
     val statDataSize = staticDataSize
+    val livePieces = image.livePieces
     var dynamicBuffers: List[ByteBuffer] = Nil
     val bodyCrc = new CRC32C
 
     // DynamicData ---------
     var offset = startingOffset + StaticEntryHeaderSize
 
-    def allocate(buff: ByteBuffer): Piece =
+    def allocate(data: org.aspen_ddp.aspen.common.DataBuffer): Piece =
+      val buff = data.asReadOnlyBuffer()
       val loc = StreamLocation(streamId, offset, buff.remaining())
       offset += buff.remaining()
       dynamicBuffers = buff :: dynamicBuffers
@@ -128,30 +164,46 @@ class LogEntry(val previousEntryLocation: StreamLocation,
       livePieces.add(entrySerialNumber)
       Piece(loc, entrySerialNumber)
 
-    // Each record's pieces are located before its forgotten ones are unpinned: the static record built here names the
-    // new locations, so the old pieces are no longer needed once this entry is durable. Until then the last durable
-    // entry, stamped while they were pinned, still covers them
-    txs.valuesIterator.foreach: tx =>
-      if tx.txdPiece.isEmpty then
-        tx.txdPiece = Some(allocate(tx.state.serializedTxd.asReadOnlyBuffer()))
+    def lastBuilt(txid: TxId): BuiltTx = image.txs.getOrElse(txid,
+      throw IllegalStateException(s"CRL entry $entrySerialNumber names the pieces of $txid, which has no built form"))
 
-      if tx.keepObjectUpdates then
-        tx.updatePieces = tx.updatePieces.lazyZip(tx.state.objectUpdates).map: (p, ou) =>
-          p.orElse(Some(allocate(ou.data.asReadOnlyBuffer())))
-      else
-        tx.releaseDroppedUpdates()
-      tx.unpinReleased(livePieces)
+    val builtTxs: List[(TxId, BuiltTx)] = txs.toList.map: (txid, write) =>
+      val built = write match
+        case TxSave(form, true) => BuiltTx(form, form.pieceData.map(allocate))
+        case TxSave(form, false) =>
+          val old = lastBuilt(txid)
+          // Same update count as the form before it (W4), and data is never kept again once dropped
+          require(form.updateCount == old.form.updateCount || !form.keepUpdates,
+            s"CRL form of $txid changes its update count without writing its pieces")
+          BuiltTx(form, if form.keepUpdates then old.pieces else old.pieces.take(1))
+        case TxEvacuation(b, streams) =>
+          require(lastBuilt(txid) eq b, s"CRL evacuation of $txid is not of its last-built form")
+          BuiltTx(b.form, b.pieces.lazyZip(b.form.pieceData).map: (p, data) =>
+            if streams.contains(p.location.streamId) then allocate(data) else p)
+      image.txs.get(txid).foreach(_.pieces.filterNot(built.pieces.contains).foreach(p => livePieces.remove(p.serial)))
+      image.txs += txid -> built
+      txid -> built
 
-    stubs.valuesIterator.foreach: stub =>
-      if stub.anchor.isEmpty then
-        livePieces.add(entrySerialNumber)
-        stub.anchor = Some(Piece(StreamLocation(streamId, offset, 0), entrySerialNumber))
-      stub.unpinReleased(livePieces)
+    // Every stub here is anchored at the end of this entry's dynamic data, where recovery finds it
+    val anchor = StreamLocation(streamId, offset, 0)
+    stubs.foreach: (txid, start) =>
+      livePieces.add(entrySerialNumber)
+      image.stubs.get(txid).foreach(old => livePieces.remove(old.anchor.serial))
+      image.stubs += txid -> BuiltStub(start, Piece(anchor, entrySerialNumber))
 
-    // oldestEntryNeeded is stamped now, not when the entry was made: after this entry's pieces are added and its
-    // records' forgotten ones removed, so it is the oldest entry holding a piece some live record's newest static
-    // record names once this entry is durable. Every built record has a piece (a txd, an anchor), and its static record
-    // is in no older entry than any of them, so the walk back to it reaches every live static record too
+    // A deletion takes its record out of the image only now (W3): until this entry is durable, a recovery starts from
+    // an entry naming the record live, so its pieces stayed pinned and evacuations carried it
+    txDeletions.foreach: txid =>
+      image.txs.get(txid).foreach(_.pieces.foreach(p => livePieces.remove(p.serial)))
+      image.txs -= txid
+    stubDeletions.foreach: txid =>
+      image.stubs.get(txid).foreach(old => livePieces.remove(old.anchor.serial))
+      image.stubs -= txid
+
+    // oldestEntryNeeded is stamped now: after this entry's pieces are added and the pieces it supersedes removed, so it
+    // is the oldest entry holding a piece of the image once this entry is durable. Every built record has a piece (a
+    // txd, an anchor), and its static record is in no older entry than any of them, so the walk back to it reaches
+    // every live static record too
     val oldest = livePieces.oldest.getOrElse(entrySerialNumber)
 
     // Header ---------
@@ -178,13 +230,14 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
     val bb = ByteBuffer.wrap(staticArr)
 
-    txs.valuesIterator.foreach(_.writeStaticEntry(bb))
-    stubs.valuesIterator.foreach(_.writeStaticEntry(bb))
+    builtTxs.foreach((txid, built) => Tx.writeStatic(bb, txid, built.form, built.pieces))
+    stubs.foreach((txid, start) => Stub.writeStatic(bb, txid, start))
     txDeletions.foreach(Tx.putTxId(bb, _))
     stubDeletions.foreach(Tx.putTxId(bb, _))
     Tx.putUUID(bb, streamUUID)
 
     assert(bb.position() == bb.limit)
+    assert(offset == startingOffset + StaticEntryHeaderSize + dynDataSize)
 
     buffers = ByteBuffer.wrap(staticArr) :: buffers
 
@@ -317,6 +370,9 @@ object LogEntry:
 
     rstate.stubDeletions ++= stubsDeletedHere
 
+
+  /** An entry of `size` bytes with its padding to the next 4 KiB boundary */
+  def padded(size: Long): Long = size + padTo4k(size)
 
   def padTo4k(offset: Long): Int =
     if (offset < 4096)

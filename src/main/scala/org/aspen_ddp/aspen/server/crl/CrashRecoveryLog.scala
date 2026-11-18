@@ -158,6 +158,8 @@ trait CrashRecoveryLog {
     Future.sequence(state.appliedStubs.toList.map(saveStub)).flatMap: _ =>
       Future.sequence(state.transactions.map(saveT)).map(_ => ())
 
+  /** Saves `state` for `txid`; `completionHandler` runs once it is durable, on the CRL's completion thread (SimpleCRL),
+    * in the order the saves were made. A handler must not block: it delays every later one of the device */
   def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit
 
   /** Forgets the object data of `txid`'s state, in memory only: nothing is written, so a restart may still recover
@@ -165,7 +167,7 @@ trait CrashRecoveryLog {
     * without it (Tx.persistWithoutUpdateOf; transaction-recovery R-N13) */
   def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit
 
-  /** Runs `handler` once every request of `storeId`'s queued before this call is durable, on the CRL's thread. A
+  /** Runs `handler` once every request of `storeId`'s queued before this call is durable, on the CRL's completion thread. A
     * deletion has no completion of its own; this orders a later write elsewhere (a backend deletion) after it. The
     * default runs it at once, for CRLs that keep nothing on disk. A CRL that dies runs it never */
   def whenDurable(storeId: StoreId, handler: () => Unit): Unit = handler()
@@ -175,7 +177,7 @@ trait CrashRecoveryLog {
 
   /** Saves an applied stub for `txid` of `storeId`, in place of any transaction state the store holds for it, in one
     * write. `start` is the transaction's start timestamp, by which the store expires the stub. `completionHandler`
-    * runs, on the CRL's thread, once it is durable. Never subject to CrlAdmission: a stub is a few dozen bytes, and
+    * runs, on the CRL's completion thread, once it is durable. Never subject to CrlAdmission: a stub is a few dozen bytes, and
     * the stores that write one are concluding a transaction (StoreRecoveryState) */
   def saveAppliedStub(storeId: StoreId, txid: TransactionId, start: HLCTimestamp, completionHandler: () => Unit): Unit
 

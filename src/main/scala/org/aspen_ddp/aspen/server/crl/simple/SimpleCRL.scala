@@ -4,12 +4,13 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
+import org.aspen_ddp.aspen.server.store.backend.BackendTiming
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlConfigInvalid,
   CrlFailed, CrlLocked, CrlMissing, CrlSizingDefaults, CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
 import scribe.Logging
 
 import java.util.UUID
-import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, LinkedBlockingQueue, Semaphore}
+import java.util.concurrent.{CopyOnWriteArrayList, CountDownLatch, Executors, LinkedBlockingQueue, Semaphore}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.collection.immutable.HashMap
 import scala.concurrent.{Future, Promise}
@@ -60,6 +61,10 @@ object SimpleCRL extends Logging:
 
   /** Queued when the writer thread dies: the CRL thread dies of it */
   case class WriterDied(cause: Throwable) extends ActionRequest
+
+  /** Queued when a completion handler throws on the completion thread: the CRL thread dies of it, as of a writer's
+    * death (fail-stop) */
+  case class HandlerFailed(cause: Throwable) extends ActionRequest
 
   case class Shutdown(completionHandler: () => Unit) extends ActionRequest
 
@@ -380,6 +385,24 @@ class SimpleCRL private (streamsDir: os.Path,
     * its write completes */
   private var afterInFlight: List[() => Unit] = Nil
 
+  /** The completion thread: runs every save, stub, deletion and barrier handler, in the order the CRL thread hands
+    * them over (crash-recovery-log C2). Kept off the writer and CRL threads, whose next write and next entry's build
+    * would otherwise wait for the handlers' network sends (CRL-W4). Shut down with the writer: handlers already handed
+    * over, all of durable entries, still run */
+  private val completions = Executors.newSingleThreadExecutor: r =>
+    val t = new Thread(r, "crl-completions")
+    t.setDaemon(true)
+    t
+
+  /** Hands `handlers` to the completion thread, to run in order. One that throws fails the CRL, and the rest of
+    * them are not run */
+  private def complete(handlers: () => Unit): Unit =
+    completions.execute: () =>
+      try handlers()
+      catch case t: Throwable =>
+        logger.error("CRL completion handler failed", t)
+        ioQueue.put(HandlerFailed(t))
+
   // ---- Growth (crl/CLAUDE.md): preallocated on the growth thread, committed on the CRL thread ----
 
   private val limitListeners = new CopyOnWriteArrayList[Long => Unit]()
@@ -398,6 +421,10 @@ class SimpleCRL private (streamsDir: os.Path,
 
   /** Tests only: runs inside the preallocation step, before the file is created */
   @volatile private[simple] var inPreallocationForTest: () => Unit = () => ()
+
+  /** Tests only: runs on the writer thread once an entry's write has returned, before its WriteComplete is queued.
+    * Blocking in it holds the entry durable but unacknowledged: no handler of it runs and nothing more is issued */
+  @volatile private[simple] var entryWrittenForTest: LogEntry => Unit = _ => ()
 
   /** A GrowthReady waiting for the rotation in progress to place its head (commitGrowthWhenQuiescent). CRL thread */
   private var pendingGrowth: Option[Int] = None
@@ -425,6 +452,7 @@ class SimpleCRL private (streamsDir: os.Path,
     * leaves at most a `.tmp` or an unlisted stream file, which the next open removes */
   private def shutdownWriter(completionHandler: () => Unit): Unit =
     stopGrowth()
+    completions.shutdown()
     writer.shutdown: () =>
       lock.release()
       completionHandler()
@@ -542,7 +570,7 @@ class SimpleCRL private (streamsDir: os.Path,
     newestUnwritten match
       case Some(entry) => entry.addCompletionHandler(handler)
       case None if writeInProgress => afterInFlight = handler :: afterInFlight
-      case None => handler()
+      case None => complete(handler)
 
   private def startWrite(): Unit =
     if !writeInProgress then
@@ -609,6 +637,7 @@ class SimpleCRL private (streamsDir: os.Path,
     val serial = nextSerial
     logger.trace(s"CRL beginning write for entry $serial")
     previousEntryLocation = streams(currentStream).writeEntry(entry, serial, previousEntryLocation, () => {
+      entryWrittenForTest(entry)
       ioQueue.put(WriteComplete(serial))
     })
     nextSerial += 1
@@ -639,17 +668,27 @@ class SimpleCRL private (streamsDir: os.Path,
 
         case WriterDied(t) => throw t // Nothing more can be written: the CRL dies with its writer
 
+        case HandlerFailed(t) => throw t
+
         case WriteComplete(serialNumber) =>
           logger.trace(s"CRL write complete for entry serial number: ${serialNumber}")
 
+          val written = inFlight
           writeInProgress = false
           inFlight = None
           val barriers = afterInFlight.reverse
           afterInFlight = Nil
-          barriers.foreach(_())
           // Nothing is in flight: if that was a head, the ring may take a stream before the next write
           commitGrowthWhenQuiescent()
+          // The next entry is issued at once, and the written one's handlers run on the completion thread meanwhile:
+          // every entry up to the written one is durable, which is all a handler relies on (C2)
           startWrite()
+          complete: () =>
+            val start = System.nanoTime()
+            written.foreach(_.runCompletionHandlers())
+            barriers.foreach(_())
+            BackendTiming.report.record("crl handlers", System.nanoTime() - start,
+              written.fold(0)(_.completionHandlerCount) + barriers.size)
 
         case GrowthReady(streamNumber) =>
           pendingGrowth = Some(streamNumber)
@@ -829,7 +868,7 @@ class SimpleCRL private (streamsDir: os.Path,
   private def onDeleteTransactions(storeId: StoreId, transactionIds: List[TransactionId], resavable: Boolean,
                                    completionHandler: () => Unit): Unit =
     if transactionIds.isEmpty then
-      completionHandler()
+      complete(completionHandler)
     else
       transactionIds.foreach: transactionId =>
         val txid = TxId(storeId, transactionId)

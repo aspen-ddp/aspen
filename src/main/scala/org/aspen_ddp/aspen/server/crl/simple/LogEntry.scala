@@ -77,7 +77,10 @@ class LogEntry(image: Image) extends Logging:
   /** The form of `txid` this entry writes, if any */
   def txWrite(txid: TxId): Option[TxWrite] = txs.get(txid)
 
+  /** Run on the completion thread once the entry is durable (SimpleCRL, WriteComplete), newest first */
   def runCompletionHandlers(): Unit = completionHandlers.foreach(ch => ch())
+
+  def completionHandlerCount: Int = completionHandlers.size
 
   def addTx(txid: TxId, save: TxWrite, completionHandler: () => Unit): Unit =
     // Do not check if txs already contains the transaction. Allow the duplicate insert so we queue

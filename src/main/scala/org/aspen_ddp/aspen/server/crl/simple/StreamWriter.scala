@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
+import org.aspen_ddp.aspen.server.store.backend.BackendTiming
 import scribe.Logging
 
 import java.nio.ByteBuffer
@@ -78,7 +79,10 @@ class StreamWriter(val maxSizeInBytes: Long,
           val channel = streams.getOrElse(w.streamId,
             throw IllegalStateException(s"CRL write to unknown stream ${w.streamId.number}"))
           channel.position(w.offset)
+          val start = System.nanoTime()
+          val bytes = w.buffers.foldLeft(0L)(_ + _.remaining)
           writeFully(channel, w.buffers)
+          BackendTiming.report.record("crl write", System.nanoTime() - start, bytes)
           w.onWriteComplete()
 
         case WriterThread.AddStream(streamId, channel) =>

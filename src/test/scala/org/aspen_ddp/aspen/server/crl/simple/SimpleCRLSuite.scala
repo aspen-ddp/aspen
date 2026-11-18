@@ -113,9 +113,9 @@ class SimpleCRLSuite extends FileBasedTests {
     crl.save(txid, trs, () => q.put(""))
     q.take()
 
-  /** A completion handler runs on the writer thread before the write's WriteComplete is queued, so a round trip
-    * through the CRL thread may overtake it. Waits, on the CRL thread, until every request is written and the last
-    * write's completion processed: the test's reads of the CRL's state (its stream, its serial) follow that */
+  /** A completion handler runs on the completion thread, possibly before the CRL thread has processed its entry's
+    * WriteComplete. Waits, on the CRL thread, until every request is written and the last write's completion
+    * processed: the test's reads of the CRL's state (its stream, its serial) follow that */
   private def settle(crl: SimpleCRL): Unit =
     val deadline = System.nanoTime() + 10.seconds.toNanos
     while !onCrl(crl)(crl.idleForTest) do
@@ -132,11 +132,11 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
-    queue.take() // Block till completion handlers are run
+    queue.take() // Block till the entry is written
 
     i.crl.save(transactionId, trsValidTxd2, completionHandler)
 
-    queue.take() // Block till completion handlers are run
+    queue.take() // Block till the entry is written
 
     val trs1 = i.crl.getFullRecoveryState(storeId)
 
@@ -237,7 +237,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
-    queue.take() // Block till completion handlers are run
+    queue.take() // Block till the entry is written
 
     i.crl.dropTransactionObjectData(storeId, transactionId)
     i.crl.save(transactionId, trsValidTxd, completionHandler)
@@ -265,7 +265,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
-    queue.take() // Block till completion handlers are run
+    queue.take() // Block till the entry is written
     assert(i.crl.currentStreamNumber == 0)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
@@ -344,7 +344,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
-    queue.take() // Block till completion handlers are run
+    queue.take() // Block till the entry is written
     assert(i.crl.currentStreamNumber == 0)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
@@ -403,7 +403,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
-    queue.take() // Block till completion handlers are run
+    queue.take() // Block till the entry is written
     assert(i.crl.currentStreamNumber == 0)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
@@ -443,7 +443,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
-    queue.take() // Block till completion handlers are run
+    queue.take() // Block till the entry is written
 
     settle(i.crl)
     assert(i.crl.currentEntrySerialNumber == 1)
@@ -479,13 +479,13 @@ class SimpleCRLSuite extends FileBasedTests {
 
     le.addTx(txid, TxSave(TxForm(trs, keepUpdates = true), writesPieces = true), completionHandler)
 
-    val entry1Location = stream.writeEntry(le, 0, StreamLocation.Null, () => ())
+    val entry1Location = stream.writeEntry(le, 0, StreamLocation.Null, () => le.runCompletionHandlers())
 
     val le2 = LogEntry(image)
 
     le2.addTx(txid, TxSave(TxForm(trs, keepUpdates = true), writesPieces = false), completionHandler)
 
-    val entry2Location = stream.writeEntry(le2, 1, entry1Location, () => ())
+    val entry2Location = stream.writeEntry(le2, 1, entry1Location, () => le2.runCompletionHandlers())
 
     // Both entries durable, and the writer stopped, before recovery reads the stream: one take left the second
     // entry's write in flight while recovery read it
@@ -518,12 +518,12 @@ class SimpleCRLSuite extends FileBasedTests {
 
     le.addTx(txid, TxSave(TxForm(trs, keepUpdates = true), writesPieces = true), completionHandler)
 
-    val entryLocation = stream.writeEntry(le, 0, StreamLocation.Null, () => ())
+    val entryLocation = stream.writeEntry(le, 0, StreamLocation.Null, () => le.runCompletionHandlers())
 
     assert(entryLocation.streamId == stream0)
     assert(entryLocation.offset == 0)
 
-    queue.take() // Block till completion handlers are run
+    queue.take() // Block till the entry is written
 
     streamWriter.shutdown()
 
@@ -902,7 +902,7 @@ class SimpleCRLSuite extends FileBasedTests {
     failsFast(crl.loadStore(storeId2, StoreRecoveryState(List(trsValidTxd2), Map(transactionId2 -> stubStart))))
     assertThrows[CrlFailed](crl.getFullRecoveryState(storeId))
 
-  test("A CRL whose writer thread died fails every call, reports the death once and recovers on reopen") {
+  test("A CRL whose completion handler threw fails every call, reports the death once and recovers on reopen") {
     val died = new LinkedBlockingQueue[Throwable]()
     val i = SimpleCRL(tdir, 3, 1024 * 1024, t => died.put(t))
     val err = new RuntimeException("completion handler failed")
@@ -1008,12 +1008,11 @@ class SimpleCRLSuite extends FileBasedTests {
     assertShutdownReturns(i.crl)
   }
 
-  test("A dead CRL writer thread is reported") {
+  test("A completion handler that throws kills the CRL, and the death is reported") {
     val died = new LinkedBlockingQueue[Throwable]()
     val i = SimpleCRL(tdir, 3, 1024 * 1024, t => died.put(t))
     val err = new RuntimeException("completion handler failed")
 
-    // Completion handlers run on the writer thread
     i.crl.save(transactionId, trsValidTxd, () => throw err)
 
     assert(died.poll(10, TimeUnit.SECONDS) eq err)
@@ -1367,15 +1366,12 @@ class SimpleCRLSuite extends FileBasedTests {
   test("Re-saved transaction survives recovery when its earlier delete shares an entry with a live transaction") {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
-    val gate = new CountDownLatch(1)
 
     val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
-    // Completion handlers run on the writer thread before the IO thread sees the write finish.
-    // Holding the writer inside tx1's handler guarantees that the delete of tx1 and the save of
-    // tx2 are batched into the same log entry, and the re-save of tx1 lands in a later one.
-    i.crl.save(transactionId, trsValidTxd, () => { queue.put(""); gate.await() })
-    queue.take()
+    // Holding the writer once tx1's entry is written guarantees that the delete of tx1 and the save of tx2 are
+    // batched into the same log entry, and the re-save of tx1 lands in a later one.
+    val gate = holdWriter(i.crl, (transactionId, trsValidTxd)).release
     i.crl.deleteTransaction(storeId, transactionId)
     i.crl.save(transactionId2, trsValidTxd2, completionHandler)
     gate.countDown()
@@ -1397,13 +1393,11 @@ class SimpleCRLSuite extends FileBasedTests {
 
   test("Save after a delete in the same unwritten entry is skipped but reports success") {
     val queue = new LinkedBlockingQueue[String]()
-    val gate = new CountDownLatch(1)
 
     val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     // Hold the writer so that everything below is batched into a single log entry
-    i.crl.save(transactionId2, trsValidTxd2, () => { queue.put("first"); gate.await() })
-    queue.take()
+    val gate = holdWriter(i.crl)
     i.crl.save(transactionId, trsValidTxd, () => queue.put("save"))
     i.crl.deleteTransaction(storeId, transactionId)
     i.crl.save(transactionId, trsValidTxd, () => queue.put("late save"))
@@ -1430,14 +1424,12 @@ class SimpleCRLSuite extends FileBasedTests {
 
   test("A save skipped after a delete in the same entry does not pin the log across a full wrap") {
     val queue = new LinkedBlockingQueue[String]()
-    val gate = new CountDownLatch(1)
 
     // Three entries per stream
     val i = SimpleCRL(tdir, 3, 4096 * 3)
 
     // Hold the writer so that the save, delete and late save are batched into a single log entry
-    i.crl.save(transactionId2, trsValidTxd2, () => { queue.put("first"); gate.await() })
-    queue.take()
+    val gate = holdWriter(i.crl)
     i.crl.save(transactionId, trsValidTxd, () => queue.put("save"))
     i.crl.deleteTransaction(storeId, transactionId)
     i.crl.save(transactionId, trsValidTxd, () => queue.put("late save"))
@@ -1667,14 +1659,14 @@ class SimpleCRLSuite extends FileBasedTests {
       List(ObjectUpdate(ObjectId(new UUID(0, 9)), DataBuffer(payload))), disp, status, pax)
     val le = LogEntry(new Image(new LivePieces))
     le.addTx(txid, TxSave(TxForm(a, keepUpdates = true), writesPieces = true), () => queue.put(""))
-    stream.writeEntry(le, 0, StreamLocation.Null, () => ())
+    stream.writeEntry(le, 0, StreamLocation.Null, () => le.runCompletionHandlers())
     queue.take()
 
     // The stream's next cycle: its only entry covers the first page, leaving A's payload behind it
     stream.recycleStream()
     val le2 = LogEntry(new Image(new LivePieces))
     le2.addTx(txid2, TxSave(TxForm(trs2, keepUpdates = true), writesPieces = true), () => queue.put(""))
-    stream.writeEntry(le2, 1, StreamLocation.Null, () => ())
+    stream.writeEntry(le2, 1, StreamLocation.Null, () => le2.runCompletionHandlers())
     queue.take()
     val stopped = new CountDownLatch(1)
     streamWriter.shutdown(() => stopped.countDown())
@@ -2036,12 +2028,8 @@ class SimpleCRLSuite extends FileBasedTests {
 
   /** Saves `transactionId2`'s state and holds the writer until the returned latch is counted down: requests queued
     * meanwhile are batched into a single log entry */
-  private def holdWriter(crl: CrashRecoveryLog): CountDownLatch =
-    val first = new LinkedBlockingQueue[String]()
-    val gate = new CountDownLatch(1)
-    crl.save(transactionId2, trsValidTxd2, () => { first.put(""); gate.await() })
-    first.take()
-    gate
+  private def holdWriter(crl: SimpleCRL): CountDownLatch =
+    holdWriter(crl, (transactionId2, trsValidTxd2)).release
 
   test("an applied stub written after its transaction's deletion in the same entry is kept") {
     val q = new LinkedBlockingQueue[String]()
@@ -2509,22 +2497,67 @@ class SimpleCRLSuite extends FileBasedTests {
     val (tid, t) = mkTx(n, 0)
     (tid, t.copy(objectUpdates = List(ObjectUpdate(ObjectId(new UUID(9, n)), DataBuffer(Array.fill[Byte](bytes)(n.toByte))))))
 
-  /** A completion handler that blocks the writer thread, once it runs, until `release` is counted down: every request
-    * queued meanwhile is processed into unwritten entries, and the files hold exactly the entries written so far */
+  /** Holds the writer once an entry is written, until `release`: its WriteComplete is withheld, so none of its
+    * handlers runs and nothing more is issued (SimpleCRL.entryWrittenForTest). Every request queued meanwhile is
+    * processed into unwritten entries, and the files hold exactly the entries written so far */
   private class Hold:
     val reached = new CountDownLatch(1)
     val release = new CountDownLatch(1)
-    val handler: () => Unit = () =>
+    def block(): Unit =
       reached.countDown()
       release.await(10, TimeUnit.SECONDS)
     def awaitReached(): Unit = assert(reached.await(10, TimeUnit.SECONDS))
 
-  /** Saves `t` with a handler that holds the writer, once that save's entry is written */
-  private def holdWriter(crl: SimpleCRL, t: (TransactionId, TransactionRecoveryState)): Hold =
+  /** A hold of the first entry written from now on that holds a save of `t`. Installed before the save is made */
+  private def holdEntryOf(crl: SimpleCRL, t: (TransactionId, TransactionRecoveryState)): Hold =
     val hold = new Hold
-    crl.save(t._1, t._2, hold.handler)
+    val id = TxId(t._2.storeId, t._1)
+    val fired = new AtomicBoolean(false)
+    val previous = crl.entryWrittenForTest
+    crl.entryWrittenForTest = e =>
+      previous(e)
+      if e.txWrite(id).isDefined && fired.compareAndSet(false, true) then
+        hold.block()
+    hold
+
+  /** Saves `t` and holds the writer once that save's entry is written */
+  private def holdWriter(crl: SimpleCRL, t: (TransactionId, TransactionRecoveryState)): Hold =
+    val hold = holdEntryOf(crl, t)
+    crl.save(t._1, t._2, () => ())
     hold.awaitReached()
     hold
+
+  test("A slow completion handler does not hold up the next entry's write (CRL-W4)") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    val a = (transactionId, trsValidTxd)
+    val b = (transactionId2, trsValidTxd2)
+    val held = holdEntryOf(i.crl, a)
+    val written = new LinkedBlockingQueue[LogEntry]()
+    val previous = i.crl.entryWrittenForTest
+    i.crl.entryWrittenForTest = e =>
+      previous(e)
+      written.put(e)
+    val inHandler = new CountDownLatch(1)
+    val handlerRelease = new CountDownLatch(1)
+    i.crl.save(a._1, a._2, () => { inHandler.countDown(); handlerRelease.await(10, TimeUnit.SECONDS) })
+    held.awaitReached()
+    // B waits in the next entry while A's is written but unacknowledged
+    val bDone = new LinkedBlockingQueue[String]()
+    i.crl.save(b._1, b._2, () => bDone.put("b"))
+    held.release.countDown()
+    assert(inHandler.await(10, TimeUnit.SECONDS))
+    // A's handler still runs, and B's entry is written meanwhile
+    val bId = TxId(b._2.storeId, b._1)
+    def bWritten(): Boolean =
+      val e = written.poll(10, TimeUnit.SECONDS)
+      assert(e != null, "B's entry was not written while A's handler ran")
+      e.txWrite(bId).isDefined || bWritten()
+    assert(bWritten())
+    assert(bDone.poll(50, TimeUnit.MILLISECONDS) == null)
+    handlerRelease.countDown()
+    assert(bDone.poll(10, TimeUnit.SECONDS) == "b")
+    i.crl.shutdown()
+  }
 
   /** `f` evaluated on the CRL thread, after every request queued before */
   private def onCrl[T](crl: SimpleCRL)(f: => T): T =
@@ -2612,8 +2645,8 @@ class SimpleCRLSuite extends FileBasedTests {
     val a = sized(1, 3000)._2  // and its late data
     val f1 = sized(2, 20000)
     val f2 = sized(3, 20000)
-    val inE1 = new Hold
-    i.crl.save(aId, a0, inE1.handler)
+    val inE1 = holdEntryOf(i.crl, (aId, a0))
+    i.crl.save(aId, a0, () => ())
     i.crl.save(f1._1, f1._2, () => ())
     i.crl.save(f2._1, f2._2, () => ()) // Seals A0 and F1's entry, E1
     val done = new LinkedBlockingQueue[String]()
@@ -2677,9 +2710,9 @@ class SimpleCRLSuite extends FileBasedTests {
     saveAndWait(i.crl, transactionId, trsValidTxd)
     // The deletion's entry is written, and its write held from completing by the handler of a save beside it
     val first = holdWriter(i.crl, sized(100, 100))
-    val hold = new Hold
+    val hold = holdEntryOf(i.crl, sized(101, 100))
     i.crl.deleteTransaction(storeId, transactionId)
-    i.crl.save(sized(101, 100)._1, sized(101, 100)._2, hold.handler)
+    i.crl.save(sized(101, 100)._1, sized(101, 100)._2, () => ())
     first.release.countDown()
     hold.awaitReached()
     val done = new LinkedBlockingQueue[String]()
@@ -2701,8 +2734,8 @@ class SimpleCRLSuite extends FileBasedTests {
     val hold = holdWriter(i.crl, h)
     val f1 = sized(2, 20000)
     val f2 = sized(3, 20000)
-    val inE2 = new Hold
-    i.crl.save(f1._1, f1._2, inE2.handler)
+    val inE2 = holdEntryOf(i.crl, f1)
+    i.crl.save(f1._1, f1._2, () => ())
     i.crl.save(f2._1, f2._2, () => ()) // Seals F1's entry
     i.crl.deleteTransaction(storeId, transactionId) // Behind it
     assert(onCrl(i.crl)(i.crl.sealedEntryCount) == 1)
@@ -3148,11 +3181,16 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(i.crl.currentStreamNumber == 1)
     val s = sized(2, 21000)
 
+    // S's entry, the rotation's head, has been written: its handlers may run only after the commit
     val sDurable = new AtomicBoolean(false)
+    val sId = TxId(s._2.storeId, s._1)
+    i.crl.entryWrittenForTest = e =>
+      if e.txWrite(sId).isDefined then
+        sDurable.set(true)
     val durableAtCommit = new LinkedBlockingQueue[Boolean]()
     i.crl.onAdmissionLimitRaised(_ => durableAtCommit.put(sDurable.get))
     val release = holdCrlThread(i.crl)
-    i.crl.save(s._1, s._2, () => sDurable.set(true))
+    i.crl.save(s._1, s._2, () => ())
     i.crl.requestGrowth()
     // S, then the growth, queue behind the held CRL thread: S's rotation is under way, its evacuation of X in flight,
     // when the growth arrives

@@ -48,7 +48,7 @@ store; an applied stub is a `TransactionId` with its transaction's start `HLCTim
 
 | Method | Meaning |
 |--------|---------|
-| `save(txid, state, onDurable)` | Make `state` durable; `onDurable` runs once it is. Saves for one (store, txid) replace one another; the newest wins. |
+| `save(txid, state, onDurable)` | Make `state` durable; `onDurable` runs once it is, on the CRL's completion thread (C2). Saves for one (store, txid) replace one another; the newest wins. |
 | `deleteTransaction(store, txid)` | Lazy, unacknowledged deletion of the transaction state. A crash before it is written leaves the transaction recoverable. An applied stub of the id stays. |
 | `deleteTransactions(store, txids): Future` | Deletes transaction state **and** applied stubs of each id, in one entry; completes once that entry is durable. An empty list completes at once. |
 | `dropTransactionObjectData(store, txid)` | Memory only: saves made after it leave the object data out. Nothing is written. Saves already queued, and the last-built form an evacuation carries, keep the data until a later save is built (5.3). |
@@ -62,7 +62,7 @@ store; an applied stub is a `TransactionId` with its transaction's start `HLCTim
 | `storesWithEntries(): Future[Set[StoreId]]` | Stores with live entries, stub-only stores included. |
 | `recoveredBytesByStore` | What the open recovered for each store, as admission counts it (section 6). |
 | `failed: Future[Throwable]` | Completes, with the cause, if the CRL dies (5.10). |
-| `shutdown()` | Blocks until the CRL's threads have stopped and its files are closed. Idempotent. |
+| `shutdown()` | Blocks until the CRL's thread and writer have stopped and its files are closed. Handlers already handed to the completion thread may still finish after it returns. Idempotent. |
 | `admissionLimitBytes` | The device's admission limit (section 6): `(n − 2) · S/2 − S/16` in SimpleCRL, for `n` streams of `S` bytes. |
 | `maxTransactionBytes` | The most bytes, as admission counts them, one store's transaction may hold: `S/2 − 8192` in SimpleCRL. A prepare past it is dropped unsaved (section 6, Oversized). |
 | `requestGrowth()` | Asks for more room; cheap, idempotent, from any thread. SimpleCRL adds one stream if its growth policy allows (5.11). |
@@ -83,10 +83,13 @@ no failure, no per-transaction bound, no growth) are for CRLs that keep nothing 
   and still acknowledged (C9, W1b). A deletion is the store's decision to forget the transaction, which already
   makes every earlier state of it forgettable.
 - **C2 (entry order).** Entries are written one at a time, in serial order. Entry N+1 is not issued until entry N's
-  write returned and every handler of N ran (`writeInProgress`; the writer queues `WriteComplete` only after the
-  handlers). So when a handler of entry N runs, every earlier entry is durable. Handlers run on the **writer thread**,
-  newest first within an entry (`LogEntry.completionHandlers` is prepended and run in list order). Callers that touch
-  store state post to the store's executor (`Frontend.post`); `Tx`'s prepare and accept handlers only send messages.
+  write returned and the CRL thread processed its `WriteComplete` (`writeInProgress`). At that point the CRL thread
+  issues the next entry and hands N's handlers, and then the barriers waiting on N (`afterInFlight`), to the
+  **completion thread**, which runs them while N+1 is written. So when a handler of entry N runs, every entry up to N
+  is durable. The completion thread runs every handler (save, stub, deletion, barrier) in the order the CRL thread
+  hands them over, newest first within an entry (`LogEntry.completionHandlers` is prepended and run in list order).
+  A handler never blocks it. Callers that touch store state post to the store's executor (`Frontend.post`); `Tx`'s
+  prepare and accept handlers only send messages.
 - **C3 (single run).** Each handler runs at most once, and only if its entry's write returned normally. A CRL that
   dies runs no handler of an entry not yet written.
 - **C4 (newest wins).** After recovery, each live record has the state of its newest durable record
@@ -406,14 +409,16 @@ who has learned the id, which means read access to the device itself.
 
 ### 5.3 In-memory structures and threads
 
-Two threads per CRL, and a third for growth when the CRL may grow:
+Three threads per CRL, and a fourth for growth when the CRL may grow:
 
 - the **CRL thread** takes `ActionRequest`s from `ioQueue` and owns all mutable state: the live records
   (`transactions`, `stubs`), the durable image (`Image`) with its live-piece index (`LivePieces`), the unwritten
   entries (`sealedEntries`, `currentLogEntry`), the streams' offsets, and `afterInFlight` barriers;
 - the **writer thread** (`StreamWriter`) takes `Write` commands, positions the channel and writes every buffer
-  (`writeFully` loops, since a gathering write takes at most `IOV_MAX` buffers per call), then runs the entry's
-  completion handlers and queues `WriteComplete` to the CRL thread (`Stream.writeEntry`);
+  (`writeFully` loops, since a gathering write takes at most `IOV_MAX` buffers per call), then queues `WriteComplete`
+  to the CRL thread (`Stream.writeEntry`). It runs no handler;
+- the **completion thread** (`SimpleCRL.completions`) runs the handlers the CRL thread hands it at each
+  `WriteComplete` (C2), so neither the next write nor the next entry's build waits for their network sends;
 - the **growth thread** (none when `crl-max-streams` is at or below the ring size at open) runs a growth's slow
   steps off the CRL thread, so a zero-filling preallocation never delays a write (5.11).
 
@@ -511,8 +516,9 @@ written only into the active stream, so every piece in a stream is reached as "n
 
 - Every stream file is opened `DSYNC`: each `write` returns only after its data and the metadata needed to read it are
   on stable storage (AS1). No separate `force`, no `O_DIRECT`.
-- One write in flight per CRL; throughput is `entries/s = 1 / (write latency + handler time)`, since the next entry is
-  issued only after the previous one's handlers ran (C2).
+- One write in flight per CRL; throughput is about `entries/s = 1 / max(write latency, handler time)`: the next entry
+  is issued as the previous one's handlers are handed to the completion thread, so the write and the handlers'
+  sends overlap (C2). `BackendTiming` logs both, as the `crl write` and `crl handlers` stages.
 - Preallocation with `fallocate` leaves unwritten extents; the first write to each converts it, a metadata change
   `DSYNC` commits with the write.
 - `DurableFiles` (tmp, `force`, atomic rename, directory fsync) is used for `sizing`, the stream files' creation, and
@@ -576,9 +582,9 @@ supersedes them. A save after a final deletion in any unwritten entry is skipped
 
 ### 5.9 Barriers
 
-`whenDurable` queues a `Barrier`: if an unwritten entry holds anything, its handler is added to the newest one (run on
-the writer thread); else if a write is in flight it waits in `afterInFlight` and runs on the CRL thread at
-`WriteComplete`; else it runs at once. Every request queued before the barrier is in an unwritten entry no newer than
+`whenDurable` queues a `Barrier`: if an unwritten entry holds anything, its handler is added to the newest one; else if
+a write is in flight it waits in `afterInFlight` and is handed over at that write's `WriteComplete`, after the entry's
+own handlers; else it is handed over at once. It runs on the completion thread in every case (C2). Every request queued before the barrier is in an unwritten entry no newer than
 that one, in the entry being written, or already durable, and entries are written in order, so this is exact.
 
 ### 5.10 Shutdown and death
@@ -587,13 +593,16 @@ that one, in the entry being written, or already durable, and entries are writte
 write in flight, closes the channels, releases the lock and signals. The unwritten entries, sealed and newest, are
 discarded; none of their handlers has run (C3). Futures of requests not yet written are never completed (CRL-W5).
 
-The CRL has one death path. A writer that throws (an I/O error, a completion handler that throws) closes its channels
-and queues `WriterDied`; the CRL thread throws it. Any throw on the CRL thread (including a head not written after
+The CRL has one death path. A writer that throws (an I/O error) closes its channels and queues `WriterDied`, and a
+completion handler that throws queues `HandlerFailed` (the rest of its batch does not run); the CRL thread throws
+either. Any throw on the CRL thread (including a head not written after
 `n − 1` rotations, W6, and `Stream.writeEntry`'s `require`) marks the CRL dead, fails every pending tracked Future (`readStoreState`, `deleteTransactions`, `dropStore`,
 `storesWithEntries`, `loadStore`'s saves) with `CrlFailed`, shuts the writer down (releasing the lock), completes
 `failed` and calls `onThreadDeath` once. Every later tracked call fails with `CrlFailed`. Handler-style completions
 (`save`, `saveAppliedStub`, `whenDurable`) never run for an unwritten entry, so no vote follows. An entry whose write
-was already in flight when the CRL thread died is still written and its handlers run. The files hold what was
+was already in flight when the CRL thread died is still written, but its handlers never run, since only the CRL
+thread hands them over. Handlers already handed over still run: their entries are durable, and the shutdown of the
+completion thread lets them finish. The files hold what was
 written, so a restart recovers them as after a crash.
 
 Shutdown and death stop growth first (5.11), before the lock is released.
@@ -1156,21 +1165,6 @@ at `writeHead`'s `require`, which only a bug can reach.
 ---
 
 ## Open weaknesses
-
-### CRL-W4. Completion handlers run on the writer thread before the next write is issued (PLAUSIBLE; performance)
-Mechanism: `Stream.writeEntry`'s callback runs `entry.runCompletionHandlers()` and only then queues `WriteComplete`;
-the writer thread runs the callback before taking its next command, and the CRL thread issues the next entry only on
-`WriteComplete`. The handlers of `Tx.answerPrepareAsAcceptor`, `sendDelayedPrepare` and `receiveAccept` send network
-messages inline (`net.sendTransactionMessage`, `sendClientResponse`: QUIC lookup, encode and submit per message).
-Trigger / scenario: group commit under load: an entry carrying thousands of saves runs thousands of sends serially on
-the one writer thread of the device, adding their time to every entry's cycle. On NVMe, where a `DSYNC` takes tens
-of microseconds, the handler time can exceed the write time.
-Consequence: device CRL throughput, and so every vote on the device, is bounded by single-threaded message encoding
-as well as by the write.
-Suggested fix: hand an entry's handlers to a dedicated, ordered completion executor (or post each to its store's
-executor) and queue `WriteComplete` at once; C2's guarantee (every earlier entry durable when a handler runs) is
-unaffected. Measure with `BackendTiming`-style timing first.
-Effort: S   Priority: 5
 
 ### CRL-W5. `shutdown()` leaves pending Futures uncompleted forever (CONFIRMED mechanism; PLAUSIBLE trigger; liveness)
 Mechanism: `SimpleCRL`'s `Shutdown` case shuts the writer down and returns; only the death path calls `failPending`,

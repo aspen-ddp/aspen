@@ -122,6 +122,14 @@
   every pending and later Future fails with `CrlFailed` (`SimpleCRL.tracked`), `failed` completes and
   `onThreadDeath` runs once. Save completions never run, so no vote follows. The host unloads the device until it
   restarts (`DeviceShutdown.crlFailed`, `server/host/CLAUDE.md`), and the restart recovers the files as after a crash
+- Completion handlers (save, stub, deletion, `whenDurable`) run on the CRL's **completion thread**
+  (`SimpleCRL.completions`), never on the writer or CRL thread (safety `crash-recovery-log.md` C2). At each
+  `WriteComplete` the CRL thread issues the next entry first, then hands over the written entry's handlers and its
+  `afterInFlight` barriers, so the handlers' network sends overlap the next write. A barrier or empty deletion that
+  completes at once is handed over too, so every handler runs in request order. Handlers must not block: one slow
+  handler delays every later one on the device. One that throws fails the CRL (`HandlerFailed`). `BackendTiming`
+  logs the `crl write` and `crl handlers` stages. Tests hold a written entry unacknowledged with
+  `entryWrittenForTest` (`SimpleCRLSuite.holdEntryOf`), never with a blocking handler
 - `admissionLimitBytes` (SimpleCRL: `(n − 2) · S/2 − S/16` for `n` streams of `S` bytes, 15S/16 at 4 streams: with
   it every evacuation fits and every head is written within `n − 1` rotations, safety 6.1) sizes the device's
   `CrlAdmission`, which drops prepares for unseen transactions past it. It rises with each committed growth

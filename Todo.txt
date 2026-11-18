@@ -59,10 +59,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.3  CRL completion handlers run on the writer thread before the next write: CRL-W4                        [S]
-     PLAUSIBLE. Network sends in handlers serialize on the device's one writer thread under group commit. Fix:
-     ordered completion executor; queue WriteComplete at once. Measure first.
-
 5.4  CRL shutdown() leaves pending Futures uncompleted: CRL-W5                                             [S]
      CONFIRMED mechanism. droppingCrlState / crlDropsRunning keep a store until process restart. Fix: fail
      every pending and later call with CrlClosed.
@@ -109,7 +105,6 @@ PRIORITY 7: documentation corrections
      MissedUpdateMarker.writeBatch (head chunk may itself be None);
      UnackedCommitEntry (lists every changed object, not only traceless ones); RepairPolicy
      .minErrorEntryAgeForDeletion (age paces a read; only InvalidObject.provesDeletion deletes);
-     CrashRecoveryLog trait (saveAppliedStub / whenDurable handlers run on the writer thread);
      TransactionDescription.tracelessObjects has no caller (remove).
 
 7.5  Stale text in Backlog.txt                                                                              [S]

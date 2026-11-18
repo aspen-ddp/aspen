@@ -36,10 +36,9 @@ class Stream(val streamId: StreamId,
 
     val buffers = entry.createEntryBuffers(serial, previous, nextWriteOffset, crlId, currentUUID, streamId)
 
-    streamWriter.write(streamId, nextWriteOffset, buffers, () =>
-      entry.runCompletionHandlers()
-      onWriteComplete()
-    )
+    // The entry's handlers are handed to the completion thread once the CRL thread processes this completion
+    // (SimpleCRL, WriteComplete)
+    streamWriter.write(streamId, nextWriteOffset, buffers, onWriteComplete)
 
     nextWriteOffset += entrySize
     entryLocation

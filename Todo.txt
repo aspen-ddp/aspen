@@ -1,8 +1,8 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, fourth pass, built 2026-11-18 against 0941d4fd)
--------------------------------------------------------------------------------------
+Safety work list (from docs/safety/*, fifth pass, built 2026-11-19 against c2df32ba)
+------------------------------------------------------------------------------------
 
 Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
 once, grouped where one change addresses several ids. Completed items are removed; their record is in git history.
@@ -39,13 +39,34 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-(no open items)
+1.1 [Q-W12] Compatible KeyValue votes that each fit the slice limit commit together; the later apply is skipped.
+    CONFIRMED. Effort M. transaction-requirements.md.
+    Disjoint-key KeyValueUpdates on one object hold compatible locks, and each vote's checkSliceSize
+    (RequirementsChecker.check) measures its growth against the current state only. Both commit; the apply re-check
+    (Tx.issueCommits -> RequirementsApplyer.apply with frontend.maxSliceSize) fails SliceSizeExceeded for whichever
+    applies second, which is logged as an INVARIANT VIOLATION and skipped. Stores applying in different orders keep
+    different halves, so no replica may hold the second update: committed data lost. TKVL allows maxNodeSize up to
+    the slice limit, so a nearly full node under concurrent inserts can hit it.
+    Fix: a per-object reservation of the growth that lock-holding commit votes have yet to apply, kept with the
+    locks and released at unlock, included in the vote-time size check, so votes a store holds together always fit
+    together. Keep the apply-time check. Do not drop it: FSIF's slice limit is its segment payload, so an oversized
+    slice would fail the backend commit and poison the object. State the concurrency limit in client/tkvl/CLAUDE.md.
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-(no open items)
+2.1 [Q-W13, X-W7] A non-voter's blind Insert applied after a Delete of its key writes the key back unreported.
+    PLAUSIBLE. Effort S. transaction-requirements.md, cross-document-review.md.
+    Q-W13: a store that did not vote commit for T applies a later D first (a Delete on a required revision alone is
+    a no-op on the absent key), then T's Insert passes its re-check and writes k back; issueCommits' reinserts test
+    covers only repairedUnder objects and recovered votes. X-W7: D carries a KeyRevision, fails at S and marks it, but
+    a later write E leaves S's timestamp equal to the repair read's, so the repair installs nothing, records no
+    repair install, and deletes the entry; T's held lock-order apply then writes k back. Permanent silent divergence.
+    Fix (covers both): in Tx.issueCommits, report a blind Insert of a key absent before the apply whenever the Tx did
+    not vote commit here. A non-voter is not counted toward t, so the report costs a repair pass, not margin.
+    Tightening the Delete rule alone fixes Q-W13 but not X-W7 (and would need a content lock in
+    SimpleTaskExecutor.deallocateTask).
 
 
 PRIORITY 3: systemic loss protection
@@ -57,12 +78,44 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
+4.1 [X-W8] A store whose config cannot be read at load, or whose executor slot is still held, is left unserved and
+    untracked. PLAUSIBLE. Effort S. cross-document-review.md.
+    StoreLoader.tryLoadStore's catch-all only logs a loadStoreConfig failure; AlreadyAssigned goes to abandonLoad with
+    no retry. Reached from device load, the Completed Transfers In and Completed Rebuilds passes (which remove their
+    marker first) and reloadClosedStores. The Active store stays unserved until a restart, using a unit of w - t.
+    Fix: record the store offline and in storesAwaitingRetry (retryFailedLoads already re-runs tryLoadStore); correct
+    the reloadClosedStores scaladoc.
+
+4.2 [RB-W14] A rebuild-complete removal whose unlink succeeded but whose directory sync failed leaves the store
+    unserved until a restart. PLAUSIBLE. Effort S. rebuild-process.md.
+    DurableFiles.remove unlinks, syncDirectory throws, clearRebuildCompleteMarker returns false and the copy is kept
+    offline for the Completed Rebuilds pass, which selects only stores whose marker still exists. The old copy is
+    released meanwhile.
+    Fix: the Completed Rebuilds pass also retries removals it or the Adopt branch left pending (or any offline Active
+    store with no marker), and the retry syncs the directory even when the marker is already gone.
+
+4.3 [RB-W13] A transfer onto a device whose store path holds a copy of an earlier tenancy never starts.
+    PLAUSIBLE. Effort S. rebuild-process.md.
+    Host down while device D holds an unretired finished rebuild or a rebuild-required copy; replaceRebuild moves the
+    store elsewhere, then a transfer moves it back (D's entry TransferringIn). No pass clears the path (Deleted Stores
+    needs no entry, retireForeignCopy needs Rebuilding, Completed Rebuilds needs Active), so StoreTransfers.startIn
+    logs "store path already exists" at every check until an operator aborts.
+    Fix: in startIn, retire (StoreCopies.retire) a copy at the path carrying rebuild-complete or rebuild-required,
+    then start once the path is clear. It must retire before the transfer can make the entry Active:
+    markRebuiltStoreActive adopts an Active entry without an episode check (cross-document-review.md 2.2).
+
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
+
 
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-(no open items)
+5.1 [Q-W14] A lock-order waiter withholds colliding lock-only votes it would never wait for.
+    CONFIRMED. Effort S. transaction-requirements.md.
+    Tx.lockWaitBlocked asks wouldWaitFor, which tests the lock collision but not the Frontend.changes filter that
+    awaitLockHolders applies, so lock-only votes (a vdisk fence lock, repair proofs) wait up to CollisionWait and then
+    vote abort needlessly.
+    Fix: skip a waiter none of whose changed objects this transaction changes.
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
@@ -74,7 +127,15 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-(no open items)
+7.1 [R-W8, CRL-W10] Tx.scala scaladoc. CONFIRMED. Effort S. transaction-recovery.md, crash-recovery-log.md.
+    Tx.issueCommits cites a nonexistent Frontend.awaitReplayHazardsDurable (it is awaitBlindInsertsDurable).
+    Tx.persistWithoutUpdateOf, Tx.droppedUpdates and server/transaction/CLAUDE.md describe only the deletion of an
+    object the Tx allocated; awaitBlindInsertsDurable also calls it for blind-Insert key deletions.
+
+7.2 [SL-W11] server/store/backend/fsif/DESIGN.md 4.6 says a non-ENOSPC open failure is not retried before a restart.
+    CONFIRMED. Effort S. systemic-loss-protection.md.
+    StoreLoader.handleBackendOpened puts every such failure in storesAwaitingRetry; retryFailedLoads reopens it at
+    each ScanDevices with backoff.
 
 
 PRIORITY 8: unimplemented features

@@ -92,7 +92,7 @@ retransmit 1 s. `TestNetwork` builds recovery drivers with 10 ms / 100 ms.
 | `errorTimeout` | 2 s | `MissedUpdateFinalizationAction.errorTimeout` | Marker waits this long after it executes for `TxCommitted`s before marking |
 | Finalizer restart | 1 s doubling to 60 s | `TransactionDriver.finalizerRetryDelay` | Backoff of a failed finalizer |
 | `FinalizationStallAfter` | 60 s | `TransactionDriver.finalizationStall`, `FinalizationStallReport` | `FINALIZATION STALLED` logged once a minute per store |
-| `Tx.CollisionWait` | 500 ms (+ up to 1 s granularity) | `Tx.checkCollisionWait` | Vote withheld for a lock holder the Tx builds on |
+| `Tx.CollisionWait` | 500 ms (+ up to 1 s granularity) | `Tx.checkCollisionWait` | Vote withheld for a lock holder the Tx builds on, or for a committed Tx waiting in lock order whose wait collides with the vote's locks (`Tx.lockWaitBlocked`, `lockWaitBlockStart`); then it votes abort |
 | `Frontend.MissingDataWait` | 5 s | `Tx.awaitingClientPrepare` | A Tx that has seen no client prepare withholds promise and vote this long (from its creation), then votes abort (`NoClientPrepare`), requirements unchecked |
 | `Frontend.UnackedLookupTimeout` | 5 s | `Frontend.retryUnackedLookups` | Logs an UnackedCommits lookup still unanswered (it is not re-issued); a failed one is retried at the next heartbeat |
 | `prepareResponseCache` | 10 s, 1000 entries | `Store` | Prepare responses arriving before the store's driver exists, replayed into it |
@@ -350,8 +350,9 @@ up and fails every entry of the batch. The marker transaction is `replaySafe` (m
   `TxCommitted` or has an entry, through which a recovered or expiring voter applies T, and repair leaves the entry
   alone while the store may still hold or join T. A `TxCommitted` naming no changed object means its backend commits
   persisted, so at least a write threshold of stores holds T. One naming objects comes from a store that holds T
-  already (a stub), is not owed it (another incarnation), or keeps T's CRL state for a failed backend commit; the
-  last two keep the object out of the write-threshold count until that state is replayed or repair reconciles the
+  already (a stub), that applied T but reports objects for repair (a recovered Tx that did not vote commit, a blind
+  Insert over a possibly newer deletion, a live voter's invariant violation: 7.4), that is not owed it (another
+  incarnation), or that keeps T's CRL state for a failed backend commit; the last two keep the object out of the write-threshold count until that state is replayed or repair reconciles the
   copy. Such a store set `keptForReplay`, so a counted voter among them has an entry, and a reload after
   T's finalization replays the state through it (an uncounted one's kept state applies nothing on reload; its
   ErrorTree marks repair it). An uncounted voter or non-voter that sent no `TxCommitted` gets only ErrorTree marks, which repair keeps
@@ -414,8 +415,13 @@ Mechanism and proofs: paxos-transactions.md (transaction horizon), `server/trans
   are final.
 * A store with no Tx answers a cached outcome, or "unknown" only below its floor (a permanent answer); a rebuilt store
   answers `amnesiac` for T started before its `acceptorSince`. A Tx created from a cached outcome (`Tx.outcomeDecided`)
-  answers that outcome as the cache now holds it (`Tx.statusForExpiry`), so an observer adopts it. An unresolved Tx
-  answers only once frozen with its objects loaded (a commit vote only once durable, `Tx.voteDurable`), or muted for
+  answers that outcome as the cache now holds it (`Tx.statusForExpiry`), so an observer adopts it. A Tx resolved
+  through its UnackedCommits entry answers, as any resolved Tx does, before it is frozen, but reports its saved
+  status (`Unresolved`, its vote and accept) until finalized, so no observer adopts a non-late commit from it. Its
+  accepted value may still change after such a reply; that is harmless, since T committed (its entry exists): an
+  observer's commit is right, and an observer's discard is one a committed T allows (a commit voter discards only after
+  a lookup finds no entry, and every store that sent no `TxCommitted` gets the marks the finalizer writes). An
+  unresolved Tx answers only once frozen with its objects loaded (a commit vote only once durable, `Tx.voteDurable`), or muted for
   good; until then it is silent.
 * `ExpiryTally.decide` adopts an outcome, decides commit (`Frontend.onExpiryCommit` -> `Store.finalizeExpiryCommit`:
   the deciding store resolves T at every store and its driver finalizes it, so its marks repair the stores that never
@@ -459,7 +465,8 @@ Code: `server/host/StoreLoader` (`awaitCrlLoad`, `handleUnloadFailed`), `StoreRo
 is dropped, durably, before the file is loaded into it (crash-recovery-log.md). The recovered state is counted in the
 device's admission before what was retained for the store is released (`Frontend.recoverState`).
 
-While `Frontend.holding` (CRL awaited, recovered transactions loading, or undecided recovered ones waiting) the store
+While `Frontend.holding` (CRL awaited, recovered transactions loading, or loaded recovered ones that do not relock
+waiting for those that do, 7.2) the store
 queues every transaction message in arrival order and handles them after (`receiveTransactionMessage`,
 `releaseHeldMessages`), and drops client reads (a read before a recovered commit vote retook its locks would report
 the pre-commit state unlocked). `Store.handleTransactionMessage` still routes driver messages (prepare responses,
@@ -490,8 +497,10 @@ Ordering (`Frontend.recoveredTransactionLoaded`, `Tx.completeLoad`):
 1. Every recovered Tx is registered before any object read starts, so a synchronously loaded one cannot release the
    held messages early.
 2. A recovered `VoteCommit` with unresolved status completes its load as soon as its objects load. Every other
-   recovered Tx completes only once every such vote has: first those with a persisted vote (an abort vote, or a
-   restored resolution), then those without, in the order their objects loaded. A recovered vote is kept, never
+   recovered Tx completes only once every such vote has: the ones loaded by then complete together, first those with
+   a persisted vote (an abort vote, or a restored resolution), then those without, each group in the order its
+   objects loaded; one whose objects load after that completes at once (`Frontend.recoveringTransactions`,
+   `deferredRecovered`, `undecidedRecovered`). A recovered vote is kept, never
    recomputed (it may already have been counted). A Tx without a vote promises and votes abort to any driver at once,
    but stays undecided after load so a client retransmit that arrives first is still checked; completing last, it
    cannot take locks that conflict with a recovered commit vote.
@@ -519,7 +528,11 @@ saved data.
   and the in-flight-commit marker (`Frontend.commitInFlight`) orders the transactions that follow.
 * A committed Tx holding no locks does not apply while another Tx holds locks it collides with on an object both
   change (`Tx.awaitLockHolders`, transaction-requirements.md R15): it is held (`commitHeld`) until each holder
-  releases (`Frontend.locksReleased`), and new votes whose locks it collides with wait meanwhile (`Tx.lockWaitBlocked`). A
+  releases (`Frontend.locksReleased`). A new vote whose planned locks it would wait for (`Tx.lockWaitBlocked`:
+  `RequirementsLocker.plannedLocks`, tested by the waiter's `wouldWaitFor`) withholds its vote meanwhile, no locks
+  taken, for at most `Tx.CollisionWait`, then votes abort naming the waiter (`TransactionCollision`): the waiter's
+  holder may need a vote another store's waiter withholds, and the abort ends such a cross-store cycle. Any other vote
+  decides at once. A recovered Tx is not exempt: the rule is the same once it decides a vote. A
   `TxFinalized` reaching it while held is deferred like one for a commit held for its turn
   (`Frontend.finalizationDeferred`), its CRL state kept until it applies.
 
@@ -540,7 +553,12 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   object (superseded, traceless, or its data dropped once applied). A live voter's failed re-check is an invariant
   violation, logged at error, skipped and reported; an allocation the backend missed is reported (no copy, no lost
   lock); any apply that throws fail-stops the store (transaction-requirements.md 8.5). A recovered Tx that did not vote
-  commit reports every object it applies: it may have applied before the crash.
+  commit reports every object it applies: it may have applied before the crash. A blind Insert of an absent key is
+  applied and its object reported where a repair installed a state newer than T's start (`Tx.repairInstalled`,
+  `Frontend.recordRepairInstall`) or, for a recovered commit vote, whose in-memory record of such installs died with
+  the crash, where the object's timestamp is past T's start: the state may hold a later deletion of the key the store
+  never applied, so the finalizer marks the store and repair reconciles the object (transaction-requirements.md 9.4,
+  10.5c).
 * The CRL's drop of applied object data (`Tx.allObjectCommitsComplete`, `CrashRecoveryLog.dropTransactionObjectData`)
   is in memory only, so a crash can recover a Tx with data it already applied. For allocations this matters: a
   deletion of an object an unconcluded Tx allocated here waits (`Frontend.awaitAllocationsDurable`) until that Tx's
@@ -635,6 +653,7 @@ lookup that finds no entry.
      [Undetermined] --determineDisposition--> [VoteCommit | VoteAbort | withheld | proof]
         withheld while: no client prepare yet (< MissingDataWait, promise withheld too; not for a recovered Tx)
                         / waiting on lock holders it builds on (< CollisionWait) / an in-flight commit
+                        / a colliding committed Tx waiting in lock order (< CollisionWait, then abort)
         frozen past expiry: no vote is decided, no promise or accept given
                     |
      CRL.save(vote + acceptor)  ---durable--->  TxPrepareResponse (+ TransactionVote to the client)
@@ -836,4 +855,12 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-None.
+### R-W8: `Tx.issueCommits` cites a nonexistent `Frontend.awaitReplayHazardsDurable`
+Verdict CONFIRMED. Priority 7. Effort S.
+Mechanism: the comment above `recoveredApplied` in `Tx.issueCommits` says a key's deletion reaches the backend only
+once no CRL state holds a blind Insert of it "(Frontend.awaitReplayHazardsDurable)". No such symbol exists: the
+mechanism is `Frontend.awaitBlindInsertsDurable` (registered through `Frontend.registerReplayHazards`), which the
+same file's `insertedKeys`, `holdsUpdateOf` and the `reportedApplied` comment cite correctly.
+Consequence: a reader following the safety argument for taking a recovered vote's failed re-check as applied, and
+for re-applying an Insert of an absent key, finds no such method.
+Fix: cite `Frontend.awaitBlindInsertsDurable` in that comment.

@@ -53,7 +53,7 @@ pending-allocation sweep for allocations the lost store had acknowledged (sectio
 
 | # | From | To | Writer | Condition |
 |---|---|---|---|---|
-| R1 | Active | Rebuilding (same device) | `StoreRebuilds.requestRebuild`, called by the reconcile's Lost CRL State pass | store in the device's `offlineStores` with a `rebuild-required` marker; device not Failed and owned by this host; entry Active. A retry after `TransactionOutcomeUnknown` that finds Rebuilding takes it as its own commit and checks the device at once |
+| R1 | Active | Rebuilding (same device) | `StoreRebuilds.requestRebuild`, called by the reconcile's Lost CRL State pass | store in the device's `offlineStores` with a `rebuild-required` marker; device not Failed and owned by this host; entry Active. A retry after `TransactionOutcomeUnknown` that finds the entry Rebuilding under its own episode takes it as its own commit and checks the device at once |
 | R2 | any | Rebuilding (same device) | `DeviceMetadata.adoptDevice` | adopted device; store's `DeviceDiscovery.adoptionClass` is `CrlLost` (a `rebuild-required` marker, or `transferring-out` with an unusable `crl_save.log`) |
 | R3 | absent on destination | Rebuilding (another device) | `FailedStorageDeviceDurableTask.moveStore` | operator ran `fail-storage-device`; one store per drain pass; the same transaction removes the store from the tombstone and repoints the pool entry |
 | R4 | Rebuilding on D1 | Rebuilding on D2 | `AspenClient.replaceRebuild` (`transfer-store` on a Rebuilding store) | operator re-placement; one transaction removes the D1 entry, writes D2's, repoints the pool (and the radicle's bootstrap config for a bootstrap-pool store) |
@@ -137,9 +137,9 @@ the entry straight to Rebuilding.
 
 | # | Trigger | Detection | Effect |
 |---|---|---|---|
-| T1 | `<device>/crl` missing from a device that holds store directories (a device-root directory with a `config.yaml`) | `DeviceDiscovery.openDeviceCrl` | every store directory gets the marker, except one whose valid `crl_save.log` is its whole state (`holdsOwnState`); a fresh CRL is created in `crl.creating/`, renamed to `crl/` once finished, and opened |
+| T1 | `<device>/crl` missing from a device that holds store directories (a device-root directory with a `config.yaml`) | `DeviceDiscovery.openDeviceCrl` | every store directory gets the marker, except one that held nothing in the lost CRL (`holdsOwnState`): one whose valid `crl_save.log` is its whole state, or a finished rebuild carrying `rebuild-complete`, which has never served, so its flip (or the Completed Rebuilds pass) proceeds over the fresh CRL; a fresh CRL is created in `crl.creating/`, renamed to `crl/` once finished, and opened |
 | T2 | the device CRL of a device holding store directories fails to open with anything but `CrlLocked`, `CrlSizingMismatch`, `CrlConfigInvalid` (each refuses the device and retries each scan) or a transient error (`DeviceDiscovery.isTransient`, retried up to `CrlOpenAttempts` = 3 device scans in a row; only a `ScanDevices` open counts, host start and nudges retry uncounted); `CrlCorrupt` and `CrlMissing` (a `crl/` with no stream files, `openCRL(..., holdsStores = true)`) are logged as such | same | as T1; the old CRL is kept as `crl.lost-<uuid>` |
-| T3 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` fails | `StoreLoader.handleLoad` ► `StoreRebuilds.crlSaveFileLost` ► `retireUnserved` | backend closed unserved, marker, offline, device checked |
+| T3 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` fails, or its state can never fit its device's CRL (`StoreLoader.neverFits`: above the most admission limit any device config allows plus the per-transaction bound, or one transaction above that bound; neither follows the device config) | `StoreLoader.handleLoad` ► `StoreRebuilds.crlSaveFileLost` ► `retireUnserved` | backend closed unserved, marker, offline, device checked |
 | T4 | backend open throws `BackendStateLost` (FSIF `FsifRecovery.StoreLost`; RocksDB `RocksDBStateLost` for a directory with no database) | `StoreLoader.handleBackendOpened` | marker, offline, device checked |
 | T5 | backend fail-stop while served (`Host.BackendFailed`; only FSIF's `onFatal` raises it) | `StoreRebuilds.backendFailed` | marker first, then `closeUnloaded(dropDurably = false)`: the CRL entries stay for the discard to save |
 | T6 | backend failed between open and install | `StoreLoader.handleLoad` ► `retireUnserved` | marker, offline |
@@ -154,8 +154,10 @@ the entry straight to Rebuilding.
 The marker written in adoption's prepare closure (T9, T10) is correct whatever the transaction's outcome: the set of
 CRL-lost stores is derived from the disk's own contents, so the state is gone whichever host ends up owning it.
 
-Not triggers: other backend open failures are logged and retried at the next load; an out-of-space open leaves the
-store intact and retries (`StoreLoader.retryFailedLoads`); a failed `crl_save.log` load by a **transfer-in**
+Not triggers: any other backend open failure (out of space, an I/O, lock or resource error) leaves the store offline,
+unmarked and in `StoreLoader.storesAwaitingRetry`, retried at the device scans with backoff (`retryFailedLoads`: 1, 2,
+4 ... scans, capped at `Host.LoadRetryCap`, 5 min); a `crl_save.log` state that fits only after the CRL grows waits
+the same way; a failed `crl_save.log` load by a **transfer-in**
 destination restarts the transfer, since the source still holds the state. Nothing declares a *device* Failed
 automatically; only `fail-storage-device` does.
 
@@ -507,8 +509,8 @@ mute, not on the failure budget:
 * On load the store also records its load time (`Frontend.loadedAt`), refusing for good each unknown transaction that
   started before the load plus `MaxStartLead`.
 * A fresh `incarnation` means UnackedCommits entries naming the old incarnation never apply through the rebuilt
-  store (`Frontend.unackedLookupComplete` applies only an entry naming its own incarnation; another one calls
-  `Tx.unackedCommitNotOwed`); the entry's reconcile installs the committed state instead. A rebuild also discards the
+  store (`Frontend.unackedLookupComplete` applies an entry naming its own incarnation, or none, a driver that never heard
+  from the store; one naming another incarnation calls `Tx.unackedCommitNotOwed`); the entry's reconcile installs the committed state instead. A rebuild also discards the
   old incarnation's applied stubs (`dropStore`), which is harmless for the same reason.
 * A late commit reaching the rebuilt store for a muted transaction applies nothing; its owed state comes back through
   the ErrorTree or UnackedCommits entries the finalizer wrote for it.
@@ -791,4 +793,34 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 
 ## Open weaknesses
 
-None.
+### RB-W13: A transfer onto a device whose store path holds a retired-to-be copy of an earlier tenancy never starts
+Verdict PLAUSIBLE. Priority 4. Effort S.
+Mechanism: host H is down holding, at the store's path on device D, a copy no pass has retired yet: a finished rebuild
+awaiting its flip (`rebuild-complete` of episode E1) or a marked lost copy (`rebuild-required`). `AspenClient.replaceRebuild`
+(R4, which needs neither D nor H up) moves the Rebuilding entry to D2, which rebuilds and flips Active; then an operator
+`transfer-store` or the rebalancer (`SetRebalanceDurableTask`) moves the store back onto D, writing D's entry
+TransferringIn. When H returns, `StoreLoader.tryLoadStore` leaves the copy offline in `offlineStores`, but no pass
+clears the path: the Deleted Stores pass retires only an offline store whose entry is absent, `retireForeignCopy` runs
+only for a Rebuilding entry, and the Completed Rebuilds pass only for an Active one. `StoreTransfers.startIn` then finds
+`os.exists(finalPath)` with no `transferred-in` marker and logs "store path already exists" at every check, forever.
+Consequence: the transfer stalls (the source D2 stays TransferringOut) until an operator aborts it, after which the
+entry is absent and the Deleted Stores pass retires the copy. No data is lost.
+Fix: in `startIn`, treat a directory at the path carrying `rebuild-complete` or `rebuild-required` (never an arrived
+copy of this transfer) as a copy of an earlier tenancy: retire it (`StoreCopies.retire`) and start the transfer once
+the path is clear.
+
+### RB-W14: A rebuild-complete removal whose unlink succeeded but whose directory sync failed leaves the store unserved until a restart
+Verdict PLAUSIBLE. Priority 4. Effort S.
+Mechanism: `StoreRebuilds.clearRebuildCompleteMarker` calls `DurableFiles.remove`, which unlinks the marker and then
+forces the directory. If `syncDirectory` throws after `os.remove` succeeded, the method returns false; the `Adopt`
+branch records the copy offline (`keepUnpromotedCopyOffline`) for the Completed Rebuilds pass, whose filter requires
+`os.exists(<store>/rebuild-complete)`. The marker is already gone, so the pass never selects the store (and
+`DurableFiles.remove` of an absent file would not sync anyway). No other pass loads an offline Active store with no
+marker (`reloadClosedStores` covers only stores its shutdown closed). The same holds when the pass's own removal
+fails this way.
+Consequence: the store's entry is Active, so its old copy is released (`StoreCopies.release`), but it is served by
+nobody for the life of the process: one unit of the pool's `w - t` margin is used up until a restart, which loads it
+(or finds the marker again and takes the pass).
+Fix: have the Completed Rebuilds pass also select stores whose removal it or the `Adopt` branch left pending (a set
+kept by `StoreRebuilds`, or any offline Active store with no marker at all), and make the retry sync the directory
+even when the marker is already absent.

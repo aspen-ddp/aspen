@@ -308,7 +308,8 @@ applied (10.5c).
 
 **R7 (no divergence between replicas).** Committed transactions not ordered by R1 either touch disjoint keys and no
 common object-level field (K/N/X locks at the common store), or are blind Inserts of one key (last writer wins), so
-their application order does not change the result. The object timestamp is the max of every applied transaction's,
+their application order does not change the result, except for the slice-size check, which each vote makes against
+the state without the other's pending writes (Q-W12). The object timestamp is the max of every applied transaction's,
 so it is order-independent too. A store that applies them in an order its re-check rejects skips and reports, and
 repair restores it, provided a read threshold of stores applied the skipped update. A commit voter of T never applies in
 such an order: a committed transaction that holds no locks at a store waits to apply while a transaction there holds
@@ -411,7 +412,8 @@ commit per object.
 * `txCommitsInFlight: ObjectId -> count`: outstanding backend commits of transactions (deletions included) and repair
   writes (`reconcileSettled`).
 * `heldCommits: ObjectId -> List[Tx]`: committed transactions waiting their turn, oldest first.
-* `commitWaiters: ObjectId -> List[Tx]`: transactions withholding their vote.
+* `commitWaiters: ObjectId -> List[Tx]`: transactions withholding their vote, for a commit in flight or held, or for
+  a committed transaction waiting there in lock order (`Tx.lockWaitBlocked`).
 * `collisionWaiters: TransactionId -> List[Tx]`: transactions waiting out a lock holder (8.4), by holder.
 * `commitInFlight(oid) = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)`.
 * `lockWaitingCommits: ObjectId -> List[Tx]`: committed transactions waiting to apply in lock order (8.3), by object
@@ -454,13 +456,17 @@ commit per object.
    it only if the waiter's requirements or writes collide with the locks the vote would take on one of its objects
    (`Tx.lockWaitBlocked`: `RequirementsLocker.plannedLocks` seen through `RequirementsChecker.PlannedLocks`, tested by
    the waiter's `Tx.wouldWaitFor` with the same `lockHoldersIn` rule as its own holder set), so it cannot be starved.
+   The test leaves out the waiter's second condition, that the holder changes an object the waiter changes, so a
+   lock-only vote that collides is withheld too, although the waiter would not wait for it (Q-W14).
    Any other new vote decides at once, on the state before the waiter's apply: what the waiter changes is nothing
    that vote's requirements or writes depend on, as for two votes holding compatible locks (R4). A waiter may itself
    wait for a holder whose transaction can decide only with a vote withheld at another store, by a waiter there that
    waits for this vote's transaction: four contending multi-key writers and two delayed prepares suffice. So a vote
    is never withheld for a waiter it does not collide with, and a colliding one at most `Tx.CollisionWait`
    (`Tx.checkCollisionWait` at the 1 s store heartbeat, so up to about 1.5 s, `lockWaitBlockStart`): it then votes
-   abort, a `TransactionCollision` naming the waiter, on the state before the waiter's apply. An abort vote is
+   abort, a `TransactionCollision` naming the waiter, on the state before the waiter's apply. A Tx whose such wait
+   expired (`lockWaitBlockExpired`) never waits for a lock-order waiter again: it votes abort at once if one still
+   collides, and otherwise waits for real in-flight commits as usual. An abort vote is
    always safe, and it ends any such cycle: the holder its transaction would have needed decides without it. A
    holder that never resolves holds the waiter as long as its own locks (section 12).
 3. **Issue** (`doCommit`): release the locks, apply (`issueCommits`), answer parked reads, one `Frontend.commit` per
@@ -506,8 +512,9 @@ the re-check after the wait only costs time.
 * a live voter's skipped changed object, except one already applied (`appliedBy`) or an allocation the backend missed
   (`allocatedHere`), is an invariant violation. A committed write that does not depend on T, a deletion included,
   never applies over T's locks before T: it waits for T's vote in lock order (8.3, R15). So the causes left are a
-  state discarded under the locks (`Frontend.discard`, `StaleObjectState`) and two conflicting commits, which the
-  quorum overlap excludes. It is logged at error (`INVARIANT VIOLATION`), naming the transaction each object now
+  state discarded under the locks (`Frontend.discard`, `StaleObjectState`), two conflicting commits, which the
+  quorum overlap excludes, and a slice-size re-check that the compatible writes of another vote applied first now
+  fail (`SliceSizeExceeded`, Q-W12). It is logged at error (`INVARIANT VIOLATION`), naming the transaction each object now
   shows, then skipped and reported in `objectCommitErrors`, so the finalizer marks the store; no state is kept and
   the store is not fail-stopped. An allocation the backend missed is reported: the store holds no copy, so no lock
   was lost, and every other transaction on it misses and votes abort;
@@ -585,6 +592,9 @@ A non-voter that applies a revision-chained update after a later unrelated updat
 repaired. A commit voter never applies in that order: the later update waits for its vote in lock order (8.3, R15), so
 T's `t` voters hold T and repair restores the at most `w - t` stores that skipped it. A recovered `DoesNotExist` or blind Insert whose key a later
 transaction deleted no longer holds its update in its CRL state (9.4), so it never writes the key back (10.5c).
+A key Delete checked by a `KeyRevision` or a content lock fails at a store that lacks the Insert it follows, so that
+store skips and reports it. One checked only by a required revision passes there, deletes nothing, and the Insert
+applied after it is not rejected either (Q-W13). TKVL deletes always carry a `KeyRevision` or a content lock.
 
 ### 9.4 Deletion and allocation
 
@@ -610,7 +620,8 @@ each other covering transaction T whose update Inserts one of those keys is hand
   recovered vote sharing the lock, cast after T's update persisted, 10.5a): T's state is saved again without the
   object's update (`persistWithoutUpdateOf`), and the write waits for that save;
 * otherwise (a non-voter that has not applied): nothing waits. Its update is one the store does not hold and may yet
-  apply.
+  apply. When the deletion follows T in the serial order (a required-revision Delete, which T's key lock ordered
+  after T at T's voters), that later apply writes the key back at this store alone, unreported (Q-W13).
 
 So a recovered commit vote that still holds a blind Insert of an absent key never applied it, and applies it (10.5c).
 The cost is one index entry per Tx with a blind KeyValue update, and a decode only for a key deletion soon after a
@@ -801,4 +812,63 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
 
 ## Open weaknesses
 
-None.
+### Q-W12: Compatible KeyValue votes that each fit the slice limit commit together, and the later apply is skipped
+Verdict CONFIRMED. Priority 1. Effort M.
+Mechanism: two transactions T1 and T2 write disjoint keys of one KeyValue object without a required revision (TKVL
+puts with `KeyRevision` / `DoesNotExist`, the normal case). Their K/N locks are compatible (section 4), so every store
+votes commit for both. Each vote's `RequirementsChecker.check` runs `checkSliceSize` against
+`kvs.encodedSizeAfter` of the current state alone, which does not include the other vote's pending writes, so each
+passes when the object is within one entry of `maxSliceSize`. Both commit. `Tx.issueCommits` applies the first to
+arrive; the second's re-check (`RequirementsApplyer.apply` -> `check(applying = true)`, which passes
+`frontend.maxSliceSize`) now sees the combined size above the limit and above the current size, and fails
+`SliceSizeExceeded`. Neither lock order nor `lockWaitBlocked` orders two live votes holding compatible locks. A live
+voter logs `INVARIANT VIOLATION`, skips the object and reports it; no store holds the update. The same happens to a
+new vote that decides beside a lock-order waiter it does not collide with (8.3), on the state before the waiter's
+apply. TKVL allows a tier's `maxNodeSize` up to the pool's slice limit (`NodeAllocator.nodeSizeLimit`), and each
+client checks only its own insert against the node it read.
+Consequence: every commit voter that applied T1 first skips T2. Stores usually apply in the same order, so T2's
+committed update is missing from at least a write threshold of stores, often from all. Repair installs the read
+state, which lacks it: committed data is lost although the client was told it committed.
+Fix: make the vote-time size check include the growth that commit votes holding locks on the object have yet to
+apply (a per-object reservation kept with the locks, released at unlock), so the votes that a store holds together
+always fit together. Alternatively, take X for a KeyValue update that would bring the object within some margin of
+the limit. Keep the apply-time check, which then cannot fail for a live voter.
+
+### Q-W13: A non-voter's blind Insert applied after a required-revision Delete of its key writes the key back unreported
+Verdict PLAUSIBLE. Priority 2. Effort S.
+Mechanism: T Inserts k blindly (`DoesNotExist(k)`, `MayExist`, or no key requirement) and commits; its voters hold
+N(k) or K(k) until they apply. D, built on the post-T state, deletes k checked only by a required revision (2.5
+allows a Delete with a `KeyRevision`, a content lock or a required revision). T's key-level write does not move the
+revision, so D's check passes on pre-T and post-T states alike. At T's voters, D's X collides with T's key lock, so D
+is ordered after T (R4, lock order 8.3). At a store S that holds T's data but did not vote commit for T (an abort
+vote from a collision there, say) and learns T's outcome late (a lost or delayed `TxResolved`, then a retransmit or
+`TxFinalized`), D votes and applies first: its Delete of the absent k is a no-op. `Frontend.awaitBlindInsertsDurable`
+finds T's record covering k and lets D proceed, since T neither issued its commit nor voted commit
+(`Tx.holdsUpdateOf`). T then applies: its re-check passes (k absent), `insertWins` installs k, and `Tx.issueCommits`
+reports nothing, because its `reinserts` test covers only `repairedUnder` objects and recovered commit votes. The
+same holds for a Tx for T created at S only after D applied (a delayed client prepare whose vote passes T's pin
+elsewhere): `repairInstalls` records repair writes only, not a transaction's deletion. A store whose D carries a
+`KeyRevision` or content lock fails D instead and reports it (a report whose repair can still come first:
+cross-document-review.md, X-W7). TKVL deletes carry a `KeyRevision` or a content lock.
+The one production caller that deletes keys on a required revision alone, `compute/impl/SimpleTaskExecutor`'s
+`deallocateTask`, empties a task object whose other writes carry a `KeyRevision` or a required revision, so it meets
+no blind Insert.
+Consequence: S keeps k while every other store has it deleted, at the same revision and timestamp, with no ErrorTree
+entry. The replicas diverge permanently until a later write of k.
+Fix: either require a `KeyRevision` or a content lock for every key Delete outside an allocation (builder and
+`refuseBlindWrites`), so D fails and reports at any store lacking T's Insert; or report, in `Tx.issueCommits`, a blind
+Insert of an absent key applied by a Tx that did not vote commit or whose vote saw an object timestamp past T's start.
+The awaitBlindInsertsDurable branch that lets a non-voter through could also mark that Tx, as `repairInstalled` does.
+
+### Q-W14: A lock-order waiter withholds colliding lock-only votes it would never wait for
+Verdict CONFIRMED. Priority 5. Effort S.
+Mechanism: `Tx.awaitLockHolders` waits only for holders that change an object the waiter changes
+(`Frontend.changes`). `Tx.lockWaitBlocked` asks `Tx.wouldWaitFor`, which tests only the lock collision
+(`RequirementsChecker.lockHoldersIn`) and not that condition. So a new vote that would take only a
+`SharedRevisionLock` or `ExclusiveRevisionLock` on the object, or that changes none of the waiter's objects, is
+withheld while the waiter waits, and after `Tx.CollisionWait` (up to about 1.5 s) votes abort naming the waiter.
+Consequence: lock-only transactions on an object with a committed transaction waiting in lock order at a store, such
+as a vdisk block commit's fence lock, wait and then draw an abort vote there that they need not draw. Performance
+only; lock-order waits are rare.
+Fix: in `lockWaitBlocked`, skip a waiter none of whose changed objects this transaction changes, mirroring the
+holder filter in `awaitLockHolders`.

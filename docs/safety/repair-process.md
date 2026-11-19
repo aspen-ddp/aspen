@@ -40,7 +40,7 @@ guards that make the copy safe against concurrent transactions at that store.
 | Q6 | Every apply sets the object's timestamp to the later of its current timestamp and the transaction's start (`later`), so object timestamps never decrease. Only revision-bearing requirements (`checkRevision`, a `KeyValueUpdate` with a required revision) check `state.timestamp > txTimestamp`. A `RefcountUpdate` and a key-level `KeyValueUpdate` do not, so two transactions on one object may commit in the opposite order of their starts. | `server/store/RequirementsApplyer.scala`; `RequirementsChecker.checkRevision`, `checkKVRequirements` |
 | Q7 | A KeyValue update moves the object revision only when it has a required revision. | `RequirementsApplyer.scala` |
 | Q8 | Stores refuse blind writes as `TransactionBuilder` does: a key Delete needs a `KeyRevision` on that key, a required revision or a content lock; a min/max/left/right change needs a required revision (except an allocation's initial content). So every key delete fails at a store lacking the key (and is marked there), and every object-level change moves the revision. | `RequirementsChecker.refuseBlindWrites`; `TransactionBuilder.refuseBlindWrites` |
-| Q9 | A store holding recovered transactions (`Frontend.holding`: CRL still loading, a recovered Tx still loading its objects, or one deciding its vote) drops every client read, as a silent store would. A recovered commit vote retakes its locks before holding ends. | `Frontend.readObjectForNetwork`; `Tx.completeLoad` |
+| Q9 | A store holding recovered transactions (`Frontend.holding`: CRL still loading, a recovered Tx still loading its objects, a recovered Tx that does not relock waiting for every recovered commit vote to relock, or one deciding its vote) drops every client read, as a silent store would. A recovered commit vote retakes its locks before holding ends. | `Frontend.readObjectForNetwork`, `recoveredTransactionLoaded`; `Tx.completeLoad` |
 
 Q1 with Q2 and Q9 is why an unlocked part of a read reflects every transaction committed before the read began
 (invariant E1, section 11).
@@ -319,8 +319,9 @@ from a read after T's commit. Deleting the UnackedCommits entry early costs noth
 Both kinds of entry are left for a later pass while `RepairTarget.mayJoinTransaction(store, start)` holds: the entry's
 transaction started at or above the store's forget floor (`StoreRouter.mayJoinTransaction` =
 `!Frontend.belowForgetFloor(start)`). The floor (`Frontend.forgetFloorMillis`) is the latest of `now - horizon`
-(`TransactionHorizon.Horizon`, 20 s), the store's load floor (`loadFloorMillis`: its load plus `MaxStartLead`, or plus
-`RebuildingStore.AcceptorSinceMargin` soon after an arrival) and the status cache's eviction watermark. At or above
+(`TransactionHorizon.Horizon`, 20 s), the store's load floor (`loadFloorMillis`: its load plus `MaxStartLead`, or the join ceiling its previous
+life on this host ran under when lower, `JoinCeiling.boundAtLoad`; its load plus `RebuildingStore.AcceptorSinceMargin`
+soon after an arrival) and the status cache's eviction watermark. At or above
 it, a replayed prepare could still create a Tx for T at the store after the scan's `holdsTransaction` check, apply T
 after the reconcile, and the entry would be deleted under that apply. Below it the store refuses every prepare for a
 transaction it does not hold (`Frontend.receivePrepare`), and a store never rejoins a transaction it forgot. The wait
@@ -410,7 +411,15 @@ made durable. A recovered commit vote therefore never writes back a key repair r
 memory and counted in flight meanwhile, as for any repair write. Every repair write also records the object timestamp
 it installs (`Frontend.repairInstalls`): a transaction started before it that later applies a blind Insert of a key
 absent here reports the object, since the installed state may hold a deletion of the key this store never held
-(transaction-requirements.md 9.4).
+(transaction-requirements.md 9.4). The recorded timestamp is the installed object's: a pass narrowed to deferred
+keys (6.3) does not raise it, so a deletion such a pass installs can be recorded below the deleting transaction D's
+start. That loses nothing: the store holds the key at the snapshot's revision and the read lacks it, so the store has
+not applied D (a key delete applied there would have removed it, and one it cannot apply fails, Q8), and D's mark of
+the store exists or follows. Written before the whole-object pass that narrowed this one read the entry, it set that
+pass's `minTimestamp` to at least D's start, and that pass, not stale, raised the store's timestamp to a read at least that new. Written between
+the passes, it moved the entry's revision, and `DeferralState.observeEntry` made this pass whole-object. Written after
+the entry's delete, it is a fresh entry, repaired whole-object from a read reflecting D, which removes a key written
+back meanwhile.
 
 ### 6.3 `Reconcile.plan`
 
@@ -663,7 +672,7 @@ repairable or the sweep was cancelled counts as incomplete. `SweepResult.needsAn
 incomplete, or a walk that missed nodes) keeps the store at the floor; a clean sweep lets it back off. Its staleness
 window is an accepted limitation (13).
 
-### 10.3 No read-driven repair
+### 10.2 No read-driven repair
 
 There is no read-driven repair path: a read never writes a store's copy, and every repair goes through Reconcile.
 

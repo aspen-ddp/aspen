@@ -170,7 +170,7 @@ UnackedCommits tree (`resolvedFromTree`) saves `Unresolved`, so a restart looks 
 | Accept | `Tx.receiveAccept` | sends `TxAcceptResponse` | accepted proposal and value |
 | A frozen Tx (past expiry) holds a decided vote no save holds yet | `Tx.saveUndurableVote` | nothing sent; the save's completion sets `voteDurable` | the vote a later status reply reports ([paxos-transactions.md](paxos-transactions.md), expiry) |
 | Object data adopted from a later prepare | `Tx.saveAdoptedData` | posts: releases a commit held for the data (`adoptedDataUnsaved`) | the data a commit will apply |
-| Object this transaction allocated is being deleted | `Tx.persistWithoutUpdateOf` | posts: lets the backend deletion proceed | a restart must not allocate it again (transaction-recovery.md) |
+| An object this transaction allocated is being deleted, or a key its applied blind Insert wrote | `Tx.persistWithoutUpdateOf` | posts: lets the backend deletion proceed | a restart must not allocate the object, or Insert the key, again over the deletion (transaction-recovery.md, transaction-requirements.md) |
 | Backend commits of the transaction complete | `Tx.allObjectCommitsComplete` | `dropTransactionObjectData`, nothing written, unless a backend commit failed (`keptForReplay`) | stop carrying object data |
 | Finalized (or aborted, expired, forgotten) | `Frontend.concludeTransactionState`, `Frontend.deleteTransactionState` | `deleteTransaction` | end of the record |
 | Finalized, and an UnackedCommits entry may name the store | `Frontend.recordAppliedStub` | `saveAppliedStub`; posts: releases the transaction's admission | the record is replaced by an applied stub (3.6) |
@@ -241,7 +241,12 @@ This is the rule behind AS4.
 A backend deletion of an object that a transaction allocated recently waits until no CRL state durably holds that
 allocation's update (`Frontend.awaitAllocationsDurable`): an unconcluded transaction's state is saved again without
 the update (`Tx.persistWithoutUpdateOf`), and a concluded one's deletion or stub only has to be durable
-(`whenDurable`).
+(`whenDurable`). A deletion of KeyValue keys (by a commit or a repair write) waits the same way for every recent
+transaction that may have Inserted one of them blindly, with no required revision, and holds that update here as
+applied (it issued its commit of the object, or voted commit: `Tx.holdsUpdateOf`) or has concluded
+(`Frontend.awaitBlindInsertsDurable`, `blindInsertRecords`): a recovered commit vote re-applies an Insert of an absent
+key. Both saves drop the update from every later save of the transaction too (`Tx.droppedUpdates`), and the update's
+piece leaves the image when that save's entry is built (5.3: a form's build unpins the pieces it does not name).
 
 ### 3.5 Transfer out, drop, rebuild
 
@@ -265,9 +270,12 @@ control task that issues the `DropStore`, a store that lands has its directory b
 CRL processes requests in queue order, so the drop is processed before any save of the new store, and a save landing
 in the drop's own entry cancels the drop's deletion of that id (C9). Its admission release covers only the records it
 removes: it reads the store's retained charge in that same control task and releases it on completion only if it is
-still that charge (`CrlAdmission.releaseRetained(storeId, charge)`, compared by identity). A landing store's
-`crl_save.log` charge (A3) replaces it, and that store's recovery releases all of it once it has counted its records
-(A2), so the landed records are never uncounted.
+still that charge (`CrlAdmission.releaseRetained(storeId, charge)`, compared by identity: every `retain` and release
+replaces the store's `CrlAdmission.Retained` value). A landing store's `crl_save.log` charge (A3) is merged into a new
+value, so the drop releases nothing, and that store's recovery releases the whole value once it has counted its records
+(A2): the landed records are never uncounted, and the leftover records' charge is released with them. A landing store
+with no save file saves nothing before its recovery's `readStoreState`, which queues behind the drop; that recovery
+releases the leftover charge, and the drop's later identity check then finds nothing to release twice.
 
 ### 3.6 Applied stubs
 
@@ -325,13 +333,20 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   stream files there (`openCRL` is passed `holdsStores` and throws `CrlMissing` before writing anything: stores exist
   only on a device whose CRL was opened, so a `crl/` emptied by hand, a file system repair or a partial restore is a
   lost CRL, never a new one), or the open throws anything else, or a transient error a third time in a row: every
-  such store directory gets a durable `rebuild-required` marker, one by one, except one whose `crl_save.log`
-  validates as its own (`DeviceDiscovery.holdsOwnState`), whose whole state is that file (3.3, step 4: a store with a
-  save file has served nowhere since it was written, and its load drops what the device CRL holds for it); `crl/` is moved to `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the
-  device directory is forced; a fresh CRL is created in `crl.creating/` (`CrashRecoveryLogFactory.createCRL`), renamed
-  to `crl/` durably once finished, and opened. A crash or a failed creation (ENOSPC while preallocating) leaves no
-  `crl/`: device load removes `crl.creating/`, and the next load declares the CRL lost again, moving nothing aside. `CrlCorrupt` is logged under its own cause. The reconcile then
-  flips each store to Rebuilding. A device without stores simply has its CRL created.
+  such store directory gets a durable `rebuild-required` marker, one by one, except one that held nothing in the lost
+  CRL (`DeviceDiscovery.holdsOwnState`): its `crl_save.log` validates as its own, so its whole state is that file (3.3,
+  step 4: a store with a save file has served nowhere since it was written, and its load drops what the device CRL
+  holds for it), or it carries `rebuild-complete`, a finished rebuild awaiting its flip that has never served
+  (`StoreLoader.tryLoadStore` leaves it offline), so its flip and load proceed as over the old CRL. `crl/` is moved to
+  `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the device directory is forced; a fresh CRL is created in
+  `crl.creating/` (`CrashRecoveryLog.replacementCrlDir`, `CrashRecoveryLogFactory.createCRL`, `SimpleCRL.create`: an
+  empty directory, every file forced, nothing opened), renamed to `crl/` durably once finished (`DurableFiles.move`),
+  and opened with `holdsStores`. A crash or a failed creation (ENOSPC while preallocating) leaves no `crl/`: device
+  load removes `crl.creating/`, and the next load declares the CRL lost again, moving nothing aside. `CrlCorrupt` is
+  logged under its own cause. The reconcile then flips each marked store to Rebuilding.
+- **Storeless devices.** A device with no store directory and no `crl/` has its CRL created in place. One with no
+  store directory whose open throws is never declared lost: the error is rethrown and the device stays unloaded,
+  retried at each scan, so no CRL is ever moved aside and replaced unless the stores it served were marked first.
 - **Failed.** A CRL whose thread dies (5.10) completes `failed`; `DeviceShutdown.crlFailed` disowns the directory,
   closes the stores, gossips them offline and unloads the device until the host restarts. It is neither reloaded
   before that (a reopen loop would reach `CrlOpenAttempts`) nor marked Failed in the tree.
@@ -1027,7 +1042,8 @@ All stores on a device share one ring, one writer thread and one admission count
   `lost-crl-state.log`. A store whose `crl_save.log` is unusable is marked the same way.
 - **A shared stall.** A slow `DSYNC`, a full admission lane or a dead CRL affects every store on the device. There is
   no per-store allocation by design.
-- **Fate sharing.** A lost CRL marks every store on the device `rebuild-required`; a failed CRL unloads every store.
+- **Fate sharing.** A lost CRL marks every store on the device `rebuild-required` but those that held nothing in it
+  (section 4, `holdsOwnState`); a failed CRL unloads every store.
 
 ---
 
@@ -1181,8 +1197,9 @@ store comes back with no Paxos memory; it is muted for every transaction started
 (rebuild-process.md).
 
 **10.14 CRL files unrecoverable.** `openCRL` throws `BrokenEntryChain`, `CrlCorrupt`, a decode error, or an I/O or VM
-error three scans in a row: `openDeviceCrl` marks every store `rebuild-required` (durably, one by one), moves `crl/`
-aside, and opens a fresh one. A crash between the markers and the move leaves markers and the old `crl/`: the next
+error three scans in a row: `openDeviceCrl` marks every store `rebuild-required` (durably, one by one) except those
+that held nothing in it (section 4), moves `crl/` aside, and creates a fresh one apart, renames it into place and
+opens it. A crash between the markers and the move leaves markers and the old `crl/`: the next
 open may succeed, but the marked stores stay unservable. The decision is irreversible and made from local evidence
 only (Backlog.txt, "System-level protection against correlated lost store declarations": S13 covers transient,
 configuration and version conditions).
@@ -1245,4 +1262,15 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-None.
+### CRL-W10: `persistWithoutUpdateOf` and `droppedUpdates` are documented for allocations only
+Verdict CONFIRMED. Priority 7. Effort S.
+Mechanism: `Frontend.awaitBlindInsertsDurable` calls `Tx.persistWithoutUpdateOf` for a key deletion that meets a
+transaction's applied blind Insert, beside `Frontend.awaitAllocationsDurable`'s call for a deletion of an object the
+transaction allocated. The scaladocs of `Tx.persistWithoutUpdateOf` ("The store is deleting the object, which this
+transaction allocated") and `Tx.droppedUpdates` ("they were deleted here after this transaction allocated them"), and
+`server/transaction/CLAUDE.md`'s bullet on it ("A deletion of an object the Tx allocated first re-saves the state"),
+name only the allocation case.
+Consequence: a reader changing the CRL save path or `droppedUpdates` misses that a blind-insert key deletion also
+depends on the update leaving the CRL state durably, the guard against a recovered vote re-inserting a deleted key.
+Fix: state both callers and both hazards (a re-allocation over a deletion, a re-Insert of a deleted key) in the two
+scaladocs and the transaction CLAUDE.md bullet.

@@ -1890,7 +1890,10 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = restarted.control.reconciler.checkAll()
       _ <- pumpUntil(restarted, crl.dropCalls.get == 1)
       // The store lands while the leftover drop runs: its crl_save.log state is charged, its own drop and its load
-      // queue behind the leftover drop
+      // queue behind the leftover drop. Its device lists it again first, so no device check retires the copy as one
+      // put back by hand (StoreRebuilds.retireUnlistedServed) before the test reads its charge
+      _ <- setDeviceState(deviceA)(_.copy(
+             stores = Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
       _ <- writeRocksStore(deviceDir, storeId)
       _ = CrashRecoveryLog.saveStoreState(storeId, landedState, Backend.crlSaveFile(storeDir))
       _ = crl.loadGate = Some(loadGate.future)

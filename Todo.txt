@@ -33,12 +33,7 @@ X = cross-document-review (its section 5 lists contradictions between documents)
 PRIORITY 0: design rules
 ------------------------
 
-0.1 State the below-read-threshold rule in the top-level CLAUDE.md.                                  S
-    An object that drops below its read threshold (`IDA.consistentRestoreThreshold`) is a permanent, unrecoverable
-    failure. It is not to be detected, worked around or recovered from. The write threshold's margin above the read
-    threshold is the system's whole failure tolerance for writes; preventing that drop is its sole purpose, and a
-    mechanism that only matters once failures exceed the margin is invalid (quarantine, 1.2, is one). Add this to the
-    "Read threshold" bullet or "Cross-cutting invariants" of CLAUDE.md and to the memory note on beyond-margin failures.
+(no open items)
 
 
 PRIORITY 1: lost committed data, split decisions, device-wide loss

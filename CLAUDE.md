@@ -50,7 +50,10 @@ Further design docs: `docs/superpowers/specs/` (dated designs), `docs/safety`, `
   because, once a majority has identified the current copy, any one copy restores the content. So `t + r > w`, and a
   transaction's decision stays provable (quorum overlap `2t - w`) at least as long as its data stays readable
   (`t - r` stores lost): an object that drops below the read threshold is lost, and the write threshold's margin above
-  it is the only tolerance for failures on newly updated objects. Use these thresholds in every safety argument
+  it is the only tolerance for failures on newly updated objects. Use these thresholds in every safety argument.
+  Dropping below the read threshold is a permanent, unrecoverable failure: nothing detects, works around or recovers
+  from it. The margin exists solely to prevent that drop, so a mechanism that only matters once failures exceed the
+  margin (e.g. quarantining an object whose state cannot be decided) is invalid and must not be built
 - **IDA**: Replication, ReedSolomon, RandomAccessReedSolomon. Appends, byte-range reads and ranged writes are
   supported by Replication and RandomAccessReedSolomon only; classic ReedSolomon fails them with
   `RangeReadNotSupported` / `AppendNotSupported` / `RangeWriteNotSupported` (details: `client/CLAUDE.md`)

@@ -171,7 +171,7 @@ UnackedCommits tree (`resolvedFromTree`) saves `Unresolved`, so a restart looks 
 | A frozen Tx (past expiry) holds a decided vote no save holds yet | `Tx.saveUndurableVote` | nothing sent; the save's completion sets `voteDurable` | the vote a later status reply reports ([paxos-transactions.md](paxos-transactions.md), expiry) |
 | Object data adopted from a later prepare | `Tx.saveAdoptedData` | posts: releases a commit held for the data (`adoptedDataUnsaved`) | the data a commit will apply |
 | Object this transaction allocated is being deleted | `Tx.persistWithoutUpdateOf` | posts: lets the backend deletion proceed | a restart must not allocate it again (transaction-recovery.md) |
-| Backend commits of the transaction complete | `Tx.allObjectCommitsComplete` | `dropTransactionObjectData`, nothing written, unless a backend commit failed or an object is quarantined (`keptForReplay`) | stop carrying object data |
+| Backend commits of the transaction complete | `Tx.allObjectCommitsComplete` | `dropTransactionObjectData`, nothing written, unless a backend commit failed (`keptForReplay`) | stop carrying object data |
 | Finalized (or aborted, expired, forgotten) | `Frontend.concludeTransactionState`, `Frontend.deleteTransactionState` | `deleteTransaction` | end of the record |
 | Finalized, and an UnackedCommits entry may name the store | `Frontend.recordAppliedStub` | `saveAppliedStub`; posts: releases the transaction's admission | the record is replaced by an applied stub (3.6) |
 
@@ -235,8 +235,7 @@ A committed transaction's record is deleted at finalization only once its backen
 `Frontend.transactionFinalized` defers to `txCommits` while commits are outstanding or failed, and
 `transactionCommitComplete` concludes it when the last one succeeds. A failed backend commit keeps the record, with
 its object data, for the life of the loaded store; a reload recovers the transaction from it and re-applies it
-through the UnackedCommits entry its `TxCommitted` earned (`keptForReplay`). A recovered commit vote
-that quarantines objects keeps its record, data included, until the quarantine clears (`quarantinedConclusions`).
+through the UnackedCommits entry its `TxCommitted` earned (`keptForReplay`).
 This is the rule behind AS4.
 
 A backend deletion of an object that a transaction allocated recently waits until no CRL state durably holds that

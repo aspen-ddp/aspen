@@ -150,7 +150,7 @@ System-level protection against correlated "lost store" declarations
     - a store whose CRL transactions fail to recover (`Host.StoreFailStopped`, from `StoreRouter.recoverOrFail` and
       `readAndRecover`);
     - (2026-11-14, Todo 1.4) a commit voter that cannot apply the committed update it voted for (its in-memory apply
-      throws; a failed apply re-check quarantines the object instead, `Frontend.quarantine`), and a recovered commit vote whose object fails to load with
+      throws; a failed apply re-check is logged and reported, or taken as applied for a recovered vote, instead), and a recovered commit vote whose object fails to load with
       anything but ObjectNotFound (`Frontend.failStop`). A bug in the requirement checker or applier would trip this
       on every replica of an object at once;
     - a failure during a store's close (`StoreRebuilds.failedOnClose`), an unusable `crl_save.log`

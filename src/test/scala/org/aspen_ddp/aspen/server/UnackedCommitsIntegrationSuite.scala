@@ -346,12 +346,11 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
 
   private def frontendOf(i: Int) = net.smgr.control.router.loaded.get(sid(i)).map(_.frontend)
 
-  test("a recovered commit vote superseded before its crash quarantines the object until repair verifies it " +
-       "(Req F5, Todo 2.16)"):
+  test("a recovered commit vote superseded before its crash takes its update as applied (Q-W10)"):
     // Store 2 applies T from its UnackedCommits entry and T2, built on T, supersedes it. Store 2 then crashes with T's
-    // CRL state still held (restored below): the recovered vote's re-check fails, as for a state invalidated under its
-    // locks. Rather than fail-stop, or count with neither lock nor update, the store quarantines the object until the
-    // host's repair service verifies its copy against a read of the pool at least as new as T
+    // CRL state still held (restored below): the recovered vote's re-check fails. The vote held its locks until it
+    // applied and relocked them at recovery, so only T's update and the writes after it changed the object: the store
+    // holds T's update, concludes T's state and keeps T2's
     val crl = net.crl.asInstanceOf[TestNetwork.RecordingCRL]
     for
       dataPtr <- client.transactUntilSuccessful: tx =>
@@ -382,10 +381,6 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
       _ = crl.save(txid, held, () => ())
       _ = crl.deleteAppliedStub(sid(2), txid)
       _ <- pump(net.restartStore(net.stores(2)), clock = true)
-      _ <- eventually("store 2 quarantined the object", clock = true):
-             Future.successful(frontendOf(2).exists(_.testingOnlyQuarantines > 0))
-      _ <- eventually("repair verified the object and the quarantine cleared", clock = true):
-             Future.successful(frontendOf(2).exists(f => !f.isQuarantined(dataPtr.id)))
       _ <- eventually("T's CRL state concluded", clock = true):
              Future.successful(!crl.getFullRecoveryState(sid(2)).exists(_.txd.transactionId == txid))
       _ <- eventually("store 2 joins new transactions again", clock = true):

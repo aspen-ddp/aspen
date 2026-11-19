@@ -17,7 +17,7 @@ import scala.concurrent.duration.{Duration, SECONDS}
   * 0's copies of T's resolution and finalization are held back. T2, a later refcount change of D that does not chain
   * on T's revision, commits with the votes of stores 1 (which applied T) and 2; store 0 collides on T's lock and votes
   * abort. T2's resolution reaches store 0 before T's. Applied first there, it would raise D's object timestamp past
-  * T's start, fail T's re-check and quarantine D: stores 0 and 2 would agree on the pre-T revision, a read majority
+  * T's start and fail T's re-check, leaving store 0 with neither T's lock nor its update: stores 0 and 2 would agree on the pre-T revision, a read majority
   * without T, and repair would overwrite store 1, the one store holding T. Store 0 instead holds T2 until T applies.
   */
 class CommitApplyOrderIntegrationSuite extends IntegrationTestSuite:
@@ -97,7 +97,6 @@ class CommitApplyOrderIntegrationSuite extends IntegrationTestSuite:
       _ <- eventually("transactions completed")(!net.hasTransactions)
       dAfter <- client.read(d)
     yield
-      withClue("store 0 quarantined nothing: ")(frontend(0).exists(_.isQuarantined(d.id)) shouldBe false)
       withClue("store 0 holds T and T2: "):
         net.stores(0).m.get(d.id).map(s => s.metadata.revision -> s.metadata.refcount.count) shouldBe
           Some(ObjectRevision(tx.id) -> (dBefore.refcount.count + 1))

@@ -39,8 +39,6 @@ class Store(val storageDeviceId: StorageDeviceId,
             val admission: CrlAdmission = CrlAdmission.Unlimited,
             /** Looks up recovered commit votes in the pool's UnackedCommits tree (Frontend.requestUnackedLookup) */
             val unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
-            /** Verifies quarantined objects through repair (Frontend.quarantine) */
-            val quarantineVerifier: QuarantineVerifier = QuarantineVerifier.Never,
             /** Posts a task to the executor of the store installed under this store's id (StoreRouter.post). None
               * runs tasks inline, for tests with synchronous backends
               */
@@ -98,7 +96,6 @@ class Store(val storageDeviceId: StorageDeviceId,
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize,
     missingDataWait = missingDataWait, parkedReadWait = parkedReadWait, admission = admission, unackedLookup = unackedLookup,
-    quarantineVerifier = quarantineVerifier,
     // A reload installs a new Store under the same id: a task of this one's is dropped then
     post = postToStore match
       case None => task => task()
@@ -157,7 +154,6 @@ class Store(val storageDeviceId: StorageDeviceId,
     finalizationStallReport.report(stalledFinalizations(), System.nanoTime()).foreach(logger.error(_))
     frontend.transactions.values.foreach(_.checkCollisionWait())
     frontend.retryUnackedLookups()
-    frontend.retryQuarantineVerifications()
     frontend.retryHeldVoteQuery()
     frontend.expireParkedRepairs()
     frontend.expireParkedReads()

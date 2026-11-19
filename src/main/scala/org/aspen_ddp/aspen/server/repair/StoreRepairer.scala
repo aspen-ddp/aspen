@@ -164,12 +164,11 @@ final class DeferralState:
     entries.get(entryKey).flatMap(_.only)
 
   /** Forgets every entry not in `entryKeys`: those a completed scan did not see are gone or were rewritten. Sweep keys
-    * (StoreRepairer.sweepDeferralKey) are kept: they belong to the sweep, which prunes them with `retainSweep`. So are
-    * verification keys (verifyDeferralKey), which a complete verification clears
+    * (StoreRepairer.sweepDeferralKey) are kept: they belong to the sweep, which prunes them with `retainSweep`
     */
   private[repair] def retain(entryKeys: Set[Key]): Unit = synchronized:
     def kept(k: Key): Boolean =
-      StoreRepairer.isSweepDeferralKey(k) || StoreRepairer.isVerifyDeferralKey(k) || entryKeys.contains(k)
+      StoreRepairer.isSweepDeferralKey(k) || entryKeys.contains(k)
     entries = entries.filter((k, _) => kept(k))
     stalePasses = stalePasses.filter((k, _) => kept(k))
     revisions = revisions.filter((k, _) => kept(k))
@@ -298,32 +297,6 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           // A cancelled scan did not see every entry it would have: pruning by what it touched would drop live ones
           if !control.cancelled then deferral.retain(counts.touchedKeys)
           counts.result
-
-  /** Verifies a quarantined object (Frontend.quarantine, QuarantineVerifier): reconciles the store's copy with a read of
-    * it as repairUpdate does for an entry whose update started at `minTimestamp`, with proofs after lock deferrals.
-    * `complete` means the store's copy now matches a read no older than `minTimestamp`, exactly what an entry needs to
-    * be dropped. No entry is read or deleted, so the scan fence and mayJoinTransaction do not apply: the reconcile is an
-    * ordinary repair install and changes only this copy.
-    *
-    * A read that proves the object deleted (InvalidObject.provesDeletion), whether before or after the quarantine,
-    * verifies it too: a deleted object takes no transaction, every requirement on it failing MissingObject. The
-    * store's slice is dropped first (repairDeletion), best effort: a refused or failed drop is left to entry repair,
-    * since a store holding a live copy of a deleted object missed the deletion and was marked for it
-    */
-  def verifyObject(storeId: StoreId, ptr: ObjectPointer, minTimestamp: HLCTimestamp, policy: RepairPolicy,
-                   deferral: DeferralState): Future[ReconcileResult] =
-    val deferralKey = StoreRepairer.verifyDeferralKey(ptr.id)
-    repairUpdate(storeId, ptr, minTimestamp, deferralKey, policy, deferral, allowProof = true)
-      .recoverWith:
-        case e: InvalidObject if e.provesDeletion =>
-          logger.info(s"Quarantined object ${ptr.id} on $storeId is deleted: verified. Dropping the store's copy")
-          deferral.clear(deferralKey)
-          repairDeletion(storeId, ptr.id, ptr.storePointer)
-            .recover:
-              case err =>
-                logger.info(s"Dropping deleted object ${ptr.id} from $storeId failed: $err. Entry repair drops it")
-                false
-            .map(_ => ReconcileResult(Set(), objectLevelDeferred = false, stale = false))
 
   /** Reconciles the store's copy of every node of the bootstrap pool's own errorTree, then of its unackedCommitsTree,
     * every tier. Writes to those nodes run with missed-update tracking off (`limitTracking`: marker writes and entry
@@ -834,12 +807,6 @@ object StoreRepairer:
     Key(Array[Byte](2) ++ nodeId.toBytes)
 
   private[repair] def isSweepDeferralKey(key: Key): Boolean = key.bytes.nonEmpty && key.bytes(0) == 2
-
-  /** The DeferralState key of a quarantined object's verification (verifyObject) */
-  private[repair] def verifyDeferralKey(objectId: ObjectId): Key =
-    Key(Array[Byte](3) ++ objectId.toBytes)
-
-  private[repair] def isVerifyDeferralKey(key: Key): Boolean = key.bytes.nonEmpty && key.bytes(0) == 3
 
   /** Decodes the ObjectId from an errorTree key: one poolIndex byte then the UUID, big-endian. */
   private[repair] def decodeObjectId(key: Key): ObjectId =

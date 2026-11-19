@@ -2,10 +2,10 @@ package org.aspen_ddp.aspen.server.transaction
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse, TransactionVote}
-import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
+import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueOperation, Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare, ProposalId}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, InheritedVoteLock, ObjectQuarantined, DataUpdate, InvalidDescription, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, InheritedVoteLock, DataUpdate, InvalidDescription, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -164,17 +164,12 @@ class Tx( trs: TransactionRecoveryState,
   /** Some backend commit of this transaction failed: its CRL state, object data included, is kept */
   private var backendCommitFailed: Boolean = false
 
-  /** The objects this recovered commit vote quarantined (issueCommits, Frontend.quarantine). Its CRL state, object data
-    * included, is kept until their quarantine clears
+  /** The CRL state, object data included, outlives TxFinalized for a reload to replay: a backend commit failed.
+    * TxCommitted says so, and the finalizer then gives this store an UnackedCommits entry although it reported: the
+    * recovered vote learns the outcome late, and only the entry makes it apply (retrying the commit) rather than apply
+    * nothing
     */
-  private var quarantining: Set[ObjectId] = Set()
-
-  /** The CRL state, object data included, outlives TxFinalized for a reload to replay: a backend commit failed, or an
-    * object is quarantined. TxCommitted says so, and the finalizer then gives this store an UnackedCommits entry
-    * although it reported: the recovered vote learns the outcome late, and only the entry makes it apply (retrying the
-    * commit, or quarantining again) rather than apply nothing
-    */
-  private def keptForReplay: Boolean = backendCommitFailed || quarantining.nonEmpty
+  private def keptForReplay: Boolean = backendCommitFailed
   private var committed: Boolean = false
   private var committing: Boolean = false
   private var commitHeld: Boolean = false
@@ -221,12 +216,6 @@ class Tx( trs: TransactionRecoveryState,
     * since the other stores may have forgotten the transaction, and it resolves late on a memoryless post-proof quorum
     */
   private var foundUnackedEntry = false
-
-  /** This Tx applies its update through its UnackedCommits entry (unackedCommitFound), not having held its locks up
-    * to the commit as a live voter does: its apply is a re-apply, as a recovered vote's is (issueCommits,
-    * RequirementsApplyer.mayReinsertDeletedKeys)
-    */
-  private var appliesThroughEntry = false
 
   /** See foundUnackedEntry */
   def provesCommitToItsDriver: Boolean = foundUnackedEntry && ofinalized.isEmpty
@@ -746,6 +735,25 @@ class Tx( trs: TransactionRecoveryState,
     lockedWrites = Map()
 
 
+  /** The keys this transaction's update of `objectId` Inserts, decoded from the object data its CRL state holds: none
+    * once that update is dropped from it (persistWithoutUpdateOf). Asked only by a key deletion that meets this
+    * transaction's blind write (Frontend.awaitBlindInsertsDurable)
+    */
+  def insertedKeys(objectId: ObjectId): Set[Key] =
+    if droppedUpdates.contains(objectId) then Set()
+    else objectUpdates.find(_.objectId == objectId).map(u => opsOf(u.data).iterator.collect {
+      case o: Insert => o.key
+    }.toSet).getOrElse(Set())
+
+  /** This transaction's update of `objectId` is applied here: it issued its commit of the object, or it voted commit,
+    * so a deletion of a key it Inserts applied after it (Frontend.awaitBlindInsertsDurable)
+    */
+  def holdsUpdateOf(objectId: ObjectId): Boolean =
+    issuedCommits.contains(objectId) || disposition == TransactionDisposition.VoteCommit
+
+  private def opsOf(update: DataBuffer): List[KeyValueOperation] =
+    KeyValueOperation.decode(update, ObjectRevision(transactionId), txd.startTimestamp)
+
   private def trsObjectUpdates: List[ObjectUpdate] =
     if !saveObjectUpdates then Nil
     else if droppedUpdates.isEmpty then objectUpdates
@@ -923,8 +931,7 @@ class Tx( trs: TransactionRecoveryState,
 
   /** Decides the vote, or withholds it. A muted transaction is proven committed or takes no part, its requirements
     * unchecked. One that has seen no client prepare votes abort, or proves the commit, its requirements unchecked
-    * (prefer-abort, see awaitingClientPrepare). An object whose backend commit failed on this store, that is
-    * quarantined, or that a rebuilt store's inherited votes may lock (Frontend.inheritedVoteLock) gets an abort
+    * (prefer-abort, see awaitingClientPrepare). An object whose backend commit failed on this store, or that a rebuilt store's inherited votes may lock (Frontend.inheritedVoteLock) gets an abort
     * vote. One with a commit in flight, whether or not this transaction builds on it, makes the transaction wait with
     * its vote withheld and no locks taken (see Frontend.commitInFlight); the requirements are checked against the state
     * as it is once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
@@ -939,7 +946,6 @@ class Tx( trs: TransactionRecoveryState,
     logger.trace(s"Tx $transactionId on store $storeId is frozen past expiry: it decides no vote")
   } else {
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
-    val quarantined = pointersById.keysIterator.filter(frontend.isQuarantined).toList
     val inherited = pointersById.keysIterator.filter(frontend.inheritedVoteLock).toList
     val inFlight = pointersById.keysIterator.filter(frontend.voteBlocked).toSet
 
@@ -961,10 +967,10 @@ class Tx( trs: TransactionRecoveryState,
       waitingOn = Set()
       awaitingCommits = Set()
       decideDisposition(Map(), List(InvalidDescription(invalidDescription.get)))
-    else if failed.nonEmpty || quarantined.nonEmpty || inherited.nonEmpty then
+    else if failed.nonEmpty || inherited.nonEmpty then
       waitingOn = Set()
       awaitingCommits = Set()
-      decideDisposition(inherited.map(_ -> InheritedVoteLock()).toMap ++ quarantined.map(_ -> ObjectQuarantined()) ++
+      decideDisposition(inherited.map(_ -> InheritedVoteLock()).toMap ++
         failed.map(_ -> BackendCommitFailed()), Nil)
     else if inFlight.nonEmpty && oresolution.isEmpty && !outcomeKnown then
       // Once the outcome is known the vote no longer matters, so nothing waits for it: a resolved transaction may
@@ -1099,35 +1105,16 @@ class Tx( trs: TransactionRecoveryState,
     val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
     // An object whose earlier backend commit failed is neither changed nor committed: missing from the objects applied
-    // to, it is uncommittable and reported in TxCommitted, and repair restores it. So is a quarantined one
-    // (Frontend.quarantine): its copy is not trusted until repair verifies it
+    // to, it is uncommittable and reported in TxCommitted, and repair restores it
     val changed = RequirementsApplyer.changedObjects(requirements)
     val failedHere = objects.keySet.filter(oid => changed.contains(oid) && frontend.commitFailed(oid))
     failedHere.foreach { objectId =>
       logger.warn(s"Tx $transactionId. Store $storeId does not apply the committed update of object $objectId: an " +
         s"earlier backend commit of it failed")
     }
-    val quarantinedHere = objects.keySet.filter(oid => changed.contains(oid) && !failedHere.contains(oid) &&
-      frontend.isQuarantined(oid))
-    quarantinedHere.foreach { objectId =>
-      logger.warn(s"Tx $transactionId. Store $storeId does not apply the committed update of object $objectId: it is " +
-        s"quarantined until repair verifies it")
-    }
-    // A re-apply (a recovered vote, or one applying through its UnackedCommits entry) does not take an object on which
-    // it may write back a key a later transaction deleted: it is quarantined below instead
-    val reapply = disposition == TransactionDisposition.VoteCommit && (recovered || appliesThroughEntry)
-    val mayReinsert =
-      if !reapply then Set[ObjectId]()
-      else RequirementsApplyer.mayReinsertDeletedKeys(transactionId, txd.startTimestamp, requirements,
-        objects.filter((oid, _) => !failedHere.contains(oid) && !quarantinedHere.contains(oid)), ou)
-    mayReinsert.foreach { objectId =>
-      logger.warn(s"Tx $transactionId. Store $storeId does not re-apply the committed update of object $objectId: it " +
-        s"inserts a key now absent, on an object a later transaction reached, which may have deleted it")
-    }
-    val notApplied = failedHere ++ quarantinedHere ++ mayReinsert
 
     val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, requirements,
-      objects -- notApplied, ou, frontend.maxSliceSize, allocatedOver, txd.allocatingObjects)
+      objects -- failedHere, ou, frontend.maxSliceSize, allocatedOver, txd.allocatingObjects)
 
     // Objects that threw partway through their update hold partially-applied, potentially
     // corrupt state. Drop them from the cache so the next access reloads the last durable
@@ -1138,17 +1125,27 @@ class Tx( trs: TransactionRecoveryState,
     }
 
     // Skipped because they already show this transaction's update (see proveCommitted): applied, though not by this
-    // commit. Only skipped objects are looked at, so a commit applied normally pays nothing for this. A re-apply also
-    // recognizes a traceless update (a refcount, key deletes) from the state it leaves (reappliedTraceless)
-    val skippedObjects = objects.filter((oid, _) => result.skipped.contains(oid) && !notApplied.contains(oid))
+    // commit. Only skipped objects are looked at, so a commit applied normally pays nothing for this.
+    //
+    // A recovered commit vote's changed object that fails its re-check holds the update too: the vote held its locks
+    // until it applied, and relocked them at recovery, so the object changed only through this update and the writes
+    // after it in lock order (awaitLockHolders; at recovery every commit vote relocks before a Tx that does not relock
+    // completes its load, Frontend.recoveredTransactionLoaded). The store applied the update before the crash and a
+    // later transaction superseded it, or the update leaves no trace (a refcount, key deletes), or its data was dropped
+    // from the CRL state once applied (persistWithoutUpdateOf, after a deletion of the object or of a key it inserts).
+    // A re-applied Insert of an absent key was never applied: a key's deletion reaches the backend only once no CRL
+    // state holds a blind Insert of it (Frontend.awaitReplayHazardsDurable), so it applies again, and is not skipped
+    val skippedObjects = objects.filter((oid, _) => result.skipped.contains(oid) && !failedHere.contains(oid))
+    val recoveredApplied =
+      if recovered && disposition == TransactionDisposition.VoteCommit then
+        skippedObjects.keySet.filter(oid => changed.contains(oid) && !result.failed.contains(oid))
+      else Set[ObjectId]()
     val alreadyApplied = RequirementsApplyer.appliedBy(transactionId, requirements, skippedObjects, allocatedOver) ++
-      (if reapply then RequirementsApplyer.reappliedTraceless(transactionId, txd.startTimestamp, requirements,
-        skippedObjects, ou)
-      else Set[ObjectId]())
+      recoveredApplied
     if alreadyApplied.nonEmpty then
       logger.info(s"Tx $transactionId. Store $storeId already holds the committed update of objects $alreadyApplied")
 
-    result.skippedReasons.filterNot((objectId, _) => notApplied.contains(objectId) || alreadyApplied.contains(objectId))
+    result.skippedReasons.filterNot((objectId, _) => failedHere.contains(objectId) || alreadyApplied.contains(objectId))
       .foreach { (objectId, reason) =>
       val current = objects.get(objectId).map(_.metadata.revision.lastUpdateTxUUID)
       logger.warn(s"Tx $transactionId. Store $storeId cannot apply the committed update of object $objectId: $reason. " +
@@ -1156,61 +1153,38 @@ class Tx( trs: TransactionRecoveryState,
     }
 
     // A commit voter that cannot hold the update it voted for has already dropped its locks (doCommit): its vote, which
-    // may count towards the write threshold, would then stand for neither. A live or recovered voter is treated alike.
+    // may count towards the write threshold, would then stand for neither.
     //
     // An apply that threw fail-stops the store (Frontend.failStop): its in-memory state is corrupt.
     //
-    // A changed object whose apply re-check fails is quarantined (Frontend.quarantine): every transaction on it votes
-    // abort, as the lost lock would have made them, until repair shows the store's copy matches a read of the object at
-    // least as new as this transaction. That is what repair requires to drop an ErrorTree entry for it, so the store is
-    // then as good as one that missed the transaction and was repaired; the object is reported, so the finalizer marks
-    // the store. A committed write that does not depend on this one never applies over this vote's locks on an object
-    // both change before this vote applies (awaitLockHolders; at recovery every commit vote relocks before a Tx that
-    // does not relock completes its load, Frontend.recoveredTransactionLoaded), so the causes left are ones the store cannot tell from a
-    // violation: the state was invalidated under the locks (Frontend.discard), two conflicting transactions committed,
-    // or, for a recovered vote, the store applied the update before the crash and a later transaction superseded it. A
-    // live voter logs it as a possible invariant violation, naming the transaction the object now shows. An object
-    // already quarantined is quarantined by this vote too, so its bound covers this transaction.
+    // A live voter's changed object whose re-check fails is an invariant violation: a committed write that does not
+    // depend on this one never applies over this vote's locks before it (awaitLockHolders), so the state changed under
+    // the locks (Frontend.discard) or two conflicting transactions committed. It is logged as one, naming the
+    // transaction the object now shows, skipped and reported, so the finalizer marks the store for repair.
     // Not an allocation the backend missed (allocatedHere): the store holds no copy of it, so no lock was lost, and
-    // every other transaction on it misses and votes abort. A recovered allocation fails its apply only without its
-    // data, which the CRL drops once the update is applied: the object was applied and later deleted, which a read
-    // can never verify, so a quarantine would never clear. It is reported instead.
+    // every other transaction on it misses and votes abort.
     //
     // A lock-only object whose re-check fails has no update to lose: it is skipped, logged and reported. A later commit
     // applied first over the lock explains it, as a lock-only vote is not waited for: a fence takeover over a block
     // commit's SharedRevisionLock, an allocator's follow-up write, a writer after repair's object-level proof. A rebuilt
     // store votes abort on the objects its lost incarnation's votes may back (Frontend.inheritedVoteLock), so a lock
     // lost to a rebuild is not a cause.
-    //
-    // A re-apply that may write back a key deleted since (mayReinsert) is quarantined too, live or recovered: the
-    // store cannot tell whether it applied the update and a later transaction deleted the key, or never applied it.
-    // Repair's verification installs whichever the object's read shows
-    if mayReinsert.nonEmpty then
-      quarantining ++= mayReinsert
-      mayReinsert.foreach: oid =>
-        frontend.quarantine(pointerOf(oid), txd.startTimestamp, transactionId,
-          "it would insert a key a later transaction may have deleted")
     if disposition == TransactionDisposition.VoteCommit then
-      val threw = result.failed -- notApplied
+      val threw = result.failed -- failedHere
       if threw.nonEmpty then
         frontend.failStop(s"Tx $transactionId voted commit but its update of objects $threw threw")
       else
         def shows(oid: ObjectId): String =
           val now = objects.get(oid).map(_.metadata.revision.lastUpdateTxUUID.toString).getOrElse("not loaded")
           s"${result.skippedReasons.get(oid).map(_.toString).getOrElse("not applied")}; now shows Tx $now"
-        val skipped = result.uncommittable -- alreadyApplied -- notApplied
+        val skipped = result.uncommittable -- alreadyApplied -- failedHere
         val invalidated = skipped.filter(oid => changed.contains(oid) && objects.contains(oid) &&
           !allocatedHere.contains(oid))
         if !recovered && invalidated.nonEmpty then
-          logger.error(s"Tx $transactionId on store $storeId voted commit and committed, but its requirements no " +
-            s"longer hold on objects ${invalidated.toList.map(oid => s"$oid (${shows(oid)})").mkString(", ")}: the " +
-            s"state changed under its locks, or two conflicting transactions committed. Quarantined")
-        val toQuarantine = invalidated ++ quarantinedHere
-        if toQuarantine.nonEmpty then
-          quarantining ++= toQuarantine
-          toQuarantine.foreach: oid =>
-            frontend.quarantine(pointerOf(oid), txd.startTimestamp, transactionId,
-              if invalidated.contains(oid) then shows(oid) else "already quarantined")
+          logger.error(s"INVARIANT VIOLATION: Tx $transactionId on store $storeId voted commit and committed, but " +
+            s"its requirements no longer hold on objects " +
+            s"${invalidated.toList.map(oid => s"$oid (${shows(oid)})").mkString(", ")}: the state changed under its " +
+            s"locks, or two conflicting transactions committed. Skipped and reported")
 
     val uncommittable = result.uncommittable -- alreadyApplied
 
@@ -1223,15 +1197,31 @@ class Tx( trs: TransactionRecoveryState,
     pendingObjectCommits = toCommit.size
     issuedCommits = toCommit.iterator.map(_.objectId).toSet
 
+    // A recovered transaction that did not vote commit here may have applied the update before the crash, as a
+    // non-voter learning the commit, and a later transaction may have deleted a key it Inserts: nothing in its CRL state
+    // tells (its update is dropped from it only once it voted commit or applied in this incarnation,
+    // Frontend.awaitBlindInsertsDurable). It applies the update and reports every changed object, so the finalizer marks
+    // the store and repair installs the object's current state. A non-voter is not counted, so this costs no margin
+    val reportedApplied =
+      if recovered && disposition != TransactionDisposition.VoteCommit then toCommit.map(_.objectId) else Nil
+
     // Assigned before the commit loop: a synchronous backend completes inside it
-    objectCommitErrors = uncommittable.toList
+    objectCommitErrors = uncommittable.toList ++ reportedApplied
 
     toCommit.foreach { os =>
       val allocating = txd.allocatingObjects.contains(os.objectId)
       val form = UpdateForm.of(os.objectId, requirements, ou, allocating)
       val cs = CommitState(pointerOf(os.objectId), os.metadata, os.objectType, os.data, allocating, form)
+      val oid = os.objectId
+      def deletedKeys(): Set[Key] =
+        val deletes = requirements.exists {
+          case r: KeyValueUpdate => r.objectPointer.id == oid && r.deletesKeys
+          case _ => false
+        }
+        if !deletes then Set()
+        else ou.get(oid).map(u => opsOf(u).iterator.collect { case o: Delete => o.key }.toSet).getOrElse(Set())
 
-      frontend.commit(os, cs, transactionId)
+      frontend.commit(os, cs, transactionId, () => deletedKeys())
     }
   }
 
@@ -1239,7 +1229,6 @@ class Tx( trs: TransactionRecoveryState,
     committed = true
     // A failed backend commit keeps the object data: a reloaded store recovers the transaction from it and retries the
     // commit through its UnackedCommits entry (keptForReplay). See Frontend.transactionFinalized
-    // A quarantining one keeps it too: a reloaded store recovers the transaction, which quarantines its objects again
     if !keptForReplay then
       saveObjectUpdates = false
       crl.dropTransactionObjectData(storeId, transactionId)
@@ -1646,7 +1635,6 @@ class Tx( trs: TransactionRecoveryState,
       // Applied through the entry: the stub replaces the CRL state when the Tx is forgotten (addendum A, case 2). A
       // stub already held means the store has the update, and doCommit applies nothing
       stubDue = true
-      appliesThroughEntry = true
       // Found after an expiry Discard: no quorum holds T, so it committed and was finalized, and no TxFinalized will
       // come. Applied and forgotten as a held late commit is
       val late = lateCommitHeld || expiryDiscardDecided

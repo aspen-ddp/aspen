@@ -378,7 +378,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 ctx.net, ctx.backgroundTasks, crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
                 Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize,
                 ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited),
-                ctx.unackedLookup, ctx.quarantineVerifier, Some(router.post(backend.storeId)),
+                ctx.unackedLookup, Some(router.post(backend.storeId)),
                 RebuildingStore.readAcceptorSince(backend.path),
                 inheritedVotesAfter = RebuildingStore.readInheritedVotes(backend.path, ctx.transactionHorizon),
                 heldVoteQuery = ctx.heldVoteQuery,

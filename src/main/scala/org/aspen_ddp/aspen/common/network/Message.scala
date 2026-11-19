@@ -345,7 +345,7 @@ final case class TxCommitted(
                               // List of object UUIDs that could not be committed due to transaction requirement errors
                               objectCommitErrors: List[ObjectId],
                               // The store keeps the transaction's CRL state past TxFinalized for a reload to replay (a
-                              // failed backend commit or a quarantine), so the finalizer gives it an UnackedCommits entry
+                              // failed backend commit), so the finalizer gives it an UnackedCommits entry
                               keptForReplay: Boolean) extends TxMessage:
   override def toString: String =
     f"TxCommitted to $to from $from tx $transactionId errors $objectCommitErrors kept for replay $keptForReplay"

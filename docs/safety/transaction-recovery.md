@@ -80,7 +80,7 @@ retransmit 1 s. `TestNetwork` builds recovery drivers with 10 ms / 100 ms.
 
 | Timer | Value (prod) | Defined at | Role |
 |-------|--------------|-----------|------|
-| Store heartbeat | 1 s | `Host.heartbeatPeriod`, `Store.heartbeat` | Driver heartbeats, stall report, collision waits, lookup, quarantine and held-vote query retries, parked-read/repair expiry, stub expiry and expiry rounds (`Frontend.expiryHeartbeat`), expired-driver removal, idle-Tx check |
+| Store heartbeat | 1 s | `Host.heartbeatPeriod`, `Store.heartbeat` | Driver heartbeats, stall report, collision waits, lookup and held-vote query retries, parked-read/repair expiry, stub expiry and expiry rounds (`Frontend.expiryHeartbeat`), expired-driver removal, idle-Tx check |
 | `txHeartbeatTimeout` | 5 s (5 heartbeats) | `Host.txHeartbeatTimeout`, used in `Store.heartbeat` | An idle `Tx` with no driver on its store gets one. Checked each heartbeat, so 5-6 s after the last event |
 | `failedDriverDuration` | 6 s (`2 * maxDelay`) | `SimpleTransactionDriver.factory`, `SimpleDriverRecoveryMixin` (500 ms poll) | Redundant backstop to the heartbeat check (`driveTransaction` is idempotent) |
 | `txStatusCacheDuration` | 30 s | `TransactionHorizon.statusCacheDuration` (horizon + `MaxStartLead` + 8 heartbeats), asserted by `Host.checkStatusCacheDuration` | Lifetime of an outcome entry after its last write |
@@ -289,8 +289,9 @@ the client.
   or at once if nothing needed committing, and again on every later prepare. The last proposer is the sender of the
   latest prepare it saw (initially the designated leader); a `TxResolved` does not change it, so a store that never
   got the finalizing driver's prepare acknowledges another driver, and the finalizing one marks it (an extra repair
-  pass). Its `objectCommitErrors` are the objects uncommittable at apply time (quarantined objects included) plus
-  those whose backend commit failed; a store that applies nothing (it holds an applied stub, or its entry is not owed
+  pass). Its `objectCommitErrors` are the objects uncommittable at apply time (not those a recovered commit vote
+  takes as applied), plus every object a recovered Tx that did not vote commit applies, plus those whose backend commit
+  failed; a store that applies nothing (it holds an applied stub, or its entry is not owed
   to it) reports every object it changes.
 * `commitVoters(voters, incarnations)`: `voters` is `Some(set)` if this driver itself counted commit votes reaching
   the write threshold for every referenced object (`countedCommitVoters`), else `None` (the outcome came from another
@@ -314,7 +315,7 @@ bootstrap pool's own trees, healed by the bootstrap tree sweep instead, repair-p
     the store's incarnation from `incarnations` (`None`, encoded as the zero UUID, if the driver never heard it).
     A store whose `TxCommitted` names objects gets their ErrorTree marks; it also gets an entry, under the same voter
     rule, when its `TxCommitted` sets `keptForReplay`: it keeps T's CRL state for a reload to replay (a failed backend
-    commit or a quarantine, `Tx.keptForReplay`). The driver passes the set of such stores with the commit errors
+    commit, `Tx.keptForReplay`). The driver passes the set of such stores with the commit errors
     (`updateCommitErrors`).
 * It then hands the marks to `client.missedUpdateMarker` (`handedOff`), recording the stores of the planned entries
   (`handedOffStores`) whatever the write's outcome. From then on only the write's outcome completes the action; a
@@ -348,9 +349,9 @@ up and fails every entry of the batch. The marker transaction is `replaySafe` (m
   `TxCommitted` or has an entry, through which a recovered or expiring voter applies T, and repair leaves the entry
   alone while the store may still hold or join T. A `TxCommitted` naming no changed object means its backend commits
   persisted, so at least a write threshold of stores holds T. One naming objects comes from a store that holds T
-  already (a stub), is not owed it (another incarnation), or keeps T's CRL state for a failed backend commit or a
-  quarantine; the last two keep the object out of the write-threshold count until that state is replayed or repair
-  verifies the copy. Such a store set `keptForReplay`, so a counted voter among them has an entry, and a reload after
+  already (a stub), is not owed it (another incarnation), or keeps T's CRL state for a failed backend commit; the
+  last two keep the object out of the write-threshold count until that state is replayed or repair reconciles the
+  copy. Such a store set `keptForReplay`, so a counted voter among them has an entry, and a reload after
   T's finalization replays the state through it (an uncounted one's kept state applies nothing on reload; its
   ErrorTree marks repair it). An uncounted voter or non-voter that sent no `TxCommitted` gets only ErrorTree marks, which repair keeps
   until the store's copy reaches T's timestamp, read from the holders above. An owed voter's entry names its
@@ -375,8 +376,7 @@ entry)", charged to `CrlAdmission` and carrying T's start (crash-recovery-log.md
   late commits and the relay carry none (`TransactionDriver.onFinalized` sets it in the same critical section as the
   finalization). Heartbeat re-sends carry it.
 * **Where a stub is written** (only where the record would otherwise be deleted, after the Tx's backend commits
-  persist: `Frontend.recordAppliedStub` requires no outstanding or failed commits; while a quarantine names T the
-  conclusion, stub included, waits in `quarantinedConclusions` until `verificationComplete` clears it):
+  persist: `Frontend.recordAppliedStub` requires no outstanding or failed commits):
   1. a non-late commit `TxFinalized` naming S: the Tx sets `stubDue` and finalizes with it; with no Tx the Frontend
      writes it directly (`Frontend.handleTransactionMessage`), or passes it to every Tx whose commit is held for its
      turn (`deferredFinalizations`; the call that empties the list concludes the state, `Frontend.transactionFinalized`);
@@ -389,15 +389,15 @@ entry)", charged to `CrlAdmission` and carrying T's start (crash-recovery-log.md
   reaching a commit vote with a stub applies nothing without a lookup; a recovered non-late commit vote with a stub
   resolves committed through `doCommit` and stays until `TxFinalized`.
 * **Expiry.** The store drops its own stub once T is past the horizon plus the expiry margin and it holds no Tx for T
-  (live, deferred, awaiting backend commits or a quarantine) (`Frontend.expireStubs`, a queue ordered by expiry plus
+  (live, deferred or awaiting backend commits) (`Frontend.expireStubs`, a queue ordered by expiry plus
   `heldStubs`). Below the floor no Tx for T can arise, so the stub could suppress nothing. Repair neither reads nor
   drops stubs.
 * **Entries without stubs.** An entry with no stub is harmless at a store that saw T: it never rejoins T, so no Tx
   exists there to apply through it. A store that never saw T can hold a replay's Tx only above its floor; its entry,
   if any, comes from the unknown-voters case and names no incarnation. A replay's commit vote there passed T's pin, so
-  a late commit applies T through the entry, which is the update the store lacks. A non-pinned key T inserts that a
-  later transaction deleted (absent again, on an object past T's start) is not written back: the object is
-  quarantined until repair verifies it (transaction-requirements.md 10.5c). A replay that voted abort applies nothing, and the entry's
+  a late commit applies T through the entry, which is the update the store lacks. Its vote has held its locks since,
+  so its apply is a live voter's; a blind Insert of a key a later transaction deleted, installed there by repair
+  before the replay voted, is written back unmarked (transaction-requirements.md Q-W11). A replay that voted abort applies nothing, and the entry's
   reconcile installs T; repair leaves the entry until the store can no longer join T
   (`RepairTarget.mayJoinTransaction`).
 
@@ -534,27 +534,28 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   over a newer write of its key is a no-op (last writer wins on timestamp and revision); blind deletes and blind
   object-level operations are refused by the builder and the stores. The remaining replay classes are in
   transaction-requirements.md.
-* A recovered voter whose re-check fails on an object it changes (superseded before the crash, or invalidated under
-  its lost locks) quarantines the object (`Frontend.quarantine`): every transaction on it votes abort until repair
-  verifies the copy against a read at least T's start. An allocation the backend missed is reported instead (no copy,
-  no lost lock). A live voter's failed re-check quarantines the same way; any apply that throws fail-stops the store
-  (transaction-requirements.md 8.5).
+* A recovered commit voter whose re-check fails on an object it changes takes it as applied: it held its locks until
+  it applied and relocked them at recovery, so only its update and the writes after it in lock order changed the
+  object (superseded, traceless, or its data dropped once applied). A live voter's failed re-check is an invariant
+  violation, logged at error, skipped and reported; an allocation the backend missed is reported (no copy, no lost
+  lock); any apply that throws fail-stops the store (transaction-requirements.md 8.5). A recovered Tx that did not vote
+  commit reports every object it applies: it may have applied before the crash.
 * The CRL's drop of applied object data (`Tx.allObjectCommitsComplete`, `CrashRecoveryLog.dropTransactionObjectData`)
   is in memory only, so a crash can recover a Tx with data it already applied. For allocations this matters: a
   deletion of an object an unconcluded Tx allocated here waits (`Frontend.awaitAllocationsDurable`) until that Tx's
   state is saved again without the object's update (`Tx.persistWithoutUpdateOf`), or until its concluded state's
-  deletion or stub is durable (`CrashRecoveryLog.whenDurable`), so a restart never re-creates a deleted object.
+  deletion or stub is durable (`CrashRecoveryLog.whenDurable`), so a restart never re-creates a deleted object. A
+  key's deletion (a commit or a repair write) waits the same way for another Tx's state holding an applied blind
+  Insert of the key (`Frontend.awaitBlindInsertsDurable`, transaction-requirements.md 9.4), so a restart never writes
+  a deleted key back, and a recovered Insert of an absent key is one never applied.
 * A backend commit that fails keeps the CRL state and the pinned object state, marks the object `failedCommits`, and
-  makes every later transaction on it vote abort (`BackendCommitFailed`) until the store reloads. A quarantine keeps
-  the quarantining Tx's CRL state, object data included, until `verificationComplete` clears it
-  (`Frontend.concludeTransactionState`, `quarantinedConclusions`). Either kept state is recovered on reload as a
-  recovered commit vote, usually with status `Unresolved`, and re-applied (re-quarantining) if it learns a non-late
-  commit or finds an entry. Its store's `TxCommitted` set `keptForReplay`, so a counted voter has an entry: once T is
-  finalized, its late commit (relay, or a late resolution) finds it and re-applies through it
-  (`appliesThroughEntry`), retrying the backend commit or quarantining again, as does expiry past the horizon after
-  the same lookup. The entry lists the store in `TxFinalized.owed`, but the kept state is replaced by an applied stub
-  only once it concludes (a quarantine's `verificationComplete`; a failed commit's state is never concluded while the
-  store is loaded), so a reload finds the state, not a stub. Repair deletes the entry only after reconciling every
+  makes every later transaction on it vote abort (`BackendCommitFailed`) until the store reloads. The kept state is
+  recovered on reload as a recovered commit vote, usually with status `Unresolved`, and re-applied if it learns a
+  non-late commit or finds an entry. Its store's `TxCommitted` set `keptForReplay`, so a counted voter has an entry:
+  once T is finalized, its late commit (relay, or a late resolution) finds it and re-applies through it, retrying the
+  backend commit, as does expiry past the horizon after the same lookup. The entry lists the store in
+  `TxFinalized.owed`, but a failed commit's state is never concluded while the store is loaded, so no stub replaces
+  it and a reload finds the state, not a stub. Repair deletes the entry only after reconciling every
   object it names, which leaves the store holding T either way. The state is never re-saved as `Committed` for this:
   a tree-learned resolution saves `Unresolved` (`Tx.savedStatus`).
 
@@ -587,9 +588,9 @@ state, and Paxos, safe with offline acceptors, never chooses abort once commit w
   leaves T at one other store, below the read threshold, so reconcile could never restore it. Every Tx that looks up
   holds its own commit vote, so an unknown entry is applied. If that vote did not count, it is a replay's vote, which
   passed T's pin: the pinned object is before T here, and T's committed update is what the store lacks. A rebuilt store
-  whose `acceptorSince` mute a skewed clock defeated is in the same position. A non-pinned object of T changed since
-  is guarded at the apply: an Insert of a key now absent, on an object past T's start, is not applied, and the
-  object is quarantined (`appliesThroughEntry`; transaction-requirements.md 10.5c).
+  whose `acceptorSince` mute a skewed clock defeated is in the same position. A recovered vote's failed re-check there
+  is an update already applied, and its Insert of a key now absent one never applied (transaction-requirements.md
+  10.5c); a replay's live vote has held its locks since it voted (residual: transaction-requirements.md Q-W11).
 * **Entry found naming another incarnation** (`Tx.unackedCommitNotOwed`): T committed, but nothing is applied
   through the entry. A recovered or expiring vote resolves committed without writing the cache, drops its held aborts
   unaccepted, releases its locks, proves the commit to its driver, applies nothing (`notOwedHere`, reporting its
@@ -644,8 +645,8 @@ lookup that finds no entry.
         abort:  CRL state deleted at once (held for a lookup if needsUnackedCheck)
         commit: commitAwaitsData? awaitLockHolders? holdForTurn? -> doCommit -> backend commits -> TxCommitted -> data dropped in memory
                     |
-   TxFinalized(c) -> finalized(c): statusCache finalized; CRL state deleted once backend commits succeed and no
-                     quarantine names T (or replaced by an applied stub: owed names the store, or it applied T
+   TxFinalized(c) -> finalized(c): statusCache finalized; CRL state deleted once backend commits succeed
+                     (or replaced by an applied stub: owed names the store, or it applied T
                      through its entry)
                     |
               Frontend forgets Tx
@@ -703,9 +704,9 @@ lookup that finds no entry.
   heard of is never started (a client crash before any prepare arrives: nothing committed). Past the horizon a Tx
   that cannot learn its outcome ends by expiry, or holds if undecidable.
 * **Vote persistence.** A counted commit vote is in the voter's CRL until the voter learns the outcome, its backend
-  commits succeed and no quarantine of its objects names it, or the voter is rebuilt. It survives host and store
+  commits succeed, or the voter is rebuilt. It survives host and store
   restarts and is relocked on load before any new transaction can touch the same objects. A state kept past
-  finalization for a failed commit or a quarantine has an UnackedCommits entry (`TxCommitted.keptForReplay`), through
+  finalization for a failed commit has an UnackedCommits entry (`TxCommitted.keptForReplay`), through
   which a reload replays it.
 * **A recovered or expiring commit vote is not dropped silently.** It accepts an abort, or discards itself, only after
   an UnackedCommits lookup that began after the abort (or the discard decision) found no entry.
@@ -723,8 +724,8 @@ lookup that finds no entry.
   proof it resolves late and applies only where an entry names the store's own incarnation. A store holding a stub
   never applies T again. Residual classes (replay-safe transactions, allocations after a persisted deletion at a store
   that never saw T) are in transaction-requirements.md; a re-allocation is healed by reconcile only while the
-  deletion's ErrorTree mark for that store is unconsumed. A re-apply that would write back a key deleted since
-  quarantines the object instead (transaction-requirements.md 10.5c).
+  deletion's ErrorTree mark for that store is unconsumed. A recovered vote never writes back a key deleted since: the
+  deletion reached the backend only once its CRL state no longer held the Insert (transaction-requirements.md 10.5c).
 * **Missed commits are repairable.** A store that does not apply a committed update either has its ErrorTree marks
   and, if owed, its entry, or T is not finalized yet (its finalizer is being retried, alarmed after 60 s).
 * **Apply at most once per store**, given a revision or per-key check on the object; an applied stub covers a replay
@@ -761,7 +762,7 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 | After the backend is durable, before `TxCommitted` | backend has T; CRL still has the data (drop is in memory) | Marked (an extra repair pass); replay skips objects showing T |
 | After `TxCommitted`, before `TxFinalized` | backend has T; CRL entry | Recovered Unresolved; no entry (it acknowledged). Driver or caches tell it committed; a late commit applies nothing |
 | After `TxFinalized`, CRL delete or stub not durable | possibly the old record | As the previous row; for an allocation a later deletion waited for the record's removal to be durable (7.4) |
-| After `TxFinalized`, state kept for a failed backend commit or a quarantine | the kept record, usually `Unresolved` | Recovered Unresolved; an entry (its `TxCommitted` set `keptForReplay`). The late commit, or expiry, finds it and re-applies through it: the backend commit is retried, or the object quarantined again |
+| After `TxFinalized`, state kept for a failed backend commit | the kept record, usually `Unresolved` | Recovered Unresolved; an entry (its `TxCommitted` set `keptForReplay`). The late commit, or expiry, finds it and re-applies through it: the backend commit is retried |
 | Rebuild instead of recovery (failed load, fail-stop) | CRL entries dropped; new incarnation | Counted votes are lost; the store is rebuilt from peers; old-incarnation entries apply nothing. Safe while losses stay within the write threshold's tolerance (systemic-loss-protection.md) |
 
 ### 10.3 Driver-side failures
@@ -824,9 +825,8 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 * No driver starts while a store's CRL state loads, costing a client retransmit of latency.
 * Duplicate recovery drivers each run the finalization actions once.
 * A store that never saw T, whose entry names no incarnation (the unknown-voters case), applies T through it if a
-  replayed prepare reached it and voted commit. An object on which T would reinstate a key deleted since is
-  quarantined instead, which costs a verification and abort votes on the object until it completes
-  (transaction-requirements.md 10.5c).
+  replayed prepare reached it and voted commit. A blind Insert of a key deleted since, when repair installed the
+  deletion there before the replay voted, is written back unmarked (transaction-requirements.md Q-W11).
 * A transaction undecidable at expiry (too many rebuilt or forgetting primary stores, ExpiryTally rule G) holds its
   locks and CRL state, logged `UNDECIDABLE TRANSACTION`; a repair read of an allocation it holds times out and defers
   its entry at every scan (repair-process.md 12.8).

@@ -95,7 +95,7 @@ swept node by node (10.1).
 | Key | 17 bytes: `poolIndex`, `transactionId`. One entry per (store, transaction). An entry larger than `UnackedCommitEntry.maxEncodedSize` (half the leaf node size less 64 bytes) is written as chunks, each a complete entry for some of the objects: chunk 0 under the 17-byte key, chunk `i` under it plus `i` as 2 big-endian bytes. Lookups name the head only. | `UnackedCommitEntry.key`, `chunks`, `isHeadKey` |
 | Value | `timestamp` (8, T's start), `incarnation` (16, the store's `StoreIncarnation` as the driver heard it, the zero UUID meaning unknown), `count` (4), then `count` x (`length` (4), `ObjectPointer` bytes) | `UnackedCommitEntry.encode`, `decode` |
 | Objects | Every object of that store that T changes, traced or traceless | `MissedUpdateFinalizationAction.writeMissedUpdates` (`RequirementsApplyer.changedObjects`) |
-| Meaning | The store cast a commit vote the commit may have relied on and had not acknowledged applying T when T was finalized (it sent no `TxCommitted`, or one with `keptForReplay`: a failed backend commit or a quarantine keeps T's CRL state for a reload to replay): it is owed T. A recovered, expiring or late commit vote applies T through the entry when the head names the store's own incarnation or none (every Tx that awaits a lookup holds its own commit vote); one naming another incarnation concludes T committed and applies nothing (`Frontend.unackedLookupComplete`; transaction-recovery.md). Then, or when the store has forgotten T, the entry is left for repair, whose reconcile installs the committed state. Chunk keys keep their first writer's value, so chunks of one entry may differ in incarnation; only the head is looked up. | `Frontend.unackedLookupComplete`; `Host.unackedLookup` |
+| Meaning | The store cast a commit vote the commit may have relied on and had not acknowledged applying T when T was finalized (it sent no `TxCommitted`, or one with `keptForReplay`: a failed backend commit keeps T's CRL state for a reload to replay): it is owed T. A recovered, expiring or late commit vote applies T through the entry when the head names the store's own incarnation or none (every Tx that awaits a lookup holds its own commit vote); one naming another incarnation concludes T committed and applies nothing (`Frontend.unackedLookupComplete`; transaction-recovery.md). Then, or when the store has forgotten T, the entry is left for repair, whose reconcile installs the committed state. Chunk keys keep their first writer's value, so chunks of one entry may differ in incarnation; only the head is looked up. | `Frontend.unackedLookupComplete`; `Host.unackedLookup` |
 
 Repair ignores the incarnation: it reconciles the objects themselves, which is right for any incarnation.
 
@@ -209,7 +209,6 @@ The next due time is `now + interval` jittered by +/-25 %.
 | Concurrent store scans per host | 4 by default | `HostRepairLimits` |
 | Scan deadline, bootstrap sweep deadline | 90 s each (`ScanDeadline`, `SweepDeadline`): a read of an unavailable object never fails, so without a bound one sick pool would wedge the single-flight sweep | `RepairService.withDeadline` |
 | Metadata reads (policy, limits) | 15 s | `MetadataDeadline` |
-| Quarantine verification | 30 s | `VerifyDeadline` |
 | Per-entry work | strictly sequential within a store: the walk hands one entry at a time; an UnackedCommits entry's objects go one at a time | `TierEngine.walk`; `StoreRepairer.repairUnackedObjects` |
 | A failing entry callback | logged at error by the walk, which continues | `TierEngine.walk` |
 
@@ -404,7 +403,11 @@ commit for their turn (`heldCommits`). `commitFailed` includes objects poisoned 
    transaction relied on the repaired state. While the write is outstanding, reads are served the repaired state from
    memory, a state a quorum read returned; a failed write leaves the store as stale as before the repair (12.2).
 
-A `quarantine`d object is repaired like any other (its verification uses this path, 10.2).
+A repair write whose plan removes keys (`plan.deletes`) reaches the backend only once no CRL state the store holds of
+another transaction still holds a blind Insert of one of them that the store applied (`Frontend.awaitBlindInsertsDurable`,
+transaction-requirements.md 9.4): such a state is saved again without the object's update first, or its conclusion
+made durable. A recovered commit vote therefore never writes back a key repair removed. The object stays held in
+memory and counted in flight meanwhile, as for any repair write.
 
 ### 6.3 `Reconcile.plan`
 
@@ -527,7 +530,7 @@ is stale, so the entry stays and the next pass installs. A listed occupant is lo
 
 In memory, one per store, kept across scans by `RepairService` and dropped when the store leaves the repairable set
 (`StoreRepairer.DeferralState`). Keys: `errorDeferralKey(key)` (prefix 0), `unackedDeferralKey(key,
-objectId)` (prefix 1), `sweepDeferralKey(nodeId)` (prefix 2), `verifyDeferralKey(objectId)` (prefix 3).
+objectId)` (prefix 1), `sweepDeferralKey(nodeId)` (prefix 2).
 
 - `record(entryKey, result)` counts the passes since the entry's last complete pass that deferred something by a lock
   (`deferredKeys` non-empty or `objectLevelDeferred`). A complete pass forgets the entry and returns 0. A pass that is
@@ -539,16 +542,14 @@ objectId)` (prefix 1), `sweepDeferralKey(nodeId)` (prefix 2), `verifyDeferralKey
   once parking (8.2) has started for an entry it continues until a complete pass. A parked pass that meets a lock is
   then followed by another parked pass, not by a stale one, and an object busy at every unparked install reaches a
   proof in about `ParkAfterStalePasses + proofAfterDeferrals` passes.
-- `retain` (a completed scan) forgets entry keys the scan did not touch; sweep and verification keys are kept.
+- `retain` (a completed scan) forgets entry keys the scan did not touch; sweep keys are kept.
   `retainSweep` (a complete sweep walk) prunes sweep keys. A host restart forgets everything; the next pass reconciles
   whole objects and restarts the counts. An ErrorTree deferral key is the entry's key alone, so its counts survive a
   rewrite of the entry: every mark rewrites it (section 3, step 6), and a store marked again between passes, as a
   commit error on a hot key marks it, still reaches a proof or parking. `observeEntry` records the revision each pass
   reads the entry at; when it has moved, it drops only the `only` narrowing, since the later mark may name a miss of
   keys the last pass did not defer, and the next pass reconciles the whole object. A proof is safe at any pass, so a
-  count carried over a rewrite costs nothing in correctness. A verification key
-  is cleared only by a complete verification; one whose quarantine ends otherwise stays until the store leaves the
-  repairable set.
+  count carried over a rewrite costs nothing in correctness.
 
 ### 8.2 Parking (persistently stale objects)
 
@@ -618,8 +619,8 @@ other miss (ErrorTree for silent or erroring stores, UnackedCommits for unacknow
   transaction references it. Otherwise it evicts the cache, counts the object in `deleting` (reads, snapshots and
   transactions get `ObjectNotFound`), waits for allocations to be durable (`awaitAllocationsDurable`), then
   `backend.repairDelete`: RocksDB deletes the key; FSIF deletes the extent only if its slot still holds that id. Both
-  are idempotent. A stopped or closed store fails it. A quarantined or `commitFailed` object is not refused: it is
-  gone from the rest of the system.
+  are idempotent. A stopped or closed store fails it. A `commitFailed` object is not refused: it is gone from the
+  rest of the system.
 
 ### 9.3 Can a store that missed a delete resurrect the object?
 
@@ -658,39 +659,6 @@ with marker traffic), never narrowed to deferred keys (a later missed untracked 
 repairable or the sweep was cancelled counts as incomplete. `SweepResult.needsAnotherPass` (anything reconciled or
 incomplete, or a walk that missed nodes) keeps the store at the floor; a clean sweep lets it back off. Its staleness
 window is an accepted limitation (13).
-
-### 10.2 Quarantine verification
-
-A store quarantines an object a commit vote, live or recovered, could not apply its committed update to, or on which a
-re-apply could write back a key deleted since (`Frontend.quarantine`, from `Tx`; transaction-requirements.md): every
-transaction on it votes abort (`ObjectQuarantined`) and committed ones apply nothing to it (reported, so their
-finalizers mark the store), until `QuarantineVerifier` (`Host.quarantineVerifier`, through
-`RepairService.verifyObject`, `VerifyDeadline` 30 s) shows the store's copy matches a read at least as new as the
-latest start of the quarantining transactions. `StoreRepairer.verifyObject` is `repairUpdate` with that
-`minTimestamp`, proofs allowed, keyed `verifyDeferralKey`, under the pool's cached policy (the default if none is
-cached). It reads and deletes no entry, so the fence and `mayJoinTransaction` do not apply, and it takes none of the
-host's scan slots. A quarantine is not an unsettled state (6.2): repair installs on the object, ordinary entry repair
-included, and `repairDelete` is not refused for it.
-
-`Frontend.verificationComplete` clears the quarantine on `Success(true)` and concludes the CRL state it kept
-(`quarantinedConclusions`). A stale or deferred result, or a failure (an unreadable object, a timeout, the repair
-service not yet started), is retried at store heartbeat (`retryQuarantineVerifications`) after 1 heartbeat, the wait
-doubling to `MaxQuarantineRetryInterval` (60) heartbeats. A further quarantine raising `minTimestamp` starts a new
-verification at once; an answer to an older attempt is ignored. A verification cut off by `VerifyDeadline` keeps
-running in the background, as a scan does, and its result still records in the store's DeferralState; its read times
-out first (`ObjectReadTimeout`, 15 s). The quarantine lives in memory only: a reloaded store recovers the quarantining
-transaction from the CRL and quarantines again when the recovered vote re-applies (a non-late outcome or a found
-UnackedCommits entry); the quarantining store's `TxCommitted` sets `keptForReplay`, so it has an entry once T is
-finalized (transaction-requirements.md 8.5). A quarantined object that a read proves deleted
-(`InvalidObject.provesDeletion`), before or after the quarantine, is verified by that read: a deleted object takes no
-transaction, every requirement on it failing `MissingObject`. The verification first drops the store's slice
-(`repairDeletion`), best effort: a refused or failed drop is left to entry repair, since a store holding a live copy of
-a deleted object missed the deletion and was marked for it. The verification counts the store's own quarantined copy among the read's `r` replies, like any
-other read. That relies on T's other commit voters applying T before any later write over its locks
-(transaction-requirements.md 8.3) and on the quarantined copy holding T or a state superseding it; a recovered vote
-that never applied T and releases its locks unapplied breaks the second (transaction-requirements.md Q-W10). Verification uses the store's
-DeferralState like an entry, so a pass narrowed to the keys an earlier verification deferred does not reconcile the
-rest of the object, even after a later quarantine raised `minTimestamp`. Both go with quarantine (Q-W10).
 
 ### 10.3 No read-driven repair
 
@@ -812,8 +780,7 @@ logged, with the same effect). The scan goes on to
 the store's later entries, so each stuck object costs one bounded wait per scan and leaves no read behind. More than
 `ScanDeadline / ObjectReadTimeout` (6) stuck objects at the head of a store's range still use up its scan before the
 later entries; the tree reads (`foreachInRange`, `allocationTree.get`) are not timed, and a metadata pool short of
-its read threshold stalls the scan until the deadline. `verifyObject`'s read times out before `VerifyDeadline`, and
-the quarantining store retries at heartbeat.
+its read threshold stalls the scan until the deadline.
 
 ### 12.9 More scenarios
 
@@ -853,7 +820,4 @@ the quarantining store retries at heartbeat.
 
 ## 14. Open weaknesses
 
-None open. RP-W6 (a recovered vote quarantined unapplied loses T's insert) and RP-W7 (a narrowed verification ignores
-a raised `minTimestamp`) were flaws in quarantine itself, whose triggers are invariant violations or an avoidable
-re-apply ambiguity: transaction-requirements.md Q-W10 replaces both by removing quarantine. Until it is fixed, the
-quarantine verification of 10.2 is not sound for a counted voter's unapplied update.
+None open.

@@ -112,7 +112,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 
 #### UnackedCommits
 - Written by the finalizer for each commit voter that sent no TxCommitted, or whose TxCommitted set `keptForReplay`
-  (`Tx.keptForReplay`: a failed backend commit or a quarantine keeps T's CRL state past TxFinalized, and only the
+  (`Tx.keptForReplay`: a failed backend commit keeps T's CRL state past TxFinalized, and only the
   entry makes the reloaded store's recovered vote, which learns T late, re-apply it; `client/internal/transaction/CLAUDE.md`);
   an entry durable means T committed, not that the other actions are done (they may be failing and retried): only an
   acceptor having forgotten T (on TxFinalized) implies that
@@ -133,8 +133,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   it) apply through the entry (`Tx.unackedCommitFound`; `None` logged at info). Every Tx that looks up holds its own
   commit vote, which may be the counted one the commit relied on: with `t = r` (Replication(3, 2)) skipping it can
   leave T below the read threshold, beyond reconcile. A vote that did not count is a replay's, which passed T's pin,
-  so T is what the store lacks. An object on which T would insert a key now absent, past T's start, is quarantined
-  instead of applied: the key may have been deleted since (transaction-requirements.md 10.5c).
+  so T is what the store lacks. A recovered vote's re-check failure there is an update already applied, and an
+  Insert of an absent key is one never applied (`server/store/CLAUDE.md`, Key deletion after a blind insert).
   `Found` of another incarnation (a rebuilt store, Rebuild N3) logs both at info and calls
   `Tx.unackedCommitNotOwed`: T committed, and nothing is applied through the entry, held
   aborts dropped and never accepted. A recovered or expiring commit vote does as for a matching entry, applying
@@ -250,7 +250,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   and finalizes at once, listing the received `owed` plus the stores its mark had handed off (`handedOffStores`), so
   a stub may precede its entry. A commit at a store with a stub applies nothing; a non-late one reports its objects in
   `objectCommitErrors`. The store drops a stub itself (`Frontend.expireStubs`, at heartbeat) once T is past the
-  horizon plus the expiry margin and it holds no Tx for T (live, deferred, awaiting backend commits or a quarantine):
+  horizon plus the expiry margin and it holds no Tx for T (live, deferred or awaiting backend commits):
   below the floor no prepare creates a Tx for T, so the stub can suppress nothing (crash-recovery-log 3.6). A queue
   ordered by expiry (`stubExpiry`, stale entries skipped) means a heartbeat looks only at the stubs due, and a stub a
   Tx keeps past its expiry waits in `heldStubs` without blocking the rest. Stubs are so
@@ -258,8 +258,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   no stub is harmless at a store that saw T: it never
   rejoins T, so no replay Tx exists there to apply through it (a second driver's lost TxFinalized included). Residual:
   a store that never saw T (below a quorum): its entry can exist only through the unknown-voters case, which names no
-  incarnation. A replay Tx there that voted commit applies T through it on a late commit (its vote passed T's pin; an
-  object whose key T inserts was deleted since is quarantined, not re-inserted);
+  incarnation. A replay Tx there that voted commit applies T through it on a late commit (its vote passed T's pin,
+  and it has held its locks since; a blind Insert of a key deleted elsewhere is transaction-requirements Q-W11);
   otherwise the entry's reconcile installs the committed state, since repair leaves the entry until the store can no
   longer join T
   (`server/repair/CLAUDE.md`; transaction-recovery 5.4)
@@ -271,11 +271,12 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 #### Commit delivery, lost messages, status cache
 - A commit voter unlocks before applying (`Tx.doCommit`). An applied object is still ordered by the in-flight
   commit marker, but one it cannot apply would leave its counted vote standing for neither. An apply that throws
-  fail-stops the store (`server/store/CLAUDE.md`, Fail-stop). A voter, live or recovered, whose re-check fails on a
-  changed object quarantines it until repair verifies it, and so does any re-apply (recovered or through its entry)
-  that would write back a key deleted since (`Tx.quarantining`; `server/store/CLAUDE.md`, Quarantine). A live voter
-  logs it at error, naming the transaction each object now shows (where two conflicting commits would surface). A
-  lock-only object that fails the re-check is skipped and reported only
+  fail-stops the store (`server/store/CLAUDE.md`, Fail-stop). A live voter whose re-check fails on a changed object
+  meets an invariant violation: it logs `INVARIANT VIOLATION` at error, naming the transaction each object now shows
+  (where two conflicting commits would surface), and skips and reports the object. A recovered voter (through its
+  entry too) takes such an object as already applied (`Tx.issueCommits`, transaction-requirements 8.5); a recovered
+  Tx that did not vote commit reports every object it applies. A lock-only object that fails the re-check is skipped
+  and reported only
 - Lock order (transaction-requirements 8.3, R15): a committed Tx holding no locks at a store does not apply while
   another Tx there holds locks its requirements or writes collide with (`RequirementsChecker.lockHolders`) on an
   object both change. It is held (`Tx.awaitLockHolders`, `commitHeld`, no locks, references kept) until each holder

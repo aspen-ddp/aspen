@@ -125,7 +125,7 @@ These are facts about the current code. They define the problem; none of them is
   and `Tx.objectLoadFailed`), except on a store whose writes are frozen, which poisons the object instead
   (`Frontend.poisonObject`). Every FSIF error other than ENOSPC in a write, force, checkpoint or compaction, and any
   internal exception in its serial executor, fail-stops the backend. Persistent and version causes are handled the same
-  way as damage. A commit vote whose apply re-check fails does not declare: it quarantines the object (section 4.6).
+  way as damage. A commit vote whose apply re-check fails does not declare (section 4.6).
 * **S6 Configuration cannot change an existing CRL's sizing.** A CRL records its sizing and id in `crl/sizing` when it
   is created and always opens with them (`SimpleCRL.recordedSizing`), whatever the device config says; a config that
   differs is only logged. The device config keys `crl-num-streams` and `crl-max-file-size-mb` are optional and size only
@@ -330,14 +330,9 @@ steps or checks the preconditions. Both are part of the Backlog item.
 
 These look like loss, or take a store or device out of service, but write no marker and destroy nothing:
 
-* **Quarantine** (`Frontend.quarantine`, from `Tx.issueCommits`). A commit vote, live or recovered, whose apply
-  re-check fails on a changed object, or whose re-apply may write back a deleted key
-  (`RequirementsApplyer.mayReinsertDeletedKeys`), quarantines the object: every transaction on it votes abort
-  (`ObjectQuarantined`) and committed ones apply nothing to it, until repair verifies the store's copy
-  (`QuarantineVerifier`, `StoreRepairer.verifyObject`), retried from 1 heartbeat doubling to
-  `Frontend.MaxQuarantineRetryInterval` (60). In memory only: the quarantining transaction's CRL state, object data
-  included, is kept until the quarantine clears, so a reload quarantines the object again. It never escalates to a
-  fail-stop, however long verification fails.
+* **A failed apply re-check** (`Tx.issueCommits`). A live commit voter's failed re-check on a changed object is an
+  invariant violation: logged at error, skipped and reported, so repair restores the object. A recovered commit vote
+  takes a failed re-check as an update already applied (transaction-requirements.md 8.5). Neither fail-stops.
 * **Failed backend commit and poisoned objects** (`Frontend.commitFailed`, `poisonObject`): every later transaction
   on the object votes abort until the store reloads. A recovered commit vote whose object fails to load on a
   write-frozen store poisons it instead of fail-stopping the store.
@@ -420,9 +415,6 @@ These are places where one software change or environmental fault produces decla
   transactions and go with them in X1, X2, X6 and X7, and move with them in X8 and X12. Losing them with a rebuild costs
   no data: a rebuilt store is muted for older transactions. A long repair stall, which a systemic event can cause, lets
   stubs accumulate against each device's CRL admission. That is a stall, not a declaration.
-* **Quarantine** (section 4.6). A quarantined object's verification reads through the pool and repair, so a systemic
-  event that takes its pool or metadata group below `r` keeps the quarantine, and the CRL state it holds, until the
-  pool returns. Every transaction on the object votes abort meanwhile. That is a stall, not a declaration.
 * **Prefer-abort** ([paxos-transactions.md](paxos-transactions.md)). A systemic client outage aborts orphaned
   data-less transactions rather than committing them, which is the intended direction.
 

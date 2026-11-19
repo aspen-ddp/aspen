@@ -40,7 +40,7 @@
   and apply re-check): unless the transaction allocates the object, a key Delete needs a `KeyRevision` on its key, a
   required revision or a content lock, and a min/max/left/right change a required revision (a content lock does not move
   the revision a repair proof locks; repair-process 1.2, Q8). A re-apply (a recovered commit vote, or one applying
-  through its UnackedCommits entry) never writes back a key deleted since: see Quarantine
+  through its UnackedCommits entry) never writes back a key deleted since: see Key deletion after a blind insert
 - Allocations (transaction-requirements 9.4): an object in `txd.allocatingObjects` is loaded like any other (cache,
   `deleting`, backend read). Only a backend miss gives the fresh `Allocating` state (`Tx.allocationLoaded`). An
   existing state goes into `Tx.allocatedOver`, and every requirement on it fails with `ObjectExists`, at vote and at
@@ -71,7 +71,7 @@
 - Inherited votes (`Frontend.inheritedVoteLock`, cross-document-review.md section 2.3): the old incarnation's commit
   votes still count for their transactions, with none of their locks held here. While the `inherited-votes` file
   (`RebuildingStore.InheritedVotesFile`, passed as `inheritedVotesAfter`) is present, `Tx.determineDisposition` votes
-  abort (`InheritedVoteLock`, beside `ObjectQuarantined`) on every object until a query of the peers' held votes
+  abort (`InheritedVoteLock`, beside `BackendCommitFailed`) on every object until a query of the peers' held votes
   (`HeldVoteQuery`, Host → `client.heldVotes`, `Store.heartbeat` → `retryHeldVoteQuery`, from the file's time on,
   1 s doubling to 30 s) completes, then on the objects of the reported transactions started before `acceptorSince`.
   A transaction is released when a later query no longer reports it or its `TxResolved`/`TxFinalized` reaches the
@@ -160,10 +160,15 @@
 - Fail-stop (`Frontend.failStop`, transaction-requirements.md 8.5): a commit voter has dropped its locks before it
   applies, so one that cannot hold the update it voted for must not serve as if it did. An apply that throws, and a
   recovered commit vote whose object fails to load with anything but `ObjectNotFound`, fail-stop the store. A failed
-  apply re-check, live or recovered, quarantines the object instead (below): the state was invalidated under the
-  locks, or two conflicting commits happened, which the store cannot tell apart (a later commit over the vote's locks
-  waits for it in lock order, so it is no cause). A live voter logs it at error, naming the transaction whose update
-  each object now shows; this is where two conflicting commits would surface. A lock-only object that fails the re-check is skipped and reported only. A fail-stopped store drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
+  apply re-check does not (transaction-requirements.md 8.5). A live voter's is an invariant violation (the
+  state was invalidated under its locks, or two conflicting commits happened; a later commit over the vote's locks
+  waits for it in lock order, so it is no cause): logged at error as `INVARIANT VIOLATION`, naming the transaction
+  each object now shows, then skipped and reported. A recovered commit vote's (one applying through its UnackedCommits
+  entry included) is taken as already applied, neither reported nor kept: the vote held its locks until it applied
+  and relocked them at recovery, so only its update and the writes after it in lock order changed the object
+  (superseded, traceless, or its data dropped from the CRL by `persistWithoutUpdateOf`). A recovered Tx that did not
+  vote commit and applies a committed update reports every object it applies, since it may have applied before the
+  crash. A lock-only object that fails the re-check is skipped and reported only. A fail-stopped store drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
   store is rebuilt as a failed backend is. Never for a full device: a write-frozen store poisons the object instead
   (`poisonObject`, the `BackendCommitFailed` rule) and keeps serving. Every fail-stop is a lost-store declaration
   (Backlog: correlated declarations)
@@ -179,27 +184,17 @@
   a store stopped or closed first never issues it and keeps the deleting transaction's CRL state. Inline for every
   object no unconcluded allocation covers. MapBackend keeps a refcount-0 state rather than removing it, unlike RocksDB
   and FSIF, so its tests see no miss: the deletion-after-allocation tests use a removing MapBackend
-- Quarantine (`Frontend.quarantine`, transaction-requirements.md 8.5): a commit vote whose apply re-check fails may have
-  been invalidated under its locks, met a conflicting commit, or, if recovered, been superseded before the crash
-  (10.5a), and the store does not tell these apart. Each changed object it could not apply is quarantined,
-  except one already applied: `appliedBy` finds T's revision or key trace, and a re-apply also recognizes a traceless
-  update from the state it leaves (`RequirementsApplyer.reappliedTraceless`: refcount equal to `newRefcount`, a
-  delete-only KV update's keys absent, object timestamp at least T's start; re-apply only, never a proof), and one
-  the backend missed and the Tx allocates (`allocatedHere`: no copy, no lost lock; one whose data was dropped
-  was applied and then deleted, which no read verifies), which is reported (transaction-requirements 8.5). Before the
-  apply, a re-apply (recovered, or through an UnackedCommits entry: `Tx.appliesThroughEntry`) also leaves out and
-  quarantines every object on which it would insert a key now absent while the object's timestamp is past T's start
-  (`RequirementsApplyer.mayReinsertDeletedKeys`): T may have inserted it and a later transaction deleted it, and the
-  re-check would pass again (transaction-requirements.md 10.5c). The object is never counted as skipped, so it is
-  quarantined once. Every transaction on a quarantined object votes abort (`ObjectQuarantined`), and committed ones
-  apply nothing to it and report it. Repair is not held off, unlike `commitFailed`. The store asks its host to verify
-  the object (`QuarantineVerifier`, Host → `RepairService.verifyObject`, bounded by `VerifyDeadline`, 30 s). It clears
-  once `StoreRepairer.verifyObject` reports the copy complete against a read at least the transaction's start. Otherwise
-  it retries at heartbeat, 1 doubling to `MaxQuarantineRetryInterval` (60) heartbeats. In memory only: the quarantining
-  transaction's CRL state, object data included, is kept until it clears (`concludeTransactionState` defers a
-  finalization or stub to `verificationComplete`), so a reloaded store quarantines again. Its `TxCommitted` sets
-  `keptForReplay`, so the finalizer gives the store an UnackedCommits entry, through which the recovered vote
-  re-applies (and quarantines again) even when it learns the outcome late. Nothing else is written for it
+- Key deletion after a blind insert (transaction-requirements 9.4, 10.5c): a recovered commit vote re-applies an Insert
+  of an absent key, which is right only if no deletion of that key followed the update its CRL state holds. So
+  `blindInsertRecords`/`blindInsertsOf` index the Txs whose KeyValue update of an object here has no required
+  revision (by shape only, registered beside the allocations by `registerReplayHazards`, dropped once the state's
+  deletion or stub is durable, `stateConcluded`), and `awaitBlindInsertsDurable` holds a key deletion's backend write
+  (`commit`, whose `deletedKeys` thunk is asked only when the index covers the object, and a repair write whose plan
+  removes keys) for each other covering Tx whose update Inserts a deleted key: a concluded one until its deletion is
+  durable; one that holds its update of the object here (`Tx.holdsUpdateOf`: it issued its commit, or voted commit,
+  whose lock puts the deletion after it) until its state is saved without that update (`persistWithoutUpdateOf`;
+  its recovered vote then finds the update missing and takes it as applied). A non-voter that has not applied holds
+  an update the store lacks: nothing waits for it. Inline for every object no recent blind write covers
 - Ranged-write/append deltas are read through `EncodedAppendDelta`, which parses only the header and region table
   and XORs straight from the encoded buffer, so checking and applying never copy the delta
 

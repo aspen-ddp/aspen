@@ -39,30 +39,17 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.2 [Q-W10, X section 5] Remove quarantine: it has no valid trigger and loses committed data.       CONFIRMED, M
-    transaction-requirements.md Q-W10 (replaces repair-process RP-W6 and RP-W7, flaws in quarantine itself). Verified
-    against the code, `Tx.issueCommits` quarantines in three cases:
-      (a) a live voter's failed re-check: since lock order (`Tx.awaitLockHolders`) only an invariant violation (state
-          changed under the locks, two conflicting commits) causes it. Log it as one, skip and report the object.
-      (b) a recovered voter's failed re-check: within the margin it was applied before the crash and superseded
-          (refcounts carry update serials, so they are chained too). Treat it as applied.
-      (c) `RequirementsApplyer.mayReinsertDeletedKeys`: a genuine normal-operation ambiguity, not a below-threshold
-          workaround. A re-applied blind Insert/`DoesNotExist` of k passes again after a later delete of k. Remove
-          the ambiguity: a commit deleting k waits until no unconcluded Tx whose CRL state holds a blind Insert of k
-          on that object remains (as `Frontend.awaitAllocationsDurable` does for deletion after allocation); a
-          re-applied Insert of an absent key is then known unapplied and is applied. The wait costs only a key
-          delete that closely follows a blind insert of the same key: nothing on the ordinary commit path.
-    Quarantining in (b)/(c) leaves a counted voter with neither T's update nor its lock, and its verification counts
-    its own stale copy: one crash plus one store legitimately missing T loses T. Then delete `Frontend.quarantine`,
-    `QuarantineVerifier`, `StoreRepairer.verifyObject`, `ObjectQuarantined`, the quarantine half of `keptForReplay`,
-    `reappliedTraceless`, and their tests. Correct transaction-requirements.md 8.5 / 10.5c / 10.7(e), repair-process.md
-    10.2, cross-document-review.md 2.3 and 5, the store/transaction/repair CLAUDE.md files and the scaladoc.
+(no open items)
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-(no open items)
+2.18 [Q-W11] A live replay at a store that never saw T writes back a blind-inserted key deleted since.  PLAUSIBLE, M
+    transaction-requirements.md Q-W11. A replay Tx at a store that missed T votes commit on a blind Insert of k (T's
+    pin is on another object) after repair installed a later deletion of k from a read; its apply writes k back at
+    that store alone, unmarked. Fix (to design): such an apply reports the object, so the finalizer marks the store;
+    the open part is telling a replay's vote (which needs a delayed client prepare) from a counted one.
 
 
 PRIORITY 3: systemic loss protection

@@ -33,11 +33,6 @@ case class StaleObjectState() extends RequirementError
   */
 case class BackendCommitFailed() extends RequirementError
 
-/** The object is quarantined on this store (Frontend.quarantine): a recovered commit vote could not apply its committed
-  * update, and the store's copy is not trusted until repair verifies it. Purely local, like RequirementCheckFailure.
-  */
-case class ObjectQuarantined() extends RequirementError
-
 /** This store was rebuilt, and a transaction its lost incarnation voted commit on may still commit and may lock the
   * object (Frontend.inheritedVoteLock): the rebuilt store holds none of that transaction's locks, so it grants no
   * commit vote on the object until its peers show the transaction resolved. Purely local, like

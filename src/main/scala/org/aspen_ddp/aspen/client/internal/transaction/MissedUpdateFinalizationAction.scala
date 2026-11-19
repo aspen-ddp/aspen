@@ -142,8 +142,8 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     // change leaves a trace. A store that never voted holds no vote to recover: the ErrorTree marks above repair it,
     // so it gets no entry.
     // A voter whose TxCommitted says it keeps the transaction's CRL state for a reload to replay (a failed backend
-    // commit, or a quarantine) gets one too: after a reload its recovered vote learns the outcome late, and only the
-    // entry makes it apply again, retrying the commit or quarantining again, rather than apply nothing
+    // commit) gets one too: after a reload its recovered vote learns the outcome late, and only the entry makes it
+    // apply again, retrying the commit, rather than apply nothing
     val changed = RequirementsApplyer.changedObjects(txd.requirements)
     val unacked = txd.allDataStores.toList.flatMap: storeId =>
       val acknowledged = commitErrors.contains(storeId) && !keptForReplay.contains(storeId)

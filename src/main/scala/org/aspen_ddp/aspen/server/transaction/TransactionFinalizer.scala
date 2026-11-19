@@ -22,7 +22,7 @@ trait TransactionFinalizer {
     * via this callback.
     *
     * `keptForReplay` holds every store whose TxCommitted said it keeps the transaction's CRL state for a reload to
-    * replay (a failed backend commit or a quarantine): it reported, but it still owes the transaction its replay
+    * replay (a failed backend commit): it reported, but it still owes the transaction its replay
     */
   def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]], keptForReplay: Set[StoreId]): Unit
 

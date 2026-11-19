@@ -338,29 +338,6 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       result.deferred shouldBe 1
       stillThere shouldBe true
 
-  test("verifying a quarantined object reconciles it and is complete for a read at least the transaction's start"):
-    val target = RecordingTarget(List(storeId))
-    val repairer = StoreRepairer(client, target)
-    for
-      ptr <- allocateObjectPointer()
-      os <- client.read(ptr)
-      result <- repairer.verifyObject(storeId, ptr, os.timestamp, RepairPolicy.Default, DeferralState())
-    yield
-      target.repairs shouldBe List(ptr.id)
-      result.complete shouldBe true
-
-  test("verifying a quarantined object against a read older than the transaction's start is not complete"):
-    val target = RecordingTarget(List(storeId))
-    val repairer = StoreRepairer(client, target)
-    for
-      ptr <- allocateObjectPointer()
-      os <- client.read(ptr)
-      result <- repairer.verifyObject(storeId, ptr, HLCTimestamp.happensAfter(os.timestamp), RepairPolicy.Default,
-        DeferralState())
-    yield
-      target.repairs shouldBe List(ptr.id)
-      result.complete shouldBe false
-
   test("an update missed while the repair is underway leaves the entry in place"):
     // The repair reads the object, then the store misses an update and the entry is rewritten
     // with that update's timestamp before the repair completes.
@@ -1585,21 +1562,6 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       storeHasObject(0, kvPtr.id) shouldBe false
       storeHasObject(1, kvPtr.id) shouldBe false
       withClue("repair removed the zombie: ")(storeHasObject(2, kvPtr.id) shouldBe false)
-
-  // A quarantined object deleted since needs no transaction to wait for: every requirement on it fails
-  // MissingObject, so a read proving the deletion verifies it, and the store's slice is dropped
-  test("verifying a quarantined object that a read proves deleted is complete and drops the store's copy"):
-    for
-      dataPtr <- sharedDataObject()
-      before <- client.read(dataPtr)
-      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, before.refcount.setCount(0)))
-      _ = withClue("store 2 missed the deletion: ")(storeHasObject(2, dataPtr.id) shouldBe true)
-      result <- pump(StoreRepairer(client, SeamTarget()).verifyObject(sid(2), dataPtr, before.timestamp,
-                  RepairPolicy.Default, DeferralState()), deadline())
-      _ <- settle()
-    yield
-      result.complete shouldBe true
-      withClue("the store's copy was dropped: ")(storeHasObject(2, dataPtr.id) shouldBe false)
 
   /** Writes the object's allocationTree entry back, standing in for a DeletionFinalizationAction that has yet to run:
     * the object is deleted, and only its record lingers

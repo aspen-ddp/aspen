@@ -223,11 +223,11 @@ the Frontend holds all transaction messages until every recovered vote has loade
 (`Tx.outcomeDecided`) or recovered with a resolved status takes none. Details: `transaction-requirements.md`.
 
 **P13 Object data lives in the CRL until the backend commit succeeds.** `crl.dropTransactionObjectData` runs only once
-every issued backend commit completed without error and no object of T is quarantining (`Tx.allObjectCommitsComplete`).
-A failed backend commit keeps the record, with its data, for the life of the loaded store; a quarantine keeps it until
-the quarantine clears. Either way the store's `TxCommitted` sets `keptForReplay` (`Tx.keptForReplay`), so the
-finalizer gives it an UnackedCommits entry although it reported, and after a reload its recovered vote, which learns T
-late, re-applies T through that entry (retrying the commit, or quarantining again) instead of applying nothing. Data
+every issued backend commit completed without error (`Tx.allObjectCommitsComplete`). A failed backend commit keeps
+the record, with its data, for the life of the loaded store, and the store's `TxCommitted` sets `keptForReplay`
+(`Tx.keptForReplay`), so the finalizer gives it an UnackedCommits entry although it reported, and after a reload its
+recovered vote, which learns T late, re-applies T through that entry, retrying the commit, instead of applying
+nothing. Data
 adopted from a later prepare is saved before a commit applies it (`Tx.adoptedDataUnsaved`, `saveAdoptedData`).
 
 **P14 Finalization ordering.** A driver sends `TxFinalized(commit)` and `TransactionFinalized` only after every
@@ -381,9 +381,8 @@ decided in `Tx.determineDisposition`, in this order:
 2. No client prepare seen (prefer-abort, 6.2): `VoteAbort` with `NoClientPrepare`, requirements unchecked, once the
    wait for the client's prepare is over or the outcome is known. It still proves the commit if an object shows it.
 3. Invalid description (6.5): `VoteAbort` with `InvalidDescription` for every object.
-4. A hosted object whose earlier backend commit failed or that was poisoned (`BackendCommitFailed`), that is
-   quarantined (`ObjectQuarantined`), or that a rebuilt store's inherited votes may lock (`InheritedVoteLock`, 10.10):
-   `VoteAbort`.
+4. A hosted object whose earlier backend commit failed or that was poisoned (`BackendCommitFailed`), or that a
+   rebuilt store's inherited votes may lock (`InheritedVoteLock`, 10.10): `VoteAbort`.
 5. A hosted object with a commit in flight or held for its turn (`Frontend.commitInFlight`), or changed by a committed
    Tx waiting to apply in lock order (9.1; together `Frontend.voteBlocked`), outcome unknown: the vote is withheld and
    the Tx registers to be told when the object is free (`Frontend.awaitCommitPersisted`).
@@ -462,8 +461,8 @@ forgetting the Tx or writing a cache entry (`Tx.unackedCommitFound`); its driver
 (`Store.giveProof`, at start or through `Frontend.onCommitProven`). A found entry naming no incarnation (the driver did
 not count the voters, or heard two incarnations from the store) applies too (`Frontend.unackedLookupComplete`): the
 Tx holds its own commit vote, which may be the counted one, and a vote that did not count is a replay's, which passed
-T's pin. Such a re-apply leaves out and quarantines every object on which it would insert a key now absent
-(`RequirementsApplyer.mayReinsertDeletedKeys`, 9.1). A found entry of another incarnation resolves committed applying
+T's pin. A recovered vote's failed re-check there is an update already applied, and its Insert of an absent key one
+never applied (9.1). A found entry of another incarnation resolves committed applying
 nothing (`Tx.unackedCommitNotOwed`; `notOwedHere`), its objects reported, its driver given the proof. An absent entry from a lookup started after the latest
 held abort releases the held aborts. A failed or unanswered lookup keeps them held; a failed one is retried at
 heartbeat, an unanswered one awaited (`Frontend.retryUnackedLookups`). Details: `transaction-recovery.md`.
@@ -594,8 +593,7 @@ reported only once durable), and an expiry commit's `TxResolved`.
 | commit applied, every backend commit succeeded | object data dropped, record kept |
 | `TxFinalized(true)` and every backend commit succeeded | record deleted, or replaced by an applied stub (9.1) |
 | a backend commit failed | record with data kept until the store reloads; `TxCommitted.keptForReplay` earns it an UnackedCommits entry (P13) |
-| a Tx quarantining an object (a voter's failed re-check, or a re-apply) | record with data kept until the quarantine clears, then deleted or stubbed; `keptForReplay` as above |
-| a deletion of an object the Tx allocated | record re-saved without that object's update (`Tx.persistWithoutUpdateOf`) |
+| a deletion of an object the Tx allocated, or of a key its applied blind Insert wrote | record re-saved without that object's update (`Tx.persistWithoutUpdateOf`) |
 | expiry discard | record deleted (`Frontend.expireTransaction`) |
 
 What is not persisted: the outcome at a store (saved only incidentally); the proposer's round or local proposal;
@@ -631,23 +629,21 @@ every prepare and accept response, retransmits included: write amplification, no
   objects reported in `objectCommitErrors`, so a non-late finalizer marks the store for repair) or `issueCommits`:
   `RequirementsApplyer.apply` re-checks the requirements with `applying = true`, skipping objects that already show T,
   one backend commit per changed object, and `TxCommitted` when all complete. A commit voter whose apply throws
-  fail-stops the store (`Frontend.failStop`); one, live or recovered, whose re-check fails on a changed object
-  quarantines the object until repair verifies it (`Frontend.quarantine`, transaction-requirements.md 8.5). A
-  re-apply (a recovered commit vote, or one applying through its entry: `Tx.appliesThroughEntry`) first leaves out
-  and quarantines every object on which it would insert a key now absent while the object is past T's start
-  (`RequirementsApplyer.mayReinsertDeletedKeys`): the key may have been deleted since. Objects whose earlier backend
-  commit failed, or that are quarantined, are not applied and are reported. A quarantining Tx keeps its CRL record,
-  data included, until the quarantine clears (P13).
+  fail-stops the store (`Frontend.failStop`). A live voter whose re-check fails on a changed object meets an
+  invariant violation: it logs it at error, skips and reports the object. A recovered voter (through its entry too)
+  takes such an object as already applied; its Insert of a key now absent applies, since a key's deletion reaches
+  the backend only once no CRL state holding an applied blind Insert of it remains
+  (`Frontend.awaitBlindInsertsDurable`; transaction-requirements.md 8.5, 9.4). A recovered Tx that did not vote commit
+  reports every object it applies. Objects whose earlier backend commit failed are not applied and are reported.
 * **Forgetting a committed T.** Where its CRL record would be deleted (after `TxFinalized` and its backend commits), it
   is replaced by an applied stub if an UnackedCommits entry may name this store: `TxFinalized` listed it in `owed`, or
   it applied T through its entry (`Tx.stubDue`; `Frontend.transactionFinalized`, `concludeTransactionState`). A failed
-  backend commit keeps the record until the store reloads, so no stub replaces it; a quarantine defers the deletion or
-  stub until it clears (`quarantinedConclusions`, `Frontend.verificationComplete`). A `TxFinalized` listing a store with
+  backend commit keeps the record until the store reloads, so no stub replaces it. A `TxFinalized` listing a store with
   no Tx writes a stub from `TxFinalized.startTimestamp`. A finalization that arrives while a commit is held (any of the
   holds above) is deferred (`Frontend.finalizationDeferred`); every deferring Tx of the txid is listed, a stub owed
   meanwhile passes to each, and the call that empties the list concludes the state.
 * **Stub lifetime.** A stub is dropped (`Frontend.expireStubs`, at heartbeat) once T is past the horizon plus the
-  expiry margin and the store holds no Tx for T, live, deferred, awaiting backend commits or quarantining. Below the
+  expiry margin and the store holds no Tx for T, live, deferred or awaiting backend commits. Below the
   floor no prepare creates a Tx for T, so the stub can suppress nothing. Stubs are therefore bounded by their rate times
   about 30 s. Encoding: `crash-recovery-log.md`.
 

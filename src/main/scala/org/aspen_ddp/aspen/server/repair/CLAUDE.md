@@ -47,12 +47,6 @@
   therefore healed within about one cap interval (Backlog.txt "Bootstrap tree sweep staleness window"). While the
   bootstrap pool is unreadable, a bootstrap store's scan and sweep each run to their 90 s deadline, so it holds a scan
   slot most of each floor interval (spec-mandated)
-- `StoreRepairer.verifyObject` (through `RepairService.verifyObject`, `VerifyDeadline` 30 s) verifies an object a
-  store quarantined (`server/store/CLAUDE.md`, Quarantine): `repairUpdate` with the quarantining transaction's start as
-  `minTimestamp`, proofs allowed, keyed `verifyDeferralKey` (prefix 3, kept by `DeferralState.retain`). It reads and
-  deletes no entry, so the ownership fence and `mayJoinTransaction` do not apply. `complete` clears the quarantine.
-  A read proving the object deleted (`InvalidObject.provesDeletion`) is complete too: the store's slice is dropped
-  first (`repairDeletion`), best effort, a refused or failed drop being left to entry repair
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes since the last complete one, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
 - A proof cannot help a `stale` pass (the store's own copy is busy or changed), so stale passes escalate by waiting
@@ -86,7 +80,7 @@
   its read threshold, an allocation parked past expiry, a key that stays `NotRestorable`) fails with `ReadTimeout`
   and its entry is deferred (`repairListed`, and `repairAbsent`'s catch-all), so it costs one bounded wait per scan
   and the scan goes on to later entries. Tree reads (`foreachInRange`, `allocationTree.get`) stay untimed; the scan
-  deadline bounds them. A `verifyObject` read times out before its `VerifyDeadline`; its store retries at heartbeat
+  deadline bounds them
 - A repair write that meets a foreign occupant of the object's slot (`backend.RepairSlotOccupied`, FSIF slot reuse
   over a missed delete) drops the occupant with an id-checked `repairDelete` once the AllocationTree does not list it.
   The object was just read live, and two live objects never share a slot. The entry stays (stale), and the next pass

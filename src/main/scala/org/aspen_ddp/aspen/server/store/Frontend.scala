@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, CurrentAllocationsReply, CurrentAllocationsRequest, HeldVote, PendingAllocation, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{Key, Metadata, ObjectId, ObjectPointer, ObjectType, ReadError, ReadType, Value}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId, StoreIncarnation}
-import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, ObjectUpdate, TransactionHorizon, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrlAdmission, StoreRecoveryState,
   TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
@@ -103,9 +103,6 @@ object Frontend {
   /** An undecidable expiring Tx (ExpiryTally.Decision.Hold) is logged at its first such round, then every this many */
   val UndecidableLogRounds: Int = 60
 
-  /** The most store heartbeats between retries of a quarantined object's verification (Frontend.quarantine) */
-  val MaxQuarantineRetryInterval: Int = 60
-
   /** How often, at most, a store warns of a client prepare it refuses (refusePrepare). While a status cache eviction's
     * watermark is the binding part of the floor, every client prepare is refused
     */
@@ -141,8 +138,6 @@ class Frontend(val storeId: StoreId,
                val admission: CrlAdmission = CrlAdmission.Unlimited,
                /** Looks up recovered commit votes in the pool's UnackedCommits tree: see requestUnackedLookup */
                val unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
-               /** Verifies quarantined objects through repair: see quarantine */
-               val quarantineVerifier: QuarantineVerifier = QuarantineVerifier.Never,
                /** Runs a task on this store's executor: how completions arriving on other threads, such as a repair's
                  * backend write, get back to the Frontend's state. Inline by default, for tests with synchronous
                  * backends
@@ -495,116 +490,6 @@ class Frontend(val storeId: StoreId,
     */
   def poisonObject(oid: ObjectId): Unit = failedCommits += oid
 
-  // ---- Quarantine (transaction-requirements 8.5) ----
-
-  /** A quarantined object: see quarantine.
-    *
-    * @param minTimestamp the latest start of the transactions that quarantined it: a verification must read the object
-    *                     at least this new
-    * @param txids        the transactions whose CRL state the quarantine keeps
-    * @param attempt      identifies the latest verification: an answer to an older one is ignored
-    * @param countdown    store heartbeats until the next verification, while none is outstanding
-    * @param interval     heartbeats between the next failed verification and the one after it, doubling to
-    *                     MaxQuarantineRetryInterval
-    */
-  private final class Quarantine(val pointer: ObjectPointer, var minTimestamp: HLCTimestamp,
-                                 var txids: Set[TransactionId], var attempt: Long, var inFlight: Boolean,
-                                 var countdown: Int, var interval: Int, var failures: Int)
-  private val quarantined = scala.collection.mutable.HashMap[ObjectId, Quarantine]()
-
-  /** Finalized transactions whose CRL state a quarantine keeps (concludeTransactionState), and the start timestamp of
-    * an applied stub owed, if any: concluded once no quarantine names them
-    */
-  private val quarantinedConclusions = scala.collection.mutable.HashMap[TransactionId, Option[HLCTimestamp]]()
-
-  /** The object is quarantined: every transaction on it votes abort (ObjectQuarantined) and a committed one applies
-    * nothing to it, until repair verifies the store's copy
-    */
-  def isQuarantined(oid: ObjectId): Boolean = quarantined.contains(oid)
-
-  /** Quarantines placed by this Frontend (quarantine), for tests that cannot observe one before its verification clears
-    * it
-    */
-  @volatile private[aspen] var testingOnlyQuarantines: Int = 0
-
-  /** Quarantines an object a commit vote, live or recovered, could not apply its committed update to
-    * (Tx.issueCommits): the state was invalidated under its locks, two conflicting transactions committed, or, for a
-    * recovered vote, the store applied the update before the crash and a later transaction superseded it. A later
-    * commit that does not depend on the vote is no cause: it waits for the vote in lock order (Tx.awaitLockHolders). The vote then counts with neither its lock nor its update. The store does not tell
-    * these apart. A re-apply (recovered, or through an UnackedCommits entry) that would insert a key now absent
-    * on an object a later transaction reached is quarantined too, applied nothing: the key may have been deleted since
-    * (RequirementsApplyer.mayReinsertDeletedKeys). Every transaction on the object votes abort, as the lock would have made it, and committed
-    * ones apply nothing to it (reported, so their finalizers mark the store for repair), until a verification
-    * (QuarantineVerifier) shows the store's copy matches a read of the object no older than `minTimestamp`, the
-    * transaction's start: what repair requires before it drops an ErrorTree entry for the transaction. Repair is not
-    * held off the object, unlike commitFailed.
-    *
-    * In memory only: the quarantining transaction's CRL state, object data included, is kept until the quarantine
-    * clears (concludeTransactionState), so a reloaded store recovers it, fails the same re-check, and quarantines the
-    * object again. Its TxCommitted says the state is kept (keptForReplay), so the finalizer gives the store an
-    * UnackedCommits entry: through it the recovered vote re-applies, and quarantines again, even once the transaction
-    * is finalized and it learns the outcome late. Nothing else is written for this. It declares no lost store
-    */
-  def quarantine(pointer: ObjectPointer, minTimestamp: HLCTimestamp, txid: TransactionId, reason: String): Unit =
-    val oid = pointer.id
-    logger.error(s"Store $storeId quarantines object $oid: the commit vote of transaction $txid does not apply its " +
-      s"committed update ($reason). Every transaction on it votes abort until repair verifies the store's copy is at " +
-      s"least as new as $minTimestamp")
-    testingOnlyQuarantines += 1
-    quarantined.get(oid) match
-      case Some(q) =>
-        q.txids += txid
-        if q.minTimestamp < minTimestamp then
-          q.minTimestamp = minTimestamp
-          startVerification(oid, q)
-      case None =>
-        val q = new Quarantine(pointer, minTimestamp, Set(txid), 0, false, 0, 1, 0)
-        quarantined(oid) = q
-        startVerification(oid, q)
-
-  private def startVerification(oid: ObjectId, q: Quarantine): Unit =
-    q.attempt += 1
-    q.inFlight = true
-    val attempt = q.attempt
-    quarantineVerifier.verify(storeId, q.pointer, q.minTimestamp,
-      result => post(() => verificationComplete(oid, attempt, result)))
-
-  /** A verification of a quarantined object answered. Complete: the quarantine clears and the CRL state it kept is
-    * concluded. Otherwise it is retried at heartbeat, after 1 heartbeat doubling to MaxQuarantineRetryInterval
-    */
-  def verificationComplete(oid: ObjectId, attempt: Long, result: Try[Boolean]): Unit =
-    quarantined.get(oid).filter(_.attempt == attempt).foreach: q =>
-      q.inFlight = false
-      result match
-        case Success(true) =>
-          logger.info(s"Store $storeId: repair verified quarantined object $oid at least as new as " +
-            s"${q.minTimestamp}. Quarantine cleared")
-          quarantined.remove(oid)
-          q.txids.foreach: txid =>
-            if !quarantined.valuesIterator.exists(_.txids.contains(txid)) then
-              quarantinedConclusions.remove(txid).foreach: stub =>
-                concludeTransactionState(txid, stub, keepAdmission = transactions.contains(txid))
-        case other =>
-          q.failures += 1
-          q.countdown = q.interval
-          q.interval = math.min(q.interval * 2, MaxQuarantineRetryInterval)
-          val why = other match
-            case Failure(err) => s"failed: $err"
-            case _ => "is not complete yet (stale, or deferred by locks)"
-          logger.warn(s"Store $storeId: verification of quarantined object $oid $why (${q.failures} in a row). " +
-            s"Retrying in ${q.countdown} heartbeats")
-
-  /** Store heartbeat: starts the verifications whose retry is due */
-  def retryQuarantineVerifications(): Unit =
-    quarantined.toList.foreach: (oid, q) =>
-      if !q.inFlight then
-        q.countdown -= 1
-        if q.countdown <= 0 then
-          startVerification(oid, q)
-
-  private def quarantineKeeps(txid: TransactionId): Boolean =
-    quarantined.valuesIterator.exists(_.txids.contains(txid))
-
   /** `waiter` withholds its vote until each of `oids` has no commit in flight: it is then told through
     * Tx.commitPersisted, once per object
     */
@@ -794,6 +679,103 @@ class Frontend(val storeId: StoreId,
           case _ =>
             crl.whenDurable(storeId, () => post(() => oneDone()))
 
+  /** A transaction whose KeyValue update of objects here has no required revision, so it may Insert keys blindly
+    * (`KeyValueUpdate.DoesNotExist`, `MayExist` or no requirement on the key), and whose CRL state may still hold that
+    * update. Kept, as an AllocationRecord is, until the state's deletion or stub is durable
+    */
+  private final class BlindInsertRecord(var tx: Tx, var objects: Set[ObjectId], var concluded: Boolean)
+
+  /** Transactions that may Insert keys blindly into objects here and whose CRL state may still hold the update, by
+    * txid and by object (transaction-requirements 9.4). Filled by the update's shape alone; its keys are decoded only
+    * when a key deletion meets it (awaitBlindInsertsDurable). Empty for every object no recent blind write covers
+    */
+  private val blindInsertRecords = scala.collection.mutable.HashMap[TransactionId, BlindInsertRecord]()
+  private val blindInsertsOf = scala.collection.mutable.HashMap[ObjectId, Set[TransactionId]]()
+
+  private def registerBlindInserts(tx: Tx, hosted: List[ObjectPointer]): Unit =
+    val ids = hosted.iterator.map(_.id).toSet
+    val blind = tx.txd.requirements.iterator.collect {
+      case r: KeyValueUpdate if r.requiredRevision.isEmpty && ids.contains(r.objectPointer.id) => r.objectPointer.id
+    }.toSet
+    if blind.nonEmpty then
+      val txid = tx.transactionId
+      blindInsertRecords.get(txid) match
+        case Some(r) =>
+          r.tx = tx
+          r.concluded = false
+          r.objects ++= blind
+        case None => blindInsertRecords(txid) = new BlindInsertRecord(tx, blind, false)
+      blind.foreach(oid => blindInsertsOf(oid) = blindInsertsOf.getOrElse(oid, Set()) + txid)
+
+  private def unregisterBlindInserts(txid: TransactionId, oids: Set[ObjectId]): Unit =
+    oids.foreach: oid =>
+      val rest = blindInsertsOf.getOrElse(oid, Set()) - txid
+      if rest.isEmpty then blindInsertsOf.remove(oid) else blindInsertsOf(oid) = rest
+
+  private def registerReplayHazards(tx: Tx, hosted: List[ObjectPointer]): Unit =
+    registerAllocation(tx, hosted)
+    registerBlindInserts(tx, hosted)
+
+  /** `txid`'s CRL state was deleted or replaced by a stub: no save of it may follow. Its records are dropped once that
+    * is durable, unless a newer Tx registered them again meanwhile
+    */
+  private def stateConcluded(txid: TransactionId): Unit =
+    allocationConcluded(txid)
+    blindInsertRecords.get(txid).foreach: r =>
+      r.concluded = true
+      crl.whenDurable(storeId, () => post { () =>
+        blindInsertRecords.get(txid).filter(_ eq r).filter(_.concluded).foreach: r =>
+          blindInsertRecords.remove(txid)
+          unregisterBlindInserts(txid, r.objects)
+      })
+
+  /** Runs `proceed` once no CRL state of another transaction that applied a blind Insert of one of `deleted` (keys of
+    * `oid`, about to be removed from the backend by `by`'s commit or by a repair write) holds that update durably. A
+    * recovered commit vote re-applies an Insert of an absent key (Tx.issueCommits), which is right only if no deletion
+    * of that key followed the update it holds (transaction-requirements 10.5c).
+    *
+    * A covering transaction whose update of `oid` is applied here has its state saved again without it
+    * (Tx.persistWithoutUpdateOf); its recovered vote then finds the update missing and takes it as applied. Applied
+    * means: it issued its commit of `oid` here, or it voted commit here, since a commit voter holds the key's lock from
+    * its vote until it applies, and a deletion of the key applies before it only as a recovered vote sharing the lock,
+    * cast after the update persisted (10.5a). A concluded one's deletion or stub only has to be durable (whenDurable).
+    * Any other (a non-voter that has not applied) holds an update the store does not hold, which it may yet apply:
+    * nothing waits for it.
+    *
+    * Inline when no blind write covers `oid`, which is every key deletion but one soon after a blind write of its
+    * object; only then are the keys decoded (`deleted`, the covering transactions' inserts)
+    */
+  private def awaitBlindInsertsDurable(oid: ObjectId, by: Option[TransactionId], deleted: () => Set[Key])
+                                      (proceed: () => Unit): Unit =
+    val covering = blindInsertsOf.getOrElse(oid, Set()) -- by
+    if covering.isEmpty then
+      proceed()
+    else
+      val keys = deleted()
+      val hazards = if keys.isEmpty then Nil else covering.toList.flatMap: txid =>
+        blindInsertRecords.get(txid).filter(r => r.tx.insertedKeys(oid).exists(keys.contains)).map(txid -> _)
+      if hazards.isEmpty then
+        proceed()
+      else
+        var pending = hazards.size
+        def oneDone(): Unit =
+          pending -= 1
+          if pending == 0 then proceed()
+        logger.info(s"Store $storeId deletes keys of object $oid soon after transactions " +
+          s"${hazards.map(_._1).mkString(", ")} inserted them: the deletion waits until their CRL state durably holds " +
+          s"no update of it")
+        hazards.foreach: (txid, r) =>
+          if r.concluded then
+            crl.whenDurable(storeId, () => post(() => oneDone()))
+          else if r.tx.holdsUpdateOf(oid) then
+            // The update is gone from its state for good: later deletions of its keys need nothing from it
+            r.objects -= oid
+            unregisterBlindInserts(txid, Set(oid))
+            if r.objects.isEmpty then blindInsertRecords.remove(txid)
+            r.tx.persistWithoutUpdateOf(oid)(() => oneDone())
+          else
+            oneDone()
+
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
 
   /** The state of every object a transaction or an in-flight backend commit references (see retain), consulted before
@@ -933,7 +915,7 @@ class Frontend(val storeId: StoreId,
         admitRecovered(txd.transactionId, trs)
         val tx = new Tx(trs, txd, this, net, crl, statusCache, pointers, recovered = true)
         transactions += (txd.transactionId -> tx)
-        registerAllocation(tx, pointers)
+        registerReplayHazards(tx, pointers)
         // A transaction with no objects here never loads any
         if pointers.nonEmpty then
           recoveringTransactions += (txd.transactionId -> (trs.disposition == TransactionDisposition.VoteCommit &&
@@ -1017,7 +999,7 @@ class Frontend(val storeId: StoreId,
     if !keepAdmission then
       admitted.remove(txid).foreach: a =>
         stubReplacedAdmissions(txid) = stubReplacedAdmissions.getOrElse(txid, 0L) + a.bytes
-    allocationConcluded(txid)
+    stateConcluded(txid)
     crl.saveAppliedStub(storeId, txid, stubs(txid), () => post { () =>
       stubReplacedAdmissions.remove(txid).foreach(admission.release)
       onDurable
@@ -1035,7 +1017,7 @@ class Frontend(val storeId: StoreId,
 
   /** Drops every applied stub whose transaction is past the horizon plus the expiry margin (stubExpiresAt) and for
     * which the store holds no Tx, whether live, waiting on a held commit (deferredFinalizations), on its backend
-    * commits (txCommits) or on a quarantine (quarantinedConclusions). Called at heartbeat (expiryHeartbeat). Only the
+    * commits (txCommits). Called at heartbeat (expiryHeartbeat). Only the
     * stubs due are looked at (stubExpiry), plus those a Tx kept past theirs (heldStubs), so a heartbeat costs
     * O(k log n) for k stubs due, not a pass over all n.
     *
@@ -1048,8 +1030,7 @@ class Frontend(val storeId: StoreId,
     */
   private def expireStubs(now: Long): Unit =
     def txHeld(txid: TransactionId): Boolean =
-      transactions.contains(txid) || deferredFinalizations.contains(txid) || txCommits.contains(txid) ||
-        quarantinedConclusions.contains(txid)
+      transactions.contains(txid) || deferredFinalizations.contains(txid) || txCommits.contains(txid)
     if heldStubs.nonEmpty then
       heldStubs.toList.foreach: txid =>
         if !txHeld(txid) then
@@ -1446,13 +1427,13 @@ class Frontend(val storeId: StoreId,
                     s"rebuilt store's acceptor existed")
       transactions -= tx.transactionId
       tx.releaseObjects()
-      allocationConcluded(tx.transactionId) // It saved nothing
+      stateConcluded(tx.transactionId) // It saved nothing
       releaseAdmission(tx.transactionId)
 
   /** Deletes a transaction's CRL entry and releases its admission */
   def deleteTransactionState(txid: TransactionId): Unit =
     crl.deleteTransaction(storeId, txid)
-    allocationConcluded(txid)
+    stateConcluded(txid)
     releaseAdmission(txid)
 
   /** Releases everything this Frontend's transactions were admitted for: it was built and never served. A store
@@ -1490,8 +1471,12 @@ class Frontend(val storeId: StoreId,
   /** Hands `os` to the backend and keeps it in memory until the backend reports the commit complete.
     * Applies a transaction's committed update; transactions and repairs on the object wait behind it
     * (txCommitsInFlight).
+    *
+    * @param deletedKeys the keys of `os` the update deletes: asked only when a blind write covers the object
+    *                    (awaitBlindInsertsDurable)
     */
-  def commit(os: ObjectState, cs: CommitState, txid: TransactionId): Unit =
+  def commit(os: ObjectState, cs: CommitState, txid: TransactionId,
+             deletedKeys: () => Set[Key] = () => Set()): Unit =
     val deletes = os.metadata.refcount.count == 0
     if deletes then
       // Deleted: the state is no longer served, nor checked by transactions that still reference it
@@ -1512,13 +1497,15 @@ class Frontend(val storeId: StoreId,
     txCommits.getOrElseUpdate(txid, new TxCommits(0, false, false)).outstanding += 1
     txCommitsInFlight(os.objectId) = txCommitsInFlight.getOrElse(os.objectId, 0) + 1
     // A deletion reaches the backend only once no allocation's CRL state can bring the object back
-    // (crash-recovery-log 3.4). Until then it is in flight like any commit: reads, snapshots and transactions see the
+    // (crash-recovery-log 3.4), and a key's deletion only once no blind Insert's CRL state can bring the key back
+    // (awaitBlindInsertsDurable). Until then it is in flight like any commit: reads, snapshots and transactions see the
     // deletion. A store stopped or closed meanwhile never issues it, and keeps this transaction's CRL state, so a
     // reload applies the deletion again
     if deletes then
       awaitAllocationsDurable(os.objectId)(() => if !stopped && !closed then backend.commit(cs, txid))
     else
-      backend.commit(cs, txid)
+      awaitBlindInsertsDurable(os.objectId, Some(txid), deletedKeys)(() =>
+        if !stopped && !closed then backend.commit(cs, txid))
 
   /** A transaction was finalized. Its CRL state is deleted now, unless backend commits this store issued for it are
     * outstanding or failed: the store deletes a committed transaction's CRL state only once every backend commit it
@@ -1559,15 +1546,11 @@ class Frontend(val storeId: StoreId,
     *                      keeps it, and releases it when it is forgotten
     */
   private def concludeTransactionState(txid: TransactionId, stub: Option[HLCTimestamp], keepAdmission: Boolean): Unit =
-    if quarantineKeeps(txid) then
-      // Kept until the quarantine clears (verificationComplete): a reloaded store recovers it and, through its
-      // UnackedCommits entry (TxCommitted.keptForReplay), quarantines again
-      quarantinedConclusions(txid) = quarantinedConclusions.get(txid).flatten.orElse(stub)
-    else if stub.nonEmpty && !stubs.contains(txid) then
+    if stub.nonEmpty && !stubs.contains(txid) then
       recordAppliedStub(txid, stub.get, keepAdmission)(())
     else
       crl.deleteTransaction(storeId, txid)
-      allocationConcluded(txid)
+      stateConcluded(txid)
       if !keepAdmission then
         releaseAdmission(txid)
 
@@ -1792,7 +1775,7 @@ class Frontend(val storeId: StoreId,
     val tx = new Tx(trs, m.txd, this, net, crl, statusCache, pointers,
       muted = muted)
     transactions += (m.txd.transactionId -> tx)
-    registerAllocation(tx, pointers)
+    registerReplayHazards(tx, pointers)
     tx.receivePrepare(m)
     // The new Tx recorded itself as Unresolved, which the monotone cache does not let replace a known outcome
     known.foreach { _ =>
@@ -2200,7 +2183,12 @@ class Frontend(val storeId: StoreId,
         post(() => repairWriteComplete(os, result.isSuccess, prior))
         p.complete(result.map(_ => plan.result.copy(changed = true)))
       }(using scala.concurrent.ExecutionContext.parasitic)
-      backend.repair(CommitState(read.pointer, os.metadata, os.objectType, os.data), done)
+      // A key the repair removes reaches the backend only once no blind Insert's CRL state can bring it back, as for a
+      // transaction's key deletion (awaitBlindInsertsDurable)
+      val removed = plan.deletes.toSet
+      awaitBlindInsertsDurable(objectId, None, () => removed): () =>
+        if stopped || closed then done.tryFailure(new IllegalStateException(s"Store $storeId stopped"))
+        else backend.repair(CommitState(read.pointer, os.metadata, os.objectType, os.data), done)
 
   /** A repair's backend write of `os` completed: its state is no longer held in memory for the write, and the
     * transactions waiting behind it may proceed.

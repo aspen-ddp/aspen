@@ -481,7 +481,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
 
   atest("a commit voter that reported but keeps the state for replay gets a UnackedCommits entry and its marks " +
         "(R-W4, Q-W5)"):
-    // store1 quarantined the object (or its backend commit failed) and keeps T's CRL state: after a reload its
+    // store1's backend commit failed and keeps T's CRL state: after a reload its
     // recovered vote learns T late, and only this entry makes it apply again. store2 reported the same error without
     // keeping anything, so it is repaired through its mark alone
     val ptr = pointerWith(Array[Byte](4, 9))

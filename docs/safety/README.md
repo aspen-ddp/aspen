@@ -30,7 +30,7 @@ docs/safety; 8 unimplemented features.
 | Document | Covers | Weakness ids |
 |---|---|---|
 | [paxos-transactions.md](paxos-transactions.md) | Votes, the Paxos instance, the client's commit from votes, proofs and late commits, the status cache, the transaction horizon, forget floor and expiry | P-W* |
-| [transaction-requirements.md](transaction-requirements.md) | Requirement checks, lock classes, vote tallying, the commit window, description validation, fail-stop and quarantine | Q-W* |
+| [transaction-requirements.md](transaction-requirements.md) | Requirement checks, lock classes, vote tallying, the commit window, description validation, fail-stop and the apply re-check | Q-W* |
 | [transaction-recovery.md](transaction-recovery.md) | Driver takeover, participant recovery, finalizers, the missed-update marker, UnackedCommits entries and applied stubs | R-W* |
 | [crash-recovery-log.md](crash-recovery-log.md) | The CRL contract, SimpleCRL's format, rotation and recovery, admission, per-device sharing | CRL-W* |
 | [repair-process.md](repair-process.md) | ErrorTree and UnackedCommits repair scans, Reconcile, deferral, parking, proofs, deletes | RP-W* |

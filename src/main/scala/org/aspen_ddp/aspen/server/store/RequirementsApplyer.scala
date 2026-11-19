@@ -66,69 +66,6 @@ object RequirementsApplyer extends Logging {
     }.map(_.objectId).toSet
     byUpdate ++ allocatedOver.filter(oid => atRevision(oid).nonEmpty)
 
-  /** The objects in `objects` that a re-apply of the committed transaction's traceless update finds already applied:
-    * each change the transaction makes to the object is a RefcountUpdate whose `newRefcount` the object holds, or a
-    * KeyValueUpdate without a required revision whose operations are all key Deletes of keys now absent, and the
-    * object's timestamp is at least the transaction's. Only a re-apply of a commit vote may ask (a recovered vote, or
-    * one applying through its UnackedCommits entry), never a proof (`appliedBy`): the store held the required refcount
-    * and keys when it voted, and only this update, or a write after it in lock order, changes them. A refcount a later
-    * update changed again, like a superseded trace, is not recognized (transaction-requirements.md 8.5).
-    */
-  def reappliedTraceless(transactionId: TransactionId,
-                         timestamp: HLCTimestamp,
-                         requirements: List[TransactionRequirement],
-                         objects: Map[ObjectId, ObjectState],
-                         objectUpdates: Map[ObjectId, DataBuffer]): Set[ObjectId] =
-    val changes = requirements.iterator.collect {
-      case r: TransactionObjectRequirement if changedObjects(List(r)).nonEmpty => r
-    }.toList.groupBy(_.objectPointer.id)
-    changes.iterator.filter { (oid, reqs) =>
-      objects.get(oid).exists { state =>
-        state.metadata.timestamp >= timestamp && reqs.forall {
-          case r: RefcountUpdate => state.metadata.refcount == r.newRefcount
-          case r: KeyValueUpdate if r.requiredRevision.isEmpty =>
-            (state.kvState, objectUpdates.get(oid)) match
-              case (Some(kvs), Some(update)) =>
-                val ops = KeyValueOperation.decode(update, ObjectRevision(transactionId), timestamp)
-                ops.nonEmpty && ops.forall {
-                  case o: Delete => !kvs.content.contains(o.key)
-                  case _ => false
-                }
-              case _ => false
-          case _ => false
-        }
-      }
-    }.map(_._1).toSet
-
-  /** The objects a re-apply of the committed transaction must not take: KeyValue updates without a required revision
-    * that Insert a key now absent, on an object a later transaction has reached (its timestamp is past the
-    * transaction's). Such a key may have been inserted by this transaction and deleted by a later one: a `DoesNotExist`
-    * or blind Insert passes its re-check again and would write the key back at this store alone, reporting success
-    * (transaction-requirements.md 10.5c). The store cannot tell that from a state the transaction never reached, whose
-    * other keys were written since. Only a re-apply asks (a recovered commit vote, or one applying through its
-    * UnackedCommits entry): a live voter has held the key's lock since its own check. An update with a required
-    * revision needs no such test: its re-check fails on any state it does not apply to, and `appliedBy` sees its
-    * revision. A key Delete always needs a key check, which fails on an absent key.
-    */
-  def mayReinsertDeletedKeys(transactionId: TransactionId,
-                             timestamp: HLCTimestamp,
-                             requirements: List[TransactionRequirement],
-                             objects: Map[ObjectId, ObjectState],
-                             objectUpdates: Map[ObjectId, DataBuffer]): Set[ObjectId] =
-    requirements.iterator.collect {
-      case r: KeyValueUpdate if r.requiredRevision.isEmpty => r.objectPointer.id
-    }.filter { oid =>
-      (objects.get(oid), objectUpdates.get(oid)) match
-        case (Some(state), Some(update)) if state.metadata.timestamp > timestamp =>
-          state.kvState.exists { kvs =>
-            KeyValueOperation.decode(update, ObjectRevision(transactionId), timestamp).exists {
-              case o: Insert => !kvs.content.contains(o.key)
-              case _ => false
-            }
-          }
-        case _ => false
-    }.toSet
-
   def apply(transactionId: TransactionId,
             timestamp: HLCTimestamp,
             requirements: List[TransactionRequirement],

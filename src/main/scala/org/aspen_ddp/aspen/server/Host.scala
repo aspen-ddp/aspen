@@ -16,7 +16,7 @@ import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDevice
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
-import org.aspen_ddp.aspen.server.store.{Frontend, HeldVoteQuery, QuarantineVerifier, ReconcileResult, RepairSnapshot, Store, UnackedCommitLookup,
+import org.aspen_ddp.aspen.server.store.{Frontend, HeldVoteQuery, ReconcileResult, RepairSnapshot, Store, UnackedCommitLookup,
   UnackedLookupResult}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler, DefaultBackendOpener}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -255,16 +255,6 @@ class Host(val client: AspenClient,
         case None => UnackedLookupResult.Absent
         case Some(vs) => UnackedLookupResult.Found(UnackedCommitEntry.decode(vs.value.bytes).incarnation)))
 
-  /** Stores have no client, so a quarantined object (Frontend.quarantine) is verified by the host's repair service. The
-   *  service is built after the DeviceControl, but no store loads before then; a call that still finds it unset fails
-   *  and its store retries at heartbeat. */
-  private val quarantineVerifier: QuarantineVerifier = (storeId, pointer, minTimestamp, answer) =>
-    given ExecutionContext = ec
-    Future.unit
-      .flatMap(_ => Option(repairService).map(_.verifyObject(storeId, pointer, minTimestamp))
-        .getOrElse(Future.failed(new IllegalStateException("repair service not started"))))
-      .onComplete(answer)
-
   /** Stores have no client, so a rebuilt store's query of its peers' held votes (Frontend.inheritedVoteLock) goes
    *  through the host's: `width - writeThreshold + 1` of the pool's other stores, given up after HeldVoteQueryDeadline
    *  (its store asks again at a later heartbeat). */
@@ -327,7 +317,6 @@ class Host(val client: AspenClient,
     ec = ec,
     writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker),
     unackedLookup = seams.wrapUnackedLookup.fold(unackedLookup)(wrap => wrap(unackedLookup)),
-    quarantineVerifier = quarantineVerifier,
     heldVoteQuery = heldVoteQuery,
     missingDataWait = seams.missingDataWait,
     parkedReadWait = seams.parkedReadWait,

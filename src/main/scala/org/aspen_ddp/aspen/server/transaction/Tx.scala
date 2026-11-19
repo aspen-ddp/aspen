@@ -1515,13 +1515,13 @@ class Tx( trs: TransactionRecoveryState,
     *  - Already resolved committed: the commit was learned normally and is applied, or held, as usual. It finalizes,
     *    replacing its CRL state by an applied stub if TxFinalized listed this store in `owed` or it applied the update
     *    through its entry. Otherwise no TxFinalized listing `owed` reached it, so an entry may still name it: it looks
-    *    the entry up first (addendum A, case 3), writes a stub if found and is forgotten either way; a failed or
-    *    unanswered lookup is retried at heartbeat.
+    *    the entry up first (addendum A, case 3), writes a stub if found and is forgotten either way; a failed
+    *    lookup is retried at heartbeat, an unanswered one awaited.
     *  - Undecided with its own commit vote, recovered or live: an applied stub means the store already holds the
     *    update, so it applies nothing. Otherwise held for a lookup started now (one per hold, so a
     *    retransmit does not push the lookup that counts further away). An entry applies the update
-    *    (unackedCommitFound), none applies nothing (unackedCommitAbsent). A failed or unanswered lookup is retried at
-    *    heartbeat (Frontend.retryUnackedLookups).
+    *    (unackedCommitFound), none applies nothing (unackedCommitAbsent). A failed lookup is retried at heartbeat, an
+    *    unanswered one awaited (Frontend.retryUnackedLookups).
     *  - Otherwise (an abort vote, no vote, a muted Tx, or an abort already learned): applies nothing.
     * The Tx concludes itself: the Frontend forgets it here, not on the message.
     *

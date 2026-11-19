@@ -64,8 +64,8 @@ object Frontend {
   /** The most reads a store parks at once. A read arriving with this many parked is answered at once */
   val MaxParkedReads: Int = 1024
 
-  /** How long a UnackedCommits lookup may go unanswered before the store heartbeat makes another. An answer can be
-    * lost: one completing before its store is installed in the StoreRouter is dropped
+  /** How long a UnackedCommits lookup may go unanswered before the store heartbeat warns of it. It is not made again:
+    * its read retries until the tree is readable, and its answer always reaches this Frontend (see retryUnackedLookups)
     */
   val UnackedLookupTimeout: FiniteDuration = FiniteDuration(5, SECONDS)
 
@@ -845,9 +845,11 @@ class Frontend(val storeId: StoreId,
     *                      arrived do not, since the entry may have been written after they read the tree
     * @param failed the latest lookup failed: retryUnackedLookups makes another
     * @param failures lookups failed in a row, for logging
+    * @param stallWarned the latest lookup was logged as unanswered past UnackedLookupTimeout
     */
   private final class UnackedLookup(var latest: Long, var inFlight: Boolean, var startedAt: Long,
-                                      var firstCounting: Long, var failed: Boolean, var failures: Int)
+                                      var firstCounting: Long, var failed: Boolean, var failures: Int,
+                                      var stallWarned: Boolean = false)
   // Before recoverTransactions: a recovered transaction that loads at once requests its lookup inside it
   private val unackedLookups = scala.collection.mutable.HashMap[TransactionId, UnackedLookup]()
   private var nextUnackedRequest: Long = 0L
@@ -1069,6 +1071,7 @@ class Frontend(val storeId: StoreId,
     l.inFlight = true
     l.startedAt = System.nanoTime()
     l.failed = false
+    l.stallWarned = false
     // Through `post`, so a store replaced meanwhile drops the answer rather than handing it to its successor
     unackedLookup.lookup(storeId, txid, requestId,
       result => post(() => unackedLookupComplete(txid, requestId, result)))
@@ -1133,20 +1136,22 @@ class Frontend(val storeId: StoreId,
                   logger.warn(s"Store $storeId: UnackedCommits lookup of transaction $txid failed " +
                     s"(${l.failures} in a row), retrying at heartbeat: $err")
 
-  /** Store heartbeat: makes another lookup for each one that failed, and for each unanswered after
-    * `Frontend.UnackedLookupTimeout`, whose answer may have been lost
+  /** Store heartbeat: makes another lookup for each one that failed. One still unanswered is left to finish, however
+    * long it takes: its read of the tree retries until the tree's metadata pool is readable, so another would only run
+    * beside it, and many would pile up through a metadata outage. Its answer cannot be lost: lookups start only from
+    * recovery or messages, after the store is installed, and `post` drops an answer only once another store replaced
+    * this one, and this Frontend with it. One unanswered past `Frontend.UnackedLookupTimeout` is logged once
     */
   def retryUnackedLookups(now: Long = System.nanoTime()): Unit =
     unackedLookups.toList.foreach: (txid, l) =>
-      val timedOut = l.inFlight && now - l.startedAt >= UnackedLookupTimeout.toNanos
-      if l.failed || timedOut then
-        if transactions.get(txid).exists(_.awaitsUnackedLookup) then
-          if timedOut then
-            logger.warn(s"Store $storeId: UnackedCommits lookup of transaction $txid went unanswered " +
-              s"for $UnackedLookupTimeout, looking up again")
-          startUnackedLookup(txid, l)
-        else
-          unackedLookups.remove(txid)
+      if !transactions.get(txid).exists(_.awaitsUnackedLookup) then
+        unackedLookups.remove(txid)
+      else if l.failed then
+        startUnackedLookup(txid, l)
+      else if l.inFlight && !l.stallWarned && now - l.startedAt >= UnackedLookupTimeout.toNanos then
+        l.stallWarned = true
+        logger.warn(s"Store $storeId: UnackedCommits lookup of transaction $txid unanswered for " +
+          s"$UnackedLookupTimeout, still waiting for it")
 
   // ---- Expiry of unresolved transactions past the horizon (transaction horizon design, section 2) ----
 

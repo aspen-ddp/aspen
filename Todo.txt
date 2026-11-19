@@ -57,11 +57,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.5  R-W3  UnackedCommits lookups pile up as untimed reads during a metadata outage. CONFIRMED, M.
-     retryUnackedLookups re-issues every 5 s without cancelling the old lookup, and Host.unackedLookup reads through
-     the untimed client: about N*D/5 retransmitting reads after an outage of D seconds with N waiting Txs. Fix: use
-     a timed read (withReadTimeout), or re-issue only when the earlier lookup has finished.
-
 5.6  RB-W9  A finished copy whose flip did not promote it is stranded when its entry leaves the device. CONFIRMED, S.
      After Superseded or a permanently failed flip, the copy is not in offlineStores, so the Deleted Stores pass
      never retires it before a host restart. Meanwhile every transfer of the store onto that device refuses ("store

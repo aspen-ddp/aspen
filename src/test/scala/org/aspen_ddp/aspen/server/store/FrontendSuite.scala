@@ -3669,20 +3669,21 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     crl.stubsSaved should contain (unackedTxid) // An applied stub replaces its state (replay-pins addendum A)
   }
 
-  test("a UnackedCommits lookup whose answer is lost is made again at heartbeat once it times out") {
+  test("a UnackedCommits lookup still unanswered is not made again at heartbeat, however long it takes") {
+    // Its read retries until the tree is readable, so a second one would only pile up beside it (R-W3)
     val (frontend, backend, _, _, lookup) = unackedFixture()
-    val lost = lookup.made.last._2 // the recovery's lookup, whose answer never arrives
+    val slow = lookup.made.last._2 // the recovery's lookup, unanswered while the tree is unreadable
     frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = false, late = false, proof = false))
     lookup.requests.count(_ == unackedTxid) shouldBe 1
 
     val now = System.nanoTime()
     frontend.retryUnackedLookups(now)
-    lookup.requests.count(_ == unackedTxid) shouldBe 1
     frontend.retryUnackedLookups(now + Frontend.UnackedLookupTimeout.toNanos + 1)
-    lookup.requests.count(_ == unackedTxid) shouldBe 2
+    frontend.retryUnackedLookups(now + 100 * Frontend.UnackedLookupTimeout.toNanos)
+    lookup.requests.count(_ == unackedTxid) shouldBe 1
 
-    // The lost lookup read the tree before the abort arrived: its late answer finding no entry does not count
-    lookup.answer(unackedTxid, lookup.absent, Some(lost))
+    // It read the tree before the abort arrived: its answer finding no entry does not count, and another is made
+    lookup.answer(unackedTxid, lookup.absent, Some(slow))
     frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Unresolved
     lookup.requests.count(_ == unackedTxid) shouldBe 2
 
@@ -3980,9 +3981,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.retryUnackedLookups()
     lookup.requests.count(_ == txid1) shouldBe 2
 
-    // A lost answer is asked again once it times out
+    // One still unanswered is not asked again, however long it takes
     frontend.retryUnackedLookups(System.nanoTime() + Frontend.UnackedLookupTimeout.toNanos + 1)
-    lookup.requests.count(_ == txid1) shouldBe 3
+    lookup.requests.count(_ == txid1) shouldBe 2
 
     lookup.answer(txid1, lookup.own)
     backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)

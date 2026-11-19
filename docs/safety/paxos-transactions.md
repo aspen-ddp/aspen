@@ -72,7 +72,7 @@ votes on one object" argument rely on.
 | Client retransmit | 1 s | `cmdline/Main`, `SimpleAspenClient` |
 | Prefer-abort wait | 5 s from the Tx's creation | `Frontend.MissingDataWait` |
 | Collision wait | 500 ms, checked at the store heartbeat | `Tx.CollisionWait` |
-| UnackedCommits lookup timeout | 5 s | `Frontend.UnackedLookupTimeout` |
+| UnackedCommits lookup stall warning | 5 s | `Frontend.UnackedLookupTimeout` |
 | Prepare-response cache (no driver yet) | 10 s, 1000 transactions | `Store.prepareResponseCache` |
 | Acceptor-since margin | 10 s | `server/rebuild/RebuildingStore.AcceptorSinceMargin` |
 | Join ceiling | renewed every 250 ms to now + `MaxStartLead` + 1 s | `server/host/JoinCeiling` |
@@ -455,8 +455,8 @@ Tx holds its own commit vote, which may be the counted one, and a vote that did 
 T's pin. Such a re-apply leaves out and quarantines every object on which it would insert a key now absent
 (`RequirementsApplyer.mayReinsertDeletedKeys`, 9.1). A found entry of another incarnation resolves committed applying
 nothing (`Tx.unackedCommitNotOwed`; `notOwedHere`), its objects reported, its driver given the proof. An absent entry from a lookup started after the latest
-held abort releases the held aborts. A failed or unanswered lookup keeps them held and is retried at heartbeat
-(`Frontend.retryUnackedLookups`, `UnackedLookupTimeout`). Details: `transaction-recovery.md`.
+held abort releases the held aborts. A failed or unanswered lookup keeps them held; a failed one is retried at
+heartbeat, an unanswered one awaited (`Frontend.retryUnackedLookups`). Details: `transaction-recovery.md`.
 
 A recovered commit vote whose object fails to load with an error other than `ObjectNotFound` fail-stops the store, or
 poisons the object if the store's writes are frozen (`Tx.objectLoadFailed`), since its lock would be missing.

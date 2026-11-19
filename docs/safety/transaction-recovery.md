@@ -94,7 +94,7 @@ retransmit 1 s. `TestNetwork` builds recovery drivers with 10 ms / 100 ms.
 | `FinalizationStallAfter` | 60 s | `TransactionDriver.finalizationStall`, `FinalizationStallReport` | `FINALIZATION STALLED` logged once a minute per store |
 | `Tx.CollisionWait` | 500 ms (+ up to 1 s granularity) | `Tx.checkCollisionWait` | Vote withheld for a lock holder the Tx builds on |
 | `Frontend.MissingDataWait` | 5 s | `Tx.awaitingClientPrepare` | A Tx that has seen no client prepare withholds promise and vote this long (from its creation), then votes abort (`NoClientPrepare`), requirements unchecked |
-| `Frontend.UnackedLookupTimeout` | 5 s | `Frontend.retryUnackedLookups` | Re-issues an unanswered UnackedCommits lookup (the earlier one is not cancelled); a failed one is retried at the next heartbeat |
+| `Frontend.UnackedLookupTimeout` | 5 s | `Frontend.retryUnackedLookups` | Logs an UnackedCommits lookup still unanswered (it is not re-issued); a failed one is retried at the next heartbeat |
 | `prepareResponseCache` | 10 s, 1000 entries | `Store` | Prepare responses arriving before the store's driver exists, replayed into it |
 | `Tx.StuckReportAfter/Every` | 2 s / 5 s | `Tx.reportIfStuck`, `TransactionDriver.reportIfStuck` | Logging only |
 
@@ -586,11 +586,14 @@ state, and Paxos, safe with offline acceptors, never chooses abort once commit w
   cache entry here would let the relay report T late while other stores' entries are not yet durable. The entry is
   left for the repair scan, whose reconcile installs the committed state. Another incarnation means the store was
   rebuilt since its vote, so the vote that counted is lost and this incarnation's copy comes from its rebuild.
-* **Lookup failure or no answer**: retried at heartbeat, re-issued after `UnackedLookupTimeout`; the Tx keeps holding
-  aborts (and its locks) meanwhile, and is driven. Each lookup has its own request id: an entry found by any of them is
-  taken, while no entry counts only from a lookup started after the latest held abort or late commit
-  (`firstCounting`); a non-counting absent answer of the latest lookup starts another. The lookup is an untimed
-  read of the tree through the host's client, and a re-issue does not cancel the one before (R-W3).
+* **Lookup failure or no answer**: a failed lookup is retried at heartbeat; the Tx keeps holding aborts (and its
+  locks) meanwhile, and is driven. Each lookup has its own request id: an entry found by any of them is taken, while
+  no entry counts only from a lookup started after the latest held abort or late commit (`firstCounting`); a
+  non-counting absent answer of the latest lookup starts another. The lookup is an untimed read of the tree through
+  the host's client, so one still unanswered is never re-issued (one past `UnackedLookupTimeout` is logged once):
+  through a metadata outage each Tx keeps at most one read in flight. Its answer cannot be lost: lookups start only
+  after the store is installed (recovery is deferred until then), and `Store`'s `post` drops an answer only once
+  another store replaced the one that asked.
 * A found entry of any incarnation is never taken as absent. When a lookup finds an entry while a driver already runs,
   the Frontend hands the proof to it (`Frontend.onCommitProven` -> `Store.giveProof`).
 
@@ -819,18 +822,4 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-### R-W3. UnackedCommits lookups pile up as untimed reads while the tree's metadata pool is unavailable (CONFIRMED; resource leak)
-Mechanism: `Frontend.retryUnackedLookups` re-issues a lookup still unanswered after `UnackedLookupTimeout` through
-`startUnackedLookup`, without cancelling the one in flight. `Host.unackedLookup` runs `client.getStoragePool` and
-`unackedCommitsTree.get` through the host's client, whose reads are untimed (they retry until they restore the
-object). A superseded lookup's answer is used or ignored, but its read keeps running until the tree is readable.
-Trigger / scenario: the metadata pool holding a data pool's UnackedCommits tree stays below its read threshold for D
-seconds while N Txs of the host await lookups (recovered commit votes after a host restart, held late commits, expiry
-discards, forget-lookups).
-Consequence: about N * D / 5 concurrent tree reads, each retransmitting to the metadata stores, accumulate in the
-host's client until the pool returns, then all complete at once. Memory and network load grow with the outage. No
-safety impact: only the latest lookup's absence counts, and any found entry is the same entry.
-Suggested fix: bound each lookup by `UnackedLookupTimeout` with a timed read of the tree (the reader
-`withReadTimeout` returns), so it settles as a failure that the heartbeat retries; or re-issue only when the answer
-can have been lost (the store was replaced) and otherwise wait for the read.
-Effort: M   Priority: 5
+None.

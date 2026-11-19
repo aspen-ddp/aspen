@@ -8,12 +8,12 @@ import org.aspen_ddp.aspen.common.network.{CurrentAllocationsReply, TransactionV
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription, TransactionDisposition, TransactionId}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, Metadata, ObjectId, ObjectPointer, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
-import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, DefaultBackendOpener, StoreCreation}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, CommitState, CompletionHandler, DefaultBackendOpener, StoreCreation}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.BufferedConsistentRocksDB
 
 import java.nio.ByteBuffer
@@ -1022,5 +1022,84 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
     yield
       outcome.failed.get should be(failure)
+      os.exists(dev / storeId.directoryName) should be(false)
+      RebuildState.load(staging).isDefined should be(true)
+
+  /** Opens through the default opener, wrapping the backend so its rebuildFlush throws an out-of-space error while
+   *  `full` is set */
+  private final class FillingOpener extends BackendOpener:
+    @volatile var full: Boolean = false
+
+    def create(storeCfg: StoreConfig, storePath: os.Path, creatingRoot: os.Path): Future[Unit] =
+      backends.create(storeCfg, storePath, creatingRoot)
+
+    def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit): Future[Backend] =
+      given ExecutionContext = executionContext
+      backends.open(storeCfg, storePath, onFatal).map: b =>
+        new Backend:
+          val storeId: StoreId = b.storeId
+          def path: os.Path = b.path
+          def close(): Future[Unit] = b.close()
+          def estimateSize(): Long = b.estimateSize()
+          def setCompletionHandler(handler: CompletionHandler): Unit = b.setCompletionHandler(handler)
+          def bootstrapAllocate(objectId: ObjectId, objectType: ObjectType.Value, metadata: Metadata,
+                                data: DataBuffer): Unit = b.bootstrapAllocate(objectId, objectType, metadata, data)
+          def bootstrapOverwrite(objectId: ObjectId, data: DataBuffer): Unit = b.bootstrapOverwrite(objectId, data)
+          def rebuildWrite(pointer: ObjectPointer, objectType: ObjectType.Value, metadata: Metadata,
+                           data: DataBuffer): Unit = b.rebuildWrite(pointer, objectType, metadata, data)
+          def rebuildFlush(): Unit =
+            if full then throw new java.io.IOException("No space left on device")
+            b.rebuildFlush()
+          def read(pointer: ObjectPointer): Unit = b.read(pointer)
+          def commit(state: CommitState, transactionId: TransactionId): Unit = b.commit(state, transactionId)
+          def repair(state: CommitState, complete: Promise[Unit]): Unit = b.repair(state, complete)
+          def repairDelete(objectId: ObjectId, storePointer: Array[Byte], complete: Promise[Unit]): Unit =
+            b.repairDelete(objectId, storePointer, complete)
+
+  atest("a full device at finish's flush raises the out-of-space alert and keeps the checkpoint (RB-W10)"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+    val opener = new FillingOpener
+    val alerts = new java.util.concurrent.LinkedBlockingQueue[scribe.Level]()
+    val handler = scribe.handler.LogHandler(scribe.Level.Info): r =>
+      val text = r.logOutput.plainText
+      if text.contains("REBUILD OUT OF SPACE") && text.contains(dev.toString) then alerts.add(r.level)
+    scribe.Logger.root.withHandler(handler).replace()
+    val run =
+      for
+        _ <- populate(6)
+        _ <- net.waitForTransactionsToComplete()
+        // The walk fit; the final flush is the write that finds the device full
+        rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener,
+                                      checkpointInterval = 2,
+                                      testingOnlyAfterWalk = () =>
+                                        opener.full = true
+                                        Future.unit)
+        outcome <- rebuild.complete.transform(scala.util.Success.apply)
+      yield outcome
+    run.transform: result =>
+      scribe.Logger.root.withoutHandler(handler).replace()
+      result.map: outcome =>
+        Backend.isOutOfSpace(outcome.failed.get) should be(true)
+        alerts.toArray(Array.empty[scribe.Level]).toList should be(List(scribe.Level.Error))
+        os.exists(dev / storeId.directoryName) should be(false)
+        RebuildState.load(staging).isDefined should be(true)
+
+  atest("a failed completion-file write in finish keeps the checkpoint for the next pass (RB-W10)"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+    for
+      _ <- populate(6)
+      _ <- net.waitForTransactionsToComplete()
+      // A directory where the marker goes makes its write, the last before the move, fail
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                    checkpointInterval = 2,
+                                    testingOnlyOnFinishClosed = () =>
+                                      os.makeDir.all(staging / RebuildingStore.RebuildCompleteMarkerFile / "x"))
+      outcome <- rebuild.complete.transform(scala.util.Success.apply)
+    yield
+      outcome.isFailure should be(true)
       os.exists(dev / storeId.directoryName) should be(false)
       RebuildState.load(staging).isDefined should be(true)

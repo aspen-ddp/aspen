@@ -57,9 +57,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.7  RB-W10  An out-of-space flush in finish is not classified. CONFIRMED, S.
-     The pass fails generically, with no REBUILD OUT OF SPACE alert, and repeats with backoff.
-
 5.8  CRL-W7  An expiring stub's charge is released before its deletion is queued. CONFIRMED, S.
      Frontend.dropAppliedStub calls releaseStub() before crl.deleteAppliedStub, breaking the release-after-deletion
      rule Lemma C (1) relies on. Up to 41 uncovered bytes per stub. Fix: swap the two calls.

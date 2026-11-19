@@ -120,8 +120,8 @@ start
         ► abort latch check (out of space, > MaxFailedObjects failures, MaxConsecutiveReadTimeouts,
                              cancel, staging fail-stop)
         ► retryFailures (re-read tree entry; absent = deleted; still failing ► acceptLoss? mark : fail)
-        ► finish: flush, close, re-check latch, remove checkpoint, acceptor-since, inherited-votes,
-                  incarnation, rebuild-complete (the episode), DurableFiles.move(staging ► final)
+        ► finish: flush, close, re-check latch, acceptor-since, inherited-votes, incarnation,
+                  rebuild-complete (the episode), remove checkpoint, DurableFiles.move(staging ► final)
   ► complete ► StoreRebuilds completion handler ► markRebuiltStoreActive
              ► Adopt | AdoptOffline | Discard | NotOwned | Superseded
 ```
@@ -388,15 +388,16 @@ acceptance: a pool below its read threshold is not papered over.
 ### 5.6 Finish (`RebuildingStore.finish`)
 
 `rebuildFlush`, close the backend, **re-check the abort latch** (a cancel or fail-stop during the close fails the
-pass), remove the checkpoint and temp file, write `acceptor-since` (`writeAcceptorSince`: now plus
-`AcceptorSinceMargin`, 10 s), write `inherited-votes` (`writeInheritedVotes`: the pass start plus the horizon plus
-twice the margin; section 6.4, inherited votes), write a fresh `incarnation` (`StoreIncarnationFile.writeFresh`), write
-`rebuild-complete` durably with the episode as its content, `DurableFiles.move(staging, final)` (both directories
-forced; it fails if the final path exists). All four files are written durably in staging before the move, so the
-directory at the final path carries them from the instant it appears. A failure anywhere in `finish` fails the pass;
-one after the checkpoint's removal makes the next pass a first pass (fresh staging, full walk). The first
-`rebuildFlush` is outside the out-of-space classification of the walk (RB-W10). A cancel that arrives after the
-latch re-check does not stop the move: the rebuild completes and its flip decides (5.7).
+pass), write `acceptor-since` (`writeAcceptorSince`: now plus `AcceptorSinceMargin`, 10 s), write `inherited-votes`
+(`writeInheritedVotes`: the pass start plus the horizon plus twice the margin; section 6.4, inherited votes), write a
+fresh `incarnation` (`StoreIncarnationFile.writeFresh`), write `rebuild-complete` durably with the episode as its
+content, remove the checkpoint and temp file, `DurableFiles.move(staging, final)` (both directories forced; it fails
+if the final path exists). All four files are written durably in staging before the move, so the directory at the
+final path carries them from the instant it appears. A failure anywhere in `finish` fails the pass; one before the
+checkpoint's removal leaves the next pass a resume (a resumed `finish` rewrites all four files), one after it makes the
+next pass a first pass (fresh staging, full walk). An out-of-space failure of the flush or a write
+(`Backend.isOutOfSpace`) is classified as the walk's is: it latches the abort and logs `REBUILD OUT OF SPACE`. A cancel
+that arrives after the latch re-check does not stop the move: the rebuild completes and its flip decides (5.7).
 
 ### 5.7 Completion and promotion (`StoreRebuilds.startRebuild`)
 
@@ -785,17 +786,6 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 ---
 
 ## Open weaknesses
-
-### RB-W10. An out-of-space flush in `finish` is not classified (CONFIRMED; alerting)
-Mechanism: `RebuildingStore.finish` calls `backend.rebuildFlush()` directly, outside `checkpointBestEffort`, so an
-ENOSPC/EDQUOT there fails the pass as a generic error without `latchOutOfSpace`; the same holds for the marker writes
-that follow.
-Trigger / scenario: the destination fills during the final flush (FSIF's data force, RocksDB's flush) of a walk that
-otherwise fit.
-Consequence: no `REBUILD OUT OF SPACE` line, the operator's alert and remedy pointer; the pass fails and retries with
-backoff, each pass re-walking from the last checkpoint and failing again at the same point.
-Suggested fix: classify `finish`'s flush and writes with `Backend.isOutOfSpace` and latch the out-of-space abort.
-Effort: S   Priority: 5
 
 ### RB-W11. Documentation corrections outside docs/safety (CONFIRMED; documentation)
 Mechanism / corrections:

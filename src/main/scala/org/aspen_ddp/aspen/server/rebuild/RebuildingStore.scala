@@ -858,29 +858,42 @@ class RebuildingStore(client: AspenClient,
         checkpointBestEffort("after a failed loss record")
         Future.failed(new Exception(s"Rebuild of $storeId: failed to record its accepted losses: $t", t))
 
-  /** Flush, close, drop the checkpoint, move into place. */
+  /** Flush, close, write the completion files, drop the checkpoint, move into place.
+   *
+   *  The flush and the file writes touch the disk as the walk's writes do, so a full device here is classified the
+   *  same way (latchOutOfSpace): the operator alert, and a failed pass. The checkpoint is dropped only after the last
+   *  write, so a pass failing on any of them resumes from it rather than walking the pool again. */
   private def finish(): Future[Unit] =
-    backend.rebuildFlush()
-    closeBackend().map: _ =>
-      testingOnlyOnFinishClosed()
-      // An abort latched while the backend closed (a fail-stop of the staging store's last I/O, a cancel)
-      // means the staging copy must not become the live store: the pass fails with the checkpoint left in place
-      synchronized(abortCause).foreach(cause => throw cause)
-      // The temp file only exists if a crash caught a save between its write and its rename, and
-      // only survives if this pass never checkpointed. Dropping it here keeps it out of the
-      // directory that is about to become a live store.
-      RebuildState.removeAll(stagingPath)
-      // The rebuilt store has no Paxos state: it takes no part in transactions started before now (plus the margin)
-      writeAcceptorSince(stagingPath)
-      // Its old incarnation's commit votes may still count, with none of their locks held here: the store votes abort
-      // on what they may lock until its peers' held votes, complete from this time on, release them
-      writeInheritedVotes(stagingPath, inheritedVotesAfter(passStartMillis, horizon))
-      // A new life for the store, replacing any incarnation the staging directory carried
-      StoreIncarnationFile.writeFresh(stagingPath)
-      // Last before the move: the directory is a finished rebuild, kept out of service until its flip commits
-      DurableFiles.write(stagingPath / RebuildCompleteMarkerFile, rebuildCompleteContent(episode))
+    val done =
+      try
+        backend.rebuildFlush()
+        closeBackend().map(_ => completeStaging())
+      catch case NonFatal(t) => Future.failed(t)
+    done.transform:
+      case scala.util.Failure(err) if isOutOfSpace(err) =>
+        latchOutOfSpace(err)
+        scala.util.Failure(err)
+      case other => other
 
-      // Durable before the store is reported in place: a device shut down and moved after this
-      // must come back with the store at finalPath, or an adopting host refuses it.
-      DurableFiles.move(stagingPath, finalPath)
-      logger.info(s"Rebuild of $storeId: store in place at $finalPath")
+  /** finish's work once the staging backend is closed */
+  private def completeStaging(): Unit =
+    testingOnlyOnFinishClosed()
+    // An abort latched while the backend closed (a fail-stop of the staging store's last I/O, a cancel)
+    // means the staging copy must not become the live store: the pass fails with the checkpoint left in place
+    synchronized(abortCause).foreach(cause => throw cause)
+    // The rebuilt store has no Paxos state: it takes no part in transactions started before now (plus the margin)
+    writeAcceptorSince(stagingPath)
+    // Its old incarnation's commit votes may still count, with none of their locks held here: the store votes abort
+    // on what they may lock until its peers' held votes, complete from this time on, release them
+    writeInheritedVotes(stagingPath, inheritedVotesAfter(passStartMillis, horizon))
+    // A new life for the store, replacing any incarnation the staging directory carried
+    StoreIncarnationFile.writeFresh(stagingPath)
+    // Last write before the move: the directory is a finished rebuild, kept out of service until its flip commits
+    DurableFiles.write(stagingPath / RebuildCompleteMarkerFile, rebuildCompleteContent(episode))
+    // The checkpoint, and a temp file a crash caught between its write and its rename, are kept out of the
+    // directory that is about to become a live store
+    RebuildState.removeAll(stagingPath)
+    // Durable before the store is reported in place: a device shut down and moved after this
+    // must come back with the store at finalPath, or an adopting host refuses it.
+    DurableFiles.move(stagingPath, finalPath)
+    logger.info(s"Rebuild of $storeId: store in place at $finalPath")

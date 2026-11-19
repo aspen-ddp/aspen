@@ -60,7 +60,8 @@
   keeps it pending for the next round, and a cancel takes effect within one timeout. Tree-node reads (the walk itself,
   `allocationTree.get`) and the pool lookup stay untimed: they read the metadata pool, whose loss stalls the rebuild
 - Placement alarms (rebuild-process 4.2, 5.2): `REBUILD CO-LOCATED` (the selection had to share a device with the pool),
-  `REBUILD OUT OF SPACE`, and a warning for a store with no recorded usage. The remedy for either is re-placement,
+  `REBUILD OUT OF SPACE` (from any write of the walk, the sweep, a checkpoint, or `finish`'s flush and completion
+  files), and a warning for a store with no recorded usage. The remedy for either is re-placement,
   `transfer-store` on the Rebuilding store (`server/host/CLAUDE.md`)
 - Silence (rebuild-process 6.2): `StoreRebuilds.startRebuild` marks a store offline in the router on every reconcile
   that sees its Rebuilding entry, queued or running (`silenced`), so its host drops its messages rather than answering

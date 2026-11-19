@@ -57,13 +57,7 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.2 [SL-W9] A device without room for the CRL replacing its lost one stays unloaded.               PLAUSIBLE, M
-    systemic-loss-protection.md SL-W9. The replacement is now created in `crl.creating/` and renamed into place once
-    finished, so a crash or failed creation no longer leaves a refused CRL or piles up `crl.lost-*`. Residual: on a
-    device with less free space than one CRL (the old one is kept aside as `crl.lost-*`), preallocation fails with
-    ENOSPC every scan and the device never loads, so its `pending-delete/` copies are never released. Fix: size the
-    replacement to the free space (minimum streams, growing later), or release the device's `pending-delete/` copies
-    whose stores are Active elsewhere first.
+(SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
 4.3 [Q-W9] Votes blocked by lock-order waits can form a cross-store cycle that lasts until expiry.   PLAUSIBLE, S
     transaction-requirements.md Q-W9 (raised independently by the Paxos audit). `Frontend.voteBlocked` blocks every new

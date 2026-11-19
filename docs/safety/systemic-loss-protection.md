@@ -506,8 +506,12 @@ logging the failure. The device never loads, so its `pending-delete/` copies, wh
 released, and nothing reclaims `crl.lost-*` (S7).
 Consequence: a nearly full device whose CRL is lost stays out of service until an operator frees space, for instance
 by removing a `crl.lost-*` directory.
-Suggested fix: create the replacement no larger than the free space allows (the minimum stream count, growing later),
-or release the device's `pending-delete/` copies whose stores are Active elsewhere before the creation.
+Fix: tracked in Backlog.txt's entry on system-level protection against correlated lost store declarations. Under
+that space pressure, delete `crl.lost-*` until the replacement fits, but only once the system-level check rules the
+declaration isolated or on an explicit release, because in a correlated false declaration each `crl.lost-*` holds the
+only copy of its stores' CRL state. A smaller replacement stream size is rejected: it would permanently lower the
+device's per-transaction limit (S/2) and its never-fits bound. Releasing `pending-delete/` copies before the device
+loads is rejected too: the reconcile has already released every copy whose store is Active, so it seldom frees space.
 
 ### SL-W10: A lost device CRL marks a finished rebuild that awaits its flip
 Verdict CONFIRMED. Priority 5. Effort S.

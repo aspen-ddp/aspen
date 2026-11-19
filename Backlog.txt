@@ -130,6 +130,18 @@ System-level protection against correlated "lost store" declarations
       aside as `<device>/crl.lost-<uuid>` (up to num-streams x file size, 900 MB by default) and marks every store on
       the device rebuild-required. Those directories are kept forever today, deliberately: they are suspected-loss
       content, held for the system-level check below, never deleted on local evidence alone.
+    - (moved here from Safety Work Item list, 4.2, SL-W9) A device without room for the CRL that replaces its lost
+      one stays unloaded. The replacement is preallocated in `crl.creating/` at full size, and on a device whose free
+      space is below one CRL that fails with ENOSPC at every scan. So the device never loads and its stores stay out
+      of service. The space is usually in the `crl.lost-<uuid>` the declaration just moved aside.
+      - Intended fix: under that space pressure, delete `crl.lost-*` directories (rename-first, through `deleting/`)
+        until the replacement fits. Do it only once the system-level check below rules the declaration isolated, or
+        on an explicit release through the admin channel, never on the device's own evidence: during a correlated
+        false declaration (a release that rejects valid CRLs on every host), each `crl.lost-*` holds the only copy of
+        its stores' votes and pending updates.
+      - Rejected: a smaller replacement stream size, which permanently lowers the device's per-transaction limit
+        (S/2) and its never-fits bound; releasing `pending-delete/` copies before the device loads, which seldom
+        frees anything because the reconcile has already released every copy whose store is Active.
   - A higher-level system check decides what happens to suspected-loss content.
     - Look across the pool and the whole system for correlation:
       - several stores of one pool declared lost within a short window;

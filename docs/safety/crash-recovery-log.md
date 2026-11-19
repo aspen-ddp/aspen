@@ -328,7 +328,9 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   such store directory gets a durable `rebuild-required` marker, one by one, except one whose `crl_save.log`
   validates as its own (`DeviceDiscovery.holdsOwnState`), whose whole state is that file (3.3, step 4: a store with a
   save file has served nowhere since it was written, and its load drops what the device CRL holds for it); `crl/` is moved to `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the
-  device directory is forced and a fresh CRL is opened. `CrlCorrupt` is logged under its own cause. The reconcile then
+  device directory is forced; a fresh CRL is created in `crl.creating/` (`CrashRecoveryLogFactory.createCRL`), renamed
+  to `crl/` durably once finished, and opened. A crash or a failed creation (ENOSPC while preallocating) leaves no
+  `crl/`: device load removes `crl.creating/`, and the next load declares the CRL lost again, moving nothing aside. `CrlCorrupt` is logged under its own cause. The reconcile then
   flips each store to Rebuilding. A device without stores simply has its CRL created.
 - **Failed.** A CRL whose thread dies (5.10) completes `failed`; `DeviceShutdown.crlFailed` disowns the directory,
   closes the stores, gossips them offline and unloads the device until the host restarts. It is neither reloaded
@@ -383,7 +385,9 @@ the ring need not be in numeric order. "Next", "successor" and "after" below alw
    (`FilePreallocation.preallocate`: `fallocate(2)` mode 0 through FFM on Linux, zero-fill elsewhere or on
    `EOPNOTSUPP`; forced), renamed into place, and the directory forced. Only then does the writer start, so a creation
    that crashed wrote no entry and leaves each listed stream at most once, as `<n>.crl` or as `<n>.crl.tmp`, and no
-   other `.crl.tmp`. It never leaves one under `mustExist`: stores exist only on a device whose CRL creation finished.
+   other `.crl.tmp`. It never leaves one under `mustExist`: a CRL is created in place only on a device holding no stores,
+   and the replacement of a lost CRL is created apart (`SimpleCRL.create`, in `crl.creating/`) and renamed to `crl/`
+   only once finished.
    Any `*.crl.tmp` left after step 3 is therefore taken for an unfinished creation only when `mustExist` is unset and
    every one is a listed stream's `<n>.crl.tmp` with no `<n>.crl` beside it: every `*.crl.tmp` and every stream file
    is removed, and creation starts over. Any other `.crl.tmp` (a stray beside its stream, an unlisted name, or any

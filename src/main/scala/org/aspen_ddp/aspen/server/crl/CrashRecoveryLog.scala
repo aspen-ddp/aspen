@@ -15,6 +15,10 @@ object CrashRecoveryLog:
   /** Where a device's CRL files live */
   def deviceCrlDir(devicePath: os.Path): os.Path = devicePath / "crl"
 
+  /** Where the CRL that replaces a lost device CRL is created before it is renamed to deviceCrlDir. Whatever an
+   *  interrupted or failed creation left there is removed at device load and before each creation */
+  def replacementCrlDir(devicePath: os.Path): os.Path = devicePath / "crl.creating"
+
   /** Creates a new device's crl directory and forces it to disk. Device creation must do this: a device that holds
    *  stores but has no crl directory is taken to have lost its CRL, and its stores are rebuilt. */
   def createDeviceCrlDir(devicePath: os.Path): Unit =

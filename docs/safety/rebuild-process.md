@@ -137,7 +137,7 @@ the entry straight to Rebuilding.
 
 | # | Trigger | Detection | Effect |
 |---|---|---|---|
-| T1 | `<device>/crl` missing from a device that holds store directories (a device-root directory with a `config.yaml`) | `DeviceDiscovery.openDeviceCrl` | every store directory gets the marker, except one whose valid `crl_save.log` is its whole state (`holdsOwnState`); a fresh CRL is opened |
+| T1 | `<device>/crl` missing from a device that holds store directories (a device-root directory with a `config.yaml`) | `DeviceDiscovery.openDeviceCrl` | every store directory gets the marker, except one whose valid `crl_save.log` is its whole state (`holdsOwnState`); a fresh CRL is created in `crl.creating/`, renamed to `crl/` once finished, and opened |
 | T2 | the device CRL of a device holding store directories fails to open with anything but `CrlLocked`, `CrlSizingMismatch`, `CrlConfigInvalid` (each refuses the device and retries each scan) or a transient error (`DeviceDiscovery.isTransient`, retried up to `CrlOpenAttempts` = 3 device scans in a row; only a `ScanDevices` open counts, host start and nudges retry uncounted); `CrlCorrupt` and `CrlMissing` (a `crl/` with no stream files, `openCRL(..., holdsStores = true)`) are logged as such | same | as T1; the old CRL is kept as `crl.lost-<uuid>` |
 | T3 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` fails | `StoreLoader.handleLoad` ► `StoreRebuilds.crlSaveFileLost` ► `retireUnserved` | backend closed unserved, marker, offline, device checked |
 | T4 | backend open throws `BackendStateLost` (FSIF `FsifRecovery.StoreLost`; RocksDB `RocksDBStateLost` for a directory with no database) | `StoreLoader.handleBackendOpened` | marker, offline, device checked |

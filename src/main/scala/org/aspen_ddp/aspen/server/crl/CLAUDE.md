@@ -117,7 +117,9 @@
   writer starts. A `.crl.tmp` at open is a creation that wrote nothing, and it starts over, only when `holdsStores`
   (`mustExist`) is unset and every one is a listed stream's `<n>.crl.tmp` with no `<n>.crl` beside it. Any other
   (a stray beside its stream, an unlisted name, any on a device with stores) is damage: `CrlSizingMismatch`, nothing
-  removed, never a fresh CRL under live state. A `<ringSize>.crl` or
+  removed, never a fresh CRL under live state. The replacement of a lost CRL on a device holding stores is never
+  created in place: `createCRL` (`SimpleCRL.create`) builds it in an empty scratch directory, which the caller renames
+  to `crl/` once finished. A `<ringSize>.crl` or
   `<ringSize>.crl.tmp` the ring does not list is a growth that never committed: removed at open with a warning
   (`removeUncommittedGrowth`, run before that creation rule), but only when every listed stream exists and no other file
   is unlisted. Otherwise, as for any other unlisted stream file, the open is `CrlSizingMismatch` and removes nothing:

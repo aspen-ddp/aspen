@@ -1727,6 +1727,9 @@ object Main {
         openedCrls.updateAndGet(_ + (devicePath -> crl))
         crl
 
+      def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
+        SimpleCRL.DeviceFactory().createCRL(devicePath, config, dir)
+
     val tls = TlsCredentials.fromPem(bootstrapCfg.caCertificate, hostCfg.tlsCertificate, hostCfg.tlsPrivateKey)
 
     val objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache =

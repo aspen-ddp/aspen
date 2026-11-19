@@ -537,7 +537,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  scans in a row (an open outside a scan neither counts nor declares; a success anywhere resets). The stores'
    *  transaction state was in it, so each is marked rebuild-required (the reconcile pass turns them into rebuilds),
    *  except one whose valid crl_save.log is its whole state (holdsOwnState). The old directory is kept aside as
-   *  `crl.lost-<uuid>`, and a fresh CRL is opened. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
+   *  `crl.lost-<uuid>`, and a fresh CRL is created in `crl.creating` (CrashRecoveryLog.replacementCrlDir), renamed
+   *  to `crl/` durably once finished, and opened. A failed creation removes `crl.creating` and is rethrown, leaving no
+   *  `crl/`. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
    *  A corrupt CRL (CrlCorrupt) is lost too, logged under its own cause.
    *  A CRL another writer holds open (CrlLocked) is never lost: it is rethrown each time, uncounted.
    *  Nor is a CRL whose files do not match the sizing it recorded, or that holds a `.crl.tmp` that is no unfinished
@@ -613,8 +615,22 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     storeDirs.filterNot(holdsOwnState).foreach(ctx.rebuilds.markRebuildRequired)
     if os.exists(crlDir) then
       DurableFiles.move(crlDir, devicePath / s"crl.lost-${UUID.randomUUID()}")
-    // A fresh CRL: the stores now marked recover nothing from it
-    ctx.crlFactory.openCRL(devicePath, sdCfg, holdsStores = false)
+    // A fresh CRL, which the stores now marked recover nothing from. Created apart and renamed into place only once
+    // finished, so a crash or a failure (ENOSPC while preallocating) leaves no crl/ beside the stores: the next load
+    // declares the CRL lost again, moving nothing aside, and creates it afresh
+    val replacement = CrashRecoveryLog.replacementCrlDir(devicePath)
+    try
+      os.remove.all(replacement)
+      os.makeDir(replacement)
+      ctx.crlFactory.createCRL(devicePath, sdCfg, replacement)
+      DurableFiles.move(replacement, crlDir)
+    catch case t: Throwable =>
+      try os.remove.all(replacement)
+      catch case r: Throwable => t.addSuppressed(r)
+      logger.error(s"Failed to create the CRL replacing the lost CRL of storage device $devicePath. Retrying on " +
+                   s"the next scan: $t")
+      throw t
+    ctx.crlFactory.openCRL(devicePath, sdCfg, holdsStores = true)
 
   /** Whether the store directory `storeDir` holds its whole transaction state in its own crl_save.log, which
    *  validates as that store's (an arrived transfer, a transfer out's source, a rebuilt store kept offline). Its load
@@ -660,6 +676,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
           logger.warn(s"Failed to remove stale store-creation directory $creating: $t")
         // And whatever an interrupted delete left (StoreCopies.delete)
         StoreCopies.sweepDeleting(storageDevicePath)
+        // And an unfinished replacement of a lost CRL (openDeviceCrl): it holds no entry
+        val replacementCrl = CrashRecoveryLog.replacementCrlDir(storageDevicePath)
+        try os.remove.all(replacementCrl)
+        catch case t: Throwable =>
+          logger.warn(s"Failed to remove the unfinished replacement CRL directory $replacementCrl: $t")
         Try(os.list(storageDevicePath)) match
           case Failure(t) =>
             // Same hazard as the scan in checkForNewDevices: listing can fail with an IO

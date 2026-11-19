@@ -57,12 +57,13 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.2 [SL-W9] The fresh CRL replacing a lost device CRL is created in place, beside the device's stores.  CONFIRMED, S
-    systemic-loss-protection.md SL-W9. A crash mid-rename leaves `<n>.crl` beside `<n>.crl.tmp`, refused as
-    `CrlSizingMismatch` forever; a failed preallocation (ENOSPC) leaves `.crl.tmp` files, so every scan declares the
-    CRL lost again and piles up `crl.lost-*` directories. The device never loads, so its `pending-delete/` copies are
-    never released. Fix: create the replacement in a scratch directory (swept at device load) and rename it to `crl/`
-    durably once complete. Correct the `SimpleCRL.createStreamsIfNew` scaladoc and crash-recovery-log.md 5.1 step 4.
+4.2 [SL-W9] A device without room for the CRL replacing its lost one stays unloaded.               PLAUSIBLE, M
+    systemic-loss-protection.md SL-W9. The replacement is now created in `crl.creating/` and renamed into place once
+    finished, so a crash or failed creation no longer leaves a refused CRL or piles up `crl.lost-*`. Residual: on a
+    device with less free space than one CRL (the old one is kept aside as `crl.lost-*`), preallocation fails with
+    ENOSPC every scan and the device never loads, so its `pending-delete/` copies are never released. Fix: size the
+    replacement to the free space (minimum streams, growing later), or release the device's `pending-delete/` copies
+    whose stores are Active elsewhere first.
 
 4.3 [Q-W9] Votes blocked by lock-order waits can form a cross-store cycle that lasts until expiry.   PLAUSIBLE, S
     transaction-requirements.md Q-W9 (raised independently by the Paxos audit). `Frontend.voteBlocked` blocks every new

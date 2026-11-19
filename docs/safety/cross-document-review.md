@@ -335,7 +335,7 @@ Mechanism: Backlog.txt (item 3.1 of the systemic-loss entry) cites "SL M1-M5, M1
 "S8 (record each declaration durably ...)": systemic-loss-protection.md has M1-M9 (no M11), questions Q1, Q3 and Q4
 only, and S8 is "no brake and no escalation" (recording declarations is M9). The scaladoc of
 `ExpiryTally.decideUnknown` carries history twice ("Counting only `k_p` was unsafe, found 2026-11-16", "Requiring it
-only through `vc >= r` was unsafe, found 2026-11-16"). (`SimpleCRL.createStreamsIfNew`'s false premise is SL-W9's.)
+only through `vc >= r` was unsafe, found 2026-11-16").
 Consequence: readers following Backlog.txt land on the wrong items; the scaladoc narrates removed rules.
 Suggested fix: renumber the Backlog citations against the current document; state the two rules' reasons in the
 present tense.

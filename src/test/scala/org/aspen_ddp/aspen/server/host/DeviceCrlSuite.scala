@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
   TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig,
+import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, GossipRetransmitter, Host, StorageDeviceConfig,
   StorageDeviceManager, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlCorrupt,
   StoreRecoveryState, TransactionRecoveryState}
@@ -124,6 +124,9 @@ private class RecordingCrlFactory(completions: ExecutionContext, gate: Option[Co
     val crl = new RecordedCrl(devicePath, inner.openCRL(devicePath, config, holdsStores), gate, completions)
     synchronized { crls = crls :+ crl }
     crl
+
+  def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
+    inner.createCRL(devicePath, config, dir)
 
   def opened: List[RecordedCrl] = synchronized(crls)
 
@@ -674,6 +677,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         if calls.incrementAndGet() == 1 then
           throw Recovery.BrokenEntryChain("unrecoverable")
         inner.openCRL(devicePath, config, holdsStores)
+      def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
+        inner.createCRL(devicePath, config, dir)
     val host = newCrlHost(hostRoot, failingFirst)
 
     Future.successful:
@@ -699,6 +704,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         if calls.incrementAndGet() == 1 then
           throw CrlCorrupt("corrupt")
         inner.openCRL(devicePath, config, holdsStores)
+      def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
+        inner.createCRL(devicePath, config, dir)
     val host = newCrlHost(hostRoot, corruptFirst)
 
     Future.successful:
@@ -716,6 +723,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         if calls.incrementAndGet() == 1 then
           throw CrlCorrupt("corrupt")
         inner.openCRL(devicePath, config, holdsStores)
+      def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
+        inner.createCRL(devicePath, config, dir)
     for
       (hostRoot, deviceDir, saved) <- activeStoreDevice()
       // Its state is in its own save file (an arrived transfer, a transfer out's source, a rebuilt store kept offline)
@@ -750,6 +759,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         if calls.incrementAndGet() <= failures then
           throw new java.io.IOException("transient")
         inner.openCRL(devicePath, config, holdsStores)
+      def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
+        inner.createCRL(devicePath, config, dir)
     (deviceDir, storeDir, inner, calls, newCrlHost(hostRoot, failing))
 
   atest("a transient CRL open failure leaves the stores untouched and a later scan loads the device"):
@@ -890,6 +901,64 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       host.control.devices.devices.keySet should be(Set(deviceA))
       os.exists(CrashRecoveryLog.deviceCrlDir(deviceDir) / "0.crl") should be(true)
       os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
+
+  atest("a replacement CRL whose creation fails leaves no crl dir, and the next scan creates it without moving more aside"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    createCrl(deviceDir)
+    val inner = newFactory()
+    val opens = new AtomicInteger(0)
+    val creates = new AtomicInteger(0)
+    val factory = new CrashRecoveryLogFactory:
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
+        if opens.incrementAndGet() == 1 then
+          throw CrlCorrupt("corrupt")
+        inner.openCRL(devicePath, config, holdsStores)
+      def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
+        if creates.incrementAndGet() == 1 then
+          // A full device: one stream preallocated, the next refused
+          os.write(dir / SimpleCRL.SizingFile, "partial")
+          os.write(dir / "0.crl.tmp", "partial")
+          throw new java.io.IOException("No space left on device")
+        inner.createCRL(devicePath, config, dir)
+    val host = newCrlHost(hostRoot, factory)
+    val crlDir = CrashRecoveryLog.deviceCrlDir(deviceDir)
+
+    host.control.devices.devices.contains(deviceA) should be(false)
+    os.exists(marker(storeDir)) should be(true)
+    os.exists(crlDir) should be(false)
+    os.exists(CrashRecoveryLog.replacementCrlDir(deviceDir)) should be(false)
+    os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
+
+    host.control.reconciler.scan()
+    Future.successful:
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
+      os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
+      os.exists(crlDir / "0.crl") should be(true)
+      os.exists(CrashRecoveryLog.replacementCrlDir(deviceDir)) should be(false)
+      opens.get should be(2)
+      creates.get should be(2)
+
+  atest("an unfinished replacement CRL left by a crash is removed at device load and the CRL created afresh"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    // A crash during the renames of the replacement's stream files, after the old crl/ was moved aside
+    createCrl(deviceDir)
+    val replacement = CrashRecoveryLog.replacementCrlDir(deviceDir)
+    DurableFiles.move(CrashRecoveryLog.deviceCrlDir(deviceDir), replacement)
+    os.list(replacement).filter(f => f.ext == "crl" && f.last != "0.crl").foreach(f =>
+      os.move(f, replacement / s"${f.last}.tmp"))
+    val factory = newFactory()
+    val host = newCrlHost(hostRoot, factory)
+
+    Future.successful:
+      os.exists(marker(storeDir)) should be(true)
+      os.exists(replacement) should be(false)
+      os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
+      os.list(CrashRecoveryLog.deviceCrlDir(deviceDir)).exists(_.last.endsWith(".tmp")) should be(false)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.head
 
   /** Points the pool's entry for `sid` at `device` on the bootstrap host */
   private def setPoolEntry(sid: StoreId, device: StorageDeviceId): Future[Unit] =

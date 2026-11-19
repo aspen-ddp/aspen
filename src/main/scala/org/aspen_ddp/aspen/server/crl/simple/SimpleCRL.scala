@@ -112,6 +112,12 @@ object SimpleCRL extends Logging:
       SimpleCRL(dir, sizing.numStreams, sizing.streamBytes, onThreadDeath,
         mustExist = holdsStores, growth = growth).crl
 
+    def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
+      val sizing =
+        try CrlSizingDefaults.resolve(config, devicePath.toIO.getTotalSpace)
+        catch case e: IllegalArgumentException => throw CrlConfigInvalid(dir, e)
+      SimpleCRL.create(dir, sizing.numStreams, sizing.streamBytes)
+
   /** The CRL's own record of its sizing and id, written durably when it is created, before any stream file. The
    *  sizing is fixed then: an existing CRL is always opened with the sizing it recorded, whatever it is asked for, so
    *  a change of the device config or of the code defaults cannot make it unopenable */
@@ -207,6 +213,14 @@ object SimpleCRL extends Logging:
       lock.release()
       throw t
 
+  /** Creates a new, empty CRL in `streamsDir`, an existing empty directory: its SizingFile, then its stream files
+    * (createStreamsIfNew), all forced to disk. Nothing is opened: apply opens it */
+  def create(streamsDir: os.Path, numStreams: Int, maxSizeInBytes: Long): Unit =
+    require(os.list(streamsDir).isEmpty, s"A CRL is created only in an empty directory, not $streamsDir")
+    val sizing = recordedSizing(streamsDir, numStreams, maxSizeInBytes, None)
+    createStreamsIfNew(streamsDir, (0 until sizing.numStreams).map(i => streamsDir / s"$i.crl").toList,
+      sizing.maxSizeInBytes, mustExist = false)
+
   private def streamFiles(streamsDir: os.Path): Set[os.Path] =
     if os.isDir(streamsDir) then os.list(streamsDir).filter(_.ext == "crl").toSet else Set[os.Path]()
 
@@ -248,9 +262,11 @@ object SimpleCRL extends Logging:
     * allocates a block and a full device cannot fail one with ENOSPC (crash-recovery-log 5.1). Each is written as
     * `<name>.tmp` and renamed into place, and the directory is forced once all are: only then does the writer start.
     * So a crashed creation leaves each listed stream at most once, as `<n>.crl` or as `<n>.crl.tmp`, and no other
-    * `.crl.tmp`; it wrote no entry, and it starts over. It never leaves one under `mustExist`: stores exist only on a
-    * device whose CRL creation finished. Any other `.crl.tmp` (a stray beside its stream, an unlisted name, or any
-    * under `mustExist`) is damage beside a CRL that may hold entries: CrlSizingMismatch, and nothing is removed.
+    * `.crl.tmp`; it wrote no entry, and it starts over. It never leaves one under `mustExist`: a CRL is created in
+    * place only on a device holding no stores, and the replacement of a lost CRL on a device that holds stores is
+    * created apart (create, in CrashRecoveryLog.replacementCrlDir) and renamed into place once finished. Any other
+    * `.crl.tmp` (a stray beside its stream, an unlisted name, or any under `mustExist`) is damage beside a CRL that
+    * may hold entries: CrlSizingMismatch, and nothing is removed.
     * A copy-on-write file system allocates on every overwrite, which no preallocation prevents: warned once. */
   private def createStreamsIfNew(streamsDir: os.Path, streams: List[os.Path], maxSizeInBytes: Long,
                                  mustExist: Boolean): Unit =

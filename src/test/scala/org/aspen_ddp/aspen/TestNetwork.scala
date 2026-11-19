@@ -162,6 +162,8 @@ object TestNetwork {
     override def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
       os.makeDir.all(CrashRecoveryLog.deviceCrlDir(devicePath))
       new TestCRL()
+
+    override def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit = ()
   }
 
   class TClient(executionContext: ExecutionContext,

@@ -14,6 +14,12 @@ trait CrashRecoveryLogFactory {
    *                     must exist then: one with no files holding entries (none ever created, or all removed) throws
    *                     CrlMissing instead of being created empty. */
   def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog
+
+  /** Creates a new, empty CRL for the device at `devicePath` in `dir`, an empty directory on the device, sized by
+   *  `config` (CrlConfigInvalid if it cannot be). Every file it writes is forced to disk, and nothing is opened:
+   *  renamed to `CrashRecoveryLog.deviceCrlDir(devicePath)`, it is that device's CRL. A failure throws and may leave
+   *  partial files in `dir`, which the caller removes. */
+  def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit
 }
 
 /** Thrown by openCRL, asked to open the CRL of a device that holds stores, when the CRL has no files that could hold

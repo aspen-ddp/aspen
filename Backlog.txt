@@ -171,14 +171,14 @@ System-level protection against correlated "lost store" declarations
   - Related: a rebuild that can't find enough healthy peers must fail loudly rather than rebuild from what's left.
   - Track suspected-loss space use per device, including `crl.lost-*` directories, since retained copies compete
     with live stores; see the "Full storage devices" item.
-  - (moved here from Safety Work Item list) 3.1 Design protections S11-S15 (SL M1-M5, M11; scenarios SC3-SC7)
+  - (moved here from Safety Work Item list) 3.1 Design protections S11-S15 (SL M1-M9; scenarios SC1-SC8)
        S11: prove that the rest of the pool can reconstruct a store before discarding it. S12: bound concurrent
        discarded or rebuilding stores per pool, across hosts. S13: transient, configuration and version conditions
        are never treated as corruption. S14: discarded state stays recoverable for a retention period. S15: detect
        a burst of declarations and halt automatic destruction. The SL doc's suggested first step is a test that
        forces openCRL to throw fleet-wide during a simulated rolling restart. Build that test first.
-       Include: S7/Q1 (crl.lost-<uuid> is kept but never used: define retention and salvage, or delete it), S8
-       (record each declaration durably with its cause, visible in show-* commands), SL Q3-Q6, and the destructive
+       Include: S7/Q1 (crl.lost-<uuid> is kept but never used: define retention and salvage, or delete it), S8/M9
+       (record each declaration durably with its cause, visible in show-* commands), SL Q3 and Q4, and the destructive
        4.3 rows X3 and X6 as false-positive amplifiers. Every
        automatic fail-stop (backend I/O error, failed CRL recovery, Frontend.failStop) is a lost-store declaration
        and falls under the same check (Backlog: "System-level protection against correlated lost store

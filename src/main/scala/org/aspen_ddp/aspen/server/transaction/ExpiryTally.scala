@@ -119,17 +119,16 @@ object ExpiryTally:
     *    (primary) and every changed pool has `vc >= r`. B and C did not fire and no store is silent, so every primary
     *    store that still holds T and is not amnesiac accepted nothing. Only the `k_p` amnesiac and `n_p` "unknown"
     *    stores, fewer than a quorum, could hide an accepted abort, so no abort was chosen, and no client heard one (a
-    *    client hears abort only through Paxos). (Counting only `k_p` was unsafe, found 2026-11-16: with a lock-only
-    *    primary object, a quorum of one rebuilt store and one that accepted abort, was finalized and forgot T could
-    *    hide a chosen abort. With a changed primary object `n_p` never matters: `vc_p >= r` leaves at most
-    *    `w - r < t` others.)
+    *    client hears abort only through Paxos). (`n_p` counts as well as `k_p`: with a lock-only primary object, a
+    *    quorum of one rebuilt store and one that accepted abort, was finalized and forgot T can hide a chosen abort.
+    *    With a changed primary object `n_p` never matters: `vc_p >= r` leaves at most `w - r < t` others.)
     *    Frozen acceptors and muted rebuilt stores accept nothing more, so nothing is chosen later. No conflicting
     *    transaction committed: it would need `t` commit votes in some pool of T, but T's `vc` voters there hold its
     *    locks and `vc + t > w`. That premise needs `vc > w - t` in every referenced pool, lock-only ones included; a
-    *    changed pool has it from `vc >= r`, since `t + r > w`. (Requiring it only through `vc >= r` was unsafe, found
-    *    2026-11-16: in a lock-only pool of Replication(3, 2), a stale commit vote, a rebuilt abort voter and a frozen
-    *    abort voter give `vc + k >= t`, yet T' may have committed with the two stores holding no lock of T, so T's
-    *    requirement failed.)
+    *    changed pool has it from `vc >= r`, since `t + r > w`. (A lock-only pool
+    *    needs it explicitly: in a lock-only pool of Replication(3, 2), a stale commit vote, a rebuilt abort voter and a
+    *    frozen abort voter give `vc + k >= t`, yet T' may have committed with the two stores holding no lock of T,
+    *    failing T's requirement.)
     *  - G. Hold otherwise: some store is silent (transient), or, every store replied (`undecidable`), either
     *    `k_p + n_p >= t`: the amnesiac and "unknown" primary stores may hide a chosen abort (with a changed primary
     *    object D fires first then, `t + r > w`, so only an unchanged primary object reaches it); or some lock-only

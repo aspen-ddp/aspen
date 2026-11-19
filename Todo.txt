@@ -74,11 +74,7 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1 [X-W6, X section 5] Citations and history outside docs/safety.                                  CONFIRMED, S
-    cross-document-review.md X-W6. Backlog.txt's systemic-loss entry cites "SL M1-M5, M11; scenarios SC3-SC7",
-    "SL Q3-Q6" and S8 for recording declarations; the document has M1-M9, Q1/Q3/Q4, and recording is M9. The
-    `ExpiryTally.decideUnknown` scaladoc narrates history ("found 2026-11-16"); restate both rules' reasons in the
-    present tense.
+(no open items)
 
 
 PRIORITY 8: unimplemented features

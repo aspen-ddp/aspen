@@ -93,16 +93,16 @@ object KVObjectState {
     }
     (nmin, nmax, nleft, nright, ncontent)
 
-  /** Size in bytes of the slice each store of a pool using `ida` holds for a new key-value object whose initial
-    * content is `ops` (given with full, unencoded values). This is exactly the `encodedSizeAfter` measure stores
-    * apply to an allocation: SetMin/SetMax keys and entry keys are replicated, while Insert, SetLeft and SetRight
-    * values are IDA-encoded to `ida.calculateEncodedSegmentLength` bytes per store.
-    */
   /** encodedSize of an empty state: the slice a store holds for a newly allocated key-value object before its
     * initial content is applied (mask byte plus a zero entry count)
     */
   val EmptyEncodedSize: Int = encodedSize(None, None, None, None, Map())
 
+  /** Size in bytes of the slice each store of a pool using `ida` holds for a new key-value object whose initial
+    * content is `ops` (given with full, unencoded values). This is exactly the `encodedSizeAfter` measure stores
+    * apply to an allocation: SetMin/SetMax keys and entry keys are replicated, while Insert, SetLeft and SetRight
+    * values are IDA-encoded to `ida.calculateEncodedSegmentLength` bytes per store.
+    */
   def allocationSliceSize(ida: IDA, ops: List[KeyValueOperation]): Int =
     val (min, max, left, right, content) = applyOps(None, None, None, None, Map(), ops)
     encodedSizeIDA(ida, min, max, left, right, content)

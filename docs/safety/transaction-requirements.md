@@ -751,10 +751,4 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
 
 ## Open weaknesses
 
-### Q-W8. An orphaned scaladoc in KVObjectState (CONFIRMED; documentation)
-Mechanism: in `KVObjectState`, the scaladoc of `allocationSliceSize` sits above `EmptyEncodedSize`, which then carries
-two scaladoc blocks, and `allocationSliceSize` none.
-Trigger / scenario: reading the code.
-Consequence: a reader misreads `EmptyEncodedSize` and finds `allocationSliceSize` undocumented.
-Suggested fix: move the orphaned scaladoc onto `allocationSliceSize`.
-Effort: S   Priority: 7
+None.

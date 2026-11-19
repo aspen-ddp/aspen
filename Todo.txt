@@ -69,9 +69,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1  Q-W8  Orphaned scaladoc. S.
-     Move the orphaned scaladoc of KVObjectState.allocationSliceSize onto it.
-
 7.2  CRL-W8  CRL documentation. S.
      server/crl/CLAUDE.md and CrashRecoveryLog.save say handlers run "in request order" (within one entry they run
      newest first); the CrlAdmission.tryChargeLoaded scaladoc says "only that file's records"; the StoreRouter.install

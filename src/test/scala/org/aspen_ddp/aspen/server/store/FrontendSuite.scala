@@ -2856,6 +2856,40 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.contains(txid1) shouldBe false
   }
 
+  test("a commit recovered Committed waits in lock order for a recovered commit vote it collides with (R-W7)") {
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    var stops = List[Throwable]()
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, new TransactionStatusCache(),
+      loadedAt = FrontendSuite.longLoaded, deferRecovery = true, onFailStop = err => stops = stops :+ err)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    // txid1, a commit vote overwriting op1; txid2, a later-started refcount change of op1 that collided with it, voted
+    // abort, and was waiting for txid1 in lock order when a save recorded its Committed status
+    val first = lockTxd(txid1, List(overwrite(op1)))
+    val later = lockTxd(txid2, List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 2)))).copy(
+      startTimestamp = HLCTimestamp(first.startTimestamp.asLong + (1000L << 16)))
+    val vote = TransactionRecoveryState(storeId, first.serialize(), List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))),
+      TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial)
+    val resolved = TransactionRecoveryState(storeId, later.serialize(), Nil, TransactionDisposition.VoteAbort,
+      TransactionStatus.Committed, PersistentState.initial)
+    // txid2 listed first, so its objects load first
+    frontend.recover(StoreRecoveryState(List(resolved, vote), Map()))
+
+    // Applied now, txid2 would fail txid1's re-check: it waits for txid1's vote to relock and resolve
+    committedMessages(net) shouldBe Nil
+    backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(1, 1)
+
+    commitErrors(frontend, net, txid1) shouldBe Nil
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe
+      List(txid1 -> Nil, txid2 -> Nil)
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
+    backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(2, 2)
+    frontend.isQuarantined(oid1) shouldBe false
+    stops shouldBe Nil
+  }
+
   test("a commit vote recovered Committed after its update persisted applies nothing again and does not fail-stop") {
     val applied = mkObjectState(oid1)
     applied.metadata = applied.metadata.copy(revision = ObjectRevision(txid1))

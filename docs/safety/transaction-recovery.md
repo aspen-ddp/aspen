@@ -488,16 +488,17 @@ Ordering (`Frontend.recoveredTransactionLoaded`, `Tx.completeLoad`):
 
 1. Every recovered Tx is registered before any object read starts, so a synchronously loaded one cannot release the
    held messages early.
-2. A recovered Tx with a persisted vote completes its load as soon as its objects load; its vote is kept, never
-   recomputed (it may already have been counted). One without a vote completes only after every recovered Tx with a
-   vote has, so it cannot take locks that conflict with a recovered commit vote. Without a vote it promises and votes
-   abort to any driver at once, but stays undecided after load so a client retransmit that arrives first is still
-   checked.
+2. A recovered `VoteCommit` with unresolved status completes its load as soon as its objects load. Every other
+   recovered Tx completes only once every such vote has: first those with a persisted vote (an abort vote, or a
+   restored resolution), then those without, in the order their objects loaded. A recovered vote is kept, never
+   recomputed (it may already have been counted). A Tx without a vote promises and votes abort to any driver at once,
+   but stays undecided after load so a client retransmit that arrives first is still checked; completing last, it
+   cannot take locks that conflict with a recovered commit vote.
 3. `completeLoad` calls `lock()`: a recovered `VoteCommit` with unresolved status retakes its requirement locks
    (`RequirementsLocker.lock`), so new transactions collide with it exactly as before the crash. A Tx with a restored
    commit resolution takes no locks and applies in the same `completeLoad`, waiting in lock order
-   (`Tx.awaitLockHolders`) only for holders that have already relocked: recovered Txs with a vote complete in the
-   order their objects load (R-W7).
+   (`Tx.awaitLockHolders`) for the holders it collides with. Every recovered commit vote has relocked by then (step 2),
+   so it never applies over a recovered vote's update before that vote applies.
 4. `completeLoad` requests the UnackedCommits lookup if `needsUnackedCheck` (7.5).
 5. Held messages are released only once nothing is holding.
 
@@ -833,20 +834,4 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-### R-W7: A restored commit resolution applies before a recovered commit vote it waited for relocks
-Verdict CONFIRMED. Priority 1. Effort S.
-Mechanism: before a crash, committed Tx A, holding no locks at S, waits in lock order for recovered or live commit
-vote B, whose locks it collides with on an object both change (`Tx.awaitLockHolders`, `commitHeld`). A prepare or
-accept reaching A meanwhile (for example its own store's idle driver after a lost `TxFinalized`) saves its state with
-status `Committed`. S crashes. On reload `Frontend.recoverTransactions` starts every object read at once, and
-`Frontend.recoveredTransactionLoaded` calls `completeLoad` for each Tx with a vote as soon as its own objects load. If
-A's objects load first (one of B's is uncached, or the CRL lists A first), A's `completeLoad` restores
-`oresolution = Some(true)`, skips `lock()`, and `resolvedAndAllObjectsLoaded` finds no lock holder on the shared
-`ObjectState`, since B has not run `lock()` yet. A applies. When B learns its commit, its re-apply re-check fails over
-A's newer timestamp and quarantines the object (`Tx.issueCommits`).
-Consequence: the case R15 exists to prevent. B's counted commit vote stands for neither its lock nor its update. With a
-lagging store, the stores lacking B's update can reach the read threshold, and repair's verification then overwrites
-the one copy holding it, losing a committed update with no failure beyond the crash.
-Suggested fix: in `recoveredTransactionLoaded`, defer `completeLoad` of a recovered Tx that will not relock (restored
-resolution, or no commit vote) until every recovered Tx with a vote has completed, as is already done for vote-less
-ones; or have `awaitLockHolders` also wait for recovered commit votes that have not yet relocked.
+None.

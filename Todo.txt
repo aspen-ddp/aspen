@@ -39,22 +39,13 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.1 [R-W7] A restored commit resolution applies before a recovered commit vote it waited for relocks.  CONFIRMED, S
-    transaction-recovery.md R-W7. On reload `Frontend.recoveredTransactionLoaded` completes each Tx with a vote as soon
-    as its own objects load; a Tx whose saved status is `Committed` skips `lock()`, finds no holder in
-    `Tx.awaitLockHolders` (the vote it waited for has not relocked yet) and applies first. The recovered vote's re-check
-    then fails and quarantines it unapplied, the state of 1.2. Fix: defer `completeLoad` of a Tx that will not relock
-    until every recovered Tx with a vote has completed (as already done for vote-less ones), or have
-    `awaitLockHolders` wait for recovered votes not yet relocked. Also correct the lock-order comment in
-    `Tx.issueCommits` and transaction-requirements.md R15 ("ordered by what persisted before the crash").
-
 1.2 [Q-W10, X section 5] Remove quarantine: it has no valid trigger and loses committed data.       CONFIRMED, M
     transaction-requirements.md Q-W10 (replaces repair-process RP-W6 and RP-W7, flaws in quarantine itself). Verified
     against the code, `Tx.issueCommits` quarantines in three cases:
       (a) a live voter's failed re-check: since lock order (`Tx.awaitLockHolders`) only an invariant violation (state
           changed under the locks, two conflicting commits) causes it. Log it as one, skip and report the object.
       (b) a recovered voter's failed re-check: within the margin it was applied before the crash and superseded
-          (refcounts carry update serials, so they are chained too). Treat it as applied. Needs 1.1 first.
+          (refcounts carry update serials, so they are chained too). Treat it as applied.
       (c) `RequirementsApplyer.mayReinsertDeletedKeys`: a genuine normal-operation ambiguity, not a below-threshold
           workaround. A re-applied blind Insert/`DoesNotExist` of k passes again after a later delete of k. Remove
           the ambiguity: a commit deleting k waits until no unconcluded Tx whose CRL state holds a blind Insert of k

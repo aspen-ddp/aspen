@@ -149,8 +149,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   suppress nothing. A found entry of any incarnation is never taken as absent. The entry is left for the repair scan,
   whose reconcile installs the committed state
 - A recovered Tx whose saved status is resolved (re-saved by a prepare or accept after the resolution) restores it
-  into `oresolution`. It takes no locks and needs no lookup: once its objects load it applies the commit with the
-  recovered re-check rules, or deletes the abort's state, then waits for TxFinalized as a live resolved Tx does.
+  into `oresolution`. It takes no locks and needs no lookup: once its objects load and every recovered unresolved
+  commit vote has relocked (`Frontend.recoveredTransactionLoaded` defers its `completeLoad`, so lock order sees every
+  holder) it applies the commit with the recovered re-check rules, or deletes the abort's state, then waits for TxFinalized as a live resolved Tx does.
   A resolution learned from the tree (`unackedCommitFound`, `unackedCommitNotOwed`) saves `Unresolved`
   (`Tx.savedStatus`): restored as resolved it would seed the host cache with a non-finalized `Committed` for a T its
   peers forgot and lose `notOwedHere`; restored unresolved it looks its entry up again (transaction-recovery 7.2)

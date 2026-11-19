@@ -526,7 +526,10 @@ class Tx( trs: TransactionRecoveryState,
     * cannot be starved. The holder's own commit never waits for it (holdForTurn ignores the wait).
     *
     * A Tx holding its own locks never waits: two live votes never hold conflicting locks, and recovered votes
-    * sharing a lock (displaced holders) are ordered by what persisted before the crash. A lock-only holder has no
+    * sharing a lock (displaced holders) are ordered by what persisted before the crash: the later one voted after the
+    * earlier one's update persisted (transaction-requirements.md 10.5a).
+    * A recovered Tx that does not relock completes its load only after every recovered commit vote has relocked
+    * (Frontend.recoveredTransactionLoaded), so it finds every holder it must wait for. A lock-only holder has no
     * update to lose and is not waited for. A holder that never resolves (an undecidable expiry tally) holds this
     * commit as long as its own locks: that needs failures beyond the write threshold's margin, and is alarmed
     */
@@ -1162,7 +1165,8 @@ class Tx( trs: TransactionRecoveryState,
     // least as new as this transaction. That is what repair requires to drop an ErrorTree entry for it, so the store is
     // then as good as one that missed the transaction and was repaired; the object is reported, so the finalizer marks
     // the store. A committed write that does not depend on this one never applies over this vote's locks on an object
-    // both change before this vote applies (awaitLockHolders), so the causes left are ones the store cannot tell from a
+    // both change before this vote applies (awaitLockHolders; at recovery every commit vote relocks before a Tx that
+    // does not relock completes its load, Frontend.recoveredTransactionLoaded), so the causes left are ones the store cannot tell from a
     // violation: the state was invalidated under the locks (Frontend.discard), two conflicting transactions committed,
     // or, for a recovered vote, the store applied the update before the crash and a later transaction superseded it. A
     // live voter logs it as a possible invariant violation, naming the transaction the object now shows. An object

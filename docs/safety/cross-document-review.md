@@ -26,8 +26,8 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | CRL | Store lifecycle | Entries leave the device CRL only after another durable copy exists or the store is unservable on disk |
 | Transaction requirements | CRL, recovery | Recovered commit votes re-take their locks before any message is handled |
 | Transaction requirements | CRL, recovery | A quarantine survives a reload through the quarantining Tx's kept CRL state and its UnackedCommits entry |
-| Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter can break this (2.3: Q-W10, R-W7) |
-| Requirements (lock order) | Recovery | Every recovered commit vote has relocked before a recovered Tx with a restored resolution applies (fails: R-W7) |
+| Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter can break this (2.3: Q-W10) |
+| Requirements (lock order) | Recovery | Every recovered commit vote has relocked before a recovered Tx with a restored resolution applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2) |
 | Client reads | Requirements, rebuild | `InvalidObject.provesDeletion`: a commit voter of an unapplied allocation answers `AllocationPending` (2.5) |
 | Transaction recovery | Repair | ErrorTree and UnackedCommits entries are consumed only once the store can no longer join T, and only by the store the pool names |
 | Transaction recovery | Metadata pools | Marker batches commit (finalization waits for them) |
@@ -154,13 +154,14 @@ The premises other subsystems take from this:
   re-check. Reads choose the revision by count alone (`BaseObjectReader.getStoreStates`, per key in
   `KeyValueObjectReader.resolve`, where only a lock held by the transaction of a revision present defers the answer)
   and a quarantine verification counts the quarantined copy itself among the `r`; both rely on T's `t` commit voters
-  holding T or its lock. The lock order guarantees that for a live voter. A recovered voter can lose both, the voter's
-  crash being the only fault: a re-apply that may re-insert a deleted key is quarantined unapplied after `doCommit`
-  released its locks (`RequirementsApplyer.mayReinsertDeletedKeys`, Q-W10), and a recovered Tx with a restored commit
-  resolution applies in its `completeLoad` before a recovered commit vote it collides with has relocked, so the vote's
-  re-check fails and quarantines it unapplied too (R-W7). Both end in the same state, a counted voter holding neither
-  T nor its lock, which with one store lagging within the `w - t` margin leaves T on fewer than `r` stores, lost through reads,
-  entry repair and verification. R-W7 is a second cause of it; Q-W10 removes quarantine altogether.
+  holding T or its lock. The lock order guarantees that for a live voter. For a recovered voter
+  too: a recovered Tx that does not relock (a restored resolution) completes its load only after every recovered
+  commit vote has relocked (`Frontend.recoveredTransactionLoaded`), so its apply waits for them in lock order. A
+  recovered voter can still lose both, the voter's crash being the only fault: a re-apply that may re-insert a deleted
+  key is quarantined unapplied after `doCommit` released its locks (`RequirementsApplyer.mayReinsertDeletedKeys`,
+  Q-W10). That leaves a counted voter holding neither T nor its lock, which with one store lagging within the `w - t`
+  margin leaves T on fewer than `r` stores, lost through reads, entry repair and verification. Q-W10 removes
+  quarantine altogether.
 * A lock-order wait has no timer, and while it lasts every new vote on the waiter's objects waits
   (`Frontend.voteBlocked`), whatever the vote's requirements. Waits at two stores can block the votes each other's
   holders need (Q-W9). Expiry ends such a cycle: a blocked vote's Tx is frozen past expiry and then reports as a
@@ -210,7 +211,7 @@ The premises other subsystems take from this:
   revision (`Reconcile.planData`): a refcount or key-level write moves the timestamp without the revision, so the
   revision decides. That rule overwrites a store's copy only with what a read majority holds, which includes every
   committed T because its commit voters apply in lock order (2.3), except where a recovered voter was quarantined
-  unapplied (Q-W10, R-W7).
+  unapplied (Q-W10).
 
 ### 2.5 Allocations and proofs of deletion
 
@@ -290,7 +291,7 @@ Every clock comparison that crosses subsystems, and what bounds it:
 | Expiry (`Frontend.pastExpiry`, freeze) | each store's own clock | stores freeze at different moments under skew; the 8 s margin covers the inter-host skew, so an expiry commit exists only past the horizon on every clock (late condition 1). A backward step after a freeze thaws the Tx, breaking the tally's "reported states are final" premise (accepted, paxos-transactions.md) |
 | Repair age gate (60 s) | repairing host's HLC against the marker's start | paces only; the read decides a deletion |
 | Repair `mayJoinTransaction` | the store's own floor | same host |
-| Repair completion gate, quarantine verification | object timestamps, no clock | object timestamps never decrease; a timestamp past T's start does not show T was applied, so the gates rely on T's commit voters applying T before any later write over its locks (2.3), which a recovered voter quarantined unapplied breaks (Q-W10, R-W7) |
+| Repair completion gate, quarantine verification | object timestamps, no clock | object timestamps never decrease; a timestamp past T's start does not show T was applied, so the gates rely on T's commit voters applying T before any later write over its locks (2.3), which a recovered voter quarantined unapplied breaks (Q-W10) |
 | Rebuild pending-allocation coverage | none | the checkpointed union of listed allocations |
 
 ---
@@ -302,9 +303,7 @@ Every clock comparison that crosses subsystems, and what bounds it:
   transaction and was repaired") present quarantining a counted voter's unapplied update as safe. It is not: such a
   store is one more copy without T beyond the `w - t` that may lack it, and its own copy then counts against T in
   reads and in its verification. Quarantine's triggers are invariant violations or an avoidable re-apply ambiguity,
-  so it is to be removed (transaction-requirements.md Q-W10, with transaction-recovery.md R-W7 first). The
-  `Tx.issueCommits` comment also states that no non-chaining commit applies over a vote's locks before the vote
-  applies, which R-W7 contradicts for recovered votes.
+  so it is to be removed (transaction-requirements.md Q-W10).
 * **Tree-learned commits spread as non-late.** paxos-transactions.md 10.2 and transaction-recovery.md 7.2 say a
   non-finalized `Committed` cache entry never stems from a tree-learned resolution, so nothing spreads a non-late
   commit known only from the tree. `Tx.statusForExpiry` reports such a Tx's commit with `late = false`, and

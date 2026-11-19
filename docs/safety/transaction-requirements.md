@@ -330,7 +330,9 @@ while another transaction there holds locks its requirements or writes on an obj
 (section 4), when that holder changes one of the objects it changes (8.3). If that holder
 commits, a store in both write quorums held its lock until it applied and only then voted for the newcomer, so the
 holder precedes it in every serial order; applying the newcomer first would let it break the holder's re-check and
-leave a counted commit vote standing for neither its lock nor its update.
+leave a counted commit vote standing for neither its lock nor its update. At recovery a Tx that does not relock (a
+restored resolution) completes its load only after every recovered commit vote has relocked, so it never misses a
+holder (transaction-recovery.md 7.2).
 
 **R10 (a failed backend commit poisons the object).** After a backend commit failure (or `poisonObject`), the object is
 in `failedCommits` until the store reloads: every later transaction on it votes abort, and committed transactions do
@@ -443,8 +445,10 @@ commit per object.
    (`Frontend.locksReleased`, after the holder applied or aborted). The holder set is then computed again, and with
    none left it takes the ordinary path, queueing behind the holder's in-flight commit. A lock-only holder is not waited for: it has no
    update to lose. A Tx holding its own locks never waits: two live votes never hold conflicting locks (R4), and
-   recovered votes sharing a lock (section 3) are ordered by what persisted before the crash. The wait is not counted
-   by `commitInFlight`, so the holder's own commit never queues behind it; a new vote on one of its objects waits for
+   recovered votes sharing a lock (section 3) are ordered by what persisted before the crash (the later one voted after
+   the earlier one's update persisted, 10.5a). A recovered Tx that does not relock completes its load only after
+   every recovered commit vote has relocked (transaction-recovery.md 7.2), so it finds every holder it must wait for.
+   The wait is not counted by `commitInFlight`, so the holder's own commit never queues behind it; a new vote on one of its objects waits for
    it instead (`Frontend.voteBlocked`), so it cannot be starved. A holder that never resolves holds the waiter as long
    as its own locks (section 12).
 3. **Issue** (`doCommit`): release the locks, apply (`issueCommits`), answer parked reads, one `Frontend.commit` per
@@ -784,7 +788,7 @@ Mechanism: `Tx.issueCommits` quarantines (`Frontend.quarantine`) in three cases.
 locks waits for it in lock order (`Tx.awaitLockHolders`), so what remains is state changed under the locks or two
 conflicting commits, invariant violations no mechanism should try to absorb. (b) A recovered vote whose re-check
 fails was applied before the crash and superseded since: nothing else changes an object over the vote's relocked
-locks (once transaction-recovery.md R-W7 is fixed); refcounts carry an update serial, so a refcount update is
+locks; refcounts carry an update serial, so a refcount update is
 revision-chained too. (c) `RequirementsApplyer.mayReinsertDeletedKeys` is a real ambiguity in normal operation: a
 re-applied blind Insert (or `DoesNotExist`) of key k passes its re-check again after a later delete of k, and the
 store cannot tell "applied, then k deleted" from "never applied, and another key's write raised the object
@@ -800,4 +804,4 @@ as an invariant violation, skip and report the object. (b) Treat a recovered re-
 whose CRL state holds a blind Insert of k there remains (concluded, or re-saved without the object's update), as
 `Frontend.awaitAllocationsDurable` already does for an object deleted after its allocation; the cost falls only on
 a key delete closely following a blind insert of the same key. A re-applied blind Insert of an absent key was then
-never applied, and is applied. Requires R-W7 first.
+never applied, and is applied.

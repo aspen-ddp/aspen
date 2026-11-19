@@ -815,15 +815,19 @@ class Frontend(val storeId: StoreId,
     */
   @volatile private var awaitingCrl: Boolean = false
 
-  /** Recovered transactions whose objects have not all loaded yet, and whether each has a persisted vote */
+  /** Recovered transactions whose objects have not all loaded yet, and whether each relocks: an unresolved commit
+    * vote, which takes its locks again at completeLoad (a restored resolution takes none)
+    */
   private var recoveringTransactions: Map[TransactionId, Boolean] = Map()
 
-  /** Recovered transactions without a persisted vote that have loaded their objects, waiting to decide it. See
-    * recoveredTransactionLoaded
+  /** Recovered transactions that have loaded their objects but do not relock, waiting for every one that relocks to
+    * complete first: those with a persisted vote, then those without. See recoveredTransactionLoaded
     */
+  private var deferredRecovered: List[Tx] = Nil
   private var undecidedRecovered: List[Tx] = Nil
 
-  private def holding: Boolean = awaitingCrl || recoveringTransactions.nonEmpty || undecidedRecovered.nonEmpty
+  private def holding: Boolean =
+    awaitingCrl || recoveringTransactions.nonEmpty || deferredRecovered.nonEmpty || undecidedRecovered.nonEmpty
 
   /** What a transaction this Frontend admitted holds in the device's CRL admission, until released.
     *
@@ -932,25 +936,33 @@ class Frontend(val storeId: StoreId,
         registerAllocation(tx, pointers)
         // A transaction with no objects here never loads any
         if pointers.nonEmpty then
-          recoveringTransactions += (txd.transactionId -> (trs.disposition != TransactionDisposition.Undetermined))
+          recoveringTransactions += (txd.transactionId -> (trs.disposition == TransactionDisposition.VoteCommit &&
+            trs.status == TransactionStatus.Unresolved))
         Some((tx, pointers))
     }
     recovered.foreach((tx, pointers) => pointers.foreach(ptr => readObjectForTransaction(tx, ptr)))
 
-  /** A recovered transaction has loaded (or failed to load) all its objects. One with a persisted vote completes its
-    * load at once, taking the locks of a commit vote. One without decides its vote only once every recovered
-    * transaction with a persisted vote has done so: deciding earlier, it could take locks that conflict with theirs.
+  /** A recovered transaction has loaded (or failed to load) all its objects. An unresolved commit vote completes its
+    * load at once, taking its locks again. Every other one completes only once every recovered commit vote that
+    * relocks has done so, those with a persisted vote first. One applying a restored commit resolution earlier would
+    * find no lock holder to wait for in lock order (Tx.awaitLockHolders) and could apply over a vote's update first,
+    * failing its re-check (transaction-recovery.md 7.2); one deciding its vote earlier could take locks that conflict
+    * with a recovered vote's.
     */
   def recoveredTransactionLoaded(tx: Tx, hasVote: Boolean): Unit =
+    val relocks = recoveringTransactions.getOrElse(tx.transactionId, false)
     recoveringTransactions -= tx.transactionId
-    if hasVote then
+    if relocks then
       tx.completeLoad()
+    else if hasVote then
+      deferredRecovered = deferredRecovered :+ tx
     else
       undecidedRecovered = undecidedRecovered :+ tx
     if !recoveringTransactions.valuesIterator.contains(true) then
-      val undecided = undecidedRecovered
+      val deferred = deferredRecovered ++ undecidedRecovered
+      deferredRecovered = Nil
       undecidedRecovered = Nil
-      undecided.foreach(_.completeLoad())
+      deferred.foreach(_.completeLoad())
     releaseHeldMessages()
 
   /** The store's CRL state is being loaded after this Frontend was created (from a crl_save.log), or its recovery is

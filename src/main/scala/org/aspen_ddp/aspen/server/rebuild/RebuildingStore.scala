@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.rebuild
 
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, InvalidObject, KeyValueObjectState, MetadataObjectState, ObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, InvalidObject, KeyValueObjectState, MetadataObjectState, ObjectState, ReadTimeout}
 import org.aspen_ddp.aspen.client.internal.CurrentAllocationsQuery
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.tkvl.{KeyValueListNode, TieredKeyValueList}
@@ -157,6 +157,22 @@ object RebuildingStore:
    *  cannot be restored now (its pool below the read threshold, an allocation parked past expiry) times out */
   val ObjectReadTimeout: FiniteDuration = FiniteDuration(30, SECONDS)
 
+  /** How long the peer query (queryPeers) waits for `width - writeThreshold + 1` answers before the pass fails into
+   *  the host's backoff retry. A pool short of that many live peers cannot be rebuilt now (its objects are below the
+   *  read threshold too), and the pass must not hold a host rebuild slot while it waits. The query notices it
+   *  at its next resend, at most 10 s later */
+  val PeerQueryTimeout: FiniteDuration = FiniteDuration(60, SECONDS)
+
+  /** Read timeouts in a row, with no object restored between them, after which the walk aborts: every read timing out
+   *  means the pool is below its read threshold, and a sequential walk at ObjectReadTimeout per object would hold the
+   *  host's rebuild slot for days before MaxFailedObjects. The checkpoint is kept and the pass retried with backoff */
+  val MaxConsecutiveReadTimeouts: Int = 100
+
+  /** The failure of a pass whose peer query got too few answers within its timeout (PeerQueryTimeout) */
+  final class PeerQueryTimedOut(storeId: StoreId, timeout: FiniteDuration)
+    extends Exception(s"Rebuild of $storeId: too few of its pool's peers answered the pending-allocations query " +
+                      s"within $timeout")
+
   /** The failure of a rebuild stopped by `cancel()`. */
   case class RebuildCancelled(storeId: StoreId) extends Exception(s"Rebuild of $storeId was cancelled")
 
@@ -182,6 +198,8 @@ class RebuildingStore(client: AspenClient,
                       testingOnlyOutOfSpaceKeys: Set[Key] = Set(),
                       testingOnlyTrackRestoredKeys: Boolean = false,
                       maxFailedObjects: Int = RebuildState.MaxFailedObjects,
+                      /** Read timeouts in a row after which the walk aborts (MaxConsecutiveReadTimeouts) */
+                      maxConsecutiveReadTimeouts: Int = RebuildingStore.MaxConsecutiveReadTimeouts,
                       testingOnlyOnRestored: () => Unit = () => (),
                       testingOnlyOnFinishClosed: () => Unit = () => (),
                       testingOnlyAfterWalk: () => Future[Unit] = () => Future.unit,
@@ -192,7 +210,9 @@ class RebuildingStore(client: AspenClient,
                       /** How long the sweep waits before recording what is unsettled (PendingWaitLimit) */
                       pendingWaitLimit: FiniteDuration = RebuildingStore.PendingWaitLimit,
                       /** How long one object read may take before the object counts as failed (ObjectReadTimeout) */
-                      objectReadTimeout: FiniteDuration = RebuildingStore.ObjectReadTimeout)
+                      objectReadTimeout: FiniteDuration = RebuildingStore.ObjectReadTimeout,
+                      /** How long the peer query waits for its quorum before the pass fails (PeerQueryTimeout) */
+                      peerQueryTimeout: FiniteDuration = RebuildingStore.PeerQueryTimeout)
   extends StoreRebuild with Logging:
 
   import RebuildingStore.*
@@ -225,6 +245,8 @@ class RebuildingStore(client: AspenClient,
   private var restoredSinceCheckpoint = 0
   private var lastKey: Option[Key] = None
   private var failed: List[ObjectId] = Nil
+  /** The walk's read timeouts since it last restored an object (MaxConsecutiveReadTimeouts) */
+  private var consecutiveReadTimeouts = 0
   /** Every allocation the peers listed at the query of this pass or an earlier one, kept across resumes by the
    *  checkpoint (rebuild-process 5.3). Set by runPass before the walk */
   private var listedAllocations: Map[TransactionId, PendingAllocation] = Map()
@@ -417,7 +439,9 @@ class RebuildingStore(client: AspenClient,
    *  which comes only after its AllocationFinalizationAction recorded its objects. The lost store may have been one of
    *  them, so that many replies include a holder of every committed allocation whose entry may not have landed. It is
    *  never more than the consistent read threshold the rebuild needs anyway. Waits until the quorum answers; fails
-   *  with the abort cause if the rebuild is aborted meanwhile.
+   *  with the abort cause if the rebuild is aborted meanwhile, and with PeerQueryTimedOut if the quorum has not
+   *  answered within `peerQueryTimeout` (noticed at the query's next resend), so a pool short of live peers fails the
+   *  pass into the host's backoff retry rather than holding its rebuild slot.
    */
   private def queryPeers(ida: IDA): Future[Map[TransactionId, PendingAllocation]] =
     val peers = (0 until ida.width).filter(_ != storeId.poolIndex.toInt)
@@ -427,13 +451,15 @@ class RebuildingStore(client: AspenClient,
       // A single-store pool: there is no one to ask, and nothing to read the objects from either
       Future.successful(Map())
     else
-      client.currentAllocations(peers, needed, aborted).transform:
+      val deadline = System.nanoTime() + peerQueryTimeout.toNanos
+      val stop = () => aborted() || System.nanoTime() - deadline >= 0
+      client.currentAllocations(peers, needed, stop).transform:
         case scala.util.Success(replies) =>
           val merged = replies.valuesIterator.flatten.toList.groupBy(_.transactionId).map: (txid, as) =>
             txid -> PendingAllocation(txid, as.exists(_.committed), as.flatMap(_.pointers).distinctBy(_.id))
           scala.util.Success(merged)
         case scala.util.Failure(_: CurrentAllocationsQuery.Abandoned) =>
-          scala.util.Failure(synchronized(abortCause).getOrElse(RebuildCancelled(storeId)))
+          scala.util.Failure(synchronized(abortCause).getOrElse(new PeerQueryTimedOut(storeId, peerQueryTimeout)))
         case scala.util.Failure(err) => scala.util.Failure(err)
 
   /** Restores the objects of the allocations the peers listed before this pass's walk or an earlier pass's
@@ -473,7 +499,11 @@ class RebuildingStore(client: AspenClient,
               if remaining.isEmpty then None else Some(p.copy(pointers = remaining))
 
       for
-        now <- queryPeers(ida)
+        now <- queryPeers(ida).recoverWith:
+                 case e: PeerQueryTimedOut =>
+                   // The walk is done: keep its progress for the next pass, which sweeps the listed set again
+                   checkpointBestEffort("after a timed-out peer query")
+                   Future.failed(e)
         settled <- Future.sequence(pending.values.toList.map(p => settle(p, now.get(p.transactionId))))
         remaining = settled.flatten.map(p => p.transactionId -> p).toMap
         _ <- nextRound(ida, remaining, round, deadlineMillis)
@@ -660,6 +690,7 @@ class RebuildingStore(client: AspenClient,
       if !advance then
         false
       else
+        consecutiveReadTimeouts = 0
         lastKey = Some(key)
         restoredSinceCheckpoint += 1
         if restoredSinceCheckpoint >= checkpointInterval then
@@ -673,15 +704,27 @@ class RebuildingStore(client: AspenClient,
     Future.unit
 
   private def recordFailure(objectId: ObjectId, err: Throwable): Future[Unit] =
-    val over = synchronized:
+    val (over, timedOut) = synchronized:
       // A resumed walk can fail an object an earlier pass already failed: it is one object to retry
       if !failed.contains(objectId) then
         failed = objectId :: failed
-      failed.size > maxFailedObjects
+      if err.isInstanceOf[ReadTimeout] then
+        consecutiveReadTimeouts += 1
+      (failed.size > maxFailedObjects, consecutiveReadTimeouts >= maxConsecutiveReadTimeouts)
 
     logger.warn(s"Rebuild of $storeId: failed to read object $objectId: $err")
 
-    if over then
+    if timedOut && !over then
+      // Every read timing out: the pool is below its read threshold, and the sequential walk would hold the host's
+      // rebuild slot for days before the cap below. Aborted as the cap aborts, the checkpoint kept
+      val cause = new Exception(
+        s"Rebuild of $storeId aborted: $maxConsecutiveReadTimeouts object reads in a row timed out")
+      synchronized:
+        if abortCause.isEmpty then
+          abortCause = Some(cause)
+      checkpointBestEffort("after consecutive read timeouts")
+      Future.unit
+    else if over then
       // Something systemic is wrong -- the pool below its read threshold, most likely -- and
       // continuing only burns I/O. Abort with the checkpoint intact; the next device check
       // retries. Set the abort latch so the rest of the walk is a no-op.

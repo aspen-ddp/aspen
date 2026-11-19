@@ -110,14 +110,15 @@ start
         load checkpoint (total: unreadable = none; another episode's = none)
         ► read pool state ► first pass: createStaging (discard staging, BackendOpener.create)
         ► openStaging (BackendStateLost: discard staging and checkpoint, fail)
-        ► queryPeers: CurrentAllocationsRequest until w - t + 1 peers answer (no deadline; a latched abort
-                      abandons it); merge with the checkpoint's list
+        ► queryPeers: CurrentAllocationsRequest until w - t + 1 peers answer (PeerQueryTimeout fails the
+                      pass; a latched abort abandons it); merge with the checkpoint's list
         ► walk allocation tree: foreach | foreachFrom(lastRestoredKey) (inclusive), stopWhen = aborted
               per entry: restoreObject ► timed read ► rebuildWrite (► mark if a reply held a write lock);
               every 1000: flush THEN checkpoint
         ► sweepPending: restore the listed allocations directly, re-querying in rounds; mark what is
                         unsettled at the wait limit
-        ► abort latch check (out of space, > MaxFailedObjects failures, cancel, staging fail-stop)
+        ► abort latch check (out of space, > MaxFailedObjects failures, MaxConsecutiveReadTimeouts,
+                             cancel, staging fail-stop)
         ► retryFailures (re-read tree entry; absent = deleted; still failing ► acceptLoss? mark : fail)
         ► finish: flush, close, re-check latch, remove checkpoint, acceptor-since, inherited-votes,
                   incarnation, rebuild-complete (the episode), DurableFiles.move(staging ► final)
@@ -296,7 +297,10 @@ ErrorTree entries there, so the earlier episode's copy of every object is stale 
   walk, the host's rebuild slot (`rebuildingStores`) and a cancel for at most that long. The same bound covers the
   sweep's reads (5.3: the object stays pending for the next round) and the retries (5.4). More than
   `RebuildState.MaxFailedObjects` (10,000) failures latch an abort; a resumed pass keeps its checkpoint's failed list,
-  counted once per object, so an earlier pass's failures count toward it. An out-of-space error (`Backend.isOutOfSpace`,
+  counted once per object, so an earlier pass's failures count toward it. `MaxConsecutiveReadTimeouts` (100) read
+  timeouts in a row, with no object restored between them, also latch an abort with the checkpoint kept: every read
+  timing out means the pool is below `r`, and the sequential walk would otherwise hold the slot for one timeout per
+  object until the cap (about 83 hours). An out-of-space error (`Backend.isOutOfSpace`,
   ENOSPC or EDQUOT) latches an abort and logs `REBUILD OUT OF SPACE`. A cancel latches `RebuildCancelled`.
 * Checkpoint: every `CheckpointInterval` (1,000) restored objects, `backend.rebuildFlush()` **then**
   `RebuildState.save` (temp file and atomic rename). Contents: store id, last restored key (hex), failed object ids,
@@ -314,8 +318,11 @@ whose entry lands behind the walk's position. Two mechanisms close that gap:
 
 * `queryPeers`, before each pass's walk, sends `CurrentAllocationsRequest` to the pool's other stores
   (`AspenClient.currentAllocations`, `client/internal/CurrentAllocationsQuery.scala`, resending at 1 s backing off to
-  10 s) until `w - t + 1` answer. The query has no deadline: only a latched abort ends it early, at its next resend
-  (`CurrentAllocationsQuery.Abandoned`, which the pass reports as the latched cause). A pool of width 1 has no one to
+  10 s) until `w - t + 1` answer. A latched abort ends it early, at its next resend
+  (`CurrentAllocationsQuery.Abandoned`, which the pass reports as the latched cause), and so does its deadline,
+  `PeerQueryTimeout` (60 s, noticed at the next resend): the pass fails with `PeerQueryTimedOut` into the host's
+  backoff re-check (5.7), releasing its rebuild slot. A pool with fewer than `w - t + 1` live peers is below `r` as
+  well, so nothing is lost by not waiting; a query of the sweep (below) checkpoints first. A pool of width 1 has no one to
   ask and skips it. Each reply lists the allocations in the pool held by transactions the replier has not seen
   finalized or aborted (`Frontend.currentAllocations`: pointers into this pool only, `committed` when its outcome is
   known commit); a store still loading its CRL, a silent store and a rebuilding one do not answer. A committed
@@ -342,7 +349,7 @@ whose entry lands behind the walk's position. Two mechanisms close that gap:
   2 s, 30 s from the sweep's start). The limit is checked between rounds (`nextRound`), after a round's query has been
   answered. Whatever is still unsettled then is marked in the ErrorTree against this store (`markUnsettled`, missed at
   `HLCTimestamp.Zero`, pointers into this pool), durably before `finish`, and the sweep ends; a failed mark fails the
-  pass after a best-effort checkpoint. The wait on resolution cannot be unbounded (a round's own query can be, RB-W7): a transaction whose live
+  pass after a best-effort checkpoint. The wait on resolution cannot be unbounded, nor can a round's own query (`PeerQueryTimeout`): a transaction whose live
   voters disagree is undecided, and past expiry `ExpiryTally` rule G holds it while any store of it is silent, which
   this store is until the rebuild finishes. Nor can the sweep drop such a transaction unmarked: it may be decided
   commit, applied and acknowledged by the lost incarnation while the replying peers do not know the outcome yet, and
@@ -603,10 +610,10 @@ is never repaired (5.2's locked copies are marked for this reason).
   past objects still unreadable at its end (5.5).
 * Peers that are **silent** make reads time out (`ObjectReadTimeout`, 5.2): each is a failed object, so the walk goes
   on, `MaxFailedObjects` and the backoff re-check engage as for error replies, and a cancel ends the pass within one
-  timeout. The walk is sequential, so a pool whose objects all time out costs one timeout per object until the abort
-  (up to 10,001 timeouts, about 83 hours) or the end of the walk and its retries, and holds a host rebuild slot
-  throughout (RB-W7). Fewer than `w - t + 1` answering peers stall the pass at its peer query, which has no deadline
-  (RB-W7). The allocation-tree reads (the walk's node reads, the retries' `allocationTree.get`), the pool lookups and
+  timeout. The walk is sequential, so a pool whose objects all time out aborts after `MaxConsecutiveReadTimeouts`
+  (100 timeouts, about 50 minutes) and retries with backoff; a pool where only some objects time out goes on, one
+  timeout per such object. Fewer than `w - t + 1` answering peers fail the pass at its peer query after
+  `PeerQueryTimeout` (60 s), into the backoff re-check, so neither case holds a host rebuild slot for long. The allocation-tree reads (the walk's node reads, the retries' `allocationTree.get`), the pool lookups and
   the ErrorTree marks are not timed: they use the metadata pool, and a metadata pool short of `r` stalls the rebuild
   (FS14).
 * An amnesiac rebuilt store answers `ObjectNotFound` for an allocation its old incarnation voted and its peers have not
@@ -701,7 +708,8 @@ pass.
 No wrong data is written either way.
 
 **FS3 A second store of the pool is lost during the rebuild.** Replication(3,2): one live store, below `r`; every
-restore times out and the next pass's peer query waits (RB-W7); the pool is also unwritable. The stores stay Rebuilding until a store with data returns. Reed-Solomon
+restore times out, so the walk aborts after `MaxConsecutiveReadTimeouts`, and the next pass's peer query fails after
+`PeerQueryTimeout`; each pass is retried with backoff. The pool is also unwritable. The stores stay Rebuilding until a store with data returns. Reed-Solomon
 pools tolerate `w - r` silent peers. No wrong data is produced.
 
 **FS4 Transactions committing to objects already rebuilt.** The store is silent, so after 2 s the finalizer marks it
@@ -773,23 +781,6 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 ---
 
 ## Open weaknesses
-
-### RB-W7. A pool short of live peers holds a host rebuild slot for days, or indefinitely (CONFIRMED; liveness)
-Mechanism: `RebuildingStore.queryPeers` waits for `w - t + 1` replies with no deadline
-(`CurrentAllocationsQuery` ends only on `stopWhen = aborted`), before the walk and again in every sweep round, where
-`nextRound` checks `pendingWaitLimit` only after the round's query is answered. The walk is sequential
-(`TierEngine.walk`), each silent-peer read costs `ObjectReadTimeout` (30 s), and the abort latches only past
-`MaxFailedObjects` (10,000). The slot (`StoreRebuilds.rebuildingStores`, `maxConcurrentRebuilds` = 2 per host) is held
-throughout.
-Trigger / scenario: Replication(3,2) loses one store; while it rebuilds, a second store's host goes down (or is
-partitioned). The first pass's query waits for both peers forever; a pass already walking times out on every object,
-about 83 hours to the abort for a large pool, then its next pass waits at the query forever. Two such stores on one
-host block every other rebuild on that host, for any pool.
-Consequence: under-replicated stores of healthy pools on the same host are not rebuilt until an operator cancels
-(shutdown) or the silent store returns. No safety impact.
-Suggested fix: give the peer query a deadline (fail the pass into the backoff retry, as an unreadable object does),
-and abort the walk after a run of consecutive `ReadTimeout`s (say 100) rather than only after 10,000 failures.
-Effort: S   Priority: 4
 
 ### RB-W8. `abandonedRebuilds` leaks when an abandoned rebuild does not end in `RebuildCancelled` (CONFIRMED; bookkeeping)
 Mechanism: `StoreRebuilds.abandonUnlisted` adds the store to `abandonedRebuilds` and calls `cancel()`; only the

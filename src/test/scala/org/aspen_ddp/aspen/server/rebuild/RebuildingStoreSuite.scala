@@ -382,6 +382,25 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       stalled should be(None)
       os.exists(dev / storeId.directoryName) should be(true)
 
+  // A pool short of live peers fails the pass into the host's backoff retry instead of holding its slot
+  atest("a peer query without its quorum within its timeout fails the pass"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    // Replication(3, 2): both peers must answer, and one never does
+    net.dropClientResponse =
+      case r: CurrentAllocationsReply => r.fromStore == net.storeId2
+      case _ => false
+    for
+      _ <- populate(5)
+      _ <- net.waitForTransactionsToComplete()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                    peerQueryTimeout = 100.millis)
+      outcome <- within(10.seconds, "the rebuild")(rebuild.complete.transform(scala.util.Success.apply))
+    yield
+      net.dropClientResponse = _ => false
+      outcome.failed.get shouldBe a[RebuildingStore.PeerQueryTimedOut]
+      os.exists(dev / storeId.directoryName) should be(false)
+
   atest("a cancel while waiting for the peers' quorum fails the rebuild"):
     given ExecutionContext = executionContext
     val dev = deviceDir()
@@ -704,6 +723,46 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       val saved = RebuildState.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
       saved.failedObjects should be(List(ids.head))
       saved.lastRestoredKey should not be None
+
+  // A walk whose every read times out aborts after a run of them, not after MaxFailedObjects
+  atest("a run of read timeouts aborts the walk with its checkpoint kept"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    for
+      ids <- populate(20)
+      _ <- net.waitForTransactionsToComplete()
+      outcome <- net.withObjectReadsSilenced(ids.toSet):
+        val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                          checkpointInterval = 5, objectReadTimeout = 50.millis,
+                                          maxConsecutiveReadTimeouts = 1)
+        within(10.seconds, "the rebuild")(rebuild.complete.transform(scala.util.Success.apply))
+    yield
+      outcome.failed.get.getMessage should include("1 object reads in a row timed out")
+      os.exists(dev / storeId.directoryName) should be(false)
+      // Aborted at the first timeout: the rest of the walk was skipped, and the checkpoint survives for the next pass
+      val saved = RebuildState.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
+      saved.failedObjects.size should be(1)
+
+  atest("a restored object ends a run of read timeouts"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    for
+      ids <- populate(20)
+      _ <- net.waitForTransactionsToComplete()
+      // The first and last of them in walk order: the other 18 are restored between the two timeouts
+      sorted = ids.sortWith((a, b) => ByteArrayKeyOrdering.lt(Key(a.toBytes), Key(b.toBytes)))
+      silenced = Set(sorted.head, sorted.last)
+      outcome <- net.withObjectReadsSilenced(silenced):
+        val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                          checkpointInterval = 5, objectReadTimeout = 50.millis,
+                                          maxConsecutiveReadTimeouts = 2)
+        within(10.seconds, "the rebuild")(rebuild.complete.transform(scala.util.Success.apply))
+    yield
+      // Failed by retryFailures, with both objects recorded, not by the run's abort
+      outcome.isFailure should be(true)
+      outcome.failed.get.getMessage should not include("in a row timed out")
+      val saved = RebuildState.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
+      saved.failedObjects.toSet should be(silenced)
 
   atest("a cancel ends a rebuild whose walk waits on a read that never completes"):
     given ExecutionContext = executionContext

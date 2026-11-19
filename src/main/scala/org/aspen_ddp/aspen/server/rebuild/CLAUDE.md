@@ -23,7 +23,9 @@
   episode's marker nor `rebuild-required` (a copy finished for an earlier episode included) is retired as a lost copy
   (`StoreRebuilds.retireForeignCopy`: marked, kept in `pending-delete/`, rebuilt)
 - Pending allocations (rebuild-process 5.3): before each pass's walk, `queryPeers` asks the pool's other stores
-  (`CurrentAllocationsRequest`) and waits, resending, for `width - writeThreshold + 1` answers. That many answers
+  (`CurrentAllocationsRequest`) and waits, resending, for `width - writeThreshold + 1` answers, at most
+  `peerQueryTimeout` (default `PeerQueryTimeout`, 60 s, noticed at the next resend): then the pass fails with
+  `PeerQueryTimedOut` into the host's backoff retry, after a best-effort checkpoint in the sweep. That many answers
   include a holder of every committed, unfinalized allocation the lost store voted for, and the count never exceeds
   the consistent read threshold. The listed set is merged into `RebuildState.pendingAllocations`, which every
   checkpoint carries (a checkpoint without it does not load): a resume sweeps what earlier passes listed, since one
@@ -52,7 +54,9 @@
   lifted by an acceptance
 - Timed object reads (rebuild-process.md 5.2): every object read of the walk, the sweep and `retryFailures` goes
   through `client.withReadTimeout(objectReadTimeout)` (default `ObjectReadTimeout`, 30 s). A `ReadTimeout` is a
-  failed object like any other read failure: the walk records it and moves on (toward `MaxFailedObjects`), the sweep
+  failed object like any other read failure: the walk records it and moves on (toward `MaxFailedObjects`, and
+  `maxConsecutiveReadTimeouts`, default `MaxConsecutiveReadTimeouts` 100 in a row with no restore between, which
+  latches an abort with the checkpoint kept), the sweep
   keeps it pending for the next round, and a cancel takes effect within one timeout. Tree-node reads (the walk itself,
   `allocationTree.get`) and the pool lookup stay untimed: they read the metadata pool, whose loss stalls the rebuild
 - Placement alarms (rebuild-process 4.2, 5.2): `REBUILD CO-LOCATED` (the selection had to share a device with the pool),

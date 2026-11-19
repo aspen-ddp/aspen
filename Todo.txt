@@ -51,11 +51,6 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.1  RB-W7  A pool short of live peers holds a host rebuild slot for days, or indefinitely. CONFIRMED, S.
-     queryPeers (client.currentAllocations) has no deadline and runs in every sweep round. The walk is sequential at
-     30 s per timed-out read and aborts only after MaxFailedObjects (10,000, about 83 h). Two such stores fill both
-     of a host's slots. Fix: bound the peer query, and abort a pass early when peers are below threshold.
-
 4.2  RB-W8  abandonedRebuilds leaks when an abandoned rebuild does not end in RebuildCancelled. CONFIRMED, S.
      A rebuild past finish's latch re-check, or one with another cause already latched, keeps its entry. Later
      rebuilds of that store on the host cannot be cancelled by abandonUnlisted, which breaks B18. Fix: clear the

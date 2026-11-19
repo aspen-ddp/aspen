@@ -751,6 +751,18 @@ class Tx( trs: TransactionRecoveryState,
   def holdsUpdateOf(objectId: ObjectId): Boolean =
     issuedCommits.contains(objectId) || disposition == TransactionDisposition.VoteCommit
 
+  /** Objects here on which a repair wrote a state newer than this transaction's start: see repairInstalled */
+  private var repairedUnder: Set[ObjectId] = Set()
+
+  /** A repair wrote object `objectId` here at object timestamp `at` (Frontend.recordRepairInstall), while this Tx is
+    * held or before it was created. Past this transaction's start, the state may hold a later transaction's deletion of
+    * a key this one blindly Inserts, which this store never held: an apply of the Insert reports the object
+    * (issueCommits)
+    */
+  def repairInstalled(objectId: ObjectId, at: HLCTimestamp): Unit =
+    if pointersById.contains(objectId) && at > txd.startTimestamp then
+      repairedUnder += objectId
+
   private def opsOf(update: DataBuffer): List[KeyValueOperation] =
     KeyValueOperation.decode(update, ObjectRevision(transactionId), txd.startTimestamp)
 
@@ -1113,6 +1125,28 @@ class Tx( trs: TransactionRecoveryState,
         s"earlier backend commit of it failed")
     }
 
+    // Objects on which this apply writes back a key the store may have held deleted: a blind Insert of a key now
+    // absent, where a repair wrote a state newer than this transaction's start (repairInstalled), or, for a recovered
+    // commit vote, whose marks were lost with the crash, where any write newer than its start reached the object. The
+    // state may hold a later transaction's deletion of the key, from a read, at a store that never held T's update. The
+    // apply still runs, and reports the object, so the finalizer marks the store and repair installs the object's
+    // current state (transaction-requirements 10.5c). Repair writes are rare and a recovery rarer: a commit applied
+    // normally checks nothing here
+    val reinserts = requirements.iterator.collect {
+      case r: KeyValueUpdate if r.requiredRevision.isEmpty => r.objectPointer.id
+    }.filter { oid =>
+      objects.get(oid).exists { state =>
+        val suspect = repairedUnder.contains(oid) ||
+          (recovered && disposition == TransactionDisposition.VoteCommit && state.metadata.timestamp > txd.startTimestamp)
+        suspect && !failedHere.contains(oid) && state.kvState.exists { kvs =>
+          ou.get(oid).exists(u => opsOf(u).exists {
+            case o: Insert => !kvs.content.contains(o.key)
+            case _ => false
+          })
+        }
+      }
+    }.toSet
+
     val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, requirements,
       objects -- failedHere, ou, frontend.maxSliceSize, allocatedOver, txd.allocatingObjects)
 
@@ -1204,9 +1238,14 @@ class Tx( trs: TransactionRecoveryState,
     // the store and repair installs the object's current state. A non-voter is not counted, so this costs no margin
     val reportedApplied =
       if recovered && disposition != TransactionDisposition.VoteCommit then toCommit.map(_.objectId) else Nil
+    val reportedReinserts = toCommit.map(_.objectId).filter(oid => reinserts.contains(oid) &&
+      !reportedApplied.contains(oid))
+    if reportedReinserts.nonEmpty then
+      logger.info(s"Tx $transactionId. Store $storeId applies a blind Insert of an absent key to objects " +
+        s"${reportedReinserts.mkString(", ")}, on which a later write may have deleted it: reported for repair")
 
     // Assigned before the commit loop: a synchronous backend completes inside it
-    objectCommitErrors = uncommittable.toList ++ reportedApplied
+    objectCommitErrors = uncommittable.toList ++ reportedApplied ++ reportedReinserts
 
     toCommit.foreach { os =>
       val allocating = txd.allocatingObjects.contains(os.objectId)

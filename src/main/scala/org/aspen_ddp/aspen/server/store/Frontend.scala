@@ -715,6 +715,21 @@ class Frontend(val storeId: StoreId,
   private def registerReplayHazards(tx: Tx, hosted: List[ObjectPointer]): Unit =
     registerAllocation(tx, hosted)
     registerBlindInserts(tx, hosted)
+    if repairInstalls.nonEmpty then
+      hosted.foreach(p => repairInstalls.get(p.id).foreach(at => tx.repairInstalled(p.id, at)))
+
+  /** The latest object timestamp a repair write installed on each object, while a transaction started before it may
+    * still join here (above the forget floor; pruned at expiryHeartbeat). Such a transaction's Tx is told
+    * (Tx.repairInstalled), at the install or at its creation: the install may hold a later transaction's deletion of a
+    * key the transaction blindly Inserts, which its apply would write back at this store alone, so the apply reports
+    * the object (Tx.issueCommits, transaction-requirements 10.5c). Empty except soon after a repair write, and at load:
+    * the load's floor refuses every transaction started before it
+    */
+  private val repairInstalls = scala.collection.mutable.HashMap[ObjectId, HLCTimestamp]()
+
+  private def recordRepairInstall(oid: ObjectId, at: HLCTimestamp): Unit =
+    if repairInstalls.get(oid).forall(_ < at) then repairInstalls(oid) = at
+    transactions.valuesIterator.foreach(_.repairInstalled(oid, at))
 
   /** `txid`'s CRL state was deleted or replaced by a stub: no save of it may follow. Its records are dropped once that
     * is durable, unless a newer Tx registered them again meanwhile
@@ -1174,6 +1189,8 @@ class Frontend(val storeId: StoreId,
   def expiryHeartbeat(): Unit =
     val now = wallClockMillis()
     expireStubs(now)
+    if repairInstalls.nonEmpty then
+      repairInstalls.filterInPlace((_, at) => !belowForgetFloor(at))
     expiryRounds.keys.toList.foreach: txid =>
       if !transactions.get(txid).exists(_.mayExpire) then
         expiryRounds.remove(txid)
@@ -2169,6 +2186,7 @@ class Frontend(val storeId: StoreId,
         plan.timestamp.getOrElse(md.timestamp))
       logger.trace(s"Store $storeId: repair of ${os.objectId} installs ${plan.installs.size} keys, deletes " +
         s"${plan.deletes.size}, leaves ${plan.result}")
+      recordRepairInstall(os.objectId, os.metadata.timestamp)
 
       // Held as commit holds an in-flight commit's state: pinned, referenced and served from memory, so nothing reads
       // the pre-repair state from the backend meanwhile. Counted as an in-flight commit too: transactions on the

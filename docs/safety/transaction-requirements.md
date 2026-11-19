@@ -606,6 +606,21 @@ So a recovered commit vote that still holds a blind Insert of an absent key neve
 The cost is one index entry per Tx with a blind KeyValue update, and a decode only for a key deletion soon after a
 blind write of the same object; nothing on the ordinary commit path.
 
+A store can also hold a key's deletion it never applied: repair installs it from a read (a whole-object reconcile),
+at a store that may never have held the Insert either. A transaction T that reaches such a store later (a delayed
+client prepare at a store that never saw T, its vote passing T's pin on another object; or a non-voter applying a
+commit decided elsewhere) passes its re-check on the absent key and writes it back there alone. Its TxCommitted could
+reach the finalizer within `errorTimeout`, leaving no mark, and T's own mark of a store that missed it is repaired only
+once the store can no longer join T (repair-process.md 5.4), after any such apply. So the Frontend records the latest
+object timestamp each repair write installs (`repairInstalls`, kept while a transaction started before it may still
+join: pruned below the forget floor at `expiryHeartbeat`), and tells every held Tx of the object started before it,
+and every Tx created for the object later with an earlier start (`Tx.repairInstalled`). An apply of a blind Insert of
+a key absent before the apply, on an object so marked, applies and reports the object in `objectCommitErrors`
+(`Tx.issueCommits`): the finalizer marks the store, and the mark's repair, once T can no longer join here, installs
+the object's current state. A recovered commit vote, whose marks were lost with the crash, reports the same apply when
+any write newer than T's start reached the object. The map is empty except soon after a repair write, so an ordinary
+commit checks nothing; a counted voter that reports only adds a repair pass.
+
 An allocation is read like any other object (`Frontend.readObjectForTransaction`): the in-memory state, `ObjectNotFound`
 while a deletion is in flight, else the backend. Only a backend miss gives the fresh `Allocating` state
 (`Tx.allocationLoaded`), retained unshared, so only its Tx sees it. An existing state goes into `Tx.allocatedOver` and
@@ -696,8 +711,10 @@ absent passes its re-check again, and applies: T never applied it. Had T applied
 key, the deletion would have reached the backend only once T's CRL state no longer held the update
 (`Frontend.awaitBlindInsertsDurable`, 9.4), so the recovered vote would find it missing and take it as applied. This
 holds whatever later writes of other keys raised the object's timestamp. The same holds for a recovered vote applying
-through its UnackedCommits entry. A live voter, a replay's included, has held the key's lock since its own check
-(Q-W11 is the residual for a replay at a store that never saw T).
+through its UnackedCommits entry. Where a write newer than T's start reached the object, the apply also reports it,
+since the marks of repair installs are lost with the crash (9.4). A live voter, a replay's included, has held the
+key's lock since its own check; it reports the apply when a repair installed a state newer than T's start on the
+object (9.4).
 
 (d) A recovered vote whose saved status is resolved (a prepare or accept after the resolution re-saved it) restores the
 resolution, takes no locks (R13) and applies the commit or deletes the abort's state once loaded.
@@ -790,16 +807,3 @@ can recur under the same load.
 Suggested fix: have `voteBlocked` block only a vote whose requirements or writes collide with a waiting commit's
 (`RequirementsChecker.lockHolders`-style test against its changes), so a vote the waiter would not wait for proceeds;
 in the example neither H nor G collides with the waiter at the store where it is blocked.
-
-### Q-W11: A replay at a store that never saw T writes back a blind Insert's key deleted since, unmarked
-Verdict PLAUSIBLE. Priority 2. Effort M.
-Mechanism: a live replay Tx of T at a store S that never saw T (its vote passed T's pin, which is on another object)
-votes commit (on a delayed duplicate client prepare) on a blind Insert (or `DoesNotExist` + Insert) of key k after
-repair installed, from a read, a later transaction's deletion of k. It holds k's absent-key lock from its vote, so repair cannot remove k after it, but its
-apply (through an UnackedCommits entry naming no incarnation, or on a non-late commit) writes k back at S alone, and
-it reports nothing, so no mark repairs it. Repair's `mayJoinTransaction` gate bounds it: while T is still joinable at
-S, only a mark of a transaction started before T can be repaired there, so the deletion must reach S through such a
-mark's whole-object reconcile.
-Consequence: one store holds a deleted key with nothing marked: permanent divergence of one replica's key set.
-Suggested fix (to design): such an apply reports the object, so the finalizer marks the store; the open part is
-telling a replay's vote from a counted one.

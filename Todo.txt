@@ -45,11 +45,7 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.18 [Q-W11] A live replay at a store that never saw T writes back a blind-inserted key deleted since.  PLAUSIBLE, M
-    transaction-requirements.md Q-W11. A replay Tx at a store that missed T votes commit on a blind Insert of k (T's
-    pin is on another object) after repair installed a later deletion of k from a read; its apply writes k back at
-    that store alone, unmarked. Fix (to design): such an apply reports the object, so the finalizer marks the store;
-    the open part is telling a replay's vote (which needs a delayed client prepare) from a counted one.
+(no open items)
 
 
 PRIORITY 3: systemic loss protection

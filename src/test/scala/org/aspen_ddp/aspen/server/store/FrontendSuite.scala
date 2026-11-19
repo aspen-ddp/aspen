@@ -3783,14 +3783,17 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     new ObjectState(oid2, Metadata(rev0, ObjectRefcount(1, 1), timestamp), ObjectType.KeyValue,
       KVObjectState.encode(Some(k(0)), None, None, None, contents))
 
-  test("a recovered commit vote re-applies an Insert of an absent key though later writes reached the object " +
-       "(Q-W10)") {
+  test("a recovered commit vote re-applies an Insert of an absent key though later writes reached the object, and " +
+       "reports it (Q-W10, Q-W11)") {
+    // Its update was never applied here. A write newer than its start reached the object, which may have been a repair
+    // installing a later deletion of the key at a store that never held it (the marks of repair installs are lost with
+    // the crash): the object is reported, so the finalizer marks the store
     val (frontend, backend, net, crl, _) = unackedFixture(List(insertK4), ops = insertK4Ops, kvState = () => kvAt())
     frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = true, late = false,
       proof = false))
     frontend.failStopped shouldBe false
     kvKeys(backend) should contain (k(4))
-    committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid2))
     crl.dropped should contain (unackedTxid)
   }
 
@@ -5371,6 +5374,47 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.failStopped shouldBe false
     kvKeys(backend) should not contain k(4)
     committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+  }
+
+  // ---- A late blind Insert after a repair install reports its object (transaction-requirements 10.5c) ----
+  //
+  // A store that never saw T may have the state of a later transaction that deleted T's key installed by repair, from a
+  // read, before T reaches it (a delayed client prepare). T's Insert of the absent key then passes its re-check and
+  // writes the key back at this store alone: the apply reports the object, so the finalizer marks the store
+
+  /** A repair install on oid2 of keys 1 to 3 and 5 at object timestamp `at` */
+  def repairInstall(frontend: Frontend, at: HLCTimestamp): Unit =
+    def vs(n: Int) = org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState(Value(Array[Byte](n.toByte)), rev0,
+      HLCTimestamp(n.toLong))
+    val read = new org.aspen_ddp.aspen.client.KeyValueObjectState(kvPtr, rev0, ObjectRefcount(1, 1), at, at, ida,
+      Some(k(0)), None, None, None, List(1, 2, 3, 5).map(n => k(n) -> vs(n)).toMap)
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr), read, done)
+    done.future.value.get.get.changed shouldBe true
+
+  /** T, txid1's blind Insert of key 4, with a repair install on oid2 at `installAt` (relative to T's start, None for
+    * none) before or after its vote. Returns the objects its TxCommitted reports
+    */
+  def lateInsert(installAt: Option[Long], beforeVote: Boolean): List[ObjectId] =
+    val (frontend, backend, net) = lockFixture()
+    val txd = lockTxd(txid1, List(insertK4))
+    def install(): Unit = installAt.foreach(ms =>
+      repairInstall(frontend, HLCTimestamp(txd.startTimestamp.asLong + (ms << 16))))
+    if beforeVote then install()
+    prepare(frontend, net, txd, insertK4Data).disposition shouldBe TransactionDisposition.VoteCommit
+    if !beforeVote then install()
+    resolve(frontend, net, txid1, committed = true)
+    kvKeys(backend) should contain (k(4))
+    committedMessages(net).filter(_.transactionId == txid1).flatMap(_.objectCommitErrors)
+
+  test("a blind Insert of an absent key applied after a repair installed a newer read reports the object (Q-W11)") {
+    lateInsert(Some(1000), beforeVote = true) shouldBe List(oid2)
+    lateInsert(Some(1000), beforeVote = false) shouldBe List(oid2)
+  }
+
+  test("a blind Insert reports nothing without a repair install newer than its start") {
+    lateInsert(None, beforeVote = true) shouldBe Nil
+    lateInsert(Some(-1000), beforeVote = true) shouldBe Nil
   }
 
   test("a store loaded with such an entry recreates the transaction") {

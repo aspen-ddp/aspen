@@ -407,7 +407,10 @@ A repair write whose plan removes keys (`plan.deletes`) reaches the backend only
 another transaction still holds a blind Insert of one of them that the store applied (`Frontend.awaitBlindInsertsDurable`,
 transaction-requirements.md 9.4): such a state is saved again without the object's update first, or its conclusion
 made durable. A recovered commit vote therefore never writes back a key repair removed. The object stays held in
-memory and counted in flight meanwhile, as for any repair write.
+memory and counted in flight meanwhile, as for any repair write. Every repair write also records the object timestamp
+it installs (`Frontend.repairInstalls`): a transaction started before it that later applies a blind Insert of a key
+absent here reports the object, since the installed state may hold a deletion of the key this store never held
+(transaction-requirements.md 9.4).
 
 ### 6.3 `Reconcile.plan`
 

@@ -396,8 +396,8 @@ entry)", charged to `CrlAdmission` and carrying T's start (crash-recovery-log.md
   exists there to apply through it. A store that never saw T can hold a replay's Tx only above its floor; its entry,
   if any, comes from the unknown-voters case and names no incarnation. A replay's commit vote there passed T's pin, so
   a late commit applies T through the entry, which is the update the store lacks. Its vote has held its locks since,
-  so its apply is a live voter's; a blind Insert of a key a later transaction deleted, installed there by repair
-  before the replay voted, is written back unmarked (transaction-requirements.md Q-W11). A replay that voted abort applies nothing, and the entry's
+  so its apply is a live voter's; a blind Insert of a key whose later deletion repair installed there is applied and
+  reported, so the store is marked (transaction-requirements.md 9.4). A replay that voted abort applies nothing, and the entry's
   reconcile installs T; repair leaves the entry until the store can no longer join T
   (`RepairTarget.mayJoinTransaction`).
 
@@ -590,7 +590,8 @@ state, and Paxos, safe with offline acceptors, never chooses abort once commit w
   passed T's pin: the pinned object is before T here, and T's committed update is what the store lacks. A rebuilt store
   whose `acceptorSince` mute a skewed clock defeated is in the same position. A recovered vote's failed re-check there
   is an update already applied, and its Insert of a key now absent one never applied (transaction-requirements.md
-  10.5c); a replay's live vote has held its locks since it voted (residual: transaction-requirements.md Q-W11).
+  10.5c); a replay's live vote has held its locks since it voted, and reports a blind Insert applied over a repair
+  install newer than T's start (transaction-requirements.md 9.4).
 * **Entry found naming another incarnation** (`Tx.unackedCommitNotOwed`): T committed, but nothing is applied
   through the entry. A recovered or expiring vote resolves committed without writing the cache, drops its held aborts
   unaccepted, releases its locks, proves the commit to its driver, applies nothing (`notOwedHere`, reporting its
@@ -825,8 +826,8 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 * No driver starts while a store's CRL state loads, costing a client retransmit of latency.
 * Duplicate recovery drivers each run the finalization actions once.
 * A store that never saw T, whose entry names no incarnation (the unknown-voters case), applies T through it if a
-  replayed prepare reached it and voted commit. A blind Insert of a key deleted since, when repair installed the
-  deletion there before the replay voted, is written back unmarked (transaction-requirements.md Q-W11).
+  replayed prepare reached it and voted commit. A blind Insert of a key whose later deletion repair installed there is
+  written back, and reported, so the finalizer marks the store and repair removes it (transaction-requirements.md 9.4).
 * A transaction undecidable at expiry (too many rebuilt or forgetting primary stores, ExpiryTally rule G) holds its
   locks and CRL state, logged `UNDECIDABLE TRANSACTION`; a repair read of an allocation it holds times out and defers
   its entry at every scan (repair-process.md 12.8).

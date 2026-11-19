@@ -57,9 +57,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.8  CRL-W7  An expiring stub's charge is released before its deletion is queued. CONFIRMED, S.
-     Frontend.dropAppliedStub calls releaseStub() before crl.deleteAppliedStub, breaking the release-after-deletion
-     rule Lemma C (1) relies on. Up to 41 uncovered bytes per stub. Fix: swap the two calls.
+(no open items)
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

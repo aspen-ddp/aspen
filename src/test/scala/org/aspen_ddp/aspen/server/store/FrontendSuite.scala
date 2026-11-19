@@ -5965,7 +5965,11 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("stubs count toward the device's admission until they leave the CRL") {
     val admission = new CrlAdmission(Long.MaxValue)
-    val crl = new TestCrl
+    var admittedAtStubDelete: List[Long] = Nil
+    val crl = new TestCrl:
+      override def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit =
+        admittedAtStubDelete = admittedAtStubDelete :+ admission.admittedBytes
+        super.deleteAppliedStub(storeId, txid)
     val (store, _, _) = admissionStore(admission, crl)
     store.frontend.recordAppliedStub(txid1, stubStart)(())
     store.frontend.recordAppliedStub(txid2, stubStart)(())
@@ -5973,6 +5977,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     store.frontend.dropAppliedStub(txid2)
     admission.admittedBytes shouldBe CrlAdmission.AppliedStubBytes
+    // Released only after its deletion is queued, so no admission can take its bytes ahead of the deletion
+    admittedAtStubDelete shouldBe List(2 * CrlAdmission.AppliedStubBytes)
     // Only a stub held is released
     store.frontend.dropAppliedStub(txid2)
     admission.admittedBytes shouldBe CrlAdmission.AppliedStubBytes

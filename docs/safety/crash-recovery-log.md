@@ -950,10 +950,8 @@ charge (a new transaction, late data under A1) sees the total, which is at least
 and adds at most `T`; a loaded state's check-and-charge (A3) keeps the total less what is retained for the store at
 most `limit + T`; a replacing stub's charge is excluded
 until its state's release, which then lowers the covered total by that state's charge (at least 63) less 41; an
-unoffset stub adds 41 and its expiry removes it; a reload's swap changes nothing (A2); every other release lowers it.
-The rule of (1), release only after the deletion is queued, has one exception in the code: an expiring stub's
-charge is released just before its deletion is queued (CRL-W7), which can leave 41 bytes per such stub uncovered
-until the deletion's entry is built.
+unoffset stub adds 41 and its expiry removes it (`dropAppliedStub` queues the deletion, then releases); a reload's
+swap changes nothing (A2); every other release lowers it.
 So the covered total less `41 ·` (unoffset stubs outstanding) stays at most `limit + T`: each event keeps it, and at
 the device's open the covered total is the footprint of the recovered image, the durable image of the previous run.
 That run's last durable build bounded it the same way. A stub recovered at open, charged by `chargeStubs` with nothing
@@ -1224,18 +1222,6 @@ at `writeHead`'s `require`, which only a bug can reach.
 ---
 
 ## Open weaknesses
-
-### CRL-W7. An expiring stub's charge is released before its deletion is queued (CONFIRMED; proof hygiene)
-Mechanism: `Frontend.dropAppliedStub` calls `releaseStub()` (which releases `CrlAdmission.AppliedStubBytes`) and only
-then `crl.deleteAppliedStub`. Lemma C (1) relies on every record's charge being released only after its deletion is
-queued (`deleteTransactionState` and `concludeTransactionState` delete first, then release).
-Trigger / scenario: store A's heartbeat expires a stub; between the release and the `DeleteAppliedStub` put, store B
-on another executor of the same device admits a prepare against the freed bytes, and its save reaches the CRL queue
-ahead of A's deletion.
-Consequence: at the builds before the stub's deletion entry is built, the image holds 41 bytes no charge covers, per
-stub expiring this way. The amount is negligible against the `S/16` reserve, but the proof's rule is broken.
-Suggested fix: queue `crl.deleteAppliedStub` before `releaseStub()` in `dropAppliedStub`.
-Effort: S   Priority: 5
 
 ### CRL-W8. Documentation outside docs/safety contradicts the CRL's behavior (CONFIRMED; documentation)
 Mechanism and corrections:

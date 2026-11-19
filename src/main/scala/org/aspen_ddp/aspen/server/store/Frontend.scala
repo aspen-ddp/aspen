@@ -1011,14 +1011,15 @@ class Frontend(val storeId: StoreId,
       onDurable
     })
 
-  /** Drops the applied stub for `txid`, if the store holds one, deletes it from the CRL and releases its charge. Only
-    * expireStubs drops one; visible for tests */
+  /** Drops the applied stub for `txid`, if the store holds one, deletes it from the CRL and releases its charge. The
+    * deletion is queued before the release, so no admission the release makes room for can reach the CRL ahead of it
+    * (crash-recovery-log Lemma C (1)). Only expireStubs drops one; visible for tests */
   private[server] def dropAppliedStub(txid: TransactionId): Unit =
     if stubs.contains(txid) then
       stubs -= txid
       heldStubs -= txid
-      releaseStub()
       crl.deleteAppliedStub(storeId, txid)
+      releaseStub()
 
   /** Drops every applied stub whose transaction is past the horizon plus the expiry margin (stubExpiresAt) and for
     * which the store holds no Tx, whether live, waiting on a held commit (deferredFinalizations), on its backend

@@ -179,6 +179,7 @@
   list in each `LogEntry`), evacuated like a transaction (`BuiltStub.anchor`); a stub's save replaces the transaction's
   state in the same entry. `readStoreState`, `crl_save.log`, `loadStore`, `deleteTransactions` and `dropStore` carry
   both. Charged to CrlAdmission without a check (`AppliedStubBytes`, 41), by the Frontend: never refused, but counted,
-  and released when the store expires the stub
+  and released when the store expires the stub, after its deletion is queued (as every charge is released only after
+  its record's deletion is queued: crash-recovery-log Lemma C)
 - The device's CRL is shared by all its stores; sizing comes from the device config. A loading store reads its state
   with the non-blocking `readStoreState` from its executor (`server/host/CLAUDE.md`)

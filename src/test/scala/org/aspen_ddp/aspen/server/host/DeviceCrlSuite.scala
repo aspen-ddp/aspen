@@ -746,6 +746,78 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       host.control.router.loaded.contains(storeId) should be(true)
       os.exists(Backend.crlSaveFile(saved)) should be(false)
 
+  /** A factory over `inner` whose first open finds the CRL corrupt */
+  private def corruptOnFirstOpen(inner: RecordingCrlFactory): CrashRecoveryLogFactory =
+    val calls = new AtomicInteger(0)
+    new CrashRecoveryLogFactory:
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
+        if calls.incrementAndGet() == 1 then
+          throw CrlCorrupt("corrupt")
+        inner.openCRL(devicePath, config, holdsStores)
+      def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
+        inner.createCRL(devicePath, config, dir)
+
+  /** A finished rebuild of `storeId` carrying the rebuild-complete marker of `episode`, on a device whose entry for
+   *  it is `entry` and whose CRL is lost at the host's start. Returns the store's directory, the host and its
+   *  recorded rebuilds once the host's first check of the device has settled. */
+  private def finishedRebuildOnLostCrl(entry: StorageDeviceState.StoreEntry,
+                                       episode: Option[UUID]): Future[(os.Path, Host, RecordingRebuildFactory)] =
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    createCrl(deviceDir)
+    val rebuilds = new RecordingRebuildFactory
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map(storeId -> entry)))
+      _ <- waitForTransactionsToComplete()
+      storeDir <- writeRocksStore(deviceDir, storeId)
+      // As RebuildingStore.finish leaves it. It never served, so the lost CRL held nothing of it
+      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, episode.fold("")(_.toString))
+      host = newCrlHost(hostRoot, corruptOnFirstOpen(newFactory()), rebuilds = rebuilds)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpWithTx(host, host.control.reconciler.activeDeviceChecks.isEmpty &&
+                            (host.control.router.loaded.contains(storeId) || rebuilds.created.nonEmpty))
+    yield (storeDir, host, rebuilds)
+
+  private def pendingDeletes(storeDir: os.Path): List[os.Path] =
+    val dir = storeDir / os.up / RebuildingStore.PendingDeleteDirectory
+    if os.exists(dir) then os.list(dir).toList else Nil
+
+  atest("a lost device CRL does not mark a finished rebuild whose flip committed: it loads as it would have"):
+    given ExecutionContext = executionContext
+    for
+      (storeDir, host, rebuilds) <- finishedRebuildOnLostCrl(
+        StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None), None)
+      served = host.control.router.loaded.get(storeId).map(_.backend.path)
+      _ <- host.control.router.loaded.get(storeId).fold(Future.unit)(_.backend.close())
+    yield
+      os.exists(marker(storeDir)) should be(false)
+      rebuilds.created should be(empty)
+      pendingDeletes(storeDir) should be(Nil)
+      served should be(Some(storeDir))
+      os.exists(storeDir / RebuildingStore.RebuildCompleteMarkerFile) should be(false)
+
+  atest("a lost device CRL does not mark a finished rebuild awaiting its flip: its rebuild flips that copy"):
+    given ExecutionContext = executionContext
+    val episode = UUID.randomUUID()
+    for
+      (storeDir, host, rebuilds) <- finishedRebuildOnLostCrl(
+        StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None, Some(episode)), Some(episode))
+      markedAtStart = os.exists(marker(storeDir))
+      retired = pendingDeletes(storeDir)
+      _ = rebuilds.created.map(r => (r.storeId, r.episode)).toList should be(List((storeId, Some(episode))))
+      // The copy is the finished rebuild: start() takes it for done
+      _ = rebuilds.created.head.promise.success(())
+      _ <- pumpWithTx(host, host.control.router.loaded.contains(storeId))
+      served = host.control.router.loaded.get(storeId).map(_.backend.path)
+      _ <- host.control.router.loaded.get(storeId).fold(Future.unit)(_.backend.close())
+    yield
+      markedAtStart should be(false)
+      retired should be(Nil)
+      served should be(Some(storeDir))
+      os.exists(storeDir / RebuildingStore.RebuildCompleteMarkerFile) should be(false)
+
   /** A device holding a store whose CRL opens fail with an I/O error the first `failures` times */
   private def transientlyFailingCrlDevice(failures: Int): (os.Path, os.Path, RecordingCrlFactory, AtomicInteger, Host) =
     val hostRoot = newHostDir()

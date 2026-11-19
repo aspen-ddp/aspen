@@ -62,10 +62,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.2 [SL-W10] A lost device CRL marks a finished rebuild awaiting its flip.                            CONFIRMED, S
-    systemic-loss-protection.md SL-W10. `DeviceDiscovery.openDeviceCrl` spares only `holdsOwnState` directories; a
-    `rebuild-complete` copy has no save file, held nothing in the lost CRL, yet is retired and rebuilt again. Fix:
-    `holdsOwnState` also spares a `rebuild-complete` directory.
+(no open items)
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

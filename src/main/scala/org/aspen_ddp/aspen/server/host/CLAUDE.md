@@ -131,8 +131,10 @@
 - A lost device CRL does the same to every store on the device: if `<device>/crl` is absent from a device holding store
   dirs, or holds no stream files there (`openCRL(..., holdsStores = true)` throws `CrlMissing`: a device's stores exist
   only once its CRL was opened, so an emptied `crl/` is never taken as a new CRL), or `openCRL` throws (a corrupt
-  CRL, `CrlCorrupt`, is logged as such), each store dir gets `rebuild-required` except one whose `crl_save.log`
-  validates as its own (`holdsOwnState`: its whole state is the file, which its load uses over any CRL), the old
+  CRL, `CrlCorrupt`, is logged as such), each store dir gets `rebuild-required` except one that held nothing in it
+  (`holdsOwnState`): one whose `crl_save.log` validates as its own (its whole state is the file, which its load uses
+  over any CRL), or a finished rebuild carrying `rebuild-complete` (never served, so its state is empty; its flip and
+  load proceed as over the old CRL), the old
   directory is kept as `crl.lost-<uuid>`, and a fresh CRL is created in `crl.creating/` (`CrashRecoveryLogFactory.createCRL`),
   renamed to `crl/` durably once finished, and opened (`DeviceDiscovery.openDeviceCrl`). A crash or failed creation
   (ENOSPC) leaves no `crl/`: device load sweeps `crl.creating/` and the next load declares the CRL lost again, moving

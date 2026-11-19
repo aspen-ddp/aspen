@@ -536,7 +536,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  anything but a transient error (DeviceDiscovery.isTransient) or a transient error on CrlOpenAttempts device
    *  scans in a row (an open outside a scan neither counts nor declares; a success anywhere resets). The stores'
    *  transaction state was in it, so each is marked rebuild-required (the reconcile pass turns them into rebuilds),
-   *  except one whose valid crl_save.log is its whole state (holdsOwnState). The old directory is kept aside as
+   *  except one that held nothing in it (holdsOwnState: its valid crl_save.log is its whole state, or it is a
+   *  finished rebuild awaiting its flip). The old directory is kept aside as
    *  `crl.lost-<uuid>`, and a fresh CRL is created in `crl.creating` (CrashRecoveryLog.replacementCrlDir), renamed
    *  to `crl/` durably once finished, and opened. A failed creation removes `crl.creating` and is rethrown, leaving no
    *  `crl/`. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
@@ -632,16 +633,20 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       throw t
     ctx.crlFactory.openCRL(devicePath, sdCfg, holdsStores = true)
 
-  /** Whether the store directory `storeDir` holds its whole transaction state in its own crl_save.log, which
-   *  validates as that store's (an arrived transfer, a transfer out's source, a rebuilt store kept offline). Its load
-   *  drops whatever the device CRL holds for it and loads the file (StoreLoader.awaitCrlLoad), so losing the device
-   *  CRL loses nothing of its. A directory whose config cannot be read, or whose file is missing, cut short or another
-   *  store's, does not. */
+  /** Whether the store directory `storeDir` holds nothing in the device CRL, so losing that CRL loses nothing of its.
+   *  Either its whole transaction state is in its own crl_save.log, which validates as that store's (an arrived
+   *  transfer, a transfer out's source, a rebuilt store kept offline): its load drops whatever the device CRL holds
+   *  for it and loads the file (StoreLoader.awaitCrlLoad). A directory whose config cannot be read, or whose file is
+   *  missing, cut short or another store's, does not hold its state that way. Or it carries rebuild-complete: a
+   *  finished rebuild awaiting its flip, which has never served (StoreLoader.tryLoadStore leaves it offline), so its
+   *  transaction state is empty. Its rebuild or the reconcile's Completed Rebuilds pass flips and loads it as it
+   *  would have over the old CRL; one finished for an earlier episode is retired by retireForeignCopy as before. */
   private def holdsOwnState(storeDir: os.Path): Boolean =
     val saveFile = Backend.crlSaveFile(storeDir)
-    os.exists(saveFile) &&
-      Try(StoreConfig.loadStoreConfig(storeDir / StoreConfig.configFilename).storeId).toOption.exists: storeId =>
-        CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
+    os.exists(storeDir / RebuildingStore.RebuildCompleteMarkerFile) ||
+      os.exists(saveFile) &&
+        Try(StoreConfig.loadStoreConfig(storeDir / StoreConfig.configFilename).storeId).toOption.exists: storeId =>
+          CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
 
   /** The load half of tryLoadDevice, run only once the device is known to be ours. */
   private def loadOwnedDevice(storageDevicePath: os.Path,

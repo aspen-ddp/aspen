@@ -3514,6 +3514,26 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       Some(TransactionStatusCache.Entry(TransactionStatus.Committed, finalized = true, late = false))
   }
 
+  // transaction-recovery.md 7.4: a saved Committed would be restored as an ordinary resolution, seeding the host's
+  // status cache with a non-finalized outcome for a T every peer forgot, and losing notOwedHere
+  for (entry, name) <- List((None, "its own"), (Some(incarnationA), "another")) do
+    test(s"a recovered commit vote resolved by an entry naming $name incarnation saves its status as Unresolved") {
+      val (frontend, _, _, crl, lookup) = unackedFixture()
+      lookup.answer(unackedTxid, entry.fold(lookup.own)(i => Success(UnackedLookupResult.Found(Some(i)))))
+      frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
+      val before = crl.savedStates.size
+
+      val txd = lockTxd(unackedTxid, List(deleteK2))
+      frontend.receiveTransactionMessage(TxPrepare(storeId, unackedDriver, txd, ProposalId(5, 2.toByte), Nil,
+        fromClient = false))
+      frontend.receiveTransactionMessage(TxAccept(storeId, unackedDriver, unackedTxid, ProposalId(5, 2.toByte),
+        value = true))
+
+      val saved = crl.savedStates.drop(before).filter(_.txd.transactionId == unackedTxid)
+      saved.size shouldBe 2
+      saved.map(_.status).distinct shouldBe List(TransactionStatus.Unresolved)
+    }
+
   test("a held TxFinalized abort is not replaced by a later held TxResolved, so the Tx is forgotten once accepted") {
     val (frontend, _, _, _, lookup) = unackedFixture()
     lookup.answer(unackedTxid, lookup.absent)

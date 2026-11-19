@@ -83,6 +83,17 @@ class Tx( trs: TransactionRecoveryState,
     case TransactionStatus.Committed => Some(true)
     case TransactionStatus.Aborted => Some(false)
     case _ => None
+  /** The resolution was learned from the UnackedCommits tree (unackedCommitFound, unackedCommitNotOwed), not from
+    * Paxos or a TxResolved: see savedStatus */
+  private var resolvedFromTree: Boolean = false
+
+  /** The status every CRL save records. A resolution learned from the UnackedCommits tree saves Unresolved: restored
+    * as resolved, it would seed the host's status cache with a non-finalized Committed for a transaction every peer
+    * may have forgotten (whose relay answers non-late), and lose notOwedHere. A restart instead looks the entry up
+    * again and takes the same path (transaction-recovery 7.4)
+    */
+  private def savedStatus: TransactionStatus.Value =
+    if resolvedFromTree then TransactionStatus.Unresolved else txStatus
   private var ofinalized: Option[Boolean] = None
   private var objects: Map[ObjectId, ObjectState] = Map()
   private var pendingObjectLoads: Int = objectPointers.size
@@ -131,7 +142,7 @@ class Tx( trs: TransactionRecoveryState,
   private def saveUndurableVote(): Unit =
     if !muted && !stateDeleted && disposition != TransactionDisposition.Undetermined && !voteSaveIssued &&
       allObjectsLoaded then
-      saveState(TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, txStatus,
+      saveState(TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, savedStatus,
         acceptor.persistentState), () => ())
 
   /** Durably removes `objectId`'s update from this transaction's CRL state, then runs `onDurable` on the store's
@@ -144,7 +155,7 @@ class Tx( trs: TransactionRecoveryState,
   def persistWithoutUpdateOf(objectId: ObjectId)(onDurable: () => Unit): Unit =
     droppedUpdates += objectId
     if savedToCrl && !stateDeleted then
-      val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, txStatus,
+      val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, savedStatus,
         acceptor.persistentState)
       saveState(state, () => frontend.post(onDurable))
     else
@@ -480,7 +491,7 @@ class Tx( trs: TransactionRecoveryState,
     adoptedSaves += 1
     val save = adoptedSaves
     val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
-      disposition, txStatus, acceptor.persistentState)
+      disposition, savedStatus, acceptor.persistentState)
     saveState(state, () => frontend.post { () =>
       // Only the latest save holds all the adopted data
       if save == adoptedSaves then
@@ -880,7 +891,7 @@ class Tx( trs: TransactionRecoveryState,
       val r = response.copy(disposition=disposition, collisions=collisions)
       delayedPrepare = None
       val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
-        disposition, txStatus, acceptor.persistentState)
+        disposition, savedStatus, acceptor.persistentState)
       saveState(state, () =>
         logger.trace(s"AllObjectsLoaded. CRL Save Complete. Sending PrepareResponse for tx ${transactionId}")
         sendPrepareResponse(r)
@@ -1265,7 +1276,8 @@ class Tx( trs: TransactionRecoveryState,
     frontend.locksReleased(transactionId)
 
   /** @param record whether to record the outcome in the host's status cache: not for an outcome learned from the
-    *               UnackedCommits tree (see unackedCommitFound)
+    *               UnackedCommits tree (see unackedCommitFound), which its CRL saves record as Unresolved
+    *               (savedStatus)
     */
   private def resolved(committed: Boolean, record: Boolean = true): Unit = if (oresolution.isEmpty) {
     oresolution = Some(committed)
@@ -1284,6 +1296,8 @@ class Tx( trs: TransactionRecoveryState,
 
     if record then
       statusCache.updateStatus(transactionId, txStatus, late = lateOutcome)
+    else
+      resolvedFromTree = true
 
     if (allObjectsLoaded)
       resolvedAndAllObjectsLoaded(committed)
@@ -1395,7 +1409,7 @@ class Tx( trs: TransactionRecoveryState,
 
     if allObjectsLoaded then
       val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
-        disposition, txStatus, acceptor.persistentState)
+        disposition, savedStatus, acceptor.persistentState)
       saveState(state, () =>
         logger.trace(s"CRL Transaction save complete. Sending PrepareResponse: ${m.transactionId}")
         sendPrepareResponse(txr)
@@ -1414,7 +1428,7 @@ class Tx( trs: TransactionRecoveryState,
     }
     val tar = TxAcceptResponse(m.from, storeId, transactionId, m.proposalId, result)
     val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
-      disposition, txStatus, acceptor.persistentState)
+      disposition, savedStatus, acceptor.persistentState)
 
     saveState(state, () =>
       logger.trace(s"CRL Accept save completed for tx: ${tar.transactionId}. Sending AcceptResponse")

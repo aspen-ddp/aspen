@@ -93,8 +93,31 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
       store.receiveTransactionMessage(prepare(storeId, peer))
 
-      net.sentTx.collect { case r: TxResolved => (r.committed, r.late, r.proof) } shouldBe List((true, late, false))
+      net.sentTx.collect { case r: TxResolved => (r.committed, r.late, r.proof) }.distinct shouldBe
+        List((true, late, false))
       net.sentTx.collect { case f: TxFinalized => f } shouldBe Nil
+  }
+
+  // paxos-transactions 10.2: the sender's recovery driver learns the outcome, and the store's own new Tx and driver do
+  test("a relayed resolution of a non-finalized entry reaches the sender and the relaying store") {
+    for status <- List(TransactionStatus.Committed, TransactionStatus.Aborted) do
+      val statusCache = new TransactionStatusCache()
+      statusCache.updateStatus(txid1, status)
+      val (store, net, _) = mkStore(storeId, statusCache, Duration(40, SECONDS))
+
+      store.receiveTransactionMessage(prepare(storeId, peer))
+
+      net.sentTx.collect { case r: TxResolved => (r.to, r.from) }.toSet shouldBe Set((peer, storeId), (storeId, peer))
+  }
+
+  test("a relayed resolution answering a store's own prepare is delivered once") {
+    val statusCache = new TransactionStatusCache()
+    statusCache.updateStatus(txid1, TransactionStatus.Committed)
+    val (store, net, _) = mkStore(storeId, statusCache, Duration(40, SECONDS))
+
+    store.receiveTransactionMessage(prepare(storeId, storeId))
+
+    net.sentTx.collect { case r: TxResolved => (r.to, r.from) } shouldBe List((storeId, storeId))
   }
 
   // paxos-transactions 10.6: a sibling store's delayed resolution no longer downgrades the host's finalized entry, so

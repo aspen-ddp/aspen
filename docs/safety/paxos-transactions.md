@@ -672,12 +672,15 @@ repair, no safety effect.
 * Tx unknown, cache entry finalized: the Store answers `TxFinalized` (and `TransactionFinalized` to the client), late if
   committed; the Frontend ignores the prepare and releases its admission.
 * Tx unknown, cache entry resolved but not finalized, T at or above the floor: the Store sends a `TxResolved` of the
-  entry (late if the entry is) addressed to itself (`to = msg.to`, P-W6), and the Frontend creates a Tx with
-  `outcomeDecided`: no locks, still votes, answers status queries with the cached outcome. The self-addressed relay
-  arrives after the Tx and any driver exist, so the new Tx resolves from it and the store's own driver learns it; the
-  sender learns nothing from it. The designated leader drives such a T on purpose: its deciding driver may have died
-  on another host, and the self-addressed relay resolves the new driver at once.
-  The same relay is sent whenever a resolved entry exists, also to a store that holds a Tx (a duplicate there).
+  entry (late if the entry is) to the sender and to itself (once, when the sender is the store itself), and the
+  Frontend creates a Tx with `outcomeDecided`: no locks, still votes, answers status queries with the cached outcome.
+  The sender's recovery driver learns the outcome from its copy. The store's own copy arrives after the Tx and any
+  driver exist, so the new Tx resolves from it and the store's own driver learns it. The designated leader drives such
+  a T on purpose: its deciding driver may have died on another host, and its own copy resolves the new driver at once.
+  The same relay is sent whenever a resolved entry exists, also to a store that holds a Tx (a duplicate there). A
+  non-finalized `Committed` entry stems only from a Paxos or relayed resolution, never from a tree-learned one, whose
+  saved status is `Unresolved` (transaction-recovery.md 7.2), so the relay never spreads a non-late commit of a T its
+  peers forgot.
 * Tx unknown, no outcome cached, T below the store's floor: refused, no Tx at all (`Frontend.refusePrepare`); the
   designated leader starts no driver. The rebuilt store's `acceptorSince` mute is checked first and still creates its
   muted, possibly proving Tx.
@@ -1129,26 +1132,6 @@ transaction eventually resolves without operator action given a healthy quorum.
 ---
 
 ## Open weaknesses
-
-### P-W6. The status-cache relay of a resolved, unfinalized entry is addressed to the relaying store (CONFIRMED; liveness and hygiene)
-Mechanism: `Store.handleTransactionMessage` (TxPrepare case) builds the relay as `TxResolved(msg.to, msg.from, ...)`;
-the first field is `to`, so it is sent to the store itself, while the finalized relay beside it,
-`TxFinalized(msg.from, msg.to, ...)`, goes to the sender. StoreSuite "a relayed resolution of a non-finalized entry
-carries the entry's late flag" checks the flags but not the address.
-Trigger / scenario: a recovery driver on store A prepares T at store B, whose host cache holds T resolved but not yet
-finalized (another store on B's host resolved it; B never held a Tx). B relays the outcome to itself: its new
-`outcomeDecided` Tx resolves, and B's own driver if any, but A gets at most a promise and B's vote, never the
-outcome.
-Consequence: no safety effect. The driver learns T only from Paxos (a quorum's accepted values) or a later finalized
-relay, so a takeover is slower than designed. The designated leader's fast
-takeover (10.2) works only because the relay reaches its own new driver.
-Suggested fix: send the relay to `msg.from`, and keep delivering it locally (or resolve the new `outcomeDecided` Tx and
-the store's own driver directly), so both the sender and the designated leader's own driver learn it; assert the
-address in StoreSuite. Fix it together with or after transaction-recovery.md R-W5: a restored tree-learned resolution
-seeds the host cache with a non-finalized `Committed` for a T every peer forgot, and today its non-late relay reaches
-only the relaying store; addressed to `msg.from`, it would also reach every remote recovery driver, which would then
-resolve T non-late and re-run its finalization actions and marker.
-Effort: S   Priority: 5
 
 ### P-W7. Orphaned scaladoc of Tx.determineDisposition (CONFIRMED; documentation)
 Mechanism: in `server/transaction/Tx.scala` the scaladoc describing how the vote is decided ("Decides the vote, or

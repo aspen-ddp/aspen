@@ -271,8 +271,8 @@ the client.
   once its objects load (`Frontend.forgetMuted`), but it never voted commit; a prover, like any acceptor, is forgotten
   only on `TxFinalized` or a late outcome (`Tx.applyNothing`); `unackedCommitFound`, `unackedCommitNotOwed` (for a recovered or expiring
   vote) and `proveCommitted` record nothing in the status cache, so a finalized cache entry, and the late relay from
-  it, always stems from a real `TxFinalized` or late outcome. (A restart can seed a non-finalized `Committed` from a
-  tree-learned resolution's saved status: R-W5.)
+  it, always stems from a real `TxFinalized` or late outcome. Nor does a restart seed one from a tree-learned resolution:
+  its saves record `Unresolved` (7.2, `Tx.savedStatus`).
 
 ## 5. Recording missed updates (situation 6)
 
@@ -473,9 +473,11 @@ after the resolution, before an abort's state is deleted; one deleted saves noth
 `Tx.stateDeleted`, crash-recovery-log 6.1 A4; the CRL persists it) is restored into `oresolution`: once its objects load such a Tx applies the
 commit with the recovered re-check rules, or deletes the abort's state, takes no locks and needs no lookup, then waits
 for `TxFinalized` as a live resolved Tx does. The constructor also seeds the host status cache with the saved status.
-The saved status does not say how the resolution was learned: a Tx resolved through its UnackedCommits entry
-(`unackedCommitFound`, `unackedCommitNotOwed`) saves `Committed` like any other on its next prepare or accept, and a
-restart then restores it as an ordinary resolution, seeding the cache and losing `notOwedHere` (R-W5).
+A Tx resolved through its UnackedCommits entry (`unackedCommitFound`, `unackedCommitNotOwed`) saves `Unresolved` on
+every later prepare or accept (`Tx.savedStatus`): restored as resolved, it would seed the host status cache with a
+non-finalized `Committed` for a T every peer may have forgotten, whose relay answers non-late and would make the
+restored Tx's own driver re-run finalization, and it would lose `notOwedHere`, applying T from a state with no object
+data. Restored unresolved, it looks its entry up again and takes the same path, seeding nothing.
 
 Ordering (`Frontend.recoveredTransactionLoaded`, `Tx.completeLoad`):
 
@@ -540,7 +542,7 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   only once it concludes (a quarantine's `verificationComplete`; a failed commit's state is never concluded while the
   store is loaded), so a reload finds the state, not a stub. Repair deletes the entry only after reconciling every
   object it names, which leaves the store holding T either way. The state is never re-saved as `Committed` for this:
-  a restored `Committed` seeds the host status cache with a non-finalized outcome (R-W5).
+  a tree-learned resolution saves `Unresolved` (`Tx.savedStatus`).
 
 ### 7.5 A commit vote whose peers may have forgotten the transaction
 
@@ -830,29 +832,6 @@ Suggested fix: bound each lookup by `UnackedLookupTimeout` with a timed read of 
 `withReadTimeout` returns), so it settles as a failure that the heartbeat retries; or re-issue only when the answer
 can have been lost (the store was replaced) and otherwise wait for the read.
 Effort: M   Priority: 5
-
-### R-W5. A resolution learned from the UnackedCommits tree is saved, and restored after a restart, as an ordinary one (CONFIRMED; persistence)
-Mechanism: `Tx.unackedCommitFound` and `Tx.unackedCommitNotOwed` resolve through `resolved(true, record = false)`,
-which still sets `txStatus = Committed`. The next save persists it: the prepare of its own proof-holding driver's
-post-proof round (`Tx.answerPrepareWithState`), or an accept. A recovered Tx restores it into `oresolution`, and its
-constructor seeds the host status cache with a non-finalized `Committed`
-(`statusCache.updateStatus(transactionId, txStatus)`). `notOwedHere`, `foundUnackedEntry` and `stubDue` are not
-persisted.
-Trigger / scenario: a recovered commit vote finds its entry after its peers finalized and forgot T. Its driver's
-post-proof prepare re-saves the state, and the host crashes before the late resolution concludes the Tx.
-Consequence: (a) The restarted host's cache holds `Committed`, not finalized, for a T every peer forgot. The relay in
-`Store.handleTransactionMessage`, which runs before the floor check, answers any prepare for T at any of the host's
-stores with a non-late `TxResolved`. The restored Tx's own driver gets one from its own store, resolves T non-late, and
-re-runs every finalization action and the marker. The voters are unknown, so the marker writes ErrorTree marks and
-`None` entries for every silent store. The driver sends non-late `TxResolved` to every store, and stores of other
-hosts without a Tx record it in their caches, where their relays answer non-late too. This is the re-run of
-finalization that a late resolution exists to avoid (`TransactionDriver.resolveLate`). The shipped actions tolerate
-late runs, so the cost is repair churn. (b) For an entry naming another incarnation, the restored Tx applies T
-(`doCommit` without `notOwedHere`) from a state with no object data (dropped before the save): data-carrying updates
-are uncommittable and quarantine their objects; refcount and version updates re-apply where their re-check passes.
-Suggested fix: a tree-learned resolution saves its status as `Unresolved`, so a restart looks the entry up again and
-takes the same path, and seeds nothing.
-Effort: S   Priority: 5
 
 ### R-W6. A finalization action whose execute() throws orphans the marker before it (CONFIRMED; finalizer hygiene)
 Mechanism: `RegisteredTransactionFinalizerFactory.Finalizer` runs `actions.foreach(_.execute())` in its constructor

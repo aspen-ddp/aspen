@@ -149,7 +149,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   whose reconcile installs the committed state
 - A recovered Tx whose saved status is resolved (re-saved by a prepare or accept after the resolution) restores it
   into `oresolution`. It takes no locks and needs no lookup: once its objects load it applies the commit with the
-  recovered re-check rules, or deletes the abort's state, then waits for TxFinalized as a live resolved Tx does
+  recovered re-check rules, or deletes the abort's state, then waits for TxFinalized as a live resolved Tx does.
+  A resolution learned from the tree (`unackedCommitFound`, `unackedCommitNotOwed`) saves `Unresolved`
+  (`Tx.savedStatus`): restored as resolved it would seed the host cache with a non-finalized `Committed` for a T its
+  peers forgot and lose `notOwedHere`; restored unresolved it looks its entry up again (transaction-recovery 7.2)
 - Coverage: entries exist only for unacknowledged counted voters (every silent store when the voters are unknown).
   These reach the write threshold, so uncounted voters and non-voters are repaired by their ErrorTree marks alone
   (transaction-recovery 5.3). Any narrowing of entries must keep this rule
@@ -297,7 +300,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - The status cache is safety evidence, not only an optimization (paxos P17): a finalized entry is late-commit evidence
   (the relay reports it late) and finalization evidence (a prepare for a transaction the store does not hold is
   ignored), so an entry must never be wrong or downgraded. Its retention is not relied on: a lost entry's transaction
-  is below the forget floor
+  is below the forget floor. The relay of a resolved, unfinalized entry (`Store.handleTransactionMessage`) goes
+  as a `TxResolved` to the prepare's sender, whose recovery driver learns the outcome, and to the store itself, so the
+  `outcomeDecided` Tx that prepare creates and the store's own driver learn it too (paxos-transactions 10.2)
 - `TransactionStatusCache.updateStatus` keeps Committed over an opposite outcome (P19). Under the horizon an
   opposite outcome should never arise: one that does is logged as an error ("Split decision") and counted
   (`splitDecisions`)

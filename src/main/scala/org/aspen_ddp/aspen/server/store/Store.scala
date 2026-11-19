@@ -297,7 +297,14 @@ class Store(val storageDeviceId: StorageDeviceId,
               (Some(TxResolved(msg.to, msg.from, m.txd.transactionId, committed = true, late = late, proof = false)), true)
           }
 
-          r.foreach(resolved => net.sendTransactionMessage(resolved))
+          // A non-finalized outcome goes to the sender, whose driver may be recovering T, and to this store itself:
+          // delivered after the Tx this prepare creates and any driver started below exist, so both resolve from it
+          // (paxos-transactions 10.2)
+          r.foreach { resolved =>
+            net.sendTransactionMessage(resolved)
+            if (msg.from != msg.to && !entry.finalized)
+              net.sendTransactionMessage(resolved.copy(to = msg.from, from = msg.to))
+          }
 
           if (entry.finalized) {
             net.sendTransactionMessage(TxFinalized(msg.from, msg.to, m.txd.transactionId, committed, late = committed,

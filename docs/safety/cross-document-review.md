@@ -194,7 +194,8 @@ fewer than the write threshold. TKVL upper-tier caches and application caches wr
 cache holds outcomes, never object state, and is monotone (`TransactionStatusCache.updateStatus`); a size eviction
 raises the host's eviction watermark, so an evicted entry's absence is never trusted. A relay from the cache
 (`Store.handleTransactionMessage`) runs before the forget-floor check and is trusted as far as the entry is: a
-non-finalized `Committed` entry for a T every peer forgot makes the relay answer non-late (R-W5).
+non-finalized `Committed` entry stems only from a Paxos or relayed resolution: a tree-learned resolution records none
+and saves `Unresolved` (transaction-recovery.md 7.2).
 
 ## 3. Capacity
 

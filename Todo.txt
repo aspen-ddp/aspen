@@ -57,16 +57,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.1  R-W5 + P-W6  Status-cache relay correctness. CONFIRMED, S each. Fix R-W5 first, or both together.
-     - R-W5: resolved(true, record = false) still sets txStatus = Committed, and the post-proof prepare saves it.
-       After a restart that resolution is restored as ordinary: it seeds the host cache with a non-finalized
-       Committed and loses notOwedHere. The relay then resolves a forgotten T non-late, re-running finalization and
-       the marker; with an entry naming another incarnation, the store applies T with no data. Fix: save Unresolved
-       for a resolution learned from the tree.
-     - P-W6: Store.handleTransactionMessage addresses the relay's TxResolved(msg.to, msg.from, ...) to the relaying
-       store itself, so a remote recovery driver never learns the outcome from it (slower takeover). Fix: send it to
-       msg.from and keep the local delivery. Fixing this before R-W5 spreads R-W5's bogus relay to remote drivers.
-
 5.2  Q-W6  A re-applied traceless update quarantines an object that already holds it. CONFIRMED, S.
      Affects a RefcountUpdate alone, and delete-only KV updates, on a recovered non-late re-apply or an apply
      through an UnackedCommits entry. appliedBy finds no trace, so an ordinary crash quarantines the object; TKVL

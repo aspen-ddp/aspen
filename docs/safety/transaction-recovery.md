@@ -169,15 +169,17 @@ A driver's prepare (`TxPrepare(fromClient = false)`) goes to every data store of
 answers in this order:
 
 1. **Finalized in the host's status cache** (`Store.handleTransactionMessage`, the finalized relay): the store sends
-   `TxResolved(outcome)`, committed ones with `late = true`, then `TxFinalized(outcome, late = committed, owed = {})`,
-   and `TransactionFinalized` to the originating client. If the store holds no Tx, the Frontend then ignores the
-   prepare (no Tx is created and its admission is released). The driver finishes without running finalization actions: a commit through
+   itself `TxResolved(outcome)`, committed ones with `late = true` (for a Tx it holds and its own driver), sends the
+   prepare's sender `TxFinalized(outcome, late = committed, owed = {})`, and sends `TransactionFinalized` to the
+   originating client. If the store holds no Tx, the Frontend then ignores the prepare (no Tx is created and its
+   admission is released). The sender's driver finishes without running finalization actions: a commit through
    `resolveLate`, an abort through `onFinalized`.
 2. **Resolved, not finalized, in the cache**: the store sends `TxResolved(outcome)`, a commit carrying the entry's
-   `late` flag (set only by a late outcome recorded on this host). A non-late one a driver treats
-   as resolution (`onResolution(sendResolutionMessage = false)`) and, for a commit, runs the finalizer itself. If the
-   store holds no Tx and the transaction is above its floor, the Frontend creates one marked `outcomeDecided` (no
-   locks; status queries get the cached outcome); below the floor it refuses the prepare.
+   `late` flag (set only by a late outcome recorded on this host), to the prepare's sender and to itself, delivered
+   after the Tx the prepare creates and any driver started for it exist, so all of them learn it. A non-late one a
+   driver treats as resolution (`onResolution(sendResolutionMessage = false)`) and, for a commit, runs the finalizer
+   itself. If the store holds no Tx and the transaction is above its floor, the Frontend creates one marked
+   `outcomeDecided` (no locks; status queries get the cached outcome); below the floor it refuses the prepare.
 3. **Live `Tx`** (`Tx.receivePrepare`): it answers with its fixed vote and an acceptor promise, sent only after the
    CRL save of that state completes (or after its objects load, then the save). A Tx that already applied the commit
    also resends `TxCommitted` to the proposer.
@@ -280,8 +282,9 @@ the client.
 
 ### 5.1 Inputs
 
-* `updateCommitErrors(commitErrors)`: the map `store -> objects it could not apply`, updated on every `TxCommitted`
-  (`TransactionDriver.receiveTxCommitted`) and passed once when the finalizer starts. A store sends `TxCommitted` to
+* `updateCommitErrors(commitErrors, keptForReplay)`: the map `store -> objects it could not apply`, and the stores
+  whose `TxCommitted` set `keptForReplay`, updated on every `TxCommitted` (`TransactionDriver.receiveTxCommitted`) and
+  passed once when the finalizer starts. A store sends `TxCommitted` to
   its Tx's last proposer only after every backend commit it issued for T has completed (`Tx.allObjectCommitsComplete`),
   or at once if nothing needed committing, and again on every later prepare. The last proposer is the sender of the
   latest prepare it saw (initially the designated leader); a `TxResolved` does not change it, so a store that never
@@ -347,9 +350,9 @@ up and fails every entry of the batch. The marker transaction is `replaySafe` (m
   persisted, so at least a write threshold of stores holds T. One naming objects comes from a store that holds T
   already (a stub), is not owed it (another incarnation), or keeps T's CRL state for a failed backend commit or a
   quarantine; the last two keep the object out of the write-threshold count until that state is replayed or repair
-  verifies the copy. Such a store set `keptForReplay`, so it has an entry, and a reload after T's finalization
-  replays the state through it. An
-  uncounted voter or non-voter that sent no `TxCommitted` gets only ErrorTree marks, which repair keeps
+  verifies the copy. Such a store set `keptForReplay`, so a counted voter among them has an entry, and a reload after
+  T's finalization replays the state through it (an uncounted one's kept state applies nothing on reload; its
+  ErrorTree marks repair it). An uncounted voter or non-voter that sent no `TxCommitted` gets only ErrorTree marks, which repair keeps
   until the store's copy reaches T's timestamp, read from the holders above. An owed voter's entry names its
   incarnation, or none when the finalizing driver did not count the votes and never heard from it; either way the
   voter applies through it (section 7).
@@ -491,7 +494,10 @@ Ordering (`Frontend.recoveredTransactionLoaded`, `Tx.completeLoad`):
    abort to any driver at once, but stays undecided after load so a client retransmit that arrives first is still
    checked.
 3. `completeLoad` calls `lock()`: a recovered `VoteCommit` with unresolved status retakes its requirement locks
-   (`RequirementsLocker.lock`), so new transactions collide with it exactly as before the crash.
+   (`RequirementsLocker.lock`), so new transactions collide with it exactly as before the crash. A Tx with a restored
+   commit resolution takes no locks and applies in the same `completeLoad`, waiting in lock order
+   (`Tx.awaitLockHolders`) only for holders that have already relocked: recovered Txs with a vote complete in the
+   order their objects load (R-W7).
 4. `completeLoad` requests the UnackedCommits lookup if `needsUnackedCheck` (7.5).
 5. Held messages are released only once nothing is holding.
 
@@ -509,6 +515,11 @@ saved data.
   table whatever the cache does.
 * A commit voter holds its locks until it learns the outcome or is forgotten; `doCommit` drops them before applying,
   and the in-flight-commit marker (`Frontend.commitInFlight`) orders the transactions that follow.
+* A committed Tx holding no locks does not apply while another Tx holds locks it collides with on an object both
+  change (`Tx.awaitLockHolders`, transaction-requirements.md R15): it is held (`commitHeld`) until each holder
+  releases (`Frontend.locksReleased`), and new votes on its objects wait meanwhile (`Frontend.voteBlocked`). A
+  `TxFinalized` reaching it while held is deferred like one for a commit held for its turn
+  (`Frontend.finalizationDeferred`), its CRL state kept until it applies.
 
 ### 7.4 Replay of committed but unapplied updates
 
@@ -630,7 +641,7 @@ lookup that finds no entry.
                     |
    TxResolved(c) / proof-holding driver / own entry -> resolved(c): statusCache(c) unless from the tree
         abort:  CRL state deleted at once (held for a lookup if needsUnackedCheck)
-        commit: commitAwaitsData? holdForTurn? -> doCommit -> backend commits -> TxCommitted -> data dropped in memory
+        commit: commitAwaitsData? awaitLockHolders? holdForTurn? -> doCommit -> backend commits -> TxCommitted -> data dropped in memory
                     |
    TxFinalized(c) -> finalized(c): statusCache finalized; CRL state deleted once backend commits succeed and no
                      quarantine names T (or replaced by an applied stub: owed names the store, or it applied T
@@ -822,4 +833,20 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-None.
+### R-W7: A restored commit resolution applies before a recovered commit vote it waited for relocks
+Verdict CONFIRMED. Priority 1. Effort S.
+Mechanism: before a crash, committed Tx A, holding no locks at S, waits in lock order for recovered or live commit
+vote B, whose locks it collides with on an object both change (`Tx.awaitLockHolders`, `commitHeld`). A prepare or
+accept reaching A meanwhile (for example its own store's idle driver after a lost `TxFinalized`) saves its state with
+status `Committed`. S crashes. On reload `Frontend.recoverTransactions` starts every object read at once, and
+`Frontend.recoveredTransactionLoaded` calls `completeLoad` for each Tx with a vote as soon as its own objects load. If
+A's objects load first (one of B's is uncached, or the CRL lists A first), A's `completeLoad` restores
+`oresolution = Some(true)`, skips `lock()`, and `resolvedAndAllObjectsLoaded` finds no lock holder on the shared
+`ObjectState`, since B has not run `lock()` yet. A applies. When B learns its commit, its re-apply re-check fails over
+A's newer timestamp and quarantines the object (`Tx.issueCommits`).
+Consequence: the case R15 exists to prevent. B's counted commit vote stands for neither its lock nor its update. With a
+lagging store, the stores lacking B's update can reach the read threshold, and repair's verification then overwrites
+the one copy holding it, losing a committed update with no failure beyond the crash.
+Suggested fix: in `recoveredTransactionLoaded`, defer `completeLoad` of a recovered Tx that will not relock (restored
+resolution, or no commit vote) until every recovered Tx with a vote has completed, as is already done for vote-less
+ones; or have `awaitLockHolders` also wait for recovered commit votes that have not yet relocked.

@@ -157,18 +157,21 @@ no failure, no per-transaction bound, no growth) are for CRLs that keep nothing 
 ### 3.1 What is saved, and what each completion gates
 
 All `crl.save` calls go through `Tx.saveState` (`S/transaction/Tx.scala`). The state saved is always
-`TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, txStatus, acceptor.persistentState)`,
+`TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates, disposition, savedStatus, acceptor.persistentState)`,
 where `trsObjectUpdates` leaves out the data once the commits have persisted (`saveObjectUpdates`) and any update
-removed by `persistWithoutUpdateOf`.
+removed by `persistWithoutUpdateOf`, and `savedStatus` is the Tx's status, except that a resolution learned from the
+UnackedCommits tree (`resolvedFromTree`) saves `Unresolved`, so a restart looks the entry up again
+([transaction-recovery.md](transaction-recovery.md)).
 
 | Event at the store | Save site | What `onDurable` does | What it protects |
 |--------------------|-----------|-----------------------|------------------|
 | Prepare answered, objects loaded | `Tx.answerPrepareAsAcceptor` | sends `TxPrepareResponse` (Promise or Nack, vote, collisions) and the vote to the client | promise, vote, txd, object data |
 | Prepare answered before the objects loaded | `Tx.sendDelayedPrepare` | sends the delayed `TxPrepareResponse` | as above; the disposition is decided now |
 | Accept | `Tx.receiveAccept` | sends `TxAcceptResponse` | accepted proposal and value |
+| A frozen Tx (past expiry) holds a decided vote no save holds yet | `Tx.saveUndurableVote` | nothing sent; the save's completion sets `voteDurable` | the vote a later status reply reports ([paxos-transactions.md](paxos-transactions.md), expiry) |
 | Object data adopted from a later prepare | `Tx.saveAdoptedData` | posts: releases a commit held for the data (`adoptedDataUnsaved`) | the data a commit will apply |
 | Object this transaction allocated is being deleted | `Tx.persistWithoutUpdateOf` | posts: lets the backend deletion proceed | a restart must not allocate it again (transaction-recovery.md) |
-| Backend commits of the transaction complete | `Tx.allObjectCommitsComplete` | `dropTransactionObjectData`, nothing written | stop carrying object data |
+| Backend commits of the transaction complete | `Tx.allObjectCommitsComplete` | `dropTransactionObjectData`, nothing written, unless a backend commit failed or an object is quarantined (`keptForReplay`) | stop carrying object data |
 | Finalized (or aborted, expired, forgotten) | `Frontend.concludeTransactionState`, `Frontend.deleteTransactionState` | `deleteTransaction` | end of the record |
 | Finalized, and an UnackedCommits entry may name the store | `Frontend.recordAppliedStub` | `saveAppliedStub`; posts: releases the transaction's admission | the record is replaced by an applied stub (3.6) |
 
@@ -177,9 +180,9 @@ Consequences:
 - **The vote and the promise travel together.** The first prepare response carries both, and both are in the state
   saved before it is sent. This is what makes the 1-RTT commit safe across a crash ([paxos-transactions.md](paxos-transactions.md)).
 - **Nacks are saved too**, through the same path.
-- **No decision record.** No save is made because a transaction resolved, but every save writes the Tx's current
-  status, so a prepare or accept handled after the resolution persists `Committed` or `Aborted`, and recovery restores
-  it: the commit is applied, or the abort's state deleted, once the objects load. Any other recovered transaction is
+- **No decision record.** No save is made because a transaction resolved, but every save writes `savedStatus`, so a
+  prepare or accept handled after a resolution learned through Paxos or a `TxResolved` persists `Committed` or
+  `Aborted`, and recovery restores it: the commit is applied, or the abort's state deleted, once the objects load. Any other recovered transaction is
   `Unresolved` and is resolved again ([transaction-recovery.md](transaction-recovery.md)).
 - **No vote is sent for a transaction the CRL has not made durable.** A dead CRL therefore stops every vote of every
   store on the device; the host then unloads the device (5.10).
@@ -207,7 +210,8 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
    saves nothing in between. A throw while reading or recovering fail-stops the store (`Host.StoreFailStopped`).
 4. With a save file: its state is first charged to the device's admission, checked (`CrlAdmission.tryChargeLoaded`,
    section 6.1 A3); a state that does not fit now leaves the store offline with its file kept, retried at the device
-   scans, and one that never can is treated as an unusable file (step 2). Then `crl.dropStore` drops whatever the
+   scans, and one that never can, even at the CRL's growth cap (`StoreLoader.neverFits`, `maxAdmissionLimitBytes`),
+   is treated as an unusable file (step 2). Then `crl.dropStore` drops whatever the
    device CRL holds for the store, durably, and `crl.loadStore` saves every record of the file into it
    (`StoreLoader.awaitCrlLoad`), then `StoreRouter.crlLoaded` removes the
    file durably (`DurableFiles.remove`) and only then recovers. A crash between "records durable in the device CRL"
@@ -230,7 +234,8 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
 A committed transaction's record is deleted at finalization only once its backend commits have succeeded:
 `Frontend.transactionFinalized` defers to `txCommits` while commits are outstanding or failed, and
 `transactionCommitComplete` concludes it when the last one succeeds. A failed backend commit keeps the record, with
-its object data, for the life of the loaded store; a reload recovers the transaction from it. A recovered commit vote
+its object data, for the life of the loaded store; a reload recovers the transaction from it and re-applies it
+through the UnackedCommits entry its `TxCommitted` earned (`keptForReplay`). A recovered commit vote
 that quarantines objects keeps its record, data included, until the quarantine clears (`quarantinedConclusions`).
 This is the rule behind AS4.
 
@@ -248,7 +253,7 @@ the update (`Tx.persistWithoutUpdateOf`), and a concluded one's deletion or stub
 | Transfer out, store closed | `readStoreState`, merged over any earlier save file (`StoreRecoveryState.supersededBy`), saved, then `deleteTransactions`; fails if the store was opened during the read (`opensStarted`) | `StoreTransfers.extractUnloaded` |
 | Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source) | marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it (any entries `readStoreState` still returns saved first as `lost-crl-entries.log`), else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore` and the Deleted Stores pass) |
 | Store no longer on the device (safety net: a retire drops first) | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory, no drop and no retire running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
-| Store whose `crl_save.log` load failed | `dropStore` | `StoreLoader.closeUnloaded(dropDurably = true)` |
+| Store whose `loadStore` of its `crl_save.log` failed (the file stays) | `dropStore` | `StoreLoader.handleUnloadFailed`, `closeUnloaded(dropDurably = true)` |
 
 The rule that makes this safe: **entries leave the device CRL only through a written deletion, and only after another
 durable copy exists or the store has been made unservable on disk.** The transfer deletes after the save file is
@@ -303,7 +308,8 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   (`chargeRetained`), and subscribes `DeviceShutdown.crlFailed` to `crl.failed`, all before any store is offered
   for loading.
 - **Refused, retried.** `CrlLocked` (another writer holds `crl/lock`) and `CrlSizingMismatch` (stream files without a
-  readable `sizing` file, or not of the recorded count and size) are rethrown: the device stays unloaded, nothing is
+  readable `sizing` file, or not of the recorded count and size, or a `.crl.tmp` that is no unfinished creation, 5.1)
+  are rethrown: the device stays unloaded, nothing is
   marked, every scan retries. A sizing mismatch is logged once; it means damage or a hand edit, never configuration.
   So is `CrlConfigInvalid`: `crl/` holds neither a `sizing` file nor stream files, and the device config cannot size
   a new CRL (`CrlSizingDefaults.resolve` refuses it); nothing is created. The config is held to `resolve` only then,
@@ -317,7 +323,8 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   only on a device whose CRL was opened, so a `crl/` emptied by hand, a file system repair or a partial restore is a
   lost CRL, never a new one), or the open throws anything else, or a transient error a third time in a row: every
   such store directory gets a durable `rebuild-required` marker, one by one, except one whose `crl_save.log`
-  validates as its own (`DeviceDiscovery.holdsOwnState`), whose whole state is that file; `crl/` is moved to `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the
+  validates as its own (`DeviceDiscovery.holdsOwnState`), whose whole state is that file (3.3, step 4: a store with a
+  save file has served nowhere since it was written, and its load drops what the device CRL holds for it); `crl/` is moved to `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the
   device directory is forced and a fresh CRL is opened. `CrlCorrupt` is logged under its own cause. The reconcile then
   flips each store to Rebuilding. A device without stores simply has its CRL created.
 - **Failed.** A CRL whose thread dies (5.10) completes `failed`; `DeviceShutdown.crlFailed` disowns the directory,
@@ -330,7 +337,8 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   capacity / 2048 rounded down to 4 KiB, at least 64 MiB, `crl-max-streams` 20 (at most 1024) and
   `crl-min-free-percent` 5. The first two size only a new CRL; an existing one keeps the sizing in `crl/sizing` and
   logs a warning if the config asks another stream size or more streams than the ring has. The last two bound
-  growth (5.11) and are read at each open.
+  growth (5.11) and are read at each open (`CrlSizingDefaults.resolveExisting`): a bound `resolve` would refuse
+  disables growth for that open (`crl-max-streams` taken as 0, `crl-min-free-percent` as 100), with a warning.
 - **Grown.** When admission is full the Frontend asks the CRL to grow (`requestGrowth`); a committed growth raises
   the device's admission limit through `onAdmissionLimitRaised` (`CrlAdmission.raiseLimit`, registered by
   `DeviceDiscovery`).
@@ -352,7 +360,8 @@ the ring need not be in numeric order. "Next", "successor" and "after" below alw
 
 `SimpleCRL.apply`:
 
-1. `CrlLock.acquire` takes an exclusive POSIX lock on `crl/lock` before anything is read. A second opener in another
+1. `CrlLock.acquire` takes an exclusive POSIX lock on `crl/lock` before anything is read. Then, with `mustExist`
+   (`holdsStores`) and no stream files, the open throws `CrlMissing` before anything is written. A second opener in another
    process gets `CrlLocked` from `tryLock`. A second opener in this process is refused by a registry keyed by the
    lock file's identity before it opens any descriptor: closing any descriptor of the file would drop the process's
    lock. The lock is released once the writer has closed the stream files (shutdown, a failed open, or death). It does
@@ -1175,8 +1184,9 @@ systems (AS7), where an `ENOSPC` kills the CRL (10.7). Freezing the device's wri
 ("Full storage devices").
 
 **10.17 Crash during CRL creation.** `sizing` is written durably first; stream files go through `.tmp` and rename, and
-the writer starts only after the directory is forced. A `.tmp` at open restarts the creation; a `sizing` with no
-stream files creates them. No entry was written in either case, and no store can exist on the device yet: on a device
+the writer starts only after the directory is forced. `.crl.tmp` files at open restart the creation only when every
+one is a listed stream's with no `<n>.crl` beside it and the device holds no stores; any other is `CrlSizingMismatch`
+(5.1, step 4). A `sizing` with no stream files creates them. No entry was written in either case, and no store can exist on the device yet: on a device
 holding stores either state is a lost CRL (`CrlMissing`, 4).
 
 **10.18 Saves queued behind a full ring.** The head waits while evacuations run, unvoted: no handler of an unwritten
@@ -1214,7 +1224,8 @@ at `writeHead`'s `require`, which only a bug can reach.
   can never commit there; its client sees only an unknown outcome (10.20).
 - A loaded state above `limit + T` but within the limit at the growth cap waits offline for growth (A3). If growth is
   refused for good (the file system's free-space floor, `crl-min-free-percent`), it stays offline, warned once a
-  minute, until space is freed or an operator acts; it is not rebuilt.
+  minute, until space is freed or an operator acts; it is not rebuilt. The same holds once the growth thread has died
+  (5.11), until the CRL is reopened.
 - Admission lanes reserve a quarter of the limit on devices with only data stores (Backlog.txt, "CRL admission lanes
   waste headroom on data-only devices"); same-tier finalizers (TKVL split, join, tail removal) still compete with
   their tier's traffic.
@@ -1223,4 +1234,20 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-None.
+### CRL-W9: A save file is declared lost against a growth cap the device config sets
+Verdict PLAUSIBLE. Priority 3. Effort S.
+Mechanism: `StoreLoader.neverFits` judges a `crl_save.log` state never to fit when its bytes exceed
+`maxAdmissionLimitBytes + T`, and `SimpleCRL.maxAdmissionLimitBytes` is `limitAt(max(ring, growth.maxStreams))`, where
+`growth.maxStreams` is `crl-max-streams` as read from the device config at this open (`DeviceFactory.openCRL`,
+`CrlSizingDefaults.resolveExisting`), and 0 when the configured growth bounds are invalid (out of range, a typo). So a
+state that fits the CRL once grown to the cap the config allowed yesterday, or would allow after a fix, is judged by
+the cap the config gives today; with growth disabled by a bad bound, by the limit of the ring as it stands. Trigger:
+an operator lowers `crl-max-streams`, or writes an invalid growth bound, on a device that then loads an arriving
+transfer or a kept save file whose state lies above that cap's limit plus `T`.
+Consequence: `crlSaveFileLost` marks the store `rebuild-required` and it is rebuilt: an intact store's state is
+declared lost from a configuration condition, irreversibly, and the same edit rolled out fleet-wide does it on every
+device that loads such a state (the correlated-declaration pattern S13 forbids). Only the per-transaction bound `T`,
+fixed by the recorded stream size, truly can never be met.
+Suggested fix: judge the total against the limit at `CrlSizingDefaults.MaxMaxStreams`, the most any config can allow,
+so only a transaction above `T` declares the file lost; a state above the configured cap waits offline (A3's refusal),
+warned, until the config or room allows it.

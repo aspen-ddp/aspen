@@ -124,10 +124,13 @@ propose (`TransactionDriver.mayPropose`), so the pool index identifies the propo
 driver, the one its client's prepare creates the Tx with (`Store.driveTransaction(initialProposal = true)`), uses
 `(1, L)`. Every other driver calls `nextRound` in its constructor (`SimpleTransactionDriver`), starting at round 2 or
 above the highest id its own store's acceptor promised or accepted (`TransactionDriver.Start.highestSeen`,
-`Tx.highestProposal`). Residual: a restarted store-side driver of round 2 or more may repeat an id it used in an earlier
-life that its own acceptor never saw. Two such proposers tally the same immutable votes (7.2), so they propose the same
-value, and a restarted host refuses every transaction it may have forgotten (10.10). P2 is load-bearing because an
-acceptor accepts an Accept whose id equals its promise.
+`Tx.highestProposal`). Residuals: a restarted store-side driver of round 2 or more may repeat an id it used in an earlier
+life that its own acceptor never saw; and a rebuilt designated leader, whose client prepare for a T started before its
+`acceptorSince` creates a muted Tx, still has its Store start a driver at `(1, L)`, the id its old incarnation may have
+used. Two such proposers tally the same immutable votes (7.2): a store sends at most one vote value in all its lives
+(nothing before durability, 6.4), the rebuilt store's own vote is absent from the new tally, and the classes of 7.2 are
+monotone in the votes, so they propose the same value; a restarted host refuses every transaction it may have
+forgotten (10.10). P2 is load-bearing because an acceptor accepts an Accept whose id equals its promise.
 
 **P3 Acceptor durability.** A `Promise`, `Nack` or `Accepted` is sent only after the acceptor state that justifies it
 (`promised`, `accepted`) is durable in the device CRL together with the txd, the store's object data and its vote:
@@ -221,8 +224,11 @@ the Frontend holds all transaction messages until every recovered vote has loade
 
 **P13 Object data lives in the CRL until the backend commit succeeds.** `crl.dropTransactionObjectData` runs only once
 every issued backend commit completed without error and no object of T is quarantining (`Tx.allObjectCommitsComplete`).
-A failed backend commit keeps the record, with its data, for the life of the loaded store. Data adopted from a later
-prepare is saved before a commit applies it (`Tx.adoptedDataUnsaved`, `saveAdoptedData`).
+A failed backend commit keeps the record, with its data, for the life of the loaded store; a quarantine keeps it until
+the quarantine clears. Either way the store's `TxCommitted` sets `keptForReplay` (`Tx.keptForReplay`), so the
+finalizer gives it an UnackedCommits entry although it reported, and after a reload its recovered vote, which learns T
+late, re-applies T through that entry (retrying the commit, or quarantining again) instead of applying nothing. Data
+adopted from a later prepare is saved before a commit applies it (`Tx.adoptedDataUnsaved`, `saveAdoptedData`).
 
 **P14 Finalization ordering.** A driver sends `TxFinalized(commit)` and `TransactionFinalized` only after every
 FinalizationAction completed (`TransactionDriver.startFinalizer`; a failed finalizer is restarted, never skipped).
@@ -296,9 +302,9 @@ Its store keeps it: `Store.handleTransactionMessage` drops a driver on `TxFinali
 | `TransactionVote` | store -> originating client | `VoteCommit` or `VoteAbort` | Sent with every prepare response, promise or nack, from the same save handler (`Tx.sendPrepareResponse`). Never by a muted or frozen Tx (they send no prepare response), never for `Undetermined` or a proof. |
 | `TxAccept` | driver -> primary-pool stores | proposal id, value | Built only in `TransactionDriver.sendAcceptMessages`; never by a learn-only driver. |
 | `TxAcceptResponse` | acceptor -> driver | `Nack` or `Accepted(value)` | After the save. |
-| `TxResolved` | driver -> every store plus `notifyOnResolution`; store -> proposer (proof, a deleted abort's answer); store -> itself (relay of a resolved, unfinalized cache entry, 10.2); expiring store -> every store (expiry commit) | `committed`, `late`, `proof` | A proof is meant for drivers only. |
+| `TxResolved` | driver -> every store plus `notifyOnResolution`; store -> proposer (proof, a deleted abort's answer); store -> itself and the prepare's sender (relay of a resolved cache entry, 10.2); expiring store -> every store (expiry commit) | `committed`, `late`, `proof` | A proof is meant for drivers only. |
 | `TransactionResolved` / `TransactionFinalized` | driver (or a store's finalized relay) -> originating client | `committed` | |
-| `TxCommitted` | store -> its `lastProposer` | object ids this store could not apply | After the store's backend commits complete. |
+| `TxCommitted` | store -> its `lastProposer` | object ids this store could not apply, `keptForReplay` | After the store's backend commits complete. `keptForReplay`: the store keeps T's CRL state past `TxFinalized` (P13), so the finalizer gives it an UnackedCommits entry. |
 | `TxFinalized` | driver -> every store; store relay -> proposer | `committed`, `late`, `owed`, `startTimestamp` | `owed` empty for aborts, late commits and relays; `startTimestamp` lets a store with no Tx write a stub. |
 | `TxHeartbeat` | driver -> every store | | Resets a Tx's idle timer only from a primary-pool sender (`Tx.fromProposer`). |
 | `TxUnknownStore` | router -> sender | | The addressed store is not on this host; the driver drops its endpoint cache (`TransactionDriver.receiveTxUnknownStore`). |
@@ -378,8 +384,9 @@ decided in `Tx.determineDisposition`, in this order:
 4. A hosted object whose earlier backend commit failed or that was poisoned (`BackendCommitFailed`), that is
    quarantined (`ObjectQuarantined`), or that a rebuilt store's inherited votes may lock (`InheritedVoteLock`, 10.10):
    `VoteAbort`.
-5. A hosted object with a commit in flight or held for its turn (`Frontend.commitInFlight`), outcome unknown: the vote
-   is withheld and the Tx registers to be told when the commit persists (`Frontend.awaitCommitPersisted`).
+5. A hosted object with a commit in flight or held for its turn (`Frontend.commitInFlight`), or changed by a committed
+   Tx waiting to apply in lock order (9.1; together `Frontend.voteBlocked`), outcome unknown: the vote is withheld and
+   the Tx registers to be told when the object is free (`Frontend.awaitCommitPersisted`).
 6. Otherwise `RequirementsChecker.check`. If every failure is a collision with a lock holder this transaction builds on
    (`Tx.awaitableHolders`: it requires the revision the holder writes, and the holder still holds its locks), the vote
    is withheld for up to `Tx.CollisionWait`. Otherwise `VoteCommit` (no errors) or `VoteAbort`; an abort whose cause is
@@ -441,7 +448,10 @@ it counts in `a <= w - c`. A recovered prover has Paxos state, so it no longer p
 
 A Tx recovered from the CRL keeps its persisted disposition and acceptor state and restores a resolution its saved
 status records (`Tx.oresolution`; status is saved only incidentally, by a prepare or accept after the resolution). A
-recovered resolved Tx takes no locks and applies its commit, or deletes its abort's state, once its objects load.
+recovered resolved Tx takes no locks and applies its commit, or deletes its abort's state, once its objects load. A
+resolution learned from the UnackedCommits tree (`unackedCommitFound`, `unackedCommitNotOwed`) is saved as
+`Unresolved` (`Tx.savedStatus`): a restart then looks the entry up again and takes the same path, rather than restoring a
+resolved commit that would seed the host cache with a non-finalized `Committed` and lose `notOwedHere`.
 
 A recovered unresolved commit vote, of any transaction, looks up its UnackedCommits entry once loaded and again before
 accepting any abort (`Tx.needsUnackedCheck`, `holdAbort`, `Frontend.requestUnackedLookup`). Its store drives it at once
@@ -476,8 +486,8 @@ depends only on the description and the store's pool, so every store of that poo
 ### 7.1 State
 
 `TransactionDriver` holds a `Proposer(self index, w, t)`, a `Learner(w, t)`, `peerDispositions` (votes of the current
-round), `acceptedPeers`, `knownResolved`, `resolved`/`resolvedValue`, `late`, `holdsProof`, `commitErrors`, the
-finalizer, `peerIncarnations` and `owed`. A new round clears `peerDispositions`, `acceptedPeers` and
+round), `acceptedPeers`, `knownResolved`, `resolved`/`resolvedValue`, `late`, `holdsProof`, `commitErrors`,
+`keptForReplay`, the finalizer, `peerIncarnations` and `owed`. A new round clears `peerDispositions`, `acceptedPeers` and
 `acceptQueuedThisRound` (`TransactionDriver.nextRound`). The local proposal is sticky (`Proposer.setLocalProposal`):
 votes never change, so a later round would tally the same value. `Proposer.highestAccepted` also survives rounds (P8).
 
@@ -583,8 +593,8 @@ reported only once durable), and an expiry commit's `TxResolved`.
 | a vote decided just before the freeze, its response dropped | saved without a reply (`Tx.saveUndurableVote`) |
 | commit applied, every backend commit succeeded | object data dropped, record kept |
 | `TxFinalized(true)` and every backend commit succeeded | record deleted, or replaced by an applied stub (9.1) |
-| a backend commit failed | record with data kept until the store reloads |
-| a recovered vote quarantining an object | record with data kept until the quarantine clears |
+| a backend commit failed | record with data kept until the store reloads; `TxCommitted.keptForReplay` earns it an UnackedCommits entry (P13) |
+| a Tx quarantining an object (a voter's failed re-check, or a re-apply) | record with data kept until the quarantine clears, then deleted or stubbed; `keptForReplay` as above |
 | a deletion of an object the Tx allocated | record re-saved without that object's update (`Tx.persistWithoutUpdateOf`) |
 | expiry discard | record deleted (`Frontend.expireTransaction`) |
 
@@ -603,11 +613,18 @@ every prepare and accept response, retransmits included: write amplification, no
   came from an UnackedCommits entry), and if all objects are loaded applies it (`resolvedAndAllObjectsLoaded`);
   otherwise `completeLoad` applies it.
 * Abort: delete the CRL state, unlock, release the objects.
-* Commit first meets two holds:
+* Commit first meets three holds, in this order (`Tx.resolvedAndAllObjectsLoaded`):
   * the commit overtook the data (`commitAwaitsData`: not recovered, no client prepare seen, not finalized, data
     missing, or adopted data not yet durable): held without `TxCommitted`, so the driver does not yet count the store as
     having missed the update. Released by the data's save, a client prepare, or `TxFinalized`; after `TxFinalized` the
     store applies without the data, reports the object as uncommittable and repair restores it;
+  * lock order (`Tx.awaitLockHolders`): a committed Tx holding no locks here does not apply while another Tx here holds
+    commit-vote locks its requirements or writes collide with (`RequirementsChecker.lockHolders`) on an object both
+    change; it waits, holding its references, until each holder releases (`Frontend.locksReleased`), and new votes on
+    its objects wait for it (`Frontend.voteBlocked`). Otherwise a non-chaining commit applied over a vote's locks would
+    fail that vote's re-check, and the counted vote would stand for neither its lock nor its update. A lock-only holder
+    is not waited for, and the wait is outside `commitInFlight`, so the holder's own commit never queues behind it
+    (`transaction-requirements.md`);
   * an earlier commit of an object it changes is in flight or held (`Tx.holdForTurn`): queued per object in the
     Frontend (`transaction-requirements.md`).
 * `Tx.doCommit`: release the locks, then either apply nothing (an applied stub for T, or `notOwedHere`: T's changed
@@ -624,10 +641,11 @@ every prepare and accept response, retransmits included: write amplification, no
 * **Forgetting a committed T.** Where its CRL record would be deleted (after `TxFinalized` and its backend commits), it
   is replaced by an applied stub if an UnackedCommits entry may name this store: `TxFinalized` listed it in `owed`, or
   it applied T through its entry (`Tx.stubDue`; `Frontend.transactionFinalized`, `concludeTransactionState`). A failed
-  backend commit or a quarantine keeps the record, so no stub replaces it. A `TxFinalized` listing a store with no Tx
-  writes a stub from `TxFinalized.startTimestamp`. A finalization that arrives while a commit is held for its turn is
-  deferred (`Frontend.finalizationDeferred`); every deferring Tx of the txid is listed, a stub owed meanwhile passes to
-  each, and the call that empties the list concludes the state.
+  backend commit keeps the record until the store reloads, so no stub replaces it; a quarantine defers the deletion or
+  stub until it clears (`quarantinedConclusions`, `Frontend.verificationComplete`). A `TxFinalized` listing a store with
+  no Tx writes a stub from `TxFinalized.startTimestamp`. A finalization that arrives while a commit is held (any of the
+  holds above) is deferred (`Frontend.finalizationDeferred`); every deferring Tx of the txid is listed, a stub owed
+  meanwhile passes to each, and the call that empties the list concludes the state.
 * **Stub lifetime.** A stub is dropped (`Frontend.expireStubs`, at heartbeat) once T is past the horizon plus the
   expiry margin and the store holds no Tx for T, live, deferred, awaiting backend commits or quarantining. Below the
   floor no prepare creates a Tx for T, so the stub can suppress nothing. Stubs are therefore bounded by their rate times
@@ -637,10 +655,12 @@ every prepare and accept response, retransmits included: write amplification, no
 
 `onResolution(true)` starts the finalizer, giving it the counted commit voters (`countedCommitVoters`: the current
 round's commit voters if they reach `t` on every object, else none, meaning "every silent store") with their
-incarnations, and the `commitErrors` from `TxCommitted` messages. The finalizer runs the txd's FinalizationActions
+incarnations, and the `commitErrors` and `keptForReplay` stores from `TxCommitted` messages (a `keptForReplay` store
+counts as unacknowledged for its UnackedCommits entry). The finalizer runs the txd's FinalizationActions
 (at-least-once, idempotent), the missed-update marker among them, all at once; its `complete` waits for every action
 and fails with the first failure (`server/RegisteredTransactionFinalizerFactory.Finalizer`). An action whose type
-cannot be loaded, or whose factory throws, is a failed action, not a failed finalizer creation (`Finalizer.of`). So
+cannot be loaded, whose factory throws (`Finalizer.of`), or whose `execute()` throws (caught in `Finalizer`) is a failed
+action, not a failed finalizer creation, so the marker is never orphaned. So
 an UnackedCommits entry durable means T committed, not that the other actions are done; only `TxFinalized` implies
 that. Missed
 updates are recorded in the ErrorTree and UnackedCommits trees by `MissedUpdateFinalizationAction`
@@ -677,10 +697,11 @@ repair, no safety effect.
   The sender's recovery driver learns the outcome from its copy. The store's own copy arrives after the Tx and any
   driver exist, so the new Tx resolves from it and the store's own driver learns it. The designated leader drives such
   a T on purpose: its deciding driver may have died on another host, and its own copy resolves the new driver at once.
-  The same relay is sent whenever a resolved entry exists, also to a store that holds a Tx (a duplicate there). A
-  non-finalized `Committed` entry stems only from a Paxos or relayed resolution, never from a tree-learned one, whose
-  saved status is `Unresolved` (transaction-recovery.md 7.2), so the relay never spreads a non-late commit of a T its
-  peers forgot.
+  The same relay is sent whenever a resolved entry exists, also to a store that holds a Tx (a duplicate there), and
+  also below the floor, where the Frontend then refuses the prepare and the leader starts no driver. A non-finalized
+  `Committed` entry stems only from a Paxos, relayed or expiry-commit resolution, never from a tree-learned one, whose
+  saved status is `Unresolved` (6.4, transaction-recovery.md 7.2), so the relay never spreads a non-late commit known
+  only from the tree.
 * Tx unknown, no outcome cached, T below the store's floor: refused, no Tx at all (`Frontend.refusePrepare`); the
   designated leader starts no driver. The rebuilt store's `acceptorSince` mute is checked first and still creates its
   muted, possibly proving Tx.
@@ -1067,7 +1088,7 @@ transaction eventually resolves without operator action given a healthy quorum.
 |---|---|---|
 | Client, before any prepare reaches a store | Nothing | Nothing happened. |
 | Client, after some prepares | Stores that got its prepare hold Txs; an idle one starts a recovery driver (data-less, round >= 2) | Commits only if stores that got the client's prepare supply `t` commit votes per object; the others vote abort after 5 s. The client never learns (acceptable). |
-| Store, before the vote's save completes | No record, or an older one; nothing was sent to a driver or the client | As if it never saw the prepare; T is below its load floor unless the join ceiling bounds it lower, so a retransmit may get a fresh vote. |
+| Store, before the vote's save completes | No record, or an older one; nothing was sent to a driver or the client | As if it never saw the prepare. T is below its load floor: the store joined T only below the join ceiling it ran under and below its clock plus `MaxStartLead`, the two bounds the floor takes the lesser of, so a retransmit is refused. |
 | Store, vote saved, response not sent | Record with vote and acceptor state; a commit vote re-locks | Retransmitted prepares get the persisted vote. |
 | Store, after an Accept is saved | Acceptor state recovered | P8 holds. |
 | Store, after learning commit, before applying | Recovered, usually `Unresolved`, with its vote and data; re-locks | Re-learns from a driver (driven at once), the caches, a proof or its UnackedCommits lookup. If every other store finalized and forgot, its entry applies it, and without one it acknowledged or did not count, so a late commit applies nothing. Past the floor its Tx ends by expiry, applying T through an entry. |
@@ -1077,7 +1098,7 @@ transaction eventually resolves without operator action given a healthy quorum.
 | Leader, after a quorum accepted, before `TxResolved` | Accepted state at `t` acceptors | A recovery driver's promise quorum intersects it and re-proposes the same value (P8). |
 | Leader, during FinalizationActions | Stores hold the resolved commit and their records | A recovery driver learns it from relays or retained accepted values and re-runs the finalizer (at-least-once). |
 | Driver, after `TxFinalized` partly sent | Some stores finalized | The others recover through their own drivers and the cache relay. |
-| Backend commit failure | Record kept; the store votes abort on that object until it reloads | `Frontend.commitFailed`. |
+| Backend commit failure | Record kept; the store votes abort on that object until it reloads; its `TxCommitted` sets `keptForReplay` | After the reload the recovered vote finds its UnackedCommits entry and retries the commit (`Frontend.commitFailed`, P13). |
 | CRL thread death | The store stalls | Liveness only. |
 
 ---
@@ -1112,7 +1133,9 @@ transaction eventually resolves without operator action given a healthy quorum.
   promises from stores reached only by its own prepares.
 * **Stuck waits.** An in-flight commit to a hung device withholds votes on that object for as long as it hangs
   (Backlog.txt, "Isolate every device's I/O"); expiry then treats the Tx as a non-voter once frozen. Commit-vote locks
-  of an undecided T wait up to the horizon plus the margin (about 28 s) while a silent store's vote would decide.
+  of an undecided T wait up to the horizon plus the margin (about 28 s) while a silent store's vote would decide, and a
+  committed Tx waiting in lock order (9.1), with the new votes on its objects, waits as long as those locks (for good
+  behind an undecidable holder).
 * **Finalization stalls.** A finalizer failing on every attempt keeps its transaction unfinalized (alarmed after 60 s).
 * **`lastProposer` redirect.** A client retransmit can redirect a store's `TxCommitted` to a dead leader; the store
   then gets an extra ErrorTree mark and repair (10.1).

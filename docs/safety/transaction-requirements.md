@@ -326,7 +326,8 @@ holds no locks until it persists or applies. A committed transaction does not is
 of any object it changes is in flight or queued ahead of it.
 
 **R15 (a commit voter applies in its lock order).** A committed transaction holding no locks at a store does not apply
-while another transaction there holds locks it would collide with (section 4) on an object both change. If that holder
+while another transaction there holds locks its requirements or writes on an object it changes would collide with
+(section 4), when that holder changes one of the objects it changes (8.3). If that holder
 commits, a store in both write quorums held its lock until it applied and only then voted for the newcomer, so the
 holder precedes it in every serial order; applying the newcomer first would let it break the holder's re-check and
 leave a counted commit vote standing for neither its lock nor its update.
@@ -409,6 +410,8 @@ commit per object.
 * `commitWaiters: ObjectId -> List[Tx]`: transactions withholding their vote.
 * `collisionWaiters: TransactionId -> List[Tx]`: transactions waiting out a lock holder (8.4), by holder.
 * `commitInFlight(oid) = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)`.
+* `lockWaitingCommits: ObjectId -> List[Tx]`: committed transactions waiting to apply in lock order (8.3), by object
+  they change. Not part of `commitInFlight`; `voteBlocked(oid) = commitInFlight(oid) || lockWaitingCommits.contains(oid)`.
 * `failedCommits`: never cleared; the store reloads with a new Frontend.
 * `quarantined` (object -> `Quarantine`: pointer, latest quarantining start, the quarantining txids, the verification
   attempt and its back-off) and `quarantinedConclusions` (finalized txids whose CRL state a quarantine keeps): 8.5.
@@ -421,8 +424,10 @@ commit per object.
    client's prepare is over or the outcome is known); an invalid description votes `InvalidDescription`; a hosted object
    that is failed (`commitFailed`), quarantined, or covered by a rebuilt store's inherited votes
    (`Frontend.inheritedVoteLock`, cross-document-review.md 2.3) votes abort, one error per such object; a hosted object
-   with `commitInFlight` and an unknown outcome makes the Tx wait (`awaitingCommits`, `Frontend.awaitCommitPersisted`),
-   no timer and no locks, until `commitPersisted` has arrived for each; otherwise the requirements are checked, and a
+   that is `voteBlocked` (a commit in flight or held, or a committed transaction waiting to apply in lock order) while
+   the outcome is unknown makes the Tx wait (`awaitingCommits`, `Frontend.awaitCommitPersisted`), no timer and no
+   locks, until `commitPersisted` has arrived for each (from `commitTurnFree`, at a backend completion, a held commit's
+   issue, or the end of a lock-order wait, `Frontend.lockWaitWakeVoters`); otherwise the requirements are checked, and a
    collision may be waited out (8.4). The in-flight test covers every hosted object, lock-only ones included; a
    lock-only object has a commit in flight only when another transaction changes it.
 2. **Commit path** (`Tx.resolvedAndAllObjectsLoaded`): if the commit decision arrived before the object data
@@ -431,10 +436,12 @@ commit per object.
    flight or held, the Tx joins every changed object's queue in one `holdCommit` call and keeps its locks and
    references. Queues are appended to together, so the oldest held commit heads every queue it is in, and held commits
    cannot wait on each other in a cycle. Before that, a committed Tx that holds no locks here waits in lock order
-   (`Tx.awaitLockHolders`, R15): while another Tx holds locks its requirements or writes collide with
-   (`RequirementsChecker.lockHolders`) on an object both change, it is held (`commitHeld`, no locks, references kept)
-   until each such holder has released them (`Frontend.locksReleased`, after the holder applied or aborted), then takes
-   the ordinary path, queueing behind the holder's in-flight commit. A lock-only holder is not waited for: it has no
+   (`Tx.awaitLockHolders`, R15): while another Tx holds locks (`Frontend.holdsLocks`) that its requirements or writes
+   on an object it changes collide with (`RequirementsChecker.lockHolders` over `changedHere`, displaced holders
+   included), and that holder itself changes one of the objects it changes (`Frontend.changes`), it is held
+   (`commitHeld`, no locks, references kept, `Frontend.awaitLockHolders`) until each such holder has released them
+   (`Frontend.locksReleased`, after the holder applied or aborted). The holder set is then computed again, and with
+   none left it takes the ordinary path, queueing behind the holder's in-flight commit. A lock-only holder is not waited for: it has no
    update to lose. A Tx holding its own locks never waits: two live votes never hold conflicting locks (R4), and
    recovered votes sharing a lock (section 3) are ordered by what persisted before the crash. The wait is not counted
    by `commitInFlight`, so the holder's own commit never queues behind it; a new vote on one of its objects waits for
@@ -455,7 +462,9 @@ commit per object.
 
 A wait for in-flight commits has no timer: a backend commit always completes or fails. A hung device stalls every
 transaction on its objects at that store (other stores still vote); this is tracked in Backlog.txt ("Isolate every
-device's I/O, and detect and handle hung devices", including why there is no per-commit watchdog).
+device's I/O, and detect and handle hung devices", including why there is no per-commit watchdog). A vote blocked by a
+committed transaction waiting in lock order has no timer either, though that wait ends only when a holder's
+transaction resolves at other stores (Q-W9).
 
 ### 8.4 `CollisionWait`: waiting out a holder the transaction is built on
 
@@ -751,4 +760,44 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
 
 ## Open weaknesses
 
-None.
+### Q-W9: Votes blocked by lock-order waits can form a cross-store cycle that lasts until expiry
+Verdict PLAUSIBLE. Priority 4. Effort S.
+Mechanism: `Frontend.voteBlocked` blocks every new vote on an object a committed lockless Tx changes while it waits in
+`Tx.awaitLockHolders`, whatever the new vote's requirements, and `Tx.determineDisposition` gives such a wait no timer.
+Replication(3, 2), stores A, B, C, object o, four key-level KV writers: H and W write key a, G and W'' write key b
+(blind Inserts, or `KeyRevision` puts). A votes commit for H and W''; B votes commit for W and G; C votes commit for W
+and W'' and abort for H and G (they arrived while W, W'' held locks there). W commits (B, C) and W'' commits (A, C); H
+and G each hold one commit vote and one abort, undecided. At A, W (no locks there) waits for H (K on a), so
+`voteBlocked(o)`; G's delayed prepare reaches A and waits. At B, W'' waits for G (K on b), and H's delayed prepare
+reaches B and waits. H needs B's vote, G needs A's: neither driver can decide, neither wait ends.
+Consequence: every new vote on o at A and B waits, so o takes no commit (C alone is below `t`) until H and G end by
+expiry (horizon plus expiry margin, about 30 s): an object-wide stall from contention plus delayed prepares, which
+can recur under the same load.
+Suggested fix: have `voteBlocked` block only a vote whose requirements or writes collide with a waiting commit's
+(`RequirementsChecker.lockHolders`-style test against its changes), so a vote the waiter would not wait for proceeds;
+in the example neither H nor G collides with the waiter at the store where it is blocked.
+
+### Q-W10: Quarantine has no valid trigger and loses committed data; remove it
+Verdict CONFIRMED. Priority 1. Effort M.
+Mechanism: `Tx.issueCommits` quarantines (`Frontend.quarantine`) in three cases. Within the write threshold's margin:
+(a) a live commit voter whose apply re-check fails on a changed object has no cause left: a later commit over its
+locks waits for it in lock order (`Tx.awaitLockHolders`), so what remains is state changed under the locks or two
+conflicting commits, invariant violations no mechanism should try to absorb. (b) A recovered vote whose re-check
+fails was applied before the crash and superseded since: nothing else changes an object over the vote's relocked
+locks (once transaction-recovery.md R-W7 is fixed); refcounts carry an update serial, so a refcount update is
+revision-chained too. (c) `RequirementsApplyer.mayReinsertDeletedKeys` is a real ambiguity in normal operation: a
+re-applied blind Insert (or `DoesNotExist`) of key k passes its re-check again after a later delete of k, and the
+store cannot tell "applied, then k deleted" from "never applied, and another key's write raised the object
+timestamp". Quarantining in (b) or (c) leaves a counted voter holding neither T's update nor its lock, and its
+verification (`StoreRepairer.verifyObject`) counts the store's own stale copy among the read's `r`, so one crash
+plus one store legitimately missing T loses T's update (repair-process.md 10.2).
+Consequence: lost committed data and a conflicting commit inside the margin, through a mechanism that exists only
+to absorb conditions the design does not support.
+Suggested fix: remove quarantine (`Frontend.quarantine`, `QuarantineVerifier`, `StoreRepairer.verifyObject`,
+`ObjectQuarantined`, the quarantine half of `keptForReplay`, `reappliedTraceless`). (a) Log a live re-check failure
+as an invariant violation, skip and report the object. (b) Treat a recovered re-check failure as already applied.
+(c) Remove the ambiguity instead of guessing: a commit deleting key k of an object waits until no unconcluded Tx
+whose CRL state holds a blind Insert of k there remains (concluded, or re-saved without the object's update), as
+`Frontend.awaitAllocationsDurable` already does for an object deleted after its allocation; the cost falls only on
+a key delete closely following a blind insert of the same key. A re-applied blind Insert of an absent key was then
+never applied, and is applied. Requires R-W7 first.

@@ -95,7 +95,7 @@ swept node by node (10.1).
 | Key | 17 bytes: `poolIndex`, `transactionId`. One entry per (store, transaction). An entry larger than `UnackedCommitEntry.maxEncodedSize` (half the leaf node size less 64 bytes) is written as chunks, each a complete entry for some of the objects: chunk 0 under the 17-byte key, chunk `i` under it plus `i` as 2 big-endian bytes. Lookups name the head only. | `UnackedCommitEntry.key`, `chunks`, `isHeadKey` |
 | Value | `timestamp` (8, T's start), `incarnation` (16, the store's `StoreIncarnation` as the driver heard it, the zero UUID meaning unknown), `count` (4), then `count` x (`length` (4), `ObjectPointer` bytes) | `UnackedCommitEntry.encode`, `decode` |
 | Objects | Every object of that store that T changes, traced or traceless | `MissedUpdateFinalizationAction.writeMissedUpdates` (`RequirementsApplyer.changedObjects`) |
-| Meaning | The store cast a commit vote the commit may have relied on and had not acknowledged applying T when T was finalized: it is owed T. A recovered, expiring or late commit vote applies T through the entry when the head names the store's own incarnation or none (every Tx that awaits a lookup holds its own commit vote); one naming another incarnation concludes T committed and applies nothing (`Frontend.unackedLookupComplete`; transaction-recovery.md). Then, or when the store has forgotten T, the entry is left for repair, whose reconcile installs the committed state. Chunk keys keep their first writer's value, so chunks of one entry may differ in incarnation; only the head is looked up. | `Frontend.unackedLookupComplete`; `Host.unackedLookup` |
+| Meaning | The store cast a commit vote the commit may have relied on and had not acknowledged applying T when T was finalized (it sent no `TxCommitted`, or one with `keptForReplay`: a failed backend commit or a quarantine keeps T's CRL state for a reload to replay): it is owed T. A recovered, expiring or late commit vote applies T through the entry when the head names the store's own incarnation or none (every Tx that awaits a lookup holds its own commit vote); one naming another incarnation concludes T committed and applies nothing (`Frontend.unackedLookupComplete`; transaction-recovery.md). Then, or when the store has forgotten T, the entry is left for repair, whose reconcile installs the committed state. Chunk keys keep their first writer's value, so chunks of one entry may differ in incarnation; only the head is looked up. | `Frontend.unackedLookupComplete`; `Host.unackedLookup` |
 
 Repair ignores the incarnation: it reconciles the objects themselves, which is right for any incarnation.
 
@@ -118,7 +118,7 @@ recorded", and a read decides (section 9).
 | Operation | By whom | When |
 |-----------|---------|------|
 | Insert or advance an ErrorTree entry | `MissedUpdateMarker.writeBatch`, from the finalizing client's `MissedUpdateFinalizationAction` | `errorTimeout` (2 s) after the action executes, for each store that did not report a clean commit |
-| Insert an UnackedCommits entry | same batch | same, for each counted commit voter that sent no `TxCommitted` (every such store when the voters are unknown) and hosts an object T changes |
+| Insert an UnackedCommits entry | same batch | same, for each counted commit voter (every store when the voters are unknown) that sent no `TxCommitted`, or one with `keptForReplay`, and hosts an object T changes |
 | Delete either kind | `StoreRepairer.deleteEntryIfUnchanged` only | after the object(s) are reconciled completely or proven deleted |
 | Point lookup of an UnackedCommits head | `Host.unackedLookup` (`server/store/UnackedCommitLookup.scala`) | a recovered, expiring or late commit vote |
 | Applied stubs | not repair's: each store writes and expires its own (`Frontend.expireStubs`; `server/transaction/CLAUDE.md`) | |
@@ -144,7 +144,8 @@ Details are in [transaction-recovery.md](transaction-recovery.md); what repair r
      except lock-only objects (`TransactionDescription.lockOnlyObjects`), and for every object a store reported a
      commit error on;
    - `MissedUnackedCommit(store, txid, UnackedCommitEntry(start, incarnation, changedObjectsOfStore))` for every store
-     that sent no `TxCommitted`, is a counted voter (or the voters are unknown) and hosts an object T changes.
+     that sent no `TxCommitted` or one with `keptForReplay` (`updateCommitErrors`), is a counted voter (or the voters
+     are unknown) and hosts an object T changes.
    Uncounted voters and non-voters are repaired by their ErrorTree marks alone.
 5. `MissedUpdateMarker.mark` queues per pool, at most one write outstanding per pool. The queue merges ErrorTree marks
    by (poolIndex, objectId), keeping the later `missedTimestamp`, and UnackedCommits entries by (poolIndex, txid).
@@ -307,9 +308,10 @@ earlier-started transaction that committed after phase A's object read, 12.4) mo
 that delete. A mark may also land after the delete: T's UnackedCommits entry and its ErrorTree marks can be in
 different marker batches (section 3, step 5), so phase B can find T's entry while T's mark for an object is still
 queued, and the shortcut can then complete the object for T from a phase-A read that preceded T's commit. That mark
-still follows: every object of an UnackedCommits entry also gets an ErrorTree mark from the same finalization (the
-store sent no TxCommitted, so every hosted object that is not lock-only is marked, and a changed object is never
-lock-only), T is not finalized before both are written, and the mark creates a fresh entry that a later pass repairs
+still follows: every object of an UnackedCommits entry that the store did not apply also gets an ErrorTree mark from
+the same finalization (a store that sent no TxCommitted is marked for every hosted object that is not lock-only, and a
+changed object is never lock-only; a `keptForReplay` store reported every object it did not apply as a commit error,
+and an object it applied owes nothing), T is not finalized before both are written, and the mark creates a fresh entry that a later pass repairs
 from a read after T's commit. Deleting the UnackedCommits entry early costs nothing else: S cannot join T any more
 (5.4), so no Tx of S looks it up.
 
@@ -684,13 +686,15 @@ finalized (transaction-requirements.md 8.5). A quarantined object that a read pr
 transaction, every requirement on it failing `MissingObject`. The verification first drops the store's slice
 (`repairDeletion`), best effort: a refused or failed drop is left to entry repair, since a store holding a live copy of
 a deleted object missed the deletion and was marked for it. The verification counts the store's own quarantined copy among the read's `r` replies, like any
-other read: T's commit voters apply T before any later write over its locks (transaction-requirements.md 8.3), so a
-read majority holds T.
+other read. That relies on T's other commit voters applying T before any later write over its locks
+(transaction-requirements.md 8.3) and on the quarantined copy holding T or a state superseding it; a recovered vote
+that never applied T and releases its locks unapplied breaks the second (transaction-requirements.md Q-W10). Verification uses the store's
+DeferralState like an entry, so a pass narrowed to the keys an earlier verification deferred does not reconcile the
+rest of the object, even after a later quarantine raised `minTimestamp`. Both go with quarantine (Q-W10).
 
 ### 10.3 No read-driven repair
 
-There is no read-driven repair path: a read never writes a store's copy, and every repair goes through Reconcile
-(`docs/superpowers/specs/2026-11-14-opportunistic-rebuild-removal-design.md`).
+There is no read-driven repair path: a read never writes a store's copy, and every repair goes through Reconcile.
 
 ---
 
@@ -849,4 +853,7 @@ the quarantining store retries at heartbeat.
 
 ## 14. Open weaknesses
 
-None.
+None open. RP-W6 (a recovered vote quarantined unapplied loses T's insert) and RP-W7 (a narrowed verification ignores
+a raised `minTimestamp`) were flaws in quarantine itself, whose triggers are invariant violations or an avoidable
+re-apply ambiguity: transaction-requirements.md Q-W10 replaces both by removing quarantine. Until it is fixed, the
+quarantine verification of 10.2 is not sound for a counted voter's unapplied update.

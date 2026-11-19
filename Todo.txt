@@ -1,8 +1,8 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, third pass, built 2026-11-18 against b5d077e0)
-------------------------------------------------------------------------------------
+Safety work list (from docs/safety/*, fourth pass, built 2026-11-18 against 0941d4fd)
+-------------------------------------------------------------------------------------
 
 Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
 once, grouped where one change addresses several ids. Completed items are removed; their record is in git history.
@@ -30,10 +30,47 @@ Q = transaction-requirements, RP = repair-process, RB = rebuild-process, SL = sy
 X = cross-document-review (its section 5 lists contradictions between documents).
 
 
+PRIORITY 0: design rules
+------------------------
+
+0.1 State the below-read-threshold rule in the top-level CLAUDE.md.                                  S
+    An object that drops below its read threshold (`IDA.consistentRestoreThreshold`) is a permanent, unrecoverable
+    failure. It is not to be detected, worked around or recovered from. The write threshold's margin above the read
+    threshold is the system's whole failure tolerance for writes; preventing that drop is its sole purpose, and a
+    mechanism that only matters once failures exceed the margin is invalid (quarantine, 1.2, is one). Add this to the
+    "Read threshold" bullet or "Cross-cutting invariants" of CLAUDE.md and to the memory note on beyond-margin failures.
+
+
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-(no open items)
+1.1 [R-W7] A restored commit resolution applies before a recovered commit vote it waited for relocks.  CONFIRMED, S
+    transaction-recovery.md R-W7. On reload `Frontend.recoveredTransactionLoaded` completes each Tx with a vote as soon
+    as its own objects load; a Tx whose saved status is `Committed` skips `lock()`, finds no holder in
+    `Tx.awaitLockHolders` (the vote it waited for has not relocked yet) and applies first. The recovered vote's re-check
+    then fails and quarantines it unapplied, the state of 1.2. Fix: defer `completeLoad` of a Tx that will not relock
+    until every recovered Tx with a vote has completed (as already done for vote-less ones), or have
+    `awaitLockHolders` wait for recovered votes not yet relocked. Also correct the lock-order comment in
+    `Tx.issueCommits` and transaction-requirements.md R15 ("ordered by what persisted before the crash").
+
+1.2 [Q-W10, X section 5] Remove quarantine: it has no valid trigger and loses committed data.       CONFIRMED, M
+    transaction-requirements.md Q-W10 (replaces repair-process RP-W6 and RP-W7, flaws in quarantine itself). Verified
+    against the code, `Tx.issueCommits` quarantines in three cases:
+      (a) a live voter's failed re-check: since lock order (`Tx.awaitLockHolders`) only an invariant violation (state
+          changed under the locks, two conflicting commits) causes it. Log it as one, skip and report the object.
+      (b) a recovered voter's failed re-check: within the margin it was applied before the crash and superseded
+          (refcounts carry update serials, so they are chained too). Treat it as applied. Needs 1.1 first.
+      (c) `RequirementsApplyer.mayReinsertDeletedKeys`: a genuine normal-operation ambiguity, not a below-threshold
+          workaround. A re-applied blind Insert/`DoesNotExist` of k passes again after a later delete of k. Remove
+          the ambiguity: a commit deleting k waits until no unconcluded Tx whose CRL state holds a blind Insert of k
+          on that object remains (as `Frontend.awaitAllocationsDurable` does for deletion after allocation); a
+          re-applied Insert of an absent key is then known unapplied and is applied. The wait costs only a key
+          delete that closely follows a blind insert of the same key: nothing on the ordinary commit path.
+    Quarantining in (b)/(c) leaves a counted voter with neither T's update nor its lock, and its verification counts
+    its own stale copy: one crash plus one store legitimately missing T loses T. Then delete `Frontend.quarantine`,
+    `QuarantineVerifier`, `StoreRepairer.verifyObject`, `ObjectQuarantined`, the quarantine half of `keptForReplay`,
+    `reappliedTraceless`, and their tests. Correct transaction-requirements.md 8.5 / 10.5c / 10.7(e), repair-process.md
+    10.2, cross-document-review.md 2.3 and 5, the store/transaction/repair CLAUDE.md files and the scaladoc.
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
@@ -47,17 +84,59 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
+3.1 [CRL-W9] A save file is declared lost against a growth cap the device config sets.            PLAUSIBLE, S
+    crash-recovery-log.md CRL-W9. `StoreLoader.neverFits` uses `maxAdmissionLimitBytes`, which follows
+    `crl-max-streams` (0 for an invalid growth bound) as read at this open; lowering or mistyping it fleet-wide marks
+    every arriving or kept state above the new cap `rebuild-required`. Fix: judge against the limit at
+    `CrlSizingDefaults.MaxMaxStreams`, so only a transaction above `T` is lost; otherwise wait offline, warned.
+
+3.2 [X-W4] The leftover-CRL drop releases the admission charge of a store that landed while it ran.  PLAUSIBLE, S
+    cross-document-review.md X-W4. `DeviceReconciler.dropLeftoverCrlState` calls `admission.releaseRetained(storeId)`
+    on completion, which also releases a loaded state charged meanwhile by `CrlAdmission.tryChargeLoaded`; Lemma C can
+    then fail and a rotation can fail the CRL (W6). Fix: release only what was retained when the drop was issued, or
+    skip the release while the store is loaded or opening.
+
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-(no open items)
+4.1 [X-W5, RB-W12] A store whose open or rebuild-complete removal fails is left unserved and untracked until restart. CONFIRMED, S
+    cross-document-review.md X-W5, rebuild-process.md RB-W12. `StoreLoader.handleBackendOpened`'s generic
+    `Failure(e)` and `StoreRebuilds.startRebuild`'s `Adopt` branch on a failed `clearRebuildCompleteMarker` leave an
+    Active store neither loaded nor in `offlineStores`, and every reload pass filters `offlineStores`; meanwhile
+    `StoreCopies.release` deletes the superseded copy. One unit of `w - t` margin lost silently. Fix: on any such
+    failure leave the store offline (`leaveOffline` / `keepUnpromotedCopyOffline`) and have the device check retry an
+    Active offline store carrying no marker, with backoff as `retryStoresAwaitingSpace` does. Correct the
+    `clearRebuildCompleteMarker` scaladoc.
+
+4.2 [SL-W9] The fresh CRL replacing a lost device CRL is created in place, beside the device's stores.  CONFIRMED, S
+    systemic-loss-protection.md SL-W9. A crash mid-rename leaves `<n>.crl` beside `<n>.crl.tmp`, refused as
+    `CrlSizingMismatch` forever; a failed preallocation (ENOSPC) leaves `.crl.tmp` files, so every scan declares the
+    CRL lost again and piles up `crl.lost-*` directories. The device never loads, so its `pending-delete/` copies are
+    never released. Fix: create the replacement in a scratch directory (swept at device load) and rename it to `crl/`
+    durably once complete. Correct the `SimpleCRL.createStreamsIfNew` scaladoc and crash-recovery-log.md 5.1 step 4.
+
+4.3 [Q-W9] Votes blocked by lock-order waits can form a cross-store cycle that lasts until expiry.   PLAUSIBLE, S
+    transaction-requirements.md Q-W9 (raised independently by the Paxos audit). `Frontend.voteBlocked` blocks every new
+    vote on an object while a committed lockless Tx waits in `Tx.awaitLockHolders`; two such waits at two stores can
+    each block the vote the other's holder needs, stalling the object about 30 s until expiry ends the holders. Fix:
+    block only votes that collide with the waiting commit's changes.
 
 
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-(no open items)
+5.1 [X-W3, X section 5] A commit learned from the UnackedCommits tree is reported non-late to expiry and adopted. CONFIRMED, S
+    cross-document-review.md X-W3. `Tx.statusForExpiry` reports `late = lateOutcome` (false for a tree-learned
+    resolution), so a peer's `ExpiryTally.decide` adopts a non-late commit, its cache records a non-finalized
+    `Committed`, and a relayed driver re-runs T's finalization long after T was finalized. Idempotent, but wasted
+    repair and metadata work, and it contradicts paxos-transactions.md 10.2 / transaction-recovery.md 7.2. Fix: report
+    a tree-learned resolution as saved (`Unresolved`, with its vote) or as `late`.
+
+5.2 [SL-W10] A lost device CRL marks a finished rebuild awaiting its flip.                            CONFIRMED, S
+    systemic-loss-protection.md SL-W10. `DeviceDiscovery.openDeviceCrl` spares only `holdsOwnState` directories; a
+    `rebuild-complete` copy has no save file, held nothing in the lost CRL, yet is retired and rebuilt again. Fix:
+    `holdsOwnState` also spares a `rebuild-complete` directory.
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
@@ -69,7 +148,11 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-(no open items)
+7.1 [X-W6, X section 5] Citations and history outside docs/safety.                                  CONFIRMED, S
+    cross-document-review.md X-W6. Backlog.txt's systemic-loss entry cites "SL M1-M5, M11; scenarios SC3-SC7",
+    "SL Q3-Q6" and S8 for recording declarations; the document has M1-M9, Q1/Q3/Q4, and recording is M9. The
+    `ExpiryTally.decideUnknown` scaladoc narrates history ("found 2026-11-16"); restate both rules' reasons in the
+    present tense.
 
 
 PRIORITY 8: unimplemented features

@@ -138,7 +138,7 @@ the entry straight to Rebuilding.
 | # | Trigger | Detection | Effect |
 |---|---|---|---|
 | T1 | `<device>/crl` missing from a device that holds store directories (a device-root directory with a `config.yaml`) | `DeviceDiscovery.openDeviceCrl` | every store directory gets the marker, except one whose valid `crl_save.log` is its whole state (`holdsOwnState`); a fresh CRL is opened |
-| T2 | the device CRL of a device holding store directories fails to open with anything but `CrlLocked`, `CrlSizingMismatch`, `CrlConfigInvalid` (each refuses the device and retries each scan) or a transient error (`DeviceDiscovery.isTransient`, retried up to `CrlOpenAttempts` = 3 scans in a row); `CrlCorrupt` and `CrlMissing` (a `crl/` with no stream files, `openCRL(..., holdsStores = true)`) are logged as such | same | as T1; the old CRL is kept as `crl.lost-<uuid>` |
+| T2 | the device CRL of a device holding store directories fails to open with anything but `CrlLocked`, `CrlSizingMismatch`, `CrlConfigInvalid` (each refuses the device and retries each scan) or a transient error (`DeviceDiscovery.isTransient`, retried up to `CrlOpenAttempts` = 3 device scans in a row; only a `ScanDevices` open counts, host start and nudges retry uncounted); `CrlCorrupt` and `CrlMissing` (a `crl/` with no stream files, `openCRL(..., holdsStores = true)`) are logged as such | same | as T1; the old CRL is kept as `crl.lost-<uuid>` |
 | T3 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` fails | `StoreLoader.handleLoad` ► `StoreRebuilds.crlSaveFileLost` ► `retireUnserved` | backend closed unserved, marker, offline, device checked |
 | T4 | backend open throws `BackendStateLost` (FSIF `FsifRecovery.StoreLost`; RocksDB `RocksDBStateLost` for a directory with no database) | `StoreLoader.handleBackendOpened` | marker, offline, device checked |
 | T5 | backend fail-stop while served (`Host.BackendFailed`; only FSIF's `onFatal` raises it) | `StoreRebuilds.backendFailed` | marker first, then `closeUnloaded(dropDurably = false)`: the CRL entries stay for the discard to save |
@@ -322,7 +322,7 @@ whose entry lands behind the walk's position. Two mechanisms close that gap:
   (`CurrentAllocationsQuery.Abandoned`, which the pass reports as the latched cause), and so does its deadline,
   `PeerQueryTimeout` (60 s, noticed at the next resend): the pass fails with `PeerQueryTimedOut` into the host's
   backoff re-check (5.7), releasing its rebuild slot. A pool with fewer than `w - t + 1` live peers is below `r` as
-  well, so nothing is lost by not waiting; a query of the sweep (below) checkpoints first. A pool of width 1 has no one to
+  well, so nothing is lost by not waiting; a timed-out query of the sweep (below) checkpoints before the pass fails. A pool of width 1 has no one to
   ask and skips it. Each reply lists the allocations in the pool held by transactions the replier has not seen
   finalized or aborted (`Frontend.currentAllocations`: pointers into this pool only, `committed` when its outcome is
   known commit); a store still loading its CRL, a silent store and a rebuilding one do not answer. A committed
@@ -410,7 +410,9 @@ than the rebuild's; Rebuilding of its episode is flipped to `serviceStatus` (`Ad
 gossips the store online itself). The host acts only after the decision:
 
 * `Adopt`: removes `rebuild-complete` durably (`clearRebuildCompleteMarker`), then `loadStoreById`. The committed flip
-  gossips `StoreMoved` (`HostServices.gossipStoreOnline`), clearing the `StoreOffline` gossiped at the start.
+  gossips `StoreMoved` (`HostServices.gossipStoreOnline`), clearing the `StoreOffline` gossiped at the start. A failed
+  removal leaves the store unloaded and router-offline; the reconcile's Completed Rebuilds pass retries it only for a
+  store in the device's `offlineStores` (RB-W12).
 * `AdoptOffline`: `keepRebuiltStoreOffline` writes a `transferring-out` marker and an empty `crl_save.log`, then
   removes `rebuild-complete`; an adopter classes it Clean and a restart's reinstatement loads it.
 * `Discard`: deletes the final directory (`LocalDevices.discardStoreDirectory`).
@@ -787,4 +789,19 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 
 ## Open weaknesses
 
-None.
+### RB-W12: A failed rebuild-complete removal strands a rebuilt destination store unserved until a restart
+Verdict CONFIRMED. Priority 4. Effort S.
+Mechanism: `StoreRebuilds.startRebuild`, `RebuildOutcome.Adopt` branch: `unsilence(storeId, clear = false)`, then
+`clearRebuildCompleteMarker`; on a failed `DurableFiles.remove` it returns false and `loadStoreById` is skipped. The
+comment and the scaladoc of `clearRebuildCompleteMarker` say the reconcile retries it, but the Completed Rebuilds pass
+(`DeviceReconciler.reconcileDeviceState`) filters `local.offlineStores`. An in-place rebuild's store is there (its
+trigger, `retireUnserved`/`backendFailed`/`tryLoadStore`, added it), but a store rebuilt on a device that never held it
+(R3 drain, R4 re-placement, or a store re-placed away and back, whose Deleted Stores pass `forget` removed it) is not:
+`keepUnpromotedCopyOffline` covers the `Superseded` and failed-flip branches only. The router's offline mark from
+`startRebuild` stays.
+Consequence: the entry is Active and the pool names the device, while the store stays silent for the life of the
+process (until a restart's `tryLoadStore` puts it in `offlineStores`): one unit of the pool's `w - t` margin consumed
+with nothing in the tree or the logs beyond the one error line to show it, and the pending-delete copy elsewhere is
+already released by the Active entry.
+Suggested fix: on a failed removal, record the store in the device's `offlineStores` (`keepUnpromotedCopyOffline`)
+so the Completed Rebuilds pass retries it at the next check.

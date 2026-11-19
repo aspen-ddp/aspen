@@ -53,12 +53,6 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.1 [CRL-W9] A save file is declared lost against a growth cap the device config sets.            PLAUSIBLE, S
-    crash-recovery-log.md CRL-W9. `StoreLoader.neverFits` uses `maxAdmissionLimitBytes`, which follows
-    `crl-max-streams` (0 for an invalid growth bound) as read at this open; lowering or mistyping it fleet-wide marks
-    every arriving or kept state above the new cap `rebuild-required`. Fix: judge against the limit at
-    `CrlSizingDefaults.MaxMaxStreams`, so only a transaction above `T` is lost; otherwise wait offline, warned.
-
 3.2 [X-W4] The leftover-CRL drop releases the admission charge of a store that landed while it ran.  PLAUSIBLE, S
     cross-document-review.md X-W4. `DeviceReconciler.dropLeftoverCrlState` calls `admission.releaseRetained(storeId)`
     on completion, which also releases a loaded state charged meanwhile by `CrlAdmission.tryChargeLoaded`; Lemma C can

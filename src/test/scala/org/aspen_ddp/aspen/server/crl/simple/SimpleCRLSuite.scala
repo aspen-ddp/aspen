@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation
 import org.aspen_ddp.aspen.server.FilePreallocationSuite
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlClosed, CrlConfigInvalid, CrlCorrupt, CrlFailed, CrlLocked, CrlMissing, CrlSizingMismatch, StoreRecoveryState,
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlClosed, CrlConfigInvalid, CrlCorrupt, CrlFailed, CrlLocked, CrlMissing, CrlSizingDefaults, CrlSizingMismatch, StoreRecoveryState,
   TransactionRecoveryState}
 
 import java.nio.ByteBuffer
@@ -2696,15 +2696,15 @@ class SimpleCRLSuite extends FileBasedTests {
       i.crl.shutdown()
   }
 
-  test("The limit at the growth cap is that of crl-max-streams streams, or the limit now without growth (CRL-W6)") {
+  test("The most limit is that of MaxMaxStreams streams, whatever crl-max-streams this open allows (CRL-W6, CRL-W9)") {
     val s = growthStreamSize
-    val g = openGrowing(growthPolicy(maxStreams = 12), tdir / "growing")
-    assert(g.crl.maxAdmissionLimitBytes == 10 * s / 2 - s / 16)
-    assert(g.crl.maxAdmissionLimitBytes > g.crl.admissionLimitBytes)
-    g.crl.shutdown()
-    val f = SimpleCRL(tdir / "fixed", 4, ringStreamSize)
-    assert(f.crl.maxAdmissionLimitBytes == f.crl.admissionLimitBytes)
-    f.crl.shutdown()
+    val most = (CrlSizingDefaults.MaxMaxStreams - 2) * s / 2 - s / 16
+    for (name, policy) <- List("growing" -> growthPolicy(maxStreams = 12), "at-ring" -> growthPolicy(maxStreams = 4),
+                               "disabled" -> GrowthPolicy.Disabled) do
+      val c = openGrowing(policy, tdir / name)
+      assert(c.crl.maxAdmissionLimitBytes == most)
+      assert(c.crl.maxAdmissionLimitBytes > c.crl.admissionLimitBytes)
+      c.crl.shutdown()
   }
 
   test("A new CRL's streams are a multiple of 4096 bytes, and at least 3 (S1)") {

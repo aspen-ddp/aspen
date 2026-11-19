@@ -339,8 +339,10 @@ class SimpleCRL private (streamsDir: os.Path,
     * unoffset stubs outstanding stay within the `S/16` reserve's margin. Past that the CRL fails (W6) */
   override def admissionLimitBytes: Long = limitAt(numStreams)
 
-  /** The limit at `crl-max-streams` streams, or at the ring now if its growth policy allows no stream beyond it */
-  override def maxAdmissionLimitBytes: Long = limitAt(math.max(numStreams, growth.maxStreams))
+  /** The limit at `CrlSizingDefaults.MaxMaxStreams` streams, the most any device config can let the CRL grow to.
+    * Not the limit at this open's `crl-max-streams`: the config can raise that cap, or restore one an invalid bound
+    * disabled, so a state above it is one that does not fit yet, never one that cannot (crash-recovery-log 6.1, A3) */
+  override def maxAdmissionLimitBytes: Long = limitAt(math.max(numStreams, CrlSizingDefaults.MaxMaxStreams))
 
   private def limitAt(streams: Int): Long = (streams - 2) * maxSizeInBytes / 2 - maxSizeInBytes / 16
 

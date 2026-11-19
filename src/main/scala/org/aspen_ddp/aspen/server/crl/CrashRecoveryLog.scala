@@ -215,8 +215,9 @@ trait CrashRecoveryLog {
   /** How many bytes of live state the CRL admits */
   def admissionLimitBytes: Long = Long.MaxValue
 
-  /** The admissionLimitBytes the CRL reaches once grown to its cap: a load is judged never to fit against it, not
-    * against the limit now (StoreLoader.neverFits). The default is the limit now, for CRLs that do not grow */
+  /** The most admissionLimitBytes the CRL can ever reach, under any device config: a load is judged never to fit
+    * against it, not against the limit now or at the configured growth cap (StoreLoader.neverFits). The default is
+    * the limit now, for CRLs that do not grow */
   def maxAdmissionLimitBytes: Long = admissionLimitBytes
 
   /** The most CRL bytes, as CrlAdmission counts them, one transaction of one store may hold. A prepare past it is

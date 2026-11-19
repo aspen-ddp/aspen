@@ -64,7 +64,7 @@ store; an applied stub is a `TransactionId` with its transaction's start `HLCTim
 | `failed: Future[Throwable]` | Completes, with the cause, if the CRL dies (5.10). |
 | `shutdown()` | Blocks until the CRL's thread and writer have stopped and its files are closed. Handlers already handed to the completion thread run first; every Future not answered by then, and every later one, fails with `CrlClosed` (5.10). Idempotent. |
 | `admissionLimitBytes` | The device's admission limit (section 6): `(n − 2) · S/2 − S/16` in SimpleCRL, for `n` streams of `S` bytes. |
-| `maxAdmissionLimitBytes` | The admission limit once grown to the growth cap: `(m − 2) · S/2 − S/16` in SimpleCRL for `m = crl-max-streams`, or `admissionLimitBytes` when its growth policy allows no stream beyond the ring. A loaded state is judged never to fit against it (A3). |
+| `maxAdmissionLimitBytes` | The most admission limit the CRL can reach under any device config: `(m − 2) · S/2 − S/16` in SimpleCRL for `m = CrlSizingDefaults.MaxMaxStreams` (1024), whatever `crl-max-streams` this open allows. A loaded state is judged never to fit against it (A3), so no config edit can declare a state lost. |
 | `maxTransactionBytes` | The most bytes, as admission counts them, one store's transaction may hold: `S/2 − 8192` in SimpleCRL. A prepare past it is dropped unsaved (section 6, Oversized). |
 | `requestGrowth()` | Asks for more room; cheap, idempotent, from any thread. SimpleCRL adds one stream if its growth policy allows (5.11). |
 | `onAdmissionLimitRaised(f)` | Registers `f`, called on the CRL thread with the new `admissionLimitBytes` after each committed growth. |
@@ -210,7 +210,7 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
    saves nothing in between. A throw while reading or recovering fail-stops the store (`Host.StoreFailStopped`).
 4. With a save file: its state is first charged to the device's admission, checked (`CrlAdmission.tryChargeLoaded`,
    section 6.1 A3); a state that does not fit now leaves the store offline with its file kept, retried at the device
-   scans, and one that never can, even at the CRL's growth cap (`StoreLoader.neverFits`, `maxAdmissionLimitBytes`),
+   scans, and one that never can, even at the most streams any config allows (`StoreLoader.neverFits`, `maxAdmissionLimitBytes`),
    is treated as an unusable file (step 2). Then `crl.dropStore` drops whatever the
    device CRL holds for the store, durably, and `crl.loadStore` saves every record of the file into it
    (`StoreLoader.awaitCrlLoad`), then `StoreRouter.crlLoaded` removes the
@@ -837,11 +837,14 @@ Frontend and store loader (implemented: `Frontend.admitPrepare`, `recoverState`,
   `CrlAdmission` (a compare-and-set loop like `tryAdmit`) that succeeds only if the total plus its bytes, less what is
   already retained for the store, is at most `limit + T`. The charge is retained for the store, so its recovery's own count replaces it under A2: a swap, not an
   addition. A refused load leaves the store offline with its `crl_save.log` kept and is retried later. A state that can
-  never fit (its bytes above `L_max + T`, where `L_max` is the limit at the CRL's growth cap,
+  never fit (its bytes above `L_max + T`, where `L_max` is the limit at `CrlSizingDefaults.MaxMaxStreams` streams,
   `maxAdmissionLimitBytes`, or one transaction counted above `T`, as a store moved from a larger CRL may hold) is not
-  retried: its save file is treated as lost (`crlSaveFileLost`) and the store is rebuilt (`StoreLoader.neverFits`). A
-  state above `limit + T` but within `L_max + T` is refused as one that does not fit yet: it asks the CRL to grow and
-  waits. The check leaves out what is already retained
+  retried: its save file is treated as lost (`crlSaveFileLost`) and the store is rebuilt (`StoreLoader.neverFits`).
+  `L_max` is not the limit at this open's `crl-max-streams`: a declaration is irreversible and a config edit is often
+  rolled out fleet-wide, so a lowered cap, or an invalid one that disables growth (`resolveExisting`), must not make an
+  intact state lost on every device that loads one (systemic-loss-protection S13). Both bounds follow only from the
+  stream size the CRL recorded at creation. A state above `limit + T` but within `L_max + T` is refused as one that
+  does not fit yet: it asks the CRL to grow and waits, warned, until growth, the config or free space allows it. The check leaves out what is already retained
   for the store (`retainedBytes`): what the CRL holds for a store with a save file is a copy of part of that file
   (an interrupted extraction or load), entries an earlier tenancy of the store left (3.3, step 4), or, for a load
   replacing a loaded store, that store's live records. Whichever it is, the load's `dropStore` is durable before any
@@ -1221,8 +1224,8 @@ at `writeHead`'s `require`, which only a bug can reach.
 - Rot in the newest acknowledged entry is indistinguishable from a torn write (10.3).
 - A transaction whose CRL bytes on a store exceed `maxTransactionBytes` (about half a stream) is dropped silently and
   can never commit there; its client sees only an unknown outcome (10.20).
-- A loaded state above `limit + T` but within the limit at the growth cap waits offline for growth (A3). If growth is
-  refused for good (the file system's free-space floor, `crl-min-free-percent`), it stays offline, warned once a
+- A loaded state above `limit + T` but within `L_max + T` waits offline for growth (A3), even past this open's
+  `crl-max-streams`, until an operator raises that cap. If growth is refused for good (the file system's free-space floor, `crl-min-free-percent`), it stays offline, warned once a
   minute, until space is freed or an operator acts; it is not rebuilt. The same holds once the growth thread has died
   (5.11), until the CRL is reopened.
 - Admission lanes reserve a quarter of the limit on devices with only data stores (Backlog.txt, "CRL admission lanes
@@ -1233,20 +1236,4 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-### CRL-W9: A save file is declared lost against a growth cap the device config sets
-Verdict PLAUSIBLE. Priority 3. Effort S.
-Mechanism: `StoreLoader.neverFits` judges a `crl_save.log` state never to fit when its bytes exceed
-`maxAdmissionLimitBytes + T`, and `SimpleCRL.maxAdmissionLimitBytes` is `limitAt(max(ring, growth.maxStreams))`, where
-`growth.maxStreams` is `crl-max-streams` as read from the device config at this open (`DeviceFactory.openCRL`,
-`CrlSizingDefaults.resolveExisting`), and 0 when the configured growth bounds are invalid (out of range, a typo). So a
-state that fits the CRL once grown to the cap the config allowed yesterday, or would allow after a fix, is judged by
-the cap the config gives today; with growth disabled by a bad bound, by the limit of the ring as it stands. Trigger:
-an operator lowers `crl-max-streams`, or writes an invalid growth bound, on a device that then loads an arriving
-transfer or a kept save file whose state lies above that cap's limit plus `T`.
-Consequence: `crlSaveFileLost` marks the store `rebuild-required` and it is rebuilt: an intact store's state is
-declared lost from a configuration condition, irreversibly, and the same edit rolled out fleet-wide does it on every
-device that loads such a state (the correlated-declaration pattern S13 forbids). Only the per-transaction bound `T`,
-fixed by the recorded stream size, truly can never be met.
-Suggested fix: judge the total against the limit at `CrlSizingDefaults.MaxMaxStreams`, the most any config can allow,
-so only a transaction above `T` declares the file lost; a state above the configured cap waits offline (A3's refusal),
-warned, until the config or room allows it.
+None.

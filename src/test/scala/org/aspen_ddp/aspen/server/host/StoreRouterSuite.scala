@@ -15,6 +15,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.simple.{GrowthPolicy, SimpleCRL}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.{CompletionHandler, MapBackend}
@@ -618,6 +619,32 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
       crl.growthRequests.get should be(1)
       fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(Some(false))
+
+  // CRL-W9: the growth cap a device config sets is no bound on what the CRL may ever grow to: a lower or invalid
+  // crl-max-streams (resolveExisting disables growth for the latter) must not declare a state lost
+  for (what, policy) <- List(
+    "growth disabled by an invalid crl-max-streams" -> GrowthPolicy.Disabled,
+    "crl-max-streams lowered to the ring" -> GrowthPolicy(4, 5, () => 1L << 40, () => 1L << 39)) do
+    test(s"a crl_save.log state above the limit at the configured cap + T waits offline, $what"):
+      val s0 = StoreId(poolId, 0)
+      val crl = SimpleCRL(os.temp.dir(), 4, 64 * 1024L, growth = policy).crl
+      try
+        val trs = (1 to 5).toList.map(i => voteState(s0, TransactionId(new UUID(17, 40 + i)), 20000))
+        val state = StoreRecoveryState(trs)
+        trs.foreach(t => CrlAdmission.recoveredBytes(t) should be <= crl.maxTransactionBytes)
+        CrlAdmission.recoveredBytes(state) should be > (crl.admissionLimitBytes + crl.maxTransactionBytes)
+        val admission = new CrlAdmission(crl.admissionLimitBytes)
+        withRouter(crl): fx =>
+          val sds = addCountingDevice(fx, s0, crl, admission)
+          val backend = bootstrappedBackend(s0)
+          CrashRecoveryLog.saveStoreState(s0, state, backend.crlSaveFile)
+          intercept[Exception](await(fx.load(backend)))
+          assertAbandoned(fx, s0, sds, backend)
+          admission.admittedBytes should be(0)
+          os.exists(backend.crlSaveFile) should be(true)
+          os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+          fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(Some(false))
+      finally crl.shutdown()
 
   for (what, states) <- List(
     "a state above limit + T" -> ((s0: StoreId) => (1 to 3).toList.map(i => voteState(s0, TransactionId(new UUID(17, i)), 4000))),

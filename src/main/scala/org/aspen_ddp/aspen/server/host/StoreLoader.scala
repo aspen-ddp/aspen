@@ -425,7 +425,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 crlRoomLog.admit().foreach: held =>
                   logger.warn(s"Store $storeId is not loaded yet: its crl_save.log state does not fit what its " +
                               s"device's CRL admits now. Leaving it offline, its save file kept, and retrying at the " +
-                              s"device scans${LogRateLimit.heldText(held)}")
+                              s"device scans until the CRL grows (it may need a larger crl-max-streams or more free " +
+                              s"space)${LogRateLimit.heldText(held)}")
                 executor.execute(() => entry.store.objectCache.clear())
                 if replacing.isEmpty then
                   ctx.threading.release(storeId)
@@ -441,10 +442,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   private def admissionOf(storageDeviceId: StorageDeviceId): CrlAdmission =
     ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited)
 
-  /** Why `state` can never be saved in `crl` counting with `admission`, if it cannot: its bytes exceed the admission
-   *  limit the CRL reaches at its growth cap plus the per-transaction bound, the most a load is charged against
-   *  (CrlAdmission.tryChargeLoaded) once the CRL has grown, or one of its transactions exceeds that bound
-   *  (crash-recovery-log 10.20). A state within the grown limit but above the one now is refused by tryChargeLoaded,
+  /** Why `state` can never be saved in `crl` counting with `admission`, if it cannot: its bytes exceed the most
+   *  admission limit the CRL can reach under any device config (maxAdmissionLimitBytes) plus the per-transaction
+   *  bound, the most a load is charged against (CrlAdmission.tryChargeLoaded) once the CRL has grown, or one of its
+   *  transactions exceeds that bound (crash-recovery-log 10.20). Neither depends on the device config, so no config
+   *  edit can declare a state lost. A state within that limit but above the one now is refused by tryChargeLoaded,
    *  which asks the CRL to grow and leaves the store waiting offline (crash-recovery-log 6.1, A3) */
   private def neverFits(state: StoreRecoveryState, crl: CrashRecoveryLog, admission: CrlAdmission): Option[String] =
     val bytes = CrlAdmission.recoveredBytes(state)
@@ -454,7 +456,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     state.transactions.find(trs => CrlAdmission.recoveredBytes(trs) > slack) match
       case Some(trs) =>
         Some(s"a transaction of ${CrlAdmission.recoveredBytes(trs)} bytes exceeds its $slack per transaction")
-      case None if bytes > max => Some(s"its $bytes bytes exceed the $max it admits for one load at its growth cap")
+      case None if bytes > max => Some(s"its $bytes bytes exceed the $max it admits for one load at its largest")
       case None => None
 
   /** A crl_save.log state refused for want of room in its device's CRL is warned of once a minute at most */

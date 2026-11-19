@@ -110,8 +110,10 @@ These are facts about the current code. They define the problem; none of them is
   `CrlLocked` (another writer) is never lost. `CrlSizingMismatch` refuses the device and never declares it lost, and
   so does `CrlConfigInvalid` (no CRL yet, and the config cannot size one). A transient error (`IOException`,
   `UncheckedIOException` or `VirtualMachineError`, `DeviceDiscovery.isTransient`) is rethrown, leaving the device
-  unloaded, up to `CrlOpenAttempts` (3) opens in a row. The count is per device directory, in memory, so it resets at
-  restart, and every open counts, whatever started it (open weakness SL-W7). Anything else, including `CrlMissing`,
+  unloaded, until it has failed on `CrlOpenAttempts` (3) device scans in a row. Only a `ScanDevices` open counts
+  (`checkForNewDevices(scan = true)`); the host start's opens, every `CheckAllDevices` and a `CheckStorageDevice`
+  naming an unloaded device retry it uncounted, and a success anywhere resets the count. The count is per device
+  directory, in memory, so it resets at restart. Anything else, including `CrlMissing`,
   `CrlCorrupt` and `Recovery.BrokenEntryChain`, declares at once. Elsewhere there is no classification:
   `CrashRecoveryLog.loadValidStoreState` turns any `Throwable`, a transient I/O error included, into
   `InvalidSaveFile`. A failed CRL read or recovery of one store fail-stops it. So do a commit voter whose apply throws,
@@ -169,7 +171,7 @@ store directory and leaves the store offline.
 | ID | Trigger | Code | Immediate local effect | False positives |
 |---|---|---|---|---|
 | D1 | `<device>/crl` absent from, or without stream files on (`CrlMissing`), a device that holds store directories (directories directly under the device holding a store config) | `DeviceDiscovery.openDeviceCrl`, at every load of the device | marker on **every** store directory of the device, including one whose whole state is in a valid `crl_save.log` (SL-W5); an existing `crl/` renamed to `crl.lost-<uuid>`; fresh empty CRL created | a partial restore or mount (one that copies directories but not the large stream files included); a path or layout change in a release |
-| D2 | CRL open throws a non-transient error (`CrlCorrupt`, `BrokenEntryChain`, anything not `isTransient`), or a transient one on the `CrlOpenAttempts`th open in a row, on a device that holds stores | `DeviceDiscovery.openDeviceCrl` | as D1 | a CRL format or recovery change; a bug in the CRL writer that the next recovery rejects; a persistent I/O condition (EMFILE in a restart storm, a flaky controller) lasting three opens, which at host start is about one 10 s scan (SL-W7) |
+| D2 | CRL open throws a non-transient error (`CrlCorrupt`, `BrokenEntryChain`, anything not `isTransient`), or a transient one on the `CrlOpenAttempts`th device scan in a row, on a device that holds stores | `DeviceDiscovery.openDeviceCrl` | as D1 | a CRL format or recovery change; a bug in the CRL writer that the next recovery rejects; a persistent I/O condition (EMFILE in a restart storm, a flaky controller) outlasting two scan periods (about 20 s; opens outside a scan do not count) |
 | D3 | `crl_save.log` present but `loadValidStoreState` rejects it (truncated, unparsable, another store's, any `Throwable`), or its state can never fit the device's CRL (`StoreLoader.neverFits`: a transaction above `maxTransactionBytes`, or the whole above the admission limit plus that bound) | `StoreLoader.handleLoad` then `StoreRebuilds.crlSaveFileLost`/`retireUnserved` | closed unserved, marked, offline, device checked | a save-file format change: every store whose directory holds a save file; a transient read error; a change to `CrlAdmission.recoveredBytes` or the CRL bounds in a release (never-fits); a transfer onto a device with a smaller CRL (Backlog, "Transfers do not check the destination's CRL room"). A crash between the save and `deleteTransactions` leaves the same entries in the device CRL, and the retire saves those beside the file (`lost-crl-entries.log`). A state that does not fit *yet* is not declared: the store waits offline, retried at each device scan |
 | D4 | Adoption: an Offline or Active store whose directory has `transferring-out` without a valid save file, or has `rebuild-required` | `DeviceDiscovery.adoptionClass` (`CrlLost`); `DeviceMetadata.adoptDevice` writes the marker in its prepare closure and the entry Rebuilding in the adoption transaction | adopted as Rebuilding | a save-file read path that fails on the adopting host's version; it inherits any false mark the previous host wrote. A marker left by an adoption transaction that does not commit states a fact about the disk and is harmless |
 | D5 | `BackendStateLost` at backend open: FSIF `StoreLost` (missing directory or blank files, no valid index, journal sequence or corruption checks, replay bounds; `FsifRecovery`, fsif/DESIGN.md 4.1), RocksDB `RocksDBStateLost` (`CURRENT` missing) | `StoreLoader.handleBackendOpened` | marked, offline, device checked | a format or validation change in a release; an incomplete mount or restore. An open never creates: stores are created atomically (`StoreCreation`), so a store path holds nothing or a complete store, and a missing or blank backend is declared rather than silently served empty |
@@ -369,10 +371,10 @@ These are places where one software change or environmental fault produces decla
   requirement-checker bug (D7), fires on every store that runs the path. In D7 it fires on every replica of the
   object in the same transaction, so `d` for that pool jumps to the number of voters at once.
 * **SC5 Resource exhaustion at start** (file descriptors, memory, threads in a restart storm). The CRL open declares on
-  the third `isTransient` failure in a row. At host start the first two opens come within moments of each other (the
-  constructor's discovery and the `CheckAllDevices` posted right after it), so the third, at the first 10 s device
-  scan, declares a condition that lasted about 10 s; a `CheckStorageDevice` naming any device not loaded here adds an
-  open at once (SL-W7). The save-file load (`loadValidStoreState`) declares at once on any `Throwable`.
+  the third device scan in a row whose open fails with an `isTransient` error. The host start's opens (the
+  constructor's discovery and the `CheckAllDevices` posted right after it) and nudges do not count, so the first
+  counted failure is at the first 10 s scan and the declaration at the third: a condition must outlast about 20 s, two
+  scan periods, to be declared. The save-file load (`loadValidStoreState`) declares at once on any `Throwable`.
 * **SC6 Incomplete mount or restored backup.** `crl/` absent, or present without stream files, while store
   directories exist is D1, with no retry.
   Absent FSIF files or a missing RocksDB `CURRENT` is D5.
@@ -512,27 +514,10 @@ Suggested fix: in `openDeviceCrl`, skip a store directory whose `crl_save.log` p
 carries no `rebuild-required`; it loads from its file over the fresh CRL as it would over the old one.
 Effort: S   Priority: 3
 
-### SL-W7. The transient CRL-open allowance is counted per open, not per scan, so it collapses at host start (CONFIRMED; transient condition declared)
-Mechanism: `DeviceDiscovery.openDeviceCrl` counts every failed open of a device in `transientCrlFailures` and declares
-D2 on the `CrlOpenAttempts`th (3). Opens come from every `checkForNewDevices` call, which retries every device not
-loaded: the `Host` constructor, the `CheckAllDevices` posted immediately after it, every `ScanDevices`
-(`deviceScanPeriod`, 10 s), every periodic `CheckAllDevices`, and every `CheckStorageDevice` naming a device this host
-has not loaded (`DeviceReconciler.handleCheckMessage`).
-Trigger / scenario: a host restarts during a restart storm and its CRL opens fail with EMFILE. Attempts 1 and 2 come
-within moments (constructor, startup `CheckAllDevices`); attempt 3 is the first device scan 10 s later, or a nudge for
-any unloaded device arriving earlier.
-Consequence: a transient condition lasting about 10 s, or less with nudges, is D2 for every device of the host, with
-every store marked, its CRL moved aside and the pool short by all of them. The `CrlOpenAttempts` scaladoc ("one per
-scan") and the intent of S5 are not what the code does.
-Suggested fix: count at most one attempt per `ScanDevices`, or require the failures to span a minimum time (several
-scan periods) before declaring.
-Effort: S   Priority: 3
-
 ### SL-W8. Documentation outside docs/safety misstates declaration paths (CONFIRMED; documentation)
 Mechanism / errors:
 - `server/host/StoreRouter.scala`, `recoverOrFail` scaladoc: names `StoreRebuilds.handleRecoveryFailed`, which does
   not exist; the handler is `StoreRebuilds.handleFailStopped`.
-- `server/host/DeviceDiscovery.scala`, `CrlOpenAttempts` scaladoc: "one per scan"; every open counts (SL-W7).
 - `server/store/backend/fsif/DESIGN.md` 4.2, "Served store": says the store's CRL state is dropped (`crl.dropStore`)
   once the marker is on disk. `StoreRebuilds.backendFailed` closes it with `closeUnloaded(dropDurably = false)`; its
   entries stay live until the rebuild's retire saves and drops them. 4.3 L20 omits the never-fits case of D3

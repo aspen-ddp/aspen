@@ -718,34 +718,59 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     (deviceDir, storeDir, inner, calls, newCrlHost(hostRoot, failing))
 
   atest("a transient CRL open failure leaves the stores untouched and a later scan loads the device"):
-    val failures = DeviceDiscovery.CrlOpenAttempts - 1
+    // The constructor's open, then every scan but the last allowed
+    val failures = DeviceDiscovery.CrlOpenAttempts
     val (deviceDir, storeDir, inner, calls, host) = transientlyFailingCrlDevice(failures)
-    // The startup scan failed once
     host.control.devices.devices.contains(deviceA) should be(false)
     os.exists(marker(storeDir)) should be(false)
     for _ <- 2 to failures do
-      host.control.discovery.checkForNewDevices() should be(Nil)
+      host.control.reconciler.scan()
+    host.control.devices.devices.contains(deviceA) should be(false)
     os.exists(marker(storeDir)) should be(false)
 
-    host.control.discovery.checkForNewDevices() should be(List(deviceA))
+    host.control.reconciler.scan()
     calls.get should be(failures + 1)
     Future.successful:
       os.exists(marker(storeDir)) should be(false)
       os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
 
-  atest("a CRL open failing transiently CrlOpenAttempts times in a row is treated as lost"):
-    val (deviceDir, storeDir, inner, calls, host) = transientlyFailingCrlDevice(DeviceDiscovery.CrlOpenAttempts)
-    for _ <- 2 until DeviceDiscovery.CrlOpenAttempts do
-      host.control.discovery.checkForNewDevices() should be(Nil)
+  atest("a CRL open failing transiently on CrlOpenAttempts device scans in a row is treated as lost"):
+    // The constructor's open, uncounted, then CrlOpenAttempts scans
+    val (deviceDir, storeDir, inner, calls, host) = transientlyFailingCrlDevice(1 + DeviceDiscovery.CrlOpenAttempts)
+    for _ <- 1 until DeviceDiscovery.CrlOpenAttempts do
+      host.control.reconciler.scan()
     os.exists(marker(storeDir)) should be(false)
 
-    // The last attempt fails too: the CRL is lost and a fresh one opened
-    host.control.discovery.checkForNewDevices() should be(List(deviceA))
+    // The last scan fails too: the CRL is lost and a fresh one opened
+    host.control.reconciler.scan()
     Future.successful:
       os.exists(marker(storeDir)) should be(true)
       os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
-      calls.get should be(DeviceDiscovery.CrlOpenAttempts + 1)
+      calls.get should be(DeviceDiscovery.CrlOpenAttempts + 2)
+      host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
+
+  atest("only device scans count transient CRL open failures: host start and nudges never declare the CRL lost"):
+    // Host start opens twice (constructor, startup CheckAllDevices), each round below twice, then the scans once each
+    val uncounted = 2 + 2 * DeviceDiscovery.CrlOpenAttempts
+    val (deviceDir, storeDir, inner, calls, host) =
+      transientlyFailingCrlDevice(uncounted + DeviceDiscovery.CrlOpenAttempts)
+    host.testingOnlyHandleEvents()
+    for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
+      host.control.reconciler.checkAll()
+      host.control.reconciler.handleCheckMessage(CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
+    os.exists(marker(storeDir)) should be(false)
+    os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
+    calls.get should be(uncounted)
+
+    // Device scans count, CrlOpenAttempts in a row declaring it lost
+    for _ <- 1 until DeviceDiscovery.CrlOpenAttempts do
+      host.control.reconciler.scan()
+    os.exists(marker(storeDir)) should be(false)
+    host.control.reconciler.scan()
+    Future.successful:
+      os.exists(marker(storeDir)) should be(true)
+      os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
 
   atest("a device whose CRL another opener holds is left unloaded, never lost, and loads once it is released"):
@@ -762,7 +787,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     // Not a transient failure counting towards CrlOpenAttempts, nor a lost CRL, however often it is retried
     host.control.devices.devices.contains(deviceA) should be(false)
     for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
-      host.control.discovery.checkForNewDevices() should be(Nil)
+      host.control.discovery.checkForNewDevices(scan = true) should be(Nil)
     os.exists(marker(storeDir)) should be(false)
     os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
     factory.opened should be(Nil)
@@ -1815,7 +1840,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
     host.control.devices.devices.contains(deviceA) should be(false)
     for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
-      host.control.discovery.checkForNewDevices() should be(Nil)
+      host.control.discovery.checkForNewDevices(scan = true) should be(Nil)
     os.exists(marker(storeDir)) should be(false)
     os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
     factory.opened should be(Nil)
@@ -1874,7 +1899,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
     host.control.devices.devices.contains(deviceA) should be(false)
     for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
-      host.control.discovery.checkForNewDevices() should be(Nil)
+      host.control.discovery.checkForNewDevices(scan = true) should be(Nil)
     os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
     os.list(crlDir) should be(Nil)
     factory.opened should be(Nil)

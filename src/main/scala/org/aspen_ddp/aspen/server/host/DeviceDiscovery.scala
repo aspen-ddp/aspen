@@ -28,7 +28,10 @@ private[aspen] enum AdoptionClass:
   case Unclean
 
 object DeviceDiscovery:
-  /** Opens of a device's CRL that may fail with a transient error, one per scan, before it is treated as lost */
+  /** Device scans (ScanDevices, each deviceScanPeriod) in a row whose open of a device's CRL may fail with a
+   *  transient error before it is treated as lost. Only a scan's open counts: the others (host start, every
+   *  CheckAllDevices, a nudge naming an unloaded device) retry it uncounted, so a transient condition must outlast
+   *  CrlOpenAttempts - 1 scan periods to be declared, however many opens it fails */
   val CrlOpenAttempts = 3
 
   /** An I/O error or a VM error (out of memory) may clear on a later attempt. Anything else, corruption, a sizing
@@ -81,9 +84,12 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   // being listed, as loadedDirs' are. In memory only: a restart loads it once more and relinquishes it again.
   private var disownedDirs: Set[os.Path] = Set()
 
-  // Consecutive transient failures to open each device directory's CRL (openDeviceCrl). In memory only: a restart
-  // allows CrlOpenAttempts more
+  // Consecutive device scans whose open of each device directory's CRL failed transiently (openDeviceCrl). In memory
+  // only: a restart allows CrlOpenAttempts more
   private var transientCrlFailures: Map[os.Path, Int] = Map()
+
+  // Set while a device scan runs checkForNewDevices: only then does a transient CRL open failure count
+  private var countingCrlFailures = false
 
   /** Keeps the scan from loading the device at `path` again (see disownedDirs). */
   private[host] def disown(path: os.Path): Unit =
@@ -114,10 +120,18 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *
    *  Returns the devices this call loaded, so ScanDevices can check them at once.
    *
+   *  `scan` is true only for ScanDevices: its transient CRL open failures count towards CrlOpenAttempts, while the
+   *  other callers' are retried uncounted (openDeviceCrl), so the allowance is one per scan, not one per open.
+   *
    *  Mutual exclusion: the handleEvent calls run on the control thread; the constructor call
    *  precedes start(), so no control thread runs yet.
    */
-  def checkForNewDevices(): List[StorageDeviceId] =
+  def checkForNewDevices(scan: Boolean = false): List[StorageDeviceId] =
+    countingCrlFailures = scan
+    try discoverDevices()
+    finally countingCrlFailures = false
+
+  private def discoverDevices(): List[StorageDeviceId] =
     if ! os.isDir(storageDevicesDir) then
       warnOnce(storageDevicesDir, s"Invalid storage devices directory: $storageDevicesDir")
       Nil
@@ -519,8 +533,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
 
   /** Opens the device's CRL. It is lost when its directory is absent from a device that holds stores, or holds no
    *  stream files there (CrlMissing: stores exist only on a device whose CRL was opened), or when opening it throws
-   *  anything but a transient error (DeviceDiscovery.isTransient) or a transient error
-   *  CrlOpenAttempts times in a row. The stores' transaction state was in it, so each is marked rebuild-required
+   *  anything but a transient error (DeviceDiscovery.isTransient) or a transient error on CrlOpenAttempts device
+   *  scans in a row (an open outside a scan neither counts nor declares; a success anywhere resets). The stores' transaction state was in it, so each is marked rebuild-required
    *  (the reconcile pass turns them into rebuilds), the old directory is kept aside as `crl.lost-<uuid>`, and a fresh
    *  CRL is opened. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
    *  A corrupt CRL (CrlCorrupt) is lost too, logged under its own cause.
@@ -574,10 +588,14 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             if storeDirs.isEmpty then
               throw t
             if DeviceDiscovery.isTransient(t) then
+              if ! countingCrlFailures then
+                logger.error(s"Failed to open the CRL of storage device $devicePath outside a device scan. " +
+                             s"Retrying on the next scan: $t")
+                throw t
               val attempts = transientCrlFailures.getOrElse(devicePath, 0) + 1
               if attempts < DeviceDiscovery.CrlOpenAttempts then
                 transientCrlFailures += devicePath -> attempts
-                logger.error(s"Failed to open the CRL of storage device $devicePath (attempt $attempts of " +
+                logger.error(s"Failed to open the CRL of storage device $devicePath (scan $attempts of " +
                              s"${DeviceDiscovery.CrlOpenAttempts}). Retrying on the next scan: $t")
                 throw t
             transientCrlFailures -= devicePath

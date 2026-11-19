@@ -51,7 +51,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // Local only: listing the directory reads nothing over the network. A device this scan
     // loads is checked at once, as CheckAllDevices would, so its Initializing stores are
     // created now rather than up to checkStorageDevicePeriod from now.
-    ctx.discovery.checkForNewDevices().foreach(checkStorageDevice)
+    // The one caller that counts transient CRL open failures (DeviceDiscovery.CrlOpenAttempts)
+    ctx.discovery.checkForNewDevices(scan = true).foreach(checkStorageDevice)
     ctx.loader.retryStoresAwaitingSpace()
 
   /** A CheckStorageDevice message. */

@@ -309,7 +309,8 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   so it can never turn the refusal of a damaged CRL into a lost one. An emptied `crl/` under stores is refused this
   way too while the config is invalid; once it is fixed, the open throws `CrlMissing` and the CRL is lost (below).
   An `IOException`, `UncheckedIOException` or `VirtualMachineError` (`DeviceDiscovery.isTransient`) is rethrown too,
-  up to `CrlOpenAttempts` (3) consecutive scans.
+  up to `CrlOpenAttempts` (3) consecutive device scans; an open outside a scan (host start, `CheckAllDevices`, a
+  nudge) is retried uncounted.
 - **Lost.** If `crl/` is absent from a device that holds stores (a child directory with a store `config`), or holds no
   stream files there (`openCRL` is passed `holdsStores` and throws `CrlMissing` before writing anything: stores exist
   only on a device whose CRL was opened, so a `crl/` emptied by hand, a file system repair or a partial restore is a

@@ -130,7 +130,10 @@
   lost: the device stays unloaded and each scan retries. Nor is a CRL whose files disagree with its recorded sizing
   (`CrlSizingMismatch`), nor a `crl/` holding no CRL yet whose device config cannot size one (`CrlConfigInvalid`):
   the device is refused, an error is logged once, and each scan retries. A transient error (I/O or VM error,
-  `DeviceDiscovery.isTransient`) leaves the device unloaded for the next scan instead, until `CrlOpenAttempts` (3) in a row
+  `DeviceDiscovery.isTransient`) leaves the device unloaded for the next scan instead, until it has failed on
+  `CrlOpenAttempts` (3) device scans in a row, when the CRL is lost. Only a `ScanDevices` open counts
+  (`checkForNewDevices(scan = true)`): host start, `CheckAllDevices` and nudges retry uncounted, so start-up's burst of
+  opens cannot use up the allowance.
 - `Host.StoreFailStopped` (a store's CRL recovery threw, or its Frontend fail-stopped, `server/store/CLAUDE.md`) is
   handled as a backend failure (`StoreRebuilds.handleFailStopped`), but only while that Store is still the one
   installed under its id: a late fail-stop of a closed or replaced store is ignored, so its directory is not marked

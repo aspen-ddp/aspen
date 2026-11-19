@@ -47,11 +47,6 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.1  SL-W7  The transient CRL-open allowance collapses at host start. CONFIRMED, S.
-     DeviceDiscovery's transientCrlFailures counts every checkForNewDevices call, not each scan. The constructor plus
-     the CheckAllDevices posted right after it use two attempts, so an EMFILE-style spell of about 10 s becomes a D2
-     declaration on every device of the host. Fix: count per scan, or per time window.
-
 3.2  SL-W5  A lost device CRL marks stores whose whole state is in their own save file. CONFIRMED, S.
      openDeviceCrl marks every store directory, including those with a valid crl_save.log (an arrived transfer, a
      transfer out's source, a rebuilt store kept offline). Fix: skip a directory whose save file validates, as
@@ -151,9 +146,8 @@ PRIORITY 7: documentation corrections
 
 7.3  SL-W8  Declaration-path documentation. S.
      StoreRouter.recoverOrFail names StoreRebuilds.handleRecoveryFailed (the handler is handleFailStopped);
-     DeviceDiscovery.CrlOpenAttempts says "one per scan"; server/store/backend/fsif/DESIGN.md 4.2 and its L20 row;
-     Backlog's correlated-declarations item still lists a failed apply re-check as a failStop trigger (it
-     quarantines).
+     server/store/backend/fsif/DESIGN.md 4.2 and its L20 row; Backlog's correlated-declarations item still lists a
+     failed apply re-check as a failStop trigger (it quarantines).
 
 7.4  RB-W11  Rebuild documentation. S.
      server/host/CLAUDE.md says rebuilding/<id> is swept at device load (it is not); StoreRebuilds.cancelFor and

@@ -983,6 +983,45 @@ class SimpleCRLSuite extends FileBasedTests {
     i2.crl.shutdown()
   }
 
+  /** The names of `tdir`'s stream and temporary files */
+  private def crlFileNames(): Set[String] =
+    os.list(tdir).map(_.last).filter(f => f.endsWith(".crl") || f.endsWith(".crl.tmp")).toSet
+
+  test("A stray .crl.tmp beside a live CRL is refused, never taken for an unfinished creation (SL-W6)") {
+    val size = 4096L * 3
+    val i = SimpleCRL(tdir, 3, size)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    i.crl.shutdown()
+    // A listed stream's name, beside the stream itself, and a name the ring does not list
+    for stray <- List("0.crl.tmp", "7.crl.tmp") do
+      os.copy(tdir / "0.crl", tdir / stray)
+      val before = crlFileNames()
+      for mustExist <- List(true, false) do
+        assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, size, mustExist = mustExist))
+        assert(crlFileNames() == before)
+      os.remove(tdir / stray)
+      val i2 = SimpleCRL(tdir, 3, size, mustExist = true)
+      assert(i2.trsList.map(_.storeId) == List(storeId))
+      i2.crl.shutdown()
+  }
+
+  test("A creation-shaped .crl.tmp on a device that holds stores is refused, not created again") {
+    val size = 4096L * 3
+    val i = SimpleCRL(tdir, 3, size)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    i.crl.shutdown()
+    // A live stream renamed to its temporary name: the shape a crashed creation leaves, but stores exist only on a
+    // device whose CRL creation finished
+    os.move(tdir / "1.crl", tdir / "1.crl.tmp")
+    val before = crlFileNames()
+    assertThrows[CrlSizingMismatch](SimpleCRL(tdir, 3, size, mustExist = true))
+    assert(crlFileNames() == before)
+    os.move(tdir / "1.crl.tmp", tdir / "1.crl")
+    val i2 = SimpleCRL(tdir, 3, size, mustExist = true)
+    assert(i2.trsList.map(_.storeId) == List(storeId))
+    i2.crl.shutdown()
+  }
+
   test("A reopened CRL reports what it holds for each store, as admission counts it") {
     val i = SimpleCRL(tdir, 3, 1024 * 1024)
     assert(i.crl.recoveredBytesByStore.isEmpty)

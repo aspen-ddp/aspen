@@ -525,7 +525,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  CRL is opened. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
    *  A corrupt CRL (CrlCorrupt) is lost too, logged under its own cause.
    *  A CRL another writer holds open (CrlLocked) is never lost: it is rethrown each time, uncounted.
-   *  Nor is a CRL whose files do not match the sizing it recorded (CrlSizingMismatch): configuration cannot cause that,
+   *  Nor is a CRL whose files do not match the sizing it recorded, or that holds a `.crl.tmp` that is no unfinished
+   *  creation (CrlSizingMismatch): configuration cannot cause that,
    *  so it is a hand edit or damage of the directory, never by itself proof that the state is gone. The device is
    *  refused (left unloaded, an error logged once) until an operator repairs it (systemic-loss-protection.md S6, M6).
    *  Nor is a CRL directory holding no CRL yet whose device config cannot size one (CrlConfigInvalid): the device is
@@ -556,8 +557,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             if !reportedDirs.contains(devicePath) then
               reportedDirs += devicePath
               logger.error(s"Refusing to load storage device $devicePath: its CRL does not match the sizing it was " +
-                           s"created with. Its stores are not declared lost. Restore the CRL directory's stream " +
-                           s"files and sizing file, then the next scan loads it: $t")
+                           s"created with, or holds stray .crl.tmp files. Its stores are not declared lost. Restore " +
+                           s"the CRL directory's stream files and sizing file (removing any stray .crl.tmp), then " +
+                           s"the next scan loads it: $t")
             throw t
           case t: CrlConfigInvalid =>
             // The directory holds no CRL yet and the config cannot size one: a refusal, like a sizing mismatch.

@@ -33,13 +33,6 @@ X = cross-document-review (its section 5 lists contradictions between documents)
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.2  SL-W6  A stray .crl.tmp beside a live CRL deletes the CRL and recreates it empty, declaring nothing. PLAUSIBLE, S.
-     SimpleCRL.createStreamsIfNew treats any non-growth *.crl.tmp as an unfinished creation and removes every stream
-     file, even when mustExist/holdsStores is set. Every store on the device then serves with no votes, acceptor
-     state or locks. No crash of the current code produces it; the trigger is damage, a hand edit, a restore tool or
-     a release that renames the temp file. Cheap guard, so it sits above 1.3: with holdsStores, refuse as CrlMissing
-     or CrlCorrupt instead. (systemic-loss-protection.md SL-W6; crash-recovery-log.md 5.1)
-
 1.3  R-W4 + Q-W5  State kept for replay gets no UnackedCommits entry because its store sent TxCommitted. M.
      MissedUpdateFinalizationAction.writeMissedUpdates gives a store that sent TxCommitted no UnackedCommits entry
      (commitErrors.contains), even when that store kept T's CRL state as Unresolved for a later replay. After a

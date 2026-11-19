@@ -114,7 +114,10 @@
 - Stream files are preallocated at creation (`SimpleCRL.createStreamsIfNew`, `server.FilePreallocation`): `fallocate`
   through FFM on Linux, zero-fill elsewhere or on `EOPNOTSUPP`. A CRL write never allocates, so a full device cannot
   fail one (crash-recovery-log 5.1). Each file is written as `<n>.crl.tmp`, renamed, and the directory forced before the
-  writer starts: a `.tmp` at open is a creation that wrote nothing, and it starts over. A `<ringSize>.crl` or
+  writer starts. A `.crl.tmp` at open is a creation that wrote nothing, and it starts over, only when `holdsStores`
+  (`mustExist`) is unset and every one is a listed stream's `<n>.crl.tmp` with no `<n>.crl` beside it. Any other
+  (a stray beside its stream, an unlisted name, any on a device with stores) is damage: `CrlSizingMismatch`, nothing
+  removed, never a fresh CRL under live state. A `<ringSize>.crl` or
   `<ringSize>.crl.tmp` the ring does not list is a growth that never committed: removed at open with a warning
   (`removeUncommittedGrowth`, run before that creation rule), but only when every listed stream exists and no other file
   is unlisted. Otherwise, as for any other unlisted stream file, the open is `CrlSizingMismatch` and removes nothing:

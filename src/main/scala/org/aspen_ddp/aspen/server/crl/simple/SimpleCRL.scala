@@ -157,9 +157,10 @@ object SimpleCRL extends Logging:
     *                      that: stores vote only once a save completes.
     * @throws CrlLocked if the CRL is open elsewhere (CrlLock). Nothing in `streamsDir` is read or written then.
     * @throws CrlSizingMismatch if `streamsDir` holds stream files but no readable SizingFile, or stream files other
-    *                           than the recorded count of the recorded size each. Recovering with another sizing would
-    *                           silently ignore files holding live entries, so the CRL is not opened. Nothing in
-    *                           `streamsDir` is written then.
+    *                           than the recorded count of the recorded size each, or `.crl.tmp` files that are not an
+    *                           unfinished creation (createStreamsIfNew). Recovering with another sizing, or creating
+    *                           the CRL afresh, would silently ignore or delete files holding live entries, so the CRL
+    *                           is not opened. Nothing in `streamsDir` is written then.
     * @param mustExist the CRL must already exist (its device holds stores). With no stream files in `streamsDir`
     *                  (only a SizingFile or unfinished `.crl.tmp` files at most), CrlMissing is thrown instead of a
     *                  new CRL being created, and nothing in `streamsDir` is written.
@@ -184,9 +185,9 @@ object SimpleCRL extends Logging:
         (StreamId(i), streamsDir / s"$i.crl")
       ).toList
 
-      // Before createStreamsIfNew, which would take a growth's `.crl.tmp` for an unfinished creation
+      // Before createStreamsIfNew, which would refuse a growth's unlisted `.crl.tmp` as damage
       removeUncommittedGrowth(streamsDir, files.map(_._2).toSet)
-      createStreamsIfNew(streamsDir, files.map(_._2), sizing.maxSizeInBytes)
+      createStreamsIfNew(streamsDir, files.map(_._2), sizing.maxSizeInBytes, mustExist)
       checkSizing(streamsDir, files.map(_._2).toSet, sizing.maxSizeInBytes)
 
       val r = Recovery.recover(files, sizing.crlId, sizing.ring)
@@ -246,14 +247,26 @@ object SimpleCRL extends Logging:
   /** Creates the stream files of a new CRL, preallocated at their full size (FilePreallocation), so no CRL write ever
     * allocates a block and a full device cannot fail one with ENOSPC (crash-recovery-log 5.1). Each is written as
     * `<name>.tmp` and renamed into place, and the directory is forced once all are: only then does the writer start.
-    * So a `.tmp` file left at open means a creation that never finished and wrote no entry, and it starts over.
+    * So a crashed creation leaves each listed stream at most once, as `<n>.crl` or as `<n>.crl.tmp`, and no other
+    * `.crl.tmp`; it wrote no entry, and it starts over. It never leaves one under `mustExist`: stores exist only on a
+    * device whose CRL creation finished. Any other `.crl.tmp` (a stray beside its stream, an unlisted name, or any
+    * under `mustExist`) is damage beside a CRL that may hold entries: CrlSizingMismatch, and nothing is removed.
     * A copy-on-write file system allocates on every overwrite, which no preallocation prevents: warned once. */
-  private def createStreamsIfNew(streamsDir: os.Path, streams: List[os.Path], maxSizeInBytes: Long): Unit =
+  private def createStreamsIfNew(streamsDir: os.Path, streams: List[os.Path], maxSizeInBytes: Long,
+                                 mustExist: Boolean): Unit =
     def tmpOf(f: os.Path): os.Path = f / os.up / s"${f.last}.tmp"
     val leftoverTmps = os.list(streamsDir).filter(_.last.endsWith(".crl.tmp"))
     if leftoverTmps.nonEmpty then
+      val present = streamFiles(streamsDir)
+      val unfinishedCreation = !mustExist && leftoverTmps.forall: t =>
+        val stream = streamsDir / t.last.stripSuffix(".tmp")
+        streams.contains(stream) && !present.contains(stream)
+      if !unfinishedCreation then
+        throw CrlSizingMismatch(streamsDir, s"it holds ${leftoverTmps.map(_.last).sorted.mkString(", ")} beside " +
+          s"${present.map(_.last).toList.sorted.mkString(", ")}: not an unfinished creation " +
+          s"${if mustExist then "(the device holds stores)" else s"of its ${streams.size} streams"}")
       logger.warn(s"The creation of the CRL in $streamsDir did not finish. Creating its stream files again")
-      (leftoverTmps ++ streamFiles(streamsDir)).foreach(os.remove(_))
+      (leftoverTmps ++ present).foreach(os.remove(_))
     if streamFiles(streamsDir).isEmpty then
       if FilePreallocation.isCopyOnWrite(streamsDir) && warnedCopyOnWrite.compareAndSet(false, true) then
         logger.warn(s"The CRL in $streamsDir is on a copy-on-write file system: its writes allocate, so a full " +

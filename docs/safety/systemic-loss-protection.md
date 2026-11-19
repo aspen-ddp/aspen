@@ -127,7 +127,7 @@ These are facts about the current code. They define the problem; none of them is
   only a new CRL (`CrlSizingDefaults`). Stream files that disagree with the recorded sizing, stream files without a
   readable sizing file, and an uncommitted growth beside anything but the listed streams throw `CrlSizingMismatch`,
   which refuses the device. A changed default or config loader cannot turn a CRL into a lost one. A changed CRL
-  *format*, recovery check or stream-file naming still can (SC1, and open weakness SL-W6).
+  *format*, recovery check or stream-file naming still can (SC1).
 * **S7 Retained artefacts are never read by code.** `crl.lost-<uuid>` (D1, D2) is kept forever: no code reads, expires
   or references it. A `pending-delete/` copy is deleted automatically (section 4.4) but is never reopened. No tool
   reinstates a retained copy; section 4.5 is the procedure for doing it by hand.
@@ -214,7 +214,7 @@ retained, or are a derived copy of data that still exists elsewhere.
 | X8 | Entries deleted from the device CRL after a transfer out's save file is durable | `StoreLoader.handleClose`, `StoreTransfers.extractUnloaded` | Recoverable (moved) | the save file, which a retire keeps as the copy's lost CRL state |
 | X9 | Derived copies deleted (copies that never were the owner's): rebuilt copy on `RebuildOutcome.Discard` and an arrived copy on `TransferOutcome.SourceRestored` or `Aborted` (`LocalDevices.discardStoreDirectory`, via `StoreTransfers.discardArrivedTransferIn` for the latter), and a stale arrived copy (`StoreTransfers.startIn`), all rename-first; rebuild staging (first pass `createStaging`, staging `BackendStateLost`, a finished rebuild's `cleanupStaging`, `abandonUnlisted`); transfer staging: a staged copy with an unusable save file, one landed after its attempt was dropped, an abandoned one (`StoreTransfers.startIn`, `dropAbandonedTransferIn`), a partial receive (`StoreTransferManager.receive`, `removeOwnedDirectory`); `transferring-in` staging and `creating/` at device load (`DeviceDiscovery.loadOwnedDevice`) | as listed | Derived | peers, or the transfer source |
 | X10 | Tombstone: device removed from its set and host, ids zeroed, stores rebuilt elsewhere | `FailedStorageDeviceDurableTask` | One-way **metadata** change; the media is untouched | the physical data. The old host retires the device under a durable `failed` marker (`DeviceShutdown.retireFailedDevice`, also written by `DeviceDiscovery.handleOwnershipResolved`), and `tryLoadDevice` never loads or claims a device with it |
-| X11 | CRL stream files removed when the CRL is opened: an uncommitted growth's `<n>.crl` or `<n>.crl.tmp` (`SimpleCRL.removeUncommittedGrowth`), and, when any `*.crl.tmp` remains after that, every `*.crl.tmp` **and every stream file**, the CRL then created afresh (`SimpleCRL.createStreamsIfNew`) | `SimpleCRL.apply` | Derived for an uncommitted growth stream and an unfinished creation, which hold no entry; **destructive, and silent**, for a stray `.crl.tmp` beside a live CRL (SL-W6) | nothing; no store is marked |
+| X11 | CRL stream files removed when the CRL is opened: an uncommitted growth's `<n>.crl` or `<n>.crl.tmp` (`SimpleCRL.removeUncommittedGrowth`), and an unfinished creation: when every remaining `*.crl.tmp` is a listed stream's `<n>.crl.tmp` with no `<n>.crl` beside it, and the device holds no stores, every `*.crl.tmp` and every stream file, the CRL then created afresh (`SimpleCRL.createStreamsIfNew`). Any other `*.crl.tmp` is `CrlSizingMismatch` and nothing is removed | `SimpleCRL.apply` | Derived: neither holds an entry, and stores exist only on a device whose CRL creation finished | nothing; no store is marked |
 
 ### 4.4 Retention
 
@@ -511,25 +511,6 @@ reinstatable by hand (4.5).
 Suggested fix: in `openDeviceCrl`, skip a store directory whose `crl_save.log` passes `loadValidStoreState` and that
 carries no `rebuild-required`; it loads from its file over the fresh CRL as it would over the old one.
 Effort: S   Priority: 3
-
-### SL-W6. A stray `.crl.tmp` beside a live CRL deletes the CRL and recreates it empty, declaring nothing (PLAUSIBLE; silent state loss)
-Mechanism: `SimpleCRL.apply` calls `removeUncommittedGrowth`, which handles only `<ringSize>.crl` and
-`<ringSize>.crl.tmp`, then `createStreamsIfNew`, which treats any remaining `*.crl.tmp` as an unfinished creation and
-removes it **and every stream file** (`(leftoverTmps ++ streamFiles(streamsDir)).foreach(os.remove(_))`), then creates
-fresh streams. `mustExist` (`holdsStores`) is checked only before, against stream files present, so a device that
-holds stores is not protected. Recovery of the empty streams succeeds, so `DeviceDiscovery.openDeviceCrl` marks
-nothing.
-Trigger / scenario: a device holding stores whose `crl/` has its listed stream files plus any other `*.crl.tmp` (for
-example `0.crl.tmp`): a copy or restore tool's leftover, a hand edit, file-system repair, or a release that names a
-growth's temporary file differently. No crash of the current code produces it: creation renames every temporary file
-before the writer starts, and a growth's is `<ringSize>.crl.tmp`.
-Consequence: every store of the device loads and serves with no CRL state: its unresolved votes, Paxos acceptor state
-and commit-vote locks are gone with no marker and no rebuild, which can let conflicting transactions both commit. The
-old stream files are deleted, not kept as `crl.lost-<uuid>`. This is the outcome `CrlMissing` exists to prevent.
-Suggested fix: with `mustExist`, or whenever the sizing file names streams that all exist, a stray `.crl.tmp` is
-damage: remove only the temporary files when the listed streams are complete, and throw `CrlSizingMismatch` (refuse)
-when they are not; never remove stream files of a CRL that may hold entries.
-Effort: S   Priority: 1
 
 ### SL-W7. The transient CRL-open allowance is counted per open, not per scan, so it collapses at host start (CONFIRMED; transient condition declared)
 Mechanism: `DeviceDiscovery.openDeviceCrl` counts every failed open of a device in `transientCrlFailures` and declares

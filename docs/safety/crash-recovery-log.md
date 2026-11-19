@@ -364,15 +364,16 @@ the ring need not be in numeric order. "Next", "successor" and "after" below alw
    growth that never committed (5.11). It is removed, with a warning, but only when every listed stream exists and
    no other stream file is unlisted; otherwise the open is `CrlSizingMismatch` and removes nothing, since removing
    it beside missing streams could leave none and step 4 would then create an empty CRL under live stores.
-4. `createStreamsIfNew`: any `*.crl.tmp` left after step 3 is taken for a creation that never finished: every
-   `*.crl.tmp` and every stream file (`*.crl`) is removed, whatever the ring lists and whether or not `mustExist` was
-   set, and creation starts over. With no stream files, each is preallocated as `<n>.crl.tmp`
+4. `createStreamsIfNew`: with no stream files, each is preallocated as `<n>.crl.tmp`
    (`FilePreallocation.preallocate`: `fallocate(2)` mode 0 through FFM on Linux, zero-fill elsewhere or on
-   `EOPNOTSUPP`; forced), renamed into place, and the directory forced. Only then does the writer start, so every
-   `.tmp` the code itself leaves at open (other than a growth's, step 3) comes from a creation that wrote no entry. A
-   stray `.crl.tmp` of any other origin (damage, a copy or restore tool, a hand edit) beside a live CRL is treated the
-   same way: the CRL's entries are deleted, an empty CRL is created, and nothing is declared lost
-   ([systemic-loss-protection.md](systemic-loss-protection.md) SL-W6).
+   `EOPNOTSUPP`; forced), renamed into place, and the directory forced. Only then does the writer start, so a creation
+   that crashed wrote no entry and leaves each listed stream at most once, as `<n>.crl` or as `<n>.crl.tmp`, and no
+   other `.crl.tmp`. It never leaves one under `mustExist`: stores exist only on a device whose CRL creation finished.
+   Any `*.crl.tmp` left after step 3 is therefore taken for an unfinished creation only when `mustExist` is unset and
+   every one is a listed stream's `<n>.crl.tmp` with no `<n>.crl` beside it: every `*.crl.tmp` and every stream file
+   is removed, and creation starts over. Any other `.crl.tmp` (a stray beside its stream, an unlisted name, or any
+   under `mustExist`) comes from damage, a copy or restore tool or a hand edit, beside a CRL that may hold entries:
+   the open is `CrlSizingMismatch` and removes nothing, so the device is refused, not emptied.
 5. `checkSizing`: the stream files must be exactly the set the ring lists, each of the recorded size.
 6. `Recovery.recover` (5.7), then the constructor (5.7). A constructor that fails shuts its writer down and waits for
    it before rethrowing, so a retry never runs two writers over the same files.
@@ -675,9 +676,8 @@ opens the old ring. A crash after it leaves a listed `<n>.crl` that may hold no 
 recovery reads as no entry, and it lies right after the stream that was active, as the invariant requires. Beside a
 growth leftover, any other unlisted stream file or `.crl.tmp`, or a listed stream missing, is `CrlSizingMismatch`,
 never removed (`removeUncommittedGrowth`). Without a growth leftover, an unlisted `.crl` or a missing listed stream is
-`CrlSizingMismatch` (`checkSizing`), but an unlisted `.crl.tmp` makes step 4 of 5.1 remove every stream file and
-create the CRL afresh ([systemic-loss-protection.md](systemic-loss-protection.md) SL-W6); a growth never leaves one,
-so the case arises only from damage. Because nothing touches the files after the sizing rewrite, there is no third
+`CrlSizingMismatch` (`checkSizing`), and so is an unlisted `.crl.tmp` (step 4 of 5.1); a growth never leaves
+one, so the case arises only from damage. Because nothing touches the files after the sizing rewrite, there is no third
 state.
 
 **Failures.** A refused or failed attempt logs, removes what it created, backs off (a refusal for free space or a

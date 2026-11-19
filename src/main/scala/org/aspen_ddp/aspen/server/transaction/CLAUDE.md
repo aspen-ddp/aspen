@@ -111,7 +111,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   resolution still work inside the window but are no longer load-bearing
 
 #### UnackedCommits
-- Written by the finalizer for each commit voter that sent no TxCommitted (`client/internal/transaction/CLAUDE.md`);
+- Written by the finalizer for each commit voter that sent no TxCommitted, or whose TxCommitted set `keptForReplay`
+  (`Tx.keptForReplay`: a failed backend commit or a quarantine keeps T's CRL state past TxFinalized, and only the
+  entry makes the reloaded store's recovered vote, which learns T late, re-apply it; `client/internal/transaction/CLAUDE.md`);
   an entry durable means T committed, not that the other actions are done (they may be failing and retried): only an
   acceptor having forgotten T (on TxFinalized) implies that
 - A recovered unresolved commit vote looks its entry up (`UnackedCommitLookup`, from the

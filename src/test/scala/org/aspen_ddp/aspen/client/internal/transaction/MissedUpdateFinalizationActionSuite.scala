@@ -104,7 +104,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     // Naming a single store keeps commitErrors smaller than allDataStores, so the all-clear
     // branch in updateCommitErrors does not fire and complete the promise before any write.
     val fa = new MissedUpdateFinalizationAction(client, txdFor(ptr))
-    fa.updateCommitErrors(Map(net.storeId2 -> List(ptr.id)))
+    fa.updateCommitErrors(Map(net.storeId2 -> List(ptr.id)), Set())
     fa.markMissedUpdates()
 
     for
@@ -122,7 +122,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     // The record must survive even though no pointer can be found for the id. Dropping it
     // would lose the fact that a store missed an update, which no repair pass would revisit.
     val fa = new MissedUpdateFinalizationAction(client, txdFor(ptr))
-    fa.updateCommitErrors(Map(net.storeId1 -> List(unrelatedId)))
+    fa.updateCommitErrors(Map(net.storeId1 -> List(unrelatedId)), Set())
     fa.markMissedUpdates()
 
     for
@@ -387,7 +387,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
   atest("a commit error on an object the transaction only locks is not marked"):
     val List(updated, shared, exclusive) = List.fill(3)(pointerWith(Array[Byte]()))
     val fa = new MissedUpdateFinalizationAction(client, txdWithLocks(updated, shared, exclusive))
-    fa.updateCommitErrors(Map(net.storeId2 -> List(shared.id, exclusive.id)))
+    fa.updateCommitErrors(Map(net.storeId2 -> List(shared.id, exclusive.id)), Set())
     fa.markMissedUpdates()
     for
       _ <- fa.complete
@@ -401,14 +401,14 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     val List(updated, shared, exclusive) = List.fill(3)(pointerWith(Array[Byte]()))
     val txd = txdWithLocks(updated, shared, exclusive)
     val fa = new MissedUpdateFinalizationAction(client, txd)
-    fa.updateCommitErrors(txd.allDataStores.map(_ -> List(shared.id)).toMap)
+    fa.updateCommitErrors(txd.allDataStores.map(_ -> List(shared.id)).toMap, Set())
     fa.complete.isCompleted shouldBe true
 
   atest("an action with no marks to write completes"):
     val ptr = pointerWith(Array[Byte](1))
     val txd = txdFor(ptr)
     val fa = new MissedUpdateFinalizationAction(client, txd)
-    fa.updateCommitErrors(txd.allDataStores.map(_ -> Nil).toMap)
+    fa.updateCommitErrors(txd.allDataStores.map(_ -> Nil).toMap, Set())
     fa.markMissedUpdates()
 
     fa.complete.map(_ => succeed)
@@ -434,7 +434,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
 
   private def runMark(txd: TransactionDescription, commitErrors: Map[StoreId, List[ObjectId]]): Future[Unit] =
     val fa = new MissedUpdateFinalizationAction(client, txd)
-    fa.updateCommitErrors(commitErrors)
+    fa.updateCommitErrors(commitErrors, Set())
     fa.markMissedUpdates()
     fa.complete
 
@@ -453,7 +453,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
                                 commitErrors: Map[StoreId, List[ObjectId]]): Future[Unit] =
     val fa = new MissedUpdateFinalizationAction(client, txd)
     fa.commitVoters(Some(voters), Map())
-    fa.updateCommitErrors(commitErrors)
+    fa.updateCommitErrors(commitErrors, Set())
     fa.markMissedUpdates()
     fa.complete
 
@@ -479,6 +479,42 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     yield
       entries.keySet shouldBe Set(UnackedCommitEntry.key(net.storeId1, txd.transactionId))
 
+  atest("a commit voter that reported but keeps the state for replay gets a UnackedCommits entry and its marks " +
+        "(R-W4, Q-W5)"):
+    // store1 quarantined the object (or its backend commit failed) and keeps T's CRL state: after a reload its
+    // recovered vote learns T late, and only this entry makes it apply again. store2 reported the same error without
+    // keeping anything, so it is repaired through its mark alone
+    val ptr = pointerWith(Array[Byte](4, 9))
+    val txd = refcountTxd(ptr)
+    val fa = new MissedUpdateFinalizationAction(client, txd)
+    fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)), Map())
+    fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> List(ptr.id), net.storeId2 -> List(ptr.id)),
+      keptForReplay = Set(net.storeId1))
+    fa.markMissedUpdates()
+    for
+      _ <- fa.complete
+      entries <- unackedEntries(Radicle.poolId, txd.transactionId)
+      marked <- markedStores(ptr, List(net.storeId0, net.storeId1, net.storeId2))
+    yield
+      entries shouldBe Map(UnackedCommitEntry.key(net.storeId1, txd.transactionId) ->
+        UnackedCommitEntry(txd.startTimestamp, None, List(ptr)))
+      marked shouldBe List(net.storeId1, net.storeId2)
+      fa.handedOffStores shouldBe Set(net.storeId1)
+
+  atest("a store keeping state for replay that was not a counted voter gets no UnackedCommits entry"):
+    val ptr = pointerWith(Array[Byte](4, 10))
+    val txd = refcountTxd(ptr)
+    val fa = new MissedUpdateFinalizationAction(client, txd)
+    fa.commitVoters(Some(Set(net.storeId0, net.storeId1)), Map())
+    fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil, net.storeId2 -> List(ptr.id)),
+      keptForReplay = Set(net.storeId2))
+    fa.markMissedUpdates()
+    for
+      _ <- fa.complete
+      entries <- unackedEntries(Radicle.poolId, txd.transactionId)
+    yield
+      entries shouldBe empty
+
   atest("an UnackedCommits entry records the voter's incarnation, and unknown for a store the driver never heard"):
     // The driver learned the commit without counting votes, hearing only store0's prepare reply. No store sent
     // TxCommitted, so every store gets an entry: store0's with its incarnation, the others' unknown
@@ -502,7 +538,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     val txd = refcountTxd(ptr)
     val fa = new MissedUpdateFinalizationAction(client, txd)
     fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)), Map())
-    fa.updateCommitErrors(Map(net.storeId0 -> Nil))
+    fa.updateCommitErrors(Map(net.storeId0 -> Nil), Set())
     fa.handedOffStores shouldBe empty
     fa.markMissedUpdates()
     for _ <- fa.complete yield
@@ -512,7 +548,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     val ptr = pointerWith(Array[Byte](4, 7))
     val txd = refcountTxd(ptr)
     val fa = new MissedUpdateFinalizationAction(client, txd)
-    fa.updateCommitErrors(Map(net.storeId0 -> Nil))
+    fa.updateCommitErrors(Map(net.storeId0 -> Nil), Set())
     fa.cancel()
     fa.markMissedUpdates()
     fa.handedOffStores shouldBe empty
@@ -804,14 +840,14 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     val txd = refcountTxd(pointerWith(Array[Byte](7, 4)))
     val fa = new PendingWriteMarker(txd)
     fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)), Map())
-    fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil))
+    fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil), Set())
     fa.handedOffStores shouldBe empty
     fa.markMissedUpdates()
     // The planned set is known from the hand-off, before the write lands
     fa.handedOffStores shouldBe Set(net.storeId2)
 
     // The store whose entry is being written now reports in
-    fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil, net.storeId2 -> Nil))
+    fa.updateCommitErrors(Map(net.storeId0 -> Nil, net.storeId1 -> Nil, net.storeId2 -> Nil), Set())
     fa.complete.isCompleted shouldBe false
 
     fa.write.success(())
@@ -826,7 +862,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       val txd = refcountTxd(pointerWith(Array[Byte](7, 5)))
       val fa = new PendingWriteMarker(txd)
       fa.commitVoters(Some(Set(net.storeId0, net.storeId1, net.storeId2)), Map())
-      fa.updateCommitErrors(Map(net.storeId0 -> Nil))
+      fa.updateCommitErrors(Map(net.storeId0 -> Nil), Set())
       fa.markMissedUpdates()
       if cancelAfter then fa.cancel()
       val err = new Exception("one pool's batch gave up")

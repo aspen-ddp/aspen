@@ -44,7 +44,7 @@ object RegisteredTransactionFinalizerSuite:
     override def complete: Future[Unit] = done.future
     override def execute(): Unit = executed = true
     override def cancel(): Unit = cancelled = true
-    override def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = errors = commitErrors :: errors
+    override def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]], keptForReplay: Set[StoreId]): Unit = errors = commitErrors :: errors
     override def commitVoters(voters: Option[Set[StoreId]], incarnations: Map[StoreId, StoreIncarnation]): Unit =
       this.voters = voters :: this.voters
 
@@ -64,7 +64,7 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     // Commit errors and voters given after the marker executes reach it
     val errors = Map(TransactionDriverSuite.ds0 -> List.empty[ObjectId])
     f.commitVoters(Some(Set(TransactionDriverSuite.ds0)), Map())
-    f.updateCommitErrors(errors)
+    f.updateCommitErrors(errors, Set())
     marker.voters should be (List(Some(Set(TransactionDriverSuite.ds0))))
     marker.errors should be (List(errors))
 

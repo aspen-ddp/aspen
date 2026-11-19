@@ -2445,6 +2445,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     // The cached state can no longer be served while txid1 holds its locks: the committed update cannot be applied
     frontend.discard(oid1)
     commitErrors(frontend, net, txid1) shouldBe List(oid1)
+    committedMessages(net).filter(_.transactionId == txid1).map(_.keptForReplay) shouldBe List(true)
     backend.get(oid1).get.metadata.revision shouldBe rev0
     stops() shouldBe Nil
     frontend.failStopped shouldBe false
@@ -2608,6 +2609,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.deliverCommits(Right(CommitError.IOFailure))
     committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
     frontend.failStopped shouldBe false
+    // The CRL state is kept for a reload to replay, so the finalizer gives the store an UnackedCommits entry (R-W4)
+    committedMessages(net).map(_.keptForReplay) shouldBe List(true)
   }
 
   /** A Frontend recovering a commit vote of txid1 (overwrite op1 at rev0) whose object the backend holds as `stored`,
@@ -2619,7 +2622,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
                     status: TransactionStatus.Value = TransactionStatus.Unresolved,
                     updates: List[ObjectUpdate] = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))),
                     crl: TestCrl = new TestCrl,
-                    verifier: QuarantineVerifier = QuarantineVerifier.Never)
+                    verifier: QuarantineVerifier = QuarantineVerifier.Never,
+                    lookup: ManualLookup = new ManualLookup)
       : (Frontend, TestNet, () => List[Throwable]) =
     val backend = new MapBackend(storeId):
       private var failNext = readError
@@ -2639,7 +2643,6 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       PersistentState.initial)
     val net = new TestNet
     var stops = List[Throwable]()
-    val lookup = new ManualLookup
     val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(),
       unackedLookup = lookup, quarantineVerifier = verifier, loadedAt = FrontendSuite.longLoaded,
       deferRecovery = true, onFailStop = err => stops = stops :+ err)
@@ -2690,6 +2693,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
        "its lock nor its update (Req F5, Todo 2.16)") {
     val (frontend, net, crl, verifier, stops) = quarantinedVote()
     committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
+    // The CRL state is kept for a reload to replay, so the finalizer gives the store an UnackedCommits entry (Q-W5)
+    committedMessages(net).map(_.keptForReplay) shouldBe List(true)
     stops() shouldBe Nil
     frontend.failStopped shouldBe false
     frontend.isQuarantined(oid1) shouldBe true
@@ -2730,12 +2735,53 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       TransactionDisposition.VoteCommit
   }
 
+  test("a quarantine's kept state reloaded after its transaction is finalized quarantines again through its " +
+       "UnackedCommits entry (Q-W5)") {
+    // The store quarantined op1 for txid1 and kept txid1's CRL state; it reloads before the verification completes.
+    // Every peer has finalized txid1, so the recovered vote learns the commit late. The entry the finalizer wrote for
+    // it (TxCommitted.keptForReplay) is what makes it re-check, and quarantine again, rather than apply nothing
+    def reloaded(answer: ManualLookup => Try[UnackedLookupResult]): (Frontend, TestNet, TestCrl, ManualVerifier) =
+      val later = mkObjectState(oid1)
+      later.metadata = later.metadata.copy(revision = ObjectRevision(txid2))
+      val crl = new TestCrl
+      val verifier = new ManualVerifier
+      val lookup = new ManualLookup
+      val (frontend, net, stops) = recoveredVote(later, crl = crl, verifier = verifier, lookup = lookup)
+      frontend.receiveTransactionMessage(TxFinalized(storeId, unackedDriver, txid1, committed = true, late = true,
+        owed = Set(), startTimestamp = HLCTimestamp.now))
+      // The recovery's own lookup, and the late commit's if it started one after it: each is answered
+      lookup.requests should contain (txid1)
+      var answered = 0
+      while answered < lookup.made.size do
+        val (txid, requestId) = lookup.made(answered)
+        answered += 1
+        lookup.answer(txid, answer(lookup), Some(requestId))
+      stops() shouldBe Nil
+      (frontend, net, crl, verifier)
+
+    val (frontend, net, crl, verifier) = reloaded(_.own)
+    frontend.isQuarantined(oid1) shouldBe true
+    verifier.made.map(_._1) shouldBe List(oid1)
+    crl.deleted shouldBe Nil
+    crl.dropped shouldBe Nil
+    committedMessages(net).filter(_.transactionId == txid1).map(_.keptForReplay) shouldBe List(true)
+    prepare(frontend, net, lockTxd(txid3, List(overwriteAfter(txid2)))).disposition shouldBe
+      TransactionDisposition.VoteAbort
+
+    // With no entry the vote applies nothing: the quarantine, held in memory only, would be gone
+    val (unentered, _, unenteredCrl, _) = reloaded(_.absent)
+    unentered.isQuarantined(oid1) shouldBe false
+    unenteredCrl.deleted shouldBe List(txid1)
+  }
+
   test("a transaction committed by other stores' votes applies nothing to a quarantined object and reports it") {
     val (frontend, net, _, _, stops) = quarantinedVote()
     prepare(frontend, net, lockTxd(txid3, List(overwriteAfter(txid2)))).disposition shouldBe
       TransactionDisposition.VoteAbort
     resolve(frontend, net, txid3, committed = true)
     committedMessages(net).filter(_.transactionId == txid3).map(_.objectCommitErrors) shouldBe List(List(oid1))
+    // An abort voter quarantines nothing and keeps nothing: repair restores it through its ErrorTree mark
+    committedMessages(net).filter(_.transactionId == txid3).map(_.keptForReplay) shouldBe List(false)
     stops() shouldBe Nil
     frontend.isQuarantined(oid1) shouldBe true
   }

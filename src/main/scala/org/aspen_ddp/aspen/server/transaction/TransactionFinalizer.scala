@@ -20,8 +20,11 @@ trait TransactionFinalizer {
     * that depend on knowing which peers have successfully processed the transaction (as indicated by
     * them sending Accepted messages) may delay action for some time to receive additional notifications
     * via this callback.
+    *
+    * `keptForReplay` holds every store whose TxCommitted said it keeps the transaction's CRL state for a reload to
+    * replay (a failed backend commit or a quarantine): it reported, but it still owes the transaction its replay
     */
-  def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit
+  def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]], keptForReplay: Set[StoreId]): Unit
 
   /** See FinalizationAction.commitVoters */
   def commitVoters(voters: Option[Set[StoreId]], incarnations: Map[StoreId, StoreIncarnation]): Unit = ()

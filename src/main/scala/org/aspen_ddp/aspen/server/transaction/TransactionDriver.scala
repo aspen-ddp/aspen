@@ -219,6 +219,9 @@ abstract class TransactionDriver(
   // Stores IDs of objects that could not be updated on stores as part of a successful commit
   protected var commitErrors: Map[StoreId, List[ObjectId]] = Map()
 
+  // Stores whose TxCommitted said they keep the transaction's CRL state for a reload to replay (TxCommitted.keptForReplay)
+  protected var keptForReplay: Set[StoreId] = Set()
+
   private val completionPromise: Promise[TransactionDescription] = Promise()
 
   private var shouldSendAcceptMessages: Boolean = false
@@ -539,7 +542,9 @@ abstract class TransactionDriver(
     synchronized {
       knownResolved += msg.from
       commitErrors += (msg.from -> msg.objectCommitErrors)
-      finalizer.foreach(_.updateCommitErrors(commitErrors))
+      if msg.keptForReplay then
+        keptForReplay += msg.from
+      finalizer.foreach(_.updateCommitErrors(commitErrors, keptForReplay))
     }
   }
 
@@ -774,7 +779,7 @@ abstract class TransactionDriver(
 
         // Update with initial commitErrors. This avoids problems when all TxCommit messages arrive
         // before we notice that resolution has been achieved
-        f.updateCommitErrors(commitErrors)
+        f.updateCommitErrors(commitErrors, keptForReplay)
 
         finalizer = Some(f)
 

@@ -33,16 +33,7 @@ X = cross-document-review (its section 5 lists contradictions between documents)
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.3  R-W4 + Q-W5  State kept for replay gets no UnackedCommits entry because its store sent TxCommitted. M.
-     MissedUpdateFinalizationAction.writeMissedUpdates gives a store that sent TxCommitted no UnackedCommits entry
-     (commitErrors.contains), even when that store kept T's CRL state as Unresolved for a later replay. After a
-     reload, the recovered vote learns T late, finds no entry and runs applyNothing; past the horizon, expiry
-     discards it.
-     - R-W4 (PLAUSIBLE, P1): a non-fatal failed backend commit is lost on reload. Narrow: FSIF-only errors on an
-       already inconsistent store, and ObjectMismatch leaves the object unreadable rather than reverting to pre-T.
-     - Q-W5 (CONFIRMED, P5): a quarantine, including a may-reinsert-deleted-keys re-apply, is dropped on reload.
-     Shared fix: TxCommitted flags state kept for replay, and the marker writes an entry for it. Do NOT re-save the
-     state as Committed: that reintroduces R-W5. (transaction-recovery.md R-W4; transaction-requirements.md Q-W5)
+(no open items)
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
@@ -149,11 +140,8 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1  R-W7 + Q-W8  Quarantine and kept-state documentation. S.
-     The claim that a reload re-quarantines or replays kept state is false until 1.3 is fixed: the Frontend.quarantine,
-     transactionFinalized and TxCommits scaladoc, the concludeTransactionState, Tx.allObjectCommitsComplete and
-     issueCommits comments, and server/store/CLAUDE.md Quarantine (R-W7). Move the orphaned scaladoc of
-     KVObjectState.allocationSliceSize onto it (Q-W8).
+7.1  Q-W8  Orphaned scaladoc. S.
+     Move the orphaned scaladoc of KVObjectState.allocationSliceSize onto it.
 
 7.2  CRL-W8  CRL documentation. S.
      server/crl/CLAUDE.md and CrashRecoveryLog.save say handlers run "in request order" (within one entry they run

@@ -157,6 +157,13 @@ class Tx( trs: TransactionRecoveryState,
     * included, is kept until their quarantine clears
     */
   private var quarantining: Set[ObjectId] = Set()
+
+  /** The CRL state, object data included, outlives TxFinalized for a reload to replay: a backend commit failed, or an
+    * object is quarantined. TxCommitted says so, and the finalizer then gives this store an UnackedCommits entry
+    * although it reported: the recovered vote learns the outcome late, and only the entry makes it apply (retrying the
+    * commit, or quarantining again) rather than apply nothing
+    */
+  private def keptForReplay: Boolean = backendCommitFailed || quarantining.nonEmpty
   private var committed: Boolean = false
   private var committing: Boolean = false
   private var commitHeld: Boolean = false
@@ -1211,13 +1218,13 @@ class Tx( trs: TransactionRecoveryState,
 
   private def allObjectCommitsComplete(): Unit = {
     committed = true
-    // A failed backend commit keeps the object data: a reloaded store recovers the transaction from it. See
-    // Frontend.transactionFinalized
+    // A failed backend commit keeps the object data: a reloaded store recovers the transaction from it and retries the
+    // commit through its UnackedCommits entry (keptForReplay). See Frontend.transactionFinalized
     // A quarantining one keeps it too: a reloaded store recovers the transaction, which quarantines its objects again
-    if !backendCommitFailed && quarantining.isEmpty then
+    if !keptForReplay then
       saveObjectUpdates = false
       crl.dropTransactionObjectData(storeId, transactionId)
-    val m = TxCommitted(lastProposer, storeId, transactionId, objectCommitErrors)
+    val m = TxCommitted(lastProposer, storeId, transactionId, objectCommitErrors, keptForReplay)
     net.sendTransactionMessage(m)
   }
 
@@ -1316,7 +1323,7 @@ class Tx( trs: TransactionRecoveryState,
 
     if (committed) {
       // Ensure the proposer knows we've successfully committed
-      val txc = TxCommitted(lastProposer, storeId, transactionId, objectCommitErrors)
+      val txc = TxCommitted(lastProposer, storeId, transactionId, objectCommitErrors, keptForReplay)
       net.sendTransactionMessage(txc)
     }
 

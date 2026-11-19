@@ -48,8 +48,8 @@ object RegisteredTransactionFinalizerFactory {
           case None => Future.unit
       }
 
-    def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = {
-      actions.foreach(_.updateCommitErrors(commitErrors))
+    def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]], keptForReplay: Set[StoreId]): Unit = {
+      actions.foreach(_.updateCommitErrors(commitErrors, keptForReplay))
     }
 
     override def commitVoters(voters: Option[Set[StoreId]], incarnations: Map[StoreId, StoreIncarnation]): Unit =

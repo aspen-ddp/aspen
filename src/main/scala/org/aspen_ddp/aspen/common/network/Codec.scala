@@ -628,7 +628,8 @@ object Codec extends Logging:
       to = Some(encode(o.to)),
       from = Some(encode(o.from)),
       transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
-      objectCommitErrors = ByteString.copyFrom(arr)
+      objectCommitErrors = ByteString.copyFrom(arr),
+      keptForReplay = o.keptForReplay
     )
 
   def decode(m: codec.TxCommitted): TxCommitted =
@@ -643,7 +644,7 @@ object Codec extends Logging:
     }
 
     TxCommitted(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
-      commitErrors)
+      commitErrors, m.keptForReplay)
 
 
   def encode(o: TxFinalized): codec.TxFinalized =

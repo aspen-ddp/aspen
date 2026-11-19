@@ -24,6 +24,9 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
   private var commitErrors: Map[StoreId, List[ObjectId]] = Map()
 
+  // Stores that reported but keep the transaction's CRL state for a reload to replay (TxCommitted.keptForReplay)
+  private var keptForReplay: Set[StoreId] = Set()
+
   // The commit voters the driver counted, if it counted them. None: unknown, so every silent store may hold one
   private var voters: Option[Set[StoreId]] = None
 
@@ -78,8 +81,10 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
   def complete: Future[Unit] = completionPromise.future
 
-  override def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = synchronized {
+  override def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]],
+                                  keptForReplay: Set[StoreId]): Unit = synchronized {
     this.commitErrors = commitErrors
+    this.keptForReplay = keptForReplay
 
     if !handedOff && txd.allDataStores.size == commitErrors.keysIterator.toSet.size && !commitErrors.valuesIterator.exists(_.exists(!lockOnly.contains(_))) then
       logger.trace(s"All stores responded to commit of tx ${txd.transactionId} without error. No MissedUpdates.")
@@ -135,10 +140,14 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     // finalized, so it owes it: it may have crashed holding its saved vote, and if it recovers after the transaction
     // is forgotten this entry is how it learns the transaction committed. The entry is written whether or not the
     // change leaves a trace. A store that never voted holds no vote to recover: the ErrorTree marks above repair it,
-    // so it gets no entry
+    // so it gets no entry.
+    // A voter whose TxCommitted says it keeps the transaction's CRL state for a reload to replay (a failed backend
+    // commit, or a quarantine) gets one too: after a reload its recovered vote learns the outcome late, and only the
+    // entry makes it apply again, retrying the commit or quarantining again, rather than apply nothing
     val changed = RequirementsApplyer.changedObjects(txd.requirements)
     val unacked = txd.allDataStores.toList.flatMap: storeId =>
-      if commitErrors.contains(storeId) || voters.exists(!_.contains(storeId)) then
+      val acknowledged = commitErrors.contains(storeId) && !keptForReplay.contains(storeId)
+      if acknowledged || voters.exists(!_.contains(storeId)) then
         None
       else
         val objects = txd.allHostedObjects(storeId).filter(ptr => changed.contains(ptr.id))

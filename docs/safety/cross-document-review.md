@@ -25,7 +25,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | CRL | Paxos, recovery | A save skipped after a final deletion (C1, C9) belongs to a transaction the store has concluded (2.1) |
 | CRL | Store lifecycle | Entries leave the device CRL only after another durable copy exists or the store is unservable on disk |
 | Transaction requirements | CRL, recovery | Recovered commit votes re-take their locks before any message is handled |
-| Transaction requirements | CRL, recovery | A quarantine survives a reload through the quarantining Tx's kept CRL state (not met: Q-W5, R-W4) |
+| Transaction requirements | CRL, recovery | A quarantine survives a reload through the quarantining Tx's kept CRL state and its UnackedCommits entry |
 | Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it |
 | Client reads | Requirements, rebuild | `InvalidObject.provesDeletion`: a commit voter of an unapplied allocation answers `AllocationPending` (2.5) |
 | Transaction recovery | Repair | ErrorTree and UnackedCommits entries are consumed only once the store can no longer join T, and only by the store the pool names |
@@ -67,10 +67,10 @@ The premises other subsystems take from this:
 * **A recovered or expiring commit vote is not dropped silently.** It accepts an abort, or discards itself, only after
   an UnackedCommits lookup that began after the abort (or the discard decision) found no entry, and a late commit
   with no entry applies nothing (`Tx.unackedCommitAbsent` -> `applyNothing`). The premise is that a counted voter
-  without an entry acknowledged T. It fails for a voter that acknowledged with `objectCommitErrors` and kept T's
-  state for a replay (a failed backend commit, `Frontend.TxCommits.failed`; a quarantine, `quarantinedConclusions`):
-  `MissedUpdateFinalizationAction.writeMissedUpdates` gives every store with a `TxCommitted` no entry, so a reload
-  after `TxFinalized` concludes the kept state as a late commit with nothing applied (R-W4, Q-W5).
+  without an entry acknowledged T. A voter that acknowledged with `objectCommitErrors` and keeps T's state for a
+  replay (a failed backend commit, `Frontend.TxCommits.failed`; a quarantine, `quarantinedConclusions`) says so in
+  `TxCommitted.keptForReplay`, and `MissedUpdateFinalizationAction.writeMissedUpdates` gives it an entry, so a reload
+  after `TxFinalized` re-applies the kept state through it (retrying the commit, or quarantining again).
 * **A save acknowledged without being written belongs to a concluded transaction.** The CRL skips a save of an id
   that an unwritten entry deletes finally and acknowledges it once the deletion is durable (crash-recovery-log.md C1,
   C9; `SimpleCRL.skippedAfterFinalDeletion`). A store queues a final deletion of T (`crl.deleteTransaction` in

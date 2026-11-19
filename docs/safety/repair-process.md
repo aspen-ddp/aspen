@@ -674,9 +674,9 @@ doubling to `MaxQuarantineRetryInterval` (60) heartbeats. A further quarantine r
 verification at once; an answer to an older attempt is ignored. A verification cut off by `VerifyDeadline` keeps
 running in the background, as a scan does, and its result still records in the store's DeferralState; its read times
 out first (`ObjectReadTimeout`, 15 s). The quarantine lives in memory only: a reloaded store recovers the quarantining
-transaction from the CRL and quarantines again only if the recovered vote re-applies (a non-late outcome or a found
-UnackedCommits entry); once T is finalized it has no entry and concludes with nothing applied, dropping the quarantine
-(transaction-requirements.md Q-W5). A quarantined object that is deleted, before or after the quarantine, is never
+transaction from the CRL and quarantines again when the recovered vote re-applies (a non-late outcome or a found
+UnackedCommits entry); the quarantining store's `TxCommitted` sets `keptForReplay`, so it has an entry once T is
+finalized (transaction-requirements.md 8.5). A quarantined object that is deleted, before or after the quarantine, is never
 verified (RP-W4). The verification counts the store's own quarantined copy among the read's `r` replies, like any
 other read: T's commit voters apply T before any later write over its locks (transaction-requirements.md 8.3), so a
 read majority holds T.

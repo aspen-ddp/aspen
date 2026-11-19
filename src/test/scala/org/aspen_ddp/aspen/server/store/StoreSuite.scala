@@ -366,7 +366,7 @@ class StoreSuite extends AnyFunSuite with Matchers:
     var handedOff: Set[StoreId] = Set()
     def complete: scala.concurrent.Future[Unit] = completion.future
     override def handedOffStores: Set[StoreId] = handedOff
-    def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = ()
+    def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]], keptForReplay: Set[StoreId]): Unit = ()
     def debugStatus: List[(String, Boolean)] = Nil
     def cancel(): Unit = ()
 

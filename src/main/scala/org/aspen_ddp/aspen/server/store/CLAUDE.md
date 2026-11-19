@@ -194,7 +194,9 @@
   once `StoreRepairer.verifyObject` reports the copy complete against a read at least the transaction's start. Otherwise
   it retries at heartbeat, 1 doubling to `MaxQuarantineRetryInterval` (60) heartbeats. In memory only: the quarantining
   transaction's CRL state, object data included, is kept until it clears (`concludeTransactionState` defers a
-  finalization or stub to `verificationComplete`), so a reloaded store quarantines again. Nothing is written for it
+  finalization or stub to `verificationComplete`), so a reloaded store quarantines again. Its `TxCommitted` sets
+  `keptForReplay`, so the finalizer gives the store an UnackedCommits entry, through which the recovered vote
+  re-applies (and quarantines again) even when it learns the outcome late. Nothing else is written for it
 - Ranged-write/append deltas are read through `EncodedAppendDelta`, which parses only the header and region table
   and XORs straight from the encoded buffer, so checking and applying never copy the delta
 

@@ -363,14 +363,16 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
 
   test("TxCommitted round-trip"):
     val original = TxCommitted(storeId(1), storeId(2), TransactionId(uuid(3)),
-      List(ObjectId(uuid(4)), ObjectId(uuid(5))))
+      List(ObjectId(uuid(4)), ObjectId(uuid(5))), keptForReplay = true)
     val decoded = Codec.decode(Codec.encode(original))
     decoded.to shouldBe original.to
+    decoded.keptForReplay shouldBe true
     decoded.objectCommitErrors.size shouldBe 2
     decoded.objectCommitErrors.map(_.uuid).toSet shouldBe original.objectCommitErrors.map(_.uuid).toSet
 
-    val noErrors = TxCommitted(storeId(1), storeId(2), TransactionId(uuid(3)), Nil)
+    val noErrors = TxCommitted(storeId(1), storeId(2), TransactionId(uuid(3)), Nil, keptForReplay = false)
     Codec.decode(Codec.encode(noErrors)).objectCommitErrors shouldBe empty
+    Codec.decode(Codec.encode(noErrors)).keptForReplay shouldBe false
 
   test("TxFinalized round-trip"):
     for late <- List(true, false) do

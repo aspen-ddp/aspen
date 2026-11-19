@@ -307,7 +307,10 @@ bootstrap pool's own trees, healed by the bootstrap tree sweep instead, repair-p
   * UnackedCommits `MissedUnackedCommit(store, txid, UnackedCommitEntry(startTimestamp, incarnation, objects))` for
     each store that sent no `TxCommitted`, is in `voters` when `voters` is known, and hosts an object T changes, with
     the store's incarnation from `incarnations` (`None`, encoded as the zero UUID, if the driver never heard it).
-    A store whose `TxCommitted` names objects gets their ErrorTree marks only, never an entry (R-W4 for a failed backend commit; transaction-requirements.md Q-W5 for a quarantine).
+    A store whose `TxCommitted` names objects gets their ErrorTree marks; it also gets an entry, under the same voter
+    rule, when its `TxCommitted` sets `keptForReplay`: it keeps T's CRL state for a reload to replay (a failed backend
+    commit or a quarantine, `Tx.keptForReplay`). The driver passes the set of such stores with the commit errors
+    (`updateCommitErrors`).
 * It then hands the marks to `client.missedUpdateMarker` (`handedOff`), recording the stores of the planned entries
   (`handedOffStores`) whatever the write's outcome. From then on only the write's outcome completes the action; a
   failed write fails it (the driver restarts the finalizer). `cancel` shares the action's lock with the hand-off, so a
@@ -342,7 +345,8 @@ up and fails every entry of the batch. The marker transaction is `replaySafe` (m
   persisted, so at least a write threshold of stores holds T. One naming objects comes from a store that holds T
   already (a stub), is not owed it (another incarnation), or keeps T's CRL state for a failed backend commit or a
   quarantine; the last two keep the object out of the write-threshold count until that state is replayed or repair
-  verifies the copy, and a reload after T's finalization concludes that state without replaying it (R-W4, Q-W5). An
+  verifies the copy. Such a store set `keptForReplay`, so it has an entry, and a reload after T's finalization
+  replays the state through it. An
   uncounted voter or non-voter that sent no `TxCommitted` gets only ErrorTree marks, which repair keeps
   until the store's copy reaches T's timestamp, read from the holders above. An owed voter's entry names its
   incarnation, or none when the finalizing driver did not count the votes and never heard from it; either way the
@@ -528,10 +532,15 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   makes every later transaction on it vote abort (`BackendCommitFailed`) until the store reloads. A quarantine keeps
   the quarantining Tx's CRL state, object data included, until `verificationComplete` clears it
   (`Frontend.concludeTransactionState`, `quarantinedConclusions`). Either kept state is recovered on reload as a
-  recovered commit vote, usually with status `Unresolved`, and re-applied (re-quarantining) only if it learns a
-  non-late commit or finds an entry. Its store sent `TxCommitted`, so it has no entry: once T is finalized, its late
-  commit (relay, or a late resolution) finds none and applies nothing, and past the horizon expiry discards it after
-  the same lookup (R-W4 for a failed backend commit, transaction-requirements.md Q-W5 for a quarantine).
+  recovered commit vote, usually with status `Unresolved`, and re-applied (re-quarantining) if it learns a non-late
+  commit or finds an entry. Its store's `TxCommitted` set `keptForReplay`, so a counted voter has an entry: once T is
+  finalized, its late commit (relay, or a late resolution) finds it and re-applies through it
+  (`appliesThroughEntry`), retrying the backend commit or quarantining again, as does expiry past the horizon after
+  the same lookup. The entry lists the store in `TxFinalized.owed`, but the kept state is replaced by an applied stub
+  only once it concludes (a quarantine's `verificationComplete`; a failed commit's state is never concluded while the
+  store is loaded), so a reload finds the state, not a stub. Repair deletes the entry only after reconciling every
+  object it names, which leaves the store holding T either way. The state is never re-saved as `Committed` for this:
+  a restored `Committed` seeds the host status cache with a non-finalized outcome (R-W5).
 
 ### 7.5 A commit vote whose peers may have forgotten the transaction
 
@@ -677,7 +686,8 @@ lookup that finds no entry.
 * **Vote persistence.** A counted commit vote is in the voter's CRL until the voter learns the outcome, its backend
   commits succeed and no quarantine of its objects names it, or the voter is rebuilt. It survives host and store
   restarts and is relocked on load before any new transaction can touch the same objects. A state kept past
-  finalization for a failed commit or a quarantine is concluded on reload without being replayed (R-W4, Q-W5).
+  finalization for a failed commit or a quarantine has an UnackedCommits entry (`TxCommitted.keptForReplay`), through
+  which a reload replays it.
 * **A recovered or expiring commit vote is not dropped silently.** It accepts an abort, or discards itself, only after
   an UnackedCommits lookup that began after the abort (or the discard decision) found no entry.
 * **No finalization without finalizers.** `TxFinalized` is sent only by a driver whose finalizer completed, by a
@@ -732,7 +742,7 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 | After the backend is durable, before `TxCommitted` | backend has T; CRL still has the data (drop is in memory) | Marked (an extra repair pass); replay skips objects showing T |
 | After `TxCommitted`, before `TxFinalized` | backend has T; CRL entry | Recovered Unresolved; no entry (it acknowledged). Driver or caches tell it committed; a late commit applies nothing |
 | After `TxFinalized`, CRL delete or stub not durable | possibly the old record | As the previous row; for an allocation a later deletion waited for the record's removal to be durable (7.4) |
-| After `TxFinalized`, state kept for a failed backend commit or a quarantine | the kept record, usually `Unresolved` | Recovered Unresolved; no entry (it sent `TxCommitted`). The late commit finds none and applies nothing, the quarantine is gone, and the object stays stale until repair consumes its ErrorTree mark (R-W4, Q-W5) |
+| After `TxFinalized`, state kept for a failed backend commit or a quarantine | the kept record, usually `Unresolved` | Recovered Unresolved; an entry (its `TxCommitted` set `keptForReplay`). The late commit, or expiry, finds it and re-applies through it: the backend commit is retried, or the object quarantined again |
 | Rebuild instead of recovery (failed load, fail-stop) | CRL entries dropped; new incarnation | Counted votes are lost; the store is rebuilt from peers; old-incarnation entries apply nothing. Safe while losses stay within the write threshold's tolerance (systemic-loss-protection.md) |
 
 ### 10.3 Driver-side failures
@@ -821,37 +831,6 @@ Suggested fix: bound each lookup by `UnackedLookupTimeout` with a timed read of 
 can have been lost (the store was replaced) and otherwise wait for the read.
 Effort: M   Priority: 5
 
-### R-W4. A commit vote kept for a failed backend commit is concluded on reload without being replayed (PLAUSIBLE; lost update)
-Mechanism: a counted commit voter whose backend commit fails with a non-fatal error (`Frontend.backendOperationComplete`,
-`Tx.commitComplete`) keeps the committed state in memory and T's CRL state past `TxFinalized`
-(`Frontend.TxCommits.failed`, `failedCommits`) so that a reload replays it, and sends `TxCommitted` naming the object.
-`MissedUpdateFinalizationAction.writeMissedUpdates` gives any store with a `TxCommitted` no UnackedCommits entry
-(`commitErrors.contains(storeId)`). On reload the recovered Tx (CRL status `Unresolved` unless a prepare or accept
-re-saved it after the resolution) looks its entry up (absent), is driven, and learns T late: from its own host's
-finalized relay after a store reload, from its peers' relays inside the horizon after a host restart. `Tx.lateCommit`
-looks up again, finds nothing, and `Tx.unackedCommitAbsent` -> `applyNothing` deletes the state. Past the horizon
-expiry discards it after the same lookup (`Frontend.expireTransaction`). `failedCommits` is in memory only. The same
-missing entry loses a quarantine across a reload: that half is transaction-requirements.md Q-W5.
-Trigger / scenario: only FSIF fails a commit without fail-stopping (`FsifBackend.update`, `updateExt`; RocksDB and the
-Map backend never return a commit error), and its `IOFailure` is fatal (the store is rebuilt). The three non-fatal
-errors are each excluded upstream for a commit voter whose object loaded: `SliceTooLarge` by
-`RequirementsChecker.checkSliceSize` against `StoreConfig.effectiveMaxSliceSize`, which includes FSIF's segment payload
-size; `InvalidPointer` and `ObjectMismatch` because the load read the object through the same store pointer and slot,
-which nothing remaps while the vote holds its lock (a repair install or `repairDelete` is refused under it). So the
-trigger needs an FSIF store already inconsistent (a bug or on-disk damage). Then, in a Replication(3, 2) pool, A and B
-cast the counted commit votes, C is silent; A applies; B's commit of X fails, B serves T from memory, T is finalized
-with B marked for X, and B's host restarts: its recovered Tx concludes with nothing applied.
-Consequence: X's update survives on A only, below the read threshold. Under `SliceTooLarge` or `InvalidPointer` B's
-backend still holds its pre-T copy, which a read restores with C's: the committed update is lost. Under
-`ObjectMismatch` B's backend holds no copy of X, so X reads unavailable until a store regains T, rather than pre-T.
-With `t > r` the update stays readable. Priority 1 by the README tiers (the consequence is lost committed data);
-PLAUSIBLE because no trigger has been found that the code itself produces on a consistent store.
-Suggested fix (shared with Q-W5): `TxCommitted` carries a flag saying the store keeps T's state for replay (a failed
-backend commit or a quarantine), and the marker writes an UnackedCommits entry for a counted voter that sets it. The
-recovered vote then finds the entry, re-applies through it (`appliesThroughEntry`), and retries the backend commit (or
-quarantines again). Correct the scaladoc and the guide (R-W7) with it.
-Effort: M   Priority: 1
-
 ### R-W5. A resolution learned from the UnackedCommits tree is saved, and restored after a restart, as an ordinary one (CONFIRMED; persistence)
 Mechanism: `Tx.unackedCommitFound` and `Tx.unackedCommitNotOwed` resolve through `resolved(true, record = false)`,
 which still sets `txStatus = Committed`. The next save persists it: the prepare of its own proof-holding driver's
@@ -893,16 +872,3 @@ Suggested fix: run each `execute()` in a try/catch in `Finalizer`, and turn a th
 `Finalizer.of` does for a failed creation.
 Effort: S   Priority: 5
 
-### R-W7. Scaladoc and the store guide say a reload replays a state kept for a failed commit or a quarantine (CONFIRMED; documentation)
-Mechanism: the `Frontend.quarantine` scaladoc ("a reloaded store recovers it, fails the same re-check, and
-quarantines the object again"), the comment in `Frontend.concludeTransactionState` ("a reloaded store recovers it and
-quarantines again"), the `Frontend.TxCommits` scaladoc ("a reloaded store recovers the transaction from it, and its
-transaction driver concludes them"), the `Frontend.transactionFinalized` scaladoc ("a reloaded store recovers the
-transaction from it"), the comments in `Tx.allObjectCommitsComplete` ("a reloaded store recovers the transaction,
-which quarantines its objects again") and `Tx.issueCommits`, and `server/store/CLAUDE.md`, Quarantine ("so a reloaded
-store quarantines again"). This entry is the one owner of these texts.
-Trigger / scenario: R-W4 and transaction-requirements.md Q-W5. Once T is finalized, the recovered vote concludes as a
-late commit with no entry and applies nothing.
-Consequence: these texts present a replay the code does not perform.
-Suggested fix: correct them with the fix R-W4 and Q-W5 share, or state the late-commit conclusion if it is not made.
-Effort: S   Priority: 7

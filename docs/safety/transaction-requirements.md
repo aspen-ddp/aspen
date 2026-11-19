@@ -519,9 +519,10 @@ heartbeat (`retryQuarantineVerifications`) after 1 heartbeat, doubling to `MaxQu
 quarantine is in memory only; the quarantining Tx's CRL state, object data included, is kept until it clears
 (`allObjectCommitsComplete` keeps the object data, `concludeTransactionState` defers a finalization or stub to
 `verificationComplete` through `quarantinedConclusions`, and `expireStubs` keeps a stub of such a transaction). A
-reloaded store recovers that state, but quarantines again only if the recovered vote re-applies, which it does on a
-non-late outcome or a found UnackedCommits entry; its store sent `TxCommitted`, so it has no entry, and on a late
-outcome it applies nothing and the quarantine is lost (Q-W5).
+reloaded store recovers that state and quarantines again when the recovered vote re-applies, which it does on a
+non-late outcome or a found UnackedCommits entry. The store's `TxCommitted` sets `keptForReplay` (`Tx.keptForReplay`),
+so the finalizer gives a counted voter an entry even though it reported, and a late outcome re-applies through it
+(`appliesThroughEntry`) rather than apply nothing.
 
 A recovered commit vote whose object fails to load with anything but `ObjectNotFound` fail-stops the store
 (`Tx.objectLoadFailed`), because a later load could succeed and find no lock. On a write-frozen store
@@ -739,36 +740,6 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
   transaction's lifetime than the write threshold's margin covers, and is alarmed; there is no way out of the wait.
 
 ## Open weaknesses
-
-### Q-W5. State kept for a quarantine gets no UnackedCommits entry, so a reload drops the quarantine (CONFIRMED; quarantine persistence)
-Mechanism: `Frontend.quarantine` is in memory only; its durability rests on keeping the quarantining Tx's CRL state
-(`concludeTransactionState` -> `quarantinedConclusions`) for a reload to replay. But the store sent `TxCommitted`
-naming the object (`objectCommitErrors`, `Tx.issueCommits`), and `MissedUpdateFinalizationAction.writeMissedUpdates`
-gives any store with a `TxCommitted` no UnackedCommits entry (`commitErrors.contains(storeId)`). The kept state
-carries the status it was last saved with, normally `Unresolved` (`Tx.resolved` saves nothing). After a reload the
-recovered commit vote re-takes its locks, looks up its entry (absent), and learns the outcome as a late commit from the
-peers' status-cache relay or expiry adoption: `Tx.lateCommit` -> lookup -> `unackedCommitAbsent` -> `applyNothing`,
-which unlocks, never re-applies (`issueCommits` is not reached) and lets `concludeTransactionState` delete the state,
-since the new Frontend holds no quarantine. Past the horizon expiry discards it after the same lookup. The same missing
-entry affects state kept for a failed backend commit: transaction-recovery.md R-W4. The texts that claim a reload
-re-quarantines are listed in transaction-recovery.md R-W7.
-Trigger / scenario: S quarantines object o for T at apply (8.5), or a re-apply quarantines it for a key it may write
-back (`mayReinsertDeletedKeys`, 10.5c). T's `TxFinalized` reaches S and its state is kept for the quarantine; the
-verification has not completed (the object is unreadable for a while, or repair defers on locks). S's host or store
-restarts, or the store is transferred, before it does. The recovered Tx learns T late and concludes with nothing
-applied: o is served and votes again from a copy that may lack T, although S's vote counted.
-Consequence: o backs commit votes before it is verified, and a re-apply quarantine whose copy lacked T loses that
-copy's replay (the ErrorTree mark from the report remains, so repair restores T while `r` stores hold it). A stale
-transaction cannot gain from the dropped quarantine: a later commit over T's locks waits for T in lock order (8.3), so
-the later commit's voters hold T, and at most `w - t` stores lack it, S included.
-Suggested fix (shared with transaction-recovery.md R-W4): `TxCommitted` carries a flag saying the store keeps T's state
-for replay (a quarantine or a failed backend commit), and the marker writes an UnackedCommits entry for a counted voter
-that sets it. The recovered vote then finds the entry, re-applies through it (`appliesThroughEntry`), and quarantines
-again. Re-saving the kept state as `TransactionStatus.Committed` instead is not a fix: a restored `Committed` status
-seeds the host status cache with a non-finalized `Committed` for a T every peer may have forgotten (the `Tx`
-constructor's `statusCache.updateStatus`), so the status-cache relay answers prepares for T non-late and finalization
-re-runs, the defect transaction-recovery.md R-W5 describes for tree-learned resolutions.
-Effort: M   Priority: 5
 
 ### Q-W6. A re-applied traceless update quarantines an object that already holds it (CONFIRMED; spurious quarantine)
 Mechanism: `Tx.issueCommits` excludes from quarantine only skipped objects in `RequirementsApplyer.appliedBy`, which

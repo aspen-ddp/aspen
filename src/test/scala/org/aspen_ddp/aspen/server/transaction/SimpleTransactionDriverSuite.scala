@@ -52,11 +52,11 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
   }
 
   /** A leader's first driver for stores 0 to 2 whose transaction has committed and whose finalization never completes */
-  def resolvedDriver(handedOff: Set[StoreId] = Set()): (SimpleTransactionDriver, TMessenger, ManualTasks) =
+  def resolvedDriver(handedOff: Set[StoreId] = Set(), finalizer: TFinalizer = new TFinalizer(autoComplete = false))
+      : (SimpleTransactionDriver, TMessenger, ManualTasks) =
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val messenger = new TMessenger()
     val tasks = new ManualTasks(summon[ExecutionContext])
-    val finalizer = new TFinalizer(autoComplete = false)
     finalizer.handedOff = handedOff
     val driver = new SimpleTransactionDriver(summon[ExecutionContext], 100.milliseconds, 3.seconds, ds0, messenger, tasks,
       txd, finalizer, TransactionDriver.Start(initialProposal = true))
@@ -86,10 +86,24 @@ class SimpleTransactionDriverSuite extends AnyFunSuite with Matchers {
     resolvedSentTo(messenger) shouldBe Set(ds0, ds1, ds2)
 
     messenger.clear()
-    driver.receiveTxCommitted(TxCommitted(ds0, ds1, driver.txd.transactionId, Nil))
+    driver.receiveTxCommitted(TxCommitted(ds0, ds1, driver.txd.transactionId, Nil, keptForReplay = false))
 
     tasks.fireAll()
     resolvedSentTo(messenger) shouldBe Set(ds0, ds2)
+  }
+
+  test("the finalizer learns which reporting stores keep the transaction's state for replay (R-W4, Q-W5)") {
+    val finalizer = new TFinalizer(autoComplete = false)
+    val (driver, _, _) = resolvedDriver(finalizer = finalizer)
+    finalizer.created shouldBe true
+    val txid = driver.txd.transactionId
+    driver.receiveTxCommitted(TxCommitted(ds0, ds1, txid, List(simpleObj.id), keptForReplay = true))
+    driver.receiveTxCommitted(TxCommitted(ds0, ds2, txid, List(simpleObj.id), keptForReplay = false))
+    finalizer.peers shouldBe Set(ds1, ds2)
+    finalizer.keptForReplay shouldBe Set(ds1)
+    // A re-sent TxCommitted never takes it back
+    driver.receiveTxCommitted(TxCommitted(ds0, ds1, txid, List(simpleObj.id), keptForReplay = false))
+    finalizer.keptForReplay shouldBe Set(ds1)
   }
 
   test("a finalized driver stops retransmitting TxResolved") {

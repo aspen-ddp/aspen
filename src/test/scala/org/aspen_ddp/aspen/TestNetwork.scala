@@ -306,7 +306,7 @@ class TestNetwork(executionContext: ExecutionContext,
       if stalled(txd) then
         new TransactionFinalizer:
           def complete: Future[Unit] = Promise[Unit]().future
-          def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = ()
+          def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]], keptForReplay: Set[StoreId]): Unit = ()
           def debugStatus: List[(String, Boolean)] = List("stalled" -> false)
           def cancel(): Unit = ()
       else

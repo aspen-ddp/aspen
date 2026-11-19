@@ -79,7 +79,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     TxAcceptResponse(storeId(1), storeId(2), TransactionId(uuid(3)), ProposalId(4, 1.toByte),
       Right(TxAcceptResponse.Accepted(true))),
     TxResolved(storeId(1), storeId(2), TransactionId(uuid(3)), committed = true, late = false, proof = false),
-    TxCommitted(storeId(1), storeId(2), TransactionId(uuid(3)), List(ObjectId(uuid(4)))),
+    TxCommitted(storeId(1), storeId(2), TransactionId(uuid(3)), List(ObjectId(uuid(4))), keptForReplay = true),
     TxFinalized(storeId(1), storeId(2), TransactionId(uuid(3)), committed = true, late = false, owed = Set(),
       startTimestamp = HLCTimestamp(0x123456789abcL)),
     TxHeartbeat(storeId(1), storeId(2), TransactionId(uuid(3))),

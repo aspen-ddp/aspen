@@ -106,8 +106,12 @@ object TransactionDriverSuite {
       this
     }
 
-    def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = synchronized {
+    /** The stores the driver last reported as keeping the transaction's state for replay */
+    var keptForReplay: Set[StoreId] = Set()
+
+    def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]], keptForReplay: Set[StoreId]): Unit = synchronized {
       peers = commitErrors.keySet
+      this.keptForReplay = keptForReplay
     }
 
     /** None until the driver reports its commit voters */
@@ -145,7 +149,7 @@ object TransactionDriverSuite {
     var cancelled = false
     def complete: Future[Unit] = done.future
     override def handedOffStores: Set[StoreId] = handedOff
-    def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = ()
+    def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]], keptForReplay: Set[StoreId]): Unit = ()
     def debugStatus: List[(String, Boolean)] = Nil
     def cancel(): Unit = cancelled = true
 

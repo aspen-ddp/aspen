@@ -541,7 +541,9 @@ class Frontend(val storeId: StoreId,
     *
     * In memory only: the quarantining transaction's CRL state, object data included, is kept until the quarantine
     * clears (concludeTransactionState), so a reloaded store recovers it, fails the same re-check, and quarantines the
-    * object again. Nothing is written for this. It declares no lost store
+    * object again. Its TxCommitted says the state is kept (keptForReplay), so the finalizer gives the store an
+    * UnackedCommits entry: through it the recovered vote re-applies, and quarantines again, even once the transaction
+    * is finalized and it learns the outcome late. Nothing else is written for this. It declares no lost store
     */
   def quarantine(pointer: ObjectPointer, minTimestamp: HLCTimestamp, txid: TransactionId, reason: String): Unit =
     val oid = pointer.id
@@ -696,7 +698,8 @@ class Frontend(val storeId: StoreId,
     * The store deletes a committed transaction's CRL state only once every backend commit it issued for that
     * transaction has succeeded. Until then the CRL entry, object data included, outlives the Tx, which is forgotten at
     * finalization. A failed commit leaves the record, and so the CRL entry, for the life of the loaded store: a reloaded
-    * store recovers the transaction from it, and its transaction driver concludes it.
+    * store recovers the transaction from it and re-applies it through the UnackedCommits entry its TxCommitted earned
+    * (keptForReplay), retrying the commit.
     *
     * @param outstanding commits not yet reported complete by the backend
     * @param failed some commit failed
@@ -1502,7 +1505,8 @@ class Frontend(val storeId: StoreId,
   /** A transaction was finalized. Its CRL state is deleted now, unless backend commits this store issued for it are
     * outstanding or failed: the store deletes a committed transaction's CRL state only once every backend commit it
     * issued for that transaction has succeeded (see TxCommits). A reloaded store recovers the rest from the CRL, and its
-    * transaction driver concludes them. Aborted transactions, and those that committed nothing here, are deleted at once.
+    * recovered vote re-applies them through its UnackedCommits entry (TxCommitted.keptForReplay). Aborted
+    * transactions, and those that committed nothing here, are deleted at once.
     *
     * With `stub` (the transaction's start) the state is replaced by an applied stub instead (recordAppliedStub), at
     * the same point: the store holds the committed transaction's update and an UnackedCommits entry naming it may
@@ -1538,7 +1542,8 @@ class Frontend(val storeId: StoreId,
     */
   private def concludeTransactionState(txid: TransactionId, stub: Option[HLCTimestamp], keepAdmission: Boolean): Unit =
     if quarantineKeeps(txid) then
-      // Kept until the quarantine clears (verificationComplete): a reloaded store recovers it and quarantines again
+      // Kept until the quarantine clears (verificationComplete): a reloaded store recovers it and, through its
+      // UnackedCommits entry (TxCommitted.keptForReplay), quarantines again
       quarantinedConclusions(txid) = quarantinedConclusions.get(txid).flatten.orElse(stub)
     else if stub.nonEmpty && !stubs.contains(txid) then
       recordAppliedStub(txid, stub.get, keepAdmission)(())

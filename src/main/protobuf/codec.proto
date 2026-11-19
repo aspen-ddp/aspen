@@ -266,6 +266,7 @@ message TxCommitted {
   StoreId from = 2;
   UUID transaction_uuid = 3;
   bytes object_commit_errors = 4; // sequence of 16-byte UUIDs
+  bool kept_for_replay = 5;
 }
 
 message TxFinalized {

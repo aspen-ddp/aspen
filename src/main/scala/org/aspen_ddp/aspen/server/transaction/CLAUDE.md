@@ -29,7 +29,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   the missed-update marker included, executes at once, so an action failing or retrying through an outage never keeps
   the missed stores unmarked. `complete` waits for every action, then fails with the first failure.
   An action whose type cannot be loaded, or whose factory throws, is a failed action (`Finalizer.of`), not a failed
-  finalizer creation
+  finalizer creation; so is one whose `execute()` throws (caught in `Finalizer`), so the marker is never orphaned
 - Stall alarm (paxos-transactions 7.7): a committed transaction its driver has not finalized `FinalizationStallAfter`
   (60 s) after resolving it is a stall (`TransactionDriver.finalizationStall`; `Store.stalledFinalizations` is the
   metric). Each store logs one `FINALIZATION STALLED` error line a minute while it has any (`FinalizationStallReport`).

@@ -239,7 +239,9 @@ the client.
   TxFinalized, sent once a finalizer completed every action. `complete` fails with the first failure once all have
   settled. An action whose type cannot be loaded, or whose factory throws, is a failed action (`Finalizer.of`), so the
   marker still runs. The marker is the first action (`TransactionBuilder.buildTranaction` prepends it). An action
-  whose `execute()` throws is not caught: the constructor fails, which is a failed creation (R-W6). The shipped
+  whose `execute()` throws is a failed action too: `Finalizer` catches the throw as that action's failure, so the
+  finalizer is still created, the actions after it still execute, and the marker still receives `commitVoters` and
+  `updateCommitErrors` and is cancelled with the others; no marker is left running outside a finalizer. The shipped
   actions run their work inside `retryStrategy.retryUntilSuccessful`, which turns a synchronous throw into a failed
   attempt.
 * **Failure path.** A finalizer that cannot be created, or whose `complete` fails, is logged at error and started
@@ -832,22 +834,3 @@ Suggested fix: bound each lookup by `UnackedLookupTimeout` with a timed read of 
 `withReadTimeout` returns), so it settles as a failure that the heartbeat retries; or re-issue only when the answer
 can have been lost (the store was replaced) and otherwise wait for the read.
 Effort: M   Priority: 5
-
-### R-W6. A finalization action whose execute() throws orphans the marker before it (CONFIRMED; finalizer hygiene)
-Mechanism: `RegisteredTransactionFinalizerFactory.Finalizer` runs `actions.foreach(_.execute())` in its constructor
-with no guard, and the marker is the first action (`TransactionBuilder.buildTranaction` prepends it). A later
-action's synchronous throw escapes the constructor. `TransactionDriver.startFinalizer` treats it as a failed creation
-(`finalizerFailed(None, ...)`), so the marker, which has already executed and scheduled its mark, is never given
-`commitVoters` or `updateCommitErrors`, is never cancelled, and its stores never reach `failedHandedOff`. The actions
-after the thrower never execute.
-Trigger / scenario: a user-jar `FinalizationAction` whose `execute()` throws. The shipped actions wrap their work in
-`retryStrategy.retryUntilSuccessful`, which catches synchronous throws.
-Consequence: each finalizer attempt (backing off to 60 s, forever for a deterministic throw) leaves an orphan
-marker. Two seconds later it writes ErrorTree marks for every non-lock-only object of every store, and an
-UnackedCommits entry naming no incarnation for every store hosting a changed object, none listed in any `owed`. The
-result is continuous repair churn while T stays unfinalized (alarmed as a stall). A marker run independent of the
-other actions (4.4) does not hold for this failure.
-Suggested fix: run each `execute()` in a try/catch in `Finalizer`, and turn a throw into that action's failure, as
-`Finalizer.of` does for a failed creation.
-Effort: S   Priority: 5
-

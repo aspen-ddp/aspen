@@ -144,3 +144,31 @@ class RegisteredTransactionFinalizerSuite extends AnyFunSuite with Matchers:
     f.handedOffStores should be (m.owed)
     new Finalizer(List(new StubAction)).handedOffStores should be (Set())
   }
+
+  // A throw from execute() must not escape the constructor: the marker before it has already scheduled its mark, and
+  // a failed creation would leave it without voters or commit errors, uncancelled
+  test("an action whose execute throws is a failed action: the finalizer is created and keeps the marker") {
+    val marker = new StubMarker
+    val err = new IllegalStateException("execute failed")
+    val thrower = new StubAction:
+      override def execute(): Unit = throw err
+    val after = new StubAction
+    val f = new Finalizer(List(marker, thrower, after))
+
+    marker.executed should be (true)
+    after.executed should be (true)
+
+    val errors = Map(TransactionDriverSuite.ds0 -> List.empty[ObjectId])
+    f.commitVoters(Some(Set(TransactionDriverSuite.ds0)), Map())
+    f.updateCommitErrors(errors, Set())
+    marker.voters should be (List(Some(Set(TransactionDriverSuite.ds0))))
+    marker.errors should be (List(errors))
+
+    after.done.success(())
+    f.complete.isCompleted should be (false)
+    marker.done.success(())
+    f.complete.value should be (Some(scala.util.Failure(err)))
+
+    f.cancel()
+    marker.cancelled should be (true)
+  }

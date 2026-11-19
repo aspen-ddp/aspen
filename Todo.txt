@@ -57,11 +57,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.4  R-W6  A finalization action whose execute() throws orphans the marker before it. CONFIRMED, S.
-     Finalizer calls execute() unguarded. A user action that throws synchronously fails the finalizer after the
-     marker has scheduled, and that orphan marker then writes marks for every store, every retry (up to every 60 s).
-     Fix: catch each execute() throw as that action's failure.
-
 5.5  R-W3  UnackedCommits lookups pile up as untimed reads during a metadata outage. CONFIRMED, M.
      retryUnackedLookups re-issues every 5 s without cancelling the old lookup, and Host.unackedLookup reads through
      the untimed client: about N*D/5 retransmitting reads after an outage of D seconds with N waiting Txs. Fix: use

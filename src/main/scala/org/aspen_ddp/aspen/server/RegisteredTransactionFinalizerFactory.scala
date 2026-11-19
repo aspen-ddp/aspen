@@ -10,6 +10,7 @@ import org.aspen_ddp.aspen.server.transaction.TransactionFinalizer
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 
 object RegisteredTransactionFinalizerFactory {
 
@@ -29,6 +30,10 @@ object RegisteredTransactionFinalizerFactory {
     *
     * Each retry of a failed finalizer runs the marker again; its writes are idempotent.
     *
+    * An action whose `execute()` throws is a failed action, like one that could not be created (`Finalizer.of`): the
+    * throw never escapes the constructor, so the finalizer exists, the actions after it still execute, and the marker
+    * still receives voters and commit errors and is cancelled with the others.
+    *
     * The marker receives `updateCommitErrors` and `commitVoters` right after the finalizer is created, before its
     * `errorTimeout` lets it write, and keeps later updates.
     *
@@ -39,10 +44,16 @@ object RegisteredTransactionFinalizerFactory {
     */
   class Finalizer(val actions: List[FinalizationAction])(using ec: ExecutionContext) extends TransactionFinalizer {
 
-    actions.foreach(_.execute())
+    /** Each action's settlement: its `complete`, or the failure its `execute()` threw */
+    private val settled: List[Future[Try[Unit]]] = actions.map { a =>
+      try
+        a.execute()
+        a.complete.transform(t => Success(t))
+      catch case NonFatal(err) => Future.successful(Failure(err))
+    }
 
     val complete: Future[Unit] =
-      Future.sequence(actions.map(_.complete.transform(t => Success(t)))).flatMap { results =>
+      Future.sequence(settled).flatMap { results =>
         results.collectFirst { case Failure(err) => err } match
           case Some(err) => Future.failed(err)
           case None => Future.unit

@@ -88,10 +88,10 @@ class Tx( trs: TransactionRecoveryState,
     * Paxos or a TxResolved: see savedStatus */
   private var resolvedFromTree: Boolean = false
 
-  /** The status every CRL save records. A resolution learned from the UnackedCommits tree saves Unresolved: restored
-    * as resolved, it would seed the host's status cache with a non-finalized Committed for a transaction every peer
-    * may have forgotten (whose relay answers non-late), and lose notOwedHere. A restart instead looks the entry up
-    * again and takes the same path (transaction-recovery 7.4)
+  /** The status every CRL save records, and status replies report until finalized (statusForExpiry). A resolution
+    * learned from the UnackedCommits tree saves Unresolved: restored as resolved, it would seed the host's status cache
+    * with a non-finalized Committed for a transaction every peer may have forgotten (whose relay answers non-late), and
+    * lose notOwedHere. A restart instead looks the entry up again and takes the same path (transaction-recovery 7.4)
     */
   private def savedStatus: TransactionStatus.Value =
     if resolvedFromTree then TransactionStatus.Unresolved else txStatus
@@ -1855,7 +1855,10 @@ class Tx( trs: TransactionRecoveryState,
   /** This Tx's state as a status reply reports it, and as its own expiry round counts it. A commit vote counts only
     * once durable (voteDurable): an expiry commit counting it relies on its lock surviving a crash. Unresolved here
     * with an outcome from the status cache (outcomeDecided), it reports that outcome, as the cache now holds it (a
-    * finalization recorded there since included), so an observer adopts it
+    * finalization recorded there since included), so an observer adopts it. A resolution learned from the
+    * UnackedCommits tree, until finalized, is reported as its CRL saves it (savedStatus): Unresolved, with its vote and
+    * accept, so a peer decides by its tally as after a restart here. Reported committed, a peer would adopt a non-late
+    * commit of a T every acceptor may have forgotten, record a non-finalized Committed and re-run its finalization
     */
   def statusForExpiry: TxStatusResponse.TxStatus =
     val amnesiac = muted && frontend.mayHaveForgottenUndecided(txd.startTimestamp)
@@ -1865,6 +1868,7 @@ class Tx( trs: TransactionRecoveryState,
         statusCache.getStatus(transactionId).filter(_.status != TransactionStatus.Unresolved) match
           case Some(e) => (e.status, e.finalized, e.late)
           case None => (if committed then TransactionStatus.Committed else TransactionStatus.Aborted, false, false)
+      case _ if resolvedFromTree && ofinalized.isEmpty => (savedStatus, false, false)
       case _ => (txStatus, ofinalized.nonEmpty, lateOutcome)
     TxStatusResponse.TxStatus(status, finalized, late = late, holdsAcceptorState = !nonHolder,
       accepted = if muted then None else acceptor.persistentState.accepted.map(_._2),

@@ -155,6 +155,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   A resolution learned from the tree (`unackedCommitFound`, `unackedCommitNotOwed`) saves `Unresolved`
   (`Tx.savedStatus`): restored as resolved it would seed the host cache with a non-finalized `Committed` for a T its
   peers forgot and lose `notOwedHere`; restored unresolved it looks its entry up again (transaction-recovery 7.2)
+  Until finalized, its status replies report the saved status too (`Tx.statusForExpiry`: `Unresolved`, with its
+  vote and accept), so no peer's expiry adopts a non-late commit from it; peers decide by the tally
 - Coverage: entries exist only for unacknowledged counted voters (every silent store when the voters are unknown).
   These reach the write threshold, so uncounted voters and non-voters are repaired by their ErrorTree marks alone
   (transaction-recovery 5.3). Any narrowing of entries must keep this rule

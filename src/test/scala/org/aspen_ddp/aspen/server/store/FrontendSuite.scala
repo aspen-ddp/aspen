@@ -23,7 +23,7 @@ import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend, UpdateForm}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache, StoreObjectCache}
-import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
+import org.aspen_ddp.aspen.server.transaction.{ExpiryTally, TransactionStatusCache, Tx}
 import org.aspen_ddp.aspen.client.DataObjectState
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -3571,6 +3571,28 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       val saved = crl.savedStates.drop(before).filter(_.txd.transactionId == unackedTxid)
       saved.size shouldBe 2
       saved.map(_.status).distinct shouldBe List(TransactionStatus.Unresolved)
+    }
+
+  // A status reply reports a tree-learned resolution as its CRL saves it: a peer adopting a non-late commit would
+  // record a non-finalized Committed for a T every peer may have forgotten, and re-run its finalization
+  for (entry, name) <- List((None, "its own"), (Some(incarnationA), "another")) do
+    test(s"a recovered commit vote resolved by an entry naming $name incarnation reports Unresolved to expiry") {
+      val (frontend, _, net, _, lookup) = unackedFixture()
+      lookup.answer(unackedTxid, entry.fold(lookup.own)(i => Success(UnackedLookupResult.Found(Some(i)))))
+      frontend.transactions(unackedTxid).status shouldBe TransactionStatus.Committed
+
+      val txd = lockTxd(unackedTxid, List(deleteK2))
+      net.sentTx = Nil
+      frontend.receiveTransactionMessage(TxStatusRequest(storeId, StoreId(poolId, 1), unackedTxid, reqUUID,
+        txd.startTimestamp))
+      val replies = statusResponses(net).map(_.status)
+      replies.size shouldBe 1
+      val status = replies.head.get
+      status.status shouldBe TransactionStatus.Unresolved
+      status.finalized shouldBe false
+      status.late shouldBe false
+      status.votedCommit shouldBe true
+      ExpiryTally.decide(txd, Map(storeId -> Some(status))) should not be a [ExpiryTally.Decision.Adopt]
     }
 
   test("a held TxFinalized abort is not replaced by a later held TxResolved, so the Tx is forgotten once accepted") {

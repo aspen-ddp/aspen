@@ -276,7 +276,8 @@ the client.
   only on `TxFinalized` or a late outcome (`Tx.applyNothing`); `unackedCommitFound`, `unackedCommitNotOwed` (for a recovered or expiring
   vote) and `proveCommitted` record nothing in the status cache, so a finalized cache entry, and the late relay from
   it, always stems from a real `TxFinalized` or late outcome. Nor does a restart seed one from a tree-learned resolution:
-  its saves record `Unresolved` (7.2, `Tx.savedStatus`).
+  its saves record `Unresolved` (7.2, `Tx.savedStatus`). Nor does a peer's expiry adoption: until finalized, its status
+  replies report the saved status (`Tx.statusForExpiry`), so a peer decides by its tally, as after a restart here.
 
 ## 5. Recording missed updates (situation 6)
 

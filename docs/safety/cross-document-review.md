@@ -36,7 +36,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Repair | Rebuild, transfers | The ownership fence (host and device) keeps superseded copies from consuming entries |
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
-| Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit (fails for a tree-learned commit: X-W3) |
+| Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again; the leftover drop releases only the charge it was issued for, unchanged since |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
 
@@ -240,9 +240,8 @@ cache holds outcomes, never object state, and is monotone (`TransactionStatusCac
 raises the host's eviction watermark, so an evicted entry's absence is never trusted. A relay from the cache
 (`Store.handleTransactionMessage`) runs before the forget-floor check and is trusted as far as the entry is: a
 non-finalized `Committed` entry stems only from a Paxos, relayed or expiry-commit resolution: a tree-learned
-resolution records none and saves `Unresolved` (transaction-recovery.md 7.2). An expiry adoption is the exception: the
-tree-learned Tx reports its commit non-late in status replies, and a peer adopting it records a non-finalized
-`Committed` (X-W3). A self-relay is delivered after the Tx the prepare creates and any driver started for it exist, so
+resolution records none, saves `Unresolved` and reports `Unresolved` in status replies until finalized
+(`Tx.statusForExpiry`), so no expiry adoption records one either (transaction-recovery.md 7.2). A self-relay is delivered after the Tx the prepare creates and any driver started for it exist, so
 both learn the outcome; below the floor the Frontend refuses the prepare and nothing is created.
 
 ## 3. Capacity
@@ -295,36 +294,12 @@ Every clock comparison that crosses subsystems, and what bounds it:
 
 ## 5. Contradictions
 
-* **Tree-learned commits spread as non-late.** paxos-transactions.md 10.2 and transaction-recovery.md 7.2 say a
-  non-finalized `Committed` cache entry never stems from a tree-learned resolution, so nothing spreads a non-late
-  commit known only from the tree. `Tx.statusForExpiry` reports such a Tx's commit with `late = false`, and
-  `ExpiryTally.decide` adopts it (X-W3).
 * **Out-of-date citations outside docs/safety.** Backlog.txt cites systemic-loss-protection.md items that no longer
   exist, and `ExpiryTally.decideUnknown`'s scaladoc carries history (X-W6).
 
 ---
 
 ## Open weaknesses
-
-### X-W3: A commit learned from the UnackedCommits tree is reported non-late to expiry, and adopted as one
-Verdict CONFIRMED. Priority 5. Effort S.
-Mechanism: `Tx.unackedCommitFound` (outside expiry) and `unackedCommitNotOwed` resolve with `resolved(true, record =
-false)`: `txStatus` is `Committed`, `lateOutcome` false. `Tx.statusForExpiry` reports `(txStatus, finalized = false,
-late = lateOutcome)`, so a peer's expiry round (`Frontend.receiveStatusResponse` -> `ExpiryTally.decide`) adopts a
-non-late commit (`Decision.Adopt(committed = true, finalizedOrLate = false)`) and delivers `TxResolved(late = false)`
-to its own Tx: its host cache records a non-finalized `Committed` (`Tx.resolved`), whose relays answer non-late, and a
-driver reached by such a relay treats it as a resolution and runs T's finalizer again (`onResolution`). Trigger: T committed and was
-finalized while a store P was cut off; P's Tx for T reaches expiry while another store's recovered vote for T has
-found its entry and awaits `TxFinalized`.
-Consequence: the case `Tx.savedStatus` exists to prevent: T's finalization re-runs long after T was finalized, writing
-markers and UnackedCommits entries for stores that forgot T (they then delete them by reconcile, or write stubs from
-`owed`), and the adopted Tx waits for a `TxFinalized` from that re-run or for its expiry to count more than `w - t`
-non-holders (`ExpiryTally.decideKnown`). Idempotent, so no wrong
-state, but repair and metadata work for a decided transaction, and the documents' claim that a tree-learned commit is
-never spread non-late is false.
-Suggested fix: have `statusForExpiry` report a tree-learned resolution as the CRL saves it (`savedStatus`,
-`Unresolved`, with its commit vote), so peers decide by the tally, or report it `late`, so an adopter takes the
-late-commit path and looks its own entry up.
 
 ### X-W6: Citations and history outside docs/safety
 Verdict CONFIRMED. Priority 7. Effort S.

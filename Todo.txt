@@ -62,13 +62,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.1 [X-W3, X section 5] A commit learned from the UnackedCommits tree is reported non-late to expiry and adopted. CONFIRMED, S
-    cross-document-review.md X-W3. `Tx.statusForExpiry` reports `late = lateOutcome` (false for a tree-learned
-    resolution), so a peer's `ExpiryTally.decide` adopts a non-late commit, its cache records a non-finalized
-    `Committed`, and a relayed driver re-runs T's finalization long after T was finalized. Idempotent, but wasted
-    repair and metadata work, and it contradicts paxos-transactions.md 10.2 / transaction-recovery.md 7.2. Fix: report
-    a tree-learned resolution as saved (`Unresolved`, with its vote) or as `late`.
-
 5.2 [SL-W10] A lost device CRL marks a finished rebuild awaiting its flip.                            CONFIRMED, S
     systemic-loss-protection.md SL-W10. `DeviceDiscovery.openDeviceCrl` spares only `holdsOwnState` directories; a
     `rebuild-complete` copy has no save file, held nothing in the lost CRL, yet is retired and rebuilt again. Fix:

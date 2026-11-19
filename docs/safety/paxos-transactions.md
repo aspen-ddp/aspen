@@ -697,8 +697,9 @@ repair, no safety effect.
   The same relay is sent whenever a resolved entry exists, also to a store that holds a Tx (a duplicate there), and
   also below the floor, where the Frontend then refuses the prepare and the leader starts no driver. A non-finalized
   `Committed` entry stems only from a Paxos, relayed or expiry-commit resolution, never from a tree-learned one, whose
-  saved status is `Unresolved` (6.4, transaction-recovery.md 7.2), so the relay never spreads a non-late commit known
-  only from the tree.
+  saved status, and status replies until finalized (`Tx.statusForExpiry`), are `Unresolved` (6.4,
+  transaction-recovery.md 7.2), so neither a relay nor a peer's expiry adoption spreads a non-late commit known only
+  from the tree.
 * Tx unknown, no outcome cached, T below the store's floor: refused, no Tx at all (`Frontend.refusePrepare`); the
   designated leader starts no driver. The rebuilt store's `acceptorSince` mute is checked first and still creates its
   muted, possibly proving Tx.

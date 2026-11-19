@@ -74,7 +74,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   def rebuildingStoreIds: Set[StoreId] = rebuildingStores.keySet
 
   /** Cancels the rebuilds of the given stores of `deviceId` for its shutdown, returning, by store, the future of
-   *  each one's slot release. A rebuild already past its walk finishes instead and writes its entry Offline. */
+   *  each one's slot release. A cancel during the walk, sweep, retries or finish's close fails the pass; a rebuild
+   *  already past finish's abort-latch re-check (or found finished by start, awaiting its flip) completes instead
+   *  and writes its entry Offline. */
   def cancelFor(deviceId: StorageDeviceId, rebuilding: Set[StoreId]): Map[StoreId, Future[Unit]] =
     rebuilding.toList.flatMap: storeId =>
       rebuildingStores.get(storeId).map: sr =>

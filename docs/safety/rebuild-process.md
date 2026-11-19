@@ -787,16 +787,4 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 
 ## Open weaknesses
 
-### RB-W11. Documentation corrections outside docs/safety (CONFIRMED; documentation)
-Mechanism / corrections:
-* `server/host/CLAUDE.md` (store copies): "Scratch areas (`creating/`, `rebuilding/<id>`, transfer staging) are ...
-  swept whole at device load". `DeviceDiscovery.loadOwnedDevice` sweeps `creating/`, transfer staging and `deleting/`
-  only; `rebuilding/<id>` holds resumable checkpoints and is deleted only by `StoreRebuilds.abandonUnlisted` (and a
-  first pass's `createStaging`).
-* `StoreRebuilds.cancelFor` and `DeviceShutdown.stopDeviceWork` scaladoc: "a rebuild already past its walk finishes
-  instead and writes its entry Offline". A cancel during the sweep or the retries fails the pass; only a rebuild past
-  `finish`'s latch re-check (or in `start`'s already-in-place path) finishes.
-* `StorageDeviceState.StoreEntry` scaladoc cites "rebuild-process.md 4.5", which does not exist (2.1, 5.1).
-* `RebuildingStore.sweepPending` scaladoc cites the finding id "RB-W1"; `restoreObject`'s comment tells history
-  ("Before the walks moved onto TierEngine ...").
-Effort: S   Priority: 7
+None.

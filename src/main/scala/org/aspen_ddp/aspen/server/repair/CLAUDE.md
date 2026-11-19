@@ -68,7 +68,7 @@
   decrease, and a copied one (Reconcile, rebuild) is a read's, the max over the stores matching its revision, so a
   read that reflects the missed transaction passes it. A whole-object KeyValue pass that defers a locked key still
   takes the read's object timestamp, as a caught-up store would hold it, since key requirements check per-key
-  timestamps. The entry stays incomplete until the key is reconciled (repair 13.3-3)
+  timestamps. The entry stays incomplete until the key is reconciled (repair-process 6.3, 6.4)
 - Absence from the AllocationTree is not a deletion (repair-process 9.2): it may be an AllocationFinalizationAction
   running late. For an entry older than `RepairPolicy.minErrorEntryAgeForDeletion` (60 s), `repairAbsent` reads the
   object through its pool, using the entry's pointer (an UnackedCommits entry's own, or one rebuilt from an ErrorTree

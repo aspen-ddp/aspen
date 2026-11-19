@@ -1223,22 +1223,4 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-### CRL-W8. Documentation outside docs/safety contradicts the CRL's behavior (CONFIRMED; documentation)
-Mechanism and corrections:
-- `server/crl/CLAUDE.md` (completion handlers bullet): "so every handler runs in request order". Within one entry the
-  handlers run newest first (`LogEntry.completionHandlers` is prepended, `runCompletionHandlers` runs it in list
-  order); only across entries, and among `afterInFlight` barriers, is it request order (C2).
-- `CrashRecoveryLog.save` scaladoc: "in the order the saves were made". Same correction.
-- `CrlAdmission.tryChargeLoaded` scaladoc: "the CRL can hold for a store with a save file only records of that file".
-  It can also hold entries an earlier tenancy left (`StoreLoader.awaitCrlLoad`'s comment, 3.3 step 4); the check is
-  sound because the load's `dropStore` is durable before the file is saved (6.1, A3).
-- `StoreRouter.install` comment: "its CRL completions run on the CRL's thread only to send or to post". They run on
-  the CRL's completion thread (`SimpleCRL.completions`).
-- `DeviceShutdown.CrlShutdownEc` scaladoc: "a CRL whose thread has died never completes its shutdown". A dead CRL's
-  thread completes the shutdown latch itself (`SimpleCRL.ioThread`'s catch, `shutdownWriter`); what can hold a
-  shutdown thread is a hung write (10.6), which still justifies the cached pool.
-- `SimpleCRL.completions` scaladoc cites a former finding id ("(CRL-W4)"); drop it.
-Trigger / scenario: a reader relying on handler order within an entry, or on the stale threading statements.
-Consequence: wrong reasoning by a future change; no runtime effect.
-Suggested fix: edit the texts as listed.
-Effort: S   Priority: 7
+None.

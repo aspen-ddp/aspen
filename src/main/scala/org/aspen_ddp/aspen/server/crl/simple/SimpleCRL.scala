@@ -405,7 +405,7 @@ class SimpleCRL private (streamsDir: os.Path,
 
   /** The completion thread: runs every save, stub, deletion and barrier handler, in the order the CRL thread hands
     * them over (crash-recovery-log C2). Kept off the writer and CRL threads, whose next write and next entry's build
-    * would otherwise wait for the handlers' network sends (CRL-W4). Shut down with the writer: handlers already handed
+    * would otherwise wait for the handlers' network sends. Shut down with the writer: handlers already handed
     * over, all of durable entries, still run */
   private val completions = Executors.newSingleThreadExecutor: r =>
     val t = new Thread(r, "crl-completions")

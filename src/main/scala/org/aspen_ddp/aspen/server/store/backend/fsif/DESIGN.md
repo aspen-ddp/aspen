@@ -671,7 +671,8 @@ correlated loss.
 **Host routes for `BackendFailed` and other failed-backend checks.** Each of these writes `rebuild-required`:
 
 - **Served store** (`StoreRebuilds.handleBackendFailed`, then `backendFailed`). The store is marked, unloaded and left
-  offline, its CRL state dropped (`crl.dropStore`) once the marker is on disk, and the device is checked.
+  offline, and the device is checked. Its CRL entries stay live in the device CRL (`closeUnloaded(dropDurably =
+  false)`) until the rebuild's retire saves them with the copy it keeps and drops them.
 - **Not served, not replaced, directory on a loaded device** (`StoreRebuilds.backendFailed`).
 - **Failed before its `LoadStore` ran** (`StoreLoader.handleLoad`, then `StoreRebuilds.retireUnserved`).
 - **Opened but not served** (device unloaded or another backend serves it) **and failed**
@@ -691,7 +692,7 @@ correlated loss.
 
 | # | Trigger | Where | What happens | Why believed | False trigger looks like |
 |---|---|---|---|---|---|
-| L20 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` rejects it (truncated, unparsable, or naming another store) | `StoreLoader.handleLoad`, then `StoreRebuilds.crlSaveFileLost` and `retireUnserved` | Closed unserved, marked, offline, device checked | The file is the only copy of the store's transaction state | A CRL save format change: every store with a save file (every store closed by a network transfer out) is declared lost on its next load. **Generic: all backends** |
+| L20 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` rejects it (truncated, unparsable, or naming another store), or its state can never fit the device's CRL (`StoreLoader.neverFits`: a transaction above `maxTransactionBytes`, or the whole above the admission limit at the CRL's growth cap plus that bound) | `StoreLoader.handleLoad`, then `StoreRebuilds.crlSaveFileLost` and `retireUnserved` | Closed unserved, marked, offline, device checked | The file is the only copy of the store's transaction state | A CRL save format change: every store with a save file (every store closed by a network transfer out) is declared lost on its next load; for never-fits, a change to `CrlAdmission.recoveredBytes` or the CRL bounds in a release, or a transfer onto a device with a smaller CRL. **Generic: all backends** |
 | L21 | Adoption of a device: an Offline or Active store has a transfer-out marker (a network transfer out) but a missing or unusable `crl_save.log` | `DeviceDiscovery.adoptionClass`; marked in `DeviceMetadata.adoptDevice`; entry written Rebuilding in the same transaction | Adopted as Rebuilding, marked | The transfer's close forced the file, so it was lost afterwards | A save-file read path that fails on the adopting host's version (format, or a path change in `Backend.crlSaveFile`): every store on every moved device. **Generic** |
 | L22 | Adoption: an Offline or Active store's directory has `rebuild-required` | `DeviceDiscovery.adoptionClass` | CrlLost, so adopted Rebuilding | The previous host already marked it | Inherits whatever falsely marked it on the previous host. **Generic** |
 

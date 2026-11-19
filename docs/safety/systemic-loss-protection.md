@@ -496,19 +496,4 @@ with its copies retained in `pending-delete/` or at their paths, and nothing to 
 
 ## Open weaknesses
 
-### SL-W8. Documentation outside docs/safety misstates declaration paths (CONFIRMED; documentation)
-Mechanism / errors:
-- `server/host/StoreRouter.scala`, `recoverOrFail` scaladoc: names `StoreRebuilds.handleRecoveryFailed`, which does
-  not exist; the handler is `StoreRebuilds.handleFailStopped`.
-- `server/store/backend/fsif/DESIGN.md` 4.2, "Served store": says the store's CRL state is dropped (`crl.dropStore`)
-  once the marker is on disk. `StoreRebuilds.backendFailed` closes it with `closeUnloaded(dropDurably = false)`; its
-  entries stay live until the rebuild's retire saves and drops them. 4.3 L20 omits the never-fits case of D3
-  (`StoreLoader.neverFits`).
-- `Backlog.txt`, "System-level protection against correlated 'lost store' declarations": lists "a live voter's apply
-  re-check fails" among `Frontend.failStop` triggers; a failed re-check quarantines the object instead
-  (`Frontend.quarantine`).
-Trigger / scenario: a reader follows these to audit or change the declaration paths.
-Consequence: wrong handler names, wrong retry expectations and a wrong account of when a failed store's CRL entries
-leave the device CRL.
-Suggested fix: correct the four texts as above.
-Effort: S   Priority: 7
+None.

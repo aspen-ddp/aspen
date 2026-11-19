@@ -22,8 +22,9 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   *                                     of the object (StoreRepairer.repairAbsent). Absence alone
   *                                     never deletes: only a read failing
   *                                     InvalidObject.provesDeletion drops the slice
-  * @param proofAfterDeferrals          consecutive passes a repair entry's object may have parts deferred by a lock
-  *                                     before the scan proves them with a transaction instead of waiting for the
+  * @param proofAfterDeferrals          passes since its last complete pass (stale passes neither count nor reset
+  *                                     it) a repair entry's object may have parts deferred by a lock before the
+  *                                     scan proves them with a transaction instead of waiting for the
   *                                     lock to clear (RepairProofs)
   */
 case class RepairPolicy(scanIntervalFloor: Duration,

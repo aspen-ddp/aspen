@@ -187,8 +187,9 @@ object DeferralState:
   * brings each recorded object back into agreement with the rest of the system, and removes the entry.
   *
   * Parts of an object deferred by a lock are retried on later passes, only those keys when nothing else was left
-  * undone. Once they have been deferred for `RepairPolicy.proofAfterDeferrals` consecutive passes, the scan proves
-  * them with a transaction (RepairProofs) and, if it commits, reconciles them from the read the proof used.
+  * undone. Once `RepairPolicy.proofAfterDeferrals` passes since the entry's last complete pass have deferred them
+  * (a stale pass neither counts nor resets the count), the scan proves them with a transaction (RepairProofs) and,
+  * if it commits, reconciles them from the read the proof used.
   */
 class StoreRepairer(client: AspenClient, target: RepairTarget,
                     /** The host the scans run on. When given, a store is scanned only while its pool's entry names
@@ -298,17 +299,6 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
           if !control.cancelled then deferral.retain(counts.touchedKeys)
           counts.result
 
-  /** Reconciles the store's copy of every node of the bootstrap pool's own errorTree, then of its unackedCommitsTree,
-    * every tier. Writes to those nodes run with missed-update tracking off (`limitTracking`: marker writes and entry
-    * deletions in these trees), so a bootstrap store that misses one gets no entry: this sweep is what heals it. Each
-    * node goes through `repairUpdate` with no minimum timestamp (complete means the store's copy matches the read) and
-    * no proofs: a proof is an untracked write that would collide with the marker traffic these nodes carry, so a key
-    * locked at every attempt waits for a later sweep. No entries are created or deleted.
-    *
-    * A node that cannot be read (deleted under the walk by a join or root reduction, or the pool degraded) counts as
-    * incomplete, not as a failure of the sweep. Once the store stops being repairable here the remaining nodes are
-    * skipped and counted incomplete.
-    */
   /** Verifies a quarantined object (Frontend.quarantine, QuarantineVerifier): reconciles the store's copy with a read of
     * it as repairUpdate does for an entry whose update started at `minTimestamp`, with proofs after lock deferrals.
     * `complete` means the store's copy now matches a read no older than `minTimestamp`, exactly what an entry needs to
@@ -335,6 +325,17 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                 false
             .map(_ => ReconcileResult(Set(), objectLevelDeferred = false, stale = false))
 
+  /** Reconciles the store's copy of every node of the bootstrap pool's own errorTree, then of its unackedCommitsTree,
+    * every tier. Writes to those nodes run with missed-update tracking off (`limitTracking`: marker writes and entry
+    * deletions in these trees), so a bootstrap store that misses one gets no entry: this sweep is what heals it. Each
+    * node goes through `repairUpdate` with no minimum timestamp (complete means the store's copy matches the read) and
+    * no proofs: a proof is an untracked write that would collide with the marker traffic these nodes carry, so a key
+    * locked at every attempt waits for a later sweep. No entries are created or deleted.
+    *
+    * A node that cannot be read (deleted under the walk by a join or root reduction, or the pool degraded) counts as
+    * incomplete, not as a failure of the sweep. Once the store stops being repairable here the remaining nodes are
+    * skipped and counted incomplete.
+    */
   def sweepBootstrapTrees(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState,
                           control: ScanControl = ScanControl()): Future[SweepResult] =
     if storeId.poolId != PoolId.BootstrapPoolId then
@@ -739,7 +740,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       case _ => Nil
 
     // A refcount deferred under an object lock is proven on either object type; a KeyValue object's revision, min,
-    // max, left and right by a FullContentLock as well
+    // max, left and right by an ExclusiveRevisionLock as well (RepairProofs.proveObjectLevel)
     val objectProofs: List[() => Future[Boolean]] =
       if !result.objectLevelDeferred then Nil
       else read match

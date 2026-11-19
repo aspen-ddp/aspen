@@ -48,7 +48,6 @@ object RequirementsChecker extends Logging {
         throw ObjectErr(oid, TransactionCollision(other))
       }
 
-    /** Object-level locks: lockedToTransaction and a KV object's content lock. Every requirement collides with them */
     /** The store's copy of TransactionBuilder.refuseBlindWrites. Unless the transaction allocates the object (its
       * initial content), a key Delete needs a KeyRevision on its key, a required revision or a content lock, and a
       * change of min, max, left or right needs a required revision. A blind Delete leaves no tombstone and
@@ -68,6 +67,7 @@ object RequirementsChecker extends Logging {
           case _ => throw ObjectErr(oid, BlindWrite())
         }
 
+    /** Object-level locks: lockedToTransaction and a KV object's content lock. Every requirement collides with them */
     def checkObjectLocks(oid: ObjectId, os: ObjectState): Unit =
       collide(oid, os.lockedToTransaction)
       os.kvState.foreach(kvs => collide(oid, kvs.contentLocked))

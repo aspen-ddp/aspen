@@ -246,7 +246,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
 
   /** Recovers `store`'s transactions and applied stubs from `trs`, on its executor. A recovery that throws may have recreated only some
    *  of them: the store keeps holding its messages and dropping reads (Frontend.awaitRecovery stays set) and is
-   *  fail-stopped on the control thread (StoreRebuilds.handleRecoveryFailed) */
+   *  fail-stopped on the control thread (StoreRebuilds.handleFailStopped) */
   private def recoverOrFail(store: Store, trs: StoreRecoveryState): Unit =
     try
       store.frontend.recover(trs)
@@ -320,7 +320,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
     // issued from a task queued behind this one, and the CRL answers it behind the saves queued before it. Nothing
     // reaches the old store after this task: routed tasks find `closed`, its Frontend's posts find another store
     // installed (Store's `post`), its backend's completions find `closed`, and its CRL completions run on the CRL's
-    // thread only to send or to post. So no save of the old store follows the read, and no record of it is left out
+    // completion thread only to send or to post. So no save of the old store follows the read, and no record of it is left out
     // of what the new store counts
     if replaced != null then
       replaced.executor.execute: () =>

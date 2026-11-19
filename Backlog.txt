@@ -150,7 +150,7 @@ System-level protection against correlated "lost store" declarations
     - a store whose CRL transactions fail to recover (`Host.StoreFailStopped`, from `StoreRouter.recoverOrFail` and
       `readAndRecover`);
     - (2026-11-14, Todo 1.4) a commit voter that cannot apply the committed update it voted for (its in-memory apply
-      throws, or a live voter's apply re-check fails), and a recovered commit vote whose object fails to load with
+      throws; a failed apply re-check quarantines the object instead, `Frontend.quarantine`), and a recovered commit vote whose object fails to load with
       anything but ObjectNotFound (`Frontend.failStop`). A bug in the requirement checker or applier would trip this
       on every replica of an object at once;
     - a failure during a store's close (`StoreRebuilds.failedOnClose`), an unusable `crl_save.log`
@@ -335,9 +335,6 @@ Traceless commits follow-ups (minor, from the 2026-11-08 reviews):
 - TracelessCommits entries are one per transaction (not merged per object like ErrorTree entries), but only for
   commit voters that sent no TxCommitted (all silent stores when the driver did not count the votes), so an offline
   store gets none. A voter that keeps missing errorTimeout under allocation-heavy load still grows the tree. Watch it.
-- No repair proof compares a KV object's min/max/left/right (the object-level proof is a RevisionLock), and a
-  SetMin/DeleteMin/... without a required revision is a traceless change that `deletesKeys` does not flag. Check
-  whether such updates occur and, if so, how a store that misses one is repaired.
 
 CRL admission lanes waste headroom on data-only devices (from Todo 4.3, 2026-11-15):
 - `AdmissionTier` reserves the top 1/4 of a device's CRL admission limit for metadata- and bootstrap-pool stores

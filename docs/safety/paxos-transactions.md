@@ -1133,11 +1133,4 @@ transaction eventually resolves without operator action given a healthy quorum.
 
 ## Open weaknesses
 
-### P-W7. Orphaned scaladoc of Tx.determineDisposition (CONFIRMED; documentation)
-Mechanism: in `server/transaction/Tx.scala` the scaladoc describing how the vote is decided ("Decides the vote, or
-withholds it. A muted transaction is proven committed ...") is followed directly by the scaladoc of `invalidDescription`,
-so it documents nothing, and `determineDisposition` itself has none.
-Trigger / scenario: a reader or a doc tool looking up `determineDisposition`.
-Consequence: the order of the vote rules (6.1) is hard to find in the code.
-Suggested fix: move the first block onto `determineDisposition`.
-Effort: S   Priority: 7
+None.

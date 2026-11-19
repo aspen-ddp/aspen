@@ -909,14 +909,6 @@ class Tx( trs: TransactionRecoveryState,
       txd.originatingClient.foreach: client =>
         net.sendClientResponse(TransactionVote(client, storeId, transactionId, r.disposition))
 
-  /** Decides the vote, or withholds it. A muted transaction is proven committed or takes no part, its requirements
-    * unchecked. One that has seen no client prepare votes abort, or proves the commit, its requirements unchecked
-    * (prefer-abort, see awaitingClientPrepare). An object whose backend commit failed on this store, that is
-    * quarantined, or that a rebuilt store's inherited votes may lock (Frontend.inheritedVoteLock) gets an abort
-    * vote. One with a commit in flight, whether or not this transaction builds on it, makes the transaction wait with
-    * its vote withheld and no locks taken (see Frontend.commitInFlight); the requirements are checked against the state
-    * as it is once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
-    */
   /** Why the description breaks a rule the store checks before voting (DescriptionValidator), if it does. Checked
     * at vote only: the result depends on the description and the store's pool alone, so a committed transaction
     * passed it
@@ -926,6 +918,14 @@ class Tx( trs: TransactionRecoveryState,
     reason.foreach(r => logger.warn(s"Tx $transactionId on store $storeId: refusing its description, which $r"))
     reason
 
+  /** Decides the vote, or withholds it. A muted transaction is proven committed or takes no part, its requirements
+    * unchecked. One that has seen no client prepare votes abort, or proves the commit, its requirements unchecked
+    * (prefer-abort, see awaitingClientPrepare). An object whose backend commit failed on this store, that is
+    * quarantined, or that a rebuilt store's inherited votes may lock (Frontend.inheritedVoteLock) gets an abort
+    * vote. One with a commit in flight, whether or not this transaction builds on it, makes the transaction wait with
+    * its vote withheld and no locks taken (see Frontend.commitInFlight); the requirements are checked against the state
+    * as it is once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
+    */
   private def determineDisposition(): Unit = if undecidedFrozen then {
     // A frozen Tx never decides a vote: "frozen, loaded and undecided" is then a final non-voter, as its status reply
     // reports it (receiveStatusRequest). Whatever it was waiting for is moot

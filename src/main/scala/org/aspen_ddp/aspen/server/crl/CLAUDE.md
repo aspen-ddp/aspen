@@ -136,7 +136,8 @@
   (`SimpleCRL.completions`), never on the writer or CRL thread (safety `crash-recovery-log.md` C2). At each
   `WriteComplete` the CRL thread issues the next entry first, then hands over the written entry's handlers and its
   `afterInFlight` barriers, so the handlers' network sends overlap the next write. A barrier or empty deletion that
-  completes at once is handed over too, so every handler runs in request order. Handlers must not block: one slow
+  completes at once is handed over too, so entries' handlers and `afterInFlight` barriers run in request order;
+  within one entry the handlers run newest first (`LogEntry` prepends them). Handlers must not block: one slow
   handler delays every later one on the device. One that throws fails the CRL (`HandlerFailed`). `BackendTiming`
   logs the `crl write` and `crl handlers` stages. Tests hold a written entry unacknowledged with
   `entryWrittenForTest` (`SimpleCRLSuite.holdEntryOf`), never with a blocking handler

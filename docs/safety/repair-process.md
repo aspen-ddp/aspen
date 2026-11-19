@@ -849,19 +849,4 @@ the quarantining store retries at heartbeat.
 
 ## 14. Open weaknesses
 
-### RP-W5. Repair scaladoc and module guide errors (CONFIRMED; documentation)
-Mechanism: documentation outside docs/safety:
-- `server/repair/CLAUDE.md`, completion-gate bullet: cites "repair 13.3-3", which does not exist (repair-process 6.3
-  and 6.4 hold the argument).
-- `StoreRepairer.prove`, comment on the object proofs: says a KeyValue object's revision, min, max, left and right are
-  proven "by a FullContentLock"; `RepairProofs.proveObjectLevel` takes an `ExclusiveRevisionLock`.
-- `StoreRepairer` class scaladoc and `RepairPolicy` `proofAfterDeferrals` scaladoc: say "consecutive passes"; the
-  count is of lock-deferred passes since the last complete pass, and stale passes neither count nor reset it (8.1).
-- `StoreRepairer.sweepBootstrapTrees`: its scaladoc sits above `verifyObject`'s, so `verifyObject` carries two and
-  `sweepBootstrapTrees` none.
-- `RepairTarget.mayJoinTransaction` scaladoc: speaks of UnackedCommits entries only; ErrorTree entries are left too
-  (`repairErrorEntry`).
-Trigger / scenario: a reader follows the comments.
-Consequence: misleading descriptions of the proof trigger, the proof's lock and the gate's argument.
-Suggested fix: correct the text as above.
-Effort: S   Priority: 7
+None.

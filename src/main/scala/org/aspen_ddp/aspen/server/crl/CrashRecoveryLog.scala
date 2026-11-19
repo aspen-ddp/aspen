@@ -159,7 +159,7 @@ trait CrashRecoveryLog {
       Future.sequence(state.transactions.map(saveT)).map(_ => ())
 
   /** Saves `state` for `txid`; `completionHandler` runs once it is durable, on the CRL's completion thread (SimpleCRL),
-    * in the order the saves were made. A handler must not block: it delays every later one of the device */
+    * in the order the saves were made across entries (within one entry, newest first). A handler must not block: it delays every later one of the device */
   def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit
 
   /** Forgets the object data of `txid`'s state, in memory only: nothing is written, so a restart may still recover

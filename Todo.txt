@@ -69,32 +69,7 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.2  CRL-W8  CRL documentation. S.
-     server/crl/CLAUDE.md and CrashRecoveryLog.save say handlers run "in request order" (within one entry they run
-     newest first); the CrlAdmission.tryChargeLoaded scaladoc says "only that file's records"; the StoreRouter.install
-     comment says completions run on the CRL thread (they run on the completion thread); DeviceShutdown.CrlShutdownEc's
-     account of a dead CRL; SimpleCRL.completions cites "(CRL-W4)".
-
-7.3  SL-W8  Declaration-path documentation. S.
-     StoreRouter.recoverOrFail names StoreRebuilds.handleRecoveryFailed (the handler is handleFailStopped);
-     server/store/backend/fsif/DESIGN.md 4.2 and its L20 row; Backlog's correlated-declarations item still lists a
-     failed apply re-check as a failStop trigger (it quarantines).
-
-7.4  RB-W11  Rebuild documentation. S.
-     server/host/CLAUDE.md says rebuilding/<id> is swept at device load (it is not); StoreRebuilds.cancelFor and
-     DeviceShutdown.stopDeviceWork say "a rebuild past its walk finishes" (only one past finish's latch re-check
-     does); StoreEntry cites "rebuild-process.md 4.5", which does not exist; sweepPending cites "RB-W1"; a history
-     comment in restoreObject.
-
-7.5  RP-W5  Repair documentation. S.
-     server/repair/CLAUDE.md cites "repair 13.3-3"; the StoreRepairer.prove comment says FullContentLock (it is an
-     ExclusiveRevisionLock); "consecutive passes" in the StoreRepairer and RepairPolicy.proofAfterDeferrals scaladoc;
-     the misplaced sweepBootstrapTrees/verifyObject scaladoc; RepairTarget.mayJoinTransaction mentions only
-     UnackedCommits entries. Also from the cross review: Backlog.txt "Traceless commits follow-ups", second bullet, is
-     obsolete. TransactionBuilder.refuseBlindWrites and RequirementsChecker.refuseBlindWrites refuse a
-     min/max/left/right change without a required revision; reword it or drop it.
-
-7.6  P-W7  The scaladoc of Tx.determineDisposition is orphaned above invalidDescription's. S.
+(no open items)
 
 
 PRIORITY 8: unimplemented features

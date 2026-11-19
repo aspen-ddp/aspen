@@ -51,7 +51,7 @@ object StorageDeviceState:
   /** On a Rebuilding entry `transferId` is the rebuild episode instead: a fresh UUID written by every transition
    *  into Rebuilding (setRebuilding). The rebuild records it in its checkpoint and its rebuild-complete marker, so
    *  staging or a finished copy left by an earlier Rebuilding episode of the store is never resumed or promoted
-   *  (rebuild-process.md 4.5). */
+   *  (rebuild-process.md 2.1, 5.1). */
   case class StoreEntry(status: StoreStatus,
                         transferDevice: Option[StorageDeviceId],
                         transferId: Option[UUID] = None,

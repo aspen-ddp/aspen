@@ -474,7 +474,7 @@ class RebuildingStore(client: AspenClient,
    *  marks, so they are ignored.
    *
    *  What is still unsettled at `deadlineMillis` (PendingWaitLimit after the sweep began) is marked in the ErrorTree
-   *  against this store and the sweep ends (RB-W1, markUnsettled). The wait cannot be unbounded: a transaction whose
+   *  against this store and the sweep ends (markUnsettled). The wait cannot be unbounded: a transaction whose
    *  live voters disagree is held past expiry while any of its stores is silent (ExpiryTally rule G), and this store
    *  is silent until the rebuild finishes. Dropping it unmarked is not safe either: it may be decided commit, applied
    *  and acknowledged by the lost incarnation, with its peers not knowing yet, so no finalizer marks this store.
@@ -572,8 +572,7 @@ class RebuildingStore(client: AspenClient,
     else
       // Everything below is inside the try, not just the decode: the walk logs a synchronous
       // throw out of this method and steps past it, which would skip the object without
-      // recording it as failed. (Before the walks moved onto TierEngine such a throw stopped the
-      // walk outright and held the rebuild slot forever.) ObjectPointer decoding is the reachable
+      // recording it as failed. ObjectPointer decoding is the reachable
       // way to get one: it throws BufferUnderflowException out of the Varint readers and
       // MatchError out of its non-exhaustive typeCode match. Treating an undecodable pointer as
       // one more failed object subjects it to the existing cap and retry machinery instead.

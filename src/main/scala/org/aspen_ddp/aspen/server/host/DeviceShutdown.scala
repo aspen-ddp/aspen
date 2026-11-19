@@ -151,7 +151,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         remote.stores.collect { case (storeId, entry) if entry.status == status => storeId }.toSet
 
       // Cancelled rebuilds fail their complete with RebuildCancelled, which releases their slot.
-      // One already past its walk finishes instead, and writes its entry Offline.
+      // One already past finish's abort-latch re-check (or awaiting only its flip) completes instead, and writes
+      // its entry Offline.
       val rebuilds = ctx.rebuilds.cancelFor(deviceId, entriesIn(StorageDeviceState.StoreStatus.Rebuilding))
 
       // Transfers in: the pool updates already running are waited for, the attempts still shipping are
@@ -400,7 +401,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
 
 object DeviceShutdown:
   /** Where device CRLs are shut down: cached daemon threads named crl-shutdown-N. Not one thread, as a CRL whose
-   *  thread has died never completes its shutdown and would hold every later one up behind it. */
+   *  write hangs never completes its shutdown and would hold every later one up behind it (a CRL whose thread has
+   *  died completes it itself). */
   private[aspen] lazy val CrlShutdownEc: ExecutionContext =
     val counter = new AtomicInteger(0)
     ExecutionContext.fromExecutorService(Executors.newCachedThreadPool: r =>

@@ -180,8 +180,9 @@
   interrupted delete never strips a marker from a copy at a store path or leaves a partial copy in `pending-delete/`.
   A copy that never was the owner's and holds nothing its source lacks is deleted directly (still rename-first):
   `LocalDevices.discardStoreDirectory` and a stale arrived copy in `StoreTransfers.startIn`. Scratch areas
-  (`creating/`, `rebuilding/<id>`, transfer staging) are never loaded and are swept whole at device load, so they
-  are deleted in place.
+  are never loaded, so they are deleted in place: `creating/`, transfer staging and `deleting/` are swept whole at
+  device load (`DeviceDiscovery.loadOwnedDevice`); `rebuilding/<id>` holds a resumable checkpoint and is deleted
+  only by `StoreRebuilds.abandonUnlisted` or a first pass's `createStaging`.
 
   Every rename of a copy, of a store's CRL state, or of a lost device CRL goes through `DurableFiles.move`, which
   forces both directories. Without the marker on disk, a store's entries stay in the device CRL. A transfer out reads

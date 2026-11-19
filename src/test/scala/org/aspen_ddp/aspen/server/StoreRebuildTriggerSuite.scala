@@ -287,6 +287,58 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
         List((poolState.stores(rebuilt.poolIndex).hostId, poolTimestamp)))
       moved.head.onlineTimestamp should be > offline.head.timestamp
 
+  // RB-W12: a store rebuilt on a device that never held it is in no offlineStores of its own, so without recording it
+  // there a failed marker removal would leave it unserved, with its entry Active, until a restart
+  atest("a flipped rebuild whose rebuild-complete marker cannot be removed stays offline, and a later check loads it"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val rebuilt = StoreId(PoolId.BootstrapPoolId, 0)
+    val storeDir = deviceDir / rebuilt.directoryName
+    val marker = storeDir / RebuildingStore.RebuildCompleteMarkerFile
+
+    for
+      deviceSetId <- client.createStorageDeviceSet("test-set", 0, None)
+      realDeviceId <- client.createStorageDevice(HostId.BootstrapHostId, deviceSetId)
+      ptr <- client.getStorageDevicePointer(realDeviceId)
+      kvos <- client.read(ptr)
+      state = StorageDeviceState(kvos)
+      _ <- client.transactUntilSuccessful: tx =>
+        Future.successful:
+          val newState = state.setStoreEntry(rebuilt, StorageDeviceState.StoreStatus.Rebuilding, None)
+          val reqs = List(KeyRevision(StorageDeviceState.StateKey,
+            kvos.contents(StorageDeviceState.StateKey).revision))
+          tx.update(ptr, None, None, reqs, List(Insert(StorageDeviceState.StateKey, newState.encode())))
+      _ <- waitForTransactionsToComplete()
+      local = new LocalStorageDeviceState(
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL())
+      _ = injectLoadedDevice(host, local)
+      armed = recorded(host).armLookup(realDeviceId)
+      _ = host.control.reconciler.checkAll()
+      _ = armed.success(deviceState(realDeviceId, Map(rebuilding(rebuilt))))
+      _ <- yieldUntil(factory.created.nonEmpty)
+      // The marker's removal fails: a non-empty directory in its place
+      _ = os.makeDir.all(marker)
+      _ = os.write.over(marker / "held", "")
+      _ = factory.created.head.promise.success(())
+      _ <- waitForTransactionsToComplete()
+      _ <- yieldUntil(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(realDeviceId))
+      _ = recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Adopt)
+      _ = recorded(host).loadStoreByIdRequests should not contain ((realDeviceId, rebuilt))
+      _ = local.offlineStores should contain(rebuilt)
+      _ = host.control.router.offlineStores should contain(rebuilt)
+      // The removal can succeed now: the next check of the device removes the marker and loads the store
+      _ = os.remove.all(marker)
+      _ = os.write.over(marker, "")
+      before = recorded(host).storeLoadAttempts.size
+      _ = host.control.reconciler.checkAll()
+      _ <- yieldUntil(recorded(host).storeLoadAttempts.size > before)
+    yield
+      os.exists(marker) should be(false)
+      recorded(host).storeLoadAttempts.toList.drop(before) should contain((realDeviceId, storeDir))
+
   atest("an Active store marked rebuild-required is flipped to Rebuilding, discarded and rebuilt"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)

@@ -57,15 +57,6 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.1 [X-W5, RB-W12] A store whose open or rebuild-complete removal fails is left unserved and untracked until restart. CONFIRMED, S
-    cross-document-review.md X-W5, rebuild-process.md RB-W12. `StoreLoader.handleBackendOpened`'s generic
-    `Failure(e)` and `StoreRebuilds.startRebuild`'s `Adopt` branch on a failed `clearRebuildCompleteMarker` leave an
-    Active store neither loaded nor in `offlineStores`, and every reload pass filters `offlineStores`; meanwhile
-    `StoreCopies.release` deletes the superseded copy. One unit of `w - t` margin lost silently. Fix: on any such
-    failure leave the store offline (`leaveOffline` / `keepUnpromotedCopyOffline`) and have the device check retry an
-    Active offline store carrying no marker, with backoff as `retryStoresAwaitingSpace` does. Correct the
-    `clearRebuildCompleteMarker` scaladoc.
-
 4.2 [SL-W9] The fresh CRL replacing a lost device CRL is created in place, beside the device's stores.  CONFIRMED, S
     systemic-loss-protection.md SL-W9. A crash mid-rename leaves `<n>.crl` beside `<n>.crl.tmp`, refused as
     `CrlSizingMismatch` forever; a failed preallocation (ENOSPC) leaves `.crl.tmp` files, so every scan declares the

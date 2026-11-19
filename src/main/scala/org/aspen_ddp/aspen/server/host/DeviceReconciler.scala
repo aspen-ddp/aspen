@@ -55,7 +55,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // created now rather than up to checkStorageDevicePeriod from now.
     // The one caller that counts transient CRL open failures (DeviceDiscovery.CrlOpenAttempts)
     ctx.discovery.checkForNewDevices(scan = true).foreach(checkStorageDevice)
-    ctx.loader.retryStoresAwaitingSpace()
+    ctx.loader.retryFailedLoads()
 
   /** A CheckStorageDevice message. */
   def handleCheckMessage(m: CheckStorageDevice): Unit =

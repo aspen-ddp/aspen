@@ -25,9 +25,12 @@
   systemic-loss-protection 4.1, D5): `startOpen` with `create` (only `StoreRebuilds.createNewStore`) builds the
   store in `<device>/creating/` and renames it to its path before opening it, so a store directory exists only
   complete and `open` never creates.
-  A failed create, out of space included, leaves nothing at the path and is not put in `storesAwaitingSpace`: its
-  entry stays Initializing and the next device check creates it again. `DeviceDiscovery` deletes `creating/` when
-  it loads a device. Bootstrap (`cmdline`) creates its stores the same way (`DefaultBackendOpener.createStore`)
+  A failed create, out of space included, leaves nothing at the path and is not put in `storesAwaitingRetry`: its
+  entry stays Initializing and the next device check creates it again. Any other failed open but a lost state (out of
+  space, an I/O, lock or resource error) leaves the store offline, unmarked, and in `storesAwaitingRetry`: each
+  device scan retries it with backoff (`StoreLoader.retryFailedLoads`, 1, 2, 4 ... scans, capped at
+  `Host.LoadRetryCap` 5 min), so an Active store is never left unserved and untracked until a restart.
+  `DeviceDiscovery` deletes `creating/` when it loads a device. Bootstrap (`cmdline`) creates its stores the same way (`DefaultBackendOpener.createStore`)
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
   install and after close the backend and directory belong to the control side, which otherwise reads only
@@ -97,7 +100,7 @@
   never to be recovered as its own (crash-recovery-log 3.3 step 4)
 - A `crl_save.log` state is charged before `loadStore` saves it (`CrlAdmission.tryChargeLoaded`, at most the limit
   plus one transaction, A3), after the Store is built and before install, retained for the store. Refused, the store
-  is left offline, its file kept, and retried every device scan through `storesAwaitingSpace` (one warning per
+  is left offline, its file kept, and retried every device scan through `storesAwaitingRetry` (one warning per
   minute), and the CRL is asked to grow (`requestGrowth`). A state that can never fit (above the most limit any
   config allows, `maxAdmissionLimitBytes`, plus T, or a transaction above T) takes `crlSaveFileLost`: rebuilt; one
   that fits only after growth, even past this open's `crl-max-streams`, waits offline as above. Neither bound follows
@@ -196,7 +199,9 @@
   `releaseRetained(storeId, charge)`, by identity): a store landing meanwhile charges records the drop does not
   remove, and its recovery releases the whole charge
 - A rebuilt store's directory carries `rebuild-complete` from its move into place until its entry leaves
-  Rebuilding; `tryLoadStore` leaves such a store offline (`server/rebuild/CLAUDE.md`)
+  Rebuilding; `tryLoadStore` leaves such a store offline (`server/rebuild/CLAUDE.md`). An `Adopt` whose marker
+  removal fails records the copy in `offlineStores` (`keepUnpromotedCopyOffline`), so the Completed Rebuilds pass
+  retries the removal and the load at each device check
 - A failed rebuild pass or a permanently failed flip never re-checks its own device at once, which would restart the
   same store in a spin: it re-checks the other devices (the slot is host-wide) and schedules a backoff re-check of its
   own (`StoreRebuilds.scheduleRebuildRetry`: `Host.RebuildRetryInitialDelay` 30 s, doubled per failure of the store in

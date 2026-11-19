@@ -512,24 +512,36 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.getStoreIds should contain(storeId)
       host.control.router.isLoading(storeId) should be(false)
 
-  atest("a store whose open fails answers as unknown again; one out of space stays silent, offline"):
-    val hostRoot = newHostDir()
-    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val host = newSeamHost(hostRoot)
-    host.testingOnlyHandleEvents()
-    val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
-      fsif(host).failedOpens = 1
-      load(host)
-      host.getStoreIds should not contain storeId
-      host.control.router.isLoading(storeId) should be(false)
-      host.control.router.offlineStores should not contain storeId
+  // X-W5: an ordinary open failure says nothing about the data, so the store waits offline for a retry as one out of
+  // space does, rather than staying unserved and untracked until a restart
+  for (what, fail) <- List[(String, FsifSeams => Unit)](
+    "fails" -> (_.failedOpens = 2), "runs out of space" -> (_.outOfSpaceOpens = 2)) do
+    atest(s"a store whose open $what stays silent, offline, and is retried with backoff until it is served"):
+      val hostRoot = newHostDir()
+      val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+      val host = newSeamHost(hostRoot)
+      host.testingOnlyHandleEvents()
+      val storeDir = writeFsifStoreConfig(deviceDir)
+      FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+        fail(fsif(host))
+        load(host)
+        host.getStoreIds should not contain storeId
+        host.control.router.isLoading(storeId) should be(false)
+        host.control.router.offlineStores should contain(storeId)
+        os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
 
-      fsif(host).outOfSpaceOpens = 1
-      load(host)
-      host.getStoreIds should not contain storeId
-      host.control.router.isLoading(storeId) should be(false)
-      host.control.router.offlineStores should contain(storeId)
+        // Fails again on the first retry, the next scan, then waits two scans
+        host.control.reconciler.scan()
+        host.testingOnlyHandleEvents()
+        fsif(host).opens should be(2)
+        host.control.reconciler.scan()
+        host.testingOnlyHandleEvents()
+        fsif(host).opens should be(2)
+        host.control.reconciler.scan()
+        host.testingOnlyHandleEvents()
+        fsif(host).opens should be(3)
+        host.getStoreIds should contain(storeId)
+        host.control.router.offlineStores should not contain storeId
 
   /** Handles `host`'s events, yielding between rounds, until `condition` holds. Silent on exhaustion: the caller
    *  asserts the end state. */
@@ -684,7 +696,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.testingOnlyHandleEvents() // BackendOpened: out of space, left offline awaiting space
       host.getStoreIds should not contain storeId
       fsif(host).gossipedOnline should be(Nil)
-      host.control.loader.awaitingSpaceHasCallback(storeId) should be(Some(true))
+      host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(true))
 
       host.control.reconciler.scan() // the retry: its open is queued
       queued.size should be(1)
@@ -740,7 +752,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       (1 to retries).foreach(_ => load(host))
       fsif(host).opens should be(retries)
       host.getStoreIds should not contain storeId
-      host.control.loader.awaitingSpaceHasCallback(storeId) should be(Some(false))
+      host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(false))
 
       // The open that succeeds, with a close deferred over it
       val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()

@@ -599,7 +599,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       // The full CRL is asked to grow
       crl.growthRequests.get should be(1)
       // Retried at the device scans, as a store awaiting space is
-      fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(Some(false))
+      fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(Some(false))
 
   // CRL-W6: never-fits is judged against the limit the CRL reaches at its growth cap, not the one now
   test("a crl_save.log state above limit + T but within the grown limit waits offline for growth, not rebuilt"):
@@ -618,7 +618,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       os.exists(backend.crlSaveFile) should be(true)
       os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
       crl.growthRequests.get should be(1)
-      fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(Some(false))
+      fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(Some(false))
 
   // CRL-W9: the growth cap a device config sets is no bound on what the CRL may ever grow to: a lower or invalid
   // crl-max-streams (resolveExisting disables growth for the latter) must not declare a state lost
@@ -643,7 +643,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
           admission.admittedBytes should be(0)
           os.exists(backend.crlSaveFile) should be(true)
           os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
-          fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(Some(false))
+          fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(Some(false))
       finally crl.shutdown()
 
   for (what, states) <- List(
@@ -662,7 +662,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
         admission.admittedBytes should be(0)
         os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
         crl.getFullRecoveryState(s0) should be(empty)
-        fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(None)
+        fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(None)
 
   test("a reload over a loaded store leaves its view to its queued tasks, then uncounts it"):
     val s0 = StoreId(poolId, 0)

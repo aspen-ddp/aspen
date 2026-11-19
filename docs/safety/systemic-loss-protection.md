@@ -337,7 +337,7 @@ These look like loss, or take a store or device out of service, but write no mar
   on the object votes abort until the store reloads. A recovered commit vote whose object fails to load on a
   write-frozen store poisons it instead of fail-stopping the store.
 * **Out of space.** ENOSPC freezes writes (FSIF) and keeps the store serving; at load it leaves the store offline,
-  retried with backoff (`StoreLoader.storesAwaitingSpace`). A `crl_save.log` state that does not fit the device's
+  retried with backoff (`StoreLoader.storesAwaitingRetry`). A `crl_save.log` state that does not fit the device's
   CRL admission yet waits the same way, and asks the CRL to grow.
 * **CRL refusals.** `CrlLocked`, `CrlSizingMismatch` and `CrlConfigInvalid` leave the device unloaded and retried (S5);
   a transient open failure does too, until it has failed on `CrlOpenAttempts` (3) device scans in a row. A failing CRL

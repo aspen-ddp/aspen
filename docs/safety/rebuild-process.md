@@ -155,7 +155,7 @@ The marker written in adoption's prepare closure (T9, T10) is correct whatever t
 CRL-lost stores is derived from the disk's own contents, so the state is gone whichever host ends up owning it.
 
 Not triggers: other backend open failures are logged and retried at the next load; an out-of-space open leaves the
-store intact and retries (`StoreLoader.retryStoresAwaitingSpace`); a failed `crl_save.log` load by a **transfer-in**
+store intact and retries (`StoreLoader.retryFailedLoads`); a failed `crl_save.log` load by a **transfer-in**
 destination restarts the transfer, since the source still holds the state. Nothing declares a *device* Failed
 automatically; only `fail-storage-device` does.
 
@@ -411,8 +411,10 @@ gossips the store online itself). The host acts only after the decision:
 
 * `Adopt`: removes `rebuild-complete` durably (`clearRebuildCompleteMarker`), then `loadStoreById`. The committed flip
   gossips `StoreMoved` (`HostServices.gossipStoreOnline`), clearing the `StoreOffline` gossiped at the start. A failed
-  removal leaves the store unloaded and router-offline; the reconcile's Completed Rebuilds pass retries it only for a
-  store in the device's `offlineStores` (RB-W12).
+  removal leaves the store unloaded and router-offline, and records it in the device's `offlineStores`
+  (`keepUnpromotedCopyOffline`), so the reconcile's Completed Rebuilds pass, finding the entry Active and the marker
+  present, retries the removal and the load at each device check. A store rebuilt on a device that never held it is
+  in no `offlineStores` otherwise, and its pending-delete copy elsewhere is released by the Active entry.
 * `AdoptOffline`: `keepRebuiltStoreOffline` writes a `transferring-out` marker and an empty `crl_save.log`, then
   removes `rebuild-complete`; an adopter classes it Clean and a restart's reinstatement loads it.
 * `Discard`: deletes the final directory (`LocalDevices.discardStoreDirectory`).
@@ -789,19 +791,4 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 
 ## Open weaknesses
 
-### RB-W12: A failed rebuild-complete removal strands a rebuilt destination store unserved until a restart
-Verdict CONFIRMED. Priority 4. Effort S.
-Mechanism: `StoreRebuilds.startRebuild`, `RebuildOutcome.Adopt` branch: `unsilence(storeId, clear = false)`, then
-`clearRebuildCompleteMarker`; on a failed `DurableFiles.remove` it returns false and `loadStoreById` is skipped. The
-comment and the scaladoc of `clearRebuildCompleteMarker` say the reconcile retries it, but the Completed Rebuilds pass
-(`DeviceReconciler.reconcileDeviceState`) filters `local.offlineStores`. An in-place rebuild's store is there (its
-trigger, `retireUnserved`/`backendFailed`/`tryLoadStore`, added it), but a store rebuilt on a device that never held it
-(R3 drain, R4 re-placement, or a store re-placed away and back, whose Deleted Stores pass `forget` removed it) is not:
-`keepUnpromotedCopyOffline` covers the `Superseded` and failed-flip branches only. The router's offline mark from
-`startRebuild` stays.
-Consequence: the entry is Active and the pool names the device, while the store stays silent for the life of the
-process (until a restart's `tryLoadStore` puts it in `offlineStores`): one unit of the pool's `w - t` margin consumed
-with nothing in the tree or the logs beyond the one error line to show it, and the pending-delete copy elsewhere is
-already released by the Active entry.
-Suggested fix: on a failed removal, record the store in the device's `offlineStores` (`keepUnpromotedCopyOffline`)
-so the Completed Rebuilds pass retries it at the next check.
+None.

@@ -125,10 +125,15 @@ The premises other subsystems take from this:
 * `Store.close` and a reload over the same backend stop every driver of the store (`Store.shutdownDrivers`); a
   finalizer already running completes its idempotent actions and does not restart.
 * A store whose entry names this device is served, or is in the device's `offlineStores`, where a reconcile pass
-  (lost CRL, abandoned transfer out, cancelled shutdown, completed transfer in or rebuild) takes it up. Two known paths
-  leave it in neither: a failed rebuild-complete removal on a destination device (RB-W12) and a backend open that fails with
-  anything but lost state or lack of space (X-W5); and `StoreCopies.release` deletes the superseded pending-delete copy
-  once the entry is Active, whether or not the new copy is served.
+  (lost CRL, abandoned transfer out, cancelled shutdown, completed transfer in or rebuild) or a load retry takes it up.
+  A backend open that fails for anything but a lost state (out of space, an I/O, lock or resource error) leaves the
+  store offline and retries the load at the device scans with backoff (`StoreLoader.storesAwaitingRetry`,
+  `retryFailedLoads`, capped at `Host.LoadRetryCap`); a create that left nothing at the path is created again by the
+  next device check instead. A rebuilt copy whose `rebuild-complete` marker cannot be removed after its flip is kept
+  in `offlineStores` (`keepUnpromotedCopyOffline`), so the Completed Rebuilds pass retries the removal and the load at
+  each device check. This matters because `StoreCopies.release` deletes the superseded pending-delete copy once the
+  entry is Active, whether or not the new copy is served: a store left in neither state would consume one unit of the
+  pool's `w - t` margin until a restart.
 * Host-side client work (UnackedCommits lookups, held-vote queries, the repair service) runs
   on the host's `ec`, not a store executor or the control thread. It keeps no host state of its own beyond what it
   locks (`DeferralState`, `StoreRepairer`'s counters), reads store state only through `@volatile` snapshots
@@ -323,22 +328,6 @@ never spread non-late is false.
 Suggested fix: have `statusForExpiry` report a tree-learned resolution as the CRL saves it (`savedStatus`,
 `Unresolved`, with its commit vote), so peers decide by the tally, or report it `late`, so an adopter takes the
 late-commit path and looks its own entry up.
-
-### X-W5: A store whose backend open fails for an ordinary error is left unserved and untracked until a restart
-Verdict CONFIRMED. Priority 4. Effort S.
-Mechanism: `StoreLoader.handleBackendOpened`, final `case Failure(e)`: the store is removed from `loadedStores` and
-the router's loading mark, but not added to the device's `offlineStores` (unlike `BackendStateLost` and out of space,
-`leaveOffline`). Every reconcile pass that reloads a store filters `offlineStores` (`DeviceReconciler`
-completed-transfer and completed-rebuild passes, `DeviceShutdown.reloadClosedStores`), and none looks at an Active
-entry that is neither loaded nor offline. So a transient open failure (EIO, a RocksDB lock or resource error) after a
-transfer in (`StoreTransfers`, `loadStoreById`) or a rebuild's promotion leaves the store unserved for the life of the
-process, while the entry is Active and `StoreCopies.release` deletes the superseded copy. RB-W12 is the same gap for a
-failed marker removal.
-Consequence: one unit of the pool's `w - t` margin consumed silently (one warning line), with nothing retrying it
-until the host restarts; no store is declared lost, so nothing rebuilds it either.
-Suggested fix: on any open failure leave the store offline (`leaveOffline`), and have the device check retry an
-Active store in `offlineStores` that carries no marker, with backoff as `retryStoresAwaitingSpace` does; this also
-covers RB-W12.
 
 ### X-W6: Citations and history outside docs/safety
 Verdict CONFIRMED. Priority 7. Effort S.

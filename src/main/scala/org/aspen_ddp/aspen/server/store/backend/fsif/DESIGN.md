@@ -388,8 +388,8 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
   |---|---|
   | success | `serveOpened` and `LoadStore` |
   | `StoreLost` | mark `rebuild-required`, leave the store offline, `checkStorageDevice` |
-  | out of space | leave offline; `storesAwaitingSpace` retries every device scan with exponential backoff capped at `SpaceRetryCap` (5 min). A failed create left nothing at the path, so it is not retried here: its entry is still Initializing and the next device check creates it again |
-  | any other failure | logged; the store is not loaded and not marked |
+  | a create that left nothing at the path | leave offline, not retried here: its entry is still Initializing and the next device check creates it again |
+  | any other failure (out of space, I/O, lock or resource error) | leave offline, not marked; `storesAwaitingRetry` retries every device scan with exponential backoff capped at `LoadRetryCap` (5 min) |
 
 - **No create on open** (systemic-loss-protection 4.1, row D5; 2.3 creation). A missing
   store directory, or one whose FSIF files are all absent or empty (`FsifRecovery.isBlank`), is `StoreLost` (L0):

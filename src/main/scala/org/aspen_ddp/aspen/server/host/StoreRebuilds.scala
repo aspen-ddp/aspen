@@ -290,12 +290,15 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           ctx.metadata.markRebuiltStoreActive(local.storageDeviceId, storeId, episode, ctx.gossipStoreOnline).onComplete:
             case Success(RebuildOutcome.Adopt) =>
               try
-                // Loaded only once the marker is gone, or tryLoadStore leaves it offline; a failed removal is
-                // retried by the reconcile, which finds the entry Active
-                // The load's install clears the offline mark; a store not loaded stays silent
+                // Loaded only once the marker is gone, or tryLoadStore leaves it offline. The load's install clears
+                // the offline mark; a store not loaded stays silent
                 unsilence(storeId, clear = false)
                 if clearRebuildCompleteMarker(local.devicePath / storeId.directoryName) then
                   ctx.loadStoreById(local.storageDeviceId, storeId)
+                else
+                  // In offlineStores, so the Completed Rebuilds pass, finding the entry Active and the marker
+                  // there, retries the removal and the load at each check of the device (rebuild-process 5.7)
+                  keepUnpromotedCopyOffline(local, storeId)
               finally
                 settledOutcome()
                 release()
@@ -471,12 +474,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         scheduledRebuildRetries -= storeId
         ctx.reconciler.checkStorageDevice(deviceId)
 
-  /** Records a finished copy its flip did not promote (RebuildOutcome.Superseded, a permanently failed flip) in its
-   *  device's offlineStores, as a restart's load of the copy would (StoreLoader.tryLoadStore leaves a rebuild-complete
-   *  copy offline). The Deleted Stores pass then retires it if its entry leaves the device before a later rebuild of
-   *  the store here retires or promotes it; without it the copy would hold the store's path until a restart, and
-   *  every transfer of the store onto this device would refuse. A device unloaded meanwhile is left alone: its next
-   *  load does the same. */
+  /** Records a finished copy not yet loaded (RebuildOutcome.Superseded, a permanently failed flip, an adopted copy
+   *  whose rebuild-complete marker could not be removed) in its device's offlineStores, as a restart's load of the
+   *  copy would (StoreLoader.tryLoadStore leaves a rebuild-complete copy offline). The Deleted Stores pass then
+   *  retires it if its entry leaves the device before a later rebuild of the store here retires or promotes it, and
+   *  the Completed Rebuilds pass loads it once its entry is Active; without it the copy would hold the store's path
+   *  until a restart, every transfer of the store onto this device would refuse, and an Active one would stay
+   *  unserved. A device unloaded meanwhile is left alone: its next load does the same. */
   private def keepUnpromotedCopyOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     if ctx.devices.devices.get(local.storageDeviceId).contains(local) &&
        os.exists(local.devicePath / storeId.directoryName) then
@@ -515,7 +519,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         logger.error(s"Failed to mark rebuilt store $storeId offline at $storePath: $t")
 
   /** Removes the rebuild-complete marker of a rebuilt store whose entry has left Rebuilding, durably, so it can be
-   *  loaded. Returns whether it is gone; a failure is logged and leaves the store offline for a later reconcile. */
+   *  loaded. Returns whether it is gone; a failure is logged. The caller keeps the store in its device's
+   *  offlineStores, where the Completed Rebuilds pass (DeviceReconciler) retries the removal at each device check. */
   def clearRebuildCompleteMarker(storePath: os.Path): Boolean =
     try
       DurableFiles.remove(storePath / RebuildingStore.RebuildCompleteMarkerFile)

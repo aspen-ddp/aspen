@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.LogRateLimit
 import org.aspen_ddp.aspen.server.{DurableFiles, Host, StoreConfig}
 import org.aspen_ddp.aspen.server.Host.{BackendFailed, BackendOpened, LoadStore, LoadStoreById, ShutdownStore,
-  SpaceWait, StoreFailedOnClose, UnloadFailedStore}
+  LoadRetry, StoreFailedOnClose, UnloadFailedStore}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.{Store, StoreIncarnationFile}
@@ -33,15 +33,17 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   private def router = ctx.router
 
-  // Stores whose backend could not be opened because their device is out of space. Each is
-  // offline and unloaded, and ScanDevices (every deviceScanPeriod, 10 s) tries the load again with
-  // an exponential backoff counted in scans: next scan, then 2, 4, ... scans later, capped at
-  // SpaceRetryCap. Each retry opens the store through startOpen, never blocking the control thread. A store
-  // leaves this map when its load succeeds or fails for any other reason. Never marked for
-  // rebuild: the store's data is intact, it just cannot finish recovery until space returns. A store whose
-  // crl_save.log state its device's CRL cannot admit now (handleLoad, crash-recovery-log 6.1 A3) waits here too, retried
-  // at every scan: its CRL frees room as transactions conclude.
-  private var storesAwaitingSpace: Map[StoreId, SpaceWait] = Map()
+  // Stores whose backend could not be opened with their data intact: their device is out of space, or the open
+  // failed for any reason but a lost state (an I/O error, a lock or resource error). Each is offline and unloaded,
+  // and ScanDevices (every deviceScanPeriod, 10 s) tries the load again with an exponential backoff counted in
+  // scans: next scan, then 2, 4, ... scans later, capped at LoadRetryCap. Each retry opens the store through
+  // startOpen, never blocking the control thread. A store leaves this map when a load starts; a retry that fails the
+  // same way puts it back with a doubled wait. Never marked for rebuild: nothing says its data is gone. Without the
+  // retry a store whose entry is Active would stay unserved for the life of the process while its previous copy is
+  // released (cross-document-review 2.2). A store whose crl_save.log state its device's CRL cannot admit now
+  // (handleLoad, crash-recovery-log 6.1 A3) waits here too, retried at every scan: its CRL frees room as transactions
+  // conclude.
+  private var storesAwaitingRetry: Map[StoreId, LoadRetry] = Map()
   // Stores whose backend open (recovery) or create is in progress (startOpen), each with the ShutdownStore
   // events that arrived meanwhile, newest first. Such a store is in its device's loadedStores, so a
   // shutdown closes it; its ShutdownStore is put again once the open's outcome is handled, after
@@ -58,22 +60,22 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // RebuildingStore.AcceptorSinceMargin soon after the store arrived from another host (StoreLoader.ArrivedAtFile)
   private var newStores: Set[StoreId] = Set()
 
-  /** SpaceRetryCap in device scans, at least 1 */
-  private val spaceRetryCapScans: Int =
+  /** LoadRetryCap in device scans, at least 1 */
+  private val loadRetryCapScans: Int =
     val period = ctx.deviceScanPeriod
     if period.isFinite && period.toMillis > 0 then
-      math.max(1L, Host.SpaceRetryCap.toMillis / period.toMillis).toInt
+      math.max(1L, Host.LoadRetryCap.toMillis / period.toMillis).toInt
     else
       1
 
-  /** Whether a store awaiting space holds a real onServed callback; None if it is not awaiting space */
-  private[server] def awaitingSpaceHasCallback(storeId: StoreId): Option[Boolean] =
-    storesAwaitingSpace.get(storeId).map(_.onServed.isDefined)
+  /** Whether a store awaiting a load retry holds a real onServed callback; None if it awaits none */
+  private[server] def awaitingRetryHasCallback(storeId: StoreId): Option[Boolean] =
+    storesAwaitingRetry.get(storeId).map(_.onServed.isDefined)
 
   // `onServed` runs, on the control thread, once the store is recorded as served and its LoadStore queued: before
   // this returns when the backend opens in the caller (RocksDB), otherwise once BackendOpened is handled. It never
   // runs if the store is not served (skipped, already open or opening, or its open fails), except that an open that
-  // runs out of space hands it to the store's next open (SpaceWait). It runs at most once. A caller that must act
+  // fails with its data intact hands it to the store's next open (LoadRetry). It runs at most once. A caller that must act
   // once the store is served passes it rather than reading offlineStores after the call.
   def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path,
                    onServed: Option[() => Unit] = None): Unit =
@@ -141,8 +143,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                               create: Boolean, created: Option[Promise[Unit]],
                               onServed: Option[() => Unit] = None): Unit =
     val storeId = storeCfg.storeId
-    val previous = storesAwaitingSpace.get(storeId)
-    storesAwaitingSpace -= storeId
+    val previous = storesAwaitingRetry.get(storeId)
+    storesAwaitingRetry -= storeId
     // A load that failed for lack of space handed its callback to this open, which now runs it, once, if it serves
     // the store. Composed only when both are real callbacks, so retries without one never nest
     val servedCallback = (previous.flatMap(_.onServed), onServed) match
@@ -169,9 +171,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *    device was unloaded meanwhile or another backend serves it, when it is closed unserved;
    *  - BackendStateLost: the store's acknowledged state is gone. It is marked rebuild-required and left offline, as
    *    crlSaveFileLost leaves a store, and the reconcile then flips its entry to Rebuilding;
-   *  - out of space (Backend.isOutOfSpace): the data is intact, so the store is left offline and unloaded, recorded
-   *    in storesAwaitingSpace, and ScanDevices retries it with backoff;
-   *  - any other failure is logged and the store is not loaded, as for a backend that fails to open.
+   *  - a failed create that left nothing at the path: left offline; its entry is still Initializing, so the next
+   *    device check creates it again;
+   *  - any other failure (out of space, Backend.isOutOfSpace, or an I/O, lock or resource error): nothing says the
+   *    data is gone, so the store is left offline and unloaded, recorded in storesAwaitingRetry, and ScanDevices
+   *    retries it with backoff.
    *  ShutdownStore completions deferred meanwhile are then put again, after the LoadStore, and then the load's
    *  onServed callback, if any, runs for a served store.
    *
@@ -222,30 +226,27 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         if registered then
           ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
         created.foreach(_.tryFailure(e))
-      case Failure(e) if Backend.isOutOfSpace(e) =>
-        if create && !os.exists(storePath) then
-          // The create failed and left nothing at the path (StoreCreation), so the entry is still Initializing and
-          // the next device check creates it again (DeviceReconciler, StoreRebuilds.createNewStore). A create that
-          // succeeded and whose open ran out of space left a complete store, which the next check flips without
-          // loading: it takes the load retries below.
-          logger.warn(s"Store $storeId cannot be created: device ${sds.storageDeviceId} is out of space. Leaving " +
-                      s"it offline; the next device check creates it again. Error: $e")
-          leaveOffline()
-        else
-          val waitScans = previous.map(w => math.min(w.waitScans * 2, spaceRetryCapScans)).getOrElse(1)
-          if previous.isDefined then
-            logger.debug(s"Store $storeId still cannot be loaded: its device is out of space. Retrying in " +
-                         s"$waitScans device scans. Error: $e")
-          else
-            logger.warn(s"Store $storeId cannot be loaded: its device is out of space. Leaving it offline and " +
-                        s"retrying, with backoff, until space returns. $storePath. Error: $e")
-          leaveOffline()
-          storesAwaitingSpace += storeId -> SpaceWait(sds, storePath, waitScans, waitScans, onServed)
+      case Failure(e) if create && !os.exists(storePath) =>
+        // The create failed and left nothing at the path (StoreCreation), so the entry is still Initializing and the
+        // next device check creates it again (DeviceReconciler, StoreRebuilds.createNewStore). A create that
+        // succeeded and whose open failed left a complete store, which the next check flips without loading: it
+        // takes the load retries below.
+        logger.warn(s"Store $storeId cannot be created on device ${sds.storageDeviceId}. Leaving it offline; the " +
+                    s"next device check creates it again. Error: $e")
+        leaveOffline()
         created.foreach(_.tryFailure(e))
       case Failure(e) =>
-        logger.warn(s"Failed to load store $storePath. Error: $e")
-        sds.loadedStores -= storeId
-        router.clearLoading(storeId)
+        val outOfSpace = Backend.isOutOfSpace(e)
+        val waitScans = previous.map(w => math.min(w.waitScans * 2, loadRetryCapScans)).getOrElse(1)
+        val why = if outOfSpace then "its device is out of space" else "its backend failed to open"
+        if previous.isDefined then
+          logger.debug(s"Store $storeId still cannot be loaded: $why. Retrying in $waitScans device scans. " +
+                       s"Error: $e")
+        else
+          logger.warn(s"Store $storeId cannot be loaded: $why. Leaving it offline and retrying, with backoff" +
+                      s"${if outOfSpace then ", until space returns" else ""}. $storePath. Error: $e")
+        leaveOffline()
+        storesAwaitingRetry += storeId -> LoadRetry(sds, storePath, waitScans, waitScans, onServed)
         created.foreach(_.tryFailure(e))
     deferred.reverse.foreach(ctx.post)
     // After the replay, so a callback that throws cannot lose a deferred shutdown's completion
@@ -253,19 +254,19 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       try callback()
       catch case NonFatal(t) => logger.warn(s"The served callback of store $storeId failed: $t")
 
-  /** Called once per device scan. Retries the load of every store in storesAwaitingSpace whose backoff has run
+  /** Called once per device scan. Retries the load of every store in storesAwaitingRetry whose backoff has run
    *  out, whose device is still loaded here and not shutting down, and which is still offline and unloaded. Others
    *  are dropped, with their onServed callback unrun: whatever replaced or removed them has taken over. A retry's
    *  open takes the callback over from the entry (startOpen). */
-  def retryStoresAwaitingSpace(): Unit =
-    storesAwaitingSpace.foreach: (storeId, wait) =>
+  def retryFailedLoads(): Unit =
+    storesAwaitingRetry.foreach: (storeId, wait) =>
       val deviceId = wait.sds.storageDeviceId
       if ! ctx.devices.devices.get(deviceId).exists(_ eq wait.sds) || router.get(storeId).isDefined ||
          ! wait.sds.offlineStores.contains(storeId) || opening.contains(storeId) ||
          ! os.exists(wait.storePath / StoreConfig.configFilename) then
-        storesAwaitingSpace -= storeId
+        storesAwaitingRetry -= storeId
       else if wait.scansLeft > 1 then
-        storesAwaitingSpace += storeId -> wait.copy(scansLeft = wait.scansLeft - 1)
+        storesAwaitingRetry += storeId -> wait.copy(scansLeft = wait.scansLeft - 1)
       else if ! ctx.shutdown.isShuttingDown(deviceId) then
         ctx.tryLoadStore(wait.sds, wait.storePath, None)
 
@@ -432,7 +433,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                   ctx.threading.release(storeId)
                   // Retried as a store awaiting space is, once a scan, until it fits
                   ctx.devices.devices.get(storageDeviceId).foreach: sds =>
-                    storesAwaitingSpace += storeId -> SpaceWait(sds, backend.path, 1, 1)
+                    storesAwaitingRetry += storeId -> LoadRetry(sds, backend.path, 1, 1)
                 abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
               case Success(entry) =>
                 router.install(entry)

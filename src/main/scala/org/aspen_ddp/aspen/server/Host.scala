@@ -59,11 +59,12 @@ object Host:
   final case class StoreFailedOnClose(storeId: StoreId)
     extends Exception(s"Store $storeId failed on an I/O error while closing; it is marked for rebuild")
 
-  /** A store whose load awaits space: retried once `scansLeft` more device scans have passed. Each failed retry
-   *  doubles `waitScans`, up to the cap (SpaceRetryCap in scans). `onServed` is the waiting load's tryLoadStore callback: the next open of the
-   *  store (a retry or any other load) takes it over, and it is dropped with the entry if the store leaves the wait
-   *  for any other reason. */
-  private[server] final case class SpaceWait(sds: LocalStorageDeviceState, storePath: os.Path, waitScans: Int,
+  /** A store whose load failed with its data intact (out of space, a CRL that cannot admit its save file now, or any
+   *  other open failure but a lost state): retried once `scansLeft` more device scans have passed. Each failed retry
+   *  doubles `waitScans`, up to the cap (LoadRetryCap in scans). `onServed` is the waiting load's tryLoadStore
+   *  callback: the next open of the store (a retry or any other load) takes it over, and it is dropped with the entry
+   *  if the store leaves the wait for any other reason. */
+  private[server] final case class LoadRetry(sds: LocalStorageDeviceState, storePath: os.Path, waitScans: Int,
                                              scansLeft: Int, onServed: Option[() => Unit] = None)
 
   /** How long a store's Tx may sit idle before the store drives it itself. This is how a lost TxFinalized is recovered */
@@ -86,8 +87,8 @@ object Host:
   /** Each tick is a transaction per running system task, so it is not tied to the transaction heartbeat */
   val SystemTaskHeartbeatPeriod: Duration = Duration(5, SECONDS)
 
-  /** Longest wait between load retries of a store whose device is out of space */
-  val SpaceRetryCap: Duration = Duration(5, MINUTES)
+  /** Longest wait between load retries of a store whose open failed with its data intact (LoadRetry) */
+  val LoadRetryCap: Duration = Duration(5, MINUTES)
 
   private[server] case class Exit() extends Event
   private[server] case class RecoveryEvent() extends Event
@@ -112,7 +113,7 @@ object Host:
    *  for a create once its store is loaded, or failed; `onServed` is tryLoadStore's, run only if the store is served.
    *  `inline` is set when the open completed in startOpen itself, which then handles it without posting it. */
   private[server] case class BackendOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
-                                create: Boolean, previous: Option[SpaceWait], result: Try[Backend],
+                                create: Boolean, previous: Option[LoadRetry], result: Try[Backend],
                                 created: Option[Promise[Unit]], onServed: Option[() => Unit],
                                 inline: Boolean = false) extends Event
   private[server] case class InitializeTaskExecutor() extends Event

@@ -856,7 +856,7 @@ Frontend and store loader (implemented: `Frontend.admitPrepare`, `recoverState`,
   of the file's records is saved (`StoreLoader.awaitCrlLoad`), so the image never holds both: until the drop is built
   it holds the old records, covered by the retained charge, and none of the file's; after it, the file's records,
   covered by the loaded charge (Lemma C). A refused load is retried at each device scan
-  (`StoreLoader.storesAwaitingSpace`) and asks the CRL to grow. Not implemented: transfer planning does not yet
+  (`StoreLoader.storesAwaitingRetry`) and asks the CRL to grow. Not implemented: transfer planning does not yet
   avoid a destination whose CRL cannot take the state; such a transfer ends in the never-fits rebuild at the
   destination (Backlog.txt, "Transfers do not check the destination's CRL room").
 - **A4, no save without a charge.** A Tx saves to the CRL only while its transaction holds an admission record

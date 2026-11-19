@@ -163,9 +163,9 @@ The premises other subsystems take from this:
   whose Insert of an absent key passes never applied it: a key's deletion reaches the backend only once no CRL state
   holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`, transaction-requirements.md
   9.4). A live voter's failed re-check is an invariant violation, logged and reported.
-* A lock-order wait has no timer, and while it lasts every new vote on the waiter's objects waits
-  (`Frontend.voteBlocked`), whatever the vote's requirements. Waits at two stores can block the votes each other's
-  holders need (Q-W9). Expiry ends such a cycle: a blocked vote's Tx is frozen past expiry and then reports as a
+* A lock-order wait has no timer, and while it lasts every new vote whose locks the waiter collides with waits
+  (`Tx.lockWaitBlocked`); other votes decide at once. Waits at two stores can still block colliding votes each other's
+  holders need (transaction-requirements.md Q-W9, multi-key writers only). Expiry ends such a cycle: a blocked vote's Tx is frozen past expiry and then reports as a
   final non-voter (`Tx.determineDisposition`, `receiveStatusRequest`), so each holder's tally reaches a discard
   (`ExpiryTally.decideUnknown`, rule D or E), and the holder's commit vote is discarded once an UnackedCommits lookup
   started after that decision finds no entry; its locks then release and the waiter applies. During a metadata-pool

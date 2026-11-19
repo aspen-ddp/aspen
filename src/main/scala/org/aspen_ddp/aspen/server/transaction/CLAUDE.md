@@ -285,8 +285,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   Otherwise a later commit that does not chain on the vote (a refcount change, a key-level write, a repair refcount
   or key proof) would raise the object timestamp, fail the vote's re-check and leave the counted vote standing for
   neither lock nor update. A lock-only holder is not waited for; a Tx holding its own locks never waits. The wait is
-  outside `commitInFlight`, so the holder's own commit never queues behind it; new votes on the waiter's objects wait
-  for it (`Frontend.voteBlocked`), so it cannot be starved. A holder that never resolves (undecidable expiry tally)
+  outside `commitInFlight`, so the holder's own commit never queues behind it. A new vote waits for it only if the
+  waiter collides with the locks the vote would take (`Tx.lockWaitBlocked`: `RequirementsLocker.plannedLocks` through
+  `RequirementsChecker.PlannedLocks`, tested by the waiter's `wouldWaitFor`), so it cannot be starved; any other vote
+  decides at once, since a waiter blocking it could be waiting on a holder that needs that very vote elsewhere (Q-W9). A holder that never resolves (undecidable expiry tally)
   holds the waiter for as long as its locks: beyond the write threshold's margin, alarmed, no way out
 - A commit decision can overtake the data too. The store holds the commit until the data, a client's prepare, or
   TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store

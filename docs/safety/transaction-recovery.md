@@ -518,7 +518,7 @@ saved data.
   and the in-flight-commit marker (`Frontend.commitInFlight`) orders the transactions that follow.
 * A committed Tx holding no locks does not apply while another Tx holds locks it collides with on an object both
   change (`Tx.awaitLockHolders`, transaction-requirements.md R15): it is held (`commitHeld`) until each holder
-  releases (`Frontend.locksReleased`), and new votes on its objects wait meanwhile (`Frontend.voteBlocked`). A
+  releases (`Frontend.locksReleased`), and new votes whose locks it collides with wait meanwhile (`Tx.lockWaitBlocked`). A
   `TxFinalized` reaching it while held is deferred like one for a commit held for its turn
   (`Frontend.finalizationDeferred`), its CRL state kept until it applies.
 

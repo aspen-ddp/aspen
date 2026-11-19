@@ -415,7 +415,7 @@ commit per object.
 * `collisionWaiters: TransactionId -> List[Tx]`: transactions waiting out a lock holder (8.4), by holder.
 * `commitInFlight(oid) = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)`.
 * `lockWaitingCommits: ObjectId -> List[Tx]`: committed transactions waiting to apply in lock order (8.3), by object
-  they change. Not part of `commitInFlight`; `voteBlocked(oid) = commitInFlight(oid) || lockWaitingCommits.contains(oid)`.
+  they change (`Frontend.lockWaiters`). Not part of `commitInFlight`.
 * `failedCommits`: never cleared; the store reloads with a new Frontend.
 * `allocationRecords`/`allocationsOf` and `blindInsertRecords`/`blindInsertsOf`: transactions whose CRL state may
   still hold an allocation or a blind KeyValue update of an object here (9.4).
@@ -428,8 +428,8 @@ commit per object.
    client's prepare is over or the outcome is known); an invalid description votes `InvalidDescription`; a hosted object
    that is failed (`commitFailed`) or covered by a rebuilt store's inherited votes
    (`Frontend.inheritedVoteLock`, cross-document-review.md 2.3) votes abort, one error per such object; a hosted object
-   that is `voteBlocked` (a commit in flight or held, or a committed transaction waiting to apply in lock order) while
-   the outcome is unknown makes the Tx wait (`awaitingCommits`, `Frontend.awaitCommitPersisted`), no timer and no
+   with a commit in flight or held (`commitInFlight`), or whose locks a committed transaction waiting there to apply in
+   lock order would collide with (`Tx.lockWaitBlocked`, below), while the outcome is unknown makes the Tx wait (`awaitingCommits`, `Frontend.awaitCommitPersisted`), no timer and no
    locks, until `commitPersisted` has arrived for each (from `commitTurnFree`, at a backend completion, a held commit's
    issue, or the end of a lock-order wait, `Frontend.lockWaitWakeVoters`); otherwise the requirements are checked, and a
    collision may be waited out (8.4). The in-flight test covers every hosted object, lock-only ones included; a
@@ -450,9 +450,15 @@ commit per object.
    recovered votes sharing a lock (section 3) are ordered by what persisted before the crash (the later one voted after
    the earlier one's update persisted, 10.5a). A recovered Tx that does not relock completes its load only after
    every recovered commit vote has relocked (transaction-recovery.md 7.2), so it finds every holder it must wait for.
-   The wait is not counted by `commitInFlight`, so the holder's own commit never queues behind it; a new vote on one of its objects waits for
-   it instead (`Frontend.voteBlocked`), so it cannot be starved. A holder that never resolves holds the waiter as long
-   as its own locks (section 12).
+   The wait is not counted by `commitInFlight`, so the holder's own commit never queues behind it. A new vote waits for
+   it only if the waiter's requirements or writes collide with the locks the vote would take on one of its objects
+   (`Tx.lockWaitBlocked`: `RequirementsLocker.plannedLocks` seen through `RequirementsChecker.PlannedLocks`, tested by
+   the waiter's `Tx.wouldWaitFor` with the same `lockHoldersIn` rule as its own holder set), so it cannot be starved.
+   Any other new vote decides at once, on the state before the waiter's apply: what the waiter changes is nothing
+   that vote's requirements or writes depend on, as for two votes holding compatible locks (R4). A vote is never
+   withheld for a waiter it does not collide with, since that waiter may wait for a holder whose transaction can
+   decide only with this very vote (Q-W9). A holder that never resolves holds the waiter as long as its own locks
+   (section 12).
 3. **Issue** (`doCommit`): release the locks, apply (`issueCommits`), answer parked reads, one `Frontend.commit` per
    changed object that applied, then `heldCommitIssued` removes the Tx from the queues and `commitTurnFree` wakes the
    next. A store holding an applied stub for the transaction, or owed nothing through its UnackedCommits entry
@@ -469,8 +475,8 @@ commit per object.
 A wait for in-flight commits has no timer: a backend commit always completes or fails. A hung device stalls every
 transaction on its objects at that store (other stores still vote); this is tracked in Backlog.txt ("Isolate every
 device's I/O, and detect and handle hung devices", including why there is no per-commit watchdog). A vote blocked by a
-committed transaction waiting in lock order has no timer either, though that wait ends only when a holder's
-transaction resolves at other stores (Q-W9).
+committed transaction waiting in lock order (one it collides with) has no timer either, though that wait ends only
+when a holder's transaction resolves at other stores (Q-W9).
 
 ### 8.4 `CollisionWait`: waiting out a holder the transaction is built on
 
@@ -791,19 +797,22 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
 
 ## Open weaknesses
 
-### Q-W9: Votes blocked by lock-order waits can form a cross-store cycle that lasts until expiry
-Verdict PLAUSIBLE. Priority 4. Effort S.
-Mechanism: `Frontend.voteBlocked` blocks every new vote on an object a committed lockless Tx changes while it waits in
-`Tx.awaitLockHolders`, whatever the new vote's requirements, and `Tx.determineDisposition` gives such a wait no timer.
-Replication(3, 2), stores A, B, C, object o, four key-level KV writers: H and W write key a, G and W'' write key b
-(blind Inserts, or `KeyRevision` puts). A votes commit for H and W''; B votes commit for W and G; C votes commit for W
-and W'' and abort for H and G (they arrived while W, W'' held locks there). W commits (B, C) and W'' commits (A, C); H
-and G each hold one commit vote and one abort, undecided. At A, W (no locks there) waits for H (K on a), so
-`voteBlocked(o)`; G's delayed prepare reaches A and waits. At B, W'' waits for G (K on b), and H's delayed prepare
-reaches B and waits. H needs B's vote, G needs A's: neither driver can decide, neither wait ends.
-Consequence: every new vote on o at A and B waits, so o takes no commit (C alone is below `t`) until H and G end by
-expiry (horizon plus expiry margin, about 30 s): an object-wide stall from contention plus delayed prepares, which
-can recur under the same load.
-Suggested fix: have `voteBlocked` block only a vote whose requirements or writes collide with a waiting commit's
-(`RequirementsChecker.lockHolders`-style test against its changes), so a vote the waiter would not wait for proceeds;
-in the example neither H nor G collides with the waiter at the store where it is blocked.
+### Q-W9: Votes blocked by colliding lock-order waits can form a cross-store cycle that lasts until expiry
+Verdict PLAUSIBLE (narrowed). Priority 4. Effort S.
+Mechanism: a committed lockless Tx waiting in `Tx.awaitLockHolders` withholds every new vote whose locks its
+requirements or writes collide with (`Tx.lockWaitBlocked`), with no timer (`Tx.determineDisposition`). Votes that do
+not collide with the waiter decide at once (`FrontendSuite`, "a vote that does not collide with a commit waiting in
+lock order is not blocked by it"), which ends the single-key cycle first raised here: at A, W waits for H (key a) and
+G (key b) votes; at B, W'' waits for G (key b) and H (key a) votes. The residual needs every blocked vote to collide
+with its waiter, so multi-key transactions at two stores: Replication(3, 2), stores A, B, C, object o, W writes keys a
+and d, W2 writes c and e, H writes a and c, G writes d and e (blind Inserts). C votes commit for W and W2 and abort
+for H and G (they arrived while W, W2 held locks there). W2 commits (A, C) and applies at A, then A votes commit for H;
+W commits (B, C) and applies at B, then B votes commit for G. W, voting abort at A on H's lock of a, waits there for H;
+W2, voting abort at B on G's lock of e, waits there for G. G's delayed prepare reaches A and collides with W (d), so it
+waits; H's reaches B and collides with W2 (c), so it waits. H needs B's vote, G needs A's: neither decides.
+Consequence: until H and G end by expiry (horizon plus expiry margin, about 30 s), every new vote at A and B colliding
+with W or W2 waits; votes on other keys of o proceed. It takes four contending multi-key writers and two delayed
+prepares in one window.
+Suggested fix: bound a colliding vote's wait (for example by `Tx.CollisionWait`, then an abort vote on the
+pre-apply state, always safe), so a cycle lasts seconds rather than until expiry. Not done: expiry already ends it,
+and an abort cost would fall on every colliding vote whose waiter merely waits a little long.

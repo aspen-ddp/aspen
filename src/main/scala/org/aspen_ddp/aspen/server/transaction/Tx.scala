@@ -511,7 +511,7 @@ class Tx( trs: TransactionRecoveryState,
     * the stores lacking the update could reach the read threshold. So while another Tx here holds locks this
     * transaction's requirements or writes collide with (RequirementsChecker.lockHolders) on an object both change, it
     * waits for each to release them, having applied its commit or aborted (Frontend.locksReleased). It holds its
-    * references, no locks, and new votes on the objects it changes wait meanwhile (Frontend.voteBlocked), so it
+    * references, no locks, and new votes whose locks it would wait for wait meanwhile (lockWaitBlocked), so it
     * cannot be starved. The holder's own commit never waits for it (holdForTurn ignores the wait).
     *
     * A Tx holding its own locks never waits: two live votes never hold conflicting locks, and recovered votes
@@ -545,6 +545,33 @@ class Tx( trs: TransactionRecoveryState,
         lockWaitRegistered = false
         frontend.lockWaitEnded(changedHere, this)
       false
+
+  /** Whether this committed transaction, waiting to apply (awaitLockHolders), would wait for `holder` once it held
+    * `locks` on `oid`: the holder's locks collide with this transaction's requirements or writes there
+    */
+  def wouldWaitFor(holder: TransactionId, oid: ObjectId, locks: RequirementsChecker.LockView): Boolean =
+    val writes = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
+    RequirementsChecker.lockHoldersIn(transactionId, requirements, writes,
+      o => if o == oid then Some(locks) else None).contains(holder)
+
+  /** The objects on which a committed transaction waiting to apply (awaitLockHolders) would wait for this vote's
+    * locks: the vote waits for those waits to end (Frontend.lockWaitWakeVoters), so a waiter cannot be starved. Any
+    * other vote decides now, on the state before the waiter's apply, which changes nothing its requirements or
+    * writes depend on, as for two votes holding compatible locks. A vote is never withheld for a waiter it does not
+    * collide with: that waiter may wait for a holder whose transaction can decide only with this very vote, at a
+    * store where a waiter of its own waits for this vote's transaction, a cycle that would last until expiry
+    */
+  private def lockWaitBlocked(): Set[ObjectId] =
+    val waited = pointersById.keySet.filter(oid => frontend.lockWaiters(oid).exists(_ ne this))
+    if waited.isEmpty then Set()
+    else
+      val writes = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
+      val planned = RequirementsLocker.plannedLocks(requirements, objects.filter((oid, _) => waited.contains(oid)),
+        writes).groupMap(_._1)(_._2)
+      waited.filter: oid =>
+        planned.get(oid).exists: p =>
+          val locks = RequirementsChecker.PlannedLocks(transactionId, objects(oid), p)
+          frontend.lockWaiters(oid).exists(w => (w ne this) && w.wouldWaitFor(transactionId, oid, locks))
 
   /** This Tx is registered in the Frontend as a committed transaction waiting to apply: see awaitLockHolders */
   private var lockWaitRegistered = false
@@ -686,7 +713,7 @@ class Tx( trs: TransactionRecoveryState,
       applyWaitingOn -= holder
       if applyWaitingOn.isEmpty then
         releaseHeldCommit()
-        // New votes on its objects waited for it (Frontend.voteBlocked): whatever it did, they may decide now
+        // New votes colliding with it waited for it (lockWaitBlocked): whatever it did, they may decide now
         if applyWaitingOn.isEmpty then
           frontend.lockWaitWakeVoters(changedHere)
 
@@ -959,7 +986,7 @@ class Tx( trs: TransactionRecoveryState,
   } else {
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
     val inherited = pointersById.keysIterator.filter(frontend.inheritedVoteLock).toList
-    val inFlight = pointersById.keysIterator.filter(frontend.voteBlocked).toSet
+    val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet ++ lockWaitBlocked()
 
     if muted && oresolution.isEmpty && !outcomeKnown then
       // Not checked and so not waiting on anything. It never votes commit, and the abort it holds is never sent: it

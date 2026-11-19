@@ -457,11 +457,12 @@ class Frontend(val storeId: StoreId,
     */
   private val lockWaitingCommits = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
 
-  /** A new vote on `oid` waits: a commit of it is in flight or held for its turn (commitInFlight), or a committed
-    * transaction changing it waits to apply (Tx.awaitLockHolders). The latter is left out of commitInFlight, which
-    * orders held commits: the votes it waits for must never queue their own commits behind it
+  /** The committed transactions changing `oid` that wait to apply (Tx.awaitLockHolders), oldest first. A new vote
+    * whose locks one of them would wait for waits for it (Tx.lockWaitBlocked), so it cannot be starved; any other new
+    * vote proceeds. These waits are left out of commitInFlight, which orders held commits: the votes they wait for
+    * must never queue their own commits behind them
     */
-  def voteBlocked(oid: ObjectId): Boolean = commitInFlight(oid) || lockWaitingCommits.contains(oid)
+  def lockWaiters(oid: ObjectId): List[Tx] = lockWaitingCommits.getOrElse(oid, Nil)
 
   /** `tx`, committed, waits to apply its changes of `oids` until each of `holders` releases its locks
     * (locksReleased -> Tx.collisionHolderReleased)
@@ -473,7 +474,7 @@ class Frontend(val storeId: StoreId,
   /** `tx` no longer waits to apply: it is applying, or queued for its turn */
   def lockWaitEnded(oids: Set[ObjectId], tx: Tx): Unit = oids.foreach(oid => removeFrom(lockWaitingCommits, oid, tx))
 
-  /** A committed transaction's wait to apply ended: the votes withheld for it (voteBlocked) decide, unless a commit of
+  /** A committed transaction's wait to apply ended: the votes withheld for it (lockWaiters) decide, unless a commit of
     * the object is now in flight, whose completion tells them instead
     */
   def lockWaitWakeVoters(oids: Set[ObjectId]): Unit = oids.foreach(commitTurnFree)

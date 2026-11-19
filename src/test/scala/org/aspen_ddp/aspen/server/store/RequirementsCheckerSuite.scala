@@ -1347,6 +1347,34 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       lockThenCheckKV(mk(), write(tx1), req(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
   }
 
+  test("a vote's planned locks collide exactly as the locks it takes (Tx.lockWaitBlocked)") {
+    val kinds: List[TransactionId => KVTx] = List(
+      blindInsertPresent, blindInsertAbsent,
+      KVTx(_, List(KeyRevision(kk1, rev1)), Nil),
+      KVTx(_, List(KeyRevision(kk9, rev1)), Nil),
+      KVTx(_, List(KeyValueUpdate.Exists(kk1)), Nil),
+      KVTx(_, List(KeyValueUpdate.MayExist(kk1)), Nil),
+      KVTx(_, List(KeyValueUpdate.MayExist(kk9)), Nil),
+      KVTx(_, List(KeyValueUpdate.DoesNotExist(kk9)), Nil),
+      KVTx(_, List(KeyValueUpdate.WithinRange(kk9, ByteArrayKeyOrdering)), Nil),
+      KVTx(_, List(KeyValueUpdate.KeyObjectRevision(kk9, rev1)), Nil),
+      KVTx(_, List(KeyRevision(kk1, rev1)), List(Delete(kk1))),
+      KVTx(_, Nil, Nil, requiredRevision = Some(rev1)))
+    val collided = for holderKind <- kinds; waiterKind <- kinds yield
+      val (holder, waiter) = (holderKind(tx1), waiterKind(tx2))
+      val objects = kvObjectWithKey()
+      val planned = RequirementsLocker.plannedLocks(holder.requirements, objects, holder.writes).map(_._2)
+      val view = RequirementsChecker.PlannedLocks(tx1, objects(oid1), planned)
+      val fromPlan = RequirementsChecker.lockHoldersIn(tx2, waiter.requirements, waiter.writes,
+        o => if o == oid1 then Some(view) else None)
+      holder.lock(objects)
+      withClue(s"holder $holder, waiter $waiter: ") {
+        fromPlan shouldBe RequirementsChecker.lockHolders(tx2, waiter.requirements, objects, waiter.writes, Set(oid1))
+      }
+      fromPlan.nonEmpty
+    collided.toSet shouldBe Set(true, false)
+  }
+
   test("a key Delete without deletesKeys is rejected") {
     val (objErrors, _) = RequirementsChecker.check(tx1, HLCTimestamp.now,
       List(KeyValueUpdate(kp1, None, None, Nil, deletesKeys = false)), kvObjectWithKey(),

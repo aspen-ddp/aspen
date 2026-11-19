@@ -258,6 +258,43 @@ object RequirementsChecker extends Logging {
     (objectErrors, nonObjectErrors)
   }
 
+  /** The locks held on one object, as lockHolders sees them */
+  trait LockView:
+    /** The holders of a single-holder slot */
+    def slot(s: LockSlot): Set[TransactionId]
+    /** Every holder of a lock that lets it change the object (ObjectState.lockedWriteTransactions) */
+    def writers: Set[TransactionId]
+    def shared: Set[TransactionId]
+    def keyPresent(k: Key): Boolean
+
+  /** The locks an object state holds. Displaced holders count (ObjectState.displacedLocks) */
+  final class HeldLocks(os: ObjectState) extends LockView:
+    def slot(s: LockSlot): Set[TransactionId] =
+      val current = s match
+        case LockSlot.Object => os.lockedToTransaction
+        case LockSlot.Content => os.kvState.flatMap(_.contentLocked)
+        case LockSlot.Key(k) => os.kvState.flatMap(_.content.get(k)).flatMap(_.lockedToTransaction)
+        case LockSlot.AbsentKey(k) => os.kvState.flatMap(_.absentKeyLocks.get(k))
+      current.toSet ++ os.displacedLocks.iterator.collect { case (`s`, t) => t }
+    def writers: Set[TransactionId] = os.lockedWriteTransactions
+    def shared: Set[TransactionId] = os.sharedLocks
+    def keyPresent(k: Key): Boolean = os.kvState.exists(_.content.contains(k))
+
+  /** The locks `holder`'s commit vote would take on `os` (RequirementsLocker.plannedLocks), as if it alone held any */
+  final class PlannedLocks(holder: TransactionId, os: ObjectState, planned: Iterable[RequirementsLocker.PlannedLock])
+    extends LockView:
+    import RequirementsLocker.PlannedLock
+    private val me = Set(holder)
+    private val slots = planned.iterator.collect { case PlannedLock.Slot(s) => s }.toSet
+    // A Key slot of an absent key takes nothing (RequirementsLocker.take)
+    def slot(s: LockSlot): Set[TransactionId] = s match
+      case LockSlot.Key(k) if !keyPresent(k) => Set()
+      case _ => if slots.contains(s) then me else Set()
+    def writers: Set[TransactionId] =
+      if planned.exists(_ == PlannedLock.Range) || slots.exists(s => slot(s).nonEmpty) then me else Set()
+    def shared: Set[TransactionId] = if planned.exists(_ == PlannedLock.Shared) then me else Set()
+    def keyPresent(k: Key): Boolean = os.kvState.exists(_.content.contains(k))
+
   /** The other transactions holding locks on `only` that this transaction's requirements and KeyValue writes would
     * collide with in a non-applying check (transaction-requirements 4), whatever the state's revisions, refcounts and
     * keys. Displaced holders count (ObjectState.displacedLocks). For a committed transaction that holds no locks
@@ -271,47 +308,46 @@ object RequirementsChecker extends Logging {
                   objects: Map[ObjectId, ObjectState],
                   kvWrites: Map[ObjectId, KVWrites],
                   only: Set[ObjectId]): Set[TransactionId] =
+    lockHoldersIn(transactionId, requirements, kvWrites, oid =>
+      if only.contains(oid) then objects.get(oid).map(HeldLocks(_)) else None)
+
+  /** lockHolders over the locks `locks` gives for each object, None for an object left out */
+  def lockHoldersIn(transactionId: TransactionId,
+                    requirements: List[TransactionRequirement],
+                    kvWrites: Map[ObjectId, KVWrites],
+                    locks: ObjectId => Option[LockView]): Set[TransactionId] =
     var holders = Set[TransactionId]()
 
-    def slotHolders(os: ObjectState, slot: LockSlot): Set[TransactionId] =
-      val current = slot match
-        case LockSlot.Object => os.lockedToTransaction
-        case LockSlot.Content => os.kvState.flatMap(_.contentLocked)
-        case LockSlot.Key(k) => os.kvState.flatMap(_.content.get(k)).flatMap(_.lockedToTransaction)
-        case LockSlot.AbsentKey(k) => os.kvState.flatMap(_.absentKeyLocks.get(k))
-      current.toSet ++ os.displacedLocks.iterator.collect { case (`slot`, t) => t }
-
     /** A key requirement or write on `k`: the present key's lock, or the absent key's */
-    def keyHolders(os: ObjectState, k: Key): Set[TransactionId] =
-      if os.kvState.exists(_.content.contains(k)) then slotHolders(os, LockSlot.Key(k))
-      else slotHolders(os, LockSlot.AbsentKey(k))
+    def keyHolders(v: LockView, k: Key): Set[TransactionId] =
+      if v.keyPresent(k) then v.slot(LockSlot.Key(k)) else v.slot(LockSlot.AbsentKey(k))
 
     for req <- requirements do
       req match
-        case r: TransactionObjectRequirement if only.contains(r.objectPointer.id) =>
-          objects.get(r.objectPointer.id).foreach: os =>
+        case r: TransactionObjectRequirement =>
+          locks(r.objectPointer.id).foreach: v =>
             // Object-level locks collide with every request; held shared locks with every non-shared one
-            holders ++= slotHolders(os, LockSlot.Object) ++ slotHolders(os, LockSlot.Content)
+            holders ++= v.slot(LockSlot.Object) ++ v.slot(LockSlot.Content)
             r match
               case _: SharedRevisionLock =>
-                holders ++= os.lockedWriteTransactions
+                holders ++= v.writers
               case kv: KeyValueUpdate =>
-                holders ++= os.sharedLocks
+                holders ++= v.shared
                 val writes = kvWrites.get(kv.objectPointer.id)
                 val wholeObject = kv.requiredRevision.nonEmpty || kv.contentLock.nonEmpty ||
                   kv.requirements.exists(_.isInstanceOf[KeyValueUpdate.KeyObjectRevision]) ||
                   writes.exists(_.objectLevel)
                 if wholeObject then
-                  holders ++= os.lockedWriteTransactions
+                  holders ++= v.writers
                 else
                   // WithinRange collides only with whole-object requests, through the range locks
                   kv.requirements.foreach:
                     case _: KeyValueUpdate.WithinRange =>
                     case _: KeyValueUpdate.KeyObjectRevision =>
-                    case kr => holders ++= keyHolders(os, kr.key)
-                  writes.foreach(_.keys.foreach(k => holders ++= keyHolders(os, k)))
+                    case kr => holders ++= keyHolders(v, kr.key)
+                  writes.foreach(_.keys.foreach(k => holders ++= keyHolders(v, k)))
               case _ =>
-                holders ++= os.lockedWriteTransactions ++ os.sharedLocks
+                holders ++= v.writers ++ v.shared
         case _ =>
     holders - transactionId
 

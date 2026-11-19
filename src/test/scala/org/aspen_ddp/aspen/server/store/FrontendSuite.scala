@@ -2568,6 +2568,43 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions(txid1).holdsLocks shouldBe true
   }
 
+  /** txid1 holds a commit vote writing key 1 of kvPtr; txid2, a later write of key 1 that voted abort on it, is
+    * committed and waits for txid1 in lock order
+    */
+  def keyWriteWaitsInLockOrder(frontend: Frontend, net: TestNet): Unit =
+    def keyWrite(txid: TransactionId) =
+      lockTxd(txid, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(1), rev0)))))
+    prepare(frontend, net, keyWrite(txid1), insertOf(1)).disposition shouldBe TransactionDisposition.VoteCommit
+    prepare(frontend, net, keyWrite(txid2), insertOf(1)).disposition shouldBe TransactionDisposition.VoteAbort
+    commitErrors(frontend, net, txid2) shouldBe Nil
+    committedMessages(net) shouldBe Nil
+
+  def insertOf(key: Int): DataBuffer = KeyValueOperation.encode(List(new Insert(k(key), Array[Byte](9))), ida)(0)
+
+  test("a vote that does not collide with a commit waiting in lock order is not blocked by it (Q-W9)") {
+    val (frontend, _, net, _) = failStopFixture()
+    keyWriteWaitsInLockOrder(frontend, net)
+    // A write of key 2 collides with neither txid1 nor txid2's changes: it votes at once rather than waiting for txid1
+    // to resolve, which may need this very vote at another store
+    prepare(frontend, net, lockTxd(txid3, List(KeyValueUpdate(kvPtr, None, None,
+      List(KeyValueUpdate.KeyRevision(k(2), rev0))))), insertOf(2)).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("a vote colliding with a commit waiting in lock order waits for it, then votes on the applied state") {
+    val (frontend, _, net, _) = failStopFixture()
+    keyWriteWaitsInLockOrder(frontend, net)
+    // A blind Insert of key 1: it would take the key's lock, which txid2's write collides with, so it waits
+    val txd3 = lockTxd(txid3, List(KeyValueUpdate(kvPtr, None, None, Nil)))
+    frontend.receiveTransactionMessage(mkPrepare(txd3, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid2, insertOf(1)))))
+    def vote3 = net.sentTx.collect { case r: TxPrepareResponse if r.transactionId == txid3 => r.disposition }
+    vote3 shouldBe Nil
+
+    commitErrors(frontend, net, txid1) shouldBe Nil
+    committedMessages(net).map(_.transactionId) shouldBe List(txid1, txid2)
+    vote3 shouldBe List(TransactionDisposition.VoteCommit)
+  }
+
   test("an abort voter that cannot apply a committed update does not fail-stop") {
     val (frontend, backend, net, stops) = failStopFixture()
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit

@@ -543,6 +543,96 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       os.read(storeDir / RebuildingStore.RebuildCompleteMarkerFile) should be(earlier.toString)
       host.control.rebuilds.silencedStores should contain(rebuilt)
 
+  atest("a superseded copy whose entry then leaves the device is retired by the Deleted Stores pass (RB-W9)"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val rebuilt = StoreId(PoolId.BootstrapPoolId, 0)
+    val earlier = UUID.randomUUID()
+    val current = UUID.randomUUID()
+
+    def setEntry(deviceId: StorageDeviceId, episode: UUID): Future[Unit] =
+      for
+        ptr <- client.getStorageDevicePointer(deviceId)
+        kvos <- client.read(ptr)
+        _ <- client.transactUntilSuccessful: tx =>
+          Future.successful:
+            tx.update(ptr, None, None,
+              List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
+              List(Insert(StorageDeviceState.StateKey, StorageDeviceState(kvos).setRebuilding(rebuilt, episode).encode())))
+        _ <- waitForTransactionsToComplete()
+      yield ()
+
+    def pending: List[os.Path] =
+      val dir = deviceDir / RebuildingStore.PendingDeleteDirectory
+      if os.exists(dir) then os.list(dir).toList else Nil
+
+    for
+      deviceSetId <- client.createStorageDeviceSet("test-set", 0, None)
+      realDeviceId <- client.createStorageDevice(HostId.BootstrapHostId, deviceSetId)
+      _ <- setEntry(realDeviceId, earlier)
+      _ = injectLoadedDevice(host, new LocalStorageDeviceState(
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL()))
+      armed = recorded(host).armLookup(realDeviceId)
+      _ = host.control.reconciler.checkAll()
+      _ = armed.success(deviceState(realDeviceId, Map(rebuildingIn(rebuilt, earlier))))
+      _ <- yieldUntil(factory.created.nonEmpty)
+      _ <- setEntry(realDeviceId, current)
+      storeDir = deviceDir / rebuilt.directoryName
+      _ = os.makeDir.all(storeDir)
+      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, earlier.toString)
+      // The check the Superseded outcome asks for finds the entry re-placed to another device, before the current
+      // episode's rebuild could start here
+      _ = recorded(host).armLookup(realDeviceId).success(deviceState(realDeviceId, Map()))
+      _ = factory.created.head.promise.success(())
+      _ <- waitForTransactionsToComplete()
+      _ <- yieldUntil(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
+      _ <- yieldUntil(!os.exists(storeDir))
+    yield
+      recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Superseded)
+      factory.created should have size 1
+      pending should have size 1
+      os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      host.control.router.offlineStores should not contain rebuilt
+
+  atest("a copy whose flip failed permanently, whose entry then leaves the device, is retired (RB-W9)"):
+    val hostRoot = newHostDir()
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+
+    // Not registered in the tree, so the flip's getStorageDevicePointer fails permanently
+    val synthetic = StorageDeviceId(UUID.fromString("cccccccc-0000-0000-0000-000000000004"))
+    val deviceDir = hostRoot / "storage-devices" / "synth-d"
+    os.makeDir.all(deviceDir)
+    injectLoadedDevice(host, new LocalStorageDeviceState(
+      synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL()))
+    val storeDir = deviceDir / storeN(0).directoryName
+
+    def pending: List[os.Path] =
+      val dir = deviceDir / RebuildingStore.PendingDeleteDirectory
+      if os.exists(dir) then os.list(dir).toList else Nil
+
+    val first = recorded(host).armLookup(synthetic)
+    host.control.reconciler.checkAll()
+    first.success(deviceState(synthetic, Map(rebuilding(storeN(0)))))
+
+    for
+      _ <- yieldUntil(factory.created.size == 1)
+      _ = os.makeDir.all(storeDir)
+      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, "")
+      _ = factory.created.head.promise.success(())
+      _ <- yieldUntil(scheduler(host).pending.contains(Host.RebuildRetryInitialDelay), 400)
+      // Re-placed during the backoff: its retry's check finds no entry here
+      _ = recorded(host).armLookup(synthetic).success(deviceState(synthetic, Map()))
+      _ = runRebuildRetries(host)
+      _ <- yieldUntil(!os.exists(storeDir))
+    yield
+      factory.created should have size 1
+      pending should have size 1
+      os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      host.control.router.offlineStores should not contain storeN(0)
+
   /** Pumps transactions until `factory` has created a rebuild. Silent on exhaustion: callers
    *  assert on it. */
   private def completeRebuildsStarted(factory: RecordingRebuildFactory, rounds: Int = 50): Future[Unit] =

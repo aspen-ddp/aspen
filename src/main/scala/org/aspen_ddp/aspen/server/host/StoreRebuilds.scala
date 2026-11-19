@@ -320,9 +320,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
             case Success(RebuildOutcome.Superseded) =>
               // The entry is Rebuilding here under a later episode: the store was re-placed away and back while this
-              // rebuild ran. Its copy stays at the store's path, still silent; its rebuild-complete marker names this
-              // episode, so the next rebuild retires it (retireForeignCopy) and starts over
+              // rebuild ran. Its copy stays at the store's path, offline; its rebuild-complete marker names this
+              // episode, so the next rebuild retires it (retireForeignCopy) and starts over, or the Deleted Stores
+              // pass does if the entry leaves the device first
               try
+                keepUnpromotedCopyOffline(local, storeId)
                 logger.info(s"Rebuild of store $storeId on device ${local.storageDeviceId} finished for an earlier " +
                             "Rebuilding episode. Not promoting it; the store is rebuilt again")
               finally
@@ -350,6 +352,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               // is exactly as silent as the infinite retry loop it replaced. What is left
               // behind matters: the store is on disk, the tree still says Rebuilding.
               try
+                // Offline, so the Deleted Stores pass retires it if the entry leaves the device before the retry
+                keepUnpromotedCopyOffline(local, storeId)
                 logger.error(s"Failed to record the completed rebuild of store $storeId on " +
                              s"device ${local.storageDeviceId}. The store is on disk in " +
                              s"${local.devicePath / storeId.directoryName} but is not " +
@@ -464,6 +468,18 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       ctx.scheduler.schedule(delay):
         scheduledRebuildRetries -= storeId
         ctx.reconciler.checkStorageDevice(deviceId)
+
+  /** Records a finished copy its flip did not promote (RebuildOutcome.Superseded, a permanently failed flip) in its
+   *  device's offlineStores, as a restart's load of the copy would (StoreLoader.tryLoadStore leaves a rebuild-complete
+   *  copy offline). The Deleted Stores pass then retires it if its entry leaves the device before a later rebuild of
+   *  the store here retires or promotes it; without it the copy would hold the store's path until a restart, and
+   *  every transfer of the store onto this device would refuse. A device unloaded meanwhile is left alone: its next
+   *  load does the same. */
+  private def keepUnpromotedCopyOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+    if ctx.devices.devices.get(local.storageDeviceId).contains(local) &&
+       os.exists(local.devicePath / storeId.directoryName) then
+      ctx.router.markOffline(storeId)
+      local.offlineStores += storeId
 
   /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of
    *  service: it is not loaded, and it is recorded offline behind an empty transfer-out marker

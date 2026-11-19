@@ -204,7 +204,9 @@
   checks the device again; the slot release clears its `abandonedRebuilds` mark whatever the outcome, since a rebuild
   past finish's latch re-check ignores the cancel), and deletes a `rebuilding/<id>` staging copy only when no rebuild of it is running. A
   flip of a rebuild whose entry has since moved to another episode is `RebuildOutcome.Superseded`: nothing is
-  written, and its copy, marked for the earlier episode, is retired by the next `startRebuild`
+  written, and its copy, marked for the earlier episode, is retired by the next `startRebuild`. That copy, like one
+  whose flip failed permanently, is added to the device's `offlineStores` (`keepUnpromotedCopyOffline`, as a
+  restart's load would), so the Deleted Stores pass retires it if its entry leaves the device first
 - Nothing of a store's previous copy is destroyed before the store is Active on its owner device (the store copies
   rule above). A fail-stopped backend's CRL entries likewise stay live until the retire saves them
 - A device the tree records Failed is retired by its host's reconcile (`DeviceShutdown.retireFailedDevice`): a

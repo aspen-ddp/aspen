@@ -414,23 +414,25 @@ gossips the store online itself). The host acts only after the decision:
   removes `rebuild-complete`; an adopter classes it Clean and a restart's reinstatement loads it.
 * `Discard`: deletes the final directory (`LocalDevices.discardStoreDirectory`).
 * `NotOwned`: leaves the copy for the new owner, whose rebuild finds the marked final path and only flips.
-* `Superseded`: leaves the copy at the final path, silent (still in `silenced`, not in the device's `offlineStores`).
-  Its marker names the earlier episode, so the current episode's `startRebuild` retires it (`retireForeignCopy`:
-  marked `rebuild-required`, kept in `pending-delete/`). If the entry leaves the device before that rebuild starts,
-  nothing in this process retires the copy (RB-W9); a restart's load leaves it offline and the Deleted Stores pass
-  retires it. An Active entry from another episode cannot meet a running rebuild: every transition out of Rebuilding
-  on this device passes a reconcile whose `abandonUnlisted` cancels it, a second rebuild of the store
-  cannot start on this host while one runs (`rebuildingStores`), and a transfer in cannot promote over a final path
-  the rebuild's move then fails on.
+* `Superseded`: leaves the copy at the final path, offline: it is added to the device's `offlineStores`
+  (`keepUnpromotedCopyOffline`), the state a restart's load leaves it in. Its marker names the earlier episode, so the
+  current episode's `startRebuild` retires it (`retireForeignCopy`: marked `rebuild-required`, kept in
+  `pending-delete/`). If the entry leaves the device before that rebuild starts, the Deleted Stores pass retires it
+  instead, which clears the store's path for a later transfer onto the device. An Active entry from another episode
+  cannot meet a running rebuild: every transition out of Rebuilding on this device passes a reconcile whose
+  `abandonUnlisted` cancels it, a second rebuild of the store cannot start on this host while one runs
+  (`rebuildingStores`), and a transfer in cannot promote over a final path the rebuild's move then fails on.
 
 Every settled outcome releases the slot and re-checks all devices; `NotOwned` re-checks the others only. A failed pass
 or a permanently failed flip releases the slot, re-checks the **other** devices (re-checking its own would restart the
 same store at once) and schedules a backoff re-check of its own (`StoreRebuilds.scheduleRebuildRetry`:
 `Host.RebuildRetryInitialDelay` 30 s, doubled per consecutive failure of the store, capped at `RebuildRetryMaxDelay`
-30 min, reset when a flip settles; at most one scheduled per store). A cancel for a shutdown re-checks the other
-devices; a cancel because the entry left the device (`abandonedRebuilds`) re-checks all, so the next check deletes the
-staging copy. The abandoned branch is taken only when the completion is `RebuildCancelled`; a cancelled rebuild that
-ends otherwise (finished past the latch re-check, or failed with another latched cause) takes that outcome's branch.
+30 min, reset when a flip settles; at most one scheduled per store). A failed flip first records its copy in the
+device's `offlineStores`, as `Superseded` does: the Deleted Stores pass retires it if the entry leaves the device during
+the backoff, and an entry found Active (the flip committed after all) has the Completed Rebuilds pass load it. A cancel
+for a shutdown re-checks the other devices; a cancel because the entry left the device (`abandonedRebuilds`) re-checks
+all, so the next check deletes the staging copy. The abandoned branch is taken only when the completion is
+`RebuildCancelled`; a cancelled rebuild that ends otherwise (finished past the latch re-check, or failed with another latched cause) takes that outcome's branch.
 The slot release clears the abandoned mark whichever branch runs, so a later rebuild of the store on this host is
 cancelled when its entry leaves in turn.
 A device shutdown waits for its cancelled rebuilds' slot releases up to `shutdownWorkTimeout` (60 s), the staging
@@ -783,21 +785,6 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 ---
 
 ## Open weaknesses
-
-### RB-W9. A finished copy whose flip did not promote it is stranded when its entry leaves the device (CONFIRMED; hygiene)
-Mechanism: after `RebuildOutcome.Superseded`, or a permanently failed flip (`Failure` branch with its backoff
-re-check), the copy stays at the store's path with `rebuild-complete`. It is in neither `loadedStores` nor the
-device's `offlineStores` (only `silenced`), so if the entry leaves the device before the next `startRebuild` here
-retires it, the Deleted Stores pass (which walks `offlineStores`) never sees it, and `abandonUnlisted` only unsilences
-it and deletes staging.
-Trigger / scenario: E1's flip is `Superseded` while both host slots are taken, so E2's `startRebuild` waits; the
-operator re-places E2 to another device. Or a flip fails permanently and the store is re-placed during the backoff.
-Consequence: the copy occupies space until the host restarts (its load leaves it offline, the Deleted Stores pass
-then retires it). Meanwhile a transfer of the store onto this device refuses at every check (`StoreTransfers.startIn`:
-"store path already exists").
-Suggested fix: add the store to the device's `offlineStores` on `Superseded` and on a failed flip, as
-`keepRebuiltStoreOffline` does for `AdoptOffline`, so the Deleted Stores pass retires it when its entry leaves.
-Effort: S   Priority: 5
 
 ### RB-W10. An out-of-space flush in `finish` is not classified (CONFIRMED; alerting)
 Mechanism: `RebuildingStore.finish` calls `backend.rebuildFlush()` directly, outside `checkpointBestEffort`, so an

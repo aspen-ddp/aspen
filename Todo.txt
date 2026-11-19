@@ -51,11 +51,6 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.2  RB-W8  abandonedRebuilds leaks when an abandoned rebuild does not end in RebuildCancelled. CONFIRMED, S.
-     A rebuild past finish's latch re-check, or one with another cause already latched, keeps its entry. Later
-     rebuilds of that store on the host cannot be cancelled by abandonUnlisted, which breaks B18. Fix: clear the
-     entry in release().
-
 4.3  RP-W3  A store marked again between passes never reaches a proof or parking. PLAUSIBLE, S.
      errorDeferralKey(key, value.revision) resets both the lock-deferral and the stale counts whenever the entry is
      rewritten, and every mark rewrites it. A store stale on a hot key is re-marked every pass and stays stale. Fix:

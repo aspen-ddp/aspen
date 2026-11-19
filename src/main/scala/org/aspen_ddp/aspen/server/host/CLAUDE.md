@@ -201,7 +201,8 @@
   Rebuilding entry to another device and repoints the pool, under a new rebuild episode
   (`server/rebuild/CLAUDE.md`). The reconcile's `StoreRebuilds.abandonUnlisted` cancels a rebuild running for a store
   no longer Rebuilding on its device, or Rebuilding there under another episode (`rebuildEpisodes`; its completion
-  checks the device again), and deletes a `rebuilding/<id>` staging copy only when no rebuild of it is running. A
+  checks the device again; the slot release clears its `abandonedRebuilds` mark whatever the outcome, since a rebuild
+  past finish's latch re-check ignores the cancel), and deletes a `rebuilding/<id>` staging copy only when no rebuild of it is running. A
   flip of a rebuild whose entry has since moved to another episode is `RebuildOutcome.Superseded`: nothing is
   written, and its copy, marked for the earlier episode, is retired by the next `startRebuild`
 - Nothing of a store's previous copy is destroyed before the store is Active on its owner device (the store copies

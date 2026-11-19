@@ -218,10 +218,14 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
       val settled = Promise[Unit]()
 
+      // Every completion branch runs it. It clears the abandoned mark too: an abandoned rebuild past finish's latch
+      // re-check, or with another cause latched, ignores the cancel and ends in some other outcome, and a mark left
+      // behind would stop abandonUnlisted cancelling a later rebuild of the store here
       def release(): Unit =
         rebuildingStores -= storeId
         rebuildDevices -= storeId
         rebuildEpisodes -= storeId
+        abandonedRebuilds -= storeId
         ctx.publishView()
         if rebuildsSettled.get(storeId).exists(_ eq settled) then
           rebuildsSettled -= storeId
@@ -364,7 +368,6 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             logger.info(s"Rebuild of store $storeId on device ${local.storageDeviceId} abandoned: the store is " +
                         "no longer being rebuilt here")
           finally
-            abandonedRebuilds -= storeId
             release()
             recheckAll()
 

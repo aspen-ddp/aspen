@@ -430,6 +430,42 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
         List(storeN(0) -> Some(earlier), storeN(0) -> Some(current)))
       factory.created(1).cancelled should be(false)
 
+  atest("an abandoned rebuild that ends in another failure does not stop a later rebuild being cancelled (RB-W8)"):
+    // Re-placed away while its pass was already failing (out of space, say): the cancel is ignored and the rebuild
+    // ends in that failure, not RebuildCancelled. Placed back here, then away again: the new rebuild is cancelled
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val e1 = UUID.randomUUID()
+    val e2 = UUID.randomUUID()
+    val e3 = UUID.randomUUID()
+
+    def check(episode: UUID): Future[Unit] =
+      val lookup = recorded(host).armLookup(deviceA)
+      host.control.reconciler.checkStorageDevice(deviceA)
+      lookup.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), episode))))
+      yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+
+    val first = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    first.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), e1))))
+
+    for
+      _ <- yieldUntil(factory.created.nonEmpty)
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+      _ <- check(e2)
+      _ <- yieldUntil(factory.created.head.cancelled)
+      _ = factory.created.head.promise.failure(new Exception("out of space"))
+      _ <- yieldUntil(!host.control.rebuilds.rebuildingStoreIds.contains(storeN(0)))
+      _ <- check(e2)
+      _ <- yieldUntil(factory.created.size == 2)
+      _ <- check(e3)
+      _ <- yieldUntil(factory.created(1).cancelled)
+    yield
+      factory.created.map(_.episode).toList should be(List(Some(e1), Some(e2)))
+      factory.created(1).cancelled should be(true)
+
   atest("a copy finished for an earlier Rebuilding episode is retired before the rebuild starts (RB-W3)"):
     // Finished, and awaiting its flip, when the store was re-placed away; back here now under a new episode. It must
     // not be taken for done: it is kept in pending-delete like any lost copy, and the store rebuilt. A copy of the

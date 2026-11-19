@@ -419,7 +419,7 @@ gossips the store online itself). The host acts only after the decision:
   marked `rebuild-required`, kept in `pending-delete/`). If the entry leaves the device before that rebuild starts,
   nothing in this process retires the copy (RB-W9); a restart's load leaves it offline and the Deleted Stores pass
   retires it. An Active entry from another episode cannot meet a running rebuild: every transition out of Rebuilding
-  on this device passes a reconcile whose `abandonUnlisted` cancels it (but see RB-W8), a second rebuild of the store
+  on this device passes a reconcile whose `abandonUnlisted` cancels it, a second rebuild of the store
   cannot start on this host while one runs (`rebuildingStores`), and a transfer in cannot promote over a final path
   the rebuild's move then fails on.
 
@@ -431,6 +431,8 @@ same store at once) and schedules a backoff re-check of its own (`StoreRebuilds.
 devices; a cancel because the entry left the device (`abandonedRebuilds`) re-checks all, so the next check deletes the
 staging copy. The abandoned branch is taken only when the completion is `RebuildCancelled`; a cancelled rebuild that
 ends otherwise (finished past the latch re-check, or failed with another latched cause) takes that outcome's branch.
+The slot release clears the abandoned mark whichever branch runs, so a later rebuild of the store on this host is
+cancelled when its entry leaves in turn.
 A device shutdown waits for its cancelled rebuilds' slot releases up to `shutdownWorkTimeout` (60 s), the staging
 backend being closed before the release.
 
@@ -679,7 +681,7 @@ is never repaired (5.2's locked copies are marked for this reason).
 * **B17 Rebuilding survives shutdown, adoption and restart.**
 * **B18 Work belongs to one episode.** A rebuild resumes only a checkpoint of its entry's episode, takes only a
   finished copy whose `rebuild-complete` names it, and is flipped only while the entry still names it; a running
-  rebuild whose entry moved to another episode is cancelled (up to RB-W8).
+  rebuild whose entry moved to another episode is cancelled.
 * **B19 A failed device's stores are not served after the tombstone.** The reconcile retires a device it reads Failed
   (`DeviceShutdown.retireFailedDevice`: a durable `failed` marker, then unloaded like a relinquished device), and no
   host loads a device carrying the marker. Residual: until its first reconcile, a restarted or partition-healed old
@@ -781,23 +783,6 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 ---
 
 ## Open weaknesses
-
-### RB-W8. `abandonedRebuilds` leaks when an abandoned rebuild does not end in `RebuildCancelled` (CONFIRMED; bookkeeping)
-Mechanism: `StoreRebuilds.abandonUnlisted` adds the store to `abandonedRebuilds` and calls `cancel()`; only the
-completion branch `Failure(RebuildCancelled(_)) if abandonedRebuilds.contains(storeId)` removes it. `cancel()` latches
-`RebuildCancelled` only if no cause is latched yet, and a rebuild past `finish`'s latch re-check, or in `start`'s
-already-in-place path, ignores it. Such a rebuild completes with `Success` (then `Discard`/`Superseded`) or with
-another failure (out of space, `MaxFailedObjects`, a staging fail-stop, a failed accepted-loss mark), and the entry
-stays.
-Trigger / scenario: a re-placement (`replaceRebuild`) of a store whose rebuild here is finishing, or has already
-latched an out-of-space abort (the very case `REBUILD OUT OF SPACE` tells the operator to re-place). Later the store
-is rebuilt on this host again (re-placed back, or a drain picks this device) and its entry moves away once more:
-`abandonUnlisted` skips the cancel (`!abandonedRebuilds.contains`), and a shutdown cancel of it takes the abandoned
-branch (clears the router's offline mark, re-checks the shutting-down device).
-Consequence: B18's cancel does not happen; the superseded rebuild walks to completion holding a host slot, and its flip
-is then `Discard` or `Superseded`. Safety holds through the guarded flip.
-Suggested fix: remove the store from `abandonedRebuilds` in `release()`, which every completion branch runs.
-Effort: S   Priority: 4
 
 ### RB-W9. A finished copy whose flip did not promote it is stranded when its entry leaves the device (CONFIRMED; hygiene)
 Mechanism: after `RebuildOutcome.Superseded`, or a permanently failed flip (`Failure` branch with its backoff

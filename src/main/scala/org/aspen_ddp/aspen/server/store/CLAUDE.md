@@ -153,8 +153,8 @@
   release when a commit is applied in memory: the in-flight marker orders followers. A committed transaction holding
   no locks here applies in lock order: it waits while another transaction holds locks it collides with on an object
   both change (`Tx.awaitLockHolders`, `RequirementsChecker.lockHolders`; `server/transaction/CLAUDE.md`, Lock order),
-  and new votes whose locks it collides with wait for it (`lockWaiters`, `Tx.lockWaitBlocked`; other votes decide at
-  once; the wait is not in `commitInFlight`, which orders held commits). `RequirementsLocker.plannedLocks` is the one
+  and new votes whose locks it collides with wait for it, at most `Tx.CollisionWait` before voting abort
+  (`lockWaiters`, `Tx.lockWaitBlocked`; other votes decide at once; the wait is not in `commitInFlight`, which orders held commits). `RequirementsLocker.plannedLocks` is the one
   source of the locks a vote takes, for both `lock` and that test. After a failed backend commit
   every transaction on that object votes abort (`BackendCommitFailed`) until the store reloads. Objects a
   transaction only checks or locks get no backend commit, so concurrent `SharedRevisionLock` holders never wait

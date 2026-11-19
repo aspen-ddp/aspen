@@ -384,8 +384,8 @@ decided in `Tx.determineDisposition`, in this order:
 4. A hosted object whose earlier backend commit failed or that was poisoned (`BackendCommitFailed`), or that a
    rebuilt store's inherited votes may lock (`InheritedVoteLock`, 10.10): `VoteAbort`.
 5. A hosted object with a commit in flight or held for its turn (`Frontend.commitInFlight`), or changed by a committed
-   Tx waiting to apply in lock order (9.1) that would collide with this vote's locks (`Tx.lockWaitBlocked`), outcome
-   unknown: the vote is withheld and the Tx registers to be told when the object is free (`Frontend.awaitCommitPersisted`).
+   Tx waiting to apply in lock order (9.1) that would collide with this vote's locks (`Tx.lockWaitBlocked`, for at
+   most `Tx.CollisionWait`, then `VoteAbort`), outcome unknown: the vote is withheld and the Tx registers to be told when the object is free (`Frontend.awaitCommitPersisted`).
 6. Otherwise `RequirementsChecker.check`. If every failure is a collision with a lock holder this transaction builds on
    (`Tx.awaitableHolders`: it requires the revision the holder writes, and the holder still holds its locks), the vote
    is withheld for up to `Tx.CollisionWait`. Otherwise `VoteCommit` (no errors) or `VoteAbort`; an abort whose cause is
@@ -619,7 +619,8 @@ every prepare and accept response, retransmits included: write amplification, no
   * lock order (`Tx.awaitLockHolders`): a committed Tx holding no locks here does not apply while another Tx here holds
     commit-vote locks its requirements or writes collide with (`RequirementsChecker.lockHolders`) on an object both
     change; it waits, holding its references, until each holder releases (`Frontend.locksReleased`), and new votes whose
-    locks it collides with wait for it (`Tx.lockWaitBlocked`); other new votes decide at once. Otherwise a non-chaining commit applied over a vote's locks would
+    locks it collides with wait for it, up to `Tx.CollisionWait` before voting abort (`Tx.lockWaitBlocked`); other new
+    votes decide at once. Otherwise a non-chaining commit applied over a vote's locks would
     fail that vote's re-check, and the counted vote would stand for neither its lock nor its update. A lock-only holder
     is not waited for, and the wait is outside `commitInFlight`, so the holder's own commit never queues behind it
     (`transaction-requirements.md`);

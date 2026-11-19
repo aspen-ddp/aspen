@@ -2605,6 +2605,30 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     vote3 shouldBe List(TransactionDisposition.VoteCommit)
   }
 
+  test("a vote colliding with a commit waiting in lock order votes abort once CollisionWait passes (Q-W9)") {
+    val (frontend, _, net, stops) = failStopFixture()
+    keyWriteWaitsInLockOrder(frontend, net)
+    val txd3 = lockTxd(txid3, List(KeyValueUpdate(kvPtr, None, None, Nil)))
+    frontend.receiveTransactionMessage(mkPrepare(txd3, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid2, insertOf(1)))))
+    def vote3 = net.sentTx.collect { case r: TxPrepareResponse if r.transactionId == txid3 => r }
+    val tx3 = frontend.transactions(txid3)
+    tx3.checkCollisionWait(System.nanoTime() + Tx.CollisionWait.toNanos / 2)
+    vote3 shouldBe Nil
+
+    // The waiter may wait on a holder that needs this very vote elsewhere: the wait is bounded, then the vote aborts,
+    // naming the waiter, and takes no locks
+    tx3.checkCollisionWait(System.nanoTime() + Tx.CollisionWait.toNanos + 1)
+    vote3.map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+    vote3.flatMap(_.collisions) shouldBe List(txid2)
+    tx3.holdsLocks shouldBe false
+
+    // The waiter still applies once its holder commits
+    commitErrors(frontend, net, txid1) shouldBe Nil
+    committedMessages(net).map(_.transactionId) shouldBe List(txid1, txid2)
+    stops() shouldBe Nil
+  }
+
   test("an abort voter that cannot apply a committed update does not fail-stop") {
     val (frontend, backend, net, stops) = failStopFixture()
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit

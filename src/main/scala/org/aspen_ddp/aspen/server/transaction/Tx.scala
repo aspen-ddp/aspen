@@ -20,8 +20,9 @@ object Tx {
   val StuckReportAfter: FiniteDuration = FiniteDuration(2, SECONDS)
   val StuckReportEvery: FiniteDuration = FiniteDuration(5, SECONDS)
 
-  /** How long a transaction waits for a lock holder it is built on before voting abort. See `Tx.awaitableHolders`.
-    * Checked at the store's heartbeat, so a wait that times out lasts up to one heartbeat (1 s) longer
+  /** How long a transaction waits for a lock holder it is built on (`Tx.awaitableHolders`), or for a colliding
+    * committed transaction waiting in lock order (`Tx.lockWaitBlocked`), before voting abort. Checked at the store's
+    * heartbeat, so a wait that times out lasts up to one heartbeat (1 s) longer
     */
   val CollisionWait: FiniteDuration = FiniteDuration(500, MILLISECONDS)
 
@@ -192,6 +193,12 @@ class Tx( trs: TransactionRecoveryState,
 
   /** The objects whose in-flight commits this transaction waits for before voting: see determineDisposition */
   private var awaitingCommits: Set[ObjectId] = Set()
+
+  /** When this vote was first withheld for a colliding commit waiting in lock order (lockWaitBlocked), or 0 while it
+    * is not. Once that has lasted Tx.CollisionWait (checkCollisionWait) the vote aborts instead (lockWaitBlockExpired)
+    */
+  private var lockWaitBlockStart: Long = 0L
+  private var lockWaitBlockExpired = false
   /** The commit is queued in the Frontend behind earlier commits of the objects it changes: see holdForTurn */
   private var commitQueued = false
   /** TxFinalized arrived while the commit was held for its turn: the Frontend is told once the commit is issued */
@@ -554,24 +561,27 @@ class Tx( trs: TransactionRecoveryState,
     RequirementsChecker.lockHoldersIn(transactionId, requirements, writes,
       o => if o == oid then Some(locks) else None).contains(holder)
 
-  /** The objects on which a committed transaction waiting to apply (awaitLockHolders) would wait for this vote's
-    * locks: the vote waits for those waits to end (Frontend.lockWaitWakeVoters), so a waiter cannot be starved. Any
-    * other vote decides now, on the state before the waiter's apply, which changes nothing its requirements or
-    * writes depend on, as for two votes holding compatible locks. A vote is never withheld for a waiter it does not
-    * collide with: that waiter may wait for a holder whose transaction can decide only with this very vote, at a
-    * store where a waiter of its own waits for this vote's transaction, a cycle that would last until expiry
+  /** The objects on which a committed transaction waiting to apply (awaitLockHolders) collides with this vote's
+    * locks, each with one such waiter. The vote waits for those waits to end (Frontend.lockWaitWakeVoters), so a
+    * waiter cannot be starved. Any other vote decides now, on the state before the waiter's apply, which changes
+    * nothing its requirements or writes depend on, as for two votes holding compatible locks. A waiter may itself wait
+    * for a holder whose transaction can decide only with this very vote, at a store where another waiter withholds
+    * that one for this vote's transaction: so a vote is never withheld for a waiter it does not collide with, and a
+    * colliding one is withheld for at most Tx.CollisionWait (checkCollisionWait), then votes abort
     */
-  private def lockWaitBlocked(): Set[ObjectId] =
+  private def lockWaitBlocked(): Map[ObjectId, TransactionId] =
     val waited = pointersById.keySet.filter(oid => frontend.lockWaiters(oid).exists(_ ne this))
-    if waited.isEmpty then Set()
+    if waited.isEmpty then Map()
     else
       val writes = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
       val planned = RequirementsLocker.plannedLocks(requirements, objects.filter((oid, _) => waited.contains(oid)),
         writes).groupMap(_._1)(_._2)
-      waited.filter: oid =>
-        planned.get(oid).exists: p =>
+      waited.iterator.flatMap: oid =>
+        planned.get(oid).flatMap: p =>
           val locks = RequirementsChecker.PlannedLocks(transactionId, objects(oid), p)
-          frontend.lockWaiters(oid).exists(w => (w ne this) && w.wouldWaitFor(transactionId, oid, locks))
+          frontend.lockWaiters(oid).find(w => (w ne this) && w.wouldWaitFor(transactionId, oid, locks))
+            .map(w => oid -> w.transactionId)
+      .toMap
 
   /** This Tx is registered in the Frontend as a committed transaction waiting to apply: see awaitLockHolders */
   private var lockWaitRegistered = false
@@ -736,6 +746,13 @@ class Tx( trs: TransactionRecoveryState,
     if waitingForCollision && now - collisionWaitStart >= Tx.CollisionWait.toNanos then
       collisionWaitExpired = true
       waitingOn = Set()
+      endCollisionWait()
+    else if lockWaitBlockStart != 0L && awaitingCommits.nonEmpty &&
+      now - lockWaitBlockStart >= Tx.CollisionWait.toNanos then
+      // Withheld too long for a commit waiting in lock order: see lockWaitBlocked
+      lockWaitBlockExpired = true
+      frontend.stopAwaitingCommits(awaitingCommits, this)
+      awaitingCommits = Set()
       endCollisionWait()
 
   /** Decides the vote now that the holders, or the in-flight commits, are gone, unless another takes their place, and
@@ -986,7 +1003,8 @@ class Tx( trs: TransactionRecoveryState,
   } else {
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
     val inherited = pointersById.keysIterator.filter(frontend.inheritedVoteLock).toList
-    val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet ++ lockWaitBlocked()
+    val lockWaits = lockWaitBlocked()
+    val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet ++ lockWaits.keySet
 
     if muted && oresolution.isEmpty && !outcomeKnown then
       // Not checked and so not waiting on anything. It never votes commit, and the abort it holds is never sent: it
@@ -1011,11 +1029,23 @@ class Tx( trs: TransactionRecoveryState,
       awaitingCommits = Set()
       decideDisposition(inherited.map(_ -> InheritedVoteLock()).toMap ++
         failed.map(_ -> BackendCommitFailed()), Nil)
+    else if lockWaits.nonEmpty && lockWaitBlockExpired && oresolution.isEmpty && !outcomeKnown then
+      // Withheld for Tx.CollisionWait by commits waiting in lock order that still wait: an abort vote, which is always
+      // safe, ends any cycle of such waits across stores (lockWaitBlocked)
+      waitingOn = Set()
+      awaitingCommits = Set()
+      logger.info(s"Tx $transactionId on store $storeId votes abort: committed transactions waiting in lock order " +
+        s"to apply over the objects ${lockWaits.keySet} withheld its vote for ${Tx.CollisionWait}")
+      decideDisposition(lockWaits.map((oid, waiter) => oid -> TransactionCollision(waiter)), Nil)
     else if inFlight.nonEmpty && oresolution.isEmpty && !outcomeKnown then
       // Once the outcome is known the vote no longer matters, so nothing waits for it: a resolved transaction may
       // decide here only because its objects finished loading after the resolution
       waitingOn = Set()
       awaitingCommits = inFlight
+      if lockWaits.isEmpty then
+        lockWaitBlockStart = 0L
+      else if lockWaitBlockStart == 0L then
+        lockWaitBlockStart = System.nanoTime()
       frontend.awaitCommitPersisted(inFlight, this)
       logger.trace(s"Tx $transactionId waits for the in-flight commits of $inFlight before voting")
     else

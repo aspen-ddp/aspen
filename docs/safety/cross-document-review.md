@@ -164,14 +164,11 @@ The premises other subsystems take from this:
   holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`, transaction-requirements.md
   9.4). A live voter's failed re-check is an invariant violation, logged and reported.
 * A lock-order wait has no timer, and while it lasts every new vote whose locks the waiter collides with waits
-  (`Tx.lockWaitBlocked`); other votes decide at once. Waits at two stores can still block colliding votes each other's
-  holders need (transaction-requirements.md Q-W9, multi-key writers only). Expiry ends such a cycle: a blocked vote's Tx is frozen past expiry and then reports as a
-  final non-voter (`Tx.determineDisposition`, `receiveStatusRequest`), so each holder's tally reaches a discard
-  (`ExpiryTally.decideUnknown`, rule D or E), and the holder's commit vote is discarded once an UnackedCommits lookup
-  started after that decision finds no entry; its locks then release and the waiter applies. During a metadata-pool
-  outage that lookup stays unanswered (awaited, not re-issued), and the object's votes at that store wait as long: a
-  transient stall bounded by the outage, which halts the pool's finalization anyway; colliding votes would abort on
-  the holder's own locks regardless.
+  (`Tx.lockWaitBlocked`); other votes decide at once. A colliding vote waits at most `Tx.CollisionWait`, then votes
+  abort naming the waiter, so waits at two stores that withhold the votes each other's holders need end in about
+  1.5 s: each holder's driver then sees an abort vote and decides (transaction-requirements.md 8.3). A holder that
+  cannot decide otherwise ends by expiry (`ExpiryTally.decideUnknown`), and one whose tally is undecidable holds the
+  waiter as long as its own locks (transaction-requirements.md section 12).
 * A lock-only vote is not waited for, and a repair install may change an object under one: shared revision locks are
   outside `ObjectState.objectLevelLocked`. It has no update to lose; its skipped re-check is reported
   (transaction-requirements.md 8.5), and the shared lock did its work during the vote.

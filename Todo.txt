@@ -59,14 +59,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
-4.3 [Q-W9] Colliding votes blocked by lock-order waits can still form a cross-store cycle until expiry. PLAUSIBLE, S
-    transaction-requirements.md Q-W9 (narrowed). A lock-order waiter now withholds only votes whose locks it collides
-    with (`Tx.lockWaitBlocked`), which ends the single-key cycle. The residual needs four contending multi-key writers
-    and two delayed prepares, each blocked vote colliding with the waiter at its store; expiry ends it (about 30 s).
-    Possible fix: bound a colliding vote's wait (e.g. `Tx.CollisionWait`, then an abort vote). Decide whether the
-    abort cost is worth turning a rare 30 s stall into a 1.5 s one.
-
-
 PRIORITY 5: performance and hygiene
 -----------------------------------
 

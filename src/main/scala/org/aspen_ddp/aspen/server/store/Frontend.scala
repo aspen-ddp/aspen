@@ -457,6 +457,35 @@ class Frontend(val storeId: StoreId,
   /** A transaction's commit of `oid` is outstanding, or a committed transaction holds one waiting its turn */
   def commitInFlight(oid: ObjectId): Boolean = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)
 
+  /** Committed transactions waiting to apply for the commit votes they would run over (Tx.awaitLockHolders), by
+    * object they change
+    */
+  private val lockWaitingCommits = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
+
+  /** A new vote on `oid` waits: a commit of it is in flight or held for its turn (commitInFlight), or a committed
+    * transaction changing it waits to apply (Tx.awaitLockHolders). The latter is left out of commitInFlight, which
+    * orders held commits: the votes it waits for must never queue their own commits behind it
+    */
+  def voteBlocked(oid: ObjectId): Boolean = commitInFlight(oid) || lockWaitingCommits.contains(oid)
+
+  /** `tx`, committed, waits to apply its changes of `oids` until each of `holders` releases its locks
+    * (locksReleased -> Tx.collisionHolderReleased)
+    */
+  def awaitLockHolders(oids: Set[ObjectId], holders: Set[TransactionId], tx: Tx): Unit =
+    oids.foreach(oid => lockWaitingCommits(oid) = lockWaitingCommits.getOrElse(oid, Nil).filterNot(_ eq tx) :+ tx)
+    holders.foreach(awaitLocksReleased(_, tx))
+
+  /** `tx` no longer waits to apply: it is applying, or queued for its turn */
+  def lockWaitEnded(oids: Set[ObjectId], tx: Tx): Unit = oids.foreach(oid => removeFrom(lockWaitingCommits, oid, tx))
+
+  /** A committed transaction's wait to apply ended: the votes withheld for it (voteBlocked) decide, unless a commit of
+    * the object is now in flight, whose completion tells them instead
+    */
+  def lockWaitWakeVoters(oids: Set[ObjectId]): Unit = oids.foreach(commitTurnFree)
+
+  /** Whether the Tx `holder` changes `oid` here (Tx.changes) */
+  def changes(holder: TransactionId, oid: ObjectId): Boolean = transactions.get(holder).exists(_.changes(oid))
+
   /** A transaction's backend commit of `oid` failed: every later transaction on it votes abort until the store reloads */
   def commitFailed(oid: ObjectId): Boolean = failedCommits.contains(oid)
 
@@ -499,9 +528,9 @@ class Frontend(val storeId: StoreId,
   @volatile private[aspen] var testingOnlyQuarantines: Int = 0
 
   /** Quarantines an object a commit vote, live or recovered, could not apply its committed update to
-    * (Tx.issueCommits): a committed transaction that does not depend on it applied first over its locks, the state was
-    * invalidated under them, or, for a recovered vote, the store applied the update before the crash and a later
-    * transaction superseded it. The vote then counts with neither its lock nor its update. The store does not tell
+    * (Tx.issueCommits): the state was invalidated under its locks, two conflicting transactions committed, or, for a
+    * recovered vote, the store applied the update before the crash and a later transaction superseded it. A later
+    * commit that does not depend on the vote is no cause: it waits for the vote in lock order (Tx.awaitLockHolders). The vote then counts with neither its lock nor its update. The store does not tell
     * these apart. A re-apply (recovered, or through an UnackedCommits entry) that would insert a key now absent
     * on an object a later transaction reached is quarantined too, applied nothing: the key may have been deleted since
     * (RequirementsApplyer.mayReinsertDeletedKeys). Every transaction on the object votes abort, as the lock would have made it, and committed

@@ -150,17 +150,20 @@
   commit is in flight, whether or not it builds on it, withholds its vote with no locks and no timer until the commit
   persists, then checks its requirements against the state as it is then. A follower resolved committed meanwhile
   holds its commit (queued per object, oldest first) until earlier commits of its objects persist. Locks still
-  release when a commit is applied in memory: the in-flight marker orders followers. After a failed backend commit
+  release when a commit is applied in memory: the in-flight marker orders followers. A committed transaction holding
+  no locks here applies in lock order: it waits while another transaction holds locks it collides with on an object
+  both change (`Tx.awaitLockHolders`, `RequirementsChecker.lockHolders`; `server/transaction/CLAUDE.md`, Lock order),
+  and new votes on its objects wait for it (`voteBlocked`; the wait is not in `commitInFlight`, which orders held
+  commits). After a failed backend commit
   every transaction on that object votes abort (`BackendCommitFailed`) until the store reloads. Objects a
   transaction only checks or locks get no backend commit, so concurrent `SharedRevisionLock` holders never wait
 - Fail-stop (`Frontend.failStop`, transaction-requirements.md 8.5): a commit voter has dropped its locks before it
   applies, so one that cannot hold the update it voted for must not serve as if it did. An apply that throws, and a
   recovered commit vote whose object fails to load with anything but `ObjectNotFound`, fail-stop the store. A failed
-  apply re-check, live or recovered, quarantines the object instead (below): a committed apply ignores other
-  transactions' locks, so a later commit that does not depend on the voter can be applied first (fence takeover,
-  allocator follow-up, repair proof, refcount change), which the store cannot tell from two conflicting commits. A
-  live voter logs it at error, naming the transaction whose update each object now shows; this is where two
-  conflicting commits would surface. A lock-only object that fails the re-check is skipped and reported only. A fail-stopped store drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
+  apply re-check, live or recovered, quarantines the object instead (below): the state was invalidated under the
+  locks, or two conflicting commits happened, which the store cannot tell apart (a later commit over the vote's locks
+  waits for it in lock order, so it is no cause). A live voter logs it at error, naming the transaction whose update
+  each object now shows; this is where two conflicting commits would surface. A lock-only object that fails the re-check is skipped and reported only. A fail-stopped store drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
   store is rebuilt as a failed backend is. Never for a full device: a write-frozen store poisons the object instead
   (`poisonObject`, the `BackendCommitFailed` rule) and keeps serving. Every fail-stop is a lost-store declaration
   (Backlog: correlated declarations)
@@ -177,8 +180,8 @@
   object no unconcluded allocation covers. MapBackend keeps a refcount-0 state rather than removing it, unlike RocksDB
   and FSIF, so its tests see no miss: the deletion-after-allocation tests use a removing MapBackend
 - Quarantine (`Frontend.quarantine`, transaction-requirements.md 8.5): a commit vote whose apply re-check fails may have
-  been overtaken by a later commit applied over its locks, invalidated under them, or, if recovered, superseded before
-  the crash (10.5a), and the store does not tell these apart. Each changed object it could not apply is quarantined,
+  been invalidated under its locks, met a conflicting commit, or, if recovered, been superseded before the crash
+  (10.5a), and the store does not tell these apart. Each changed object it could not apply is quarantined,
   except one the backend missed and the Tx allocates (`allocatedHere`: no copy, no lost lock; one whose data was dropped
   was applied and then deleted, which no read verifies), which is reported (transaction-requirements 8.5). Before the
   apply, a re-apply (recovered, or through an UnackedCommits entry: `Tx.appliesThroughEntry`) also leaves out and

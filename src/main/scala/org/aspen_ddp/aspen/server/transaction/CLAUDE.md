@@ -266,10 +266,19 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   commit marker, but one it cannot apply would leave its counted vote standing for neither. An apply that throws
   fail-stops the store (`server/store/CLAUDE.md`, Fail-stop). A voter, live or recovered, whose re-check fails on a
   changed object quarantines it until repair verifies it, and so does any re-apply (recovered or through its entry)
-  that would write back a key deleted since (`Tx.quarantining`; `server/store/CLAUDE.md`, Quarantine). A later
-  commit that does not depend on the voter, applied first over its locks, causes it legitimately; a live voter logs
-  it at error, naming the transaction each object now shows (where two conflicting commits would surface). A
+  that would write back a key deleted since (`Tx.quarantining`; `server/store/CLAUDE.md`, Quarantine). A live voter
+  logs it at error, naming the transaction each object now shows (where two conflicting commits would surface). A
   lock-only object that fails the re-check is skipped and reported only
+- Lock order (transaction-requirements 8.3, R15): a committed Tx holding no locks at a store does not apply while
+  another Tx there holds locks its requirements or writes collide with (`RequirementsChecker.lockHolders`) on an
+  object both change. It is held (`Tx.awaitLockHolders`, `commitHeld`, no locks, references kept) until each holder
+  releases (`Frontend.locksReleased`, after the holder applied or aborted), then takes the usual `holdForTurn` path.
+  Otherwise a later commit that does not chain on the vote (a refcount change, a key-level write, a repair refcount
+  or key proof) would raise the object timestamp, fail the vote's re-check and leave the counted vote standing for
+  neither lock nor update. A lock-only holder is not waited for; a Tx holding its own locks never waits. The wait is
+  outside `commitInFlight`, so the holder's own commit never queues behind it; new votes on the waiter's objects wait
+  for it (`Frontend.voteBlocked`), so it cannot be starved. A holder that never resolves (undecidable expiry tally)
+  holds the waiter for as long as its locks: beyond the write threshold's margin, alarmed, no way out
 - A commit decision can overtake the data too. The store holds the commit until the data, a client's prepare, or
   TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
   if the data beat the finalizer's `errorTimeout` (2 s). Stores that miss it are marked in the ErrorTree

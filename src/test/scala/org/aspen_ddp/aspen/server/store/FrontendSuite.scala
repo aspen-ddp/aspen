@@ -1921,13 +1921,16 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         case Some(rr: ReadResponse) => rr.result.toOption.get.lockedWriteTransactions
         case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
 
-    // txid2 votes commit and locks op1 and the fence. Its fence write is a refcount change, which txid1's overwrite
-    // below does not invalidate: an update txid1 did invalidate could not be applied, and the store would fail-stop
+    def insertOf(key: Int) = KeyValueOperation.encode(List(new Insert(k(key), Array[Byte](1))), ida)(0)
+
+    // txid2 votes commit and locks op1 and key 1 of kvPtr
     prepare(frontend, net, lockTxd(txid2, List(overwrite(op1),
-      RefcountUpdate(fencePtr, ObjectRefcount(1, 1), ObjectRefcount(2, 2)))))
+      KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(1), rev0))))), insertOf(1))
       .disposition shouldBe TransactionDisposition.VoteCommit
-    // txid1 collides on the fence but is committed by the other stores' votes; its backend commit is held
-    prepare(frontend, net, lockTxd(txid1, List(overwrite(fencePtr)))).disposition shouldBe TransactionDisposition.VoteAbort
+    // txid1 writes key 2 of kvPtr, which txid2's locks leave free: it votes commit, and its backend commit is held
+    prepare(frontend, net, lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None,
+      List(KeyValueUpdate.KeyRevision(k(2), rev0)), pinned = true))), insertOf(2))
+      .disposition shouldBe TransactionDisposition.VoteCommit
     resolve(frontend, net, txid1, committed = true)
     backend.heldCommits shouldBe 1
 
@@ -1937,14 +1940,14 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.issued shouldBe List(txid1)
     frontend.transactions(txid2).holdsLocks shouldBe true
     locksOn(op1) shouldBe Set(txid2)
-    locksOn(fencePtr) shouldBe Set(txid2)
+    locksOn(kvPtr) shouldBe Set(txid2)
 
     // txid1 persists: txid2 is applied in memory, and only then are its locks released
     backend.deliverOne()
     // One backend commit per object txid2 changes
     backend.issued shouldBe List(txid1, txid2, txid2)
     locksOn(op1) shouldBe Set()
-    locksOn(fencePtr) shouldBe Set()
+    locksOn(kvPtr) shouldBe Set()
     frontend.transactions.get(txid2).forall(!_.holdsLocks) shouldBe true
     readData(frontend, net, op1) shouldBe Right(List[Byte](1))
   }
@@ -2302,7 +2305,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       List(TransactionDisposition.VoteCommit)
   }
 
-  test("a committed transaction is applied while another transaction holds a lock on its object") {
+  test("a committed transaction changing an object a commit vote holds applies after it, and new votes wait for it") {
     val (frontend, backend, net) = lockFixture()
 
     // txid1 locks op1. txid2 collides here but is committed by the votes of other stores
@@ -2310,17 +2313,19 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       .disposition shouldBe TransactionDisposition.VoteCommit
     prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteAbort
 
+    // txid2 waits to apply for txid1, and a new transaction on op1 waits to vote for txid2
     frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid2, committed = true, late = false, proof = false))
-    net.txMessage() match
-      case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
-      case other => throw new AssertionError(s"Expected TxCommitted, got $other")
-    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+    net.txMessage() shouldBe None
+    backend.get(oid1).get.metadata.revision shouldBe rev0
+    sendPrepare(frontend, lockTxd(txid3, List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 2)))))
+    net.txMessage() shouldBe None
 
-    // txid1's lock survives txid2's commit and is released by its own resolution
-    prepare(frontend, net, lockTxd(txid3, List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 2)))))
-      .collisions shouldBe List(txid1)
+    // txid1's resolution applies it, then txid2, and txid3 decides against the state both leave
     resolve(frontend, net, txid1, committed = true)
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe List(txid1 -> Nil, txid2 -> Nil)
     backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(2, 2)
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+    prepareResponses(net, txid3).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
   }
 
   test("a store applying two blind inserts of a key in opposite order keeps the later one (Req F1)") {
@@ -2450,29 +2455,23 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteAbort
   }
 
-  test("a live commit voter whose object a conflicting commit reached first quarantines it, and repair clears it") {
-    val verifier = new ManualVerifier
-    val (frontend, backend, net, stops) = failStopFixture(verifier)
+  test("a commit conflicting with a commit vote held here applies only after the vote, which it then cannot follow") {
+    val (frontend, backend, net, stops) = failStopFixture()
     prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
-    // txid1 collides with txid2's lock here, but the other stores' votes commit it. Its apply ignores the lock
+    // txid1 collides with txid2's lock here, but the other stores' votes commit it: its apply waits for txid2
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteAbort
     commitErrors(frontend, net, txid1) shouldBe Nil
-    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
+    committedMessages(net) shouldBe Nil
+    backend.get(oid1).get.metadata.revision shouldBe rev0
 
-    // txid2 commits too: its revision requirement no longer holds. The object is quarantined, the store kept
-    commitErrors(frontend, net, txid2) shouldBe List(oid1)
-    stops() shouldBe Nil
-    frontend.failStopped shouldBe false
-    frontend.isQuarantined(oid1) shouldBe true
-    verifier.made.map(_._1) shouldBe List(oid1)
-    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
-    prepare(frontend, net, lockTxd(txid3, List(overwriteAfter(txid1)))).disposition shouldBe
-      TransactionDisposition.VoteAbort
-
-    verifier.answer(Success(true))
+    // txid2 commits too (two conflicting commits): the vote applies first, and txid1, which this store voted against,
+    // fails its re-check and is reported. Nothing is quarantined
+    commitErrors(frontend, net, txid2) shouldBe Nil
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe
+      List(txid2 -> Nil, txid1 -> List(oid1))
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
     frontend.isQuarantined(oid1) shouldBe false
-    prepare(frontend, net, lockTxd(TransactionId(new UUID(0, 21)), List(overwriteAfter(txid1)))).disposition shouldBe
-      TransactionDisposition.VoteCommit
+    stops() shouldBe Nil
   }
 
   test("a live commit voter whose lock-only object a later commit changed first neither fail-stops nor quarantines") {
@@ -2495,20 +2494,99 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.testingOnlyQuarantines shouldBe 0
   }
 
-  test("a live commit voter whose object a later refcount change reached first does not fail-stop") {
-    val (frontend, _, net, stops) = failStopFixture()
+  /** txid1, a commit vote overwriting op1, and txid2, a later-started refcount change of op1 that collides with it */
+  def refcountAfterVote(frontend: Frontend, net: TestNet): TransactionDescription =
     val first = lockTxd(txid1, List(overwrite(op1)))
     prepare(frontend, net, first).disposition shouldBe TransactionDisposition.VoteCommit
     // Started later than txid1, so its apply raises the object timestamp past txid1's start
     val later = lockTxd(txid2, List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 2)))).copy(
       startTimestamp = HLCTimestamp(first.startTimestamp.asLong + (1000L << 16)))
     prepare(frontend, net, later).disposition shouldBe TransactionDisposition.VoteAbort
+    later
+
+  test("a commit that does not chain on a commit voter's locked update waits for it and applies after it") {
+    val (frontend, backend, net, stops) = failStopFixture()
+    refcountAfterVote(frontend, net)
+    // txid2's outcome arrives first. Applied now, it would fail txid1's re-check (the object timestamp), losing
+    // txid1's update at a store whose vote it counted: it waits for txid1 instead
     commitErrors(frontend, net, txid2) shouldBe Nil
-    // txid2 raised the object timestamp past txid1's start: txid1's re-check fails, so the object is quarantined
-    commitErrors(frontend, net, txid1) shouldBe List(oid1)
+    committedMessages(net) shouldBe Nil
+    backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(1, 1)
+
+    commitErrors(frontend, net, txid1) shouldBe Nil
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe
+      List(txid1 -> Nil, txid2 -> Nil)
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
+    backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(2, 2)
+    frontend.isQuarantined(oid1) shouldBe false
+    frontend.testingOnlyQuarantines shouldBe 0
     stops() shouldBe Nil
-    frontend.failStopped shouldBe false
-    frontend.isQuarantined(oid1) shouldBe true
+  }
+
+  test("a commit waiting to apply for a commit vote applies once the vote aborts") {
+    val (frontend, backend, net, _) = failStopFixture()
+    refcountAfterVote(frontend, net)
+    commitErrors(frontend, net, txid2) shouldBe Nil
+    committedMessages(net) shouldBe Nil
+
+    resolve(frontend, net, txid1, committed = false)
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe List(txid2 -> Nil)
+    backend.get(oid1).get.metadata.revision shouldBe rev0
+    backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(2, 2)
+  }
+
+  test("a commit waiting to apply defers its TxFinalized until it applies") {
+    val (frontend, backend, net, _) = failStopFixture()
+    refcountAfterVote(frontend, net)
+    commitErrors(frontend, net, txid2) shouldBe Nil
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
+    committedMessages(net) shouldBe Nil
+    backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(1, 1)
+
+    // Applied after txid1. Finalized, it is no longer a held transaction, so it sends no TxCommitted
+    commitErrors(frontend, net, txid1) shouldBe Nil
+    committedMessages(net).map(_.transactionId) shouldBe List(txid1)
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
+    backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(2, 2)
+    frontend.transactions.contains(txid2) shouldBe false
+    frontend.isQuarantined(oid1) shouldBe false
+  }
+
+  test("a key-level KeyValue commit waits for a commit vote with a required revision on the object") {
+    val (frontend, backend, net, stops) = failStopFixture()
+    def insertOf(key: Int) = KeyValueOperation.encode(List(new Insert(k(key), Array[Byte](9))), ida)(0)
+    val first = lockTxd(txid1, List(KeyValueUpdate(kvPtr, Some(rev0), None, Nil)))
+    prepare(frontend, net, first, insertOf(1)).disposition shouldBe TransactionDisposition.VoteCommit
+    // A later write of key 2 checking only its key: it collides with txid1's object lock here
+    val later = lockTxd(txid2, List(KeyValueUpdate(kvPtr, None, None,
+      List(KeyValueUpdate.KeyRevision(k(2), rev0))))).copy(
+      startTimestamp = HLCTimestamp(first.startTimestamp.asLong + (1000L << 16)))
+    prepare(frontend, net, later, insertOf(2)).disposition shouldBe TransactionDisposition.VoteAbort
+
+    commitErrors(frontend, net, txid2) shouldBe Nil
+    committedMessages(net) shouldBe Nil
+    commitErrors(frontend, net, txid1) shouldBe Nil
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe List(txid1 -> Nil, txid2 -> Nil)
+    backend.get(oid2).get.metadata.revision shouldBe ObjectRevision(txid1)
+    frontend.isQuarantined(oid2) shouldBe false
+    stops() shouldBe Nil
+  }
+
+  test("a key-level KeyValue commit does not wait for a commit vote on another key") {
+    val (frontend, _, net, _) = failStopFixture()
+    def insertOf(key: Int) = KeyValueOperation.encode(List(new Insert(k(key), Array[Byte](9))), ida)(0)
+    def keyWrite(txid: TransactionId, key: Int) =
+      lockTxd(txid, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(key), rev0)))))
+    prepare(frontend, net, keyWrite(txid1, 1), insertOf(1)).disposition shouldBe TransactionDisposition.VoteCommit
+    // txid2's write of key 2 collides with nothing here, but its refcount requirement on op1 fails, so it votes abort
+    // and holds no locks. Committed while txid1 still holds key 1, it applies to kvPtr at once
+    val txd2 = keyWrite(txid2, 2)
+    prepare(frontend, net, txd2.copy(requirements = txd2.requirements :+
+      RefcountUpdate(op1, ObjectRefcount(5, 5), ObjectRefcount(6, 6))), insertOf(2))
+      .disposition shouldBe TransactionDisposition.VoteAbort
+    commitErrors(frontend, net, txid2) shouldBe List(oid1)
+    frontend.transactions(txid1).holdsLocks shouldBe true
   }
 
   test("an abort voter that cannot apply a committed update does not fail-stop") {

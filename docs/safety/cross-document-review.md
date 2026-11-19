@@ -26,14 +26,14 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | CRL | Store lifecycle | Entries leave the device CRL only after another durable copy exists or the store is unservable on disk |
 | Transaction requirements | CRL, recovery | Recovered commit votes re-take their locks before any message is handled |
 | Transaction requirements | CRL, recovery | A quarantine survives a reload through the quarantining Tx's kept CRL state (not met: Q-W5, R-W4) |
-| Client reads | Requirements | Every commit voter applies a committed update or keeps its lock; at most `w - r` copies lack it (not met: Q-W4) |
+| Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it |
 | Client reads | Requirements, rebuild | `InvalidObject.provesDeletion`: a commit voter of an unapplied allocation answers `AllocationPending` (2.5) |
 | Transaction recovery | Repair | ErrorTree and UnackedCommits entries are consumed only once the store can no longer join T, and only by the store the pool names |
 | Transaction recovery | Metadata pools | Marker batches commit (finalization waits for them) |
 | Allocation and split finalizers | Client reads | A read proving deletion means the object is not live, so it needs no tree entry (2.5) |
 | Repair | Paxos, requirements | A read's unlocked parts reflect every committed transaction (quorum overlap plus lock reporting) |
 | Repair | Rebuild, transfers | The ownership fence (host and device) keeps superseded copies from consuming entries |
-| Quarantine verification | Repair, client reads | A read at least as new as the quarantining T shows T if T committed (not met: Q-W4) |
+| Quarantine verification | Repair, client reads | A read at least as new as the quarantining T shows T if T committed: T's commit voters apply it before any later write over its locks |
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
@@ -119,14 +119,14 @@ The premises other subsystems take from this:
 * Reads report the write locks of every voted, unapplied transaction (shared revision locks excepted); repair defers
   locked parts, and a read that needs a voted, unapplied allocation parks rather than answering `ObjectNotFound`
   (`Frontend.parkAllocationRead`, `Frontend.allocationPending`).
-* A committed apply ignores other transactions' locks (`RequirementsChecker.check` with `applying = true`) and waits
-  only for commits in flight or held (`Tx.holdForTurn`), not for an unresolved commit vote's lock. So a commit voter
-  of T whose outcome is late can apply a later commit T2 that does not chain on T's revision (a `RefcountUpdate`, a
-  key-level write, a repair proof, 2.4) before T. T2 raises the object timestamp, T's re-check then fails
-  `ObjectTimestampError`, and the object is quarantined with T unapplied (transaction-requirements.md 8.5). Reads
-  do not exclude a quarantined copy: they choose the revision by count alone (`BaseObjectReader.getStoreStates`), and
-  a quarantine verification counts the quarantined copy itself among the `r`. With `r` stores lacking T this way, T
-  is lost with no store failure (Q-W4).
+* A committed apply ignores other transactions' locks (`RequirementsChecker.check` with `applying = true`), but a
+  committed transaction holding no locks at a store waits to apply while another transaction there holds locks it
+  collides with on an object both change (`Tx.awaitLockHolders`, transaction-requirements.md 8.3, R15). So a commit
+  voter of T whose outcome is late applies T before a later commit T2 that does not chain on T's revision (a
+  `RefcountUpdate`, a key-level write, a repair proof, 2.4), and T2's raised object timestamp never fails T's
+  re-check. Reads choose the revision by count alone (`BaseObjectReader.getStoreStates`) and a quarantine
+  verification counts the quarantined copy itself among the `r`; both rely on T's `t` commit voters holding T, which
+  the lock order guarantees without any store failure.
 * A rebuild copies state from ordinary reads and ignores the locks they report, and the rebuilt store holds no lock
   for any transaction its old incarnation voted in. Those votes still count: a driver keeps a vote until a nack or a
   proof starts a new round (a muted store sends neither), a client's vote count is final, and expiry rule B places no
@@ -150,11 +150,11 @@ The premises other subsystems take from this:
   `MissingObject`, so no proof revives a deleted object. The object-level proof (`RepairProofs.proveObjectLevel`, an
   `ExclusiveRevisionLock`) changes nothing. The refcount proof (`RefcountUpdate(rc -> rc)`) and the key proof (a
   KeyValue update with no operations, `KeyRevision` or `DoesNotExist`) are real writes: each changes the object (a
-  backend commit, the object timestamp raised to the proof's start) and, once committed, applies over other
-  transactions' locks at the stores that voted abort on it. A proof is attempted precisely when an object stays
+  backend commit, the object timestamp raised to the proof's start) and, once committed, applies at the stores that
+  voted abort on it once the commit votes it collides with there have resolved. A proof is attempted precisely when an object stays
   locked across passes (`proofAfterDeferrals`), so where the lock is a commit vote of a revision-chained T that is
   applied at some stores and not yet resolved at the lock holder, the proof is a T2 of 2.3: if its outcome reaches
-  the holder first, T's re-check fails and the object is quarantined (Q-W4).
+  the holder first, it waits for the holder's vote in lock order (2.3), so T applies first.
 * A repair write never overwrites a different occupant of an FSIF slot (`RepairSlotOccupied`); the repairer drops a
   dead occupant with an id-checked `repairDelete`, only when the AllocationTree does not list it.
 * A failed repair write restores the fields it changed to the settled pre-repair state, the backend's
@@ -162,7 +162,8 @@ The premises other subsystems take from this:
   repair of an object the store did not hold discards its state.
 * A data copy is installed only from a read no older than the store's copy, or of equal timestamp and a different
   revision (`Reconcile.planData`): a refcount or key-level write moves the timestamp without the revision, so the
-  revision decides. That rule is what turns Q-W4's stale majority into an overwrite of the one store holding T.
+  revision decides. That rule overwrites a store's copy only with what a read majority holds, which includes every
+  committed T because its commit voters apply in lock order (2.3).
 
 ### 2.5 Allocations and proofs of deletion
 
@@ -236,7 +237,7 @@ Every clock comparison that crosses subsystems, and what bounds it:
 | Expiry (`Frontend.pastExpiry`, freeze) | each store's own clock | stores freeze at different moments under skew; the 8 s margin covers the inter-host skew, so an expiry commit exists only past the horizon on every clock (late condition 1). A backward step after a freeze thaws the Tx, breaking the tally's "reported states are final" premise (accepted, paxos-transactions.md) |
 | Repair age gate (60 s) | repairing host's HLC against the marker's start | paces only; the read decides a deletion |
 | Repair `mayJoinTransaction` | the store's own floor | same host |
-| Repair completion gate, quarantine verification | object timestamps, no clock | object timestamps never decrease; a timestamp past T's start does not show T was applied (2.3, Q-W4) |
+| Repair completion gate, quarantine verification | object timestamps, no clock | object timestamps never decrease; a timestamp past T's start does not show T was applied, so the gates rely on T's commit voters applying T before any later write over its locks (2.3) |
 | Rebuild pending-allocation coverage | none | the checkpointed union of listed allocations |
 
 ---

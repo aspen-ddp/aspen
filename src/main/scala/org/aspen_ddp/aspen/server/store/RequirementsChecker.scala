@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.ida.EncodedAppendDelta
-import org.aspen_ddp.aspen.common.objects.{Delete, Insert, KeyValueOperation, ObjectId, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueOperation, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -21,7 +21,8 @@ object RequirementsChecker extends Logging {
     *                 transactions (and the exclusive preference window) are not enforced then: only whether this
     *                 store's state satisfies the requirements. A lock holder whose requirements conflict with this
     *                 transaction's can no longer commit, so enforcing its lock would only turn this store's part of
-    *                 a committed update into a missed update.
+    *                 a committed update into a missed update. One that may still commit (it changes an object this
+    *                 transaction changes) is waited for before the apply instead (lockHolders, Tx.awaitLockHolders).
     * @param nanoTime Clock for the exclusive preference window
     * @param allocatedOver Objects the transaction allocates whose load found an existing state (in memory or in the
     *                 backend) rather than a fresh one. A replayed allocation must never overwrite a live object
@@ -256,6 +257,63 @@ object RequirementsChecker extends Logging {
 
     (objectErrors, nonObjectErrors)
   }
+
+  /** The other transactions holding locks on `only` that this transaction's requirements and KeyValue writes would
+    * collide with in a non-applying check (transaction-requirements 4), whatever the state's revisions, refcounts and
+    * keys. Displaced holders count (ObjectState.displacedLocks). For a committed transaction that holds no locks
+    * here, these are the votes its apply may run over (Tx.awaitLockHolders). The exclusive preference window is no
+    * lock and is not reported.
+    *
+    * @param kvWrites what the transaction's KeyValue operations change (KVWrites.from)
+    */
+  def lockHolders(transactionId: TransactionId,
+                  requirements: List[TransactionRequirement],
+                  objects: Map[ObjectId, ObjectState],
+                  kvWrites: Map[ObjectId, KVWrites],
+                  only: Set[ObjectId]): Set[TransactionId] =
+    var holders = Set[TransactionId]()
+
+    def slotHolders(os: ObjectState, slot: LockSlot): Set[TransactionId] =
+      val current = slot match
+        case LockSlot.Object => os.lockedToTransaction
+        case LockSlot.Content => os.kvState.flatMap(_.contentLocked)
+        case LockSlot.Key(k) => os.kvState.flatMap(_.content.get(k)).flatMap(_.lockedToTransaction)
+        case LockSlot.AbsentKey(k) => os.kvState.flatMap(_.absentKeyLocks.get(k))
+      current.toSet ++ os.displacedLocks.iterator.collect { case (`slot`, t) => t }
+
+    /** A key requirement or write on `k`: the present key's lock, or the absent key's */
+    def keyHolders(os: ObjectState, k: Key): Set[TransactionId] =
+      if os.kvState.exists(_.content.contains(k)) then slotHolders(os, LockSlot.Key(k))
+      else slotHolders(os, LockSlot.AbsentKey(k))
+
+    for req <- requirements do
+      req match
+        case r: TransactionObjectRequirement if only.contains(r.objectPointer.id) =>
+          objects.get(r.objectPointer.id).foreach: os =>
+            // Object-level locks collide with every request; held shared locks with every non-shared one
+            holders ++= slotHolders(os, LockSlot.Object) ++ slotHolders(os, LockSlot.Content)
+            r match
+              case _: SharedRevisionLock =>
+                holders ++= os.lockedWriteTransactions
+              case kv: KeyValueUpdate =>
+                holders ++= os.sharedLocks
+                val writes = kvWrites.get(kv.objectPointer.id)
+                val wholeObject = kv.requiredRevision.nonEmpty || kv.contentLock.nonEmpty ||
+                  kv.requirements.exists(_.isInstanceOf[KeyValueUpdate.KeyObjectRevision]) ||
+                  writes.exists(_.objectLevel)
+                if wholeObject then
+                  holders ++= os.lockedWriteTransactions
+                else
+                  // WithinRange collides only with whole-object requests, through the range locks
+                  kv.requirements.foreach:
+                    case _: KeyValueUpdate.WithinRange =>
+                    case _: KeyValueUpdate.KeyObjectRevision =>
+                    case kr => holders ++= keyHolders(os, kr.key)
+                  writes.foreach(_.keys.foreach(k => holders ++= keyHolders(os, k)))
+              case _ =>
+                holders ++= os.lockedWriteTransactions ++ os.sharedLocks
+        case _ =>
+    holders - transactionId
 
   /** Rejects an update whose resulting slice exceeds the limit, unless it is no larger than the current slice.
     * Allowing non-growing updates means an object that is already oversized (e.g. created before the limit

@@ -183,6 +183,8 @@ class Tx( trs: TransactionRecoveryState,
   private var commitQueued = false
   /** TxFinalized arrived while the commit was held for its turn: the Frontend is told once the commit is issued */
   private var finalizeDeferred = false
+  /** The commit votes this committed transaction waits for before applying: see awaitLockHolders */
+  private var applyWaitingOn: Set[TransactionId] = Set()
 
   /** The latest abort resolution held until a UnackedCommits lookup started after the first completes. See
     * needsUnackedCheck and holdAbort
@@ -483,12 +485,59 @@ class Tx( trs: TransactionRecoveryState,
   private var adoptedSaves: Int = 0
 
   private def releaseHeldCommit(): Unit =
-    if commitHeld && !commitAwaitsData && !(commitQueued && !frontend.heldCommitReady(changedHere, this)) then
+    if commitHeld && !commitAwaitsData && applyWaitingOn.isEmpty &&
+      !(commitQueued && !frontend.heldCommitReady(changedHere, this)) then
       commitHeld = false
       resolvedAndAllObjectsLoaded(true)
 
   /** The loaded objects this transaction changes, and so commits. Set once all objects have loaded (or failed to) */
   private var changedHere: Set[ObjectId] = Set()
+
+  /** Whether this transaction changes `oid` here. Set once its objects have loaded */
+  def changes(oid: ObjectId): Boolean = changedHere.contains(oid)
+
+  /** Whether the committed transaction must wait to apply for commit votes it would run over: a commit voter applies
+    * in its lock order (transaction-requirements 8.3). A committed apply ignores other transactions' locks
+    * (RequirementsChecker.check), so a commit that does not chain on a vote held here (a refcount change, a key-level
+    * KeyValue write, a repair refcount or key proof), started later, would raise the object timestamp past the vote's
+    * start and fail its re-check: this store's counted vote would then stand for neither its lock nor its update, and
+    * the stores lacking the update could reach the read threshold. So while another Tx here holds locks this
+    * transaction's requirements or writes collide with (RequirementsChecker.lockHolders) on an object both change, it
+    * waits for each to release them, having applied its commit or aborted (Frontend.locksReleased). It holds its
+    * references, no locks, and new votes on the objects it changes wait meanwhile (Frontend.voteBlocked), so it
+    * cannot be starved. The holder's own commit never waits for it (holdForTurn ignores the wait).
+    *
+    * A Tx holding its own locks never waits: two live votes never hold conflicting locks, and recovered votes
+    * sharing a lock (displaced holders) are ordered by what persisted before the crash. A lock-only holder has no
+    * update to lose and is not waited for. A holder that never resolves (an undecidable expiry tally) holds this
+    * commit as long as its own locks: that needs failures beyond the write threshold's margin, and is alarmed
+    */
+  private def awaitLockHolders(): Boolean =
+    val held = !(committing || committed || locked) &&
+      changedHere.exists(oid => objects.get(oid).exists(_.lockHolders.exists(_ != transactionId)))
+    val waitFor =
+      if !held then Set[TransactionId]()
+      else
+        val writes = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
+        RequirementsChecker.lockHolders(transactionId, requirements, objects, writes, changedHere)
+          .filter(h => frontend.holdsLocks(h) && changedHere.exists(frontend.changes(h, _)))
+    if waitFor.nonEmpty then
+      if !lockWaitRegistered then
+        logger.info(s"Tx $transactionId on store $storeId committed: its apply waits for the commit votes of " +
+          s"$waitFor, which hold locks on objects it changes")
+      lockWaitRegistered = true
+      applyWaitingOn = waitFor
+      frontend.awaitLockHolders(changedHere, waitFor, this)
+      true
+    else
+      applyWaitingOn = Set()
+      if lockWaitRegistered then
+        lockWaitRegistered = false
+        frontend.lockWaitEnded(changedHere, this)
+      false
+
+  /** This Tx is registered in the Frontend as a committed transaction waiting to apply: see awaitLockHolders */
+  private var lockWaitRegistered = false
 
   /** Whether the commit must wait its turn: an earlier commit of an object it changes is in flight, or held. If so, it
     * is queued in the Frontend, which calls commitPersisted when it may be its turn
@@ -520,7 +569,8 @@ class Tx( trs: TransactionRecoveryState,
       s"Locked: $locked. CommitHeld: $commitHeld. Committing: $committing. Committed: $committed. " +
       s"PendingLoads: $pendingObjectLoads. PendingCommits: $pendingObjectCommits. ClientPrepared: $clientPrepared. " +
       s"Recovered: $recovered. Waiting on: $waitingOn. Awaiting commits of: $awaitingCommits. " +
-      s"Commit queued: $commitQueued. Held aborts: ${heldAborts.size}. Last proposer: $lastProposer. " +
+      s"Commit queued: $commitQueued. Apply waits for: $applyWaitingOn. Held aborts: ${heldAborts.size}. " +
+      s"Last proposer: $lastProposer. " +
       s"Object revisions: $revisions"
 
   private var lastStuckReport: Option[Long] = None
@@ -621,6 +671,14 @@ class Tx( trs: TransactionRecoveryState,
       waitingOn -= holder
       if waitingOn.isEmpty then
         endCollisionWait()
+    // A committed transaction waiting to apply (awaitLockHolders): it re-checks for holders, then applies or queues
+    if applyWaitingOn.contains(holder) then
+      applyWaitingOn -= holder
+      if applyWaitingOn.isEmpty then
+        releaseHeldCommit()
+        // New votes on its objects waited for it (Frontend.voteBlocked): whatever it did, they may decide now
+        if applyWaitingOn.isEmpty then
+          frontend.lockWaitWakeVoters(changedHere)
 
   /** The Frontend: no commit of `oid` is in flight any more. A transaction waiting to vote decides once none of its
     * objects has one; a held commit is issued if it is now its turn on every object it changes
@@ -862,7 +920,7 @@ class Tx( trs: TransactionRecoveryState,
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
     val quarantined = pointersById.keysIterator.filter(frontend.isQuarantined).toList
     val inherited = pointersById.keysIterator.filter(frontend.inheritedVoteLock).toList
-    val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet
+    val inFlight = pointersById.keysIterator.filter(frontend.voteBlocked).toSet
 
     if muted && oresolution.isEmpty && !outcomeKnown then
       // Not checked and so not waiting on anything. It never votes commit, and the abort it holds is never sent: it
@@ -1081,21 +1139,22 @@ class Tx( trs: TransactionRecoveryState,
     // abort, as the lost lock would have made them, until repair shows the store's copy matches a read of the object at
     // least as new as this transaction. That is what repair requires to drop an ErrorTree entry for it, so the store is
     // then as good as one that missed the transaction and was repaired; the object is reported, so the finalizer marks
-    // the store. The failure has legitimate causes the store cannot tell from a violation: a committed transaction that
-    // does not depend on this one applied first, over this vote's locks (an apply ignores other transactions' locks,
-    // RequirementsChecker.check), its outcome having arrived first (a fence takeover, an allocator's follow-up write, a
-    // repair proof, a refcount change); the state was invalidated under the locks (Frontend.discard); or, for a
-    // recovered vote, the store applied the update before the crash and a later transaction superseded it. A live
-    // voter logs it as a possible invariant violation, naming the transaction the object now shows. An object already
-    // quarantined is quarantined by this vote too, so its bound covers this transaction.
+    // the store. A committed write that does not depend on this one never applies over this vote's locks on an object
+    // both change before this vote applies (awaitLockHolders), so the causes left are ones the store cannot tell from a
+    // violation: the state was invalidated under the locks (Frontend.discard), two conflicting transactions committed,
+    // or, for a recovered vote, the store applied the update before the crash and a later transaction superseded it. A
+    // live voter logs it as a possible invariant violation, naming the transaction the object now shows. An object
+    // already quarantined is quarantined by this vote too, so its bound covers this transaction.
     // Not an allocation the backend missed (allocatedHere): the store holds no copy of it, so no lock was lost, and
     // every other transaction on it misses and votes abort. A recovered allocation fails its apply only without its
     // data, which the CRL drops once the update is applied: the object was applied and later deleted, which a read
     // can never verify, so a quarantine would never clear. It is reported instead.
     //
     // A lock-only object whose re-check fails has no update to lose: it is skipped, logged and reported. A later commit
-    // applied first explains it (a fence takeover over a block commit's
-    // SharedRevisionLock); a rebuilt store's inherited votes keep a lost vote's lock, so that is no longer a cause.
+    // applied first over the lock explains it, as a lock-only vote is not waited for: a fence takeover over a block
+    // commit's SharedRevisionLock, an allocator's follow-up write, a writer after repair's object-level proof. A rebuilt
+    // store votes abort on the objects its lost incarnation's votes may back (Frontend.inheritedVoteLock), so a lock
+    // lost to a rebuild is not a cause.
     //
     // A re-apply that may write back a key deleted since (mayReinsert) is quarantined too, live or recovered: the
     // store cannot tell whether it applied the update and a later transaction deleted the key, or never applied it.
@@ -1118,9 +1177,8 @@ class Tx( trs: TransactionRecoveryState,
           !allocatedHere.contains(oid))
         if !recovered && invalidated.nonEmpty then
           logger.error(s"Tx $transactionId on store $storeId voted commit and committed, but its requirements no " +
-            s"longer hold on objects ${invalidated.toList.map(oid => s"$oid (${shows(oid)})").mkString(", ")}: a " +
-            s"commit applied first over its locks, the state changed under them, or two conflicting transactions " +
-            s"committed. Quarantined")
+            s"longer hold on objects ${invalidated.toList.map(oid => s"$oid (${shows(oid)})").mkString(", ")}: the " +
+            s"state changed under its locks, or two conflicting transactions committed. Quarantined")
         val toQuarantine = invalidated ++ quarantinedHere
         if toQuarantine.nonEmpty then
           quarantining ++= toQuarantine
@@ -1166,6 +1224,9 @@ class Tx( trs: TransactionRecoveryState,
   private def resolvedAndAllObjectsLoaded(committed: Boolean): Unit = {
     if committed && commitAwaitsData then
       logger.trace(s"Holding the commit of $transactionId until its object data arrives")
+      commitHeld = true
+    else if committed && awaitLockHolders() then
+      logger.trace(s"Holding the commit of $transactionId until the commit votes it would run over resolve")
       commitHeld = true
     else if committed && holdForTurn() then
       // Never issued while an earlier commit of the same object is in flight. Locks are kept until it is applied

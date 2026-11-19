@@ -678,7 +678,8 @@ transaction from the CRL and quarantines again only if the recovered vote re-app
 UnackedCommits entry); once T is finalized it has no entry and concludes with nothing applied, dropping the quarantine
 (transaction-requirements.md Q-W5). A quarantined object that is deleted, before or after the quarantine, is never
 verified (RP-W4). The verification counts the store's own quarantined copy among the read's `r` replies, like any
-other read (transaction-requirements.md Q-W4).
+other read: T's commit voters apply T before any later write over its locks (transaction-requirements.md 8.3), so a
+read majority holds T.
 
 ### 10.3 No read-driven repair
 

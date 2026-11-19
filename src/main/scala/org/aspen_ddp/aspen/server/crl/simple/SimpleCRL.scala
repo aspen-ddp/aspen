@@ -337,7 +337,12 @@ class SimpleCRL private (streamsDir: os.Path,
   /** `(n − 2) · S/2 − S/16` for `n` streams of `S` bytes (crash-recovery-log 6.1, "The limit"): with it, every
     * evacuation fits an empty stream and every sealed entry is written within `n − 1` rotations, as long as the
     * unoffset stubs outstanding stay within the `S/16` reserve's margin. Past that the CRL fails (W6) */
-  override def admissionLimitBytes: Long = (numStreams - 2) * maxSizeInBytes / 2 - maxSizeInBytes / 16
+  override def admissionLimitBytes: Long = limitAt(numStreams)
+
+  /** The limit at `crl-max-streams` streams, or at the ring now if its growth policy allows no stream beyond it */
+  override def maxAdmissionLimitBytes: Long = limitAt(math.max(numStreams, growth.maxStreams))
+
+  private def limitAt(streams: Int): Long = (streams - 2) * maxSizeInBytes / 2 - maxSizeInBytes / 16
 
   /** Half a stream, less EntryOverheadReserve for the headers of the entry that holds it, so one transaction's entry
     * always fits in a stream. A larger one would kill the CRL at writeHead's require (crash-recovery-log 10.20)

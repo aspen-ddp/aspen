@@ -350,7 +350,7 @@ CRL admission lanes waste headroom on data-only devices (from Todo 4.3, 2026-11-
 Transfers do not check the destination's CRL room (from the CRL growth work, 2026-11-17):
 - A transfer does not check that the destination device's CRL can take the store's `crl_save.log` state (CRL
   admission rule A3, docs/safety/crash-recovery-log.md 6.1). A state that can never fit there (its bytes above the
-  destination's admission limit plus its per-transaction bound, or one transaction above that bound, as a store
+  destination's admission limit at its growth cap plus its per-transaction bound, or one transaction above that bound, as a store
   moved from a device with a larger CRL may hold) is treated as a lost save file at the destination, and the store
   is rebuilt there. One that does not fit yet waits offline, retried at each device scan.
 - Fix: destination choice lives in the metadata management tasks (common/metadata/CLAUDE.md); have them avoid a

@@ -98,8 +98,9 @@
 - A `crl_save.log` state is charged before `loadStore` saves it (`CrlAdmission.tryChargeLoaded`, at most the limit
   plus one transaction, A3), after the Store is built and before install, retained for the store. Refused, the store
   is left offline, its file kept, and retried every device scan through `storesAwaitingSpace` (one warning per
-  minute), and the CRL is asked to grow (`requestGrowth`). A state that can never fit (above limit + T, or a
-  transaction above T) takes `crlSaveFileLost`: rebuilt
+  minute), and the CRL is asked to grow (`requestGrowth`). A state that can never fit (above the limit at the
+  CRL's growth cap, `maxAdmissionLimitBytes`, plus T, or a transaction above T) takes `crlSaveFileLost`: rebuilt; one
+  that fits only after growth waits offline as above
 - Planned physical moves: `shutdownStorageDevice` makes Active stores Offline and the device ShuttingDown; its host
   closes the stores, leaving their CRL state live in the device CRL (no per-store marker or save file), writes
   `shutdown.state` (its HostId) in the device dir, and commits Shutdown. Each device dir also has `owning-host`

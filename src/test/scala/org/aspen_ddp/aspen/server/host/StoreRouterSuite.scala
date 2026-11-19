@@ -206,10 +206,12 @@ object StoreRouterSuite:
 
   /** A GatedCrl whose loadStore waits for `loadGate`, whose readStoreState waits for `readGate` as set when it is
    *  called, and whose transactions take at most `maxTx` CRL bytes */
-  private class ReadGatedCrl(loadGate: Future[Unit] = Future.unit, maxTx: Long = Long.MaxValue)
+  /** `maxLimit` is its admission limit at its growth cap: 0, below any device admission's limit, for no growth */
+  private class ReadGatedCrl(loadGate: Future[Unit] = Future.unit, maxTx: Long = Long.MaxValue, maxLimit: Long = 0)
     extends GatedCrl(loadGate):
     @volatile var readGate: Future[Unit] = Future.unit
     override def maxTransactionBytes: Long = maxTx
+    override def maxAdmissionLimitBytes: Long = maxLimit
     /** How many times growth was requested */
     val growthRequests = new java.util.concurrent.atomic.AtomicInteger(0)
     override def requestGrowth(): Unit = growthRequests.incrementAndGet()
@@ -596,6 +598,25 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       // The full CRL is asked to grow
       crl.growthRequests.get should be(1)
       // Retried at the device scans, as a store awaiting space is
+      fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(Some(false))
+
+  // CRL-W6: never-fits is judged against the limit the CRL reaches at its growth cap, not the one now
+  test("a crl_save.log state above limit + T but within the grown limit waits offline for growth, not rebuilt"):
+    val s0 = StoreId(poolId, 0)
+    val crl = new ReadGatedCrl(maxTx = 10000, maxLimit = 100000)
+    val trs = (1 to 3).toList.map(i => voteState(s0, TransactionId(new UUID(17, 20 + i)), 4000))
+    val admission = new CrlAdmission(100)
+    CrlAdmission.recoveredBytes(StoreRecoveryState(trs)) should be > (100L + 10000L)
+    withRouter(crl): fx =>
+      val sds = addCountingDevice(fx, s0, crl, admission)
+      val backend = bootstrappedBackend(s0)
+      CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(trs), backend.crlSaveFile)
+      intercept[Exception](await(fx.load(backend)))
+      assertAbandoned(fx, s0, sds, backend)
+      admission.admittedBytes should be(0)
+      os.exists(backend.crlSaveFile) should be(true)
+      os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      crl.growthRequests.get should be(1)
       fx.onControl(fx.ctx.loader.awaitingSpaceHasCallback(s0)) should be(Some(false))
 
   for (what, states) <- List(

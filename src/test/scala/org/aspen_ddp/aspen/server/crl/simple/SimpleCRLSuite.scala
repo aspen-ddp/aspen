@@ -2696,6 +2696,17 @@ class SimpleCRLSuite extends FileBasedTests {
       i.crl.shutdown()
   }
 
+  test("The limit at the growth cap is that of crl-max-streams streams, or the limit now without growth (CRL-W6)") {
+    val s = growthStreamSize
+    val g = openGrowing(growthPolicy(maxStreams = 12), tdir / "growing")
+    assert(g.crl.maxAdmissionLimitBytes == 10 * s / 2 - s / 16)
+    assert(g.crl.maxAdmissionLimitBytes > g.crl.admissionLimitBytes)
+    g.crl.shutdown()
+    val f = SimpleCRL(tdir / "fixed", 4, ringStreamSize)
+    assert(f.crl.maxAdmissionLimitBytes == f.crl.admissionLimitBytes)
+    f.crl.shutdown()
+  }
+
   test("A new CRL's streams are a multiple of 4096 bytes, and at least 3 (S1)") {
     assertThrows[IllegalArgumentException](SimpleCRL(tdir, 4, ringStreamSize + 512))
     assertThrows[IllegalArgumentException](SimpleCRL(tdir, 2, ringStreamSize))

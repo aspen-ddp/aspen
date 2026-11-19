@@ -78,6 +78,7 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
   def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = inner.deleteTransaction(storeId, txid)
   override def admissionLimitBytes: Long = inner.admissionLimitBytes
   override def maxTransactionBytes: Long = inner.maxTransactionBytes
+  override def maxAdmissionLimitBytes: Long = inner.maxAdmissionLimitBytes
   override def requestGrowth(): Unit = inner.requestGrowth()
   override def onAdmissionLimitRaised(f: Long => Unit): Unit = inner.onAdmissionLimitRaised(f)
   override def deleteTransactions(storeId: StoreId, txids: List[TransactionId]): Future[Unit] =

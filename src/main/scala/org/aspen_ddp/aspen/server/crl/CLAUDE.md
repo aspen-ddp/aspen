@@ -143,7 +143,8 @@
 - `admissionLimitBytes` (SimpleCRL: `(n − 2) · S/2 − S/16` for `n` streams of `S` bytes, 15S/16 at 4 streams: with it
   every evacuation fits and every head is written within `n − 1` rotations, safety 6.1) sizes the device's
   `CrlAdmission`, which drops prepares for unseen transactions past it. It rises with each committed growth
-  (`onAdmissionLimitRaised`, `CrlAdmission.raiseLimit`). Lanes (`AdmissionTier`, the store's pool's, persisted in its
+  (`onAdmissionLimitRaised`, `CrlAdmission.raiseLimit`). `maxAdmissionLimitBytes` is the limit at `crl-max-streams`
+  (the limit now when growth is disabled): `StoreLoader.neverFits` judges a `crl_save.log` state against it. Lanes (`AdmissionTier`, the store's pool's, persisted in its
   StoreConfig): data stores admit below 3/4 of it, metadata stores below 7/8, bootstrap stores up to it, so the marker
   batches each tier's finalization needs keep headroom (cross-document-review 3, CRL admission lanes).
   `Stream.writeEntry`'s `require` stays the fail-stop backstop. The admission counts everything the CRL holds from the

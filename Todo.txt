@@ -1,8 +1,8 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, second pass, built 2026-11-17 against 3a7fdaf5)
--------------------------------------------------------------------------------------
+Safety work list (from docs/safety/*, third pass, built 2026-11-18 against b5d077e0)
+------------------------------------------------------------------------------------
 
 Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
 once, grouped where one change addresses several ids. Completed items are removed; their record is in git history.
@@ -33,13 +33,40 @@ X = cross-document-review (its section 5 lists contradictions between documents)
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-(no open items)
+1.1  Q-W4  A commit voter that applies a later commit first loses its update. CONFIRMED, M (needs a short design).
+     An apply re-check ignores locks but still enforces the object timestamp. A later T2 that does not chain on T's
+     revision (a refcount change, a key-level KV write, or a repair refcount/key proof) can be applied at a commit
+     voter of T before T's outcome arrives. T's re-check then fails and the object is quarantined; a lagging store
+     skips T the same way. Reads choose the revision by count alone, and repair and quarantine verification only
+     require timestamp >= T's start, so the pre-T majority wins and Reconcile.planData overwrites the one store
+     holding T. Needs only message reordering, no failure. Limited to object-level revision-chained T (a KeyRevision
+     T is immune). Fix direction: a committed apply that conflicts with an unresolved holder's commit-vote locks waits
+     for that holder. The wait needs a way out for a holder that never decides (expiry rule G), and the holder's own
+     commit must not queue behind it. (transaction-requirements.md Q-W4; cross-document-review 2.3, 2.4)
+
+1.2  SL-W6  A stray .crl.tmp beside a live CRL deletes the CRL and recreates it empty, declaring nothing. PLAUSIBLE, S.
+     SimpleCRL.createStreamsIfNew treats any non-growth *.crl.tmp as an unfinished creation and removes every stream
+     file, even when mustExist/holdsStores is set. Every store on the device then serves with no votes, acceptor
+     state or locks. No crash of the current code produces it; the trigger is damage, a hand edit, a restore tool or
+     a release that renames the temp file. Cheap guard, so it sits above 1.3: with holdsStores, refuse as CrlMissing
+     or CrlCorrupt instead. (systemic-loss-protection.md SL-W6; crash-recovery-log.md 5.1)
+
+1.3  R-W4 + Q-W5  State kept for replay gets no UnackedCommits entry because its store sent TxCommitted. M.
+     MissedUpdateFinalizationAction.writeMissedUpdates gives a store that sent TxCommitted no UnackedCommits entry
+     (commitErrors.contains), even when that store kept T's CRL state as Unresolved for a later replay. After a
+     reload, the recovered vote learns T late, finds no entry and runs applyNothing; past the horizon, expiry
+     discards it.
+     - R-W4 (PLAUSIBLE, P1): a non-fatal failed backend commit is lost on reload. Narrow: FSIF-only errors on an
+       already inconsistent store, and ObjectMismatch leaves the object unreadable rather than reverting to pre-T.
+     - Q-W5 (CONFIRMED, P5): a quarantine, including a may-reinsert-deleted-keys re-apply, is dropped on reload.
+     Shared fix: TxCommitted flags state kept for replay, and the marker writes an entry for it. Do NOT re-save the
+     state as Committed: that reintroduces R-W5. (transaction-recovery.md R-W4; transaction-requirements.md Q-W5)
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-(no open items)
+(no open items; Q-W4's overwrite is listed under 1.1)
 
 
 PRIORITY 3: systemic loss protection
@@ -47,19 +74,88 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-(no open items)
+3.1  SL-W7  The transient CRL-open allowance collapses at host start. CONFIRMED, S.
+     DeviceDiscovery's transientCrlFailures counts every checkForNewDevices call, not each scan. The constructor plus
+     the CheckAllDevices posted right after it use two attempts, so an EMFILE-style spell of about 10 s becomes a D2
+     declaration on every device of the host. Fix: count per scan, or per time window.
+
+3.2  SL-W5  A lost device CRL marks stores whose whole state is in their own save file. CONFIRMED, S.
+     openDeviceCrl marks every store directory, including those with a valid crl_save.log (an arrived transfer, a
+     transfer out's source, a rebuilt store kept offline). Fix: skip a directory whose save file validates, as
+     adoptionClass already does.
+
+3.3  CRL-W6  A loaded state is judged never to fit against the current limit, not the grown one. CONFIRMED, S.
+     StoreLoader.neverFits compares against admission.limitBytes + T. A crl_save.log state that would fit after
+     growth (up to crl-max-streams) is declared lost (crlSaveFileLost) and rebuilt. Fix: judge "never" against the
+     limit at the growth cap, and let anything below it wait offline while requesting growth.
 
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-(no open items)
+4.1  RB-W7  A pool short of live peers holds a host rebuild slot for days, or indefinitely. CONFIRMED, S.
+     queryPeers (client.currentAllocations) has no deadline and runs in every sweep round. The walk is sequential at
+     30 s per timed-out read and aborts only after MaxFailedObjects (10,000, about 83 h). Two such stores fill both
+     of a host's slots. Fix: bound the peer query, and abort a pass early when peers are below threshold.
+
+4.2  RB-W8  abandonedRebuilds leaks when an abandoned rebuild does not end in RebuildCancelled. CONFIRMED, S.
+     A rebuild past finish's latch re-check, or one with another cause already latched, keeps its entry. Later
+     rebuilds of that store on the host cannot be cancelled by abandonUnlisted, which breaks B18. Fix: clear the
+     entry in release().
+
+4.3  RP-W3  A store marked again between passes never reaches a proof or parking. PLAUSIBLE, S.
+     errorDeferralKey(key, value.revision) resets both the lock-deferral and the stale counts whenever the entry is
+     rewritten, and every mark rewrites it. A store stale on a hot key is re-marked every pass and stays stale. Fix:
+     keep the counts across revisions of the same entry key, and reset only the `only` narrowing.
 
 
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-(no open items)
+5.1  R-W5 + P-W6  Status-cache relay correctness. CONFIRMED, S each. Fix R-W5 first, or both together.
+     - R-W5: resolved(true, record = false) still sets txStatus = Committed, and the post-proof prepare saves it.
+       After a restart that resolution is restored as ordinary: it seeds the host cache with a non-finalized
+       Committed and loses notOwedHere. The relay then resolves a forgotten T non-late, re-running finalization and
+       the marker; with an entry naming another incarnation, the store applies T with no data. Fix: save Unresolved
+       for a resolution learned from the tree.
+     - P-W6: Store.handleTransactionMessage addresses the relay's TxResolved(msg.to, msg.from, ...) to the relaying
+       store itself, so a remote recovery driver never learns the outcome from it (slower takeover). Fix: send it to
+       msg.from and keep the local delivery. Fixing this before R-W5 spreads R-W5's bogus relay to remote drivers.
+
+5.2  Q-W6  A re-applied traceless update quarantines an object that already holds it. CONFIRMED, S.
+     Affects a RefcountUpdate alone, and delete-only KV updates, on a recovered non-late re-apply or an apply
+     through an UnackedCommits entry. appliedBy finds no trace, so an ordinary crash quarantines the object; TKVL
+     deletes and refcount decrements are common. Fix: in the re-apply check only, treat refcount == newRefcount (and
+     the keys already gone) as applied.
+
+5.3  RP-W4  A quarantine of a deleted object never clears. CONFIRMED, S.
+     Covers the quarantine-side trigger in transaction-requirements.md 8.5 too.
+     StoreRepairer.verifyObject does not treat InvalidObject(provesDeletion) as verified, so verification retries
+     forever. The transaction's CRL state, admission bytes and stub stay pinned until reload (expireStubs /
+     quarantinedConclusions), with a warning every minute. Applies whether the deletion came before or after the
+     quarantine. Fix: treat a proven deletion as verified.
+
+5.4  R-W6  A finalization action whose execute() throws orphans the marker before it. CONFIRMED, S.
+     Finalizer calls execute() unguarded. A user action that throws synchronously fails the finalizer after the
+     marker has scheduled, and that orphan marker then writes marks for every store, every retry (up to every 60 s).
+     Fix: catch each execute() throw as that action's failure.
+
+5.5  R-W3  UnackedCommits lookups pile up as untimed reads during a metadata outage. CONFIRMED, M.
+     retryUnackedLookups re-issues every 5 s without cancelling the old lookup, and Host.unackedLookup reads through
+     the untimed client: about N*D/5 retransmitting reads after an outage of D seconds with N waiting Txs. Fix: use
+     a timed read (withReadTimeout), or re-issue only when the earlier lookup has finished.
+
+5.6  RB-W9  A finished copy whose flip did not promote it is stranded when its entry leaves the device. CONFIRMED, S.
+     After Superseded or a permanently failed flip, the copy is not in offlineStores, so the Deleted Stores pass
+     never retires it before a host restart. Meanwhile every transfer of the store onto that device refuses ("store
+     path already exists").
+
+5.7  RB-W10  An out-of-space flush in finish is not classified. CONFIRMED, S.
+     The pass fails generically, with no REBUILD OUT OF SPACE alert, and repeats with backoff.
+
+5.8  CRL-W7  An expiring stub's charge is released before its deletion is queued. CONFIRMED, S.
+     Frontend.dropAppliedStub calls releaseStub() before crl.deleteAppliedStub, breaking the release-after-deletion
+     rule Lemma C (1) relies on. Up to 41 uncovered bytes per stub. Fix: swap the two calls.
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
@@ -71,7 +167,41 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-(no open items)
+7.1  R-W7 + Q-W8  Quarantine and kept-state documentation. S.
+     The claim that a reload re-quarantines or replays kept state is false until 1.3 is fixed: the Frontend.quarantine,
+     transactionFinalized and TxCommits scaladoc, the concludeTransactionState, Tx.allObjectCommitsComplete and
+     issueCommits comments, and server/store/CLAUDE.md Quarantine (R-W7). Quarantine causes in the Tx.issueCommits
+     comment and the server/store/CLAUDE.md Fail-stop bullet: the refcount and key repair proofs are changed-object
+     causes and only the object-level proof is lock-only; drop the stale inherited-votes wording; fix the orphaned
+     scaladoc of KVObjectState.allocationSliceSize (Q-W8).
+
+7.2  CRL-W8  CRL documentation. S.
+     server/crl/CLAUDE.md and CrashRecoveryLog.save say handlers run "in request order" (within one entry they run
+     newest first); the CrlAdmission.tryChargeLoaded scaladoc says "only that file's records"; the StoreRouter.install
+     comment says completions run on the CRL thread (they run on the completion thread); DeviceShutdown.CrlShutdownEc's
+     account of a dead CRL; SimpleCRL.completions cites "(CRL-W4)".
+
+7.3  SL-W8  Declaration-path documentation. S.
+     StoreRouter.recoverOrFail names StoreRebuilds.handleRecoveryFailed (the handler is handleFailStopped);
+     DeviceDiscovery.CrlOpenAttempts says "one per scan"; server/store/backend/fsif/DESIGN.md 4.2 and its L20 row;
+     Backlog's correlated-declarations item still lists a failed apply re-check as a failStop trigger (it
+     quarantines).
+
+7.4  RB-W11  Rebuild documentation. S.
+     server/host/CLAUDE.md says rebuilding/<id> is swept at device load (it is not); StoreRebuilds.cancelFor and
+     DeviceShutdown.stopDeviceWork say "a rebuild past its walk finishes" (only one past finish's latch re-check
+     does); StoreEntry cites "rebuild-process.md 4.5", which does not exist; sweepPending cites "RB-W1"; a history
+     comment in restoreObject.
+
+7.5  RP-W5  Repair documentation. S.
+     server/repair/CLAUDE.md cites "repair 13.3-3"; the StoreRepairer.prove comment says FullContentLock (it is an
+     ExclusiveRevisionLock); "consecutive passes" in the StoreRepairer and RepairPolicy.proofAfterDeferrals scaladoc;
+     the misplaced sweepBootstrapTrees/verifyObject scaladoc; RepairTarget.mayJoinTransaction mentions only
+     UnackedCommits entries. Also from the cross review: Backlog.txt "Traceless commits follow-ups", second bullet, is
+     obsolete. TransactionBuilder.refuseBlindWrites and RequirementsChecker.refuseBlindWrites refuse a
+     min/max/left/right change without a required revision; reword it or drop it.
+
+7.6  P-W7  The scaladoc of Tx.determineDisposition is orphaned above invalidDescription's. S.
 
 
 PRIORITY 8: unimplemented features

@@ -64,7 +64,7 @@ votes on one object" argument rely on.
 |---|---|---|
 | Horizon | 20 s on `txd.startTimestamp.wallTime` against the host's wall clock | `common/transaction/TransactionHorizon.Horizon` |
 | `MaxStartLead` | 2 s | `TransactionHorizon.MaxStartLead` (= `Frontend.MaxStartLead`) |
-| Client give-up | horizon + `MaxStartLead` (22 s) on the client's clock | `TransactionHorizon.clientGiveUp` |
+| Client give-up | horizon + `MaxStartLead` (22 s) on the client's HLC wall time | `TransactionHorizon.clientGiveUp`, `SimpleClientTransactionDriver.pastGiveUp` |
 | Status cache life | horizon + `MaxStartLead` + 8 heartbeats (30 s), after the last write; at most 4 M entries | `TransactionHorizon.statusCacheDuration`, `Host.txStatusCacheDuration` (asserted by `Host.checkStatusCacheDuration` to be at least horizon + `MaxStartLead` + `txHeartbeatTimeout` + one heartbeat), `TransactionStatusCache.DefaultMaxEntries` |
 | Expiry margin | `MaxStartLead` + `txHeartbeatTimeout` + one heartbeat (8 s) | `Frontend.expiryMargin` |
 | Host heartbeat / `txHeartbeatTimeout` | 1 s / 5 s | `cmdline/Main`, `Host.txHeartbeatTimeout` |
@@ -133,7 +133,9 @@ acceptor accepts an Accept whose id equals its promise.
 (`promised`, `accepted`) is durable in the device CRL together with the txd, the store's object data and its vote:
 `Tx.answerPrepareAsAcceptor`, `Tx.sendDelayedPrepare` (a prepare answered once the objects load) and
 `Tx.receiveAccept` send from the completion handler of `crl.save`, which runs only once the entry is durable
-(`crash-recovery-log.md`).
+(`crash-recovery-log.md`). Handlers run on the CRL's completion thread and only send messages built before the save;
+the one state change a save completes (`Tx.voteDurable`) is posted to the store's executor (`Tx.saveState`). A CRL that
+fails or shuts down runs no handler of an unwritten entry (`CrlFailed`, `CrlClosed`), so no response follows it.
 
 **P4 Vote immutability.** A store's non-`Undetermined` disposition is decided once (`Tx.determineDisposition` decides
 only while `Undetermined`) and never recomputed while the Tx lives. A recovered Tx keeps its persisted vote
@@ -187,8 +189,11 @@ the chosen value whenever one exists.
 
 **P9 Acceptor-state retention (assumption).** The state of a possibly chosen value is retained while it can matter. A
 committed Tx's CRL record and in-memory acceptor live until `TxFinalized` (or a late outcome). An aborted Tx's CRL
-record is deleted at resolution (`Tx.resolvedAndAllObjectsLoaded` -> `Frontend.deleteTransactionState`), but its
-in-memory Tx and acceptor live until `TxFinalized`. After a store forgot T, safety is carried by the forget floor: the
+record is deleted at resolution (`Tx.resolvedAndAllObjectsLoaded` -> `Frontend.deleteTransactionState`), releasing
+its CRL admission, but its in-memory Tx lives until `TxFinalized` (`Tx.stateDeleted`). It saves nothing more: a
+prepare, an accept or a held prepare response is answered with `TxResolved(committed = false)` to the proposer
+(`Tx.answerResolved`), never a promise or acceptance. That is sound because the abort is the chosen value, and an
+acceptor that promises and accepts nothing can help choose no other. After a store forgot T, safety is carried by the forget floor: the
 store refuses every prepare for T it may have forgotten (10.10), so no driver ever counts the fresh state of an
 acceptor that forgot T. A committed T's record may be replaced by an applied stub, which carries no Paxos state, only
 "this store holds T's update" (9.1).
@@ -196,14 +201,15 @@ acceptor that forgot T. A committed T's record may be replaced by an applied stu
 **P10 Only the chosen value is announced.** A driver sends `TxResolved`, `TransactionResolved` and `TxFinalized` only
 after its `Learner` saw a quorum accept one proposal id (`TransactionDriver.receiveTxAcceptResponse`,
 `onResolution`), or after another party's resolution reached it (`receiveTxResolved`, `receiveTxFinalized`), or on a
-late commit (`resolveLate`, 10.5). Two further sources exist: a status-cache relay (`Store.handleTransactionMessage`),
-which repeats an outcome a real resolution recorded, and an expiry commit (`Frontend.decideExpiry`), which sends
-`TxResolved(commit)` under rules A, B, F. A store may send a `TxResolved(proof = true)` (P15), which is not an outcome.
+late commit (`resolveLate`, 10.5). Three further sources exist: a status-cache relay (`Store.handleTransactionMessage`),
+which repeats an outcome a real resolution recorded; a Tx whose aborted state was deleted (`Tx.answerResolved`, P9),
+which repeats the abort it learned; and an expiry commit (`Frontend.decideExpiry`), which sends `TxResolved(commit)`
+under rules A, B, F. A store may send a `TxResolved(proof = true)` (P15), which is not an outcome.
 Receivers trust every non-proof `TxResolved`.
 
 **P11 Application only on resolution.** A store applies T's update only on a non-late `TxResolved(true)`, a non-late
-`TxFinalized(true)`, a found UnackedCommits entry naming its incarnation (`Tx.unackedCommitFound`), or a late commit
-reaching its own undecided commit vote whose entry is found (`Tx.lateCommit`). Never on its own vote, an Accept or a
+`TxFinalized(true)`, a found UnackedCommits entry naming its incarnation or none (`Tx.unackedCommitFound`), or a late
+commit reaching its own undecided commit vote whose entry is found so (`Tx.lateCommit`). Never on its own vote, an Accept or a
 proof: a prover applies nothing (`Tx.applyNothing`). Never at a store holding an applied stub for T or owed nothing by
 its entry (`notOwedHere`): `Tx.doCommit` applies nothing and reports T's changed objects in `TxCommitted`.
 
@@ -290,7 +296,7 @@ Its store keeps it: `Store.handleTransactionMessage` drops a driver on `TxFinali
 | `TransactionVote` | store -> originating client | `VoteCommit` or `VoteAbort` | Sent with every prepare response, promise or nack, from the same save handler (`Tx.sendPrepareResponse`). Never by a muted or frozen Tx (they send no prepare response), never for `Undetermined` or a proof. |
 | `TxAccept` | driver -> primary-pool stores | proposal id, value | Built only in `TransactionDriver.sendAcceptMessages`; never by a learn-only driver. |
 | `TxAcceptResponse` | acceptor -> driver | `Nack` or `Accepted(value)` | After the save. |
-| `TxResolved` | driver -> every store plus `notifyOnResolution`; store -> driver (cache relay, proof); expiring store -> every store (expiry commit) | `committed`, `late`, `proof` | A proof is meant for drivers only. |
+| `TxResolved` | driver -> every store plus `notifyOnResolution`; store -> proposer (proof, a deleted abort's answer); store -> itself (relay of a resolved, unfinalized cache entry, 10.2); expiring store -> every store (expiry commit) | `committed`, `late`, `proof` | A proof is meant for drivers only. |
 | `TransactionResolved` / `TransactionFinalized` | driver (or a store's finalized relay) -> originating client | `committed` | |
 | `TxCommitted` | store -> its `lastProposer` | object ids this store could not apply | After the store's backend commits complete. |
 | `TxFinalized` | driver -> every store; store relay -> proposer | `committed`, `late`, `owed`, `startTimestamp` | `owed` empty for aborts, late commits and relays; `startTimestamp` lets a store with no Tx write a stub. |
@@ -334,7 +340,7 @@ Notation: client `C`; primary pool stores `P0..P4`, leader `L = P2`, `t = 3`; on
 |---|---|---|
 | 1 | Client builds the txd: `startTimestamp = HLCTimestamp.now`, primary object, designated leader, `originatingClient`. | `TransactionBuilder.buildTranaction` |
 | 2 | Client sends the prepares and retransmits all of them every 1 s until the leader's outcome or the give-up point; a transaction already past give-up at `begin()` is never sent. | `ClientTransactionDriver.sendPrepareMessages`, `SimpleClientTransactionDriver.tick` |
-| 3 | Store entry: `Store.receiveTransactionMessage` applies CRL admission to prepares of unseen transactions (`Frontend.admitPrepare`). `Store.handleTransactionMessage` answers from the status cache (10.6) and, at the designated leader, starts a driver unless T is finalized in the cache, starts too far ahead, or is refused below the floor. The Frontend then finds or creates the Tx. | `Store.handleTransactionMessage`, `Frontend.receivePrepare` |
+| 3 | Store entry: `Store.receiveTransactionMessage` applies CRL admission to prepares of unseen transactions and to prepares bringing uncounted data (`Frontend.admitPrepare`), dropping a `Full` or `Oversized` one without a reply (10.2). `Store.handleTransactionMessage` answers from the status cache (10.6) and, at the designated leader, starts a driver unless T is finalized in the cache, starts too far ahead, or is refused below the floor. The Frontend then finds or creates the Tx. | `Store.handleTransactionMessage`, `Frontend.receivePrepare` |
 | 4 | New Tx: reads its hosted objects; once loaded, `completeLoad` decides the vote and locks. | `Frontend.createTx`, `Tx.completeLoad` |
 | 5 | The prepare is answered: `acceptor.receivePrepare` in memory, `crl.save`, then `TxPrepareResponse` to `m.from` and `TransactionVote` to the client. Before the objects load the response is held (`delayedPrepare`). | `Tx.answerPrepareAsAcceptor`, `sendDelayedPrepare`, `sendPrepareResponse` |
 | 5a | Client keeps each store's first vote; completes `Committed` on a commit-certain vote set. | `ClientTransactionDriver.receive(vote)` |
@@ -369,8 +375,9 @@ decided in `Tx.determineDisposition`, in this order:
 2. No client prepare seen (prefer-abort, 6.2): `VoteAbort` with `NoClientPrepare`, requirements unchecked, once the
    wait for the client's prepare is over or the outcome is known. It still proves the commit if an object shows it.
 3. Invalid description (6.5): `VoteAbort` with `InvalidDescription` for every object.
-4. A hosted object whose earlier backend commit failed (`BackendCommitFailed`) or that is quarantined
-   (`ObjectQuarantined`): `VoteAbort`.
+4. A hosted object whose earlier backend commit failed or that was poisoned (`BackendCommitFailed`), that is
+   quarantined (`ObjectQuarantined`), or that a rebuilt store's inherited votes may lock (`InheritedVoteLock`, 10.10):
+   `VoteAbort`.
 5. A hosted object with a commit in flight or held for its turn (`Frontend.commitInFlight`), outcome unknown: the vote
    is withheld and the Tx registers to be told when the commit persists (`Frontend.awaitCommitPersisted`).
 6. Otherwise `RequirementsChecker.check`. If every failure is a collision with a lock holder this transaction builds on
@@ -442,8 +449,12 @@ accepting any abort (`Tx.needsUnackedCheck`, `holdAbort`, `Frontend.requestUnack
 safe because, under the forget floor, no store that forgot T answers a driver, so Paxos cannot choose abort over a
 chosen commit. A found entry naming this incarnation applies the saved update and resolves committed without
 forgetting the Tx or writing a cache entry (`Tx.unackedCommitFound`); its driver gets the proof
-(`Store.giveProof`, at start or through `Frontend.onCommitProven`). A found entry of another incarnation, or of none,
-resolves committed applying nothing (`Tx.unackedCommitNotOwed`). An absent entry from a lookup started after the latest
+(`Store.giveProof`, at start or through `Frontend.onCommitProven`). A found entry naming no incarnation (the driver did
+not count the voters, or heard two incarnations from the store) applies too (`Frontend.unackedLookupComplete`): the
+Tx holds its own commit vote, which may be the counted one, and a vote that did not count is a replay's, which passed
+T's pin. Such a re-apply leaves out and quarantines every object on which it would insert a key now absent
+(`RequirementsApplyer.mayReinsertDeletedKeys`, 9.1). A found entry of another incarnation resolves committed applying
+nothing (`Tx.unackedCommitNotOwed`; `notOwedHere`), its objects reported, its driver given the proof. An absent entry from a lookup started after the latest
 held abort releases the held aborts. A failed or unanswered lookup keeps them held and is retried at heartbeat
 (`Frontend.retryUnackedLookups`, `UnackedLookupTimeout`). Details: `transaction-recovery.md`.
 
@@ -517,9 +528,13 @@ responses at its current id from valid acceptors. Resolution can also arrive wit
 * Any store whose Tx is idle (1.1). A client prepare is not activity (`Tx.receivePrepare`), so a dead leader is not
   kept alive by the client; neither are a learn-only driver's prepares and heartbeats (`Tx.fromProposer`).
 * An expiry commit at the store (`Store.finalizeExpiryCommit`).
-* A driver is created at most once per transaction per store (`Store.driveTransaction`), receives the cached prepare
-  responses and any proof its store's Tx holds, and is removed when its store receives a `TxFinalized` for T, or when
-  T is past expiry with no outcome and the store holds no Tx for it (`Store.removeExpiredDrivers`). `Store.close`
+* A driver is created at most once per transaction per store (`Store.driveTransaction`), never while the store's CRL
+  state loads (`Frontend.recoveryPending`). It starts at the initial proposal only as the designated leader's first
+  driver; every other starts at round 2 or above its own acceptor's highest id (`TransactionDriver.Start`, P2). It
+  receives any proof its store's Tx holds (`Store.giveProof`), then the cached prepare responses. It is removed when
+  its store receives a `TxFinalized` for T after which the driver is finalized (`TransactionDriver.isFinalized`; one
+  that ignored an abort `TxFinalized` stays, P19), or when T is past expiry with no outcome and the store holds no Tx
+  for it (`Store.removeExpiredDrivers`, not while the CRL state loads). `Store.close`
   and a reload stop every driver of the store (`shutdownDrivers`); a running finalizer completes.
 
 ### 7.6 Learn-only drivers
@@ -545,7 +560,10 @@ entries are what repair and owed stores rely on. `owed` includes the planned sto
 All CRL writes are `crl.save(txid, TransactionRecoveryState, handler)`. A record holds `storeId`, the serialized txd,
 the object updates (unless dropped), the disposition, the status and the acceptor's `(promised, accepted)`. A save
 replaces the whole record and always carries the then-current acceptor state, so a later save never loses an earlier
-promise. The handler runs after the record, and everything saved before it, is durable (`crash-recovery-log.md`).
+promise. The handler runs after the record, and everything saved before it, is durable (`crash-recovery-log.md`), on
+the CRL's completion thread (P3). Every save is charged to the device's `CrlAdmission` first: the prepare's admission
+(`Frontend.admitPrepare`) counts the description, data and record, and a Tx whose aborted state was deleted saves
+nothing more (`Tx.saveState` requires it; P9).
 
 | Message sent | Durable first | Code |
 |---|---|---|
@@ -555,12 +573,14 @@ promise. The handler runs after the record, and everything saved before it, is d
 | `TxCommitted` | every backend commit of the store for T completed; the CRL data drop enqueued | `Tx.allObjectCommitsComplete` |
 | `TxFinalized(commit)` | every FinalizationAction completed | `TransactionDriver.startFinalizer` |
 
-Not durable before sending: a proof (its evidence is the durable backend state), status-cache relays, `TxCommitted`
-re-sends, status replies (10.10), and an expiry commit's `TxResolved`.
+Not durable before sending: a proof (its evidence is the durable backend state), status-cache relays, a deleted
+abort's `TxResolved(false)` (`Tx.answerResolved`), `TxCommitted` re-sends, status replies (10.10; a commit vote is
+reported only once durable), and an expiry commit's `TxResolved`.
 
 | Event | CRL effect |
 |---|---|
-| `TxResolved(false)` at a Tx | record deleted at once; a later prepare or accept handled by the lingering Tx re-creates it, and `TxFinalized` deletes it again |
+| `TxResolved(false)` at a Tx | record deleted at once and its admission released (`Tx.stateDeleted`); the lingering Tx saves nothing more and answers prepares and accepts with the abort |
+| a vote decided just before the freeze, its response dropped | saved without a reply (`Tx.saveUndurableVote`) |
 | commit applied, every backend commit succeeded | object data dropped, record kept |
 | `TxFinalized(true)` and every backend commit succeeded | record deleted, or replaced by an applied stub (9.1) |
 | a backend commit failed | record with data kept until the store reloads |
@@ -571,7 +591,7 @@ re-sends, status replies (10.10), and an expiry commit's `TxResolved`.
 What is not persisted: the outcome at a store (saved only incidentally); the proposer's round or local proposal;
 driver state; the status cache. After a crash a store knows only its vote and acceptor state, and re-learns the
 outcome from a driver, the caches, a proof, a late commit, its UnackedCommits entry, or expiry. A record is saved on
-every prepare response, retransmits included: write amplification, not a safety issue.
+every prepare and accept response, retransmits included: write amplification, not a safety issue.
 
 ---
 
@@ -595,8 +615,12 @@ every prepare response, retransmits included: write amplification, not a safety 
   `RequirementsApplyer.apply` re-checks the requirements with `applying = true`, skipping objects that already show T,
   one backend commit per changed object, and `TxCommitted` when all complete. A commit voter whose apply throws
   fail-stops the store (`Frontend.failStop`); one, live or recovered, whose re-check fails on a changed object
-  quarantines the object until repair verifies it (`Frontend.quarantine`, transaction-requirements.md 8.5). Objects whose earlier backend
-  commit failed, or that are quarantined, are not applied and are reported.
+  quarantines the object until repair verifies it (`Frontend.quarantine`, transaction-requirements.md 8.5). A
+  re-apply (a recovered commit vote, or one applying through its entry: `Tx.appliesThroughEntry`) first leaves out
+  and quarantines every object on which it would insert a key now absent while the object is past T's start
+  (`RequirementsApplyer.mayReinsertDeletedKeys`): the key may have been deleted since. Objects whose earlier backend
+  commit failed, or that are quarantined, are not applied and are reported. A quarantining Tx keeps its CRL record,
+  data included, until the quarantine clears (P13).
 * **Forgetting a committed T.** Where its CRL record would be deleted (after `TxFinalized` and its backend commits), it
   is replaced by an applied stub if an UnackedCommits entry may name this store: `TxFinalized` listed it in `owed`, or
   it applied T through its entry (`Tx.stubDue`; `Frontend.transactionFinalized`, `concludeTransactionState`). A failed
@@ -614,7 +638,11 @@ every prepare response, retransmits included: write amplification, not a safety 
 `onResolution(true)` starts the finalizer, giving it the counted commit voters (`countedCommitVoters`: the current
 round's commit voters if they reach `t` on every object, else none, meaning "every silent store") with their
 incarnations, and the `commitErrors` from `TxCommitted` messages. The finalizer runs the txd's FinalizationActions
-(at-least-once, idempotent), the missed-update marker last (`server/RegisteredTransactionFinalizerFactory`). Missed
+(at-least-once, idempotent), the missed-update marker among them, all at once; its `complete` waits for every action
+and fails with the first failure (`server/RegisteredTransactionFinalizerFactory.Finalizer`). An action whose type
+cannot be loaded, or whose factory throws, is a failed action, not a failed finalizer creation (`Finalizer.of`). So
+an UnackedCommits entry durable means T committed, not that the other actions are done; only `TxFinalized` implies
+that. Missed
 updates are recorded in the ErrorTree and UnackedCommits trees by `MissedUpdateFinalizationAction`
 (`transaction-recovery.md`).
 
@@ -643,25 +671,34 @@ repair, no safety effect.
 * Tx known: as above.
 * Tx unknown, cache entry finalized: the Store answers `TxFinalized` (and `TransactionFinalized` to the client), late if
   committed; the Frontend ignores the prepare and releases its admission.
-* Tx unknown, cache entry resolved but not finalized, T at or above the floor: the Store sends `TxResolved` to the
-  sender, and the Frontend creates a Tx with `outcomeDecided`: no locks, still votes, learns the outcome from
-  `TxFinalized` (the driver counts the relay as "this store knows", `knownResolved`). The designated leader drives such
-  a T on purpose: its deciding driver may have died on another host.
+* Tx unknown, cache entry resolved but not finalized, T at or above the floor: the Store sends a `TxResolved` of the
+  entry (late if the entry is) addressed to itself (`to = msg.to`, P-W6), and the Frontend creates a Tx with
+  `outcomeDecided`: no locks, still votes, answers status queries with the cached outcome. The self-addressed relay
+  arrives after the Tx and any driver exist, so the new Tx resolves from it and the store's own driver learns it; the
+  sender learns nothing from it. The designated leader drives such a T on purpose: its deciding driver may have died
+  on another host, and the self-addressed relay resolves the new driver at once.
+  The same relay is sent whenever a resolved entry exists, also to a store that holds a Tx (a duplicate there).
 * Tx unknown, no outcome cached, T below the store's floor: refused, no Tx at all (`Frontend.refusePrepare`); the
   designated leader starts no driver. The rebuilt store's `acceptorSince` mute is checked first and still creates its
   muted, possibly proving Tx.
 * Tx unknown, no outcome cached, T at or above the floor: a fresh Tx, checked normally. A replay of a committed pinned
   transaction fails its pin; a store showing its update proves it (6.3). Accepted cost: a replay whose requirements pass
   holds commit-vote locks until a driver resolves it.
-* Dropped under CRL backpressure (`Frontend.admitPrepare`): the client retransmits, and the rest of the quorum can
-  decide without this store, which repair catches up.
+* Dropped under CRL backpressure (`Frontend.admitPrepare` `Full`: an unseen transaction while the device's admission
+  is at its lane's ceiling, or uncounted object data past it), which asks the CRL to grow (`crl.requestGrowth`): the
+  client retransmits, and the rest of the quorum can decide without this store, which repair catches up. A known
+  transaction's data-less prepare, and one finalized in the cache, are admitted without a check.
+* Dropped as `Oversized`: the transaction's counted bytes here (with data already counted, for a known one) exceed
+  `crl.maxTransactionBytes`. Nothing is charged; the store stays as one that never received the prepare (or the
+  data), warned once per `Frontend.OversizedLogPeriod` (10 s). Details: `crash-recovery-log.md`.
 
 ### 10.3 Duplicate and late accepts
 
 A `TxAccept` for an unknown Tx is ignored, so a store that forgot T never acts as an acceptor with fresh state through
 an Accept; the driver interleaves prepares for that reason. A duplicate Accept is re-accepted and re-answered;
 `acceptedPeers` and the `Learner` bitset make that idempotent. An Accept may reach a store that has not voted yet: it
-accepts (Paxos allows it) and saves its then-current, possibly `Undetermined`, disposition.
+accepts (Paxos allows it) and saves its then-current, possibly `Undetermined`, disposition. A muted or frozen Tx
+ignores an Accept; one whose aborted state was deleted answers it with `TxResolved(false)` (P9).
 
 ### 10.4 Data overtaken
 
@@ -713,8 +750,13 @@ finalized cache entry, and past its floor it refuses.
 * Write sites: the Tx constructor (`Unresolved`, or a recovered status), `Tx.resolved`, `Tx.finalized`,
   `Tx.applyNothing`, and the Frontend's no-Tx `TxResolved` (not proofs; finalized and late if the message is late) and
   `TxFinalized` (finalized) paths. All go through the monotone `updateStatus` (P17).
-* Read sites: the Store's relay, `Frontend.admitPrepare` (a finalized entry is admitted without a check),
-  `Frontend.receivePrepare` (ignore if finalized; `outcomeDecided` if resolved), `Frontend.receiveStatusRequestWithoutTx`.
+* Read sites: the Store's relay and its designated-leader check (no driver for a finalized entry),
+  `Frontend.admitPrepare` (a finalized entry is admitted without a check), `Frontend.receivePrepare` (ignore if
+  finalized; `outcomeDecided` if resolved), `Frontend.receiveStatusRequestWithoutTx`, and `Tx.statusForExpiry` of a
+  Tx created from a cached outcome (it reports the entry as the cache now holds it).
+* `Tx.resolved` records nothing for an outcome learned from an UnackedCommits entry (`unackedCommitFound`,
+  `unackedCommitNotOwed`: `record = false`), so a finalized entry always stems from a real `TxFinalized` or a late
+  outcome.
 * One cache per host, shared by its stores and keyed by transaction id. An `Unresolved` entry counts as no outcome.
 * A size eviction raises the host's eviction watermark (wall clock + `MaxStartLead`) synchronously with the removal
   (`evictionListener`), a floor component, so an evicted entry's absence is never trusted; it is logged at error at
@@ -830,7 +872,7 @@ nothing more, as if offline, which Paxos allows. A frozen Tx decides no vote and
 one still undecided then (an in-flight commit, a collision, a client prepare arriving late) is a final non-voter. A
 vote decided just before the freeze whose response is then dropped is still saved (`Tx.saveUndurableVote`), so its
 status reply reports it once durable instead of staying silent.
-Derived from the clock, so a reload cannot thaw it.
+Derived from the host's wall clock, so a reload cannot thaw it; a backward step of that clock can (12).
 
 **Expiry.** A Tx still unfinalized past the horizon plus the expiry margin (`Tx.mayExpire`: not finalized, loaded, no
 late commit or forget-lookup pending; unresolved, or resolved and waiting for a `TxFinalized` that may never come)
@@ -915,7 +957,7 @@ only in which stores are silent to them and which have since forgotten T:
 * F against E: F's observer has no silence, so its `vc + k` counts every commit voter still holding or amnesiac, and E's
   observer counts at least that in `vc + k + s`.
 
-*Why a rebuilt store counts as amnesiac.* Its acceptor state was lost with T undecided; counted as "unknown", it once
+*Why a rebuilt store counts as amnesiac.* Its acceptor state was lost with T undecided; counted as "unknown", it would
 let the last holders of a chosen commit discard it beside one store that never heard of T. HorizonIntegrationSuite
 "holders of a chosen commit apply it past expiry though a rebuilt store forgot it".
 
@@ -1049,8 +1091,10 @@ transaction eventually resolves without operator action given a healthy quorum.
   and logged. The refusal warning is limited to once per 10 s per store (`Frontend.RefusalLogPeriod`).
 * **Backward wall-clock steps.** The cache's expiry runs on `nanoTime`, the floor on the wall clock; a host clock
   stepped backward by more than about 8 s (30 - 20 - 2) between a store joining T and its entry expiring reopens the
-  window for that T. An inter-host skew beyond the 8 s bound breaks the arrival margin and the rebuilt-store mute in the
-  same way; so would a zombie old copy of a rebuilt store (`systemic-loss-protection.md`).
+  window for that T. A backward step after T's freeze (`Tx.frozen`, `Frontend.pastExpiry`) thaws its Txs, which may
+  then vote or accept after a status reply reported their state as final, so expiry observers can disagree. An
+  inter-host skew beyond the 8 s bound breaks the arrival margin and the rebuilt-store mute in the same way; so would a
+  zombie old copy of a rebuilt store (`systemic-loss-protection.md`).
 * **Slow client clocks.** A client clock more than 20 s slow has its transactions refused.
 * **Undecidable transactions.** Rule G with every store replied holds T, its locks and its CRL state indefinitely,
   logged `UNDECIDABLE TRANSACTION`. Reached only after rebuilds or forgotten stores reach a primary quorum with a
@@ -1086,12 +1130,31 @@ transaction eventually resolves without operator action given a healthy quorum.
 
 ## Open weaknesses
 
-### P-W5. Stale account of a hung commit in Backlog.txt (CONFIRMED; documentation)
-Mechanism: `Backlog.txt` (Mid Term, "Why there is no per-commit watchdog") says "the driver of an undecided
-transaction proposes abort past the horizon plus the expiry margin (about 22 s), and expiry discards the waiting Txs".
-That path was removed: an undecided tally never proposes abort (P7a), and the waiting Txs end by expiry rules A-G (a
-frozen undecided Tx is a non-voter).
-Trigger / scenario: a reader following the Backlog entry.
-Consequence: a wrong account of how a hung commit ends.
-Suggested fix: correct the Backlog sentence (Todo 7.5).
+### P-W6. The status-cache relay of a resolved, unfinalized entry is addressed to the relaying store (CONFIRMED; liveness and hygiene)
+Mechanism: `Store.handleTransactionMessage` (TxPrepare case) builds the relay as `TxResolved(msg.to, msg.from, ...)`;
+the first field is `to`, so it is sent to the store itself, while the finalized relay beside it,
+`TxFinalized(msg.from, msg.to, ...)`, goes to the sender. StoreSuite "a relayed resolution of a non-finalized entry
+carries the entry's late flag" checks the flags but not the address.
+Trigger / scenario: a recovery driver on store A prepares T at store B, whose host cache holds T resolved but not yet
+finalized (another store on B's host resolved it; B never held a Tx). B relays the outcome to itself: its new
+`outcomeDecided` Tx resolves, and B's own driver if any, but A gets at most a promise and B's vote, never the
+outcome.
+Consequence: no safety effect. The driver learns T only from Paxos (a quorum's accepted values) or a later finalized
+relay, so a takeover is slower than designed. The designated leader's fast
+takeover (10.2) works only because the relay reaches its own new driver.
+Suggested fix: send the relay to `msg.from`, and keep delivering it locally (or resolve the new `outcomeDecided` Tx and
+the store's own driver directly), so both the sender and the designated leader's own driver learn it; assert the
+address in StoreSuite. Fix it together with or after transaction-recovery.md R-W5: a restored tree-learned resolution
+seeds the host cache with a non-finalized `Committed` for a T every peer forgot, and today its non-late relay reaches
+only the relaying store; addressed to `msg.from`, it would also reach every remote recovery driver, which would then
+resolve T non-late and re-run its finalization actions and marker.
+Effort: S   Priority: 5
+
+### P-W7. Orphaned scaladoc of Tx.determineDisposition (CONFIRMED; documentation)
+Mechanism: in `server/transaction/Tx.scala` the scaladoc describing how the vote is decided ("Decides the vote, or
+withholds it. A muted transaction is proven committed ...") is followed directly by the scaladoc of `invalidDescription`,
+so it documents nothing, and `determineDisposition` itself has none.
+Trigger / scenario: a reader or a doc tool looking up `determineDisposition`.
+Consequence: the order of the vote rules (6.1) is hard to find in the code.
+Suggested fix: move the first block onto `determineDisposition`.
 Effort: S   Priority: 7

@@ -110,14 +110,17 @@ start
         load checkpoint (total: unreadable = none; another episode's = none)
         ► read pool state ► first pass: createStaging (discard staging, BackendOpener.create)
         ► openStaging (BackendStateLost: discard staging and checkpoint, fail)
-        ► queryPeers: CurrentAllocationsRequest until w - t + 1 peers answer; merge with the checkpoint's list
+        ► queryPeers: CurrentAllocationsRequest until w - t + 1 peers answer (no deadline; a latched abort
+                      abandons it); merge with the checkpoint's list
         ► walk allocation tree: foreach | foreachFrom(lastRestoredKey) (inclusive), stopWhen = aborted
-              per entry: restoreObject ► client.read ► rebuildWrite; every 1000: flush THEN checkpoint
-        ► sweepPending: restore the listed allocations directly, re-querying in rounds
+              per entry: restoreObject ► timed read ► rebuildWrite (► mark if a reply held a write lock);
+              every 1000: flush THEN checkpoint
+        ► sweepPending: restore the listed allocations directly, re-querying in rounds; mark what is
+                        unsettled at the wait limit
         ► abort latch check (out of space, > MaxFailedObjects failures, cancel, staging fail-stop)
         ► retryFailures (re-read tree entry; absent = deleted; still failing ► acceptLoss? mark : fail)
-        ► finish: flush, close, re-check latch, remove checkpoint, acceptor-since, incarnation,
-                  rebuild-complete (the episode), os.move(staging ► final), fsync device dir
+        ► finish: flush, close, re-check latch, remove checkpoint, acceptor-since, inherited-votes,
+                  incarnation, rebuild-complete (the episode), DurableFiles.move(staging ► final)
   ► complete ► StoreRebuilds completion handler ► markRebuiltStoreActive
              ► Adopt | AdoptOffline | Discard | NotOwned | Superseded
 ```
@@ -133,8 +136,8 @@ the entry straight to Rebuilding.
 
 | # | Trigger | Detection | Effect |
 |---|---|---|---|
-| T1 | `<device>/crl` missing from a device that holds store directories | `DeviceDiscovery.openDeviceCrl` | every store directory gets the marker; a fresh CRL is opened |
-| T2 | the device CRL fails to open with anything but `CrlLocked`, `CrlSizingMismatch` (both refuse the device and retry each scan) or a transient error (retried up to `CrlOpenAttempts` = 3 scans in a row); `CrlCorrupt` is logged as such | same | every store directory gets the marker; the old CRL is kept as `crl.lost-<uuid>` |
+| T1 | `<device>/crl` missing from a device that holds store directories (a device-root directory with a `config.yaml`) | `DeviceDiscovery.openDeviceCrl` | every store directory gets the marker; a fresh CRL is opened |
+| T2 | the device CRL of a device holding store directories fails to open with anything but `CrlLocked`, `CrlSizingMismatch`, `CrlConfigInvalid` (each refuses the device and retries each scan) or a transient error (`DeviceDiscovery.isTransient`, retried up to `CrlOpenAttempts` = 3 scans in a row); `CrlCorrupt` and `CrlMissing` (a `crl/` with no stream files, `openCRL(..., holdsStores = true)`) are logged as such | same | every store directory gets the marker; the old CRL is kept as `crl.lost-<uuid>`; a fresh CRL is opened |
 | T3 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` fails | `StoreLoader.handleLoad` ► `StoreRebuilds.crlSaveFileLost` ► `retireUnserved` | backend closed unserved, marker, offline, device checked |
 | T4 | backend open throws `BackendStateLost` (FSIF `FsifRecovery.StoreLost`; RocksDB `RocksDBStateLost` for a directory with no database) | `StoreLoader.handleBackendOpened` | marker, offline, device checked |
 | T5 | backend fail-stop while served (`Host.BackendFailed`; only FSIF's `onFatal` raises it) | `StoreRebuilds.backendFailed` | marker first, then `closeUnloaded(dropDurably = false)`: the CRL entries stay for the discard to save |
@@ -201,19 +204,24 @@ design; automating it is in `Backlog.txt` ("Automate re-placement of a rebuild w
 
 `StoreRebuilds.startRebuild` first silences the store (section 6.2), then proceeds only if all hold, in order: the
 store is not already rebuilding here; `rebuildingStores.size + droppingCrlState.size < maxConcurrentRebuilds`
-(default 2, `Host`); the device is not shutting down; `retireForeignCopy` clears the path (T12); and
-`discardLostStore` reports the path clear. For a directory with `rebuild-required`, `discardLostStore` retires the
-copy (`StoreCopies.retire`, the one path by which any store copy that is no longer its owner's leaves its store path):
+(default 2, `Host`); the device is not shutting down; `retireForeignCopy` clears the path (T12; it waits, returning
+false, while the store's backend is opening, `StoreLoader.isOpening`); and `discardLostStore` reports the path clear.
+For a directory with `rebuild-required`, `discardLostStore` retires the copy (`StoreCopies.retire`, the one path by
+which any store copy that is no longer its owner's leaves its store path):
 
 1. the `rebuild-required` marker, already durable here;
 2. the copy's CRL state saved into `<storeDir>/lost-crl-state.log`: kept if the file exists from an earlier attempt,
    else the copy's `crl_save.log` renamed to it (a transfer-out close that fail-stopped, T7, already deleted the
-   entries from the device CRL), else the store's device-CRL entries read and saved (`CrashRecoveryLog.saveStoreState`);
+   entries from the device CRL; any entries the device CRL still holds for the store, after a crash between the save
+   file and their deletion, are first saved beside it as `lost-crl-entries.log`, since the save file may be the one
+   found unusable, `RebuildingStore.LostCrlEntriesFile`), else the store's device-CRL entries read and saved
+   (`CrashRecoveryLog.saveStoreState`);
 3. the entries dropped from the device CRL durably (`CrashRecoveryLog.dropStore`; a rebuild onto the same device would
-   recover them otherwise), releasing their admission charge;
-4. the directory renamed to `pending-delete/<dir>-<uuid>` durably (`DurableFiles.move`);
+   recover them otherwise), releasing their admission charge (`CrlAdmission.releaseRetained`);
+4. the directory renamed to `pending-delete/<dir>-<uuid>` durably (`DurableFiles.move`), only if the device is still
+   the one loaded (a device unloaded meanwhile reports the path not clear and is retired at its next load);
 
-and then starts the rebuild in the same control-thread callback.
+and then starts the rebuild in the same control-thread callback, for the episode the triggering reconcile read.
 
 While the retire runs, the store holds a rebuild slot through `droppingCrlState`, and the slot passes straight to the
 rebuild, so one reconcile cannot discard every marked store on a device at once. A failure at any step frees the slot
@@ -258,9 +266,12 @@ ErrorTree entries there, so the earlier episode's copy of every object is stale 
   entry and node read.
 * `restoreObject` decodes the stored `ObjectPointer` inside one `try`, so an undecodable pointer is a failed object,
   not a silently skipped one. Entries of another pool are skipped; keys that are not 16 bytes are logged and skipped.
-  `restore` does a full read through `client.withReadTimeout(ObjectReadTimeout)` (30 s), then `ObjectState.getRebuildDataForStore(storeId)` (re-encodes the object and
-  takes this store's slice; a partial KV state yields none) and `Backend.rebuildWrite` with the read's revision,
-  refcount and timestamp. For an object built by appends or ranged writes the re-encode is the very slice its peers
+  `restore` does a full read through `client.withReadTimeout(objectReadTimeout)` (default
+  `RebuildingStore.ObjectReadTimeout`, 30 s; one deadline covers the pointer's IDA resolution and the read,
+  `BaseAspenClient.resolveIdaWithin`), then `ObjectState.getRebuildDataForStore(storeId)` (re-encodes the object and
+  takes this store's slice; a partial KV state yields none) and the synchronous `Backend.rebuildWrite` with the read's
+  revision, refcount and timestamp (a throw from it is a failed object; FSIF writes the segment in place and buffers
+  its mapping for `rebuildFlush`). A `MetadataObjectState` cannot occur for a full read and fails the object. For an object built by appends or ranged writes the re-encode is the very slice its peers
   hold: every IDA's layout depends only on the content, and the stores apply those updates as deltas that, the codes
   being linear, leave exactly a fresh encode's slices (`AppendDeltaSuite`, `RandomAccessReedSolomonSuite`; end to end,
   FsifIntegrationSuite's lost-store rebuild of a RandomAccessReedSolomon object, read through the rebuilt slice
@@ -277,18 +288,23 @@ ErrorTree entries there, so the earlier episode's copy of every object is stale 
   `2r >= w + 1`), so repair's read of a stale copy reports the lock and defers rather than completing the entry.
   For `t <= r`, losing a store that held T before its peers applied it is beyond the pool's tolerance (`CLAUDE.md`,
   read threshold). Marks also land for locks that change nothing (an exclusive lock-only requirement) or for
-  transactions that abort; each costs one repair read, on the rebuild's path, not the transaction's.
+  transactions that abort; each costs one repair read, on the rebuild's path, not the transaction's. The sweep (5.3)
+  and the retries (5.4) restore through the same `restore`, so their copies are marked the same way.
 * A per-object read failure is recorded in `failed` and the checkpoint advances past it. A read that gets no answer
   (its pool below `r` with the missing stores silent, an allocation a commit voter parks, `Frontend.parkAllocationRead`)
   fails with `ReadTimeout` after `ObjectReadTimeout` and stops its driver: it is one such failure, so it holds the
   walk, the host's rebuild slot (`rebuildingStores`) and a cancel for at most that long. The same bound covers the
   sweep's reads (5.3: the object stays pending for the next round) and the retries (5.4). More than
-  `RebuildState.MaxFailedObjects` (10,000) failures latch an abort. An out-of-space error (`Backend.isOutOfSpace`,
+  `RebuildState.MaxFailedObjects` (10,000) failures latch an abort; a resumed pass keeps its checkpoint's failed list,
+  counted once per object, so an earlier pass's failures count toward it. An out-of-space error (`Backend.isOutOfSpace`,
   ENOSPC or EDQUOT) latches an abort and logs `REBUILD OUT OF SPACE`. A cancel latches `RebuildCancelled`.
 * Checkpoint: every `CheckpointInterval` (1,000) restored objects, `backend.rebuildFlush()` **then**
   `RebuildState.save` (temp file and atomic rename). Contents: store id, last restored key (hex), failed object ids,
-  and `pending-allocations`, the union of the allocations listed at every pass's query so far. A checkpoint that
-  fails is logged (and an out-of-space one latches the abort); losing one costs a re-walk from the previous one.
+  and `pending-allocations`, the union of the allocations listed at every pass's query so far, plus the episode. A
+  checkpoint that fails is logged (and an out-of-space one latches the abort); losing one costs a re-walk from the
+  previous one. The save is atomic but not forced; a checkpoint lost to a crash is the same as a failed one. A
+  checkpoint older than the latest query lacks only allocations first listed after the first pass's query, which the
+  lost store cannot have acknowledged (5.3, coverage), so resuming it is safe.
 
 ### 5.3 Pending allocations
 
@@ -298,8 +314,11 @@ whose entry lands behind the walk's position. Two mechanisms close that gap:
 
 * `queryPeers`, before each pass's walk, sends `CurrentAllocationsRequest` to the pool's other stores
   (`AspenClient.currentAllocations`, `client/internal/CurrentAllocationsQuery.scala`, resending at 1 s backing off to
-  10 s) until `w - t + 1` answer. Each lists the allocations in the pool held by transactions it has not seen
-  finalized or aborted (`Frontend.currentAllocations`); a store still loading its CRL does not answer. A committed
+  10 s) until `w - t + 1` answer. The query has no deadline: only a latched abort ends it early, at its next resend
+  (`CurrentAllocationsQuery.Abandoned`, which the pass reports as the latched cause). A pool of width 1 has no one to
+  ask and skips it. Each reply lists the allocations in the pool held by transactions the replier has not seen
+  finalized or aborted (`Frontend.currentAllocations`: pointers into this pool only, `committed` when its outcome is
+  known commit); a store still loading its CRL, a silent store and a rebuilding one do not answer. A committed
   transaction is held by at least `t` of its commit voters in the pool until `TxFinalized`, which comes only after
   its AllocationFinalizationAction recorded its objects, and expiry discards a Tx that may have committed only under
   `ExpiryTally` rule D (`dataLost`: some changed pool has fewer than `r` commit voters and silent stores together, `vc + s < r`), where the allocation
@@ -314,12 +333,16 @@ whose entry lands behind the walk's position. Two mechanisms close that gap:
   the peers again (delays 1, 2, 4, 8, 16, then 30 s; progress logged every 10 rounds): still listed and unresolved,
   wait; still listed and committed (by any replier), restore, retrying any read failure (an unapplied commit reads
   like a deletion); no longer listed (finalized, or aborted and forgotten), restore, or settle on a read with
-  `InvalidObject.provesDeletion`. Transactions first listed in a later round are ignored. A cancel abandons the wait
-  (`CurrentAllocationsQuery.Abandoned`). The sweep never waits on a finalization, which could need this very store
-  in a pool with `t = w`, and it does not wait on resolution past `PendingWaitLimit` (horizon plus
-  `Frontend.DefaultExpiryMargin` plus `MaxStartLead`, about 30 s, from the sweep's start). Whatever is still unsettled
-  then is marked in the ErrorTree against this store (`markUnsettled`, missed at `HLCTimestamp.Zero`), durably before
-  `finish`, and the sweep ends; a failed mark fails the pass. The wait cannot be unbounded: a transaction whose live
+  `InvalidObject.provesDeletion`. "Committed" is the current round's replies' word; a transaction's pointers are
+  merged across passes and replies (`mergeListed`). Transactions first listed in a later round are ignored. A cancel
+  abandons the wait: the latch is checked before each round and at each resend of its query, so it takes effect
+  within one round's delay (at most 30 s) or one read timeout. The sweep never waits on a finalization, which could
+  need this very store in a pool with `t = w`, and it does not wait on resolution past `pendingWaitLimit` (default
+  `PendingWaitLimit`: `TransactionHorizon.Horizon` 20 s plus `Frontend.DefaultExpiryMargin` 8 s plus `MaxStartLead`
+  2 s, 30 s from the sweep's start). The limit is checked between rounds (`nextRound`), after a round's query has been
+  answered. Whatever is still unsettled then is marked in the ErrorTree against this store (`markUnsettled`, missed at
+  `HLCTimestamp.Zero`, pointers into this pool), durably before `finish`, and the sweep ends; a failed mark fails the
+  pass after a best-effort checkpoint. The wait on resolution cannot be unbounded (a round's own query can be, RB-W7): a transaction whose live
   voters disagree is undecided, and past expiry `ExpiryTally` rule G holds it while any store of it is silent, which
   this store is until the rebuild finishes. Nor can the sweep drop such a transaction unmarked: it may be decided
   commit, applied and acknowledged by the lost incarnation while the replying peers do not know the outcome yet, and
@@ -336,16 +359,20 @@ and still counts. The latter needs T to start inside the window between that pee
 
 ### 5.4 Retries
 
-`retryFailures` re-reads each failed object's allocation-tree entry: absent means deleted since, skipped; present is
-read and restored again. Anything still failing either fails the pass ("incomplete", checkpoint saved) or, with
-`acceptLoss`, is recorded (5.5).
+`retryFailures` re-reads each failed object's allocation-tree entry (untimed, `allocationTree.get`): absent means
+deleted since, skipped; present is decoded, read (timed) and restored again, all concurrently. Anything still failing
+either fails the pass ("incomplete", naming `accept-rebuild-loss`, after a best-effort checkpoint) or, with
+`acceptLoss`, is recorded (5.5). It runs only when the abort latch is clear after the sweep.
 
 ### 5.5 Accepted loss
 
 `RebuildingStore.lossAccepted` reads the store's entry on its device: Rebuilding with `acceptLoss` (a failed read
-counts as no). With it, `recordAcceptedLoss` marks each still-listed object in the pool's ErrorTree against this store
-(`MissedUpdateMarker.mark`, missed at `HLCTimestamp.Zero`, so it never displaces a newer mark), durably before
-`finish`, and logs `REBUILD ACCEPTED LOSS`. Repair restores a slice if the object becomes readable again; the entry is
+counts as no). `AspenClient.acceptRebuildLoss` sets the flag only on a Rebuilding entry of a device that is not
+Failed, on the device the pool names (else `StoreNotRebuilding`), and nudges its host; a re-placement (R4) or a drain
+(R3) writes a fresh entry without it. With it, `recordAcceptedLoss` marks each object still in the allocation tree
+in the pool's ErrorTree against this store (`MissedUpdateMarker.mark`, missed at `HLCTimestamp.Zero`, so it never
+displaces a newer mark; an entry that does not decode to a pointer into this pool is logged and skipped), durably
+before `finish`, and logs `REBUILD ACCEPTED LOSS`. Repair restores a slice if the object becomes readable again; the entry is
 the record of the loss until then. A failed mark fails the pass. The flip that follows makes the store Active, which
 releases the old copy (4.3), slices of the accepted objects included: the acceptance is the operator's release, and
 `accept-rebuild-loss` warns of it. The `MaxFailedObjects` abort is not lifted by an
@@ -357,8 +384,12 @@ acceptance: a pool below its read threshold is not papered over.
 pass), remove the checkpoint and temp file, write `acceptor-since` (`writeAcceptorSince`: now plus
 `AcceptorSinceMargin`, 10 s), write `inherited-votes` (`writeInheritedVotes`: the pass start plus the horizon plus
 twice the margin; section 6.4, inherited votes), write a fresh `incarnation` (`StoreIncarnationFile.writeFresh`), write
-`rebuild-complete` durably with the episode as its content, `DurableFiles.move(staging, final)` (both directories forced). All four files are written durably
-in staging before the move, so the directory at the final path carries them from the instant it appears.
+`rebuild-complete` durably with the episode as its content, `DurableFiles.move(staging, final)` (both directories
+forced; it fails if the final path exists). All four files are written durably in staging before the move, so the
+directory at the final path carries them from the instant it appears. A failure anywhere in `finish` fails the pass;
+one after the checkpoint's removal makes the next pass a first pass (fresh staging, full walk). The first
+`rebuildFlush` is outside the out-of-space classification of the walk (RB-W10). A cancel that arrives after the
+latch re-check does not stop the move: the rebuild completes and its flip decides (5.7).
 
 ### 5.7 Completion and promotion (`StoreRebuilds.startRebuild`)
 
@@ -376,17 +407,25 @@ gossips the store online itself). The host acts only after the decision:
   removes `rebuild-complete`; an adopter classes it Clean and a restart's reinstatement loads it.
 * `Discard`: deletes the final directory (`LocalDevices.discardStoreDirectory`).
 * `NotOwned`: leaves the copy for the new owner, whose rebuild finds the marked final path and only flips.
-* `Superseded`: leaves the copy at the final path, silent. Its marker names the earlier episode, so the current
-  episode's `startRebuild` retires it (`retireForeignCopy`: marked `rebuild-required`, kept in `pending-delete/`).
-  An Active entry from another episode cannot meet a running rebuild: every transition out of Rebuilding on this
-  device passes a reconcile whose `abandonUnlisted` cancels it.
+* `Superseded`: leaves the copy at the final path, silent (still in `silenced`, not in the device's `offlineStores`).
+  Its marker names the earlier episode, so the current episode's `startRebuild` retires it (`retireForeignCopy`:
+  marked `rebuild-required`, kept in `pending-delete/`). If the entry leaves the device before that rebuild starts,
+  nothing in this process retires the copy (RB-W9); a restart's load leaves it offline and the Deleted Stores pass
+  retires it. An Active entry from another episode cannot meet a running rebuild: every transition out of Rebuilding
+  on this device passes a reconcile whose `abandonUnlisted` cancels it (but see RB-W8), a second rebuild of the store
+  cannot start on this host while one runs (`rebuildingStores`), and a transfer in cannot promote over a final path
+  the rebuild's move then fails on.
 
 Every settled outcome releases the slot and re-checks all devices; `NotOwned` re-checks the others only. A failed pass
 or a permanently failed flip releases the slot, re-checks the **other** devices (re-checking its own would restart the
 same store at once) and schedules a backoff re-check of its own (`StoreRebuilds.scheduleRebuildRetry`:
 `Host.RebuildRetryInitialDelay` 30 s, doubled per consecutive failure of the store, capped at `RebuildRetryMaxDelay`
-30 min, reset when a flip settles). A cancel for a shutdown re-checks the other devices; a cancel because the entry
-left the device (`abandonedRebuilds`) re-checks all, so the next check deletes the staging copy.
+30 min, reset when a flip settles; at most one scheduled per store). A cancel for a shutdown re-checks the other
+devices; a cancel because the entry left the device (`abandonedRebuilds`) re-checks all, so the next check deletes the
+staging copy. The abandoned branch is taken only when the completion is `RebuildCancelled`; a cancelled rebuild that
+ends otherwise (finished past the latch re-check, or failed with another latched cause) takes that outcome's branch.
+A device shutdown waits for its cancelled rebuilds' slot releases up to `shutdownWorkTimeout` (60 s), the staging
+backend being closed before the release.
 
 ---
 
@@ -404,7 +443,8 @@ dropped before the rebuild (4.3), so nothing on the device recovers them.
 `StoreRouter` answers "unknown" only for a store that is neither installed nor `offline`, `loading` or
 `awaitingDevice`. `startRebuild` marks the store offline (`router.markOffline`, recorded in `silenced`) on every
 reconcile that sees its Rebuilding entry, queued for a slot or running, so the host drops its messages. The mark ends
-with the outcome: an adopted store's install clears it; `AdoptOffline` and `NotOwned` keep it; `Discard`, a cancel
+with the outcome: an adopted store's install clears it; `AdoptOffline` and `NotOwned` keep it (out of `silenced`);
+`Superseded` keeps it in `silenced` for the current episode; `Discard`, a cancel
 because the entry left the device, and `abandonUnlisted` for a queued store clear it unless a device's
 `offlineStores` holds the store for another path. A failed pass keeps it until the retry. A device that is not loaded
 has all its stores marked offline by `startDeviceCheck`. After a host restart a destination store answers unknown
@@ -427,8 +467,9 @@ The Rebuilding store is an ordinary **absent acceptor**; nothing in the transact
   is advisory; a leader chosen on the rebuilding store never answers, and recovery drivers take over after
   `Host.txHeartbeatTimeout` (5 heartbeats).
 * Reads need `r` consistent replies, which the pool must supply without the rebuilding store; this is also the
-  rebuild's own read requirement. A read whose replies cannot reach `r` because stores are silent (not erroring)
-  retransmits forever: `SimpleReadDriver` has no timeout.
+  rebuild's own read requirement. An untimed read (the client's default) whose replies cannot reach `r` because
+  stores are silent (not erroring) retransmits until they answer; the rebuild's and repair's object reads are timed
+  (`withReadTimeout`, `ReadTimeout`).
 * `checkPoolsStayWritable` refuses the shutdown of another device that would leave a pool with fewer than `t`
   writable stores; a Rebuilding store is not writable.
 
@@ -465,8 +506,9 @@ mute, not on the failure budget:
   `MaxStartLead` after its clock, and no store joins a transaction past its start plus the horizon, so from then on
   every vote on such a T has been cast; one margin covers the lead and the old host's skew, the other the skew of the
   querying and answering hosts. Until a query after that time completes, the Frontend votes abort
-  (`InheritedVoteLock`) on every object. The query (`HeldVoteQuery`, Host → `client.heldVotes`) asks `w - t + 1` of
-  the other stores for the transactions they hold with outcome unknown and a vote that is commit or undecided
+  (`InheritedVoteLock`) on every object. The query (`HeldVoteQuery`, Host → `client.heldVotes`, given up after
+  `Host.HeldVoteQueryDeadline`, 30 s, and asked again at a later heartbeat) asks `w - t + 1` of the other stores for
+  the transactions they hold, not muted or finalized, with outcome unknown and a vote that is commit or undecided
   (`Frontend.heldVotes`, carried in `CurrentAllocationsReply`); T can still commit with the old vote counted only with
   `t - 1` live commit voters among them, so the replies include one. The store then votes abort only on the objects
   of the reported transactions started before its `acceptor-since`, repeats the query at heartbeat (1 s doubling to
@@ -493,8 +535,8 @@ objects; the pointer carries the store-pointer bytes FSIF and RocksDB stores nee
 * Walk and concurrent modification: a split moves entries to a new right node, which a walk that already read the old
   node has seen. A join has the emptied left node absorb its right neighbour, deleting the neighbour with its version
   bumped, so a walk following a stale link gets `InvalidObject`; `TierEngine.walk` then descends again to the node
-  holding the last visited key and continues after it, failing the pass only after `MaxJoinRaceRestarts` restarts in a
-  row without visiting a key. Entries are filtered only by the walk's bounds and the last visited key, so none is
+  holding the last visited key and continues after it, failing the pass only after `MaxJoinRaceRestarts` (10)
+  restarts in a row without visiting a key. Entries are filtered only by the walk's bounds and the last visited key, so none is
   skipped silently.
 
 ---
@@ -524,7 +566,14 @@ store is loaded, and are then reconciled by its repair scans ([repair-process.md
 * allocation-tree entry present: reconcile the store's copy with a full read and delete the entry once complete;
 * absent: if the entry is older than `minErrorEntryAgeForDeletion` (60 s), read the object: a read proving deletion
   drops the slice (FSIF frees a slot only if it still maps this object id), a read that restores it reconciles it,
-  anything else defers. Younger entries are deferred (an allocation whose tree entry has not landed yet).
+  anything else defers. Younger entries are deferred (an allocation whose tree entry has not landed yet). The rebuild's
+  own marks (locked copies, unsettled allocations, accepted losses) are missed at `HLCTimestamp.Zero`, so they are
+  never younger: an unsettled allocation's mark is read at once. The rebuilt store holds no Tx of its old
+  incarnation, so for an allocation that incarnation voted it answers `ObjectNotFound`, not `AllocationPending`, and
+  its reply counts toward a proof of deletion. That cannot prove a live object deleted: `provesDeletion` needs more
+  than `w - r` error replies and more than `w - t` absences, so beyond the `w - t` non-voters it needs more than
+  `t - r` commit voters without their vote, which is beyond the data tolerance, where the object is unrestorable
+  anyway ([cross-document-review.md](cross-document-review.md) 2.5).
 
 So an entry for the rebuilt store is deleted only once its copy is complete. Not closed by repair: an object whose
 copy changes under every install, or never settles, stays stale and is warned about; and a staleness nothing marked
@@ -554,13 +603,20 @@ is never repaired (5.2's locked copies are marked for this reason).
   past objects still unreadable at its end (5.5).
 * Peers that are **silent** make reads time out (`ObjectReadTimeout`, 5.2): each is a failed object, so the walk goes
   on, `MaxFailedObjects` and the backoff re-check engage as for error replies, and a cancel ends the pass within one
-  timeout. A pool whose objects all time out costs one timeout per object until the abort; the host's other
-  rebuilds wait at most that long for its slot. The allocation-tree reads (the walk's node reads, the retries'
-  `allocationTree.get`) and the pool lookup are not timed: they read the metadata pool, and a metadata pool short of
-  `r` stalls the rebuild (FS14).
+  timeout. The walk is sequential, so a pool whose objects all time out costs one timeout per object until the abort
+  (up to 10,001 timeouts, about 83 hours) or the end of the walk and its retries, and holds a host rebuild slot
+  throughout (RB-W7). Fewer than `w - t + 1` answering peers stall the pass at its peer query, which has no deadline
+  (RB-W7). The allocation-tree reads (the walk's node reads, the retries' `allocationTree.get`), the pool lookups and
+  the ErrorTree marks are not timed: they use the metadata pool, and a metadata pool short of `r` stalls the rebuild
+  (FS14).
+* An amnesiac rebuilt store answers `ObjectNotFound` for an allocation its old incarnation voted and its peers have not
+  applied. A false `InvalidObject.provesDeletion` from such replies needs more than `t - r` amnesiac commit voters of
+  the allocation, beyond the data tolerance ([cross-document-review.md](cross-document-review.md) 2.5), so no reader
+  (repair, this rebuild's sweep, the allocation and split finalizers) drops or skips a restorable object for it.
 * Two stores of one pool rebuilding at once each read the other as missing. With Replication(3,2) neither can read
-  anything (`r = 2` of one live store), so both wait until a store with data returns. With Reed-Solomon, both complete
-  while `w - 2 >= r`. The concurrency bound is per host (`maxConcurrentRebuilds`), not per pool.
+  anything (`r = 2` of one live store): their queries wait (each needs both peers) until a store with data returns.
+  With Reed-Solomon, both complete while `w - 2 >= r`. The concurrency bound is per host (`maxConcurrentRebuilds`),
+  not per pool.
 
 ---
 
@@ -599,7 +655,8 @@ is never repaired (5.2's locked copies are marked for this reason).
 * **B6 Resume is inclusive and idempotent.** Re-restoring an object is an overwrite.
 * **B7 Sequential walk.** `lastRestoredKey` advances only for objects already written, because the walk awaits each
   `fn` before the next.
-* **B8 Listed allocations outlive the walk's progress.** Every checkpoint carries every allocation listed so far.
+* **B8 Listed allocations outlive the walk's progress.** Every checkpoint carries every allocation listed so far,
+  and what the sweep leaves unsettled is marked in the ErrorTree before `finish`.
 * **B9 Promotion is atomic and complete.** The final path appears only by renaming staging after the abort latch is
   re-checked and `acceptor-since`, `inherited-votes`, `incarnation` and `rebuild-complete` are durable.
 * **B10 Load follows the metadata decision.** The store is loaded only after `markRebuiltStoreActive` returned
@@ -615,16 +672,16 @@ is never repaired (5.2's locked copies are marked for this reason).
 * **B17 Rebuilding survives shutdown, adoption and restart.**
 * **B18 Work belongs to one episode.** A rebuild resumes only a checkpoint of its entry's episode, takes only a
   finished copy whose `rebuild-complete` names it, and is flipped only while the entry still names it; a running
-  rebuild whose entry moved to another episode is cancelled.
-* **B18 A failed device's stores are not served after the tombstone.** The reconcile retires a device it reads Failed
+  rebuild whose entry moved to another episode is cancelled (up to RB-W8).
+* **B19 A failed device's stores are not served after the tombstone.** The reconcile retires a device it reads Failed
   (`DeviceShutdown.retireFailedDevice`: a durable `failed` marker, then unloaded like a relinquished device), and no
   host loads a device carrying the marker. Residual: until its first reconcile, a restarted or partition-healed old
   host may still answer peers holding a stale store-to-host mapping (the no-fencing trade-off accepted for adoption).
-* **B19 A rebuilt store never joins a transaction its old incarnation may have joined** (6.4), up to the clock-skew
+* **B20 A rebuilt store never joins a transaction its old incarnation may have joined** (6.4), up to the clock-skew
   residual.
-* **B20 A rebuilt store grants no commit vote over a lock its old incarnation's vote may still back** (6.4, inherited
+* **B21 A rebuilt store grants no commit vote over a lock its old incarnation's vote may still back** (6.4, inherited
   votes), up to the same clock-skew residual.
-* **B21 A copy read under a write lock is recorded before the walk passes it.** Its ErrorTree mark is written before
+* **B22 A copy read under a write lock is recorded before the walk passes it.** Its ErrorTree mark is written before
   the restore completes (5.2, locked copies).
 
 Not an invariant: the rebuild validates neither the decision that declared the store lost nor the pool's ability to
@@ -644,7 +701,7 @@ pass.
 No wrong data is written either way.
 
 **FS3 A second store of the pool is lost during the rebuild.** Replication(3,2): one live store, below `r`; every
-restore waits; the pool is also unwritable. The stores stay Rebuilding until a store with data returns. Reed-Solomon
+restore times out and the next pass's peer query waits (RB-W7); the pool is also unwritable. The stores stay Rebuilding until a store with data returns. Reed-Solomon
 pools tolerate `w - r` silent peers. No wrong data is produced.
 
 **FS4 Transactions committing to objects already rebuilt.** The store is silent, so after 2 s the finalizer marks it
@@ -717,4 +774,76 @@ copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and 
 
 ## Open weaknesses
 
-None.
+### RB-W7. A pool short of live peers holds a host rebuild slot for days, or indefinitely (CONFIRMED; liveness)
+Mechanism: `RebuildingStore.queryPeers` waits for `w - t + 1` replies with no deadline
+(`CurrentAllocationsQuery` ends only on `stopWhen = aborted`), before the walk and again in every sweep round, where
+`nextRound` checks `pendingWaitLimit` only after the round's query is answered. The walk is sequential
+(`TierEngine.walk`), each silent-peer read costs `ObjectReadTimeout` (30 s), and the abort latches only past
+`MaxFailedObjects` (10,000). The slot (`StoreRebuilds.rebuildingStores`, `maxConcurrentRebuilds` = 2 per host) is held
+throughout.
+Trigger / scenario: Replication(3,2) loses one store; while it rebuilds, a second store's host goes down (or is
+partitioned). The first pass's query waits for both peers forever; a pass already walking times out on every object,
+about 83 hours to the abort for a large pool, then its next pass waits at the query forever. Two such stores on one
+host block every other rebuild on that host, for any pool.
+Consequence: under-replicated stores of healthy pools on the same host are not rebuilt until an operator cancels
+(shutdown) or the silent store returns. No safety impact.
+Suggested fix: give the peer query a deadline (fail the pass into the backoff retry, as an unreadable object does),
+and abort the walk after a run of consecutive `ReadTimeout`s (say 100) rather than only after 10,000 failures.
+Effort: S   Priority: 4
+
+### RB-W8. `abandonedRebuilds` leaks when an abandoned rebuild does not end in `RebuildCancelled` (CONFIRMED; bookkeeping)
+Mechanism: `StoreRebuilds.abandonUnlisted` adds the store to `abandonedRebuilds` and calls `cancel()`; only the
+completion branch `Failure(RebuildCancelled(_)) if abandonedRebuilds.contains(storeId)` removes it. `cancel()` latches
+`RebuildCancelled` only if no cause is latched yet, and a rebuild past `finish`'s latch re-check, or in `start`'s
+already-in-place path, ignores it. Such a rebuild completes with `Success` (then `Discard`/`Superseded`) or with
+another failure (out of space, `MaxFailedObjects`, a staging fail-stop, a failed accepted-loss mark), and the entry
+stays.
+Trigger / scenario: a re-placement (`replaceRebuild`) of a store whose rebuild here is finishing, or has already
+latched an out-of-space abort (the very case `REBUILD OUT OF SPACE` tells the operator to re-place). Later the store
+is rebuilt on this host again (re-placed back, or a drain picks this device) and its entry moves away once more:
+`abandonUnlisted` skips the cancel (`!abandonedRebuilds.contains`), and a shutdown cancel of it takes the abandoned
+branch (clears the router's offline mark, re-checks the shutting-down device).
+Consequence: B18's cancel does not happen; the superseded rebuild walks to completion holding a host slot, and its flip
+is then `Discard` or `Superseded`. Safety holds through the guarded flip.
+Suggested fix: remove the store from `abandonedRebuilds` in `release()`, which every completion branch runs.
+Effort: S   Priority: 4
+
+### RB-W9. A finished copy whose flip did not promote it is stranded when its entry leaves the device (CONFIRMED; hygiene)
+Mechanism: after `RebuildOutcome.Superseded`, or a permanently failed flip (`Failure` branch with its backoff
+re-check), the copy stays at the store's path with `rebuild-complete`. It is in neither `loadedStores` nor the
+device's `offlineStores` (only `silenced`), so if the entry leaves the device before the next `startRebuild` here
+retires it, the Deleted Stores pass (which walks `offlineStores`) never sees it, and `abandonUnlisted` only unsilences
+it and deletes staging.
+Trigger / scenario: E1's flip is `Superseded` while both host slots are taken, so E2's `startRebuild` waits; the
+operator re-places E2 to another device. Or a flip fails permanently and the store is re-placed during the backoff.
+Consequence: the copy occupies space until the host restarts (its load leaves it offline, the Deleted Stores pass
+then retires it). Meanwhile a transfer of the store onto this device refuses at every check (`StoreTransfers.startIn`:
+"store path already exists").
+Suggested fix: add the store to the device's `offlineStores` on `Superseded` and on a failed flip, as
+`keepRebuiltStoreOffline` does for `AdoptOffline`, so the Deleted Stores pass retires it when its entry leaves.
+Effort: S   Priority: 5
+
+### RB-W10. An out-of-space flush in `finish` is not classified (CONFIRMED; alerting)
+Mechanism: `RebuildingStore.finish` calls `backend.rebuildFlush()` directly, outside `checkpointBestEffort`, so an
+ENOSPC/EDQUOT there fails the pass as a generic error without `latchOutOfSpace`; the same holds for the marker writes
+that follow.
+Trigger / scenario: the destination fills during the final flush (FSIF's data force, RocksDB's flush) of a walk that
+otherwise fit.
+Consequence: no `REBUILD OUT OF SPACE` line, the operator's alert and remedy pointer; the pass fails and retries with
+backoff, each pass re-walking from the last checkpoint and failing again at the same point.
+Suggested fix: classify `finish`'s flush and writes with `Backend.isOutOfSpace` and latch the out-of-space abort.
+Effort: S   Priority: 5
+
+### RB-W11. Documentation corrections outside docs/safety (CONFIRMED; documentation)
+Mechanism / corrections:
+* `server/host/CLAUDE.md` (store copies): "Scratch areas (`creating/`, `rebuilding/<id>`, transfer staging) are ...
+  swept whole at device load". `DeviceDiscovery.loadOwnedDevice` sweeps `creating/`, transfer staging and `deleting/`
+  only; `rebuilding/<id>` holds resumable checkpoints and is deleted only by `StoreRebuilds.abandonUnlisted` (and a
+  first pass's `createStaging`).
+* `StoreRebuilds.cancelFor` and `DeviceShutdown.stopDeviceWork` scaladoc: "a rebuild already past its walk finishes
+  instead and writes its entry Offline". A cancel during the sweep or the retries fails the pass; only a rebuild past
+  `finish`'s latch re-check (or in `start`'s already-in-place path) finishes.
+* `StorageDeviceState.StoreEntry` scaladoc cites "rebuild-process.md 4.5", which does not exist (2.1, 5.1).
+* `RebuildingStore.sweepPending` scaladoc cites the finding id "RB-W1"; `restoreObject`'s comment tells history
+  ("Before the walks moved onto TierEngine ...").
+Effort: S   Priority: 7

@@ -115,10 +115,10 @@ applied Insert keeps the lock of the `ValueState` it replaces.
 ### 2.3 How a KV update is applied, and what it leaves
 
 `RequirementsApplyer.apply`: object timestamp := max(current, tx timestamp) for every KV update; revision := txid only
-with a `requiredRevision`. Operations apply in order: `Insert` replaces the key's `ValueState` (revision txid,
-timestamp tx, unlocked) only when it wins `KVObjectState.insertWins` (later transaction timestamp, ties broken by
-revision UUID; equal is the same transaction re-applying), otherwise it is a no-op, not a skip; `Delete` removes the key;
-the eight object-level operations set or clear `min/max/left/right`. Then `state.data := kvs.encode()`.
+with a `requiredRevision`. Operations apply in order: `Insert` replaces the key's `ValueState` (revision txid, timestamp
+tx, unlocked) only when it wins `KVObjectState.insertWins` (later transaction timestamp, ties broken by revision UUID;
+equal is the same transaction re-applying), otherwise it is a no-op, not a skip; `Delete` removes the key; the eight
+object-level operations set or clear `min/max/left/right`. Then `state.data := kvs.encode()`.
 
 Last-writer-wins makes sequential blind Inserts of one key converge whatever order a store applies them in. A checked
 Insert (`KeyRevision`, `DoesNotExist`, a required revision) always wins in practice: its check rejects a key written
@@ -148,17 +148,20 @@ timestamps instead.
 ### 2.5 Structural rules: builder and store
 
 The client builder (`client/internal/transaction/TransactionBuilder`) refuses: a second content update of an object
-(`MultipleDataUpdatesToObject`), a second refcount update (`MultipleRefcountUpdatesToObject`), a lock on an updated
-object or a shared/exclusive mix (`ConflictingRequirements`), a blind KV Delete or object-level change
-(`refuseBlindWrites`, `BlindKeyValueWrite`, even when replay-safe), and an unpinned transaction not marked
-`replaySafe(reason)` (`UnpinnedTransaction`). A `RefcountUpdate` may accompany a content update of the same object
-(allocation does this).
+(`MultipleDataUpdatesToObject`), a second refcount update (`MultipleRefcountUpdatesToObject`), a lock on an object it
+gives a content update (`DataUpdate`, `KeyValueUpdate`, `VersionBump`), a second shared lock or a shared/exclusive mix
+(`ConflictingRequirements`), a blind KV Delete or object-level change (`refuseBlindWrites`, `BlindKeyValueWrite`, even
+when replay-safe), and an unpinned transaction not marked `replaySafe(reason)` (`UnpinnedTransaction`). A
+`RefcountUpdate` may accompany a content update of the same object (allocation does this) or a lock on it: both take
+X for the same transaction, and a transaction never collides with itself.
 
 **Pin rule** (`common/transaction/Pins`): a transaction must carry a write that invalidates its own requirement once
 applied: a `DataUpdate` at a required revision other than `Allocating`, a `VersionBump`, a KV update with a required
 revision, a `KeyRevision(k, _)` on a key the same update Inserts or Deletes, or a `RefcountUpdate` whose new refcount
-differs from the required one. The builder records the key pin in the description as `KeyValueUpdate.pinned`
-(`Pins.writesCheckedKey`) and the client's claim as `TransactionDescription.replaySafe`.
+differs from the required one. The refcount pin relies on `ObjectRefcount.updateSerial` never returning to an earlier
+value: every production caller derives the new refcount with `update`, `increment` or `decrement`, which add one to the
+serial, but neither the builder nor the stores check it. The builder records the key pin in the description as
+`KeyValueUpdate.pinned` (`Pins.writesCheckedKey`) and the client's claim as `TransactionDescription.replaySafe`.
 
 **Store-side validation.** Stores do not trust the builder. Before checking requirements, a client-prepared Tx runs
 `DescriptionValidator.validate` once (`Tx.invalidDescription`, lazily, at vote only); a refusal is the non-object error
@@ -168,11 +171,12 @@ differs from the required one. The builder records the key pin in the descriptio
   `Frontend.poolIDA`; `None` skips this, tests only), and every referenced pool must have an entry. Each pool's stores
   check their own entry, so a lowered `writeThreshold` for any pool draws abort votes from every honest store of
   that pool and cannot commit;
-* `primaryObjectIDA` is the primary pool's entry, the primary object is referenced, no referenced pool tolerates more
-  failures than the primary's (the builder picks the most tolerant), and the designated leader index is below the
-  primary pool's width;
-* per object at most one content update and one `RefcountUpdate`, no lock beside an update, no shared lock beside
-  another lock (duplicate `ExclusiveRevisionLock`s, harmless, are allowed as the builder allows them);
+* `primaryObjectIDA` is the primary pool's entry, the primary object is referenced, no pool named in `poolIDAMap`
+  tolerates more failures than the primary's (the builder picks the most tolerant), and the designated leader index is
+  below the primary pool's width;
+* per object at most one content update and one `RefcountUpdate`, no lock beside a content update (a lock beside a
+  `RefcountUpdate` passes, as in the builder), no shared lock beside another lock (duplicate `ExclusiveRevisionLock`s,
+  harmless, are allowed as the builder allows them);
 * the pin rule from the description alone (`Pins.declared`, taking `pinned` as the key pin), unless `replaySafe`.
 
 The stores that hold a `pinned` object check the claim against the operations (`FalsePin`); a store that does not hold
@@ -291,8 +295,8 @@ recovered votes on one lock both hold it (section 3, displaced holders).
 
 **R5 (no vote on stale local state).** A vote is decided only when no commit of any of the transaction's hosted
 objects is in flight or held (section 8), so it is checked against exactly the state a recovery would produce. An
-object whose backend commit failed, or that is quarantined, gets an abort vote (`BackendCommitFailed`,
-`ObjectQuarantined`).
+object whose backend commit failed, that is quarantined, or that a rebuilt store's inherited votes may lock gets an
+abort vote (`BackendCommitFailed`, `ObjectQuarantined`, `InheritedVoteLock`).
 
 **R6 (apply is idempotent where requirements pin a version).** Applying re-checks the requirements; a failing object
 is skipped and reported in `TxCommitted.objectCommitErrors`, which makes the finalizer mark the store for repair.
@@ -305,7 +309,9 @@ past T's start, is not applied: the key may have been deleted since, so the obje
 common object-level field (K/N/X locks at the common store), or are blind Inserts of one key (last writer wins), so
 their application order does not change the result. The object timestamp is the max of every applied transaction's,
 so it is order-independent too. A store that applies them in an order its re-check rejects skips and reports, and
-repair restores it.
+repair restores it, provided a read threshold of stores applied the skipped update: a later write that does not
+require T's revision but raises the object timestamp, voted at stores that lacked T and applied first at T's voters,
+breaks that (Q-W4).
 
 **R8 (lock lifetime).** Locks are released when: the Tx resolves abort; the Tx resolves commit and its commit is not
 held (`doCommit` releases them before applying); a held commit is finally issued; the Tx expires (`Tx.expire`) or is
@@ -393,21 +399,24 @@ commit per object.
   writes (`reconcileSettled`).
 * `heldCommits: ObjectId -> List[Tx]`: committed transactions waiting their turn, oldest first.
 * `commitWaiters: ObjectId -> List[Tx]`: transactions withholding their vote.
+* `collisionWaiters: TransactionId -> List[Tx]`: transactions waiting out a lock holder (8.4), by holder.
 * `commitInFlight(oid) = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)`.
 * `failedCommits`: never cleared; the store reloads with a new Frontend.
-* `quarantined`: section 8.5.
+* `quarantined` (object -> `Quarantine`: pointer, latest quarantining start, the quarantining txids, the verification
+  attempt and its back-off) and `quarantinedConclusions` (finalized txids whose CRL state a quarantine keeps): 8.5.
 
 ### 8.3 Behaviour
 
 1. **Vote path** (`Tx.determineDisposition`, in this order): a frozen, unresolved Tx (past expiry) decides nothing; a
    muted Tx votes abort without checking (it proves the commit if an object shows it); a Tx that has seen no client
    prepare votes abort with `NoClientPrepare` without checking (prefer-abort; it is called only once the wait for the
-   client's prepare is over or the outcome is known); an invalid description votes `InvalidDescription`; a failed or
-   quarantined hosted object votes abort; a hosted object with `commitInFlight` and an unknown outcome makes the Tx
-   wait (`awaitingCommits`, `Frontend.awaitCommitPersisted`), no timer and no locks, until `commitPersisted` has
-   arrived for each; otherwise the requirements are checked, and a collision may be waited out (8.4). The in-flight
-   test covers every hosted object, lock-only ones included; a lock-only object has a commit in flight only when another
-   transaction changes it.
+   client's prepare is over or the outcome is known); an invalid description votes `InvalidDescription`; a hosted object
+   that is failed (`commitFailed`), quarantined, or covered by a rebuilt store's inherited votes
+   (`Frontend.inheritedVoteLock`, cross-document-review.md 2.3) votes abort, one error per such object; a hosted object
+   with `commitInFlight` and an unknown outcome makes the Tx wait (`awaitingCommits`, `Frontend.awaitCommitPersisted`),
+   no timer and no locks, until `commitPersisted` has arrived for each; otherwise the requirements are checked, and a
+   collision may be waited out (8.4). The in-flight test covers every hosted object, lock-only ones included; a
+   lock-only object has a commit in flight only when another transaction changes it.
 2. **Commit path** (`Tx.resolvedAndAllObjectsLoaded`): if the commit decision arrived before the object data
    (`commitAwaitsData`: no client prepare and data missing, or adopted data not yet saved to the CRL), the commit is
    held, without locks, since a commit vote requires the data. Else if `holdForTurn()` finds a changed object in
@@ -435,15 +444,17 @@ device's I/O, and detect and handle hung devices", including why there is no per
 
 A transaction whose check fails only with collisions against holders it is **built on** (`Tx.buildsOn`: one of its
 `DataUpdate`, `VersionBump`, `ExclusiveRevisionLock`, `SharedRevisionLock` or KV `requiredRevision` requirements on that
-object requires the revision the holder writes) and that still hold locks here (`Frontend.holdsLocks`) does not vote
-(`Tx.awaitableHolders`). It registers with each holder (`awaitLocksReleased`), holds no locks, and decides when the
-holders release (`locksReleased`, called at the end of `releaseObjects`, after the commit was issued, so the waiter
-then sees the commit in flight and waits for it to persist) or after `Tx.CollisionWait` (500 ms), checked at the 1 s
-store heartbeat (`Store.heartbeat` -> `Tx.checkCollisionWait`), so a wait lasts up to about 1.5 s. On expiry the check
-runs once more and a remaining collision is an ordinary abort vote. Recovered Txs, and any non-object error, never
-wait. A collision with a holder the transaction does not build on is an immediate abort vote. `objectErrors` keeps
-one error per object, so a later error for an object masks an earlier one; the re-check after the wait only costs
-time.
+object requires the revision the holder writes; a key requirement such as `KeyRevision` is never built on) and that
+still hold locks here (`Frontend.holdsLocks`, a held commit included) does not vote (`Tx.awaitableHolders`). It
+registers with each holder (`awaitLocksReleased`), holds no locks, and decides when the holders release
+(`locksReleased`, called at the end of `releaseObjects`, after the commit was issued, so the waiter then sees the commit
+in flight and waits for it to persist) or after `Tx.CollisionWait` (500 ms), checked at the 1 s store heartbeat
+(`Store.heartbeat` -> `Tx.checkCollisionWait`), so a wait lasts up to about 1.5 s. On expiry the check runs once more
+and a remaining collision is an ordinary abort vote; a Tx whose wait expired never waits again (`collisionWaitExpired`).
+Recovered Txs, and any non-object error, never wait. A collision raised by the exclusive preference window names the Tx
+itself, which holds no locks, so it is never waited out. A collision with a holder the transaction does not build on is
+an immediate abort vote. `objectErrors` keeps one error per object, so a later error for an object masks an earlier one;
+the re-check after the wait only costs time.
 
 ### 8.5 A commit voter that cannot apply: fail-stop, quarantine, poison
 
@@ -451,19 +462,27 @@ time.
 
 * an apply that threw (`result.failed`) fail-stops the store (`Frontend.failStop`): its in-memory state is corrupt;
 * otherwise, live or recovered, the voter's skipped changed objects, except those already applied (`appliedBy`) and
-  allocations the backend missed (`allocatedHere`), are quarantined (`Frontend.quarantine`), and an already
-  quarantined changed object is quarantined by this vote too. The re-check may fail legitimately, which the store
-  cannot tell from a state invalidated under the locks or from two conflicting commits: a committed transaction
-  that does not depend on this one applied first over its locks, its outcome having arrived first (an apply ignores
-  other transactions' locks, and `Tx.holdForTurn` waits only for in-flight commits). Examples are a fence takeover
-  after a vdisk block commit's `SharedRevisionLock`, an allocator's follow-up write after an
-  `AllocationFinalizationAction`'s lock, a writer after a repair proof, a refcount change that raised the object
-  timestamp, or a deletion. For a recovered vote, the store may also have applied the update before the crash and
-  had it superseded (section 10.5a). The vote counts with neither its lock nor its update, so the object backs no
-  commit vote until verified; it is reported, so the finalizer marks the store. A live voter logs it at error level,
-  naming the transaction each object now shows;
+  allocations the backend missed (`allocatedHere`), are quarantined (`Frontend.quarantine`), and an already quarantined
+  changed object is quarantined by this vote too. The re-check may fail legitimately, which the store cannot tell from a
+  state invalidated under the locks or from two conflicting commits: a committed transaction that does not depend on
+  this one applied first over its locks, its outcome having arrived first (an apply ignores other transactions' locks,
+  and `Tx.holdForTurn` waits only for in-flight commits). For a changed object the cause is a later write that does not
+  require T's revision: a refcount change or a key-level KV write whose later start raised the object timestamp past T's,
+  repair's refcount and key proofs among them (`RepairProofs.proveRefcount`, `proveKey`: each a backend commit that
+  raises the object timestamp to the proof's start) (`ObjectTimestampError`; when stores that lacked T voted for that
+  write, T is lost, Q-W4), or a deletion (`MissingObject`; such a quarantine never clears, repair-process.md RP-W4). The state may also have been discarded under the locks (`Frontend.discard`,
+  `StaleObjectState`). For a re-apply, the store may also have applied the update before the crash and had it superseded
+  (section 10.5a), or applied it and left no trace `appliedBy` recognizes (Q-W6). The vote counts with neither its lock
+  nor its update, so the object backs no commit vote until verified; it is reported, so the finalizer marks the store. A
+  live voter logs it at error level, naming the transaction each object now shows; a recovered one logs only the
+  per-object warning;
 * a skipped lock-only object has no update to lose: it is skipped, logged and reported, never quarantined or
-  fail-stopped. A rebuilt store's inherited votes keep the locks a lost vote held, so a lost lock is not a cause;
+  fail-stopped. The usual cause is a later commit applied first over the lock: a fence takeover after a vdisk block
+  commit's `SharedRevisionLock`, an allocator's follow-up write after an `AllocationFinalizationAction`'s
+  `SharedRevisionLock`, a writer after repair's object-level proof (`RepairProofs.proveObjectLevel`, an
+  `ExclusiveRevisionLock`, which changes nothing). Repair's refcount and key proofs are not lock-only: they raise the
+  object timestamp and so belong to the changed-object causes above. A rebuilt store votes abort on the
+  objects its lost incarnation's votes may back (`InheritedVoteLock`), so a lock lost to a rebuild is not a cause;
 * before the apply, a re-apply (recovered, or applying through its UnackedCommits entry) leaves out every object on
   which it would insert a key now absent while a later transaction has reached the object, and quarantines it
   (10.5c). The object is never counted as skipped, so it is quarantined once.
@@ -473,13 +492,24 @@ mark it rebuild-required and unload it. Every fail-stop is a lost-store declarat
 protection against correlated lost store declarations"), which is why a failed re-check quarantines one object
 instead.
 
+Objects whose earlier backend commit failed (`failedHere`) or that are already quarantined are left out of the apply
+for every Tx, voter or not, and reported; only a commit voter re-quarantines the latter. Skipped objects of a non-voter
+are reported only.
+
 A quarantined object votes abort for every transaction (`ObjectQuarantined`); committed transactions apply nothing to
-it and report it. The store has its host verify it (`QuarantineVerifier` -> `RepairService.verifyObject` ->
-`StoreRepairer.verifyObject`, bounded by `VerifyDeadline`), and it clears once the store's copy is complete against a
-read at least as new as the quarantining transaction's start: what repair requires before dropping an ErrorTree entry
-for it. Retries back off from 1 to `MaxQuarantineRetryInterval` (60) heartbeats. The quarantine is in memory only;
-the quarantining Tx's CRL state, object data included, is kept until it clears (`concludeTransactionState` defers a
-finalization or stub to `verificationComplete`), so a reloaded store quarantines again.
+it and report it. Repair is not held off it, unlike `failedCommits`. The store has its host verify it
+(`QuarantineVerifier` -> `RepairService.verifyObject` -> `StoreRepairer.verifyObject`, bounded by
+`RepairService.VerifyDeadline`, 30 s), and it clears once the store's copy is complete against a read whose object
+timestamp is at least the quarantining transaction's start (`minTimestamp`): what repair requires before dropping an
+ErrorTree entry for it. A later quarantining transaction with a later start raises `minTimestamp` and starts a new
+verification; an answer to an older attempt is ignored. A failed, stale or deferred verification is retried at store
+heartbeat (`retryQuarantineVerifications`) after 1 heartbeat, doubling to `MaxQuarantineRetryInterval` (60). The
+quarantine is in memory only; the quarantining Tx's CRL state, object data included, is kept until it clears
+(`allObjectCommitsComplete` keeps the object data, `concludeTransactionState` defers a finalization or stub to
+`verificationComplete` through `quarantinedConclusions`, and `expireStubs` keeps a stub of such a transaction). A
+reloaded store recovers that state, but quarantines again only if the recovered vote re-applies, which it does on a
+non-late outcome or a found UnackedCommits entry; its store sent `TxCommitted`, so it has no entry, and on a late
+outcome it applies nothing and the quarantine is lost (Q-W5).
 
 A recovered commit vote whose object fails to load with anything but `ObjectNotFound` fail-stops the store
 (`Tx.objectLoadFailed`), because a later load could succeed and find no lock. On a write-frozen store
@@ -514,7 +544,9 @@ through the same `releaseObjects`.
 
 A non-voter that applies a revision-chained update after a later unrelated update raised the object's timestamp
 (a refcount change or blind Insert with a later start) fails `ObjectTimestampError` at the re-check, skips and is
-repaired. The same order at a commit voter quarantines the object (8.5). A re-applied `DoesNotExist` or blind Insert whose key a later
+repaired. The same order at a commit voter quarantines the object (8.5). Repair restores T only while a read threshold
+of stores holds it; when the later write's voters included stores that lacked T, the stores that skipped T can reach
+the read threshold and T is lost (Q-W4). A re-applied `DoesNotExist` or blind Insert whose key a later
 transaction deleted is quarantined rather than applied (10.5c), so it never writes the key back.
 
 ### 9.4 Deletion and allocation
@@ -593,15 +625,18 @@ device is rebuilt and its votes are lost (systemic-loss-protection.md, rebuild-p
 
 ### 10.5 Recovered transactions re-acquiring locks
 
-(a) Two recovered commit votes that conflict can coexist: A committed, applied and persisted; B, built on A, voted
-after A's commit persisted (R9); A's CRL state stays until its `TxFinalized`. Both re-take their locks in load-completion order, which is not controlled (CRL record order
-is no guide either: a re-save of A moves it). Whichever takes a shared slot second displaces the first, which keeps
-its hold (section 3), so A's release at its resolution leaves B locked, whichever order they loaded in. A's re-check
-fails where its update was chained (a revision, refcount or checked key requirement): `appliedBy` then finds the
-update applied, so it neither applies nor quarantines. A blind key write (an Insert with `MayExist` or no requirement
-on its key) passes its re-check and applies again: its Insert ties with the entry it wrote (`insertWins`), and the
-`ValueState` it installs keeps the key's lock (`RequirementsApplyer.apply`), so B stays locked. A key Delete is never
-blind, so its re-check fails once applied and it never removes a key under B.
+(a) Two recovered commit votes that conflict can coexist: A committed, applied and persisted; B, built on A, voted after
+A's commit persisted (R9); A's CRL state stays until its `TxFinalized`. Both re-take their locks in load-completion
+order, which is not controlled (CRL record order is no guide either: a re-save of A moves it). Whichever takes a shared
+slot second displaces the first, which keeps its hold (section 3), so A's release at its resolution leaves B locked,
+whichever order they loaded in. A re-applies only on a non-late outcome or a found UnackedCommits entry; a late commit
+with no entry applies nothing (lateCommit, transaction-recovery.md). When it does re-apply, its re-check fails where its
+update was chained (a revision, refcount or checked key requirement). Where the update leaves a trace (2.3) `appliedBy`
+finds it applied, so it neither applies nor quarantines; a traceless one (a `RefcountUpdate` alone, a KV update that
+only deletes keys, or one whose Inserts were all superseded) is quarantined until verified (Q-W6). A blind key write (an
+Insert with `MayExist` or no requirement on its key) passes its re-check and applies again: its Insert ties with the
+entry it wrote (`insertWins`), and the `ValueState` it installs keeps the key's lock (`RequirementsApplyer.apply`), so B
+stays locked. A key Delete is never blind, so its re-check fails once applied and it never removes a key under B.
 
 (b) A recovered commit vote whose object data the CRL no longer holds (a re-save after `persistWithoutUpdateOf`) has a
 missing update: `MissingObjectUpdate` at the re-check, and the allocation rule of 8.5 applies.
@@ -690,4 +725,114 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
 
 ## Open weaknesses
 
-None.
+### Q-W4. A commit voter that applies a later commit first loses its update (CONFIRMED; lost committed update)
+Mechanism: a committed apply ignores other transactions' locks (`RequirementsChecker.check` with `applying = true`),
+but the re-check still enforces the object-timestamp half of `checkRevision` (and of the KV `requiredRevision` check
+in `checkKVRequirements`): object timestamp <= T's start. A committed T2 that does not require T's revision, started
+after T, can reach a commit voter S of T before T's outcome does, apply over T's X lock and raise the object
+timestamp past T's start; T's re-check at S then fails with `ObjectTimestampError` and `Tx.issueCommits` quarantines
+the object, applying nothing. A store that never voted for T and lacked it when T2 voted does the same and skips.
+The read then picks the revision by count alone (`client/internal/read/BaseObjectReader.getStoreStates`), and the
+quarantine verification and ErrorTree repair accept any read whose object timestamp is at least T's start
+(`StoreRepairer.repairUpdate`), which T2's timestamp satisfies. Neither the read nor the verification excludes a
+quarantined copy (nothing outside the vote path consults `Frontend.isQuarantined`), so the verification of S counts
+S's own unverified copy among the `r`. A data copy is then installed from a read of equal timestamp and a different
+revision (`Reconcile.planData`), which turns the stale majority into an overwrite of the store holding T.
+Trigger / scenario: Replication(3, 2), so `t = r = 2`. T (a `DataUpdate` at revision r0, or a KV update with a
+required revision) gets commit votes from S and A; B lags and has not applied T. A applies T. T2 (a
+`RefcountUpdate`, a key-level KV write, or one of repair's refcount and key proofs, `RepairProofs.proveRefcount` and
+`proveKey`, all started later) gets commit votes from B (no lock there, still r0) and from
+A (after T applied); S collides on T's lock and votes abort, but T2 commits. T's `TxResolved` to S is lost or delayed
+and T2's reaches S first: S applies T2 at r0 with T2's timestamp, then quarantines on T's re-check. B skips T on the
+same check. S and B now agree on r0, A alone holds T. Every read returns r0 (two of three); the verification of S's
+quarantine and the ErrorTree repair of S and B find their copies complete against it and clear; the next transaction
+built on r0 gets commit votes from S and B, A fails it and is repaired to it.
+Consequence: a committed update is lost permanently (A's copy is overwritten by repair), with no error beyond the
+quarantine log. The order-independence claims of R7 and 9.3 fail for this order: the timestamp check makes "T2 then
+T" unapplicable while "T then T2" (A's order) applies both.
+Scope. Narrower than "every T": T must be revision-chained at object level (`DataUpdate`, `VersionBump`, a KV update
+with a required revision); a `KeyRevision` requirement checks the key's own timestamp, which a T2 on another key does
+not move, and a T2 on the same key collides. With `t > r` it needs `r` stores lacking T, so more than one such
+reordering. Broader than chance coincidence: repair attempts its refcount and key proofs exactly while an object
+stays locked across passes (`proofAfterDeferrals`), so where the lock is a commit vote of a T applied at some stores
+and not yet resolved at the holder, the proof is the T2, aimed at the state this weakness needs. No store failure is
+needed, only message reordering.
+Suggested fix: make a commit voter apply in its lock order. A committed transaction whose apply at a store conflicts
+(section 4 matrix) with locks another Tx holds for an unresolved commit vote waits to apply until that holder resolves
+and has applied or aborted: if the holder commits, a store in both write quorums held its lock until it applied,
+then voted for the newcomer, so the holder precedes it in every serial order. The holder's own commit must not then
+queue behind the waiting one (`holdForTurn` counts `heldCommits`), or the two deadlock. A non-voter needs nothing: at
+most `w - t` stores lack T that way. Dropping the timestamp test at apply instead is not enough: a KV update with a
+required revision may delete a key a later blind Insert writes, and applied in the other order the stores diverge.
+The wait needs a way out for a holder that never resolves: an undecidable T (`ExpiryTally` rule G) holds its Tx, locks
+and CRL state indefinitely, and a waiting T2 would hold its own commit, CRL state and admission at that store as long;
+once the holder is past expiry and undecided, the waiting commit should apply and quarantine T's object as today, which
+is safe there because T cannot be applied anywhere until decided.
+Effort: M   Priority: 1
+
+### Q-W5. State kept for a quarantine gets no UnackedCommits entry, so a reload drops the quarantine (CONFIRMED; quarantine persistence)
+Mechanism: `Frontend.quarantine` is in memory only; its durability rests on keeping the quarantining Tx's CRL state
+(`concludeTransactionState` -> `quarantinedConclusions`) for a reload to replay. But the store sent `TxCommitted`
+naming the object (`objectCommitErrors`, `Tx.issueCommits`), and `MissedUpdateFinalizationAction.writeMissedUpdates`
+gives any store with a `TxCommitted` no UnackedCommits entry (`commitErrors.contains(storeId)`). The kept state
+carries the status it was last saved with, normally `Unresolved` (`Tx.resolved` saves nothing). After a reload the
+recovered commit vote re-takes its locks, looks up its entry (absent), and learns the outcome as a late commit from the
+peers' status-cache relay or expiry adoption: `Tx.lateCommit` -> lookup -> `unackedCommitAbsent` -> `applyNothing`,
+which unlocks, never re-applies (`issueCommits` is not reached) and lets `concludeTransactionState` delete the state,
+since the new Frontend holds no quarantine. Past the horizon expiry discards it after the same lookup. The same missing
+entry affects state kept for a failed backend commit: transaction-recovery.md R-W4. The texts that claim a reload
+re-quarantines are listed in transaction-recovery.md R-W7.
+Trigger / scenario: S quarantines object o for T at apply (8.5), or a re-apply quarantines it for a key it may write
+back (`mayReinsertDeletedKeys`, 10.5c). T's `TxFinalized` reaches S and its state is kept for the quarantine; the
+verification has not completed (the object is unreadable for a while, or repair defers on locks). S's host or store
+restarts, or the store is transferred, before it does. The recovered Tx learns T late and concludes with nothing
+applied: o is served and votes again from a copy that may lack T, although S's vote counted.
+Consequence: o backs commit votes before it is verified, and a re-apply quarantine whose copy lacked T loses that
+copy's replay (the ErrorTree mark from the report remains, so repair restores T while `r` stores hold it). A stale
+transaction can gain from the dropped quarantine only if some store that voted for the later commit causing it also
+lacked T, which is Q-W4's scenario, where T is lost anyway; for the other causes the later commit's voters hold T, so
+at most `w - t` stores lack it, S included.
+Suggested fix (shared with transaction-recovery.md R-W4): `TxCommitted` carries a flag saying the store keeps T's state
+for replay (a quarantine or a failed backend commit), and the marker writes an UnackedCommits entry for a counted voter
+that sets it. The recovered vote then finds the entry, re-applies through it (`appliesThroughEntry`), and quarantines
+again. Re-saving the kept state as `TransactionStatus.Committed` instead is not a fix: a restored `Committed` status
+seeds the host status cache with a non-finalized `Committed` for a T every peer may have forgotten (the `Tx`
+constructor's `statusCache.updateStatus`), so the status-cache relay answers prepares for T non-late and finalization
+re-runs, the defect transaction-recovery.md R-W5 describes for tree-learned resolutions.
+Effort: M   Priority: 5
+
+### Q-W6. A re-applied traceless update quarantines an object that already holds it (CONFIRMED; spurious quarantine)
+Mechanism: `Tx.issueCommits` excludes from quarantine only skipped objects in `RequirementsApplyer.appliedBy`, which
+recognizes revision traces and key revisions. A re-apply (a recovered commit vote on a non-late outcome, or one
+applying through its UnackedCommits entry) of a `RefcountUpdate` alone fails its re-check with `RefcountMismatch`
+once applied, and a KV update that only deletes keys fails with `KeyExistenceError` (its `KeyRevision` names a key it
+removed). Neither leaves a trace, so the object lands in `invalidated` and is quarantined.
+Trigger / scenario: a store crashes after the backend commit of such an update and before its `TxFinalized`, while
+the driver is still finalizing (the missed-update finalizer waits `errorTimeout`, so the window is seconds); on reload
+the recovered vote receives the non-late outcome and re-applies. TKVL key deletes and refcount decrements are common.
+Consequence: every transaction on the object votes abort until a verification completes, and the store reports the
+object, so the finalizer marks it for repair. No safety loss; a liveness and repair-load cost after every such
+crash, plus an error-level quarantine log that looks like an invariant violation.
+Suggested fix: in the re-apply's already-applied test (not in `appliedBy`, which proofs use), count a
+`RefcountUpdate` as applied when the object's refcount equals its `newRefcount`: for a committed transaction the
+update serial makes that state unique. Delete-only updates could be counted applied when every deleted key is absent
+and the object timestamp is at least T's start, or accepted as a cost.
+Effort: S   Priority: 5
+
+### Q-W8. Documentation of quarantine causes and two scaladoc errors (CONFIRMED; documentation)
+Mechanism: (a) the block comment in `Tx.issueCommits` and the Fail-stop bullet of `server/store/CLAUDE.md` give a
+fence takeover, an allocator's follow-up write and a repair proof as causes of a changed object's failed re-check,
+which quarantines it. The first two, and repair's object-level proof (an `ExclusiveRevisionLock`), are later commits
+applied over a lock-only requirement (`SharedRevisionLock`, `ExclusiveRevisionLock`), which is only skipped and
+reported. Repair's refcount and key proofs are changed-object causes (they raise the object timestamp, Q-W4), and the
+comment does not say which proof it means. (b) The same comment says "a rebuilt store's inherited
+votes keep a lost vote's lock, so that is no longer a cause": history wording, and inaccurate, since a rebuilt store
+holds no locks for its inherited votes but votes abort on their objects (`Frontend.inheritedVoteLock`). (c) In
+`KVObjectState`, the scaladoc of `allocationSliceSize` sits above `EmptyEncodedSize`, which then carries two scaladoc
+blocks, and `allocationSliceSize` none.
+Trigger / scenario: reading the code or the module guide.
+Consequence: a reader misjudges which skips are quarantines.
+Suggested fix: list only changed-object causes (a later refcount or key-level write raising the object timestamp,
+repair's refcount and key proofs included, a deletion, a discard, a superseded or traceless re-apply) for quarantine, and the lock-only causes under the lock-only
+skip; describe inherited votes as abort votes; move the orphaned scaladoc onto `allocationSliceSize`.
+Effort: S   Priority: 7

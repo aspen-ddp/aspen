@@ -1135,9 +1135,13 @@ class Tx( trs: TransactionRecoveryState,
     }
 
     // Skipped because they already show this transaction's update (see proveCommitted): applied, though not by this
-    // commit. Only skipped objects are looked at, so a commit applied normally pays nothing for this
-    val alreadyApplied = RequirementsApplyer.appliedBy(transactionId, requirements,
-      objects.filter((oid, _) => result.skipped.contains(oid) && !notApplied.contains(oid)), allocatedOver)
+    // commit. Only skipped objects are looked at, so a commit applied normally pays nothing for this. A re-apply also
+    // recognizes a traceless update (a refcount, key deletes) from the state it leaves (reappliedTraceless)
+    val skippedObjects = objects.filter((oid, _) => result.skipped.contains(oid) && !notApplied.contains(oid))
+    val alreadyApplied = RequirementsApplyer.appliedBy(transactionId, requirements, skippedObjects, allocatedOver) ++
+      (if reapply then RequirementsApplyer.reappliedTraceless(transactionId, txd.startTimestamp, requirements,
+        skippedObjects, ou)
+      else Set[ObjectId]())
     if alreadyApplied.nonEmpty then
       logger.info(s"Tx $transactionId. Store $storeId already holds the committed update of objects $alreadyApplied")
 

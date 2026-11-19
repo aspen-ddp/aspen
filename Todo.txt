@@ -57,12 +57,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.2  Q-W6  A re-applied traceless update quarantines an object that already holds it. CONFIRMED, S.
-     Affects a RefcountUpdate alone, and delete-only KV updates, on a recovered non-late re-apply or an apply
-     through an UnackedCommits entry. appliedBy finds no trace, so an ordinary crash quarantines the object; TKVL
-     deletes and refcount decrements are common. Fix: in the re-apply check only, treat refcount == newRefcount (and
-     the keys already gone) as applied.
-
 5.3  RP-W4  A quarantine of a deleted object never clears. CONFIRMED, S.
      Covers the quarantine-side trigger in transaction-requirements.md 8.5 too.
      StoreRepairer.verifyObject does not treat InvalidObject(provesDeletion) as verified, so verification retries

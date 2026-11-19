@@ -478,13 +478,20 @@ the re-check after the wait only costs time.
 `Tx.issueCommits`, for a commit voter (`disposition == VoteCommit`):
 
 * an apply that threw (`result.failed`) fail-stops the store (`Frontend.failStop`): its in-memory state is corrupt;
-* otherwise, live or recovered, the voter's skipped changed objects, except those already applied (`appliedBy`) and
-  allocations the backend missed (`allocatedHere`), are quarantined (`Frontend.quarantine`), and an already quarantined
+* otherwise, live or recovered, the voter's skipped changed objects, except those already applied (`appliedBy`, and
+  for a re-apply `reappliedTraceless`) and allocations the backend missed (`allocatedHere`), are quarantined (`Frontend.quarantine`), and an already quarantined
   changed object is quarantined by this vote too. A committed write that does not depend on T, a deletion included,
   never applies over T's locks before T: it waits for T's vote in lock order (8.3, R15). So for a live voter the causes
   left are a state discarded under the locks (`Frontend.discard`, `StaleObjectState`) and two conflicting commits,
   which the quorum overlap excludes; the store cannot tell them apart. For a re-apply, the store may also have applied the update before the crash and had it superseded
-  (section 10.5a), or applied it and left no trace `appliedBy` recognizes (Q-W6). The vote counts with neither its lock
+  (section 10.5a). A traceless update it applied before the crash (a `RefcountUpdate`, a KV update without a required
+  revision whose operations are all key Deletes) leaves no trace for `appliedBy`, so a re-apply recognizes it from the
+  state it leaves (`RequirementsApplyer.reappliedTraceless`): every change it makes to the object holds (the refcount
+  equals its `newRefcount`, every deleted key is absent) and the object's timestamp is at least T's start. The store
+  held T's required refcount and keys when it voted, and only T's apply, or a write after it in lock order (8.3),
+  changes them, so such a state includes T's update. Proofs never use this rule: a store that never voted on T has no
+  such bound. A traceless update a later write changed again (a refcount updated since, an Insert superseded) is not
+  recognized and is quarantined as a superseded one is. The vote counts with neither its lock
   nor its update, so the object backs no commit vote until verified; it is reported, so the finalizer marks the store. A
   live voter logs it at error level, naming the transaction each object now shows; a recovered one logs only the
   per-object warning;
@@ -644,8 +651,9 @@ slot second displaces the first, which keeps its hold (section 3), so A's releas
 whichever order they loaded in. A re-applies only on a non-late outcome or a found UnackedCommits entry; a late commit
 with no entry applies nothing (lateCommit, transaction-recovery.md). When it does re-apply, its re-check fails where its
 update was chained (a revision, refcount or checked key requirement). Where the update leaves a trace (2.3) `appliedBy`
-finds it applied, so it neither applies nor quarantines; a traceless one (a `RefcountUpdate` alone, a KV update that
-only deletes keys, or one whose Inserts were all superseded) is quarantined until verified (Q-W6). A blind key write (an
+finds it applied, so it neither applies nor quarantines. A traceless one (a `RefcountUpdate`, a KV update that only
+deletes keys) is found applied from the state it leaves (`reappliedTraceless`, 8.5); one whose Inserts were all
+superseded, or whose refcount a later update changed, is quarantined until verified. A blind key write (an
 Insert with `MayExist` or no requirement on its key) passes its re-check and applies again: its Insert ties with the
 entry it wrote (`insertWins`), and the `ValueState` it installs keeps the key's lock (`RequirementsApplyer.apply`), so B
 stays locked. A key Delete is never blind, so its re-check fails once applied and it never removes a key under B.
@@ -740,24 +748,6 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
   transaction's lifetime than the write threshold's margin covers, and is alarmed; there is no way out of the wait.
 
 ## Open weaknesses
-
-### Q-W6. A re-applied traceless update quarantines an object that already holds it (CONFIRMED; spurious quarantine)
-Mechanism: `Tx.issueCommits` excludes from quarantine only skipped objects in `RequirementsApplyer.appliedBy`, which
-recognizes revision traces and key revisions. A re-apply (a recovered commit vote on a non-late outcome, or one
-applying through its UnackedCommits entry) of a `RefcountUpdate` alone fails its re-check with `RefcountMismatch`
-once applied, and a KV update that only deletes keys fails with `KeyExistenceError` (its `KeyRevision` names a key it
-removed). Neither leaves a trace, so the object lands in `invalidated` and is quarantined.
-Trigger / scenario: a store crashes after the backend commit of such an update and before its `TxFinalized`, while
-the driver is still finalizing (the missed-update finalizer waits `errorTimeout`, so the window is seconds); on reload
-the recovered vote receives the non-late outcome and re-applies. TKVL key deletes and refcount decrements are common.
-Consequence: every transaction on the object votes abort until a verification completes, and the store reports the
-object, so the finalizer marks it for repair. No safety loss; a liveness and repair-load cost after every such
-crash, plus an error-level quarantine log that looks like an invariant violation.
-Suggested fix: in the re-apply's already-applied test (not in `appliedBy`, which proofs use), count a
-`RefcountUpdate` as applied when the object's refcount equals its `newRefcount`: for a committed transaction the
-update serial makes that state unique. Delete-only updates could be counted applied when every deleted key is absent
-and the object timestamp is at least T's start, or accepted as a cost.
-Effort: S   Priority: 5
 
 ### Q-W8. An orphaned scaladoc in KVObjectState (CONFIRMED; documentation)
 Mechanism: in `KVObjectState`, the scaladoc of `allocationSliceSize` sits above `EmptyEncodedSize`, which then carries

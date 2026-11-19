@@ -2786,6 +2786,60 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.isQuarantined(oid1) shouldBe true
   }
 
+  // A traceless update (a RefcountUpdate, a KV update that only deletes keys) applied before the crash fails its re-check
+  // when its recovered vote re-applies it, and leaves nothing appliedBy recognizes. The re-apply finds it applied from
+  // the state it leaves instead: the store held the required state when it voted, and only this update, or one after
+  // it in lock order, changes it (transaction-requirements.md 8.5)
+
+  /** A recovered commit vote of `reqs` on a store holding `stored` as `stamp` leaves it, resolved committed (not late).
+    * Returns whether its object was quarantined
+    */
+  def reappliedTraceless(reqs: List[TransactionRequirement], stored: ObjectState,
+                         updates: List[ObjectUpdate] = Nil,
+                         stamp: TransactionDescription => HLCTimestamp = _.startTimestamp): (Boolean, List[ObjectId]) =
+    val txd = lockTxd(txid1, reqs)
+    stored.metadata = stored.metadata.copy(timestamp = stamp(txd))
+    val (frontend, net, stops) = recoveredVote(stored, txd = txd, updates = updates, verifier = new ManualVerifier)
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false,
+      proof = false))
+    stops() shouldBe Nil
+    (frontend.isQuarantined(stored.objectId), committedMessages(net).flatMap(_.objectCommitErrors))
+
+  test("a re-applied refcount update the store already holds does not quarantine the object (Q-W6)") {
+    val applied = mkObjectState(oid1)
+    applied.metadata = applied.metadata.copy(refcount = ObjectRefcount(2, 2))
+    reappliedTraceless(List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 2))), applied) shouldBe
+      (false, Nil)
+
+    // A later refcount update superseded it: the store cannot tell that from a state changed under the lock
+    val superseded = mkObjectState(oid1)
+    superseded.metadata = superseded.metadata.copy(refcount = ObjectRefcount(3, 3))
+    reappliedTraceless(List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 2))), superseded) shouldBe
+      (true, List(oid1))
+  }
+
+  test("a re-applied deletion the store already holds does not quarantine the deleted object (Q-W6)") {
+    val deleted = mkObjectState(oid1)
+    deleted.metadata = deleted.metadata.copy(refcount = ObjectRefcount(2, 0))
+    reappliedTraceless(List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 0))), deleted) shouldBe
+      (false, Nil)
+  }
+
+  test("a re-applied key deletion the store already holds does not quarantine the object (Q-W6)") {
+    def withoutK2(): ObjectState =
+      val s = mkKVObjectState()
+      val kvs = KVObjectState.decode(s.data)
+      s.data = KVObjectState.encode(kvs.min, kvs.max, kvs.left, kvs.right, kvs.content - k(2))
+      s
+    val deleteK2 = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(2), rev0)), deletesKeys = true,
+      pinned = true)
+    val update = List(ObjectUpdate(oid2, KeyValueOperation.encode(List(new Delete(k(2))), ida)(0)))
+    reappliedTraceless(List(deleteK2), withoutK2(), update) shouldBe (false, Nil)
+
+    // An object no update since the vote has reached is not taken as applied
+    reappliedTraceless(List(deleteK2), withoutK2(), update, stamp = _ => HLCTimestamp(1)) shouldBe (true, List(oid2))
+  }
+
   test("a commit vote recovered with a persisted Committed status applies its update on load (R-F6)") {
     val crl = new TestCrl
     val (frontend, net, stops) = recoveredVote(mkObjectState(oid1), status = TransactionStatus.Committed, crl = crl)

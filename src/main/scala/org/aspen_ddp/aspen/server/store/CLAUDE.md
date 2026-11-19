@@ -182,7 +182,10 @@
 - Quarantine (`Frontend.quarantine`, transaction-requirements.md 8.5): a commit vote whose apply re-check fails may have
   been invalidated under its locks, met a conflicting commit, or, if recovered, been superseded before the crash
   (10.5a), and the store does not tell these apart. Each changed object it could not apply is quarantined,
-  except one the backend missed and the Tx allocates (`allocatedHere`: no copy, no lost lock; one whose data was dropped
+  except one already applied: `appliedBy` finds T's revision or key trace, and a re-apply also recognizes a traceless
+  update from the state it leaves (`RequirementsApplyer.reappliedTraceless`: refcount equal to `newRefcount`, a
+  delete-only KV update's keys absent, object timestamp at least T's start; re-apply only, never a proof), and one
+  the backend missed and the Tx allocates (`allocatedHere`: no copy, no lost lock; one whose data was dropped
   was applied and then deleted, which no read verifies), which is reported (transaction-requirements 8.5). Before the
   apply, a re-apply (recovered, or through an UnackedCommits entry: `Tx.appliesThroughEntry`) also leaves out and
   quarantines every object on which it would insert a key now absent while the object's timestamp is past T's start

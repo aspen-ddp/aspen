@@ -47,11 +47,6 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.2  SL-W5  A lost device CRL marks stores whose whole state is in their own save file. CONFIRMED, S.
-     openDeviceCrl marks every store directory, including those with a valid crl_save.log (an arrived transfer, a
-     transfer out's source, a rebuilt store kept offline). Fix: skip a directory whose save file validates, as
-     adoptionClass already does.
-
 3.3  CRL-W6  A loaded state is judged never to fit against the current limit, not the grown one. CONFIRMED, S.
      StoreLoader.neverFits compares against admission.limitBytes + T. A crl_save.log state that would fit after
      growth (up to crl-max-streams) is declared lost (crlSaveFileLost) and rebuilt. Fix: judge "never" against the

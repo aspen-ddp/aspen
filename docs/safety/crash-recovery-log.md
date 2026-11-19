@@ -314,8 +314,9 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
 - **Lost.** If `crl/` is absent from a device that holds stores (a child directory with a store `config`), or holds no
   stream files there (`openCRL` is passed `holdsStores` and throws `CrlMissing` before writing anything: stores exist
   only on a device whose CRL was opened, so a `crl/` emptied by hand, a file system repair or a partial restore is a
-  lost CRL, never a new one), or the open throws anything else, or a transient error a third time in a row: every such store directory gets a durable
-  `rebuild-required` marker, one by one; `crl/` is moved to `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the
+  lost CRL, never a new one), or the open throws anything else, or a transient error a third time in a row: every
+  such store directory gets a durable `rebuild-required` marker, one by one, except one whose `crl_save.log`
+  validates as its own (`DeviceDiscovery.holdsOwnState`), whose whole state is that file; `crl/` is moved to `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the
   device directory is forced and a fresh CRL is opened. `CrlCorrupt` is logged under its own cause. The reconcile then
   flips each store to Rebuilding. A device without stores simply has its CRL created.
 - **Failed.** A CRL whose thread dies (5.10) completes `failed`; `DeviceShutdown.crlFailed` disowns the directory,

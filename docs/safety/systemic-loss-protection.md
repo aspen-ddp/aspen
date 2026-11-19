@@ -93,7 +93,7 @@ These are facts about the current code. They define the problem; none of them is
   other hosts. The flip (`requestRebuild`) checks only that the device is not Failed, is owned by this host, and has
   the entry Active.
 * **S2 One decision can flag a whole device.** `DeviceDiscovery.openDeviceCrl` marks every store directory of a device
-  after one failed CRL open. A host restart reopens every device's CRL, so it can do this to every device of the host
+  after one failed CRL open, except one whose valid `crl_save.log` is its whole state (`holdsOwnState`). A host restart reopens every device's CRL, so it can do this to every device of the host
   in one event.
 * **S3 Pacing applies to rebuild work, per host.** `StoreRebuilds.startRebuild` admits a store only while
   `rebuildingStores.size + droppingCrlState.size < maxConcurrentRebuilds`. A store holds its slot from the start of
@@ -170,7 +170,7 @@ store directory and leaves the store offline.
 
 | ID | Trigger | Code | Immediate local effect | False positives |
 |---|---|---|---|---|
-| D1 | `<device>/crl` absent from, or without stream files on (`CrlMissing`), a device that holds store directories (directories directly under the device holding a store config) | `DeviceDiscovery.openDeviceCrl`, at every load of the device | marker on **every** store directory of the device, including one whose whole state is in a valid `crl_save.log` (SL-W5); an existing `crl/` renamed to `crl.lost-<uuid>`; fresh empty CRL created | a partial restore or mount (one that copies directories but not the large stream files included); a path or layout change in a release |
+| D1 | `<device>/crl` absent from, or without stream files on (`CrlMissing`), a device that holds store directories (directories directly under the device holding a store config) | `DeviceDiscovery.openDeviceCrl`, at every load of the device | marker on **every** store directory of the device except one whose `crl_save.log` validates as its own (`holdsOwnState`: an arrived transfer, a transfer out's source, a rebuilt store kept offline), which loads from that file over the fresh CRL as it would over the old one (`StoreLoader.awaitCrlLoad` drops its device-CRL entries and loads the file); an existing `crl/` renamed to `crl.lost-<uuid>`; fresh empty CRL created | a partial restore or mount (one that copies directories but not the large stream files included); a path or layout change in a release |
 | D2 | CRL open throws a non-transient error (`CrlCorrupt`, `BrokenEntryChain`, anything not `isTransient`), or a transient one on the `CrlOpenAttempts`th device scan in a row, on a device that holds stores | `DeviceDiscovery.openDeviceCrl` | as D1 | a CRL format or recovery change; a bug in the CRL writer that the next recovery rejects; a persistent I/O condition (EMFILE in a restart storm, a flaky controller) outlasting two scan periods (about 20 s; opens outside a scan do not count) |
 | D3 | `crl_save.log` present but `loadValidStoreState` rejects it (truncated, unparsable, another store's, any `Throwable`), or its state can never fit the device's CRL (`StoreLoader.neverFits`: a transaction above `maxTransactionBytes`, or the whole above the admission limit plus that bound) | `StoreLoader.handleLoad` then `StoreRebuilds.crlSaveFileLost`/`retireUnserved` | closed unserved, marked, offline, device checked | a save-file format change: every store whose directory holds a save file; a transient read error; a change to `CrlAdmission.recoveredBytes` or the CRL bounds in a release (never-fits); a transfer onto a device with a smaller CRL (Backlog, "Transfers do not check the destination's CRL room"). A crash between the save and `deleteTransactions` leaves the same entries in the device CRL, and the retire saves those beside the file (`lost-crl-entries.log`). A state that does not fit *yet* is not declared: the store waits offline, retried at each device scan |
 | D4 | Adoption: an Offline or Active store whose directory has `transferring-out` without a valid save file, or has `rebuild-required` | `DeviceDiscovery.adoptionClass` (`CrlLost`); `DeviceMetadata.adoptDevice` writes the marker in its prepare closure and the entry Rebuilding in the adoption transaction | adopted as Rebuilding | a save-file read path that fails on the adopting host's version; it inherits any false mark the previous host wrote. A marker left by an adoption transaction that does not commit states a fact about the disk and is harmless |
@@ -495,24 +495,6 @@ with its copies retained in `pending-delete/` or at their paths, and nothing to 
 ---
 
 ## Open weaknesses
-
-### SL-W5. A lost device CRL marks stores whose whole state is in their own save file (CONFIRMED; needless declaration)
-Mechanism: `DeviceDiscovery.openDeviceCrl` marks every store directory of the device (`storeDirs.foreach(
-ctx.rebuilds.markRebuildRequired)`) when the CRL is missing (D1) or fails to open (D2). A directory holding a valid
-`crl_save.log` keeps none of its state in the device CRL: the file is its whole state (`StoreLoader.awaitCrlLoad` drops
-the store's device-CRL entries and loads the file). Such directories are an arrived transfer not yet loaded
-(`transferred-in`), a transfer out's closed source (`transferring-out`), a rebuilt store kept offline
-(`StoreRebuilds.keepRebuiltStoreOffline`, empty save file), and an abandoned transfer out awaiting its load.
-`DeviceDiscovery.adoptionClass` already treats exactly these as Clean.
-Trigger / scenario: a transfer A->B completes its pool update; B's host crashes before loading the arrived copy, and
-B's CRL fails to open at restart (or is missing). The arrived copy is marked; once its entry is Active it is flipped to
-Rebuilding and rebuilt, while A's source copy is released because B is Active.
-Consequence: a store that is whole is taken out of service and rebuilt; in a correlated CRL event (SC1, SC2) every such
-store adds to `d` for its pool. The state is retained (`lost-crl-state.log` is the renamed save file), so it is
-reinstatable by hand (4.5).
-Suggested fix: in `openDeviceCrl`, skip a store directory whose `crl_save.log` passes `loadValidStoreState` and that
-carries no `rebuild-required`; it loads from its file over the fresh CRL as it would over the old one.
-Effort: S   Priority: 3
 
 ### SL-W8. Documentation outside docs/safety misstates declaration paths (CONFIRMED; documentation)
 Mechanism / errors:

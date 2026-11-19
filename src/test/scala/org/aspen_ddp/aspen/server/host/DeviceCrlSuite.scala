@@ -640,9 +640,9 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       factory.opened.size should be(2)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened(1)
 
-  private def writeStoreDir(deviceDir: os.Path): os.Path =
-    val storeDir = deviceDir / storeId.directoryName
-    DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
+  private def writeStoreDir(deviceDir: os.Path, sid: StoreId = storeId): os.Path =
+    val storeDir = deviceDir / sid.directoryName
+    DefaultBackendOpener.createStore(StoreConfig(sid, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
       storeDir / os.up / StoreCreation.CreatingDirectory)
     storeDir
 
@@ -701,6 +701,36 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
       calls.get should be(2)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
+
+  atest("a lost device CRL does not mark a store whose valid save file holds its whole state"):
+    given ExecutionContext = executionContext
+    val inner = newFactory()
+    val calls = new AtomicInteger(0)
+    val corruptFirst = new CrashRecoveryLogFactory:
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
+        if calls.incrementAndGet() == 1 then
+          throw CrlCorrupt("corrupt")
+        inner.openCRL(devicePath, config, holdsStores)
+    for
+      (hostRoot, deviceDir, saved) <- activeStoreDevice()
+      // Its state is in its own save file (an arrived transfer, a transfer out's source, a rebuilt store kept offline)
+      _ = CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState(), Backend.crlSaveFile(saved))
+      // Its state was in the device CRL
+      inCrl = writeStoreDir(deviceDir, StoreId(poolId, 1.toByte))
+      // A save file that is not its own is no state of its own
+      foreign = writeStoreDir(deviceDir, StoreId(poolId, 2.toByte))
+      _ = CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState(), Backend.crlSaveFile(foreign))
+      host = newCrlHost(hostRoot, corruptFirst)
+      lost = os.list(deviceDir).count(_.last.startsWith("crl.lost-"))
+      markers = List(saved, inCrl, foreign).map(dir => os.exists(marker(dir)))
+      // It loads from its file over the fresh CRL, as it would have over the old one. The file goes once its state
+      // is in the CRL
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId) && !os.exists(Backend.crlSaveFile(saved)))
+    yield
+      lost should be(1)
+      markers should be(List(false, true, true))
+      host.control.router.loaded.contains(storeId) should be(true)
+      os.exists(Backend.crlSaveFile(saved)) should be(false)
 
   /** A device holding a store whose CRL opens fail with an I/O error the first `failures` times */
   private def transientlyFailingCrlDevice(failures: Int): (os.Path, os.Path, RecordingCrlFactory, AtomicInteger, Host) =

@@ -534,9 +534,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   /** Opens the device's CRL. It is lost when its directory is absent from a device that holds stores, or holds no
    *  stream files there (CrlMissing: stores exist only on a device whose CRL was opened), or when opening it throws
    *  anything but a transient error (DeviceDiscovery.isTransient) or a transient error on CrlOpenAttempts device
-   *  scans in a row (an open outside a scan neither counts nor declares; a success anywhere resets). The stores' transaction state was in it, so each is marked rebuild-required
-   *  (the reconcile pass turns them into rebuilds), the old directory is kept aside as `crl.lost-<uuid>`, and a fresh
-   *  CRL is opened. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
+   *  scans in a row (an open outside a scan neither counts nor declares; a success anywhere resets). The stores'
+   *  transaction state was in it, so each is marked rebuild-required (the reconcile pass turns them into rebuilds),
+   *  except one whose valid crl_save.log is its whole state (holdsOwnState). The old directory is kept aside as
+   *  `crl.lost-<uuid>`, and a fresh CRL is opened. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
    *  A corrupt CRL (CrlCorrupt) is lost too, logged under its own cause.
    *  A CRL another writer holds open (CrlLocked) is never lost: it is rethrown each time, uncounted.
    *  Nor is a CRL whose files do not match the sizing it recorded, or that holds a `.crl.tmp` that is no unfinished
@@ -609,11 +610,22 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
               case _ =>
                 logger.error(s"Failed to recover the CRL of storage device $devicePath. Its stores must be rebuilt: $t")
             true
-    storeDirs.foreach(ctx.rebuilds.markRebuildRequired)
+    storeDirs.filterNot(holdsOwnState).foreach(ctx.rebuilds.markRebuildRequired)
     if os.exists(crlDir) then
       DurableFiles.move(crlDir, devicePath / s"crl.lost-${UUID.randomUUID()}")
     // A fresh CRL: the stores now marked recover nothing from it
     ctx.crlFactory.openCRL(devicePath, sdCfg, holdsStores = false)
+
+  /** Whether the store directory `storeDir` holds its whole transaction state in its own crl_save.log, which
+   *  validates as that store's (an arrived transfer, a transfer out's source, a rebuilt store kept offline). Its load
+   *  drops whatever the device CRL holds for it and loads the file (StoreLoader.awaitCrlLoad), so losing the device
+   *  CRL loses nothing of its. A directory whose config cannot be read, or whose file is missing, cut short or another
+   *  store's, does not. */
+  private def holdsOwnState(storeDir: os.Path): Boolean =
+    val saveFile = Backend.crlSaveFile(storeDir)
+    os.exists(saveFile) &&
+      Try(StoreConfig.loadStoreConfig(storeDir / StoreConfig.configFilename).storeId).toOption.exists: storeId =>
+        CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
 
   /** The load half of tryLoadDevice, run only once the device is known to be ours. */
   private def loadOwnedDevice(storageDevicePath: os.Path,

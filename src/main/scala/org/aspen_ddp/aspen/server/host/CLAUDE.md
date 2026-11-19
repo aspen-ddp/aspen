@@ -125,8 +125,10 @@
   failure, since the source still holds the state
 - A lost device CRL does the same to every store on the device: if `<device>/crl` is absent from a device holding store
   dirs, or holds no stream files there (`openCRL(..., holdsStores = true)` throws `CrlMissing`: a device's stores exist
-  only once its CRL was opened, so an emptied `crl/` is never taken as a new CRL), or `openCRL` throws (a corrupt CRL, `CrlCorrupt`, is logged as such), each store dir gets `rebuild-required`, the old directory is kept as `crl.lost-<uuid>`, and
-  a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`). A CRL another writer holds open (`CrlLocked`) is never
+  only once its CRL was opened, so an emptied `crl/` is never taken as a new CRL), or `openCRL` throws (a corrupt
+  CRL, `CrlCorrupt`, is logged as such), each store dir gets `rebuild-required` except one whose `crl_save.log`
+  validates as its own (`holdsOwnState`: its whole state is the file, which its load uses over any CRL), the old
+  directory is kept as `crl.lost-<uuid>`, and a fresh CRL is opened (`DeviceDiscovery.openDeviceCrl`). A CRL another writer holds open (`CrlLocked`) is never
   lost: the device stays unloaded and each scan retries. Nor is a CRL whose files disagree with its recorded sizing
   (`CrlSizingMismatch`), nor a `crl/` holding no CRL yet whose device config cannot size one (`CrlConfigInvalid`):
   the device is refused, an error is logged once, and each scan retries. A transient error (I/O or VM error,

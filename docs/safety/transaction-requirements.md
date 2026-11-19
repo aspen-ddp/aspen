@@ -520,7 +520,9 @@ it and report it. Repair is not held off it, unlike `failedCommits`. The store h
 (`QuarantineVerifier` -> `RepairService.verifyObject` -> `StoreRepairer.verifyObject`, bounded by
 `RepairService.VerifyDeadline`, 30 s), and it clears once the store's copy is complete against a read whose object
 timestamp is at least the quarantining transaction's start (`minTimestamp`): what repair requires before dropping an
-ErrorTree entry for it. A later quarantining transaction with a later start raises `minTimestamp` and starts a new
+ErrorTree entry for it, or once a read proves the object deleted (`InvalidObject.provesDeletion`, whether the deletion
+came before or after the quarantine): a deleted object takes no transaction, every requirement on it failing
+`MissingObject`, and the store's slice is dropped first, best effort. A later quarantining transaction with a later start raises `minTimestamp` and starts a new
 verification; an answer to an older attempt is ignored. A failed, stale or deferred verification is retried at store
 heartbeat (`retryQuarantineVerifications`) after 1 heartbeat, doubling to `MaxQuarantineRetryInterval` (60). The
 quarantine is in memory only; the quarantining Tx's CRL state, object data included, is kept until it clears

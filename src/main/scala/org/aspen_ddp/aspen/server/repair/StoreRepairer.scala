@@ -313,12 +313,27 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     * it as repairUpdate does for an entry whose update started at `minTimestamp`, with proofs after lock deferrals.
     * `complete` means the store's copy now matches a read no older than `minTimestamp`, exactly what an entry needs to
     * be dropped. No entry is read or deleted, so the scan fence and mayJoinTransaction do not apply: the reconcile is an
-    * ordinary repair install and changes only this copy
+    * ordinary repair install and changes only this copy.
+    *
+    * A read that proves the object deleted (InvalidObject.provesDeletion), whether before or after the quarantine,
+    * verifies it too: a deleted object takes no transaction, every requirement on it failing MissingObject. The
+    * store's slice is dropped first (repairDeletion), best effort: a refused or failed drop is left to entry repair,
+    * since a store holding a live copy of a deleted object missed the deletion and was marked for it
     */
   def verifyObject(storeId: StoreId, ptr: ObjectPointer, minTimestamp: HLCTimestamp, policy: RepairPolicy,
                    deferral: DeferralState): Future[ReconcileResult] =
-    repairUpdate(storeId, ptr, minTimestamp, StoreRepairer.verifyDeferralKey(ptr.id), policy, deferral,
-      allowProof = true)
+    val deferralKey = StoreRepairer.verifyDeferralKey(ptr.id)
+    repairUpdate(storeId, ptr, minTimestamp, deferralKey, policy, deferral, allowProof = true)
+      .recoverWith:
+        case e: InvalidObject if e.provesDeletion =>
+          logger.info(s"Quarantined object ${ptr.id} on $storeId is deleted: verified. Dropping the store's copy")
+          deferral.clear(deferralKey)
+          repairDeletion(storeId, ptr.id, ptr.storePointer)
+            .recover:
+              case err =>
+                logger.info(s"Dropping deleted object ${ptr.id} from $storeId failed: $err. Entry repair drops it")
+                false
+            .map(_ => ReconcileResult(Set(), objectLevelDeferred = false, stale = false))
 
   def sweepBootstrapTrees(storeId: StoreId, policy: RepairPolicy, deferral: DeferralState,
                           control: ScanControl = ScanControl()): Future[SweepResult] =

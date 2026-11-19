@@ -50,7 +50,9 @@
 - `StoreRepairer.verifyObject` (through `RepairService.verifyObject`, `VerifyDeadline` 30 s) verifies an object a
   store quarantined (`server/store/CLAUDE.md`, Quarantine): `repairUpdate` with the quarantining transaction's start as
   `minTimestamp`, proofs allowed, keyed `verifyDeferralKey` (prefix 3, kept by `DeferralState.retain`). It reads and
-  deletes no entry, so the ownership fence and `mayJoinTransaction` do not apply. `complete` clears the quarantine
+  deletes no entry, so the ownership fence and `mayJoinTransaction` do not apply. `complete` clears the quarantine.
+  A read proving the object deleted (`InvalidObject.provesDeletion`) is complete too: the store's slice is dropped
+  first (`repairDeletion`), best effort, a refused or failed drop being left to entry repair
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes since the last complete one, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it
 - A proof cannot help a `stale` pass (the store's own copy is busy or changed), so stale passes escalate by waiting

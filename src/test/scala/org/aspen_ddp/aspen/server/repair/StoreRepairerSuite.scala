@@ -1586,6 +1586,21 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       storeHasObject(1, kvPtr.id) shouldBe false
       withClue("repair removed the zombie: ")(storeHasObject(2, kvPtr.id) shouldBe false)
 
+  // A quarantined object deleted since needs no transaction to wait for: every requirement on it fails
+  // MissingObject, so a read proving the deletion verifies it, and the store's slice is dropped
+  test("verifying a quarantined object that a read proves deleted is complete and drops the store's copy"):
+    for
+      dataPtr <- sharedDataObject()
+      before <- client.read(dataPtr)
+      _ <- missedBy(2)(_.setRefcount(dataPtr, before.refcount, before.refcount.setCount(0)))
+      _ = withClue("store 2 missed the deletion: ")(storeHasObject(2, dataPtr.id) shouldBe true)
+      result <- pump(StoreRepairer(client, SeamTarget()).verifyObject(sid(2), dataPtr, before.timestamp,
+                  RepairPolicy.Default, DeferralState()), deadline())
+      _ <- settle()
+    yield
+      result.complete shouldBe true
+      withClue("the store's copy was dropped: ")(storeHasObject(2, dataPtr.id) shouldBe false)
+
   /** Writes the object's allocationTree entry back, standing in for a DeletionFinalizationAction that has yet to run:
     * the object is deleted, and only its record lingers
     */

@@ -216,8 +216,8 @@ including same-tier finalizers (TKVL split, join, tail removal): ordinary back-p
 transactions finalize upward. Data-only devices give up a quarter of their headroom (Backlog.txt).
 
 **State kept outside admission's turnover.** A transaction's CRL state kept for a failed backend commit or a
-quarantine stays charged for the life of the loaded store, or until the quarantine clears; a quarantine that never
-clears (a deleted object, RP-W4) holds it indefinitely.
+quarantine stays charged for the life of the loaded store, or until the quarantine clears (a quarantine of a deleted
+object clears on the read proving the deletion).
 
 **Repair backlog.** ErrorTree and UnackedCommits entries cost backend space in the metadata pools, not CRL bytes; an
 entry occupies CRL admission only while the batch writing it is in flight. The backlog drains one entry at a time per

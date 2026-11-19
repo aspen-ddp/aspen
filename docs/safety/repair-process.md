@@ -679,8 +679,11 @@ running in the background, as a scan does, and its result still records in the s
 out first (`ObjectReadTimeout`, 15 s). The quarantine lives in memory only: a reloaded store recovers the quarantining
 transaction from the CRL and quarantines again when the recovered vote re-applies (a non-late outcome or a found
 UnackedCommits entry); the quarantining store's `TxCommitted` sets `keptForReplay`, so it has an entry once T is
-finalized (transaction-requirements.md 8.5). A quarantined object that is deleted, before or after the quarantine, is never
-verified (RP-W4). The verification counts the store's own quarantined copy among the read's `r` replies, like any
+finalized (transaction-requirements.md 8.5). A quarantined object that a read proves deleted
+(`InvalidObject.provesDeletion`), before or after the quarantine, is verified by that read: a deleted object takes no
+transaction, every requirement on it failing `MissingObject`. The verification first drops the store's slice
+(`repairDeletion`), best effort: a refused or failed drop is left to entry repair, since a store holding a live copy of
+a deleted object missed the deletion and was marked for it. The verification counts the store's own quarantined copy among the read's `r` replies, like any
 other read: T's commit voters apply T before any later write over its locks (transaction-requirements.md 8.3), so a
 read majority holds T.
 
@@ -845,30 +848,6 @@ the quarantining store retries at heartbeat.
 ---
 
 ## 14. Open weaknesses
-
-### RP-W4. A quarantine of a deleted object never clears (CONFIRMED; resource leak)
-Mechanism: `StoreRepairer.verifyObject` is `repairUpdate`, whose `readObject` fails with
-`InvalidObject(provesDeletion = true)` for a deleted object; nothing handles it, so `RepairService.verifyObject`
-fails and `Frontend.verificationComplete` treats it as a failed verification, retried at heartbeat forever
-(`retryQuarantineVerifications`, at most every `MaxQuarantineRetryInterval` heartbeats).
-Trigger / scenario: two ways. (1) Deleted after the quarantine: S quarantines X (for example a TKVL node whose
-re-apply could write back a deleted key, `Tx` `mayReinsert`). The first verifications are deferred or stale (the node
-is hot). A join then deletes X: the deleting transaction commits without S (S votes abort, `ObjectQuarantined`), S is
-marked, and entry repair drops S's slice (`repairListed`/`repairAbsent`, which `deleteObjectForRepair` does not refuse
-for a quarantined object). (2) Deleted before T applied: T updates X at S and A (`w = 3`, `t = 2`); A and B apply T;
-T2 deletes X, voted at A and B; T2's outcome reaches S before T's, so T's held commit re-checks against refcount 0
-(`RequirementsChecker.loaded`, `MissingObject`) and X is quarantined (transaction-requirements.md 8.5). Either way
-every later verification reads `InvalidObject`.
-Consequence: the quarantine lasts until the store reloads. The quarantining transactions' CRL state, object data
-included (`quarantinedConclusions`), is kept for the life of the loaded store, holding CRL space and admission; a stub
-due for such a transaction is never written, or never dropped (`Frontend.expireStubs` keeps the stubs of transactions
-`quarantinedConclusions` names); a warning is logged at every retry; the verification's DeferralState key stays. The
-quarantine itself is harmless: every transaction on a deleted object fails anyway.
-Suggested fix: have `verifyObject` treat a read proving deletion as verified (a deleted object takes no transaction:
-every requirement on it fails `MissingObject`), optionally dropping the store's slice through `repairDeletion` first.
-That covers both triggers, and the cleared quarantine concludes the kept state and lets the stub be written and
-expire. Not quarantining an object already deleted at the apply would cover only trigger (2).
-Effort: S   Priority: 5
 
 ### RP-W5. Repair scaladoc and module guide errors (CONFIRMED; documentation)
 Mechanism: documentation outside docs/safety:

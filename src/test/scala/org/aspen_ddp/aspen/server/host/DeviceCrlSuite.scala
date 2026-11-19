@@ -69,8 +69,12 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
       case None => read
       case Some(gate) => read.flatMap(trs => gate.map(_ => trs)(using ExecutionContext.parasitic))(
         using ExecutionContext.parasitic)
+  /** While set, loadStore waits for it before saving the state */
+  @volatile var loadGate: Option[Future[Unit]] = None
   override def loadStore(storeId: StoreId, state: StoreRecoveryState): Future[Unit] =
-    inner.loadStore(storeId, state)
+    loadGate match
+      case None => inner.loadStore(storeId, state)
+      case Some(gate) => gate.flatMap(_ => inner.loadStore(storeId, state))(using ExecutionContext.parasitic)
   def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
     inner.save(txid, state, () => completions.execute(() => { completionHandler(); firstSave.trySuccess(()) }))
   def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit =
@@ -1788,6 +1792,59 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       heldBefore should be(Set(txid))
       leftInCrl should be(Set())
       heldOnDisk(deviceDir, storeId) should be(Set())
+
+  atest("a leftover drop releases only the charge it was issued for, not that of a store landing meanwhile"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val landedTx = TransactionId(new UUID(9, 6))
+    val landedState = StoreRecoveryState(List(recoveryState(storeId, landedTx, Array[Byte](1, 2, 3))))
+    val landedBytes = CrlAdmission.recoveredBytes(landedState)
+    val dropGate = Promise[Unit]()
+    val loadGate = Promise[Unit]()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      // A store whose directory went by hand, unlisted: its entries are left over, charged at the device's open
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      _ = os.remove.all(storeDir)
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map()))
+      _ <- waitForTransactionsToComplete()
+      restarted = newCrlHost(hostRoot, second)
+      crl = second.opened.head
+      sds = restarted.control.devices.devices(deviceA)
+      leftoverBytes = sds.admission.retainedBytes(storeId)
+      _ = crl.dropGate = Some(dropGate.future)
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpUntil(restarted, crl.dropCalls.get == 1)
+      // The store lands while the leftover drop runs: its crl_save.log state is charged, its own drop and its load
+      // queue behind the leftover drop
+      _ <- writeRocksStore(deviceDir, storeId)
+      _ = CrashRecoveryLog.saveStoreState(storeId, landedState, Backend.crlSaveFile(storeDir))
+      _ = crl.loadGate = Some(loadGate.future)
+      _ = restarted.control.loader.tryLoadStore(sds, storeDir)
+      _ <- pumpUntil(restarted, crl.dropCalls.get == 2)
+      retainedWhileLanding = sds.admission.retainedBytes(storeId)
+      _ = dropGate.success(())
+      _ <- pumpUntil(restarted, restarted.control.reconciler.leftoverCrlDropsRunning.isEmpty)
+      // The landed records are saved into the CRL next, and must stay counted until the store's recovery counts them.
+      // The load changed the charge, so the drop leaves all of it to that recovery: counted over, never under
+      admittedAfterDrop = sds.admission.admittedBytes
+      _ = loadGate.success(())
+      _ <- pumpUntil(restarted, restarted.control.router.loaded.get(storeId).exists(
+             _.frontend.transactions.contains(landedTx)) && sds.admission.retainedBytes(storeId) == 0)
+      admittedAfterRecovery = sds.admission.admittedBytes
+      leftInCrl = held(crl, storeId)
+      _ = second.shutdownAll()
+    yield
+      leftoverBytes should be > 0L
+      retainedWhileLanding should be(leftoverBytes + landedBytes)
+      admittedAfterDrop should be(leftoverBytes + landedBytes)
+      admittedAfterRecovery should be(landedBytes)
+      leftInCrl should be(Set(landedTx))
 
   atest("a store loaded from its crl_save.log does not recover entries an earlier tenancy left in the device CRL"):
     given ExecutionContext = executionContext

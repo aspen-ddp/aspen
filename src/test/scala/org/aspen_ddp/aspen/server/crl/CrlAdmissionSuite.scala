@@ -119,3 +119,38 @@ class CrlAdmissionSuite extends AnyFunSuite with Matchers:
     val a = CrlAdmission.Unlimited
     a.tryChargeLoaded(s0, 1000, slack = Long.MaxValue) shouldBe true
     a.admittedBytes shouldBe 1000
+
+  test("a retained charge read earlier is released only while nothing was retained or released for its store since"):
+    val s0 = StoreId(PoolId(new UUID(3, 1)), 0)
+    val a = new CrlAdmission(1000)
+    a.chargeRetained(s0, 40)
+    val unchanged = a.retainedCharge(s0)
+    unchanged.map(_.bytes) shouldBe Some(40)
+    a.releaseRetained(s0, unchanged.get)
+    a.admittedBytes shouldBe 0
+    a.retainedBytes(s0) shouldBe 0
+    a.retainedCharge(s0) shouldBe None
+
+  test("a retained charge read before a load charged its state leaves both charges counted"):
+    val s0 = StoreId(PoolId(new UUID(3, 1)), 0)
+    val a = new CrlAdmission(1000)
+    a.chargeRetained(s0, 40)
+    val before = a.retainedCharge(s0).get
+    a.tryChargeLoaded(s0, 70, slack = 10) shouldBe true
+    a.releaseRetained(s0, before)
+    a.admittedBytes shouldBe 110
+    a.retainedBytes(s0) shouldBe 110
+    // The load's recovery releases all of it, once it has counted the records itself
+    a.releaseRetained(s0)
+    a.admittedBytes shouldBe 0
+
+  test("a retained charge is matched by identity, not by size"):
+    val s0 = StoreId(PoolId(new UUID(3, 1)), 0)
+    val a = new CrlAdmission(1000)
+    a.chargeRetained(s0, 40)
+    val stale = a.retainedCharge(s0).get
+    a.releaseRetained(s0)
+    a.chargeRetained(s0, 40)
+    a.releaseRetained(s0, stale)
+    a.admittedBytes shouldBe 40
+    a.retainedBytes(s0) shouldBe 40

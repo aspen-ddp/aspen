@@ -53,12 +53,6 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.2 [X-W4] The leftover-CRL drop releases the admission charge of a store that landed while it ran.  PLAUSIBLE, S
-    cross-document-review.md X-W4. `DeviceReconciler.dropLeftoverCrlState` calls `admission.releaseRetained(storeId)`
-    on completion, which also releases a loaded state charged meanwhile by `CrlAdmission.tryChargeLoaded`; Lemma C can
-    then fail and a rotation can fail the CRL (W6). Fix: release only what was retained when the drop was issued, or
-    skip the release while the store is loaded or opening.
-
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------

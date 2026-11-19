@@ -191,7 +191,10 @@
   (`StoreTransfers.closeForTransferOut`), and deletes them from the device CRL (`deleteTransactions`) only once that
   file is durable: a crash or failed save before that leaves the device CRL holding them.
   `DeviceReconciler.dropLeftoverCrlState` drops the entries of a store with no entry, no directory and no retire
-  running, as a safety net for a directory removed by hand
+  running, as a safety net for a directory removed by hand. It releases only the admission charge retained for the
+  store when it was issued, and only if unchanged at completion (`CrlAdmission.retainedCharge` /
+  `releaseRetained(storeId, charge)`, by identity): a store landing meanwhile charges records the drop does not
+  remove, and its recovery releases the whole charge
 - A rebuilt store's directory carries `rebuild-complete` from its move into place until its entry leaves
   Rebuilding; `tryLoadStore` leaves such a store offline (`server/rebuild/CLAUDE.md`)
 - A failed rebuild pass or a permanently failed flip never re-checks its own device at once, which would restart the

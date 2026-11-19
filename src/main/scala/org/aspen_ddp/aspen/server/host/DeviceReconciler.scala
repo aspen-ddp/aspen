@@ -32,6 +32,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
 
   private[server] def activeDeviceChecks: Set[StorageDeviceId] = activeChecks
 
+  private[server] def leftoverCrlDropsRunning: Set[StoreId] = crlDropsRunning
+
   private[server] def pendingDeleteLookupsInFlight: Set[os.Path] = ctx.copies.releaseLookupsInFlight
 
   private[server] def scheduledDeviceRechecks: Set[StorageDeviceId] = scheduledRechecks
@@ -76,7 +78,13 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *
    *  The directory and loaded checks run when the CRL's answer arrives, in the same control task that starts the
    *  drop: a store that lands on the device has its directory before anything saves entries for it. A failed drop is
-   *  retried by the device's next reconcile. */
+   *  retried by the device's next reconcile.
+   *
+   *  The drop releases only the admission charge retained for the store when it was issued, and only if it is still
+   *  unchanged when the drop completes (CrlAdmission.releaseRetained(storeId, charge)). A store landing meanwhile
+   *  charges its crl_save.log state under the same id (CrlAdmission.tryChargeLoaded) for records saved behind the drop,
+   *  which the drop does not remove; its recovery releases the whole charge once it has counted them, so the records
+   *  stay counted throughout (crash-recovery-log 6.1, A2). */
   private def dropLeftoverCrlState(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     val deviceId = local.storageDeviceId
     val listed =
@@ -97,13 +105,15 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
             logger.info(s"Dropping the device-CRL entries of store $storeId, which storage device $deviceId no " +
                         s"longer holds")
             crlDropsRunning += storeId
+            // Read with the decision: only this charge covers the entries the drop removes
+            val charge = local.admission.retainedCharge(storeId)
             val dropped =
               try local.crl.dropStore(storeId)
               catch case NonFatal(t) => Future.failed(t)
             dropped.onComplete: result =>
               crlDropsRunning -= storeId
               if result.isSuccess then
-                local.admission.releaseRetained(storeId)
+                charge.foreach(local.admission.releaseRetained(storeId, _))
               result.failed.foreach: t =>
                 logger.error(s"Failed to drop the device-CRL entries of store $storeId, which storage device " +
                              s"$deviceId no longer holds. Retrying at the device's next check. Error: $t")

@@ -16,7 +16,7 @@ import scala.annotation.tailrec
   * forgets a transaction that never reached the CRL. A store that closes, or is replaced by a reload, leaves its
   * entries live in the CRL unless its closer takes them out, so its bytes stay counted, retained for it (`retain`)
   * until they leave the CRL with all of the store's entries (`releaseRetained`: a transfer out's extraction, a
-  * dropStore) or the store loads again and, having counted its recovered transactions afresh, releases them (a swap,
+  * dropStore; a leftover drop releases only the charge it saw when issued, if unchanged) or the store loads again and, having counted its recovered transactions afresh, releases them (a swap,
   * never a gap: crash-recovery-log 6.1, A2). The check is against the total before the admission, so one transaction
   * may cross the limit: the limit leaves headroom for that.
   *
@@ -74,19 +74,32 @@ final class CrlAdmission(initialLimitBytes: Long):
 
   def release(bytes: Long): Unit = total.addAndGet(-bytes)
 
-  // What closed stores' live entries are counted for, by store
-  private val retained = new ConcurrentHashMap[StoreId, java.lang.Long]()
+  // What closed stores' live entries are counted for, by store. Every change replaces the value with a new
+  // CrlAdmission.Retained, so a value read earlier identifies the charge as it was then (releaseRetained(storeId, charge))
+  private val retained = new ConcurrentHashMap[StoreId, CrlAdmission.Retained]()
 
   /** Keeps `bytes`, which a closing store of the device was admitted for, counted until releaseRetained */
   def retain(storeId: StoreId, bytes: Long): Unit =
     if bytes > 0 then
-      retained.merge(storeId, bytes, (a, b) => a + b)
+      retained.merge(storeId, new CrlAdmission.Retained(bytes), (a, b) => new CrlAdmission.Retained(a.bytes + b.bytes))
 
   /** Releases what `storeId` was retained for: its entries have left the CRL, or it is loaded again. Idempotent */
   def releaseRetained(storeId: StoreId): Unit =
-    val bytes = retained.remove(storeId)
-    if bytes != null then
-      total.addAndGet(-bytes)
+    val charge = retained.remove(storeId)
+    if charge != null then
+      total.addAndGet(-charge.bytes)
+
+  /** What is retained for `storeId` now, to release later only if it is still that (releaseRetained(storeId, charge)) */
+  def retainedCharge(storeId: StoreId): Option[CrlAdmission.Retained] = Option(retained.get(storeId))
+
+  /** Releases `charge`, read from retainedCharge, only if it is still what `storeId` is retained for: nothing was
+    * retained or released for the store since. For a release that covers only the records counted when `charge` was
+    * read (DeviceReconciler.dropLeftoverCrlState: a store landing during the drop charges records the drop does not
+    * remove). Whatever changed the charge since releases all of it in turn: a load's recovery, a failed load's drop, an
+    * extraction or a copy's release */
+  def releaseRetained(storeId: StoreId, charge: CrlAdmission.Retained): Unit =
+    if retained.remove(storeId, charge) then
+      total.addAndGet(-charge.bytes)
 
   /** Charges `bytes`, which `storeId`'s entries hold in the CRL, without a check and retained for it: the device's
     * CRL is opened holding them, whether or not the store loads (crash-recovery-log 6, admission) */
@@ -125,7 +138,7 @@ final class CrlAdmission(initialLimitBytes: Long):
     charged
 
   /** What `storeId` is retained for */
-  def retainedBytes(storeId: StoreId): Long = Option(retained.get(storeId)).map(_.longValue).getOrElse(0L)
+  def retainedBytes(storeId: StoreId): Long = Option(retained.get(storeId)).map(_.bytes).getOrElse(0L)
 
   def admittedBytes: Long = total.get
 
@@ -150,6 +163,9 @@ object AdmissionTier:
       Data
 
 object CrlAdmission:
+  /** A store's retained charge at one moment. Compared by identity, never by value: each retain or release replaces it */
+  final class Retained private[CrlAdmission] (val bytes: Long)
+
   /** SimpleCRL's static record of a saved transaction (LogContent.staticDataSize): TxId 33, txd location 14,
     * disposition 1, Paxos state 11, object-update count 4. Rewritten with each save; the latest is the live one
     */

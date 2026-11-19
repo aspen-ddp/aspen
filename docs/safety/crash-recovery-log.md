@@ -263,7 +263,11 @@ with the start timestamp), and the deletions name `state.entryIds`.
 The leftover drop is safe against a store landing on the device meanwhile: the directory and loaded checks run in the
 control task that issues the `DropStore`, a store that lands has its directory before anything saves for it, and the
 CRL processes requests in queue order, so the drop is processed before any save of the new store, and a save landing
-in the drop's own entry cancels the drop's deletion of that id (C9).
+in the drop's own entry cancels the drop's deletion of that id (C9). Its admission release covers only the records it
+removes: it reads the store's retained charge in that same control task and releases it on completion only if it is
+still that charge (`CrlAdmission.releaseRetained(storeId, charge)`, compared by identity). A landing store's
+`crl_save.log` charge (A3) replaces it, and that store's recovery releases all of it once it has counted its records
+(A2), so the landed records are never uncounted.
 
 ### 3.6 Applied stubs
 
@@ -754,7 +758,8 @@ cannot discharge. W1-W6 and S1 are SimpleCRL's, A1-A4 the Frontend's and the sto
   what is retained for the store (`StoreRouter.install`, `Frontend.retainAdmissions`), released once the replacing
   store has counted the same records (A2).
 - **Retained.** A closing store keeps its bytes counted for it (`CrlAdmission.retain`) until its entries leave the CRL
-  (`releaseRetained` after an extraction's deletion, a `dropStore`, a leftover drop) or it loads again and counts its
+  (`releaseRetained` after an extraction's deletion, a `dropStore`, a leftover drop of the charge it was issued for,
+  3.5) or it loads again and counts its
   own. Records of stores that never load on this run are therefore counted from the open while they are evacuated.
 - **Not counted:** entry headers, trailing UUIDs and padding, static records rewritten by later saves, deletions
   queued in an entry, and the second copies written when the update count changes. None of these is ever moved by an

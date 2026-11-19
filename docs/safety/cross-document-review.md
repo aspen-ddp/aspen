@@ -37,7 +37,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit (fails for a tree-learned commit: X-W3) |
-| CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again (fails: X-W4) |
+| CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again; the leftover drop releases only the charge it was issued for, unchanged since |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
 
 ## 2. Cross-subsystem invariants and the guards that hold them
@@ -258,8 +258,9 @@ Charges made without a check (one transaction crossing its ceiling, data arrivin
 at load, applied stubs) are bounded by the transactions already admitted, plus 41 bytes per unoffset stub
 (crash-recovery-log.md, Lemma C), and one transaction's bytes on a store by `maxTransactionBytes`, past which its
 prepare is dropped (crash-recovery-log.md section 6, Oversized). The device reconciler's leftover drop
-(`DeviceReconciler.dropLeftoverCrlState`) releases everything retained for the store when the drop completes, which
-can include the charge of a store that landed meanwhile (X-W4). What can still fill a lane is the tier's own traffic,
+(`DeviceReconciler.dropLeftoverCrlState`) releases only the charge retained for the store when it was issued, and only
+if it is unchanged when the drop completes, so a store landing meanwhile keeps its loaded state counted until its
+recovery counts it (crash-recovery-log.md 3.5). What can still fill a lane is the tier's own traffic,
 including same-tier finalizers (TKVL split, join, tail removal): ordinary back-pressure that clears as the tier's
 transactions finalize upward. Data-only devices give up a quarter of their headroom (Backlog.txt).
 
@@ -322,22 +323,6 @@ never spread non-late is false.
 Suggested fix: have `statusForExpiry` report a tree-learned resolution as the CRL saves it (`savedStatus`,
 `Unresolved`, with its commit vote), so peers decide by the tally, or report it `late`, so an adopter takes the
 late-commit path and looks its own entry up.
-
-### X-W4: The leftover-CRL drop releases the charge of a store that landed while it ran
-Verdict PLAUSIBLE. Priority 3. Effort S.
-Mechanism: `DeviceReconciler.dropLeftoverCrlState` picks a store with device-CRL entries that is not listed, not
-loaded, has no directory, no drop and no retire running, and issues `crl.dropStore`; on completion it calls
-`admission.releaseRetained(storeId)`, which removes everything retained for the store. If the store lands on the
-device meanwhile (a later poll lists it again and a transfer in or load reaches `StoreLoader`), its loaded state is
-charged and retained under the same id (`CrlAdmission.tryChargeLoaded`), then `awaitCrlLoad` queues its own
-`dropStore` and `loadStore` behind the leftover drop. The leftover drop completes first and releases the loaded
-charge; the file's records are then written into the CRL uncounted until `Frontend.recoverState` counts them.
-Consequence: in that window other stores on the device admit into bytes the CRL already holds, so the total can pass
-`limit + T + 41 · N` by up to one loaded state, breaking Lemma C (crash-recovery-log.md); a CRL whose bound fails can
-fail to place an entry on rotation and fail (W6), taking the device's stores out of service. Needs a landing within
-one drop's latency of the leftover decision for the same store, so rare.
-Suggested fix: release only what was retained when the drop was issued (read `retainedBytes` then and release at most
-that), or skip the release when the store is loaded or opening at completion; its recovery releases the rest.
 
 ### X-W5: A store whose backend open fails for an ordinary error is left unserved and untracked until a restart
 Verdict CONFIRMED. Priority 4. Effort S.

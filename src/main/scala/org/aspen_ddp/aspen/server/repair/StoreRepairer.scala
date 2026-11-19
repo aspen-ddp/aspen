@@ -76,7 +76,8 @@ final class ScanControl:
 /** Lock deferrals of one store's repair entries, kept in memory across its scans by RepairService. A host restart
   * forgets them: the next pass then reconciles each whole object again and restarts the count.
   *
-  * Keyed per entry and object (StoreRepairer.errorDeferralKey, unackedDeferralKey). Only parts deferred by a lock
+  * Keyed per entry and object (StoreRepairer.errorDeferralKey, unackedDeferralKey). An errorTree entry's key survives
+  * its rewrites by later marks, so its counts do too (observeEntry). Only parts deferred by a lock
   * count: `deferredKeys` and `objectLevelDeferred`, the latter including a refcount deferred under an object lock. A
   * pass that is only `stale` defers nothing by a lock: the object is retried whole on the next pass, but the pass
   * neither counts toward `RepairPolicy.proofAfterDeferrals` nor triggers a proof, since a proof cannot help an object
@@ -91,6 +92,16 @@ final class DeferralState:
 
   private var entries: Map[Key, DeferralState.Deferral] = Map()
   private var stalePasses: Map[Key, Int] = Map()
+  private var revisions: Map[Key, ObjectRevision] = Map()
+
+  /** Records the revision of the entry a pass is about to reconcile for. A rewritten entry (a later mark) may name a
+    * miss of keys the last pass did not defer, so the next pass reconciles the whole object; the counts are kept, since
+    * marks of a hot object would otherwise keep it from ever reaching a proof or parking
+    */
+  def observeEntry(entryKey: Key, revision: ObjectRevision): Unit = synchronized:
+    if revisions.get(entryKey).exists(_ != revision) then
+      entries.get(entryKey).foreach(d => entries += entryKey -> d.copy(only = None))
+    revisions += entryKey -> revision
 
   /** Records whether one pass's final result was stale. Returns the count of stale passes since the last complete
     * one, this one included, or 0 when it was not stale. A complete pass resets the count; a lock-deferred one keeps
@@ -144,6 +155,7 @@ final class DeferralState:
   def clear(entryKey: Key): Unit = synchronized:
     entries -= entryKey
     stalePasses -= entryKey
+    revisions -= entryKey
 
   /** The keys the next pass reconciles, when the last pass deferred only keys and left nothing else undone. None
     * means the whole object
@@ -160,6 +172,7 @@ final class DeferralState:
       StoreRepairer.isSweepDeferralKey(k) || StoreRepairer.isVerifyDeferralKey(k) || entryKeys.contains(k)
     entries = entries.filter((k, _) => kept(k))
     stalePasses = stalePasses.filter((k, _) => kept(k))
+    revisions = revisions.filter((k, _) => kept(k))
 
   /** Forgets every sweep key not in `sweepKeys`: the nodes a complete sweep did not visit are gone */
   private[repair] def retainSweep(sweepKeys: Set[Key]): Unit = synchronized:
@@ -417,8 +430,9 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
         counts.control.sawEntry()
         val objectId = decodeObjectId(key)
         val errorEntry = MissedUpdateFinalizationAction.decodeErrorEntry(value.value)
-        val entryKey = errorDeferralKey(key, value.revision)
+        val entryKey = errorDeferralKey(key)
         counts.touch(List(entryKey))
+        deferral.observeEntry(entryKey, value.revision)
 
         def completed(complete: Boolean): Future[Unit] =
           if complete then
@@ -789,11 +803,11 @@ object StoreRepairer:
     */
   val ParkAfterStalePasses: Int = 3
 
-  /** The DeferralState key of an errorTree entry: the entry's key and value revision. A store that misses another
-    * update rewrites the entry, and the rewritten entry starts over with its whole object
+  /** The DeferralState key of an errorTree entry: the entry's key alone. A store that misses another update rewrites
+    * the entry; its counts carry over, and only the next pass's narrowing is dropped (DeferralState.observeEntry)
     */
-  private[repair] def errorDeferralKey(entryKey: Key, entryRevision: ObjectRevision): Key =
-    Key(Array[Byte](0) ++ entryKey.bytes ++ entryRevision.toArray)
+  private[repair] def errorDeferralKey(entryKey: Key): Key =
+    Key(Array[Byte](0) ++ entryKey.bytes)
 
   /** The DeferralState key of one object of a UnackedCommits entry */
   private[repair] def unackedDeferralKey(entryKey: Key, objectId: ObjectId): Key =

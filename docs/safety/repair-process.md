@@ -255,7 +255,7 @@ not be visited. A join that deletes a node the walk was about to read makes it r
 
 ```
 if abandoned: return
-seen += 1; decode objectId, (missedTs, type, storePointer); entryKey = errorDeferralKey(key, value.revision)
+seen += 1; decode objectId, (missedTs, type, storePointer); entryKey = errorDeferralKey(key); deferral.observeEntry(entryKey, value.revision)
 if target.mayJoinTransaction(store, missedTs): deferred += 1; return                    -- 5.4
 alloc = pool.allocationTree.get(objectId)
 listed:  done = repairListed(store, pointer(alloc), missedTs, entryKey)                 -- 6, 9.2
@@ -480,8 +480,8 @@ read includes the miss. The gate does not show that the read reflects every merg
 read following each miss's commit. Two transactions on one object can commit in the opposite order of their starts
 (Q6: a `RefcountUpdate` and a key-level `KeyValueUpdate` check no object timestamp), so a miss older than the held one
 can commit after the read. Its mark is written after its commit and moves the entry's revision (section 3, step 6),
-so the entry's delete fails (12.4) and the next pass, keyed by the new revision (`errorDeferralKey`), reconciles the
-whole object from a later read.
+so the entry's delete fails (12.4) and the next pass, seeing the new revision (`DeferralState.observeEntry`),
+reconciles the whole object from a later read.
 
 ### 6.5 A foreign occupant of the slot
 
@@ -524,7 +524,7 @@ is stale, so the entry stays and the next pass installs. A listed occupant is lo
 ### 8.1 DeferralState
 
 In memory, one per store, kept across scans by `RepairService` and dropped when the store leaves the repairable set
-(`StoreRepairer.DeferralState`). Keys: `errorDeferralKey(key, entry revision)` (prefix 0), `unackedDeferralKey(key,
+(`StoreRepairer.DeferralState`). Keys: `errorDeferralKey(key)` (prefix 0), `unackedDeferralKey(key,
 objectId)` (prefix 1), `sweepDeferralKey(nodeId)` (prefix 2), `verifyDeferralKey(objectId)` (prefix 3).
 
 - `record(entryKey, result)` counts the passes since the entry's last complete pass that deferred something by a lock
@@ -539,9 +539,12 @@ objectId)` (prefix 1), `sweepDeferralKey(nodeId)` (prefix 2), `verifyDeferralKey
   proof in about `ParkAfterStalePasses + proofAfterDeferrals` passes.
 - `retain` (a completed scan) forgets entry keys the scan did not touch; sweep and verification keys are kept.
   `retainSweep` (a complete sweep walk) prunes sweep keys. A host restart forgets everything; the next pass reconciles
-  whole objects and restarts the counts. Because an ErrorTree deferral key includes the entry's revision, a rewritten
-  entry starts over with a whole-object pass, and with both counts at zero: every mark rewrites the entry (section 3,
-  step 6), so a store marked again between passes never reaches a proof or parking for it (RP-W3). A verification key
+  whole objects and restarts the counts. An ErrorTree deferral key is the entry's key alone, so its counts survive a
+  rewrite of the entry: every mark rewrites it (section 3, step 6), and a store marked again between passes, as a
+  commit error on a hot key marks it, still reaches a proof or parking. `observeEntry` records the revision each pass
+  reads the entry at; when it has moved, it drops only the `only` narrowing, since the later mark may name a miss of
+  keys the last pass did not defer, and the next pass reconciles the whole object. A proof is safe at any pass, so a
+  count carried over a rewrite costs nothing in correctness. A verification key
   is cleared only by a complete verification; one whose quarantine ends otherwise stays until the store leaves the
   repairable set.
 
@@ -842,26 +845,6 @@ the quarantining store retries at heartbeat.
 ---
 
 ## 14. Open weaknesses
-
-### RP-W3. A store marked again between passes never reaches a proof or parking (PLAUSIBLE; liveness)
-Mechanism: `StoreRepairer.repairErrorEntry` keys the entry's `DeferralState` record by
-`errorDeferralKey(key, value.revision)`, so `DeferralState.record` (the lock-deferral count that triggers
-`RepairProofs` at `proofAfterDeferrals`) and `recordStale` (the count that sets `awaitSettle` at
-`ParkAfterStalePasses`) start from zero whenever the entry's revision changes. `MissedUpdateMarker.writeBatch`
-rewrites the entry, moving its revision, on every mark, older ones included (section 3, step 6), and `retain` drops
-the old key.
-Trigger / scenario: store S missed a write of key k of KeyValue object X, and k is hot. Every later transaction that
-requires k's revision fails at S, which reports a commit error, so each finalization marks (S, X) and rewrites the
-entry. If such a transaction finalizes between any two scan passes (the 30 s floor) and the repair read finds k
-locked each time (a key locked at nearly every read is the case proofs exist for), every pass records count 1 for a
-new deferral key: neither the proof nor parking is ever reached, and k is never installed at S.
-Consequence: S stays stale on k for as long as k stays hot, so the object runs with one fewer up-to-date store, and S
-keeps generating marks, marker writes and repair passes. M15 and E15 give no progress for exactly the hot-lock case
-they target.
-Suggested fix: keep the lock-deferral and stale counts across a revision change of the same entry key (key them by
-the entry key alone, or carry them over when the walk sees a new revision), and reset only the `only` narrowing. A
-proof is safe at any pass, so an earlier proof costs nothing in correctness.
-Effort: S   Priority: 4
 
 ### RP-W4. A quarantine of a deleted object never clears (CONFIRMED; resource leak)
 Mechanism: `StoreRepairer.verifyObject` is `repairUpdate`, whose `readObject` fails with

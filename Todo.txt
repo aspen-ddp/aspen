@@ -51,10 +51,7 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.3  RP-W3  A store marked again between passes never reaches a proof or parking. PLAUSIBLE, S.
-     errorDeferralKey(key, value.revision) resets both the lock-deferral and the stale counts whenever the entry is
-     rewritten, and every mark rewrites it. A store stale on a hot key is re-marked every pass and stays stale. Fix:
-     keep the counts across revisions of the same entry key, and reset only the `only` narrowing.
+(no open items)
 
 
 PRIORITY 5: performance and hygiene

@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.TestTransactions
 import org.aspen_ddp.aspen.{IntegrationTestSuite, PinAudit}
 import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, ReadLocks, Transaction}
 import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateMarker, UnackedCommitEntry}
-import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedUnackedCommit
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.{MissedUnackedCommit, MissedUpdate}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{TKVLInsert, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -1299,7 +1299,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
         control.cancel()
       Future.unit)
     val deferral = DeferralState()
-    val unrelated = StoreRepairer.errorDeferralKey(Key(Array[Byte](2, 9)), ObjectRevision(TransactionId(new UUID(9, 9))))
+    val unrelated = StoreRepairer.errorDeferralKey(Key(Array[Byte](2, 9)))
     deferral.record(unrelated, ReconcileResult(Set(k0), false, false))
     for
       a <- sharedKVObject(Map(k0 -> Value(Array[Byte](0))))
@@ -1800,6 +1800,49 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       remaining shouldBe empty
       deferral.deferredKeys(entryKey) shouldBe None
 
+  test("an errorTree entry re-marked between passes keeps its lock deferrals and reaches a proof"):
+    // Every later mark of (store 2, object) rewrites the entry, moving its revision, as a commit error on a hot key
+    // does. The rewritten entry keeps its counts, and starts over only with a whole-object pass
+    @volatile var proofs = 0
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target, testingOnlyOnProof = (_, _, _) => proofs += 1)
+    val deferral = DeferralState()
+    val n = RepairPolicy.Default.proofAfterDeferrals
+    def remark(kvPtr: KeyValueObjectPointer): Future[Unit] =
+      val again = MissedUpdate(sid(2), kvPtr.id, Some(kvPtr.objectType), kvPtr.storePointer, HLCTimestamp.Zero)
+      pump(new MissedUpdateMarker(client).mark(List(again)), deadline()).flatMap(_ => settle())
+    def entryRevision(kvPtr: KeyValueObjectPointer): Future[Option[ObjectRevision]] =
+      errorTree.flatMap(_.get(MissedUpdateMarker.errorKey(sid(2), kvPtr.id))).map(_.map(_.revision))
+    def remarkedPasses(left: Int, kvPtr: KeyValueObjectPointer): Future[Unit] =
+      if left == 0 then Future.unit
+      else
+        for
+          before <- entryRevision(kvPtr)
+          _ <- remark(kvPtr)
+          after <- entryRevision(kvPtr)
+          _ = withClue("the mark rewrote the entry: ")(after should not be before)
+          _ <- pass(2, repairer, deferral)
+          _ <- remarkedPasses(left - 1, kvPtr)
+        yield ()
+    for
+      kvPtr <- sharedKVObject(Map(k0 -> Value(Array[Byte](0)), k1 -> Value(Array[Byte](1)),
+                                  k2 -> Value(Array[Byte](2))))
+      _ <- missedBy(2)(kvUpdate(kvPtr, List(Delete(k1), Delete(k2))))
+      _ = target.lockedKeys += kvPtr.id -> Set(k2)
+      marked <- errorEntries(2)
+      _ = marked should not be empty
+      _ <- remarkedPasses(n - 1, kvPtr)
+      keysBeforeProof = storeKeys(2, kvPtr)
+      _ = proofs shouldBe 0
+      _ <- remarkedPasses(1, kvPtr)
+      remaining <- errorEntries(2)
+    yield
+      keysBeforeProof shouldBe Set(k0, k2)
+      proofs shouldBe 1
+      storeKeys(2, kvPtr) shouldBe Set(k0)
+      remaining shouldBe empty
+      deferral.size shouldBe 0
+
   test("a hot object alternating stale and lock-deferred passes still reaches a proof (RP-W2)"):
     // Store 2's copy is busy at every install the store does not wait out, and k2 is locked whenever it settles.
     // Stale passes neither count toward the proof nor reset its count, and once parking starts it continues until a
@@ -1839,6 +1882,26 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       deferral.record(key, ReconcileResult(Set(), false, stale = false)) shouldBe 0
       deferral.size shouldBe 0
       deferral.record(key, locked) shouldBe 1
+
+  test("a rewritten entry keeps its counts and drops only the next pass's narrowing"):
+    Future.successful:
+      val deferral = DeferralState()
+      val key = StoreRepairer.errorDeferralKey(Key(Array[Byte](2, 9)))
+      val r1 = ObjectRevision(TransactionId(new UUID(1, 1)))
+      val r2 = ObjectRevision(TransactionId(new UUID(2, 2)))
+      deferral.observeEntry(key, r1)
+      deferral.record(key, ReconcileResult(Set(k0), false, stale = false)) shouldBe 1
+      deferral.recordStale(key, ReconcileResult(Set(), false, stale = true)) shouldBe 1
+      deferral.observeEntry(key, r1)
+      deferral.deferredKeys(key) shouldBe Some(Set(k0))
+      deferral.observeEntry(key, r2)
+      withClue("the rewrite may name other keys, so the next pass reconciles the whole object: "):
+        deferral.deferredKeys(key) shouldBe None
+      deferral.staleCount(key) shouldBe 1
+      deferral.record(key, ReconcileResult(Set(k0), false, stale = false)) shouldBe 2
+      deferral.clear(key)
+      deferral.size shouldBe 0
+      deferral.staleCount(key) shouldBe 0
 
   test("an aborted proof leaves the key deferred for a later pass"):
     // On the proof's pass, k2 is written between the read and the proof: the proof requires k2 absent, as the read

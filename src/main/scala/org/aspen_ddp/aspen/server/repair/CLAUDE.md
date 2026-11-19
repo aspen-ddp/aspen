@@ -59,7 +59,9 @@
   1 s; `server/store/CLAUDE.md`). Every `proofAfterDeferrals` stale passes log a warning. Only a complete pass resets
   either count: a stale pass neither counts toward nor resets the lock-deferral count, and a lock-deferred pass keeps
   the stale count, so parking continues once started. A hot object alternating busy and locked passes so reaches a proof
-  (repair-process 8.1). The bootstrap sweep (no proofs) neither counts nor parks
+  (repair-process 8.1). An ErrorTree entry's deferral key (`errorDeferralKey`) is its tree key alone, so both counts
+  survive the entry's rewrite by a later mark; `DeferralState.observeEntry` drops only the next pass's narrowing to the
+  deferred keys when the entry's revision has moved. The bootstrap sweep (no proofs) neither counts nor parks
 - The completion gate (`read.timestamp >= missedTimestamp`) is sound (repair-process 6.4): object timestamps never
   decrease, and a copied one (Reconcile, rebuild) is a read's, the max over the stores matching its revision, so a
   read that reflects the missed transaction passes it. A whole-object KeyValue pass that defers a locked key still

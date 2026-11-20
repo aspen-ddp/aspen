@@ -40,6 +40,12 @@ case class BackendCommitFailed() extends RequirementError
   */
 case class InheritedVoteLock() extends RequirementError
 
+/** This store was rebuilt and may lack a committed update its lost incarnation voted for on the object, so it grants
+  * no commit vote on an update that grows the object until a repair shows it holds that update
+  * (Frontend.inheritedGrowthLock; cross-document-review.md 2.3). Purely local, like RequirementCheckFailure.
+  */
+case class InheritedGrowthLock() extends RequirementError
+
 /** A transaction allocates an object this store already holds (in memory or in its backend): a replayed allocation,
   * which must not overwrite the live object (transaction-requirements 9.4). Purely local, like RequirementCheckFailure.
   */

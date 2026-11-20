@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateFinalization
 import org.aspen_ddp.aspen.client.tkvl.{KeyValueListNode, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer,
-                                           ObjectId, ObjectPointer, ObjectRevision}
+                                           ObjectId, ObjectPointer, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.{Frontend, ReconcileResult, RepairSnapshot}
@@ -791,6 +791,50 @@ object StoreRepairer:
     * be in flight, which the next pass misses, so waiting is kept for an object whose copy stays busy
     */
   val ParkAfterStalePasses: Int = 3
+
+  /** A rebuilt store's inherited-growth scan (Frontend, Inherited growth; cross-document-review.md 2.3): first marks
+    * each KeyValue object of `mark` the pool's allocation tree lists in the ErrorTree against `storeId` (missed at
+    * HLCTimestamp.Zero, so it never displaces a newer mark), then lists every KeyValue object with an ErrorTree or
+    * UnackedCommits entry against the store, those marks included. Only KeyValue objects can overfill a slice this way
+    * (a DataObject's updates form a revision chain each voter checked in full, R16). An entry that cannot be decoded
+    * fails the scan, as does any failed read or mark: the caller retries rather than miss an object. An object `mark`
+    * names that the allocation tree does not list is not marked (deleted, or an allocation the rebuild's pending sweep
+    * covers). An ErrorTree entry recording no type is left out: repair acts on one only for a proven deletion, so a
+    * guard on its object would never end
+    */
+  def inheritedGrowthScan(client: AspenClient, storeId: StoreId, mark: Set[ObjectId]): Future[Set[ObjectId]] =
+    given ExecutionContext = client.clientContext
+    import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedUpdate
+    val min = Key(Array[Byte](storeId.poolIndex))
+    val max = Key(Array[Byte]((storeId.poolIndex + 1).toByte))
+    for
+      pool <- client.getStoragePool(storeId.poolId)
+      listed <- Future.sequence(mark.toList.map: oid =>
+                  pool.allocationTree.get(Key(oid.toBytes)).map(_.map(vs => ObjectPointer(vs.value.bytes))))
+      marks = listed.flatten.filter(p => p.poolId == storeId.poolId && p.objectType == ObjectType.KeyValue).map: ptr =>
+                MissedUpdate(storeId, ptr.id, Some(ptr.objectType), ptr.storePointer, HLCTimestamp.Zero)
+      _ <- if marks.isEmpty then Future.unit else client.missedUpdateMarker.mark(marks)
+      // foreachInRange logs and steps past a failing fn, so a decode failure is carried out of band
+      found = new java.util.concurrent.ConcurrentHashMap[ObjectId, Unit]()
+      undecodable = new AtomicInteger(0)
+      _ <- pool.errorTree.foreachInRange(min, max, (_, key, value) =>
+             try
+               val oid = decodeObjectId(key)
+               if MissedUpdateFinalizationAction.decodeErrorEntry(value.value).objectType
+                    .contains(ObjectType.KeyValue) then found.put(oid, ())
+             catch case scala.util.control.NonFatal(_) => undecodable.incrementAndGet()
+             Future.unit)
+      _ <- pool.unackedCommitsTree.foreachInRange(min, max, (_, _, value) =>
+             try UnackedCommitEntry.decode(value.value.bytes).objects.foreach: ptr =>
+                   if ptr.poolId == storeId.poolId && ptr.objectType == ObjectType.KeyValue then found.put(ptr.id, ())
+             catch case scala.util.control.NonFatal(_) => undecodable.incrementAndGet()
+             Future.unit)
+      _ <- if undecodable.get == 0 then Future.unit
+           else Future.failed(new Exception(s"Inherited-growth scan of $storeId: ${undecodable.get} entries against " +
+                                            "it could not be decoded"))
+    yield
+      import scala.jdk.CollectionConverters.*
+      found.keySet.asScala.toSet
 
   /** The DeferralState key of an errorTree entry: the entry's key alone. A store that misses another update rewrites
     * the entry; its counts carry over, and only the next pass's narrowing is dropped (DeferralState.observeEntry)

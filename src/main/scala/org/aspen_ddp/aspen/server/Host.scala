@@ -15,7 +15,7 @@ import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrashRec
 import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DeviceControl, DeviceMetadata, HostThreading, JoinCeiling, LocalDevices, LocalStorageDeviceState, LockstepThreading, StoreRebuilds}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
-import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
+import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget, StoreRepairer}
 import org.aspen_ddp.aspen.server.store.{Frontend, HeldVoteQuery, ReconcileResult, RepairSnapshot, Store, UnackedCommitLookup,
   UnackedLookupResult}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler, DefaultBackendOpener}
@@ -260,20 +260,29 @@ class Host(val client: AspenClient,
   /** Stores have no client, so a rebuilt store's query of its peers' held votes (Frontend.inheritedVoteLock) goes
    *  through the host's: `width - writeThreshold + 1` of the pool's other stores, given up after HeldVoteQueryDeadline
    *  (its store asks again at a later heartbeat). */
-  private val heldVoteQuery: HeldVoteQuery = (storeId, answer) =>
-    given ExecutionContext = ec
-    Future.unit
-      .flatMap(_ => client.getStoragePool(storeId.poolId))
-      .flatMap: pool =>
-        val ida = pool.ida
-        val peers = (0 until ida.width).filter(_ != storeId.poolIndex).map(i => StoreId(storeId.poolId, i.toByte)).toList
-        val needed = math.min(ida.width - ida.writeThreshold + 1, peers.size)
-        if needed <= 0 then
-          Future.successful(Nil)
-        else
-          val deadline = System.nanoTime() + Host.HeldVoteQueryDeadline.toNanos
-          client.heldVotes(peers, needed, () => System.nanoTime() > deadline)
-      .onComplete(answer)
+  private val heldVoteQuery: HeldVoteQuery = new HeldVoteQuery:
+    def query(storeId: StoreId, answer: scala.util.Try[List[HeldVote]] => Unit): Unit =
+      given ExecutionContext = ec
+      Future.unit
+        .flatMap(_ => client.getStoragePool(storeId.poolId))
+        .flatMap: pool =>
+          val ida = pool.ida
+          val peers = (0 until ida.width).filter(_ != storeId.poolIndex)
+            .map(i => StoreId(storeId.poolId, i.toByte)).toList
+          val needed = math.min(ida.width - ida.writeThreshold + 1, peers.size)
+          if needed <= 0 then
+            Future.successful(Nil)
+          else
+            val deadline = System.nanoTime() + Host.HeldVoteQueryDeadline.toNanos
+            client.heldVotes(peers, needed, () => System.nanoTime() > deadline)
+        .onComplete(answer)
+
+    override def growthScan(storeId: StoreId, mark: Set[ObjectId],
+                            answer: scala.util.Try[Set[ObjectId]] => Unit): Unit =
+      given ExecutionContext = ec
+      Future.unit
+        .flatMap(_ => StoreRepairer.inheritedGrowthScan(client, storeId, mark))
+        .onComplete(answer)
 
   private val deviceControl: DeviceControl = new DeviceControl(
     metadata = seams.wrapMetadata.fold(hostMetadata)(wrap => wrap(hostMetadata)),

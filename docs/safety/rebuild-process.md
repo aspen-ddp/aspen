@@ -539,8 +539,18 @@ mute, not on the failure budget:
   of the reported transactions started before its `acceptor-since`, repeats the query at heartbeat (1 s doubling to
   30 s), and releases a transaction once a query no longer reports it or its `TxResolved`/`TxFinalized` reaches the
   store (one of T's stores): T is then decided and cannot commit after a later T'. Once none is held the file is
-  removed; a reload that still finds it queries again. An abort vote, not a withheld one: a single store's abort does
+  removed once no growth guard (below) is held either; a reload that still finds it queries again. An abort vote, not a withheld one: a single store's abort does
   not abort a transaction its peers commit (RebuiltVoterLockIntegrationSuite).
+* **Inherited growth.** The old incarnation's commit vote for a KeyValue growth T also counts in the slice-limit bound
+  (transaction-requirements.md R16), and a T that committed after the walk read its object is missing from the
+  rebuilt copy until repair. The first held-vote round therefore also takes, from the same replies, the transactions
+  the peers hold committed and not finalized (`HeldVote.committed`), and then, through the Host, marks the reported
+  transactions' KeyValue objects in the ErrorTree and lists every KeyValue object with an ErrorTree or UnackedCommits
+  entry against the store (`HeldVoteQuery.growthScan`, `StoreRepairer.inheritedGrowthScan`); a T finalized before the
+  round left such an entry, written by its finalizer before TxFinalized. Every object of that list is guarded at once,
+  and the objects of a still-unresolved reported T from its release: the Frontend votes abort (`InheritedGrowthLock`)
+  on an update that grows a guarded object until a whole-object repair completes from a snapshot taken after the guard
+  (cross-document-review.md 2.3). A failed scan leaves every object locked and repeats the round.
 
 ---
 
@@ -706,6 +716,8 @@ is never repaired (5.2's locked copies are marked for this reason).
   residual.
 * **B21 A rebuilt store grants no commit vote over a lock its old incarnation's vote may still back** (6.4, inherited
   votes), up to the same clock-skew residual.
+* **B21a A rebuilt store grants no commit vote on a growth of a KeyValue object its copy may hold without a growth its
+  old incarnation voted for** (6.4, inherited growth), until a repair that follows that growth's commit.
 * **B22 A copy read under a write lock is recorded before the walk passes it.** Its ErrorTree mark is written before
   the restore completes (5.2, locked copies).
 

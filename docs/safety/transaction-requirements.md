@@ -377,11 +377,16 @@ measure is the same at each. The argument holds whatever messages are late or lo
 the voter sets. The cost is capacity: a KeyValue object grows only to `t / w` of the slice (2/3 for Replication(3, 2)).
 DataObjects need no such limit: every data update requires the object's revision or matches the current slice
 (appends, ranged writes), so committed data updates form a chain each voter checked in full.
-Residual: the bound counts each store's votes as one copy. A rebuilt store's new incarnation holds what its rebuild
-read, which can lack an update its lost incarnation voted commit for that resolved afterwards (its inherited-vote
-lock ends at the resolution, which carries no data, and the update reaches it only through repair), so a vote it
-then grants counts that store a second time: the union can exceed `maxSliceSize` only with a store loss and
-concurrent growth of one object near `L` together (cross-document-review.md X-W9).
+The bound counts each store's votes as one copy, which a rebuilt store would break: its new incarnation holds what
+its rebuild read, which can lack a growth T its lost incarnation voted commit for and that committed afterwards (the
+inherited-vote lock ends at T's resolution, which carries no data; the update arrives only through repair). A
+growing vote it granted then would be checked without T while T is counted at the old incarnation. So until a
+complete whole-object repair from a snapshot taken after the guard was set (a read after T's commit, which reflects
+T), a rebuilt store votes abort (`InheritedGrowthLock`) on any update that grows a KeyValue object its old
+incarnation may have voted to grow (`Frontend.inheritedGrowthLock`): the objects of the transactions its first
+held-vote round reports, and every KeyValue object with a missed-update entry against it, which covers a T finalized
+before the round (cross-document-review.md 2.3). It needs a store loss, a transaction left unresolved across the
+rebuild's read and concurrent growth of one object near `L` together; the guard costs nothing elsewhere.
 
 **R10 (a failed backend commit poisons the object).** After a backend commit failure (or `poisonObject`), the object is
 in `failedCommits` until the store reloads: every later transaction on it votes abort, and committed transactions do

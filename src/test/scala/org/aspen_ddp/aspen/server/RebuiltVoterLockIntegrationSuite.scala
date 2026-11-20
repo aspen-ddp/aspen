@@ -1,12 +1,13 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
-import org.aspen_ddp.aspen.client.{Transaction, TransactionAborted}
+import org.aspen_ddp.aspen.client.{TestTransactions, Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.network.{ClientResponse, TransactionVote, TxMessage, TxPrepareResponse}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{TransactionDisposition, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionDisposition, TransactionId}
+import org.aspen_ddp.aspen.server.repair.{RepairPolicy, StoreRepairer}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.Frontend
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
@@ -24,6 +25,15 @@ import scala.util.{Success, Try}
   * own vote is held from the leader, so the leader's round holds store 1's commit vote alone and waits for a quorum.
   */
 class RebuiltVoterLockIntegrationSuite extends IntegrationTestSuite with org.scalatest.ParallelTestExecution:
+
+  // Five stores for the growth test: a lost commit voter of a fresh write stays within the margin (t = 4 > r = 3)
+  override def testIdaFor(name: String): org.aspen_ddp.aspen.common.ida.IDA =
+    if name.contains("admits no growth") then org.aspen_ddp.aspen.common.ida.Replication(5, 4) else testIda
+
+  // T's stores resolve it by expiry once its client has committed it, so the growth test shortens the horizon
+  override def testHostOptionsFor(name: String): TestNetwork.HostOptions =
+    if name.contains("admits no growth") then testHostOptions.copy(transactionHorizon = Duration(2, SECONDS))
+    else testHostOptions
 
   // Retransmitting drivers, the leader's included: the leader's round waits for store 0's vote and gets it by resending
   override def testHostOptions: TestNetwork.HostOptions =
@@ -166,3 +176,94 @@ class RebuiltVoterLockIntegrationSuite extends IntegrationTestSuite with org.sca
 
   test("a rebuilt voter refuses a commit over a shared lock its lost incarnation's vote backs"):
     lockedThenConflicting((tx, f, rev) => tx.sharedLockRevision(f, rev))
+
+  // ---- Inherited growth (Frontend, Inherited growth; cross-document-review.md 2.3) ----
+  //
+  // The rare case: T grows a KeyValue object O with stores 0, 1, 3 and 4 voting commit (Replication(5, 4)), store 1 is
+  // lost and rebuilt while T is undecided, so its copy of O lacks T, and T then commits counting store 1's old vote.
+  // Until a repair installs T on the rebuilt store, a growth of O it voted for would count it twice in the bound that
+  // keeps every committed growth of O within the slice limit (transaction-requirements R16). T's leader is store 0,
+  // whose own vote is held from it, so T waits; store 2 never hears of T.
+
+  private def kvKey(s: String): Key = Key(s.getBytes)
+
+  private def allocateKV(): Future[KeyValueObjectPointer] =
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      kp <- client.transactUntilSuccessful: tx =>
+              given Transaction = tx
+              tx.replaySafe("test")
+              pool.allocator.allocateKeyValueObject()
+      _ <- settle(clock = false)
+    yield kp
+
+  /** A transaction inserting `key` into `kp`, which grows it */
+  private def growth(kp: KeyValueObjectPointer, key: String): Transaction =
+    val tx = TestTransactions.replaySafe(client.newTransaction())
+    tx.update(kp, None, None, List(KeyValueUpdate.DoesNotExist(kvKey(key))), List(Insert(kvKey(key), new Array[Byte](8))))
+    tx
+
+  test("a rebuilt voter admits no growth of a KeyValue object its lost incarnation's vote may be missing from, until repaired"):
+    var store1Votes = Map[TransactionId, TransactionDisposition.Value]()
+    def recordStore1Votes(r: ClientResponse): Boolean =
+      r match
+        case v: TransactionVote if v.fromStore == sid(1) => store1Votes += v.transactionId -> v.disposition
+        case _ => ()
+      false
+    def guarded(kp: KeyValueObjectPointer): Boolean = frontend(1).exists(_.inheritedGrowthLock(kp.id))
+    for
+      kp <- allocateKV()
+      tx = growth(kp, "t")
+      _ = net.offlineStores = Set(sid(1), sid(2), sid(3), sid(4))
+      _ = net.droppedTx = Set((sid(2), tx.id))
+      _ = net.dropTxMessage = store0Vote(tx.id)
+      _ = net.dropClientResponse = store0ClientVote(tx.id)
+      tCommit = tx.commit()
+      _ <- eventually("stores 0, 1, 3 and 4 voted commit on T", clock = false):
+             List(0, 1, 3, 4).forall(i => vote(i, tx.id).contains(TransactionDisposition.VoteCommit))
+      _ = net.offlineStores = Set()
+      _ = withClue("store 1's copy, which the rebuild serves, lacks T: "):
+            net.stores(1).m.get(kp.id).flatMap(_.kvState).exists(_.content.contains(kvKey("t"))) shouldBe false
+      rebuiltDir <- loseAndRebuildStore1()
+      _ <- eventually("the rebuilt store holds T's inherited vote", clock = true):
+             frontend(1).flatMap(_.inheritedVoteTransactions).contains(Set(tx.id))
+      // T commits, its resolution reaching the rebuilt store without its data
+      _ = net.dropTxMessage = _ => false
+      _ = net.dropClientResponse = _ => false
+      tResult <- outcome(tCommit, clock = true)
+      _ = withClue("T commits: ")(tResult.isSuccess shouldBe true)
+      _ = net.droppedTx = Set()
+      _ <- settle(clock = true)
+      _ <- eventually("the rebuilt store released T's inherited vote", clock = true):
+             frontend(1).flatMap(_.inheritedVoteTransactions).contains(Set())
+      _ = withClue("O is guarded against growth: ")(guarded(kp) shouldBe true)
+      _ = withClue("the inherited-votes file stays while O is guarded: "):
+            os.exists(rebuiltDir / RebuildingStore.InheritedVotesFile) shouldBe true
+      // U grows O: the rebuilt store votes abort, and the other four commit it
+      _ = net.dropClientResponse = recordStore1Votes
+      u = growth(kp, "u")
+      uResult <- outcome(u.commit(), clock = true)
+      _ <- settle(clock = true)
+      _ = withClue("U commits without the rebuilt store: ")(uResult.isSuccess shouldBe true)
+      _ = withClue("the rebuilt store votes abort on U: ")(store1Votes.get(u.id) shouldBe
+            Some(TransactionDisposition.VoteAbort))
+      // Repair installs T (and U) on the rebuilt store from a read after T committed, which ends the guard
+      repairer = StoreRepairer(client, net.hostFor(sid(1)))
+      _ <- {
+        def repairUntilReleased(passes: Int): Future[Unit] =
+          if !guarded(kp) then Future.unit
+          else if passes == 0 then Future.failed(new AssertionError("repair never released the growth guard"))
+          else pump(repairer.scan(sid(1), RepairPolicy.Default), clock = true)
+            .flatMap(_ => settle(clock = true)).flatMap(_ => repairUntilReleased(passes - 1))
+        repairUntilReleased(50)
+      }
+      v = growth(kp, "v")
+      vResult <- outcome(v.commit(), clock = true)
+      _ <- settle(clock = true)
+      read <- client.read(kp)
+    yield
+      withClue("V commits: ")(vResult.isSuccess shouldBe true)
+      withClue("once repaired, the rebuilt store votes commit on a growth: "):
+        store1Votes.get(v.id) shouldBe Some(TransactionDisposition.VoteCommit)
+      withClue("the inherited-votes file is gone: ")(os.exists(rebuiltDir / RebuildingStore.InheritedVotesFile) shouldBe false)
+      read.contents.keySet should contain allOf (kvKey("t"), kvKey("u"), kvKey("v"))

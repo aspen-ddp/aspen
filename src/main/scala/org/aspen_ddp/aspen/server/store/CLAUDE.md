@@ -43,7 +43,7 @@
   `Frontend.maxKVSliceSize` = `IDA.maxKVSliceSize(maxSliceSize)`, `floor(t * (maxSliceSize - 4) / w)` (allocations
   included; DataObjects keep `maxSliceSize`): a store checks only the slice it holds, which lacks commits it did not
   vote for, and this keeps the union of committed updates, which repair and rebuild install unchecked, within
-  `maxSliceSize` (transaction-requirements R16, with a rebuilt-store residual, cross-document-review X-W9). Without a
+  `maxSliceSize` (transaction-requirements R16; a rebuilt store also guards inherited growth, below). Without a
   `poolIDA` (tests) it is `maxSliceSize`. So a commit voter's apply never fails on size; a committed non-voter that
   no longer fits is skipped and reported. A non-growing update always passes. A repair install that grows a slice
   holding reservations is measured the same way, against `maxKVSliceSize` (`Frontend.repairFitsReservations`), and if
@@ -91,8 +91,23 @@
   (`HeldVoteQuery`, Host → `client.heldVotes`, `Store.heartbeat` → `retryHeldVoteQuery`, from the file's time on,
   1 s doubling to 30 s) completes, then on the objects of the reported transactions started before `acceptorSince`.
   A transaction is released when a later query no longer reports it or its `TxResolved`/`TxFinalized` reaches the
-  store; with none left the file is removed. Muted Txs are decided first, so only transactions started after
-  `acceptorSince` are affected
+  store; with none left, and no inherited growth guard held, the file is removed. Muted Txs are decided first, so only
+  transactions started after `acceptorSince` are affected
+- Inherited growth (`Frontend.inheritedGrowthLock`, the "Inherited growth" block in Frontend; transaction-requirements
+  R16, cross-document-review.md 2.3). Exists only for a rare case: the lost incarnation voted commit for a KeyValue
+  growth T, T committed after the rebuild read the object, and another growth of it near the KeyValue limit comes
+  before repair; a vote for that would count this store twice in R16's bound, so the union could overfill the slice.
+  The first held-vote round, after the peers answer (unresolved votes, and committed unfinalized ones,
+  `HeldVote.committed`), runs `HeldVoteQuery.growthScan` (the Host's: `StoreRepairer.inheritedGrowthScan`), which
+  marks the reported transactions' KeyValue objects and lists every KeyValue object with an ErrorTree or
+  UnackedCommits entry against the store. Those are guarded at once; a reported unresolved T's objects (if listed)
+  from its release (`setInheritedVotes`). A guarded object's growing update votes abort (`InheritedGrowthLock`, after
+  `RequirementsChecker.check` in `Tx.determineDisposition`, computed with `sliceGrowth` only while a guard is held); a
+  non-growing one passes. `reconcileForRepair`: a KeyValue object under the inherited-vote lock (all of them before
+  the first round) answers stale; a guarded one's complete result is stale unless the pass is whole-object and its
+  snapshot is later than the guard (`RepairSnapshot.takenAt`, numbered by `snapshotForRepair`), which ends the guard
+  (`inheritedGrowthRepaired`). A failed scan keeps every object locked and repeats the round. Nothing is persisted
+  beyond the inherited-votes file: a reload repeats the round, the guarded objects' entries still there
 - Start-time lead (`Frontend.MaxStartLead`, 2 s): every store mutes, the same way, a prepare for an unknown transaction
   whose client-chosen start timestamp leads the host's wall clock (`wallClockMillis`, not the JVM-wide HLC, which the
   host's own client ratchets) by more; the designated leader does not drive it (`Store`). The client's retransmission
@@ -104,7 +119,8 @@
   hold transactions it does not know yet. A committed Tx is held until TxFinalized, after its
   AllocationFinalizationAction, so every allocation whose AllocationTree entry may still be missing is listed by each
   store holding it. The reply also carries `Frontend.heldVotes`: each held Tx with outcome unknown, not muted, whose
-  vote is commit or undecided, with its objects in this pool (a rebuilt store's inherited votes)
+  vote is commit or undecided, with its objects in this pool (a rebuilt store's inherited votes), and each held Tx
+  known committed and not finalized, flagged `committed` (a rebuilt store's inherited growth)
 - Status query (`TxStatusRequest`, carrying the transaction's `startTimestamp`; horizon design section 2): every store
   with a final state answers. A store with a Tx replies with `Tx.statusForExpiry`: status, finalized, late,
   `holdsAcceptorState` (false only for a Tx muted for good below the floor), its latest `accepted` value and

@@ -93,3 +93,9 @@
   entries. Each entry delete re-checks it first: one cached ownership read per scan, redone when older than
   `StoreRepairer.OwnershipRecheck` (1 s, constructor seam `ownershipRecheck`). A check that fails leaves that entry and
   abandons the rest of the scan. The bootstrap sweep checks only at its start (it deletes nothing)
+- A rebuilt store's inherited-growth scan (`StoreRepairer.inheritedGrowthScan`, run by the Host for the store's first
+  held-vote round, `server/store/CLAUDE.md` Inherited growth): marks the given KeyValue objects the allocation tree
+  lists (missed at `HLCTimestamp.Zero`), then lists every KeyValue object with an ErrorTree or UnackedCommits entry
+  against the store. A typeless ErrorTree entry is left out (repair acts on it only for a deletion); an undecodable
+  entry fails the scan. Such a store answers stale for a guarded object's repair until a whole-object pass whose
+  snapshot follows the guard (repair-process 6.2), so its entry outlives the guard

@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueOperation, Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare, ProposalId}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, InheritedVoteLock, DataUpdate, InvalidDescription, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, InheritedGrowthLock, InheritedVoteLock, DataUpdate, InvalidDescription, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -1074,9 +1074,16 @@ class Tx( trs: TransactionRecoveryState,
       awaitingCommits = Set()
       val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
-      val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
+      val (checked, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
         frontend.maxSliceSize, frontend.maxKVSliceSize, allocatedOver = allocatedOver,
         allocating = txd.allocatingObjects)
+      // Only on a rebuilt store that may lack a committed growth its lost incarnation voted for (Frontend, Inherited
+      // growth; cross-document-review.md 2.3): no growing update of such an object is admitted until it is repaired
+      val m =
+        if !frontend.holdsInheritedGrowthLocks then checked
+        else checked ++ RequirementsChecker.sliceGrowth(transactionId, txd.startTimestamp, requirements, objects, ou)
+          .keysIterator.filter(oid => frontend.inheritedGrowthLock(oid) && !checked.contains(oid))
+          .map(_ -> InheritedGrowthLock())
 
       awaitableHolders(m, l) match
         case Some(holders) =>

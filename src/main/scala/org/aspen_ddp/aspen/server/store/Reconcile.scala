@@ -28,7 +28,11 @@ final case class RepairSnapshot(objectId: ObjectId, revision: ObjectRevision, re
                                 objectLevel: Option[KVObjectLevel],
                                 only: Option[Set[Key]] = None,
                                 proven: ReadLocks = ReadLocks.None,
-                                awaitSettle: Boolean = false):
+                                awaitSettle: Boolean = false,
+                                /** When the store recorded it, in its own sequence (Frontend.snapshotForRepair): a
+                                  * repair reads only after its snapshot, so a later snapshot means a later read. Used
+                                  * only to release a rebuilt store's inherited-growth lock (Frontend.inheritedGrowthLocks) */
+                                takenAt: Long = 0L):
 
   /** The store holds no copy: a live object never has a zero count */
   def isMissing: Boolean = refcount.count == 0

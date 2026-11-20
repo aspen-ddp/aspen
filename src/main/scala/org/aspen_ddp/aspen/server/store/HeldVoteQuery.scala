@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.network.HeldVote
+import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.StoreId
 
 import scala.util.Try
@@ -18,6 +19,14 @@ import scala.util.Try
   */
 trait HeldVoteQuery:
   def query(storeId: StoreId, answer: Try[List[HeldVote]] => Unit): Unit
+
+  /** A rebuilt store's inherited-growth scan (Frontend.inheritedGrowthLocks): marks each object of `mark` in the
+    * ErrorTree against the store, then answers every object with an ErrorTree or UnackedCommits entry against it
+    * (StoreRepairer.inheritedGrowthScan), or a Failure. The default answers no objects at once: for tests and stores
+    * without a host, which have no repair either. The Host's runs the real scan
+    */
+  def growthScan(storeId: StoreId, mark: Set[ObjectId], answer: Try[Set[ObjectId]] => Unit): Unit =
+    answer(scala.util.Success(Set()))
 
 object HeldVoteQuery:
   /** For tests and stores without a host: never answers */

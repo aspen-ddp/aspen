@@ -1343,6 +1343,18 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     def query(storeId: StoreId, answer: Try[List[HeldVote]] => Unit): Unit = answers = answers :+ answer
     def answer(result: Try[List[HeldVote]]): Unit = answers.last(result)
 
+    /** What each inherited-growth scan was asked to mark. A scan is answered at once with `autoScan`, or, when that is
+      * None, when the test calls answerScan */
+    var marked: List[Set[ObjectId]] = Nil
+    var autoScan: Option[Try[Set[ObjectId]]] = Some(Success(Set()))
+    private var scans: List[Try[Set[ObjectId]] => Unit] = Nil
+    override def growthScan(storeId: StoreId, mark: Set[ObjectId], answer: Try[Set[ObjectId]] => Unit): Unit =
+      marked = marked :+ mark
+      autoScan match
+        case Some(result) => answer(result)
+        case None => scans = scans :+ answer
+    def answerScan(result: Try[Set[ObjectId]]): Unit = scans.last(result)
+
   private val inheritedTxid = TransactionId(new UUID(0, 99))
 
   /** A rebuilt store (acceptor started 2 s ago) holding its inherited-votes file, gate at `after` */
@@ -1431,6 +1443,144 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       query.answer(Failure(new Exception("no quorum")))
       frontend.inheritedVoteTransactions shouldBe None
       voteOn(frontend, txid1, List(overwrite(op1))) shouldBe TransactionDisposition.VoteAbort
+  }
+
+  // ---- A rebuilt store's inherited growth (Frontend, Inherited growth; cross-document-review.md 2.3) ----
+  //
+  // The rare case: the lost incarnation voted commit for a growth T of kvPtr, T committed after the rebuild read
+  // kvPtr, so the rebuilt copy lacks it. Until a repair shows the store holds T, it admits no growth of kvPtr.
+
+  /** This store's vote on a fresh transaction writing key `key` of kvPtr with `value`, under a pinned KeyRevision.
+    * A value longer than the stored one-byte value grows the object; an empty one shrinks it */
+  private def voteKV(frontend: Frontend, txid: TransactionId, key: Int, value: Array[Byte])
+      : TransactionDisposition.Value =
+    val req = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(key), rev0)), pinned = true)
+    val txd = lockTxd(txid, List(req)).copy(startTimestamp = ago(FiniteDuration(1, SECONDS)))
+    val data = KeyValueOperation.encode(List(new Insert(k(key), value)), ida)(0)
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(objectUpdates =
+      List(ObjectUpdate(oid2, data))))
+    frontend.transactions(txid).vote
+
+  private val growing = Array.fill[Byte](32)(7)
+  private val shrinking = Array[Byte]()
+
+  /** A whole-object repair of kvPtr from `snapshot`, whose read matches the store: complete unless the store says
+    * stale */
+  private def repairKV(frontend: Frontend, snapshot: RepairSnapshot): ReconcileResult =
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(snapshot, kvRead(1 to 3), done)
+    done.future.value.get.get
+
+  private def abortTx(frontend: Frontend, txid: TransactionId): Unit =
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid, committed = false, late = false,
+      proof = false))
+
+  test("a rebuilt store admits no growth of an object with an entry against it until a later repair of it") {
+    // T was finalized before the first round: no peer reports it, but its finalizer marked this store
+    withInheritedVotes(): (frontend, query, dir) =>
+      query.autoScan = None
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(Nil))
+      withClue("every object stays locked until the scan answers: ")(frontend.inheritedVoteTransactions shouldBe None)
+      val before = repairSnapshot(frontend, kvPtr)
+      query.answerScan(Success(Set(oid2)))
+      frontend.inheritedVoteTransactions shouldBe Some(Set())
+
+      voteKV(frontend, txid1, 1, growing) shouldBe TransactionDisposition.VoteAbort
+      withClue("an update that grows nothing passes: "):
+        voteKV(frontend, txid2, 2, shrinking) shouldBe TransactionDisposition.VoteCommit
+      abortTx(frontend, txid2)
+      withClue("data objects are not guarded: "):
+        voteOn(frontend, txid3, List(overwrite(op1))) shouldBe TransactionDisposition.VoteCommit
+      abortTx(frontend, txid3)
+
+      withClue("a repair from a snapshot taken before the guard is stale, keeping the entry: "):
+        repairKV(frontend, before).stale shouldBe true
+      voteKV(frontend, TransactionId(new UUID(0, 90)), 1, growing) shouldBe TransactionDisposition.VoteAbort
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe true
+
+      repairKV(frontend, repairSnapshot(frontend, kvPtr)).complete shouldBe true
+      voteKV(frontend, TransactionId(new UUID(0, 91)), 1, growing) shouldBe TransactionDisposition.VoteCommit
+      withClue("the file goes once nothing is guarded: ")(os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false)
+  }
+
+  test("a rebuilt store guards the objects of an unresolved inherited transaction once it is released") {
+    withInheritedVotes(): (frontend, query, dir) =>
+      // The scan lists the entry its own mark wrote
+      query.autoScan = Some(Success(Set(oid2)))
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(List(HeldVote(inheritedTxid, ago(FiniteDuration(3, SECONDS)), Set(oid2)))))
+      withClue("the scan marks the reported transaction's objects: ")(query.marked shouldBe List(Set(oid2)))
+      frontend.inheritedVoteTransactions shouldBe Some(Set(inheritedTxid))
+      voteKV(frontend, txid1, 2, shrinking) shouldBe TransactionDisposition.VoteAbort
+      withClue("no repair completes while the inherited vote may yet commit: "):
+        repairKV(frontend, repairSnapshot(frontend, kvPtr)).stale shouldBe true
+
+      val beforeRelease = repairSnapshot(frontend, kvPtr)
+      frontend.receiveTransactionMessage(TxResolved(storeId, StoreId(poolId, 1), inheritedTxid, committed = true,
+        late = false, proof = false))
+      frontend.inheritedVoteTransactions shouldBe Some(Set())
+      voteKV(frontend, txid2, 1, growing) shouldBe TransactionDisposition.VoteAbort
+      voteKV(frontend, txid3, 2, shrinking) shouldBe TransactionDisposition.VoteCommit
+      abortTx(frontend, txid3)
+      repairKV(frontend, beforeRelease).stale shouldBe true
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe true
+
+      repairKV(frontend, repairSnapshot(frontend, kvPtr)).complete shouldBe true
+      voteKV(frontend, TransactionId(new UUID(0, 92)), 1, growing) shouldBe TransactionDisposition.VoteCommit
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false
+  }
+
+  test("a rebuilt store guards the objects of a committed, unfinalized inherited transaction at once") {
+    withInheritedVotes(): (frontend, query, dir) =>
+      query.autoScan = None
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(List(HeldVote(inheritedTxid, ago(FiniteDuration(3, SECONDS)), Set(oid2),
+        committed = true))))
+      query.marked shouldBe List(Set(oid2))
+      query.answerScan(Success(Set(oid2)))
+      withClue("a committed transaction locks nothing: ")(frontend.inheritedVoteTransactions shouldBe Some(Set()))
+      voteKV(frontend, txid1, 1, growing) shouldBe TransactionDisposition.VoteAbort
+      repairKV(frontend, repairSnapshot(frontend, kvPtr)).complete shouldBe true
+      voteKV(frontend, txid2, 1, growing) shouldBe TransactionDisposition.VoteCommit
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false
+  }
+
+  test("a narrowed repair does not release a growth guard, and answers stale so the next pass is whole") {
+    withInheritedVotes(): (frontend, query, _) =>
+      query.autoScan = Some(Success(Set(oid2)))
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(Nil))
+      val narrowed = repairKV(frontend, repairSnapshot(frontend, kvPtr).copy(only = Some(Set(k(1)))))
+      narrowed shouldBe ReconcileResult(Set(), false, stale = true)
+      voteKV(frontend, txid1, 1, growing) shouldBe TransactionDisposition.VoteAbort
+  }
+
+  test("a failed inherited-growth scan keeps every object locked and repeats the round") {
+    withInheritedVotesClock(0L): (frontend, query, _, clock) =>
+      query.autoScan = Some(Failure(new Exception("trees unreadable")))
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(Nil))
+      frontend.inheritedVoteTransactions shouldBe None
+      voteOn(frontend, txid1, List(overwrite(op1))) shouldBe TransactionDisposition.VoteAbort
+      query.autoScan = Some(Success(Set()))
+      clock.now += Frontend.InheritedVoteQueryInitialInterval.toMillis
+      frontend.retryHeldVoteQuery()
+      query.made shouldBe 2
+      query.answer(Success(Nil))
+      frontend.inheritedVoteTransactions shouldBe Some(Set())
+  }
+
+  test("a store reports the transactions it knows committed until they are finalized") {
+    val (frontend, _, net) = lockFixture()
+    val start = ago(FiniteDuration(1, SECONDS))
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = start)).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    frontend.heldVotes() shouldBe List(HeldVote(txid1, start, Set(oid1), committed = true))
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false,
+      owed = Set(), startTimestamp = start))
+    frontend.heldVotes() shouldBe Nil
   }
 
   test("a store reports the commit votes it holds unresolved, and not its abort votes or resolved ones") {

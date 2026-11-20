@@ -385,6 +385,13 @@ else reconcileSettled
 `commitInFlight` covers outstanding transaction commits, repair writes and committed transactions holding their
 commit for their turn (`heldCommits`). `commitFailed` includes objects poisoned by `poisonObject`.
 
+A rebuilt store also answers stale, before any of this, for a KeyValue object under its inherited-vote lock (every
+object until its first held-vote round completes), and turns a complete result into a stale one for an object it
+guards against growth unless the pass is whole-object and its snapshot was taken after the guard was set
+(`RepairSnapshot.takenAt`), when the guard ends (`Frontend.inheritedGrowthRepaired`; cross-document-review.md 2.3).
+The entry so outlives the guard, which only a repair can end. A stale result defers nothing by a lock, so the next
+pass is whole-object.
+
 `reconcileSettled`, all in one executor task:
 
 1. `current` = the store's copy now (`RepairSnapshot.of`, or `missing`).

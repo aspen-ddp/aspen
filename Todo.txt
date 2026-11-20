@@ -45,16 +45,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.1 [X-W9] A rebuilt store can count its lost incarnation's KeyValue growth twice; the union can exceed maxSliceSize.
-    PLAUSIBLE. Effort M. cross-document-review.md (residual of the closed concurrency case; R16 states the bound).
-    Stores admit KeyValue growth within IDA.maxKVSliceSize (t/w of the slice), which bounds the union of committed
-    updates by maxSliceSize when each store is one copy. A rebuilt store lacks a growth T its lost incarnation voted
-    commit for that resolved after the rebuild's read: the inherited-vote lock ends at T's resolution, which carries no
-    data, so a growing vote it grants before repair installs T is checked without T. Needs a store loss and concurrent
-    near-limit growth of one object. Consequence as before: repair and an FSIF rebuild cannot install the object.
-    Fix: a rebuilt store refuses growing votes on an object whose inherited vote resolved committed until it holds
-    that transaction's update.
-
 2.2 [CRL-W14] A transfer out of a closed store merges stale device-CRL entries into its crl_save.log.
     PLAUSIBLE. Effort S. crash-recovery-log.md.
     StoreTransfers.extractUnloaded saves saved.supersededBy(state): device-CRL entries override the save file's by id.

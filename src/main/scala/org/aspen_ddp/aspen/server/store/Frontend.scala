@@ -20,7 +20,7 @@ import org.aspen_ddp.aspen.server.host.JoinCeiling
 import org.aspen_ddp.aspen.client.{ReadLocks, ObjectState as ClientObjectState}
 
 import scala.concurrent.duration.{Duration, FiniteDuration, SECONDS}
-import scala.concurrent.{Await, Future, Promise}
+import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
 
 
@@ -342,16 +342,23 @@ class Frontend(val storeId: StoreId,
 
   /** The transactions this store holds whose commit vote may still count: outcome unknown, and a vote that is commit or
     * not yet decided (a collision wait or an in-flight commit may still decide commit). A muted Tx never votes commit.
-    * Each with its objects in this store's pool. Answered with currentAllocations: None while the CRL loads
+    * Each with its objects in this store's pool. Answered with currentAllocations: None while the CRL loads.
+    * Also every held Tx known committed and not yet finalized (`HeldVote.committed`): a rebuilt store's lost
+    * incarnation may have voted for it, and the rebuilt copy may lack its update (inheritedGrowthLocks). A committed Tx
+    * is held by each of its commit voters until TxFinalized, and its finalizer marks a voter that never acknowledged
+    * it before finalizing, so a transaction no store reports this way has its marks written
     */
   def heldVotes(): List[HeldVote] =
     transactions.valuesIterator.flatMap: tx =>
-      if tx.muted || tx.isFinalized || tx.knownOutcome.isDefined || tx.vote == TransactionDisposition.VoteAbort then
+      val committedUnfinalized = tx.knownOutcome.contains(true) && !tx.isFinalized
+      if !committedUnfinalized && (tx.muted || tx.isFinalized || tx.knownOutcome.isDefined ||
+                                   tx.vote == TransactionDisposition.VoteAbort) then
         None
       else
         val txd = tx.txd
         val oids = txd.allReferencedObjectsSet.iterator.filter(_.poolId == storeId.poolId).map(_.id).toSet
-        if oids.isEmpty then None else Some(HeldVote(txd.transactionId, txd.startTimestamp, oids))
+        if oids.isEmpty then None
+        else Some(HeldVote(txd.transactionId, txd.startTimestamp, oids, committed = committedUnfinalized))
     .toList
 
   def receiveCurrentAllocationsRequest(req: CurrentAllocationsRequest): Unit =
@@ -387,6 +394,98 @@ class Frontend(val storeId: StoreId,
   /** The transactions this store's inherited votes may still back. None: not known yet, every object is locked */
   def inheritedVoteTransactions: Option[Set[TransactionId]] = inheritedVotes.map(_.keySet)
 
+  // ---- Inherited growth (a rebuilt store; transaction-requirements.md R16, cross-document-review.md 2.3) ----
+  //
+  // THE RARE CASE THIS EXISTS FOR. Everything below is idle unless all of these happen together:
+  //   1. a store is lost while its old incarnation holds a commit vote for a transaction T that grows a KeyValue
+  //      object O;
+  //   2. T is still unresolved when the rebuild reads O, and commits afterwards, so the rebuilt copy of O lacks T's
+  //      update while T still counts this store among its writeThreshold commit voters;
+  //   3. before repair installs T here, another transaction grows O near the KeyValue limit and this store votes
+  //      commit on it.
+  // Each store admits KeyValue growth only within maxKVSliceSize (t/w of the slice) of the slice it holds, and the
+  // argument that this keeps the union of committed updates within maxSliceSize counts each store once (R16). In step
+  // 3 the store checks the new growth against a slice without T, while T is counted at its old incarnation: the store
+  // is counted twice, the union can exceed maxSliceSize, and repair and an FSIF rebuild can then never install O
+  // (CommitError.SliceTooLarge) until it shrinks. The inherited-vote lock above does not cover it: it ends when T's
+  // resolution reaches the store, and a resolution carries no data.
+  //
+  // So a rebuilt store votes abort on any update that GROWS an object it may hold without such a T
+  // (InheritedGrowthLock, Tx.determineDisposition) until a repair shows it holds T. Updates that grow nothing pass, so
+  // an object can always be shrunk. The objects are found at the store's first held-vote round, which runs only past
+  // the inherited-votes gate, when every vote on such a T has been cast (heldVotesAnswered):
+  //   - T still unresolved: reported by a peer (the inherited votes). Its objects are under the inherited-vote lock
+  //     until T is released, and guarded against growth from then on (setInheritedVotes).
+  //   - T committed, not yet finalized: reported by a peer as committed (HeldVote.committed); guarded at once.
+  //   - T finalized before the round: its finalizer first marked this store, which never acknowledged T, in the
+  //     ErrorTree or UnackedCommits tree. The round lists every KeyValue object with an entry against the store, read
+  //     after the peers answered (HeldVoteQuery.growthScan), and guards them all: more than needed, but only until the
+  //     repair those entries already call for.
+  // The scan first marks every KeyValue object of the reported transactions (missed at HLCTimestamp.Zero), so each
+  // object has an entry whatever T's outcome, and repair comes to it. A guard ends at a complete whole-object repair
+  // from a snapshot taken after the guard was set (inheritedGrowthRepaired): that read began after T committed, so it
+  // reflects T (repair-process.md E1). A repair that cannot release a guard, or of a KeyValue object under the
+  // inherited-vote lock (every object until the first round completes), answers stale, so the entry stays for the
+  // repair that can: an entry consumed while the round runs could otherwise leave a guard no repair ever ends. Only
+  // KeyValue objects are guarded: a DataObject's updates form a revision chain each voter checked in full (R16). The
+  // inherited-votes file stays while any guard does: a reload repeats the round, and finds what is still guarded by
+  // the entries the guards keep.
+
+  /** Objects this rebuilt store guards against growth, each with the repair-snapshot sequence number when its guard
+    * was set: only a snapshot taken after it releases it. Empty on a store that was never rebuilt */
+  private var inheritedGrowthLocks: Map[ObjectId, Long] = Map()
+  /** The objects with entries against this store that the first round's scan found. An inherited transaction released
+    * later guards only these: only they are sure to be repaired */
+  private var inheritedGrowthScanned: Set[ObjectId] = Set()
+  /** Counts repair snapshots (snapshotForRepair, RepairSnapshot.takenAt) */
+  private var repairSnapshotSeq: Long = 0L
+
+  /** A growing update of `oid` votes abort (InheritedGrowthLock): see Inherited growth */
+  def inheritedGrowthLock(oid: ObjectId): Boolean = inheritedGrowthLocks.contains(oid)
+
+  /** Whether any object is guarded against growth: false, and free to test, on a store that was never rebuilt */
+  def holdsInheritedGrowthLocks: Boolean = inheritedGrowthLocks.nonEmpty
+
+  private def guardGrowth(oids: Iterable[ObjectId]): Unit =
+    oids.foreach(oid => inheritedGrowthLocks += oid -> repairSnapshotSeq)
+
+  /** Removes the inherited-votes file once neither an inherited vote nor a growth guard is held */
+  private def removeInheritedStateWhenDone(): Unit =
+    if inheritedVotes.exists(_.isEmpty) && inheritedGrowthLocks.isEmpty then
+      RebuildingStore.removeInheritedVotes(backend.path)
+
+  /** The first round's scan answered (HeldVoteQuery.growthScan): every object with an entry against this store, the
+    * reported transactions' objects now among them. The objects are guarded, then the inherited votes are set */
+  private def growthScanAnswered(result: Try[Set[ObjectId]], unresolved: Map[TransactionId, Set[ObjectId]]): Unit =
+    heldVoteQueryInFlight = false
+    result match
+      case Failure(err) =>
+        logger.warn(s"Store $storeId: inherited-growth scan failed, retrying the held-vote round: $err")
+      case Success(objects) =>
+        if inheritedVotes.isEmpty then
+          if objects.nonEmpty then
+            logger.info(s"Store $storeId: guarding ${objects.size} objects against growth until repaired " +
+                        "(inherited growth)")
+          inheritedGrowthScanned = objects
+          guardGrowth(objects)
+          setInheritedVotes(unresolved)
+
+  /** The result of a repair of `objectId`, which is guarded against growth. A complete whole-object repair from a
+    * snapshot taken after the guard was set releases it; any other complete one answers stale instead, keeping its
+    * entry for a repair that can release the guard */
+  private def inheritedGrowthRepaired(objectId: ObjectId, snapshot: RepairSnapshot, result: Try[ReconcileResult],
+                                      p: Promise[ReconcileResult]): Unit =
+    result match
+      case Success(r) if r.complete && inheritedGrowthLocks.contains(objectId) =>
+        if snapshot.only.isEmpty && inheritedGrowthLocks.get(objectId).exists(snapshot.takenAt > _) then
+          inheritedGrowthLocks -= objectId
+          logger.info(s"Store $storeId: object $objectId is repaired, so no longer guarded against growth")
+          removeInheritedStateWhenDone()
+          p.success(r)
+        else
+          p.success(r.copy(deferredKeys = Set(), objectLevelDeferred = false, stale = true))
+      case _ => p.complete(result)
+
   private def holdsInheritedVotes: Boolean = inheritedVotes.forall(_.nonEmpty)
 
   /** Store heartbeat: asks the peers again, once past the gate and the backoff, while any inherited vote is held */
@@ -405,10 +504,14 @@ class Frontend(val storeId: StoreId,
   private def setInheritedVotes(next: Map[TransactionId, Set[ObjectId]]): Unit =
     if !inheritedVotes.contains(next) then
       logger.info(s"Store $storeId: inherited votes now held for ${next.keySet}")
+    // A released transaction may have committed, and this store may lack its update: its objects are guarded against
+    // growth from now on (Inherited growth)
+    inheritedVotes.foreach: votes =>
+      guardGrowth(votes.iterator.filter((txid, _) => !next.contains(txid)).flatMap(_._2)
+        .filter(inheritedGrowthScanned.contains).toList)
     inheritedVotes = Some(next)
     inheritedObjects = next.valuesIterator.flatten.toSet
-    if next.isEmpty then
-      RebuildingStore.removeInheritedVotes(backend.path)
+    removeInheritedStateWhenDone()
 
   private def heldVotesAnswered(result: Try[List[HeldVote]]): Unit =
     heldVoteQueryInFlight = false
@@ -417,11 +520,17 @@ class Frontend(val storeId: StoreId,
         logger.warn(s"Store $storeId: query of its peers' held votes failed, retrying: $err")
       case Success(held) =>
         // A transaction started at or after acceptorSince never had this store's old vote
-        val reported = held.iterator.filter(v => acceptorSince.forall(v.startTimestamp < _))
-          .toList.groupMapReduce(_.transactionId)(_.objectIds)(_ ++ _)
-        setInheritedVotes(inheritedVotes match
-          case None => reported
-          case Some(votes) => votes.filter((txid, _) => reported.contains(txid)))
+        val inherited = held.filter(v => acceptorSince.forall(v.startTimestamp < _))
+        val unresolved = inherited.filterNot(_.committed).groupMapReduce(_.transactionId)(_.objectIds)(_ ++ _)
+        inheritedVotes match
+          case None =>
+            // The first round: before the inherited votes are set, the growth scan lists what to guard (Inherited
+            // growth), read after the peers answered. Every object stays locked until it answers
+            heldVoteQueryInFlight = true
+            heldVoteQuery.growthScan(storeId, inherited.iterator.flatMap(_.objectIds).toSet,
+              scanned => post(() => growthScanAnswered(scanned, unresolved)))
+          case Some(votes) =>
+            setInheritedVotes(votes.filter((txid, _) => unresolved.contains(txid)))
     heldVoteQueryNotBefore = wallClockMillis() + heldVoteQueryInterval
     heldVoteQueryInterval = math.min(heldVoteQueryInterval * 2, InheritedVoteQueryMaxInterval.toMillis)
 
@@ -2005,8 +2114,13 @@ class Frontend(val storeId: StoreId,
   /** Records the store's copy of the object for a repair (Reconcile): first step, before the repair reads it. An
     * object the store does not hold, or is deleting, gives an empty snapshot
     */
-  def snapshotForRepair(pointer: ObjectPointer, p: Promise[RepairSnapshot]): Unit =
+  def snapshotForRepair(pointer: ObjectPointer, stamped: Promise[RepairSnapshot]): Unit =
     val objectId = pointer.id
+    // Numbered when asked for, which is no later than the state it records (Inherited growth)
+    repairSnapshotSeq += 1
+    val takenAt = repairSnapshotSeq
+    val p = Promise[RepairSnapshot]()
+    stamped.completeWith(p.future.map(_.copy(takenAt = takenAt))(using ExecutionContext.parasitic))
     if stopped then p.failure(new IllegalStateException(s"Store $storeId fail-stopped"))
     else servableState(objectId) match
       case Some(os) => p.success(RepairSnapshot.of(os))
@@ -2019,6 +2133,22 @@ class Frontend(val storeId: StoreId,
     * `p` completes with what was left undone once the backend has the change
     */
   def reconcileForRepair(snapshot: RepairSnapshot, read: ClientObjectState, p: Promise[ReconcileResult]): Unit =
+    val objectId = read.pointer.id
+    if !stopped && read.pointer.objectType == ObjectType.KeyValue && inheritedVoteLock(objectId) then
+      // A rebuilt store's inherited vote may back a growth of the object that has yet to commit, or the first held-vote
+      // round has yet to find what to guard: the entry must stay for a repair the guard can rely on (Inherited
+      // growth). Only KeyValue objects are guarded
+      p.success(ReconcileResult(Set(), false, stale = true))
+    else if !stopped && inheritedGrowthLocks.contains(objectId) then
+      val guarded = Promise[ReconcileResult]()
+      guarded.future.onComplete(r => post(() => inheritedGrowthRepaired(objectId, snapshot, r, p)))(
+        using ExecutionContext.parasitic)
+      reconcileUnguarded(snapshot, read, guarded)
+    else
+      reconcileUnguarded(snapshot, read, p)
+
+  private def reconcileUnguarded(snapshot: RepairSnapshot, read: ClientObjectState,
+                                 p: Promise[ReconcileResult]): Unit =
     val objectId = read.pointer.id
     if stopped then p.failure(new IllegalStateException(s"Store $storeId fail-stopped"))
     else servableState(objectId) match
@@ -2142,7 +2272,8 @@ class Frontend(val storeId: StoreId,
   private def retryParkedRepair(objectId: ObjectId): Unit =
     if parkedRepairs.nonEmpty && settledForRepair(objectId) then
       parkedRepairs.remove(objectId).foreach: parked =>
-        reconcileForRepair(parked.snapshot.copy(awaitSettle = false), parked.read, parked.p)
+        // Its promise is already the guarded one, if the object is guarded (reconcileForRepair)
+        reconcileUnguarded(parked.snapshot.copy(awaitSettle = false), parked.read, parked.p)
 
   /** Answers stale every parked repair past its deadline. Called on the store's heartbeat */
   def expireParkedRepairs(): Unit =

@@ -6,7 +6,9 @@
   `runPass`) plus the `horizon` parameter (default `TransactionHorizon.Horizon`, the longest a host uses) plus twice
   `AcceptorSinceMargin`. From then on every vote on a transaction the old incarnation joined has been cast, so the
   rebuilt store's first query of its peers' held votes after it is complete (`Frontend.inheritedVoteLock`,
-  `server/store/CLAUDE.md`)
+  `server/store/CLAUDE.md`). The same round finds the KeyValue objects the rebuilt copy may hold without a growth the
+  old incarnation voted for, and guards them against growth until repaired (Inherited growth, same guide); the
+  rebuild itself does nothing for it
 - `finish` also writes a fresh `incarnation` file (`StoreIncarnationFile.writeFresh`) into staging, overwriting any
   present, after `acceptor-since` and before the marker: a rebuilt store is a new incarnation
 - Rebuild episode (rebuild-process.md 2.1, B18): every transition into Rebuilding writes a fresh UUID into the

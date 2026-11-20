@@ -17,7 +17,8 @@ import scala.language.implicitConversions
   *
   * Stores check growth against the slice they hold, which lacks the commits they did not vote for, so growth is
   * admitted only within the KeyValue limit (IDA.maxKVSliceSize, transaction-requirements R16): the union of the
-  * committed updates, which repair and rebuild install, then fits the pool's slice limit (cross-document-review X-W9).
+  * committed updates, which repair and rebuild install, then fits the pool's slice limit (a rebuilt store also guards
+  * the growth its lost incarnation voted for until repaired: RebuiltVoterLockIntegrationSuite).
   */
 class ConcurrentSliceGrowthIntegrationSuite extends IntegrationTestSuite:
   val sliceLimit: Int = 16384

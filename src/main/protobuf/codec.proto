@@ -404,6 +404,7 @@ message HeldVote {
   UUID transaction_uuid = 1;
   uint64 start_timestamp = 2;
   repeated UUID object_ids = 3; // the transaction's objects in the store's pool
+  bool committed = 4; // known committed, not yet finalized
 }
 
 message CurrentAllocationsReply {

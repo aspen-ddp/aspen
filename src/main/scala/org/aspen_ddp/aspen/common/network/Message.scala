@@ -224,12 +224,14 @@ final case class PendingAllocation(transactionId: TransactionId,
                                    committed: Boolean,
                                    pointers: List[ObjectPointer])
 
-/** A transaction a store holds with its outcome unknown and a vote that is commit or not yet decided: a commit vote
-  * that may still count. `objectIds` are the transaction's objects in the store's pool (a rebuilt store's inherited
-  * votes: Frontend.inheritedVotes) */
+/** A transaction a store holds with its outcome unknown and a vote that is commit or not yet decided, a commit vote
+  * that may still count (`committed` false), or one it knows committed and has not seen finalized (`committed` true).
+  * `objectIds` are the transaction's objects in the store's pool (a rebuilt store's inherited votes and inherited
+  * growth: Frontend.inheritedVotes, Frontend.inheritedGrowthLocks) */
 final case class HeldVote(transactionId: TransactionId,
                           startTimestamp: HLCTimestamp,
-                          objectIds: Set[ObjectId])
+                          objectIds: Set[ObjectId],
+                          committed: Boolean = false)
 
 final case class CurrentAllocationsReply(toClient: ClientId,
                                          fromStore: StoreId,

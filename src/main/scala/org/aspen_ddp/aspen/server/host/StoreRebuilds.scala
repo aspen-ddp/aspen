@@ -349,6 +349,18 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 release()
                 recheckAll()
 
+            case Success(RebuildOutcome.Unconfirmed) =>
+              // An attempt reported Unknown may have made the copy the owner's before its entry moved on (a transfer
+              // out, say). Kept in place, offline and unpromoted, for the pass that owns the entry's state: the
+              // transfer ships it, an aborted one reinstates it, the Deleted Stores pass retires it
+              try
+                unsilence(storeId, clear = false)
+                keepUnpromotedCopyOffline(local, storeId)
+              finally
+                settledOutcome()
+                release()
+                recheckAll()
+
             case Success(RebuildOutcome.NotOwned) =>
               // The device is another host's now; the copy is left for it. Only the other
               // devices are worth re-checking: this one is not ours to reconcile.

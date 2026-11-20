@@ -235,6 +235,35 @@ class CommittedUnknownRetrySuite extends IntegrationTestSuite:
       dev.stores(storeId).status should be(StorageDeviceState.StoreStatus.Active)
       online should be(List(storeId))
 
+  atest("a rebuild completion reported Unknown keeps the copy whose entry has moved on since (RB-W15)"):
+    given ExecutionContext = executionContext
+    val tclient = client.asInstanceOf[TestNetwork.TClient]
+    @volatile var entryMoved = false
+    for
+      _ <- ready()
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- setDeviceState(net.secondDeviceId)(_.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Rebuilding, None))
+      devPtr <- client.getStorageDevicePointer(net.secondDeviceId)
+      _ = net.reportCommitAsUnknown(touches(devPtr))
+      // Between the attempt that committed Active and its retry, a transfer takes the now Active entry out
+      _ = tclient.beforeRetry =
+        case _: org.aspen_ddp.aspen.client.TransactionOutcomeUnknown if !entryMoved =>
+          entryMoved = true
+          setDeviceState(net.secondDeviceId)(_.setStoreEntry(storeId, StorageDeviceState.StoreStatus.TransferringOut,
+                                                             Some(net.thirdDeviceId)))
+        case _ => Future.unit
+      outcome <- net.smgr.control.metadata.markRebuiltStoreActive(net.secondDeviceId, storeId, None, _ => ())
+      _ = tclient.beforeRetry = _ => Future.unit
+      dev <- client.getStorageDeviceState(net.secondDeviceId)
+    yield
+      net.pendingUnknownCommits should be(0)
+      entryMoved should be(true)
+      dev.stores(storeId).status should be(StorageDeviceState.StoreStatus.TransferringOut)
+      // Not Discard: the earlier attempt may have made the copy the owner's, and the transfer is shipping it
+      outcome should be(RebuildOutcome.Unconfirmed)
+
   atest("replaceRebuild reported Unknown succeeds and sends its nudges"):
     given ExecutionContext = executionContext
     for

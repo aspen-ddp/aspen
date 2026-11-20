@@ -59,7 +59,7 @@ pending-allocation sweep for allocations the lost store had acknowledged (sectio
 | R4 | Rebuilding on D1 | Rebuilding on D2 | `AspenClient.replaceRebuild` (`transfer-store` on a Rebuilding store) | operator re-placement; one transaction removes the D1 entry, writes D2's, repoints the pool (and the radicle's bootstrap config for a bootstrap-pool store) |
 | R5 | Rebuilding | Active | `DeviceMetadata.markRebuiltStoreActive` returning `RebuildOutcome.Adopt` | device not Failed, owned by this host, entry Rebuilding, device not ShuttingDown/Shutdown (`StorageDeviceState.serviceStatus`) |
 | R6 | Rebuilding | Offline | same method, `AdoptOffline` | device ShuttingDown or Shutdown |
-| R7 | Rebuilding | unchanged | same method, `Discard` / `NotOwned` / `Superseded` | device Failed, or entry absent or of another status (`Discard`); device owned by another host (`NotOwned`); entry Rebuilding under another episode than the rebuild's (`Superseded`) |
+| R7 | Rebuilding | unchanged | same method, `Discard` / `NotOwned` / `Superseded` / `Unconfirmed` | device Failed, or entry absent or of another status (`Discard`; `Unconfirmed` instead on a retry after `TransactionOutcomeUnknown` on a non-Failed device); device owned by another host (`NotOwned`); entry Rebuilding under another episode than the rebuild's (`Superseded`) |
 | R8 | Rebuilding | unchanged | device shutdown (`DeviceShutdown.stopDeviceWork`) | `withActiveStoresOffline` touches only Active entries; the rebuild is cancelled with its checkpoint kept, and resumed after restart or adoption |
 | R9 | Rebuilding on a tombstone | moved | `moveStore` | the drain moves a Rebuilding entry like any other |
 
@@ -124,7 +124,7 @@ start
                   empty crl_save.log, rebuild-complete (the episode), remove checkpoint,
                   DurableFiles.move(staging ► final)
   ► complete ► StoreRebuilds completion handler ► markRebuiltStoreActive
-             ► Adopt | AdoptOffline | Discard | NotOwned | Superseded
+             ► Adopt | AdoptOffline | Discard | NotOwned | Superseded | Unconfirmed
 ```
 
 ---
@@ -422,7 +422,10 @@ Offline; `NotOwned` if another host owns the device; `Superseded` if the entry i
 than the rebuild's; Rebuilding of its episode is flipped to `serviceStatus` (`Adopt` for Active,
 `AdoptOffline` for Offline on a shutting-down device); an entry already Active is `Adopt` and one already Offline is
 `AdoptOffline` (a concurrent completion, or this call's own attempt reported `TransactionOutcomeUnknown`, which then
-gossips the store online itself). The host acts only after the decision:
+gossips the store online itself). A retry after `TransactionOutcomeUnknown` (`retry.mayHaveCommitted`) on a device not
+Failed never answers `Discard`: the earlier attempt may have flipped the entry Active, making the copy the owner copy,
+and a transfer out (`StoreTransfers.startOut` accepts the unloaded copy) or a removal of the entry may have moved it on
+since. It answers `Unconfirmed` instead. The host acts only after the decision:
 
 * `Adopt`: removes `rebuild-complete` durably (`clearRebuildCompleteMarker`: unlink if present, then force the store
   directory), then `loadStoreById`. The committed flip gossips `StoreMoved` (`HostServices.gossipStoreOnline`),
@@ -437,6 +440,11 @@ gossips the store online itself). The host acts only after the decision:
   `finish` wrote, then removes `rebuild-complete`; an adopter classes it Clean and a restart's reinstatement loads it.
 * `Discard`: deletes the final directory (`LocalDevices.discardStoreDirectory`).
 * `NotOwned`: leaves the copy for the new owner, whose rebuild finds the marked final path and only flips.
+* `Unconfirmed`: leaves the copy at the final path, offline and unpromoted (`keepUnpromotedCopyOffline`), for the pass
+  that owns the entry's current state. A TransferringOut entry ships it (its `rebuild-complete` travels with it, and the
+  destination's Completed Rebuilds pass clears it once the entry there is Active); an aborted transfer has the
+  Abandoned Transfers Out pass reinstate it and the Completed Rebuilds pass load it; an entry that has left the device
+  has the Deleted Stores pass retire it. Only the retry path differs, so nothing is added per transaction.
 * `Superseded`: leaves the copy at the final path, offline: it is added to the device's `offlineStores`
   (`keepUnpromotedCopyOffline`), the state a restart's load leaves it in. Its marker names the earlier episode, so the
   current episode's `startRebuild` retires it (`retireForeignCopy`: marked `rebuild-required`, kept in
@@ -477,7 +485,8 @@ dropped before the rebuild (4.3), so nothing on the device recovers them.
 `StoreRouter` answers "unknown" only for a store that is neither installed nor `offline`, `loading` or
 `awaitingDevice`. `startRebuild` marks the store offline (`router.markOffline`, recorded in `silenced`) on every
 reconcile that sees its Rebuilding entry, queued for a slot or running, so the host drops its messages. The mark ends
-with the outcome: an adopted store's install clears it; `AdoptOffline` and `NotOwned` keep it (out of `silenced`);
+with the outcome: an adopted store's install clears it; `AdoptOffline`, `NotOwned` and `Unconfirmed` keep it (out of
+`silenced`);
 `Superseded` keeps it in `silenced` for the current episode; `Discard`, a cancel
 because the entry left the device, and `abandonUnlisted` for a queued store clear it unless a device's
 `offlineStores` holds the store for another path. A failed pass keeps it until the retry. A device that is not loaded
@@ -830,25 +839,4 @@ transfer's promotion fail and retry; its flip then reads TransferringIn and gets
 
 ## Open weaknesses
 
-### RB-W15: A flip retried after `TransactionOutcomeUnknown` deletes the owner copy its own committed attempt promoted
-Verdict PLAUSIBLE. Priority 2. Effort S.
-Mechanism: `DeviceMetadata.markRebuiltStoreActive` runs under `StopRetrying.collisionRetry`. Its first attempt commits
-the Rebuilding entry Active, but the client reports `TransactionOutcomeUnknown` (past the transaction horizon, 20 s or
-more), and the retry re-reads the device state. Meanwhile the entry is Active and the rebuilt copy sits unloaded at the
-final path, still carrying `rebuild-complete`. An operator `transfer-store` or the rebalancer can take that Active
-entry TransferringOut in the window; `StoreTransfers.startOut` accepts an unloaded store (`closeForTransferOut` ►
-`extractUnloaded`), writes the transfer-out marker and starts shipping the directory. The retry then finds the entry
-TransferringOut, which matches neither Rebuilding, Active nor Offline, and returns `RebuildOutcome.Discard` with no
-`retry.mayHaveCommitted` check. `StoreRebuilds.startRebuild`'s Discard branch calls
-`LocalDevices.discardStoreDirectory`, which deletes the directory (`StoreCopies.delete`) under the send.
-Consequence: the pool still names the device and the entry is TransferringOut, but the device holds no copy. The send
-fails, and every retransmitted `StartStoreTransfer` fails at the marker write into the missing directory. An abort
-returns the entry to Active over no directory. No pass notices an Active entry without a directory on a loaded device,
-so the store is never served or rebuilt, and `checkPoolsStayWritable` counts it writable. That is a silent, permanent
-loss of one unit of the pool's write-threshold margin, caused by asynchrony alone.
-Fix: in `markRebuiltStoreActive`, once `retry.mayHaveCommitted` holds, never answer `Discard` for a non-Failed
-device: the earlier attempt may have made the copy the owner's. Return an outcome that keeps the copy in place
-(the `Superseded` handling: `keepUnpromotedCopyOffline`). A TransferringOut source then ships it, and the destination's
-Completed Rebuilds pass clears the marker it carries. An aborted transfer has the Abandoned Transfers Out pass reinstate
-it and the Completed Rebuilds pass load it. An entry that has left the device has the Deleted Stores pass retire it.
-Only the retry path changes, so nothing is added per transaction.
+None.

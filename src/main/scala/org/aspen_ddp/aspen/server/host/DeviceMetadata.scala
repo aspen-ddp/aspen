@@ -121,6 +121,13 @@ object DeviceMetadata:
      *  marker names the earlier episode, is never promoted, and the current episode's rebuild retires it. */
     case Superseded
 
+    /** An earlier attempt of this flip was reported TransactionOutcomeUnknown, so it may have made the entry Active
+     *  and the copy the store's owner copy, and the entry has since become something the flip does not adopt
+     *  (TransferringOut, say, or gone from the device). Nothing was written. The copy stays at the store's path,
+     *  offline and unpromoted, for the pass that owns the entry's current state: a transfer out ships it, an aborted
+     *  one reinstates it, and an entry that has left the device has its copy retired (rebuild-process 5.4). */
+    case Unconfirmed
+
   /** What completeDeviceShutdown decided, so shutDownDevice knows whether to unload the device,
    *  go round again, or undo its own on-disk work.
    *
@@ -461,6 +468,15 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
               // flipped Active and then taken Offline by the shutdown request. Either way the
               // copy is this device's and must stay out of service. No update staged.
               RebuildOutcome.AdoptOffline
+
+            case _ if retry.mayHaveCommitted =>
+              // An earlier attempt may have flipped the entry Active, making the copy the owner's, and a transfer
+              // out (or a removal of the entry) has moved it on since. Deleting the copy could delete the store's
+              // only owner copy under that transfer: it is kept for the pass that owns the entry's current state.
+              // No update staged
+              logger.info(s"Rebuild of store $storeId may have completed in an attempt reported Unknown, and its " +
+                          s"entry has moved on since. Keeping the copy offline")
+              RebuildOutcome.Unconfirmed
 
             case _ =>
               // Entry missing entirely, or has a status other than Rebuilding/Active (Initializing,

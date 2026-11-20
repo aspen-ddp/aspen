@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen
 import java.util.UUID
 import org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.internal.BaseAspenClient
-import org.aspen_ddp.aspen.client.{AspenClient, RegisteredTypeFactory, Transaction, TransactionStatusCache}
+import org.aspen_ddp.aspen.client.{AspenClient, ExponentialBackoffRetryStrategy, RegisteredTypeFactory, RetryStrategy, Transaction, TransactionStatusCache}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.read.BaseReadDriver
@@ -197,6 +197,18 @@ object TestNetwork {
     /** Retries creates as the production client does (SimpleAspenClient.runCreate), for tests of a create whose
       * committed attempt the client is told is Unknown */
     @volatile var retryCreates: Boolean = false
+
+    /** Runs after a failed attempt of a `transactUntilSuccessfulWithRecovery` call whose handler chose to retry, and
+      * before the retry is scheduled: a test's write between an attempt reported Unknown and its retry's reads */
+    @volatile var beforeRetry: Throwable => Future[Unit] = _ => Future.unit
+
+    override val retryStrategy: RetryStrategy = new RetryStrategy:
+      private val base = new ExponentialBackoffRetryStrategy(TClient.this)
+      def retryUntilSuccessful[T](attempt: => Future[T]): Future[T] = base.retryUntilSuccessful(attempt)
+      def retryUntilSuccessful[T](onAttemptFailure: Throwable => Future[Unit])(attempt: => Future[T]): Future[T] =
+        given ExecutionContext = executionContext
+        base.retryUntilSuccessful(err => onAttemptFailure(err).flatMap(_ => beforeRetry(err)))(attempt)
+      def shutdown(): Unit = base.shutdown()
 
     // Single attempt, no retry: test failures must surface rather than being retried away.
     override protected def runCreate[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T]): Future[T] =

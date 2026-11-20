@@ -45,17 +45,7 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.4 [RB-W15] A flip retried after TransactionOutcomeUnknown deletes the owner copy its own committed attempt promoted.
-    PLAUSIBLE. Effort S. rebuild-process.md.
-    DeviceMetadata.markRebuiltStoreActive runs under StopRetrying.collisionRetry. If the first attempt commits Active
-    but reports TransactionOutcomeUnknown (after the horizon), a transfer-store or rebalancer can move the entry to
-    TransferringOut meanwhile (startOut accepts the unloaded copy). The retry reads TransferringOut and returns
-    RebuildOutcome.Discard without checking retry.mayHaveCommitted; StoreRebuilds.startRebuild then
-    LocalDevices.discardStoreDirectory deletes the only owner copy. The transfer fails, an abort restores Active over
-    no directory, and nothing notices (X-W11): permanent silent loss of a unit of margin.
-    Fix: once retry.mayHaveCommitted holds, never return Discard for a non-Failed device; return the Superseded
-    handling (keepUnpromotedCopyOffline) so the transfer, Abandoned Transfers Out, Completed Rebuilds and Deleted
-    Stores passes take over. Retry path only.
+(no open items)
 
 
 PRIORITY 3: systemic loss protection
@@ -87,7 +77,7 @@ PRIORITY 3: systemic loss protection
     marker or a specific entry state, and entry/directory consistency is checked only at adoption (Unclean).
     tryLoadStore skips a directory without config.yaml silently, retryFailedLoads drops a retry whose config vanished,
     and an unreadable config is retried forever, logged at debug after the first warning. checkPoolsStayWritable
-    counts the store: one fault (a lost directory, RB-W15) silently and permanently costs a unit of margin, and the
+    counts the store: one fault (a lost directory) silently and permanently costs a unit of margin, and the
     entry keeps its CRL leftovers out of dropLeftoverCrlState.
     Fix: a reconcile pass that, for such an entry (not loaded, opening, retiring or closed for shutdown), marks it
     offline, drops its leftover device-CRL entries and calls StoreRebuilds.requestRebuild. Log a missing or

@@ -38,7 +38,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Repair | Rebuild, transfers | The ownership fence (host and device) keeps superseded copies from consuming entries |
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
-| Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); no transfer starts onto an occupied store path, so the copy is this episode's (2.2). A retried flip that finds TransferringOut discards the copy (rebuild-process.md RB-W15) |
+| Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); no transfer starts onto an occupied store path, so the copy is this episode's (2.2). A flip retried after `TransactionOutcomeUnknown` that finds the entry moved on (TransferringOut, absent) keeps the copy offline rather than discarding it (`Unconfirmed`, rebuild-process.md 5.7) |
 | Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (`rebuild-complete`) has never served, so it holds nothing in the device CRL and is not marked (`DeviceDiscovery.holdsOwnState`) |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
@@ -443,7 +443,7 @@ Mechanism: `DeviceDiscovery.loadOwnedDevice` offers only directories that exist 
 every `DeviceReconciler.reconcileDeviceState` pass that loads or rebuilds a store needs an `offlineStores` member with
 a marker, an Initializing, TransferringIn or Rebuilding entry, or a shutdown's closed store. Entry-versus-directory
 consistency is checked only at adoption (`DeviceDiscovery.adoptionClass`, Unclean). A directory lost by a bad
-restore or partial mount, a hand removal, or rebuild-process.md RB-W15's discard leaves an Active (or Offline) entry
+restore, a partial mount or a hand removal leaves an Active (or Offline) entry
 with nothing behind it. `tryLoadStore` also skips a directory without `config.yaml` with no log and no
 `offlineStores` entry, and `retryFailedLoads` drops a retry whose `config.yaml` vanished; an unreadable one is retried
 forever, logged at `debug` after the first warning.

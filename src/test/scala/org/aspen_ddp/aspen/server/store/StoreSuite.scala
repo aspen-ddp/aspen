@@ -120,6 +120,22 @@ class StoreSuite extends AnyFunSuite with Matchers:
     net.sentTx.collect { case r: TxResolved => (r.to, r.from) } shouldBe List((storeId, storeId))
   }
 
+  // transaction-recovery 4.2: after a lost TxFinalized, the entry the store's own resolved Tx wrote is no news to its
+  // driver, which would otherwise take it as a non-late resolution and run T's finalization actions again
+  test("the relay of a non-finalized entry tells a store whose own Tx is resolved nothing, and still tells the sender") {
+    val statusCache = new TransactionStatusCache()
+    val (store, net, _) = mkStore(storeId, statusCache, Duration(40, SECONDS))
+    store.receiveTransactionMessage(prepare(storeId, leader))
+    store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true, late = false, proof = false))
+    statusCache.getStatus(txid1).map(e => (e.status, e.finalized)) shouldBe Some((TransactionStatus.Committed, false))
+
+    net.sentTx = Nil
+    store.receiveTransactionMessage(prepare(storeId, storeId))
+    store.receiveTransactionMessage(prepare(storeId, peer))
+
+    net.sentTx.collect { case r: TxResolved => (r.to, r.from, r.late) } shouldBe List((peer, storeId, false))
+  }
+
   // paxos-transactions 10.6: a sibling store's delayed resolution no longer downgrades the host's finalized entry, so
   // the relay still answers a replayed prepare with a late, finalized commit
   test("a sibling store's delayed resolution does not downgrade a finalized late entry") {

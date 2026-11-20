@@ -402,9 +402,9 @@ non-finalized `Committed` entry stems only from a Paxos, relayed or expiry-commi
 resolution records none, saves `Unresolved` and reports `Unresolved` in status replies until finalized
 (`Tx.statusForExpiry`), so no expiry adoption records one either (transaction-recovery.md 7.2). A self-relay is
 delivered after the Tx the prepare creates and any driver started for it exist, so both learn the outcome; below the
-floor the Frontend refuses the prepare and nothing is created. The entry may be the store's own Tx's: after a lost
-`TxFinalized`, its idle driver learns a non-late commit from it and runs T's finalization actions again before a
-peer's finalized relay makes it resolve late (R-W10). A prepare dropped by CRL admission
+floor the Frontend refuses the prepare and nothing is created. The entry may be the store's own Tx's, so no
+self-relay is sent while that Tx is resolved: after a lost `TxFinalized` its idle driver would take it as a non-late
+commit and run T's finalization actions again; it learns the outcome from its peers. A prepare dropped by CRL admission
 (`Store.receiveTransactionMessage`, lane full) gets no relay either; every store still holding T answers itself, so
 that only delays the sender.
 

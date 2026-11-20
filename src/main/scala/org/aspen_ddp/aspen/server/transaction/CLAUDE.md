@@ -323,7 +323,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   ignored), so an entry must never be wrong or downgraded. Its retention is not relied on: a lost entry's transaction
   is below the forget floor. The relay of a resolved, unfinalized entry (`Store.handleTransactionMessage`) goes
   as a `TxResolved` to the prepare's sender, whose recovery driver learns the outcome, and to the store itself, so the
-  `outcomeDecided` Tx that prepare creates and the store's own driver learn it too (paxos-transactions 10.2)
+  `outcomeDecided` Tx that prepare creates and the store's own driver learn it too (paxos-transactions 10.2). Not to
+  itself while its own Tx for T is resolved: the entry may be that Tx's (`Tx.resolved`), and after a lost TxFinalized
+  its idle driver would take it as a non-late commit and re-run T's finalization actions; it learns from its peers
+  (late from their finalized relay, or by Paxos) (transaction-recovery 4.2)
 - `TransactionStatusCache.updateStatus` keeps Committed over an opposite outcome (P19). Under the horizon an
   opposite outcome should never arise: one that does is logged as an error ("Split decision") and counted
   (`splitDecisions`)

@@ -180,10 +180,11 @@ answers in this order:
    driver treats as resolution (`onResolution(sendResolutionMessage = false)`) and, for a commit, runs the finalizer
    itself. If the store holds no Tx and the transaction is above its floor, the Frontend creates one marked
    `outcomeDecided` (no locks; status queries get the cached outcome); below the floor it refuses the prepare. The
-   entry may be the store's own: a Tx resolved committed records a non-finalized `Committed` (`Tx.resolved`), so the
-   idle driver a store starts after its `TxFinalized` was lost, whose prepare reaches its own store too, learns a
-   non-late commit from its own host's entry and starts a finalizer; a peer's finalized relay (`TxFinalized(late)`)
-   then makes it resolve late and cancel that finalizer (`resolveLate`; R-W10).
+   entry may be the store's own: a Tx resolved committed records a non-finalized `Committed` (`Tx.resolved`). So the
+   store sends itself nothing when its own Tx for T is already resolved: that resolution is no news to its driver,
+   and the idle driver a store starts after its `TxFinalized` was lost would take it as a non-late commit and run T's
+   finalization actions again. That driver learns the outcome from its peers instead: late from their finalized relay
+   (`TxFinalized(late)`, then `resolveLate`), or by Paxos while they still hold T.
 3. **Live `Tx`** (`Tx.receivePrepare`): it answers with its fixed vote and an acceptor promise, sent only after the
    CRL save of that state completes (or after its objects load, then the save). A Tx that already applied the commit
    also resends `TxCommitted` to the proposer.
@@ -854,10 +855,10 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
   entry's transaction is refused rather than joined afresh.
 * **Lost `TxFinalized`**: the idle Tx starts a driver after 5-6 s; the peers answer from their 30 s entries with
   `TxResolved`+`TxFinalized(late)`; the driver resolves late, finalizes with no actions, and a commit voter that
-  already applied looks its entry up only for its stub. Unless a store of T on the same host saw `TxFinalized`, the
-  store's own host entry is a non-finalized `Committed` that answers the driver's prepare to its own store first: the
-  driver resolves non-late, starts a finalizer whose actions execute at once, and cancels it when the late answer
-  arrives (its marker writes nothing if that is within `errorTimeout`; R-W10). If even that window passes, nothing is re-decided: the Tx ends by expiry,
+  already applied looks its entry up only for its stub. The store's own host entry, a non-finalized `Committed` unless
+  a store of T on the same host saw `TxFinalized`, does not answer the driver's prepare to its own store: the relay
+  sends no self `TxResolved` while the store's own Tx is resolved, so no finalization action runs again. If the
+  caches' window passes, nothing is re-decided: the Tx ends by expiry,
   concluding its known outcome once more than `w - t` primary acceptors no longer hold T.
 * **Clock skew**: no clock decides replay. Clocks remain in the forget floor's time leg (a step back of more than about
   8 s can let a store rejoin T, paxos-transactions.md), in the `acceptorSince` and `MaxStartLead` mutes, and in repair's
@@ -894,24 +895,4 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-### R-W10: after a lost TxFinalized the store's own status-cache entry makes its recovery driver re-run T's actions
-Verdict CONFIRMED. Priority 5. Effort S.
-Mechanism: a Tx resolved committed records a non-finalized `Committed` in its host's status cache (`Tx.resolved`). When
-its `TxFinalized` is lost and no other store of T on the host saw one, the store drives the idle Tx
-(`Store.heartbeat`), and its driver's prepare to its own store meets that entry in `Store.handleTransactionMessage`'s
-relay, which sends the store `TxResolved(committed, late = false)`. The driver takes it as resolution
-(`TransactionDriver.receiveTxResolved` -> `onResolution(sendResolutionMessage = false)`) and starts a finalizer
-(`startFinalizer`), whose actions all execute at once (`RegisteredTransactionFinalizerFactory.Finalizer`). The peers'
-finalized relay (`TxFinalized(late)`) arrives after the local answer and makes it `resolveLate`, which cancels the
-finalizer: the marker writes nothing if that is within `errorTimeout`, but the other actions have already run.
-Consequence: every lost `TxFinalized` at such a store re-executes T's non-marker finalization actions after T was
-finalized and forgotten (allocation-tree reads, TKVL split, join or tail-removal work), which `resolveLate`'s premise
-says it never does. If no late answer arrives within `errorTimeout` (peers unreachable, or past their caches after a
-size eviction), the marker writes ErrorTree marks for every store of T and UnackedCommits entries naming no
-incarnation for every one but this, and the `TxFinalized` that follows has every store write a stub: repair passes and
-CRL admission spent on stores that applied T long ago. The shipped actions tolerate a late re-run, so no safety effect.
-Fix: in the relay, send the self `TxResolved` of a non-finalized entry only when the store's own Tx for T is not
-already resolved (`frontend.transactions.get(txid).forall(_.knownOutcome.isEmpty)`): its own resolution is no news to
-its own driver, which then learns the outcome from its peers (late from their finalized relay, or by Paxos from their
-accepted values while they still hold T). One map lookup on the relay of a resolved, unfinalized entry; nothing on the
-hot path.
+None.

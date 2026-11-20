@@ -295,9 +295,13 @@ class Store(val storageDeviceId: StorageDeviceId,
 
           // A non-finalized outcome goes to the sender, whose driver may be recovering T, and to this store itself:
           // delivered after the Tx this prepare creates and any driver started below exist, so both resolve from it
-          // (paxos-transactions 10.2)
+          // (paxos-transactions 10.2). Not to itself when its own Tx is resolved: the entry may be that Tx's own
+          // (Tx.resolved), no news to its driver, which after a lost TxFinalized would take it as a non-late resolution
+          // and run T's finalization actions again. That driver learns the outcome from its peers instead: late from
+          // their finalized relay, or by Paxos while they still hold T (transaction-recovery 4.2)
           r.foreach { resolved =>
-            net.sendTransactionMessage(resolved)
+            if (entry.finalized || frontend.transactions.get(m.txd.transactionId).forall(_.knownOutcome.isEmpty))
+              net.sendTransactionMessage(resolved)
             if (msg.from != msg.to && !entry.finalized)
               net.sendTransactionMessage(resolved.copy(to = msg.from, from = msg.to))
           }

@@ -45,17 +45,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.3 [X-W12] A rebuilt copy's first load recovers device-CRL entries an earlier copy of the store left.
-    PLAUSIBLE. Effort S. cross-document-review.md.
-    Only StoreCopies.retire drops a store's entries and dropLeftoverCrlState skips stores the device entry lists.
-    retireForeignCopy / discardLostStore return at once on an empty path, so a rebuild over a copy removed without a
-    retire loads with no crl_save.log (awaitCrlLoad None -> recoverDeferred) and recovers the stale entries. Second,
-    narrow path: StoreRebuilds.backendFailed starts closeUnloaded(dropDurably = false) without awaiting it, so a save
-    the closing executor enqueues after the retire's dropStore survives. Stale votes, locks and stubs come back under a
-    new incarnation; a stale commit vote can re-apply.
-    Fix: crl.dropStore(storeId) before a rebuilt copy's first load (Adopt, AdoptOffline, Completed Rebuilds pass);
-    closeUnloaded returns its future and the retire paths wait for it.
-
 2.4 [RB-W15] A flip retried after TransactionOutcomeUnknown deletes the owner copy its own committed attempt promoted.
     PLAUSIBLE. Effort S. rebuild-process.md.
     DeviceMetadata.markRebuiltStoreActive runs under StopRetrying.collisionRetry. If the first attempt commits Active

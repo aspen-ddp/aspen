@@ -392,8 +392,9 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(rebuilds.created.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      // The rebuilt store lands at its final path, as the walk leaves it.
+      // The rebuilt store lands at its final path, with the empty save file finish writes.
       _ = os.makeDir.all(deviceDir / s0.directoryName)
+      _ = RebuildingStore.writeEmptyCrlState(deviceDir / s0.directoryName, s0)
       _ = rebuilds.created.head.promise.success(())
       _ <- pumpUntil(recorded(host).rebuildFlipSeq.contains((deviceA, s0)))
       entryAfterFlip <- state(deviceA).map(_.stores.get(s0))
@@ -404,7 +405,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
       recorded(host).loadStoreByIdRequests.toList should be(Nil)
       os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
-      // Empty, as a fresh rebuild has no transaction state, but present so an adopter accepts it.
+      // Kept beside the marker, so an adopter accepts it.
       os.exists(Backend.crlSaveFile(deviceDir / s0.directoryName)) should be(true)
       host.control.router.offlineStores should contain(s0)
       st.stores(s0).status should be(StoreStatus.Offline)

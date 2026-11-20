@@ -12,6 +12,7 @@ import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPoint
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, CommitState, CompletionHandler, DefaultBackendOpener, StoreCreation}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.BufferedConsistentRocksDB
@@ -115,6 +116,8 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       os.exists(finalPath / RebuildState.stateFilename) should be(false)
       // Moved in carrying the marker that keeps it offline until its flip commits (rebuild-process 2.2)
       os.exists(finalPath / RebuildingStore.RebuildCompleteMarkerFile) should be(true)
+      // Its whole transaction state, empty, so its first load drops what the device CRL holds for it (rebuild-process 5.6)
+      CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(finalPath), storeId) should be(Right(StoreRecoveryState.Empty))
       // A StoreConfig is written up front, so the moved directory is loadable.
       StoreConfig.loadStoreConfig(finalPath / StoreConfig.configFilename).storeId should
         be(storeId)

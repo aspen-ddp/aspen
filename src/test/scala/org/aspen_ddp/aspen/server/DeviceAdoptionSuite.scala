@@ -574,8 +574,9 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       // The rebuild, past its last read, lands its store and finishes on the unloaded device.
       d0Old = oldDir / s0.directoryName
       _ = os.makeDir.all(d0Old)
+      _ = RebuildingStore.writeEmptyCrlState(d0Old, s0)
       _ = rebuilds.created.head.promise.success(())
-      _ <- pumpUntil(os.exists(Backend.crlSaveFile(d0Old)))
+      _ <- pumpUntil(os.exists(d0Old / StoreTransfer.TransferOutMarkerFile))
       entryAfterRebuild <- state(deviceA).map(_.stores(s0))
       markerWritten = os.exists(marker(d0Old))
       crlWritten = os.exists(Backend.crlSaveFile(d0Old))

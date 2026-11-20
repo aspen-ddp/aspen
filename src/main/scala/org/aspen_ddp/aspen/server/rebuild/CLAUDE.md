@@ -11,6 +11,11 @@
   rebuild itself does nothing for it
 - `finish` also writes a fresh `incarnation` file (`StoreIncarnationFile.writeFresh`) into staging, overwriting any
   present, after `acceptor-since` and before the marker: a rebuilt store is a new incarnation
+- `finish` also writes an empty `crl_save.log` (`RebuildingStore.writeEmptyCrlState`) before the marker: the rebuilt
+  store's whole transaction state. Its first load, by any path, is then a save-file load, which drops whatever the
+  device CRL holds under its id (an earlier copy's leftovers: one removed without a retire, or a fail-stopped copy's
+  close saving behind its retire's drop) before loading it (`server/host/CLAUDE.md`). `keepRebuiltStoreOffline`
+  relies on the file being there
 - Rebuild episode (rebuild-process.md 2.1, B18): every transition into Rebuilding writes a fresh UUID into the
   entry's `transferId` (`StorageDeviceState.setRebuilding`, `StoreEntry.rebuildEpisode`), and `RebuildingStore`
   runs for the episode the reconcile read (`StoreRebuildFactory.createRebuild`'s `episode`). The checkpoint carries

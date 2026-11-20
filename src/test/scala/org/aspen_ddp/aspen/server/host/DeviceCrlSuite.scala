@@ -773,7 +773,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       storeDir <- writeRocksStore(deviceDir, storeId)
       // As RebuildingStore.finish leaves it. It never served, so the lost CRL held nothing of it
-      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, episode.fold("")(_.toString))
+      _ = landRebuiltCopy(storeDir, episode)
       host = newCrlHost(hostRoot, corruptOnFirstOpen(newFactory()), rebuilds = rebuilds)
       _ = host.control.reconciler.checkAll()
       _ <- pumpWithTx(host, host.control.reconciler.activeDeviceChecks.isEmpty &&
@@ -1152,6 +1152,51 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       recoveredByCopy should be(Set())
       // Deleted from the files too, so a later restart does not recover them either
       heldOnDisk(deviceDir, storeId) should be(Set())
+
+  // rebuild-process 5.6: a rebuild over a path whose copy left without a retire (removed by hand) finds nothing to
+  // discard, so the device CRL still holds the old copy's entries when the rebuilt copy first loads
+  atest("a rebuilt copy's first load does not recover entries a copy removed without a retire left in the device CRL"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    val episode = UUID.randomUUID()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      _ = os.remove.all(storeDir)
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map(storeId ->
+             StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None, Some(episode)))))
+      _ <- waitForTransactionsToComplete()
+      restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
+      heldAtRestart = held(second.opened.head, storeId)
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
+      _ <- writeRocksStore(deviceDir, storeId)
+      _ = landRebuiltCopy(storeDir, Some(episode))
+      _ = rebuilds.created.head.promise.success(())
+      _ <- pumpWithTx(restarted, restarted.control.router.loaded.contains(storeId) &&
+                                 !os.exists(Backend.crlSaveFile(storeDir)))
+      rebuilt = restarted.control.router.loaded(storeId)
+      recoveredByCopy = rebuilt.frontend.transactions.keySet
+      leftInCrl = held(second.opened.head, storeId)
+      _ <- rebuilt.backend.close()
+      _ = second.shutdownAll()
+    yield
+      heldAtRestart should be(Set(txid))
+      recoveredByCopy should be(Set())
+      leftInCrl should be(Set())
+      heldOnDisk(deviceDir, storeId) should be(Set())
+
+  /** Writes into the store directory at `storeDir` the files RebuildingStore.finish leaves beside the rebuilt
+   *  backend, for a test whose rebuild only lands a store there */
+  private def landRebuiltCopy(storeDir: os.Path, episode: Option[UUID]): Unit =
+    RebuildingStore.writeEmptyCrlState(storeDir, storeId)
+    os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, RebuildingStore.rebuildCompleteContent(episode))
 
   atest("a discarded store is kept in pending-delete with its CRL entries until the store is Active again"):
     given ExecutionContext = executionContext

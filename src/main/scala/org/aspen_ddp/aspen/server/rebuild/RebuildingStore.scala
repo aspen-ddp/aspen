@@ -13,6 +13,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.PendingAllocation
 import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId}
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.store.{Frontend, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, StoreCreation}
 import scribe.Logging
@@ -52,6 +53,18 @@ object RebuildingStore:
    *  (StoreRebuilds), or by the reconcile for an Active entry after a crash between the flip and the removal
    *  (DeviceReconciler) */
   val RebuildCompleteMarkerFile = "rebuild-complete"
+
+  /** Writes the rebuilt store's whole transaction state, which is empty, as the crl_save.log of the store directory
+   *  at `storePath` (finish, in staging before the rebuild-complete marker). A rebuilt store has never served, so
+   *  whatever the device CRL holds under its id was left by an earlier copy of the store on this device whose
+   *  directory left its path without a retire (removed by hand, or a fail-stopped copy's close saving behind the
+   *  retire's drop). Its first load, wherever it comes from (the flip, the Completed Rebuilds pass, a restart, a
+   *  reinstated transfer out, an adoption), is a save-file load, which drops those entries durably before loading the
+   *  file (StoreLoader.awaitCrlLoad); a transfer out of the unloaded copy ships the file and drops them likewise
+   *  (StoreTransfers.extractUnloaded). Without it the copy would recover their votes, locks and applied stubs as its
+   *  own under its new incarnation, and a stale commit vote could apply again. */
+  def writeEmptyCrlState(storePath: os.Path, storeId: StoreId): Unit =
+    CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(storePath))
 
   /** The content of the rebuild-complete marker of `episode` */
   def rebuildCompleteContent(episode: Option[UUID]): String = episode.map(_.toString).getOrElse("")
@@ -887,6 +900,8 @@ class RebuildingStore(client: AspenClient,
     writeInheritedVotes(stagingPath, inheritedVotesAfter(passStartMillis, horizon))
     // A new life for the store, replacing any incarnation the staging directory carried
     StoreIncarnationFile.writeFresh(stagingPath)
+    // Its whole transaction state: its first load drops whatever the device CRL holds under its id
+    writeEmptyCrlState(stagingPath, storeId)
     // Last write before the move: the directory is a finished rebuild, kept out of service until its flip commits
     DurableFiles.write(stagingPath / RebuildCompleteMarkerFile, rebuildCompleteContent(episode))
     // The checkpoint, and a temp file a crash caught between its write and its rename, are kept out of the

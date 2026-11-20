@@ -39,7 +39,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
 | Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); no transfer starts onto an occupied store path, so the copy is this episode's (2.2). A retried flip that finds TransferringOut discards the copy (rebuild-process.md RB-W15) |
-| Rebuild, CRL | Store lifecycle | A rebuilt copy's first load finds nothing under its id in the device CRL (it need not: X-W12) |
+| Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (`rebuild-complete`) has never served, so it holds nothing in the device CRL and is not marked (`DeviceDiscovery.holdsOwnState`) |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
@@ -182,8 +182,11 @@ skipped silently (X-W11). This
   existing path, except an earlier tenancy's `rebuild-complete` or `rebuild-required` copy, which it retires before
   asking for any bytes, and not while a rebuild of the store still runs here (rebuild-process.md FS18). So an Active
   entry here over this rebuild's copy was made Active by this episode. Its wait for a store served here tests the
-  store id alone, so a transfer between two devices of one host never starts (X-W13). A rebuilt copy loads without
-  dropping device-CRL entries under its id, which only a retire drops (X-W12).
+  store id alone, so a transfer between two devices of one host never starts (X-W13). A rebuilt copy carries an empty
+  `crl_save.log` (`RebuildingStore.writeEmptyCrlState`), so its first load (by the flip, the Completed Rebuilds pass,
+  a restart, a reinstatement or an adoption) drops whatever device-CRL entries an earlier copy left under its id
+  (`StoreLoader.awaitCrlLoad`), and a transfer out of the unloaded copy ships the file and drops them
+  (`StoreTransfers.extractUnloaded`).
 * Host-side client work (UnackedCommits lookups, held-vote queries, the repair service) runs
   on the host's `ec`, not a store executor or the control thread. It keeps no host state of its own beyond what it
   locks (`DeferralState`, `StoreRepairer`'s counters), reads store state only through `@volatile` snapshots
@@ -446,28 +449,11 @@ with nothing behind it. `tryLoadStore` also skips a directory without `config.ya
 forever, logged at `debug` after the first warning.
 Consequence: the pool counts the store writable (`checkPoolsStayWritable`) while nothing serves it: a silent,
 permanent loss of one unit of margin from one fault, and the entry keeps the store's device-CRL entries out of
-`dropLeftoverCrlState` (X-W12).
+`dropLeftoverCrlState` (a rebuilt copy's first load drops them).
 Fix: add a reconcile pass: an Active or Offline entry on a loaded device with no directory, not loaded, opening,
 retiring or closed for shutdown, is marked offline, its leftover device-CRL entries dropped, and a rebuild requested
 (`StoreRebuilds.requestRebuild`). Log a directory without a config, and a config retry at each cap interval, at error.
 Rare path only.
-
-### X-W12: A rebuilt copy's first load recovers device-CRL entries an earlier copy of the store left
-Verdict PLAUSIBLE. Priority 2. Effort S.
-Mechanism: only `StoreCopies.retire` drops a store's device-CRL entries before a new copy lands at its path, and
-`DeviceReconciler.dropLeftoverCrlState` skips every store the device entry lists. `StoreRebuilds.startRebuild` runs
-`retireForeignCopy` and `discardLostStore`, both true at once when the path holds nothing, so a rebuild over a path
-whose copy was removed without a retire (X-W11) promotes its copy, and `ctx.loadStoreById` loads it with no
-`crl_save.log`: `StoreLoader.handleLoad` -> `awaitCrlLoad` (None) -> `StoreRouter.recoverDeferred` recovers what the
-CRL holds under the id. A second entry path: `StoreRebuilds.backendFailed` starts `closeUnloaded(dropDurably = false)`
-without waiting, so a save the closing store's executor still enqueues after the retire's `dropStore` survives it
-(SimpleCRL orders by enqueue; narrow).
-Consequence: the rebuilt store, with a fresh incarnation, recovers stale votes, locks and applied stubs of
-transactions it has forgotten: a stale commit vote can find an UnackedCommits entry and apply again (an overwritten
-update), the hazard `awaitCrlLoad` drops entries for.
-Fix: a rebuilt copy has never served, so before its first load (`startRebuild`'s Adopt and AdoptOffline branches and
-the Completed Rebuilds pass) `crl.dropStore(storeId)` and load on completion; have `closeUnloaded` return its future
-and the retire paths wait for it. Rebuild path only.
 
 ### X-W13: A transfer between two devices of one host onto a path holding an earlier tenancy's copy never starts
 Verdict CONFIRMED. Priority 4. Effort S.

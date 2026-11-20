@@ -9,7 +9,6 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
 import org.aspen_ddp.aspen.server.{DurableFiles, Host, StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild}
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.Backend
@@ -502,10 +501,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
   /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of
    *  service: it is not loaded, and it is recorded offline behind an empty transfer-out marker
-   *  plus an empty CRL save file. A restart keeps it offline behind the marker until the
-   *  reconcile or bringIntoService finds its entry Active, and an adoption classes it Clean (a
-   *  transfer-out marker with a valid save file). Empty because a store fresh from a rebuild has
-   *  no transaction state.
+   *  beside the empty CRL save file the rebuild wrote (RebuildingStore.writeEmptyCrlState). A restart
+   *  keeps it offline behind the marker until the reconcile or bringIntoService finds its entry
+   *  Active, and an adoption classes it Clean (a transfer-out marker with a valid save file).
    *
    *  Written even when the device has already been unloaded (its shutdown finished first): the
    *  device path is still known, and without the pair an adopting host would refuse the whole
@@ -520,8 +518,6 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     val storePath = local.devicePath / storeId.directoryName
     try
       DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile, "")
-      if ! os.exists(Backend.crlSaveFile(storePath)) then
-        CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(storePath))
       // After the pair: the transfer-out marker now keeps it offline, and its reinstatement loads it
       DurableFiles.remove(storePath / RebuildingStore.RebuildCompleteMarkerFile)
     catch

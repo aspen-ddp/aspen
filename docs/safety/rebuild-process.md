@@ -121,7 +121,8 @@ start
                              cancel, staging fail-stop)
         ► retryFailures (re-read tree entry; absent = deleted; still failing ► acceptLoss? mark : fail)
         ► finish: flush, close, re-check latch, acceptor-since, inherited-votes, incarnation,
-                  rebuild-complete (the episode), remove checkpoint, DurableFiles.move(staging ► final)
+                  empty crl_save.log, rebuild-complete (the episode), remove checkpoint,
+                  DurableFiles.move(staging ► final)
   ► complete ► StoreRebuilds completion handler ► markRebuiltStoreActive
              ► Adopt | AdoptOffline | Discard | NotOwned | Superseded
 ```
@@ -395,11 +396,20 @@ acceptance: a pool below its read threshold is not papered over.
 `rebuildFlush`, close the backend, **re-check the abort latch** (a cancel or fail-stop during the close fails the
 pass), write `acceptor-since` (`writeAcceptorSince`: now plus `AcceptorSinceMargin`, 10 s), write `inherited-votes`
 (`writeInheritedVotes`: the pass start plus the horizon plus twice the margin; section 6.4, inherited votes), write a
-fresh `incarnation` (`StoreIncarnationFile.writeFresh`), write `rebuild-complete` durably with the episode as its
-content, remove the checkpoint and temp file, `DurableFiles.move(staging, final)` (both directories forced; it fails
-if the final path exists). All four files are written durably in staging before the move, so the directory at the
-final path carries them from the instant it appears. A failure anywhere in `finish` fails the pass; one before the
-checkpoint's removal leaves the next pass a resume (a resumed `finish` rewrites all four files), one after it makes the
+fresh `incarnation` (`StoreIncarnationFile.writeFresh`), write an empty `crl_save.log`
+(`RebuildingStore.writeEmptyCrlState`), write `rebuild-complete` durably with the episode as its content, remove the
+checkpoint and temp file, `DurableFiles.move(staging, final)` (both directories forced; it fails if the final path
+exists). All five files are written durably in staging before the move, so the directory at the final path carries
+them from the instant it appears. The save file is the rebuilt store's whole transaction state, which is empty, so its
+first load, by whatever path, is a save-file load: it drops whatever the device CRL holds under the store's id before
+loading the file (crash-recovery-log.md 3.3 step 4). The store has never served, so anything there was left by an
+earlier copy of the store on this device: one whose directory left its path without a retire (removed by hand), or a
+fail-stopped copy whose close, not awaited, saved behind its retire's `dropStore`. The rebuilt copy's load cannot
+install before that close releases the store's executor slot (`HostThreading.AlreadyAssigned`), so every such save
+precedes the drop. Recovered under the new incarnation, such entries would bring back votes, locks and applied stubs of
+transactions the store has forgotten, and a stale commit vote could apply again. A failure anywhere in `finish` fails
+the pass; one before the checkpoint's removal leaves the next pass a resume (a resumed `finish` rewrites all five
+files), one after it makes the
 next pass a first pass (fresh staging, full walk). An out-of-space failure of the flush or a write
 (`Backend.isOutOfSpace`) is classified as the walk's is: it latches the abort and logs `REBUILD OUT OF SPACE`. A cancel
 that arrives after the latch re-check does not stop the move: the rebuild completes and its flip decides (5.7).
@@ -423,8 +433,8 @@ gossips the store online itself). The host acts only after the decision:
   succeeded but whose directory sync failed, and the retry forces the directory even with the marker already gone; a
   later rebuild of the store starting on this host drops the record, its own completion then owning the marker. A
   store rebuilt on a device that never held it is in no `offlineStores` otherwise, and its pending-delete copy elsewhere is released by the Active entry.
-* `AdoptOffline`: `keepRebuiltStoreOffline` writes a `transferring-out` marker and an empty `crl_save.log`, then
-  removes `rebuild-complete`; an adopter classes it Clean and a restart's reinstatement loads it.
+* `AdoptOffline`: `keepRebuiltStoreOffline` writes a `transferring-out` marker beside the empty `crl_save.log`
+  `finish` wrote, then removes `rebuild-complete`; an adopter classes it Clean and a restart's reinstatement loads it.
 * `Discard`: deletes the final directory (`LocalDevices.discardStoreDirectory`).
 * `NotOwned`: leaves the copy for the new owner, whose rebuild finds the marked final path and only flips.
 * `Superseded`: leaves the copy at the final path, offline: it is added to the device's `offlineStores`

@@ -100,7 +100,10 @@
   stores
 - A store loaded from its `crl_save.log` first drops whatever the device CRL holds for it (`StoreLoader.awaitCrlLoad`):
   the file is its whole state, and anything else there is a copy of part of it or an earlier tenancy's leftover,
-  never to be recovered as its own (crash-recovery-log 3.3 step 4)
+  never to be recovered as its own (crash-recovery-log 3.3 step 4). A rebuilt copy carries an empty one
+  (`RebuildingStore.writeEmptyCrlState`), so its first load drops what an earlier copy left; a late save by a
+  fail-stopped earlier copy's close precedes that drop, since the new store cannot install until the close releases
+  its executor slot (`HostThreading.AlreadyAssigned`)
 - A `crl_save.log` state is charged before `loadStore` saves it (`CrlAdmission.tryChargeLoaded`, at most the limit
   plus one transaction, A3), after the Store is built and before install, retained for the store. Refused, the store
   is left offline, its file kept, and retried every device scan through `storesAwaitingRetry` (one warning per

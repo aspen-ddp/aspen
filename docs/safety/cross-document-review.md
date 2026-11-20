@@ -165,10 +165,10 @@ The premises other subsystems take from this:
 * A rebuild's flip that finds the entry already Active returns `Adopt` without checking the episode
   (`DeviceMetadata.markRebuiltStoreActive`), and `AdoptOffline` likewise for an Offline entry. That is sound because a
   rebuild still running for a superseded episode is cancelled when the reconcile sees its entry move, and no transfer
-  can bring the store back onto this device while a copy occupies its path (`StoreTransfers.startIn` refuses an
-  existing path): an Active entry here over this rebuild's copy was made Active by this episode. A fix of
-  rebuild-process.md's RB-W13 that lets a transfer start over an earlier tenancy's copy must retire that copy before
-  the transfer's metadata step, or this premise breaks.
+  can bring the store back onto this device while a copy occupies its path: `StoreTransfers.startIn` refuses an
+  existing path, except an earlier tenancy's `rebuild-complete` or `rebuild-required` copy, which it retires before
+  asking for any bytes, and not while a rebuild of the store still runs here (rebuild-process.md FS18). So an Active
+  entry here over this rebuild's copy was made Active by this episode.
 * Host-side client work (UnackedCommits lookups, held-vote queries, the repair service) runs
   on the host's `ec`, not a store executor or the control thread. It keeps no host state of its own beyond what it
   locks (`DeferralState`, `StoreRepairer`'s counters), reads store state only through `@volatile` snapshots

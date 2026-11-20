@@ -789,24 +789,14 @@ started before the load.
 elsewhere and serves, and the store later comes back Rebuilding (a drain choosing the device, or the operator). The
 entry carries a new episode, so the host's returning reconcile resumes neither the old checkpoint nor the old finished
 copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and one that finishes first is
-`Superseded` (5.7). The new episode walks the whole tree.
+`Superseded` (5.7). The new episode walks the whole tree. A store that comes back by a transfer instead (an operator `transfer-store`, or the rebalancer) finds the
+old tenancy's copy at its path: a finished rebuild awaiting its flip (`rebuild-complete`) or a lost copy
+(`rebuild-required`). `StoreTransfers.startIn` retires it (`StoreCopies.retire`) and starts the transfer once the
+path is clear, so it is gone before the transfer's metadata step can make the entry Active; while a rebuild of the
+store still runs on the device (being cancelled) or the store is served, it waits.
 
 ---
 
 ## Open weaknesses
 
-### RB-W13: A transfer onto a device whose store path holds a retired-to-be copy of an earlier tenancy never starts
-Verdict PLAUSIBLE. Priority 4. Effort S.
-Mechanism: host H is down holding, at the store's path on device D, a copy no pass has retired yet: a finished rebuild
-awaiting its flip (`rebuild-complete` of episode E1) or a marked lost copy (`rebuild-required`). `AspenClient.replaceRebuild`
-(R4, which needs neither D nor H up) moves the Rebuilding entry to D2, which rebuilds and flips Active; then an operator
-`transfer-store` or the rebalancer (`SetRebalanceDurableTask`) moves the store back onto D, writing D's entry
-TransferringIn. When H returns, `StoreLoader.tryLoadStore` leaves the copy offline in `offlineStores`, but no pass
-clears the path: the Deleted Stores pass retires only an offline store whose entry is absent, `retireForeignCopy` runs
-only for a Rebuilding entry, and the Completed Rebuilds pass only for an Active one. `StoreTransfers.startIn` then finds
-`os.exists(finalPath)` with no `transferred-in` marker and logs "store path already exists" at every check, forever.
-Consequence: the transfer stalls (the source D2 stays TransferringOut) until an operator aborts it, after which the
-entry is absent and the Deleted Stores pass retires the copy. No data is lost.
-Fix: in `startIn`, treat a directory at the path carrying `rebuild-complete` or `rebuild-required` (never an arrived
-copy of this transfer) as a copy of an earlier tenancy: retire it (`StoreCopies.retire`) and start the transfer once
-the path is clear.
+None.

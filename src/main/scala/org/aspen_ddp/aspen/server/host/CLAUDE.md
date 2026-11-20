@@ -170,11 +170,15 @@
   3. `CrashRecoveryLog.dropStore` removes the entries from the device CRL;
   4. the copy is renamed to `<device>/pending-delete/<store-dir>-<uuid>`.
 
-  A crash at any step leaves the marker, so the next retire redoes what remains. Two passes retire:
+  A crash at any step leaves the marker, so the next retire redoes what remains. Three passes retire:
   - The Rebuilding pass, for a `rebuild-required` copy at the path of a store rebuilt here
     (`StoreRebuilds.discardLostStore`). It holds a rebuild slot from its start (`maxConcurrentRebuilds` counts
     `droppingCrlState`), and the slot passes straight to the rebuild in the same callback, so one reconcile cannot
     retire every marked store at once.
+  - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the
+    path of a store transferring onto the device (re-placed away while the host was down, then transferred back;
+    rebuild-process FS18). It retires before asking for bytes, waits while a rebuild of the store runs here or the
+    store is served, and checks the device again once the path is clear, which starts the transfer.
   - The Deleted Stores pass, for an offline store whose entry has left the device. The store stays offline until its
     path is clear, so a failed retire is retried.
     A store served from the device that its entry does not list (a copy put back by hand: `tryLoadStore` reads no

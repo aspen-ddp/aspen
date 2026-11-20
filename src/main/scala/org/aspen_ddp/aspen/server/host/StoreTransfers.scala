@@ -430,6 +430,12 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           transferringIn += storeId -> transferUUID
           recordTransferIn(storeId, transferUUID, fromDeviceId, toDeviceid)
 
+        // A finished rebuild awaiting its flip or a lost copy, left by an earlier tenancy of the store on this device
+        // (rebuild-process FS17): retired, and the transfer starts at the check that follows
+        else if os.exists(finalPath / RebuildingStore.RebuildCompleteMarkerFile) ||
+                os.exists(finalPath / RebuildingStore.RebuildRequiredMarkerFile) then
+          retireEarlierTenancy(toDevice, storeId)
+
         // Promotion moves the arrived copy here and would fail on an existing directory, after
         // the whole store had been shipped. Whatever is here is not ours to delete, so refuse
         // before asking for any bytes.
@@ -542,6 +548,31 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           pendingStartTransfers += storeId -> new PendingTransfer(msg, toDeviceid, HLCTimestamp.now)
 
           ctx.client.sendHostMessage(msg)
+
+  /** Clears the path of a store transferring onto `local` that holds a copy of an earlier tenancy of the store there:
+   *  a finished rebuild awaiting its flip (`rebuild-complete`) or a lost copy (`rebuild-required`), left when the
+   *  store was re-placed away (AspenClient.replaceRebuild) while this host was down. No other pass clears it while
+   *  the entry is TransferringIn. The copy is retired (StoreCopies.retire), not deleted: it is not the owner's, and
+   *  the source still is. Once the path is clear the device is checked again, which starts the transfer.
+   *
+   *  Retired before any bytes are asked for, so before the transfer's metadata step can make the entry Active:
+   *  a rebuild's flip finding an Active entry adopts it without an episode check (DeviceMetadata.markRebuiltStoreActive).
+   *  For the same reason it waits while a rebuild of the store runs here: the reconcile cancels one whose entry has
+   *  moved (StoreRebuilds.abandonUnlisted), and one past its latch could still move a copy into the path. A served
+   *  store waits too: whatever path took it out of service retires or reloads it. */
+  private def retireEarlierTenancy(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+    if ctx.rebuilds.rebuildingStoreIds.contains(storeId) || ctx.router.loaded.contains(storeId) then
+      logger.info(s"Not transferring store $storeId onto device ${local.storageDeviceId} yet: its path holds a copy " +
+                  s"of an earlier tenancy, which waits for a rebuild or a close of the store here to end")
+    else if !ctx.copies.isRetiring(storeId) then
+      logger.warn(s"Retiring the copy of an earlier tenancy of store $storeId at its path on device " +
+                  s"${local.storageDeviceId} before transferring the store onto it")
+      ctx.copies.retire(local, storeId).foreach: clear =>
+        if clear then
+          ctx.router.clearOffline(storeId)
+          local.offlineStores -= storeId
+          local.loadedStores -= storeId
+          ctx.reconciler.checkStorageDevice(local.storageDeviceId)
 
   /** Returns the request's handling, which fails when the request is refused. Only tests look at
    *  it (they call this directly); the control thread drops it, as a refusal is answered by

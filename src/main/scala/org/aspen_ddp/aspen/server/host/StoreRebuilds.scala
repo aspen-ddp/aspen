@@ -492,8 +492,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  copy would (StoreLoader.tryLoadStore leaves a rebuild-complete copy offline). The Deleted Stores pass then
    *  retires it if its entry leaves the device before a later rebuild of the store here retires or promotes it, and
    *  the Completed Rebuilds pass loads it once its entry is Active; without it the copy would hold the store's path
-   *  until a restart, every transfer of the store onto this device would refuse, and an Active one would stay
-   *  unserved. A device unloaded meanwhile is left alone: its next load does the same. */
+   *  until a restart, and an Active one would stay unserved. A transfer of the store onto this device retires it
+   *  (StoreTransfers.retireEarlierTenancy). A device unloaded meanwhile is left alone: its next load does the same. */
   private def keepUnpromotedCopyOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     if ctx.devices.devices.get(local.storageDeviceId).contains(local) &&
        os.exists(local.devicePath / storeId.directoryName) then

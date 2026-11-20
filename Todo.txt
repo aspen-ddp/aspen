@@ -57,15 +57,7 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.3 [RB-W13] A transfer onto a device whose store path holds a copy of an earlier tenancy never starts.
-    PLAUSIBLE. Effort S. rebuild-process.md.
-    Host down while device D holds an unretired finished rebuild or a rebuild-required copy; replaceRebuild moves the
-    store elsewhere, then a transfer moves it back (D's entry TransferringIn). No pass clears the path (Deleted Stores
-    needs no entry, retireForeignCopy needs Rebuilding, Completed Rebuilds needs Active), so StoreTransfers.startIn
-    logs "store path already exists" at every check until an operator aborts.
-    Fix: in startIn, retire (StoreCopies.retire) a copy at the path carrying rebuild-complete or rebuild-required,
-    then start once the path is clear. It must retire before the transfer can make the entry Active:
-    markRebuiltStoreActive adopts an Active entry without an episode check (cross-document-review.md 2.2).
+(no open items)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 

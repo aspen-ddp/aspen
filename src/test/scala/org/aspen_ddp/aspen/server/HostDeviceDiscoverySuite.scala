@@ -1771,6 +1771,38 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       os.exists(promoted) should be(false)
       recorded(host2).transferOutcomes.get(t.movingStore) should be(None)
 
+  // rebuild-process FS17: a copy an earlier tenancy left at the store's path (a finished rebuild awaiting its flip, a
+  // lost copy), the store having since been re-placed away and transferred back
+  for marker <- List(RebuildingStore.RebuildCompleteMarkerFile, RebuildingStore.RebuildRequiredMarkerFile) do
+    atest(s"a transfer in over an earlier tenancy's $marker copy retires the copy and starts"):
+      given ExecutionContext = executionContext
+
+      val hostRoot = newHostDir()
+      val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
+      val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+      val earlier = writeStoreDir(deviceDir, movingStore)
+      os.write.over(earlier / marker, "")
+      val transfers = new StagedTransferService
+      val host = newHost(hostRoot, transferService = transfers)
+
+      for
+        _ <- net.createSecondDevice()
+        _ <- waitForTransactionsToComplete()
+        _ <- client.transferStore(movingStore, net.secondDeviceId)
+        _ <- waitForTransactionsToComplete()
+
+        _ = host.control.reconciler.checkAll()
+        _ <- pumpUntil(startTransferSent(transfers, movingStore, 1))
+      yield
+        startTransferSent(transfers, movingStore, 1) should be(true)
+        os.exists(earlier) should be(false)
+        // Retired, not deleted: kept with its CRL state until the store is Active on its owner device
+        val retired = os.list(deviceDir / RebuildingStore.PendingDeleteDirectory).toList
+        retired.map(_.last.startsWith(movingStore.directoryName)) should be(List(true))
+        os.exists(retired.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+        os.exists(retired.head / RebuildingStore.LostCrlStateFile) should be(true)
+        host.control.transfers.transferringIn.keySet should be(Set(movingStore))
+
   atest("a store carrying the transferred-in marker is not loaded at startup"):
     // A real Host rather than one with the recording tryLoadStore seam, which records every
     // candidate and honours no marker.
@@ -1900,7 +1932,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
       Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2)
 
-  private def writeStoreDir(deviceDir: os.Path): os.Path =
+  private def writeStoreDir(deviceDir: os.Path, storeId: StoreId = storeId): os.Path =
     val storeDir = deviceDir / storeId.directoryName
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
       storeDir / os.up / StoreCreation.CreatingDirectory)

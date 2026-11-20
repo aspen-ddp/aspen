@@ -156,8 +156,10 @@ CRL-lost stores is derived from the disk's own contents, so the state is gone wh
 
 Not triggers: any other backend open failure (out of space, an I/O, lock or resource error) leaves the store offline,
 unmarked and in `StoreLoader.storesAwaitingRetry`, retried at the device scans with backoff (`retryFailedLoads`: 1, 2,
-4 ... scans, capped at `Host.LoadRetryCap`, 5 min); a `crl_save.log` state that fits only after the CRL grows waits
-the same way; a failed `crl_save.log` load by a **transfer-in**
+4 ... scans, capped at `Host.LoadRetryCap`, 5 min); a `crl_save.log` state that fits only after the CRL grows, a
+`config.yaml` that cannot be read (`StoreLoader.awaitUnreadRetry`), and an executor slot an earlier close still holds
+(`HostThreading.AlreadyAssigned`) wait the same way, so a load from a pass that removed its marker first (Completed
+Rebuilds) is retried, not dropped; a failed `crl_save.log` load by a **transfer-in**
 destination restarts the transfer, since the source still holds the state. Nothing declares a *device* Failed
 automatically; only `fail-storage-device` does.
 
@@ -237,7 +239,8 @@ device's state; a failed read keeps it. The store is named by the copy's directo
 name that identifies no store is kept. Deletes are rename-first through `<device>/deleting/`, so an interrupted one
 leaves nothing partial behind. A lost copy whose rebuild is re-placed onto another device before it ran (section 4.2)
 is retired the same way by the reconcile's Deleted Stores pass, once its entry has left this device, and released when
-the destination's flip makes the store Active there. An accepted loss (5.5) ends in that flip too: the old copy goes
+the destination's flip makes the store Active there; one still at the path when the store transfers back onto the
+device is retired by `StoreTransfers.startIn` (FS18). An accepted loss (5.5) ends in that flip too: the old copy goes
 with it. The same pass first takes out of service a store served from a device whose entry does not list it (FS17), so
 a hand-placed copy is retired the same way. What may be done with suspected-loss content is the subject of [systemic-loss-protection.md](systemic-loss-protection.md) and
 `Backlog.txt` ("System-level protection against correlated lost store declarations").
@@ -417,7 +420,8 @@ gossips the store online itself). The host acts only after the decision:
   records it in `StoreRebuilds.pendingMarkerRemovals` and in the device's `offlineStores` (`keepUnpromotedCopyOffline`),
   so the reconcile's Completed Rebuilds pass, finding the entry Active and the marker present or the removal pending,
   retries the removal and the load at each device check. The pending record is what selects a store whose unlink
-  succeeded but whose directory sync failed, and the retry forces the directory even with the marker already gone. A
+  succeeded but whose directory sync failed, and the retry forces the directory even with the marker already gone; a
+  later rebuild of the store starting on this host drops the record, its own completion then owning the marker. A
   store rebuilt on a device that never held it is in no `offlineStores` otherwise, and its pending-delete copy elsewhere is released by the Active entry.
 * `AdoptOffline`: `keepRebuiltStoreOffline` writes a `transferring-out` marker and an empty `crl_save.log`, then
   removes `rebuild-complete`; an adopter classes it Clean and a restart's reinstatement loads it.
@@ -427,7 +431,7 @@ gossips the store online itself). The host acts only after the decision:
   (`keepUnpromotedCopyOffline`), the state a restart's load leaves it in. Its marker names the earlier episode, so the
   current episode's `startRebuild` retires it (`retireForeignCopy`: marked `rebuild-required`, kept in
   `pending-delete/`). If the entry leaves the device before that rebuild starts, the Deleted Stores pass retires it
-  instead, which clears the store's path for a later transfer onto the device. An Active entry from another episode
+  instead; a transfer of the store onto the device that finds it first retires it itself (FS18). An Active entry from another episode
   cannot meet a running rebuild: every transition out of Rebuilding on this device passes a reconcile whose
   `abandonUnlisted` cancels it, a second rebuild of the store cannot start on this host while one runs
   (`rebuildingStores`), and a transfer in cannot promote over a final path the rebuild's move then fails on.
@@ -509,7 +513,8 @@ mute, not on the failure budget:
   clocks do not enter. Residual: if the old incarnation's host clock led the rebuilding host's by more than 8 s plus
   the rebuild's duration, a transaction it joined can start after `acceptor-since`.
 * On load the store also records its load time (`Frontend.loadedAt`), refusing for good each unknown transaction that
-  started before the load plus `MaxStartLead`.
+  started before its load floor (`Frontend.loadFloorMillis`: the load plus `MaxStartLead`, capped by the host's join
+  ceiling, or the load plus `AcceptorSinceMargin` soon after an arrival from another host).
 * A fresh `incarnation` means UnackedCommits entries naming the old incarnation never apply through the rebuilt
   store (`Frontend.unackedLookupComplete` applies an entry naming its own incarnation, or none, a driver that never heard
   from the store; one naming another incarnation calls `Tx.unackedCommitNotOwed`); the entry's reconcile installs the committed state instead. A rebuild also discards the
@@ -791,12 +796,37 @@ entry carries a new episode, so the host's returning reconcile resumes neither t
 copy (5.1); a rebuild still running for the old episode is cancelled (4.2), and one that finishes first is
 `Superseded` (5.7). The new episode walks the whole tree. A store that comes back by a transfer instead (an operator `transfer-store`, or the rebalancer) finds the
 old tenancy's copy at its path: a finished rebuild awaiting its flip (`rebuild-complete`) or a lost copy
-(`rebuild-required`). `StoreTransfers.startIn` retires it (`StoreCopies.retire`) and starts the transfer once the
-path is clear, so it is gone before the transfer's metadata step can make the entry Active; while a rebuild of the
-store still runs on the device (being cancelled) or the store is served, it waits.
+(`rebuild-required`). No other pass clears it while the entry is TransferringIn. `StoreTransfers.startIn`
+(`retireEarlierTenancy`) retires it (`StoreCopies.retire`) before asking for any bytes, so it is gone before the
+transfer's metadata step can make the entry Active (a flip finding an Active entry adopts it without an episode check),
+and checks the device again once the path is clear, which starts the transfer. While a rebuild of the store still runs
+on this host (being cancelled by `abandonUnlisted`; past its latch it could still move a copy into the path) or the
+store is served on this host, it waits. A rebuild that moves its copy in after the transfer started makes the
+transfer's promotion fail and retry; its flip then reads TransferringIn and gets `Discard`.
 
 ---
 
 ## Open weaknesses
 
-None.
+### RB-W15: A flip retried after `TransactionOutcomeUnknown` deletes the owner copy its own committed attempt promoted
+Verdict PLAUSIBLE. Priority 2. Effort S.
+Mechanism: `DeviceMetadata.markRebuiltStoreActive` runs under `StopRetrying.collisionRetry`. Its first attempt commits
+the Rebuilding entry Active, but the client reports `TransactionOutcomeUnknown` (past the transaction horizon, 20 s or
+more), and the retry re-reads the device state. Meanwhile the entry is Active and the rebuilt copy sits unloaded at the
+final path, still carrying `rebuild-complete`. An operator `transfer-store` or the rebalancer can take that Active
+entry TransferringOut in the window; `StoreTransfers.startOut` accepts an unloaded store (`closeForTransferOut` ►
+`extractUnloaded`), writes the transfer-out marker and starts shipping the directory. The retry then finds the entry
+TransferringOut, which matches neither Rebuilding, Active nor Offline, and returns `RebuildOutcome.Discard` with no
+`retry.mayHaveCommitted` check. `StoreRebuilds.startRebuild`'s Discard branch calls
+`LocalDevices.discardStoreDirectory`, which deletes the directory (`StoreCopies.delete`) under the send.
+Consequence: the pool still names the device and the entry is TransferringOut, but the device holds no copy. The send
+fails, and every retransmitted `StartStoreTransfer` fails at the marker write into the missing directory. An abort
+returns the entry to Active over no directory. No pass notices an Active entry without a directory on a loaded device,
+so the store is never served or rebuilt, and `checkPoolsStayWritable` counts it writable. That is a silent, permanent
+loss of one unit of the pool's write-threshold margin, caused by asynchrony alone.
+Fix: in `markRebuiltStoreActive`, once `retry.mayHaveCommitted` holds, never answer `Discard` for a non-Failed
+device: the earlier attempt may have made the copy the owner's. Return an outcome that keeps the copy in place
+(the `Superseded` handling: `keepUnpromotedCopyOffline`). A TransferringOut source then ships it, and the destination's
+Completed Rebuilds pass clears the marker it carries. An aborted transfer has the Abandoned Transfers Out pass reinstate
+it and the Completed Rebuilds pass load it. An entry that has left the device has the Deleted Stores pass retire it.
+Only the retry path changes, so nothing is added per transaction.

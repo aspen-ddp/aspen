@@ -274,7 +274,8 @@ the client.
   `Tx.unackedCommitNotOwed` and `Tx.concludeOwedCommit` rely on it too. A muted Tx is dropped without `TxFinalized`
   once its objects load (`Frontend.forgetMuted`), but it never voted commit; a prover, like any acceptor, is forgotten
   only on `TxFinalized` or a late outcome (`Tx.applyNothing`); `unackedCommitFound`, `unackedCommitNotOwed` (for a recovered or expiring
-  vote) and `proveCommitted` record nothing in the status cache, so a finalized cache entry, and the late relay from
+  vote) and `proveCommitted` record nothing in the status cache (concluding a held late commit or a decided expiry
+  discard records the late outcome, finalized), so a finalized cache entry, and the late relay from
   it, always stems from a real `TxFinalized` or late outcome. Nor does a restart seed one from a tree-learned resolution:
   its saves record `Unresolved` (7.2, `Tx.savedStatus`). Nor does a peer's expiry adoption: until finalized, its status
   replies report the saved status (`Tx.statusForExpiry`), so a peer decides by its tally, as after a restart here.
@@ -291,12 +292,15 @@ the client.
   latest prepare it saw (initially the designated leader); a `TxResolved` does not change it, so a store that never
   got the finalizing driver's prepare acknowledges another driver, and the finalizing one marks it (an extra repair
   pass). Its `objectCommitErrors` are the objects uncommittable at apply time (not those a recovered commit vote
-  takes as applied), plus every object a recovered Tx that did not vote commit applies, plus those whose backend commit
-  failed; a store that applies nothing (it holds an applied stub, or its entry is not owed
+  takes as applied), plus every object a recovered Tx that did not vote commit applies, plus each object on which it
+  applies a blind Insert of a key absent before the apply where a later deletion of the key may already have applied
+  (7.4), plus those whose backend commit failed; a store that applies nothing (it holds an applied stub, or its entry is not owed
   to it) reports every object it changes.
-* `commitVoters(voters, incarnations)`: `voters` is `Some(set)` if this driver itself counted commit votes reaching
-  the write threshold for every referenced object (`countedCommitVoters`), else `None` (the outcome came from another
-  driver, a relay or an accepted value). `incarnations` is every store's incarnation heard in any prepare reply of any
+* `commitVoters(voters, incarnations)`: `voters` is `Some(set)` if the prepare replies of this driver's current round
+  (`peerDispositions`, reset by `nextRound`) hold commit votes reaching the write threshold for every referenced
+  object (`countedCommitVoters`), else `None` (the outcome came from another
+  driver, a relay or an accepted value, or the current round heard too few). Any such set covers T: its votes are
+  fixed and durable, so a commit voter of an earlier round outside it needs no entry. `incarnations` is every store's incarnation heard in any prepare reply of any
   round; a store that reported two different incarnations is recorded as unknown for good (`recordIncarnation`).
 
 ### 5.2 `MissedUpdateFinalizationAction`
@@ -528,11 +532,12 @@ saved data.
   and the in-flight-commit marker (`Frontend.commitInFlight`) orders the transactions that follow.
 * A committed Tx holding no locks does not apply while another Tx holds locks it collides with on an object both
   change (`Tx.awaitLockHolders`, transaction-requirements.md R15): it is held (`commitHeld`) until each holder
-  releases (`Frontend.locksReleased`). A new vote whose planned locks it would wait for (`Tx.lockWaitBlocked`:
-  `RequirementsLocker.plannedLocks`, tested by the waiter's `wouldWaitFor`) withholds its vote meanwhile, no locks
+  releases (`Frontend.locksReleased`). A new vote it would wait for as a holder (`Tx.lockWaitBlocked`: the vote changes an object the
+  waiter changes, the `Frontend.changes` filter, and its planned locks, `RequirementsLocker.plannedLocks`, collide with
+  the waiter's requirements or writes, the waiter's `wouldWaitFor`) withholds its vote meanwhile, no locks
   taken, for at most `Tx.CollisionWait`, then votes abort naming the waiter (`TransactionCollision`): the waiter's
-  holder may need a vote another store's waiter withholds, and the abort ends such a cross-store cycle. Any other vote
-  decides at once. A recovered Tx is not exempt: the rule is the same once it decides a vote. A
+  holder may need a vote another store's waiter withholds, and the abort ends such a cross-store cycle. Any other vote,
+  a lock-only one included, decides at once. A recovered Tx is not exempt: the rule is the same once it decides a vote. A
   `TxFinalized` reaching it while held is deferred like one for a commit held for its turn
   (`Frontend.finalizationDeferred`), its CRL state kept until it applies.
 
@@ -554,8 +559,9 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   violation, logged at error, skipped and reported; an allocation the backend missed is reported (no copy, no lost
   lock); any apply that throws fail-stops the store (transaction-requirements.md 8.5). A recovered Tx that did not vote
   commit reports every object it applies: it may have applied before the crash. A blind Insert of an absent key is
-  applied and its object reported where a repair installed a state newer than T's start (`Tx.repairInstalled`,
-  `Frontend.recordRepairInstall`) or, for a recovered commit vote, whose in-memory record of such installs died with
+  applied and its object reported where the Tx did not vote commit (it held no key lock keeping a later deletion out:
+  a deletion checked by a required revision alone may have applied first as a no-op), where a repair installed a
+  state newer than T's start (`Tx.repairInstalled`, `Frontend.recordRepairInstall`) or, for a recovered commit vote, whose in-memory record of such installs died with
   the crash, where the object's timestamp is past T's start: the state may hold a later deletion of the key the store
   never applied, so the finalizer marks the store and repair reconciles the object (transaction-requirements.md 9.4,
   10.5c).
@@ -653,7 +659,8 @@ lookup that finds no entry.
      [Undetermined] --determineDisposition--> [VoteCommit | VoteAbort | withheld | proof]
         withheld while: no client prepare yet (< MissingDataWait, promise withheld too; not for a recovered Tx)
                         / waiting on lock holders it builds on (< CollisionWait) / an in-flight commit
-                        / a colliding committed Tx waiting in lock order (< CollisionWait, then abort)
+                        / a committed Tx waiting in lock order that changes an object it changes and
+                          collides with its planned locks (< CollisionWait, then abort)
         frozen past expiry: no vote is decided, no promise or accept given
                     |
      CRL.save(vote + acceptor)  ---durable--->  TxPrepareResponse (+ TransactionVote to the client)
@@ -855,4 +862,21 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-(no open weaknesses)
+### R-W9: every non-voter's apply of a blind Insert of a new key is reported, marking routine applies at slow replicas
+Verdict PLAUSIBLE. Priority 5. Effort M.
+Mechanism: `Tx.issueCommits` puts an object in `reinserts`, and so in `objectCommitErrors`, when the Tx's
+`disposition != VoteCommit` and its KeyValue update has no required revision and Inserts a key absent before the
+apply. Ordinary TKVL in-place inserts take that shape: `KeyValueListNode.applyChange` passes no required revision
+unless `pinned`, and a new key's Insert carries `DoesNotExist`. A store is a non-voter whenever T resolved while its
+vote was withheld: behind an in-flight commit of the object (`Tx.awaitingCommits`, `Frontend.commitInFlight`), a
+collision wait or a lock-order wait, or before its client prepare. Under pipelined inserts into one leaf, the replica
+whose previous commit persists last routinely withholds while the others decide. Its apply is then reported although
+no deletion of the key reached it: no committed Delete found the key absent there and no repair touched the object.
+Consequence: such a transaction's `MissedUpdateFinalizationAction` loses its clean fast path (`updateCommitErrors`),
+so finalization waits `errorTimeout` (2 s) plus a marker batch, every store holds T's CRL state and admission that
+much longer, and the replica gets an ErrorTree mark and a repair pass per transaction. No safety effect.
+Fix: report a non-voter's Insert of an absent key only when a deletion of that key may have applied first. Record it on
+the rare path: the Frontend notes, per object and key, a committed Delete applied over an absent key (a no-op) and a
+repair reconcile of the object, kept while a transaction started before it may still join (pruned below the forget
+floor, as `repairInstalls` is), and `issueCommits` tests a non-voter's Inserts against it. A commit applied normally,
+or by a non-voter of an object with no such record, then checks nothing.

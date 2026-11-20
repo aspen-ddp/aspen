@@ -1,7 +1,7 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, fifth pass, built 2026-11-19 against c2df32ba)
+Safety work list (from docs/safety/*, sixth pass, built 2026-11-19 against b9eb7860)
 ------------------------------------------------------------------------------------
 
 Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
@@ -39,13 +39,107 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-(no open items)
+1.1 [P-W8] An expiring Tx counts its own not-yet-durable commit vote as a replied non-voter and can discard a commit.
+    CONFIRMED. Effort S. paxos-transactions.md.
+    Frontend.startExpiryRound seeds round.replies with tx.statusForExpiry, whose votedCommit stays false until
+    Tx.voteDurable, while peers see such a Tx as silent (Tx.receiveStatusRequest, commitVoteSaving). A commit vote
+    decided just before T's freeze, with its CRL save still in flight at the first expiry round, makes its own round
+    see vc = 1, s = 0: rule D or E fires (ExpiryTally.decideUnknown), the UnackedCommits lookup finds nothing, and the
+    store discards T. Its save then completes and its vote can still reach a retransmitting client, or a peer's round
+    that counts it commits by rule A: lost committed data or a commit/discard split, from save latency alone.
+    Fix: in startExpiryRound, leave the Tx's own entry out of round.replies while it is an unresolved commit voter
+    whose vote is not yet durable (it counts as silent; rule G holds), and call Tx.saveUndurableVote so a later round
+    counts it. Expiry path only. Test: Replication(3,2) with a third, frozen non-voter replying (the existing
+    FrontendSuite test covers only the case that holds).
+
+1.2 [Q-W15, X-W10] A recovered commit voter whose committed resolution was restored takes no locks or reservation.
+    CONFIRMED (Q-W15), PLAUSIBLE (X-W10). Effort S. transaction-requirements.md, cross-document-review.md.
+    Q-W15: T's CRL state was re-saved Committed (a prepare or accept after the resolution: Tx.receiveAccept /
+    answerPrepareWithState, savedStatus) before its backend commit completed; at recovery Tx.lock skips it (R13). A
+    restored non-voter U on the same KeyValue object (a blind Insert of a key T checks with KeyRevision, or a growth
+    that fits only without T's reservation) can complete first from deferredRecovered; T's re-check then fails and
+    Tx.issueCommits' recoveredApplied takes the skipped object as already applied, unreported. A counted voter misses
+    a committed update; with a non-voter that also lacks T, T is below r and lost. X-W10: until T applies, S reports
+    no lock for it (lockedKeys, objectLevelLocked, lockedWriteTransactions), so reads and repair elsewhere take the
+    pre-T state as current: stale reads, and a repair of a lagging replica's mark deletes it with nothing installed.
+    Fix (covers both): a recovered VoteCommit with a restored Committed resolution relocks in Tx.lock (locks and slice
+    reservation, no check) and counts as relocking in Frontend.recoveringTransactions until it applies; doCommit
+    releases as usual. Recovery-only cost. Reordering deferredRecovered alone is not enough. Restate R13, P12,
+    transaction-requirements 8.3/8.5, transaction-recovery 7.2 step 3 and 7.4, and server/transaction/CLAUDE.md
+    (cross-document-review.md section 5 lists the contradiction).
+
+1.3 [RP-W8] A repair install grows a KeyValue slice under held slice reservations; a counted voter's apply then fails.
+    CONFIRMED. Effort S. repair-process.md.
+    Frontend.reconcile does not treat held commit votes as unsettled and reconcileSettled defers only the keys the
+    store's own votes lock, so Reconcile.planKeyValue installs missed keys with no size check while votes V and V2
+    hold ObjectState.sliceReservations. V's apply re-check (checkKVSliceSize, applying = true) counts V2's reservation
+    against the larger slice and throws SliceSizeExceeded: a counted voter skips a committed update ("INVARIANT
+    VIOLATION ... skipped and reported"). With a non-voter skipping it too (R16 allows), V can drop below r.
+    Fix: in Frontend.reconcileSettled, when the object holds other transactions' sliceReservations and the plan grows
+    the slice, apply the checkKVSliceSize measure to the planned state plus those reservations; if it does not fit,
+    write nothing and answer stale so a later pass installs. Cost only on repair passes over objects with growing
+    votes. Does not cover 2.1.
+
+1.4 [CRL-W11] The body of the entry before a torn newest entry is recovered without its checksum.
+    CONFIRMED. Effort S. crash-recovery-log.md.
+    StreamReader.lastIntactEntry checks only the last entry's body; on failure it returns the previous entry
+    unchecked, and Recovery.loadPrevious skips the body check for lastEntryLocation ("checked when it was found").
+    Rot or a misdirected write in the newest acknowledged entry plus a torn next write recovers corrupt promises,
+    acceptances, votes or data as genuine instead of failing CrlCorrupt: a possible split decision or wrong data.
+    Fix: when lastIntactEntry drops the last entry, check prev's body too; if it fails, Recovery throws CrlCorrupt.
+    Correct both scaladocs. One extra body read at open, only after a torn write. (Two coincident faults; P1 because
+    the result is silent corruption, not a detected loss.)
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-(no open items)
+2.1 [X-W9] Growths committed by different voter sets can together exceed maxSliceSize; repair/rebuild cannot install.
+    PLAUSIBLE. Effort M. cross-document-review.md.
+    Slice reservations are per store. Replication(3,2), an object near the limit, three disjoint-key inserts where any
+    two fit: S1 commits {T1,T3}, S2 {T1,T2}, S3 {T2,T3}; each store skips its third as a non-voter (R16), no counted
+    voter skips. Repair's read state holds all three; Reconcile.planKeyValue installs it unchecked. Under FSIF the
+    repair write fails CommitError.SliceTooLarge every pass (Frontend.repairWriteComplete restores) and
+    FsifBackend.rebuildWrite throws, so the rebuild never completes: permanent divergence, unconsumed marks, and any
+    later lost store of the pool stays Rebuilding.
+    Fix: a store votes abort, with a distinct error, on a growing KeyValue update without a required object revision
+    when slice + growth + held reservations exceeds a high-water mark below maxSliceSize; the TKVL writer retries
+    pinned (KeyValueListNode.applyChange with a required revision), so near-limit growths form a revision chain. Only
+    near-full objects pay. State the rule in client/tkvl/CLAUDE.md and transaction-requirements R16.
+
+2.2 [CRL-W14] A transfer out of a closed store merges stale device-CRL entries into its crl_save.log.
+    PLAUSIBLE. Effort S. crash-recovery-log.md.
+    StoreTransfers.extractUnloaded saves saved.supersededBy(state): device-CRL entries override the save file's by id.
+    For a closed store with a valid save file, the file is its whole state; CRL entries for it are copies or an earlier
+    tenancy's leftovers (which StoreLoader.awaitCrlLoad drops before loading a file). Trigger: the store, transferred
+    back, stays unloaded (no CRL room in tryChargeLoaded, or a failed open in storesAwaitingRetry) when a transfer out
+    is requested. The destination recovers stale records; a stale commit vote can find its UnackedCommits entry and
+    re-apply over a later update.
+    Fix: with a valid save file, ship it unchanged, dropStore the device-CRL entries, then releaseRetained; save the
+    CRL's state only when there is no file. Remove supersededBy (no other caller).
+
+2.3 [X-W12] A rebuilt copy's first load recovers device-CRL entries an earlier copy of the store left.
+    PLAUSIBLE. Effort S. cross-document-review.md.
+    Only StoreCopies.retire drops a store's entries and dropLeftoverCrlState skips stores the device entry lists.
+    retireForeignCopy / discardLostStore return at once on an empty path, so a rebuild over a copy removed without a
+    retire loads with no crl_save.log (awaitCrlLoad None -> recoverDeferred) and recovers the stale entries. Second,
+    narrow path: StoreRebuilds.backendFailed starts closeUnloaded(dropDurably = false) without awaiting it, so a save
+    the closing executor enqueues after the retire's dropStore survives. Stale votes, locks and stubs come back under a
+    new incarnation; a stale commit vote can re-apply.
+    Fix: crl.dropStore(storeId) before a rebuilt copy's first load (Adopt, AdoptOffline, Completed Rebuilds pass);
+    closeUnloaded returns its future and the retire paths wait for it.
+
+2.4 [RB-W15] A flip retried after TransactionOutcomeUnknown deletes the owner copy its own committed attempt promoted.
+    PLAUSIBLE. Effort S. rebuild-process.md.
+    DeviceMetadata.markRebuiltStoreActive runs under StopRetrying.collisionRetry. If the first attempt commits Active
+    but reports TransactionOutcomeUnknown (after the horizon), a transfer-store or rebalancer can move the entry to
+    TransferringOut meanwhile (startOut accepts the unloaded copy). The retry reads TransferringOut and returns
+    RebuildOutcome.Discard without checking retry.mayHaveCommitted; StoreRebuilds.startRebuild then
+    LocalDevices.discardStoreDirectory deletes the only owner copy. The transfer fails, an abort restores Active over
+    no directory, and nothing notices (X-W11): permanent silent loss of a unit of margin.
+    Fix: once retry.mayHaveCommitted holds, never return Discard for a non-Failed device; return the Superseded
+    handling (keepUnpromotedCopyOffline) so the transfer, Abandoned Transfers Out, Completed Rebuilds and Deleted
+    Stores passes take over. Retry path only.
 
 
 PRIORITY 3: systemic loss protection
@@ -53,19 +147,98 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
+3.1 [X-W14] A transient RocksDB read error at a recovered commit vote's object load is taken as corruption.
+    CONFIRMED. Effort S. cross-document-review.md.
+    RocksDBBackend.read maps every failure (IOError, Busy, TryAgain, Incomplete, ShutdownInProgress, a throw while
+    issuing, a decode error) to ReadError.CorruptedObject; Tx.objectLoadFailed fail-stops a recovered VoteCommit (D7)
+    and backendFailed marks the store rebuild-required. Likeliest at start-up (EMFILE, ENOMEM, transient EIO) when
+    many stores of a pool recover together: a correlated false declaration.
+    Fix: bounded retry with short backoff of non-Corruption exceptions in RocksDBBackend.read; map only a Corruption
+    status or a decode error to CorruptedObject.
+
+3.2 [CRL-W12] A CRL that dies while a store awaits its recovery read marks that store for rebuild.
+    CONFIRMED. Effort S. crash-recovery-log.md.
+    StoreRouter.readAndRecover fail-stops the store on any failed readStoreState; SimpleCRL answers from memory, so the
+    only failures are CrlFailed / CrlClosed. failPending fails the read before DeviceShutdown.crlFailed closes the
+    device's stores, so handleFailStopped finds the store installed and backendFailed writes rebuild-required
+    (crlLoaded likewise). Intact stores are declared lost, likeliest at device load and across devices under load.
+    Fix: in readAndRecover's failure handler treat CrlFailed and CrlClosed as the device's failure: log and leave the
+    store for crlFailed or shutdown to close unmarked. Keep the fail-stop for a throw from Frontend.recover itself.
+
+3.3 [X-W11] An Active entry whose store directory is missing on a loaded device is never served, rebuilt or reported.
+    CONFIRMED. Effort S. cross-document-review.md.
+    DeviceDiscovery.loadOwnedDevice offers only existing directories, every DeviceReconciler pass needs an offline
+    marker or a specific entry state, and entry/directory consistency is checked only at adoption (Unclean).
+    tryLoadStore skips a directory without config.yaml silently, retryFailedLoads drops a retry whose config vanished,
+    and an unreadable config is retried forever, logged at debug after the first warning. checkPoolsStayWritable
+    counts the store: one fault (a lost directory, RB-W15) silently and permanently costs a unit of margin, and the
+    entry keeps its CRL leftovers out of dropLeftoverCrlState.
+    Fix: a reconcile pass that, for such an entry (not loaded, opening, retiring or closed for shutdown), marks it
+    offline, drops its leftover device-CRL entries and calls StoreRebuilds.requestRebuild. Log a missing or
+    unreadable config at error, at most once per retry cap.
+
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-(no open items)
-
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
+
+4.1 [CRL-W13, SL-W14] A failed removal of crl_save.log after its load leaves the store installed and stalled.
+    CONFIRMED. Effort S. crash-recovery-log.md, systemic-loss-protection.md (same flaw).
+    StoreRouter.crlLoaded runs DurableFiles.remove(saveFile) on the store's executor before readAndRecover; an unlink
+    or directory-force error is swallowed by HostThreading.runLogged. Frontend.awaitingCrl stays set (every
+    transaction message held, reads dropped), the LoadStore promise never completes, and retryFailedLoads skips a store
+    the router holds: one I/O error silences the store until restart.
+    Fix: catch NonFatal; unload WITHOUT dropping the device-CRL entries (closeUnloaded(dropDurably = false); dropping
+    is unsafe when the unlink succeeded and only the force failed, since the entries are then the whole state), fail
+    the promise, and add the store to storesAwaitingRetry. The retry forces the store directory even when the file is
+    already absent (as StoreRebuilds.clearRebuildCompleteMarker) before trusting the file is gone.
+
+4.2 [X-W13] A transfer between two devices of one host onto a path holding an earlier tenancy's copy never starts.
+    CONFIRMED. Effort S. cross-document-review.md.
+    StoreTransfers.retireEarlierTenancy waits on ctx.router.loaded.contains(storeId), the store id alone; the source
+    device's store is closed only by startOut, whose StartStoreTransfer is sent only past this branch. Stuck until
+    aborted (the source keeps serving).
+    Fix: wait only while the store is served or opening at the destination path (as retireForeignCopy tests, plus
+    ctx.loader.isOpening). Also check that tryLoadStore's markOffline by store id cannot mark the other device's
+    served store offline.
 
 
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-(no open items)
+5.1 [R-W9] Every non-voter's apply of a blind Insert of a new key is reported.
+    PLAUSIBLE. Effort M. transaction-recovery.md (refinement: cross-document-review.md section 5).
+    Tx.issueCommits' reinserts reports any non-VoteCommit Tx's Insert of an absent key without a required revision:
+    the shape of every ordinary TKVL insert. A store is a non-voter whenever T resolves while its vote is withheld
+    (behind an in-flight commit, a collision or lock-order wait, or before its client prepare), routine under
+    pipelined inserts into one leaf. Each such commit loses MissedUpdateFinalizationAction's clean fast path
+    (errorTimeout plus a marker batch, CRL state and admission held longer) and costs an ErrorTree mark and repair.
+    No safety effect.
+    Fix: report a non-voter's Insert of an absent key only when a deletion of that key may have applied first, kept
+    on the rare path: the Frontend records, per object and key with the deleting transaction's timestamp, every
+    committed Delete of the key applied here (not only no-op ones: a Delete checked by object revision alone passes
+    with or without T's Insert), every reconcile of the object including one that installs nothing, pruned below the
+    forget floor as repairInstalls is. A recovered non-voter still reports every object it applies. Keep the Q-W13
+    tests passing.
+
+5.2 [SL-W12] A promoted transfer-in copy marked rebuild-required is still repointed, and the intact source released.
+    CONFIRMED. Effort S. systemic-loss-protection.md.
+    StoreTransfers.startIn tests transferred-in before rebuild-required, so after a D1/D2 declaration (holdsOwnState
+    false on a transient read error) or save-file damage (D3) it resumes recordTransferIn /
+    DeviceMetadata.updateStateForTransferredStore; the source's Deleted Stores pass and StoreCopies.release then delete
+    the intact source copy before the marked copy flips. A needless rebuild, one store short of margin meanwhile.
+    Fix: in startIn's resume branch, delete a promoted copy carrying rebuild-required, or whose save file fails
+    CrashRecoveryLog.loadValidStoreState, with StoreCopies.delete, and restart the transfer. Resume path only.
+
+5.3 [X-W15] A load's onServed gossip runs when its LoadStore is queued, before the store is served.
+    CONFIRMED. Effort S. cross-document-review.md.
+    StoreLoader.handleBackendOpened runs the callback after serveOpened, which only posts LoadStore; handleLoad can
+    still leave the store offline (tryChargeLoaded, AlreadyAssigned, device unloaded, save file sent to rebuild). Both
+    callers (DeviceShutdown.reloadClosedStores, StoreTransfers.reinstateAbandonedOut) gossip StoreMoved, so peers clear
+    their offline mark early. No safety effect.
+    Fix: run the callback when serveOpened's future succeeds; on failure merge it into the storesAwaitingRetry entry
+    (composeServed). Correct the scaladoc and the reinstateAbandonedOut comment.
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
@@ -77,10 +250,14 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-(no open items)
+7.1 [SL-W13, X-W17] fsif/DESIGN.md section 4 and three test names are stale.
+    CONFIRMED. Effort S. systemic-loss-protection.md, cross-document-review.md.
+    DESIGN.md 4.6 cites "fsifOpened, :1104-1123" (the code is StoreLoader.handleBackendOpened); the 4.1/4.2 tables
+    cite drifted line numbers; 4.4 counts L1-L12 and 22 cases, omitting L0 (13 and 23). HostFsifLoadSuite,
+    FsifInitializationSuite and RocksDBBackendResourcesSuite test names cite the retired row "(SL X14)", quoted in
+    DESIGN.md. Fix: name methods instead of line numbers, correct the counts, cite "(SL D5)".
 
-
-PRIORITY 8: unimplemented features
-----------------------------------
-
-(no open items)
+7.2 [X-W16] server/repair/CLAUDE.md says the bootstrap sweep "neither counts nor parks"; it counts lock deferrals.
+    CONFIRMED. Effort S. cross-document-review.md.
+    StoreRepairer.repairUpdate calls deferral.record for sweep keys (unused; retainSweep prunes it). Fix: reword
+    (the sweep neither proves, parks nor counts stale passes), or skip deferral.record when allowProof is false.

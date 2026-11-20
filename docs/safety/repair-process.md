@@ -33,7 +33,7 @@ guards that make the copy safe against concurrent transactions at that store.
 | # | Fact | Code |
 |---|------|------|
 | Q1 | For every IDA the read threshold `r` is a majority and `r <= t <= w` (`t` the write threshold, `w` the width), so `r + t > w`: any read set of `r` stores contains at least one commit voter of any committed transaction. | `common/ida/IDA.scala`; CLAUDE.md |
-| Q2 | A store that voted commit holds the transaction's locks until it applies the outcome or the transaction resolves abort. A read reply reports them: locked keys (present keys locked, plus absent-key locks) and an object-level flag (exclusive object lock, content lock, range locks). A write locks every key it writes, and an object-level write takes the exclusive lock. Shared revision locks are not reported (they never change the object). | `server/store/ObjectState.scala` `lockedKeys`, `objectLevelLocked`; `RequirementsLocker.lock`, `lockWrites`; `Frontend.readForNetwork` |
+| Q2 | A store that voted commit holds the transaction's locks until it applies the outcome or the transaction resolves abort. A read reply reports them: locked keys (present keys locked, plus absent-key locks) and an object-level flag (exclusive object lock, content lock, range locks), each including a slot a recovered commit vote took over from another holder (`displacedLocks`). A write locks every key it writes, and an object-level write takes the exclusive lock. Shared revision locks are not reported (they never change the object). | `server/store/ObjectState.scala` `lockedKeys`, `objectLevelLocked`; `RequirementsLocker.lock`, `plannedLocks`; `Frontend.readForNetwork` |
 | Q3 | The reader picks the revision held by at least `r` replying stores, whatever its timestamp (at most one revision can reach a majority). It returns once one does. Its read locks are the union over every store that replied with a state. Its timestamp is the maximum over the matching stores. | `client/internal/read/BaseObjectReader.scala` `getStoreStates`, `attemptRestore` |
 | Q4 | A KeyValue key is restored from the stores holding a revision of it that `r` segments share. It is declared deleted only when no revision of it can still reach `r` and no store holds the lock of any segment's revision; otherwise the read waits (`NotRestorable`). | `client/internal/read/KeyValueObjectReader.scala` `resolve` |
 | Q5 | A restored object with refcount 0 is `InvalidObject(provesDeletion = true)`. A read fails `InvalidObject` when more than `w - r` stores answered `ObjectNotFound`/`ObjectMismatch`, and `provesDeletion` is set when more than `w - t` did. A store that applied a deletion answers `ObjectNotFound`. | `BaseObjectReader.scala`; `client/ReadError.scala` `InvalidObject` |
@@ -419,7 +419,10 @@ the store exists or follows. Written before the whole-object pass that narrowed 
 pass's `minTimestamp` to at least D's start, and that pass, not stale, raised the store's timestamp to a read at least that new. Written between
 the passes, it moved the entry's revision, and `DeferralState.observeEntry` made this pass whole-object. Written after
 the entry's delete, it is a fresh entry, repaired whole-object from a read reflecting D, which removes a key written
-back meanwhile.
+back meanwhile. A pass whose plan changes nothing records no install, yet its entry's delete can remove the store's
+mark for a key deletion the store already matched (a required-revision Delete applied there as a no-op on the absent
+key): a Tx that did not vote commit here reports its apply of a blind Insert of an absent key whatever repair recorded
+(`Tx.issueCommits`), and a commit voter's lock on the key defers it here (M6).
 
 ### 6.3 `Reconcile.plan`
 
@@ -832,4 +835,22 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-None open.
+### RP-W8: A repair install grows a KeyValue slice under held commit votes' slice reservations, so a counted voter's apply fails on size
+Verdict CONFIRMED. Priority 1. Effort S.
+Mechanism: store S holds commit votes V and V2 on KeyValue object O, each reserving its growth
+(`ObjectState.sliceReservations`, `RequirementsLocker.lock`); each passed `RequirementsChecker.checkKVSliceSize`
+against S's copy, which lacks keys b committed elsewhere while S was silent. V2 aborts elsewhere (its peers, holding
+b, voted abort on size) but is still held at S. S's entry for O is repaired: `Frontend.reconcile` treats held votes
+as settled, `reconcileSettled` defers only the keys S's votes lock (M6), and `Reconcile.planKeyValue` installs b with
+no size check. The slice plus the reservations now exceeds `maxSliceSize`. V commits with S counted. `Tx.issueCommits`
+re-checks with `applying = true`: `checkKVSliceSize` counts V2's reservation against the grown slice, throws
+`SliceSizeExceeded`, and V's update of O is skipped at S ("INVARIANT VIOLATION ... Skipped and reported"). R16
+(transaction-requirements.md) holds that the slice plus every reservation fits because only a checked vote or an
+apply changes the slice; a repair install is a third, unchecked change.
+Consequence: a counted commit voter does not apply a committed update, so V sits on one store fewer than its vote
+count: write-threshold margin lost to asynchrony alone. A non-voter's skip of V on size, which R16 permits, can then
+take V below `r` with no failure: committed data lost. Repair restores it only if the survivors still reach `r`.
+Fix: in `Frontend.reconcileSettled`, when O holds `sliceReservations` of other transactions and the plan grows the
+slice (installs or object-level parts), run the `checkKVSliceSize` measure on the planned state with those
+reservations. If it does not fit, write nothing and answer stale, so a later pass installs once the votes apply or
+are released. This costs only repair passes on objects that hold growing votes.

@@ -81,8 +81,9 @@ no failure, no per-transaction bound, no growth) are for CRLs that keep nothing 
 - **C1 (save before send).** `onDurable` of `save(t, s, h)` runs only after the entry holding `h` has been written
   with `DSYNC` and the write returned. A caller sends nothing that depends on `s` before `onDurable`. Exception, by
   design: a save of an id that an unwritten entry, the one in flight included, already deletes finally is skipped
-  and still acknowledged (C9, W1b). A deletion is the store's decision to forget the transaction: a save queued
-  behind it would make durable a state the deletion is about to remove anyway. That this is safe for the save's
+  and still acknowledged (C9, W1b), and so is a save that a later deletion of the id in the same unwritten entry takes
+  out of it (`LogEntry.deleteTx`, 5.8). A deletion is the store's decision to forget the transaction: a save queued
+  beside or behind it would make durable a state the deletion is about to remove anyway. That this is safe for the save's
   sender is the transaction protocol's argument, not the CRL's: a store queues a final deletion only for a transaction
   it has concluded ([cross-document-review.md](cross-document-review.md) 2.1).
 - **C2 (entry order).** Entries are written one at a time, in serial order. Entry N+1 is not issued until entry N's
@@ -207,14 +208,15 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
 3. With no save file, `StoreRouter.recoverDeferred` -> `readAndRecover` runs on the store's executor and calls
    `readStoreState`. It does not block: the Future completes on the CRL thread and recovery is routed back to the
    executor. The store holds its transaction messages until `Frontend.recover` has recreated its transactions, so it
-   saves nothing in between. A throw while reading or recovering fail-stops the store (`Host.StoreFailStopped`).
+   saves nothing in between. A throw while reading or recovering fail-stops the store (`Host.StoreFailStopped`),
+  which marks it `rebuild-required`, a CRL that died or shut down under the read included (CRL-W12).
 4. With a save file: its state is first charged to the device's admission, checked (`CrlAdmission.tryChargeLoaded`,
    section 6.1 A3); a state that does not fit now leaves the store offline with its file kept, retried at the device
    scans, and one that never can, even at the most streams any config allows (`StoreLoader.neverFits`, `maxAdmissionLimitBytes`),
    is treated as an unusable file (step 2). Then `crl.dropStore` drops whatever the
    device CRL holds for the store, durably, and `crl.loadStore` saves every record of the file into it
    (`StoreLoader.awaitCrlLoad`), then `StoreRouter.crlLoaded` removes the
-   file durably (`DurableFiles.remove`) and only then recovers. A crash between "records durable in the device CRL"
+   file durably (`DurableFiles.remove`) on the store's executor and only then recovers (a throw there: CRL-W13). A crash between "records durable in the device CRL"
    and "file removed" loads the same records again under the same ids, which is harmless: the store served nothing in
    between. A failed `loadStore` unloads the store (`handleUnloadFailed`), which drops whatever reached the CRL
    (`closeUnloaded(dropDurably = true)`): the file is still the whole state. The file is always the store's whole
@@ -254,8 +256,8 @@ piece leaves the image when that save's entry is built (5.3: a form's build unpi
 |-----------|-----------|--------|
 | Planned device shutdown | stores close with `extractCrl = false`, records stay live; then `crl.shutdown()` | `DeviceShutdown.closeForShutdown`, `shutDownCrl` |
 | Transfer out, store open | on the executor after `closing`: `readStoreState`; `saveStoreState` to `crl_save.log` (tmp, fsync, rename, directory fsync); `store.close()`; then `deleteTransactions(state.entryIds)` and the retained admission released | `StoreLoader.handleClose(extractCrl = true)` |
-| Transfer out, store closed | `readStoreState`, merged over any earlier save file (`StoreRecoveryState.supersededBy`), saved, then `deleteTransactions`; fails if the store was opened during the read (`opensStarted`) | `StoreTransfers.extractUnloaded` |
-| Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source) | marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it (any entries `readStoreState` still returns saved first as `lost-crl-entries.log`), else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore` and the Deleted Stores pass) |
+| Transfer out, store closed | `readStoreState`, merged over any earlier save file (`StoreRecoveryState.supersededBy`, the CRL's entries winning: CRL-W14), saved, then `deleteTransactions`; fails if the store was opened during the read (`opensStarted`) | `StoreTransfers.extractUnloaded` |
+| Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source, an earlier tenancy's copy at the path of a store transferring in) | marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it (any entries `readStoreState` still returns saved first as `lost-crl-entries.log`), else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore`, `StoreTransfers.retireEarlierTenancy` and the Deleted Stores pass) |
 | Store no longer on the device (safety net: a retire drops first) | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory, no drop and no retire running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
 | Store whose `loadStore` of its `crl_save.log` failed (the file stays) | `dropStore` | `StoreLoader.handleUnloadFailed`, `closeUnloaded(dropDurably = true)` |
 
@@ -357,8 +359,9 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   capacity / 2048 rounded down to 4 KiB, at least 64 MiB, `crl-max-streams` 20 (at most 1024) and
   `crl-min-free-percent` 5. The first two size only a new CRL; an existing one keeps the sizing in `crl/sizing` and
   logs a warning if the config asks another stream size or more streams than the ring has. The last two bound
-  growth (5.11) and are read at each open (`CrlSizingDefaults.resolveExisting`): a bound `resolve` would refuse
-  disables growth for that open (`crl-max-streams` taken as 0, `crl-min-free-percent` as 100), with a warning.
+  growth (5.11) and are read at each open (`CrlSizingDefaults.resolveExisting`): a `crl-max-streams` outside 4 to
+  1024 or a `crl-min-free-percent` outside 0 to 100 disables growth for that open (`crl-max-streams` taken as 0,
+  `crl-min-free-percent` as 100), with a warning.
 - **Grown.** When admission is full the Frontend asks the CRL to grow (`requestGrowth`); a committed growth raises
   the device's admission limit through `onAdmissionLimitRaised` (`CrlAdmission.raiseLimit`, registered by
   `DeviceDiscovery`).
@@ -590,7 +593,8 @@ written only into the active stream, so every piece in a stream is reached as "n
 1. **Newest entry.** Streams are ordered by the serial of their head entry (offset 0) and the first with a wholly
    intact entry wins (`StreamReader.lastIntactEntry`). Within a stream, entries are followed from the head while their
    headers are intact, carry the stream's current UUID (read from offset 0) and have rising serials; only the last
-   one's body is checked. A torn last entry is dropped with a warning and the entry before it is the last. A stream
+   one's body is checked. A torn last entry is dropped with a warning and the entry before it is the last, its body
+   unchecked: the walk skips the body check of the last entry, so that entry's body is never verified (CRL-W11). A stream
    whose only entry is a torn head (a rotation write in flight at a crash) yields to the stream before it.
 2. **Nothing newer.** `newerIntactEntry` scans the active stream past the last entry, and all of the next stream, for
    an intact entry of any cycle with a higher serial, hopping intact headers by their size and anything else by
@@ -600,7 +604,8 @@ written only into the active stream, so every piece in a stream is reached as "n
 3. **Walk.** From the last entry, follow `previous entry` links, loading each entry's static region into a
    `RecoveringState`, until reaching the last entry's `oldestEntryNeeded`. Each step must reach an entry of its
    stream's current cycle with a lower serial and an intact header and body, or `BrokenEntryChain`/`CrlCorrupt` is
-   thrown. The extents of each verified entry's dynamic data are recorded.
+   thrown; the last entry's body is taken as checked by step 1. The extents of each verified entry's dynamic data are
+   recorded.
 4. **Apply.** Entries are applied newest first: a record already present is not replaced; one named by a deletion of
    the same or a newer entry is skipped (C4, C9). Stubs follow the same rule against stub deletions.
 5. **Data.** Each surviving transaction's txd and data are read from their locations, which must lie within the
@@ -1136,7 +1141,8 @@ last-built form (W3, W5), so recovery returns that form. Tested by tearing each 
 three-lap run, the evacuation and then the head, at each sector prefix (SimpleCRLSuite).
 
 **10.3 Corruption of a durable entry.** A bad checksum in any entry the walk visits, or in the newest entry's header
-when a newer entry follows, throws `CrlCorrupt`; data is read only from verified entries. Rot exactly in the newest
+when a newer entry follows, throws `CrlCorrupt`; data is read only from verified entries. The exception is the body
+of the entry before a dropped torn one, which nothing checks (CRL-W11). Rot exactly in the newest
 acknowledged entry is indistinguishable from a torn write: that entry is dropped and its promises, votes or data are
 lost, as with a lying cache. Rot in an entry recovery no longer needs still makes the CRL lost when it hides a newer
 entry or lies in the walk. Both are accepted: the outcome is a rebuild, simple rather than optimized.
@@ -1164,7 +1170,8 @@ indefinitely and `crl.shutdown()` with it (Backlog.txt, "Isolate every device's 
 
 **10.7 A dead CRL thread or writer.** Every pending and later Future fails with `CrlFailed`, no save completion runs,
 and `DeviceShutdown.crlFailed` unloads the device until restart (5.10, section 4). Rebuilds and transfers on the device
-fail their CRL calls and are resumed by the restart. No safety loss.
+fail their CRL calls and are resumed by the restart. No safety loss, but a store whose recovery read the death
+fails is fail-stopped and rebuilt (CRL-W12).
 
 **10.8 The device is pulled.** Writes fail with an I/O error; the writer dies (10.7). Whatever was acknowledged is on
 the device, which holds a consistent post-crash CRL: that is what makes adoption possible.
@@ -1262,4 +1269,77 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-None.
+### CRL-W11: The body of the entry before a torn newest entry is recovered without its checksum
+Verdict CONFIRMED. Priority 1. Effort S.
+Mechanism: `StreamReader.lastIntactEntry` follows the active stream's entries checking headers only. When the last
+one's body fails (`bodyIntact` false) it returns the entry before it, `prev`, without checking `prev`'s body (its
+scaladoc: "unchecked: recovery checks every entry it reads"). `Recovery.recover` then uses `prev` as `lastEntry`, and
+its walk (`loadPrevious`) skips the body check for `lastEntryLocation` ("The last entry's body was checked when it was
+found"). So `prev`'s static region is loaded by `LogEntry.loadStaticEntryContent` and its dynamic extent recorded in
+`verified` with no CRC check anywhere. The trigger is rot (or a misdirected write) in the body of the newest durable
+entry, which every handler of it has acknowledged, coinciding with a crash that tears the next write.
+Consequence: corrupted promises, accepted values, dispositions, statuses or data locations of `prev`'s records are
+recovered as genuine instead of throwing `CrlCorrupt` (C7, C8, 10.3), and an object update is read from bytes the
+checksum never covered. A wrongly recovered promise or acceptance can let the store contradict what it acknowledged
+(a split decision); wrong data can be applied as a committed update.
+Fix: in `lastIntactEntry`, check `prev`'s body as well when the last one is dropped, and drop to `prev` only if it
+passes. If it fails, the CRL is corrupt: return a marker that `Recovery.recover` turns into `CrlCorrupt`, since only
+the write in flight can be torn. Correct both scaladocs. Only the open pays: one extra body read, and only after a
+torn write.
+
+### CRL-W12: A CRL that dies while a store awaits its recovery read marks that store for rebuild
+Verdict CONFIRMED. Priority 3. Effort S.
+Mechanism: `StoreRouter.readAndRecover` fail-stops the store on any failed `readStoreState`
+(`Host.StoreFailStopped(.., StoreRebuilds.RecoveryFailed)`). SimpleCRL answers that read from memory, so it fails
+only with `CrlFailed` (the CRL died: a writer I/O error, a handler throw, W6) or `CrlClosed` (shutdown). At a death,
+`SimpleCRL`'s thread fails every pending tracked Future (`failPending`) before it completes `failed`. The read's
+parasitic callback posts `StoreFailStopped` first; `DeviceShutdown.crlFailed` is posted after it and closes the
+device's stores one at a time (`closeStoresToRelinquish`). A read issued after the death fails at once in `tracked`.
+`StoreRebuilds.handleFailStopped` finds the store still installed and calls `backendFailed`, which writes
+`rebuild-required` and has the reconcile flip the entry to Rebuilding. A store reloaded through `StoreRouter.crlLoaded`
+takes the same path. The window is wide at device load, when every store's read is issued; and 6.1 says a restart
+after a W6 failure may fail at W6 again under the same load.
+Consequence: stores whose transaction state is intact in the CRL files, which a restart recovers (5.10), are declared
+lost and rebuilt: margin lost for the length of each rebuild, from a condition that is not store damage. A load-driven
+W6 failure (unoffset stubs beyond the margin) can hit many devices at once, and each restart marks the stores that
+were loading. That makes a correlated declaration (systemic-loss-protection Q3 asks the general question;
+Backlog.txt's lost-store-declaration inventory lists `readAndRecover`).
+Fix: in `readAndRecover`'s failure handler, treat `CrlFailed` and `CrlClosed` as the device's failure, not the
+store's. Log, and leave the store holding its messages: `crlFailed`, or the shutdown that closed the CRL, closes it
+without marking it, and a restart recovers it. Keep the fail-stop for a failure of `Frontend.recover` itself
+(`recoverOrFail`).
+
+### CRL-W13: A failed removal of `crl_save.log` after its load leaves the store installed and stalled
+Verdict CONFIRMED. Priority 4. Effort S.
+Mechanism: `StoreRouter.crlLoaded` runs `DurableFiles.remove(saveFile)` on the store's executor inside a `route`
+task, then `readAndRecover`, then `p.success`. If `os.remove` or the directory force throws (an I/O error),
+`HostThreading.runLogged` only logs it. `readAndRecover` never runs, so `Frontend.awaitingCrl` stays set and the
+installed store holds every transaction message indefinitely. `p` (the `LoadStore` promise) is never completed, and
+the store is in no retry set (`storesAwaitingRetry`). Until a restart it looks loaded and serves nothing.
+Consequence: one store is unavailable until the host restarts, a margin loss from one I/O error. Its state is safe:
+the device CRL holds the loaded records, and a restart either finds the file (drop and load again) or recovers from
+the CRL.
+Fix: catch `NonFatal` around the removal and treat it as a load that failed with its data intact. Unload the store
+without dropping its CRL entries (`closeUnloaded(dropDurably = false)`, through a posted event as `UnloadFailedStore`
+does), fail `p`, and put the store in `storesAwaitingRetry`. A retry must not serve until the removal is durable. If
+the unlink succeeded but the force failed, a crash could bring the file back over newer device-CRL state. So the
+retry forces the store directory before it trusts that the file is absent, or redoes the removal and its force.
+
+### CRL-W14: A transfer out of a closed store merges stale device-CRL entries into its `crl_save.log`
+Verdict PLAUSIBLE. Priority 2. Effort S.
+Mechanism: `StoreTransfers.extractUnloaded` writes `saved.supersededBy(state)`: the store's existing `crl_save.log`
+state overlaid with whatever `readStoreState` returns, the CRL's entries winning by id (a CRL transaction id also
+removes the file's stub of that id). A closed store that has a save file has served nowhere since the file was
+written (a load removes it), so the file is its whole state (3.3, step 4). What the device CRL holds for it is either
+a copy of part of the file or entries an earlier tenancy of the store left on this device, whose copy was removed by
+hand before `DeviceReconciler.dropLeftoverCrlState` dropped them. The leftover drop never runs once the store's
+directory exists. `StoreLoader.awaitCrlLoad` drops exactly these entries before loading the file so they are never
+recovered as the store's own; `extractUnloaded` writes them into the file instead. The trigger needs the store,
+transferred back onto the device, to stay unloaded (a load refused for CRL room, `tryChargeLoaded`, or a failed open
+waiting in `storesAwaitingRetry`) while a transfer out of it is requested.
+Consequence: the destination loads stale records as the store's own. They rejoin transactions it has forgotten, and a
+stale commit vote can find its own UnackedCommits entry and apply again (an overwritten update). A stale record can
+also replace the file's current record of the same id.
+Fix: when a valid save file exists, it is the whole state. Leave it unchanged, drop the store's device-CRL entries
+(`dropStore`, then `releaseRetained`), and complete. Merge, or simply save, only when there is no file. Remove
+`supersededBy` if nothing else uses it.

@@ -413,15 +413,7 @@ Every clock comparison that crosses subsystems, and what bounds it:
 
 ## 5. Contradictions
 
-Between the documents:
-
-* transaction-recovery.md R-W9's proposed narrower report must still cover every hazard the current rule covers
-  (transaction-requirements.md 9.4): a committed Delete of the key applied here that removed an older value, not only
-  one that was a no-op over an absent key (a Delete checked by an object revision alone passes whether or not T's
-  blind Insert applied, since a blind Insert moves no revision); every repair reconcile of the object, including one
-  that installs nothing and deletes the store's mark; and, with records lost in a crash, every object a recovered
-  non-voter applies. Keyed by key and by the deleting transaction's timestamp, a report is due when a recorded
-  deletion of the key is newer than T's start.
+Between the documents: none open.
 
 Terms they share mean the same in each:
 

@@ -869,21 +869,4 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-### R-W9: every non-voter's apply of a blind Insert of a new key is reported, marking routine applies at slow replicas
-Verdict PLAUSIBLE. Priority 5. Effort M.
-Mechanism: `Tx.issueCommits` puts an object in `reinserts`, and so in `objectCommitErrors`, when the Tx's
-`disposition != VoteCommit` and its KeyValue update has no required revision and Inserts a key absent before the
-apply. Ordinary TKVL in-place inserts take that shape: `KeyValueListNode.applyChange` passes no required revision
-unless `pinned`, and a new key's Insert carries `DoesNotExist`. A store is a non-voter whenever T resolved while its
-vote was withheld: behind an in-flight commit of the object (`Tx.awaitingCommits`, `Frontend.commitInFlight`), a
-collision wait or a lock-order wait, or before its client prepare. Under pipelined inserts into one leaf, the replica
-whose previous commit persists last routinely withholds while the others decide. Its apply is then reported although
-no deletion of the key reached it: no committed Delete found the key absent there and no repair touched the object.
-Consequence: such a transaction's `MissedUpdateFinalizationAction` loses its clean fast path (`updateCommitErrors`),
-so finalization waits `errorTimeout` (2 s) plus a marker batch, every store holds T's CRL state and admission that
-much longer, and the replica gets an ErrorTree mark and a repair pass per transaction. No safety effect.
-Fix: report a non-voter's Insert of an absent key only when a deletion of that key may have applied first. Record it on
-the rare path: the Frontend notes, per object and key, a committed Delete applied over an absent key (a no-op) and a
-repair reconcile of the object, kept while a transaction started before it may still join (pruned below the forget
-floor, as `repairInstalls` is), and `issueCommits` tests a non-voter's Inserts against it. A commit applied normally,
-or by a non-voter of an object with no such record, then checks nothing.
+None.

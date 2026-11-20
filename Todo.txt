@@ -67,21 +67,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.1 [R-W9] Every non-voter's apply of a blind Insert of a new key is reported.
-    PLAUSIBLE. Effort M. transaction-recovery.md (refinement: cross-document-review.md section 5).
-    Tx.issueCommits' reinserts reports any non-VoteCommit Tx's Insert of an absent key without a required revision:
-    the shape of every ordinary TKVL insert. A store is a non-voter whenever T resolves while its vote is withheld
-    (behind an in-flight commit, a collision or lock-order wait, or before its client prepare), routine under
-    pipelined inserts into one leaf. Each such commit loses MissedUpdateFinalizationAction's clean fast path
-    (errorTimeout plus a marker batch, CRL state and admission held longer) and costs an ErrorTree mark and repair.
-    No safety effect.
-    Fix: report a non-voter's Insert of an absent key only when a deletion of that key may have applied first, kept
-    on the rare path: the Frontend records, per object and key with the deleting transaction's timestamp, every
-    committed Delete of the key applied here (not only no-op ones: a Delete checked by object revision alone passes
-    with or without T's Insert), every reconcile of the object including one that installs nothing, pruned below the
-    forget floor as repairInstalls is. A recovered non-voter still reports every object it applies. Keep the Q-W13
-    tests passing.
-
 5.2 [SL-W12] A promoted transfer-in copy marked rebuild-required is still repointed, and the intact source released.
     CONFIRMED. Effort S. systemic-loss-protection.md.
     StoreTransfers.startIn tests transferred-in before rebuild-required, so after a D1/D2 declaration (holdsOwnState

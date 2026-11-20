@@ -228,15 +228,20 @@
   durable; one that holds its update of the object here (`Tx.holdsUpdateOf`: it issued its commit, or voted commit,
   whose lock puts the deletion after it) until its state is saved without that update (`persistWithoutUpdateOf`;
   its recovered vote then finds the update missing and takes it as applied). A non-voter that has not applied holds
-  an update the store lacks: nothing waits for it, and its later apply of a blind Insert of a key absent before it
-  reports the object (`Tx.issueCommits`; the deletion may have applied first, e.g. a required-revision Delete, a
-  no-op on the absent key). Inline for every object no recent blind write covers
+  an update the store lacks: nothing waits for it. `keyDeletions` keeps, per object and key, the latest start of a
+  committed transaction whose Delete of the key applied here (a no-op over an absent key included; recorded by
+  `Tx.issueCommits` for updates flagged `deletesKeys`), kept above the forget floor or while a Tx started at or before
+  it is held (pruned at `expiryHeartbeat`). A non-voter's apply of a blind Insert of a key absent before it reports the
+  object only when such a deletion started at or after its own start (`keyDeletedSince`): a deletion started earlier
+  is never ordered after it. So the routine non-voter of pipelined inserts reports nothing and its transaction's
+  finalizer stays on the clean fast path. Inline for every object no recent blind write covers
 - Late blind Insert after a repair install (transaction-requirements 9.4): a repair write can install a later
   transaction's key deletion at a store that never held the Insert, which a delayed T would then write back at this
   store alone, possibly with no mark (its TxCommitted inside `errorTimeout`). `repairInstalls` keeps the latest object
-  timestamp each repair write installed, while a transaction started before it may still join (pruned below the
-  forget floor at `expiryHeartbeat`), and tells every held Tx of the object, and every later-created one, started
-  before it (`Tx.repairInstalled`). An apply of a blind Insert of a key absent before it, on an object so marked,
+  timestamp each repair write installed, and for a reconcile that changes nothing (it may still clear a mark for a
+  deletion the store never applied) the later of the read's and the store's, while a transaction started before it
+  may still join (pruned below the forget floor at `expiryHeartbeat`), and tells every held Tx of the object, and
+  every later-created one, started before it (`Tx.repairInstalled`). An apply of a blind Insert of a key absent before it, on an object so marked,
   applies and reports the object (`Tx.issueCommits`), so the finalizer marks the store. A recovered commit vote
   (its marks lost with the crash) reports the same apply when any write newer than T's start reached the object
 - Ranged-write/append deltas are read through `EncodedAppendDelta`, which parses only the header and region table

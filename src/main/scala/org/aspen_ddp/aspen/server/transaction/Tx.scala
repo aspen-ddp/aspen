@@ -1213,24 +1213,26 @@ class Tx( trs: TransactionRecoveryState,
     }
 
     // Objects on which this apply writes back a key the store may have held deleted: a blind Insert of a key now
-    // absent, where this Tx did not vote commit here (it held no key lock that kept a later deletion out: a deletion
-    // checked by a required revision alone applied first as a no-op, or repair installed it from a read with nothing
-    // to change), where a repair wrote a state newer than this transaction's start (repairInstalled), or, for a
-    // recovered commit vote, whose marks were lost with the crash, where any write newer than its start reached the
-    // object. The state may hold a later transaction's deletion of the key at a store that never held T's update. The
-    // apply still runs, and reports the object, so the finalizer marks the store and repair installs the object's
-    // current state (transaction-requirements 9.4, 10.5c). A non-voter is not counted toward the write threshold, so
-    // its report costs a repair pass, not margin; a commit voter applied normally checks nothing here
+    // absent, where a repair wrote, or found current, a state newer than this transaction's start (repairInstalled),
+    // where this Tx did not vote commit here (it held no key lock that kept a later deletion out) and a committed
+    // Delete of the key started since applied here, a no-op over the absent key included (Frontend.keyDeletedSince),
+    // or, for a recovered commit vote, whose marks were lost with the crash, where any write newer than its start
+    // reached the object. The state may hold a later transaction's deletion of the key at a store that never held T's
+    // update. The apply still runs, and reports the object, so the finalizer marks the store and repair installs the
+    // object's current state (transaction-requirements 9.4, 10.5c). A non-voter is not counted toward the write
+    // threshold, so its report costs a repair pass, not margin. A non-voter's Insert of a key no deletion reached
+    // reports nothing, and a commit voter applied normally checks nothing here
+    val nonVoter = disposition != TransactionDisposition.VoteCommit
     val reinserts = requirements.iterator.collect {
       case r: KeyValueUpdate if r.requiredRevision.isEmpty => r.objectPointer.id
     }.filter { oid =>
       objects.get(oid).exists { state =>
-        val suspect = disposition != TransactionDisposition.VoteCommit || repairedUnder.contains(oid) ||
-          (recovered && state.metadata.timestamp > txd.startTimestamp)
+        val suspect = repairedUnder.contains(oid) || (recovered && state.metadata.timestamp > txd.startTimestamp)
         // An undecodable update fails its re-check and is skipped and reported by the apply: it writes nothing back
-        suspect && !failedHere.contains(oid) && state.kvState.exists { kvs =>
+        (suspect || nonVoter) && !failedHere.contains(oid) && state.kvState.exists { kvs =>
           ou.get(oid).exists(u => scala.util.Try(opsOf(u)).toOption.exists(_.exists {
-            case o: Insert => !kvs.content.contains(o.key)
+            case o: Insert => !kvs.content.contains(o.key) &&
+              (suspect || frontend.keyDeletedSince(oid, o.key, txd.startTimestamp))
             case _ => false
           }))
         }
@@ -1343,15 +1345,17 @@ class Tx( trs: TransactionRecoveryState,
       val form = UpdateForm.of(os.objectId, requirements, ou, allocating)
       val cs = CommitState(pointerOf(os.objectId), os.metadata, os.objectType, os.data, allocating, form)
       val oid = os.objectId
-      def deletedKeys(): Set[Key] =
-        val deletes = requirements.exists {
-          case r: KeyValueUpdate => r.objectPointer.id == oid && r.deletesKeys
-          case _ => false
-        }
+      val deletes = requirements.exists {
+        case r: KeyValueUpdate => r.objectPointer.id == oid && r.deletesKeys
+        case _ => false
+      }
+      // Only an update flagged deletesKeys may hold a Delete (RequirementsChecker, UnflaggedDelete)
+      val deletedKeys: Set[Key] =
         if !deletes then Set()
         else ou.get(oid).map(u => opsOf(u).iterator.collect { case o: Delete => o.key }.toSet).getOrElse(Set())
+      frontend.recordKeyDeletions(oid, deletedKeys, txd.startTimestamp)
 
-      frontend.commit(os, cs, transactionId, () => deletedKeys())
+      frontend.commit(os, cs, transactionId, () => deletedKeys)
     }
   }
 

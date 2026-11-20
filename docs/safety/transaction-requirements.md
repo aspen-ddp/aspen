@@ -687,26 +687,39 @@ So a recovered commit vote that still holds a blind Insert of an absent key neve
 The cost is one index entry per Tx with a blind KeyValue update, and a decode only for a key deletion soon after a
 blind write of the same object; nothing on the ordinary commit path.
 
-A Tx that did not vote commit here held no key lock that kept a later deletion of its key out, so its apply of a
-blind Insert of a key absent before the apply always reports the object in `objectCommitErrors` (`Tx.issueCommits`):
-the deletion may have applied first (a required-revision Delete, a no-op on the absent key), or reached the store
-through a repair that found nothing to change (cross-document-review.md 2.4). The finalizer marks the store, and the
-mark's repair installs the object's current state. A non-voter is not counted toward the write threshold, so the
-report costs a repair pass, not margin.
+A Tx that did not vote commit here held no key lock that kept a later deletion of its key out, so a deletion ordered
+after T may apply here first. Its apply of a blind Insert of a key absent before the apply reports the object in
+`objectCommitErrors` (`Tx.issueCommits`) when a committed Delete of that key, started at or after T's start, applied
+here (`Frontend.keyDeletions`, `keyDeletedSince`): a no-op over the absent key, or one that removed an older value (a
+Delete checked by the object revision alone passes whether or not T's Insert applied, as a blind Insert moves no
+revision). A deletion started before T's start is never ordered after T: where T's Insert applied first, the object
+timestamp is at least T's start, and the deletion's check requires its own timestamp to be at least that. The record
+keeps the latest deleting start per object and key, written by every apply that deletes keys (the keys are decoded
+only for an update flagged `deletesKeys`), and is kept while a transaction started before it may still apply here:
+above the forget floor, or while a Tx started at or before it is held (a held Tx applies below the floor too); it is
+pruned at `expiryHeartbeat`. A deletion that reached the store through repair is covered by `repairInstalls` (below).
+The finalizer marks the store, and the mark's repair installs the object's current state. A non-voter is not counted
+toward the write threshold, so the report costs a repair pass, not margin. A non-voter's Insert of a key no deletion
+reached reports nothing, so the routine non-voter of pipelined inserts into one leaf (its vote withheld behind an
+in-flight commit, a collision or lock-order wait, or its client prepare) leaves its transaction's finalizer on the
+clean fast path. The record is empty at load: the load's floor refuses every transaction started before it, and a
+recovered non-voter reports every object it applies.
 
 A store can also hold a key's deletion it never applied: repair installs it from a read (a whole-object reconcile),
 at a store that may never have held the Insert either. A transaction T that reaches such a store later (a delayed
 client prepare at a store that never saw T, its vote passing T's pin on another object; or a non-voter applying a
 commit decided elsewhere) passes its re-check on the absent key and writes it back there alone. Its TxCommitted could
 reach the finalizer within `errorTimeout`, leaving no mark, and T's own mark of a store that missed it is repaired only
-once the store can no longer join T (repair-process.md 5.4), after any such apply. So the Frontend records the latest
-object timestamp each repair write installs (`repairInstalls`, kept while a transaction started before it may still
+once the store can no longer join T (repair-process.md 5.4), after any such apply. A reconcile that changes nothing
+can leave the same state behind, the store lacking a deletion it never applied as the read does, and still delete the
+store's mark for it. So the Frontend records the latest object timestamp each repair write installs, and for a
+reconcile that changes nothing the later of the read's and the store's (`repairInstalls`, kept while a transaction started before it may still
 join: pruned below the forget floor at `expiryHeartbeat`), and tells every held Tx of the object started before it,
 and every Tx created for the object later with an earlier start (`Tx.repairInstalled`). An apply of a blind Insert of
 a key absent before the apply, on an object so marked, applies and reports the object in `objectCommitErrors`
 (`Tx.issueCommits`): the finalizer marks the store, and the mark's repair, once T can no longer join here, installs
 the object's current state. A recovered commit vote, whose marks were lost with the crash, reports the same apply when
-any write newer than T's start reached the object. The map is empty except soon after a repair write, so an ordinary
+any write newer than T's start reached the object. The map is empty except soon after a repair, so an ordinary
 commit voter checks nothing; a counted voter that reports only adds a repair pass.
 
 An allocation is read like any other object (`Frontend.readObjectForTransaction`): the in-memory state, `ObjectNotFound`

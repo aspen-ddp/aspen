@@ -848,6 +848,28 @@ class Frontend(val storeId: StoreId,
     if repairInstalls.get(oid).forall(_ < at) then repairInstalls(oid) = at
     transactions.valuesIterator.foreach(_.repairInstalled(oid, at))
 
+  /** The latest start timestamp of a committed transaction whose Delete of each key applied here, a no-op over an
+    * absent key included, while a transaction started before it may still apply here: one may still join (above the
+    * forget floor) or is held (a held Tx applies below the floor too). Pruned at expiryHeartbeat. A transaction that
+    * did not vote commit here held no key lock that ordered such a deletion after its blind Insert of the key, so its
+    * apply of the Insert over the absent key may write back a key a later transaction deleted (Tx.issueCommits,
+    * transaction-requirements 9.4). Only a deletion started at or after the Insert's transaction can be ordered after
+    * it: one ordered after it at a store that applied the Insert checked an object timestamp at least the Insert's.
+    * Empty at load: the load's floor refuses every transaction started before it
+    */
+  private val keyDeletions =
+    scala.collection.mutable.HashMap[ObjectId, scala.collection.mutable.HashMap[Key, HLCTimestamp]]()
+
+  /** A committed update started at `at` deleted `keys` of `oid` here (Tx.issueCommits) */
+  def recordKeyDeletions(oid: ObjectId, keys: Set[Key], at: HLCTimestamp): Unit =
+    if keys.nonEmpty then
+      val byKey = keyDeletions.getOrElseUpdate(oid, scala.collection.mutable.HashMap())
+      keys.foreach(key => if byKey.get(key).forall(_ < at) then byKey(key) = at)
+
+  /** Whether a committed deletion of `key` of `oid` started at or after `since` applied here: see keyDeletions */
+  def keyDeletedSince(oid: ObjectId, key: Key, since: HLCTimestamp): Boolean =
+    keyDeletions.nonEmpty && keyDeletions.get(oid).flatMap(_.get(key)).exists(_ >= since)
+
   /** `txid`'s CRL state was deleted or replaced by a stub: no save of it may follow. Its records are dropped once that
     * is durable, unless a newer Tx registered them again meanwhile
     */
@@ -1311,6 +1333,11 @@ class Frontend(val storeId: StoreId,
     expireStubs(now)
     if repairInstalls.nonEmpty then
       repairInstalls.filterInPlace((_, at) => !belowForgetFloor(at))
+    if keyDeletions.nonEmpty then
+      val oldestHeld = transactions.valuesIterator.map(_.txd.startTimestamp).minOption
+      keyDeletions.filterInPlace: (_, byKey) =>
+        byKey.filterInPlace((_, at) => !belowForgetFloor(at) || oldestHeld.exists(_ <= at))
+        byKey.nonEmpty
     expiryRounds.keys.toList.foreach: txid =>
       if !transactions.get(txid).exists(_.mayExpire) then
         expiryRounds.remove(txid)
@@ -2301,6 +2328,10 @@ class Frontend(val storeId: StoreId,
     val plan = Reconcile.plan(snapshot, current, read, storeId, locks)
 
     if plan.changesNothing then
+      // The store may lack a deletion of a key while the read lacks it too, so the pass clears a mark for it: a later
+      // transaction's blind Insert of the key is then reported (Tx.repairInstalled), as after a repair write
+      recordRepairInstall(read.pointer.id,
+        if read.timestamp > current.timestamp then read.timestamp else current.timestamp)
       p.success(plan.result)
     else if !repairFitsReservations(loaded, plan) then
       logger.trace(s"Store $storeId: repair of ${read.pointer.id} would overfill the slice beside its held commit " +

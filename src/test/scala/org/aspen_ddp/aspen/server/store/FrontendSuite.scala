@@ -5791,6 +5791,93 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     committedMessages(net).filter(_.transactionId == txid1).flatMap(_.objectCommitErrors) shouldBe List(oid2)
   }
 
+  // ---- A non-voter's blind Insert reports its object only after a deletion of the key (R-W9) ----
+
+  /** T (txid1), a blind Insert of `key`, votes abort here (behind txid3's lock on an absent key) and is resolved
+    * committed after `between` ran. Returns the objects its TxCommitted reports
+    */
+  def nonVoterInsert(key: Int, between: (Frontend, MapBackend, TestNet, TransactionDescription) => Unit,
+                     fixture: () => (Frontend, MapBackend, TestNet) = () => lockFixture()): List[ObjectId] =
+    val (frontend, backend, net) = fixture()
+    val insert = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.DoesNotExist(k(key))))
+    val data = KeyValueOperation.encode(List(new Insert(k(key), Array[Byte](9))), ida)(0)
+    val txd = lockTxd(txid1, List(insert))
+    // Over a present key T's DoesNotExist fails here anyway: no lock holder is needed
+    prepare(frontend, net, lockTxd(txid3, List(insert)), data)
+    prepare(frontend, net, txd, data).disposition shouldBe TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid3, committed = false)
+    between(frontend, backend, net, txd)
+    resolve(frontend, net, txid1, committed = true)
+    kvKeys(backend) should contain (k(key))
+    committedMessages(net).filter(_.transactionId == txid1).flatMap(_.objectCommitErrors)
+
+  /** txid2 deletes `key` checked by a required revision, started at `start`, committed here */
+  def deleteByRevision(frontend: Frontend, net: TestNet, key: Int, start: Option[HLCTimestamp] = None): Unit =
+    val delete = KeyValueUpdate(kvPtr, Some(rev0), None, Nil, deletesKeys = true)
+    val txd = lockTxd(txid2, List(delete))
+    prepare(frontend, net, start.fold(txd)(s => txd.copy(startTimestamp = s)),
+      KeyValueOperation.encode(List(new Delete(k(key))), ida)(0)).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid2, committed = true)
+
+  test("a non-voter's blind Insert of an absent key no deletion reached reports nothing (R-W9)") {
+    nonVoterInsert(4, (_, _, _, _) => ()) shouldBe Nil
+  }
+
+  test("a non-voter's blind Insert reports nothing after a deletion of another key or one older than its start") {
+    nonVoterInsert(4, (frontend, _, net, _) => deleteByRevision(frontend, net, 5)) shouldBe Nil
+    nonVoterInsert(4, (frontend, _, net, txd) =>
+      deleteByRevision(frontend, net, 4, Some(HLCTimestamp(txd.startTimestamp.asLong - (1000L << 16))))) shouldBe Nil
+  }
+
+  test("a non-voter's blind Insert of a key a Delete removed here since its start reports the object") {
+    // Key 2 is present until txid2's Delete, checked by the object revision alone, removes its older value
+    nonVoterInsert(2, (frontend, backend, net, _) =>
+      deleteByRevision(frontend, net, 2)
+      kvKeys(backend) should not contain k(2)) shouldBe List(oid2)
+  }
+
+  test("a key deletion's record outlives the forget floor while a transaction started before it is held") {
+    var clock = System.currentTimeMillis()
+    def fixture(): (Frontend, MapBackend, TestNet) =
+      val backend = new MapBackend(storeId)
+      populate(backend)
+      val net = new TestNet
+      val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net,
+        new TestCrl, new TransactionStatusCache(wallClockMillis = () => clock), wallClockMillis = () => clock,
+        loadedAt = FrontendSuite.longLoaded)
+      backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+      (frontend, backend, net)
+    nonVoterInsert(4, (frontend, _, net, _) =>
+      deleteByRevision(frontend, net, 4)
+      clock = clock + org.aspen_ddp.aspen.common.transaction.TransactionHorizon.Horizon.toMillis + 60_000L
+      frontend.expiryHeartbeat()
+      frontend.transactions.contains(txid1) shouldBe true, () => fixture()) shouldBe List(oid2)
+  }
+
+  test("a non-voter's blind Insert after a repair of the object that changed nothing since its start reports it") {
+    // txid2 writes key 5 after T's start, then a repair finds the store current and changes nothing: it may have
+    // cleared a mark for a deletion of key 4 this store missed
+    nonVoterInsert(4, (frontend, backend, net, txd) =>
+      val insertK5 = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.DoesNotExist(k(5))))
+      val later = HLCTimestamp(txd.startTimestamp.asLong + (1000L << 16))
+      prepare(frontend, net, lockTxd(txid2, List(insertK5)).copy(startTimestamp = later),
+        KeyValueOperation.encode(List(new Insert(k(5), Array[Byte](5))), ida)(0)).disposition shouldBe
+        TransactionDisposition.VoteCommit
+      resolve(frontend, net, txid2, committed = true)
+      val current = backend.get(oid2).get
+      val kvs = KVObjectState.decode(current.data)
+      val ts = current.metadata.timestamp
+      val read = new org.aspen_ddp.aspen.client.KeyValueObjectState(kvPtr, current.metadata.revision,
+        current.metadata.refcount, ts, ts, ida, kvs.min, kvs.max, kvs.left, kvs.right,
+        kvs.content.map((key, vs) => key -> org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState(vs.value,
+          vs.revision, vs.timestamp)).toMap)
+      val done = Promise[ReconcileResult]()
+      frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr), read, done)
+      val result = done.future.value.get.get
+      result.changed shouldBe false
+      result.stale shouldBe false) shouldBe List(oid2)
+  }
+
   test("a non-voter's blind Insert over a present key reports nothing") {
     val (frontend, backend, net) = lockFixture()
     val overK1 = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.MayExist(k(1))))

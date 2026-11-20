@@ -270,16 +270,18 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // A crash between a rebuild's flip committing and the removal of its rebuild-complete marker leaves an Active
       // entry over a copy that tryLoadStore skips; the rebuild's completion, which would remove the marker, is gone.
       // Active is the tree's word that the flip committed, so the copy is ours to load. A rebuild still running here
-      // removes its own marker once its flip commits.
+      // removes its own marker once its flip commits. A removal that failed here or in the rebuild's completion is
+      // retried too, marker or not: an unlink whose directory sync failed leaves none.
       local.offlineStores.filter(storeId =>
         !ctx.rebuilds.rebuildingStoreIds.contains(storeId) &&
         remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-        os.exists(local.devicePath / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile)
+        (ctx.rebuilds.markerRemovalsPending.contains(storeId) ||
+         os.exists(local.devicePath / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile))
       ).foreach: storeId =>
         val storePath = local.devicePath / storeId.directoryName
-        logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still carries its " +
-                    s"rebuild-complete marker. Completing the rebuild and loading the store")
-        if ctx.rebuilds.clearRebuildCompleteMarker(storePath) then
+        logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its rebuild-complete marker " +
+                    s"is not durably removed. Completing the rebuild and loading the store")
+        if ctx.rebuilds.clearRebuildCompleteMarker(storeId, storePath) then
           ctx.tryLoadStore(local, storePath, None)
 
       //----------------------

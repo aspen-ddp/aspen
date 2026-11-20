@@ -57,14 +57,6 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.2 [RB-W14] A rebuild-complete removal whose unlink succeeded but whose directory sync failed leaves the store
-    unserved until a restart. PLAUSIBLE. Effort S. rebuild-process.md.
-    DurableFiles.remove unlinks, syncDirectory throws, clearRebuildCompleteMarker returns false and the copy is kept
-    offline for the Completed Rebuilds pass, which selects only stores whose marker still exists. The old copy is
-    released meanwhile.
-    Fix: the Completed Rebuilds pass also retries removals it or the Adopt branch left pending (or any offline Active
-    store with no marker), and the retry syncs the directory even when the marker is already gone.
-
 4.3 [RB-W13] A transfer onto a device whose store path holds a copy of an earlier tenancy never starts.
     PLAUSIBLE. Effort S. rebuild-process.md.
     Host down while device D holds an unretired finished rebuild or a rebuild-required copy; replaceRebuild moves the

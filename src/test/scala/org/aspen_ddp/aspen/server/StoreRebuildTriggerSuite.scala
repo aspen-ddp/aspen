@@ -339,6 +339,65 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(marker) should be(false)
       recorded(host).storeLoadAttempts.toList.drop(before) should contain((realDeviceId, storeDir))
 
+  // RB-W14: the unlink succeeds but the directory sync fails, so no marker is left for the Completed Rebuilds pass to
+  // select the store by. The pending removal selects it, and the retry syncs the directory with the marker absent
+  atest("a flipped rebuild whose marker unlink succeeded but whose directory sync failed is loaded by a later check"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val rebuilt = StoreId(PoolId.BootstrapPoolId, 0)
+    val storeDir = deviceDir / rebuilt.directoryName
+    val marker = storeDir / RebuildingStore.RebuildCompleteMarkerFile
+    var syncs = List.empty[os.Path]
+    var failSync = true
+    host.control.rebuilds.syncMarkerDirectory = dir =>
+      syncs = dir :: syncs
+      if failSync then throw new java.io.IOException("injected directory sync failure")
+
+    for
+      deviceSetId <- client.createStorageDeviceSet("test-set", 0, None)
+      realDeviceId <- client.createStorageDevice(HostId.BootstrapHostId, deviceSetId)
+      ptr <- client.getStorageDevicePointer(realDeviceId)
+      kvos <- client.read(ptr)
+      state = StorageDeviceState(kvos)
+      _ <- client.transactUntilSuccessful: tx =>
+        Future.successful:
+          val newState = state.setStoreEntry(rebuilt, StorageDeviceState.StoreStatus.Rebuilding, None)
+          val reqs = List(KeyRevision(StorageDeviceState.StateKey,
+            kvos.contents(StorageDeviceState.StateKey).revision))
+          tx.update(ptr, None, None, reqs, List(Insert(StorageDeviceState.StateKey, newState.encode())))
+      _ <- waitForTransactionsToComplete()
+      local = new LocalStorageDeviceState(
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL())
+      _ = injectLoadedDevice(host, local)
+      armed = recorded(host).armLookup(realDeviceId)
+      _ = host.control.reconciler.checkAll()
+      _ = armed.success(deviceState(realDeviceId, Map(rebuilding(rebuilt))))
+      _ <- yieldUntil(factory.created.nonEmpty)
+      _ = os.makeDir.all(storeDir)
+      _ = os.write.over(marker, "")
+      _ = factory.created.head.promise.success(())
+      _ <- waitForTransactionsToComplete()
+      _ <- yieldUntil(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(realDeviceId))
+      _ = recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Adopt)
+      // Unlinked, but not durably: kept offline, its removal pending
+      _ = os.exists(marker) should be(false)
+      _ = recorded(host).loadStoreByIdRequests should not contain ((realDeviceId, rebuilt))
+      _ = local.offlineStores should contain(rebuilt)
+      _ = host.control.rebuilds.markerRemovalsPending should contain(rebuilt)
+      // The sync can succeed now: the next check syncs the directory and loads the store
+      _ = failSync = false
+      _ = syncs = Nil
+      before = recorded(host).storeLoadAttempts.size
+      _ = host.control.reconciler.checkAll()
+      _ <- yieldUntil(recorded(host).storeLoadAttempts.size > before)
+    yield
+      syncs should contain(storeDir)
+      host.control.rebuilds.markerRemovalsPending should not contain (rebuilt)
+      recorded(host).storeLoadAttempts.toList.drop(before) should contain((realDeviceId, storeDir))
+
   atest("an Active store marked rebuild-required is flipped to Rebuilding, discarded and rebuilt"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)

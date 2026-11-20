@@ -411,12 +411,14 @@ than the rebuild's; Rebuilding of its episode is flipped to `serviceStatus` (`Ad
 `AdoptOffline` (a concurrent completion, or this call's own attempt reported `TransactionOutcomeUnknown`, which then
 gossips the store online itself). The host acts only after the decision:
 
-* `Adopt`: removes `rebuild-complete` durably (`clearRebuildCompleteMarker`), then `loadStoreById`. The committed flip
-  gossips `StoreMoved` (`HostServices.gossipStoreOnline`), clearing the `StoreOffline` gossiped at the start. A failed
-  removal leaves the store unloaded and router-offline, and records it in the device's `offlineStores`
-  (`keepUnpromotedCopyOffline`), so the reconcile's Completed Rebuilds pass, finding the entry Active and the marker
-  present, retries the removal and the load at each device check. A store rebuilt on a device that never held it is
-  in no `offlineStores` otherwise, and its pending-delete copy elsewhere is released by the Active entry.
+* `Adopt`: removes `rebuild-complete` durably (`clearRebuildCompleteMarker`: unlink if present, then force the store
+  directory), then `loadStoreById`. The committed flip gossips `StoreMoved` (`HostServices.gossipStoreOnline`),
+  clearing the `StoreOffline` gossiped at the start. A failed removal leaves the store unloaded and router-offline,
+  records it in `StoreRebuilds.pendingMarkerRemovals` and in the device's `offlineStores` (`keepUnpromotedCopyOffline`),
+  so the reconcile's Completed Rebuilds pass, finding the entry Active and the marker present or the removal pending,
+  retries the removal and the load at each device check. The pending record is what selects a store whose unlink
+  succeeded but whose directory sync failed, and the retry forces the directory even with the marker already gone. A
+  store rebuilt on a device that never held it is in no `offlineStores` otherwise, and its pending-delete copy elsewhere is released by the Active entry.
 * `AdoptOffline`: `keepRebuiltStoreOffline` writes a `transferring-out` marker and an empty `crl_save.log`, then
   removes `rebuild-complete`; an adopter classes it Clean and a restart's reinstatement loads it.
 * `Discard`: deletes the final directory (`LocalDevices.discardStoreDirectory`).
@@ -808,19 +810,3 @@ entry is absent and the Deleted Stores pass retires the copy. No data is lost.
 Fix: in `startIn`, treat a directory at the path carrying `rebuild-complete` or `rebuild-required` (never an arrived
 copy of this transfer) as a copy of an earlier tenancy: retire it (`StoreCopies.retire`) and start the transfer once
 the path is clear.
-
-### RB-W14: A rebuild-complete removal whose unlink succeeded but whose directory sync failed leaves the store unserved until a restart
-Verdict PLAUSIBLE. Priority 4. Effort S.
-Mechanism: `StoreRebuilds.clearRebuildCompleteMarker` calls `DurableFiles.remove`, which unlinks the marker and then
-forces the directory. If `syncDirectory` throws after `os.remove` succeeded, the method returns false; the `Adopt`
-branch records the copy offline (`keepUnpromotedCopyOffline`) for the Completed Rebuilds pass, whose filter requires
-`os.exists(<store>/rebuild-complete)`. The marker is already gone, so the pass never selects the store (and
-`DurableFiles.remove` of an absent file would not sync anyway). No other pass loads an offline Active store with no
-marker (`reloadClosedStores` covers only stores its shutdown closed). The same holds when the pass's own removal
-fails this way.
-Consequence: the store's entry is Active, so its old copy is released (`StoreCopies.release`), but it is served by
-nobody for the life of the process: one unit of the pool's `w - t` margin is used up until a restart, which loads it
-(or finds the marker again and takes the pass).
-Fix: have the Completed Rebuilds pass also select stores whose removal it or the `Adopt` branch left pending (a set
-kept by `StoreRebuilds`, or any offline Active store with no marker at all), and make the retry sync the directory
-even when the marker is already absent.

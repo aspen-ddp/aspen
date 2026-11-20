@@ -64,6 +64,17 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   // UnknownStore/StoreNotFound for it, and readers would re-send at once, for the whole rebuild.
   private var silenced: Map[StoreId, StorageDeviceId] = Map()
 
+  // Rebuilt stores whose rebuild-complete marker removal failed (clearRebuildCompleteMarker), to be retried by the
+  // Completed Rebuilds pass. Kept apart from the marker itself: an unlink that succeeded before its directory sync
+  // failed leaves no marker to select the store by.
+  private var pendingMarkerRemovals: Set[StoreId] = Set()
+
+  /** Rebuilt stores whose rebuild-complete marker removal awaits a retry by the Completed Rebuilds pass */
+  private[server] def markerRemovalsPending: Set[StoreId] = pendingMarkerRemovals
+
+  /** How a marker removal forces the store directory. Replaced only by tests, to fail the sync after the unlink */
+  private[server] var syncMarkerDirectory: os.Path => Unit = DurableFiles.syncDirectory
+
   /** The stores marked offline for their Rebuilding entry */
   private[server] def silencedStores: Set[StoreId] = silenced.keySet
 
@@ -272,6 +283,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           Future.failed(t)
 
       rebuildingStores += storeId -> sr
+      // This rebuild's completion owns the copy's marker from here
+      pendingMarkerRemovals -= storeId
       rebuildDevices += storeId -> local.storageDeviceId
       rebuildEpisodes += storeId -> episode
       rebuildsSettled += storeId -> settled
@@ -293,11 +306,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 // Loaded only once the marker is gone, or tryLoadStore leaves it offline. The load's install clears
                 // the offline mark; a store not loaded stays silent
                 unsilence(storeId, clear = false)
-                if clearRebuildCompleteMarker(local.devicePath / storeId.directoryName) then
+                if clearRebuildCompleteMarker(storeId, local.devicePath / storeId.directoryName) then
                   ctx.loadStoreById(local.storageDeviceId, storeId)
                 else
-                  // In offlineStores, so the Completed Rebuilds pass, finding the entry Active and the marker
-                  // there, retries the removal and the load at each check of the device (rebuild-process 5.7)
+                  // In offlineStores, so the Completed Rebuilds pass, finding the entry Active and the removal
+                  // pending, retries the removal and the load at each check of the device (rebuild-process 5.7)
                   keepUnpromotedCopyOffline(local, storeId)
               finally
                 settledOutcome()
@@ -519,14 +532,19 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         logger.error(s"Failed to mark rebuilt store $storeId offline at $storePath: $t")
 
   /** Removes the rebuild-complete marker of a rebuilt store whose entry has left Rebuilding, durably, so it can be
-   *  loaded. Returns whether it is gone; a failure is logged. The caller keeps the store in its device's
-   *  offlineStores, where the Completed Rebuilds pass (DeviceReconciler) retries the removal at each device check. */
-  def clearRebuildCompleteMarker(storePath: os.Path): Boolean =
+   *  loaded. Returns whether its removal is durable; a failure is logged. The store directory is forced even when the
+   *  marker is already absent, since an earlier attempt may have unlinked it and then failed to sync. On failure the
+   *  store is recorded in pendingMarkerRemovals, and the caller keeps it in its device's offlineStores, where the
+   *  Completed Rebuilds pass (DeviceReconciler) retries the removal at each device check. */
+  def clearRebuildCompleteMarker(storeId: StoreId, storePath: os.Path): Boolean =
     try
-      DurableFiles.remove(storePath / RebuildingStore.RebuildCompleteMarkerFile)
+      os.remove(storePath / RebuildingStore.RebuildCompleteMarkerFile, checkExists = false)
+      syncMarkerDirectory(storePath)
+      pendingMarkerRemovals -= storeId
       true
     catch
       case t: Throwable =>
+        pendingMarkerRemovals += storeId
         logger.error(s"Failed to remove the rebuild-complete marker of the rebuilt store at $storePath. It stays " +
                      s"offline until a later check of its device. Error: $t")
         false

@@ -208,8 +208,11 @@
   remove, and its recovery releases the whole charge
 - A rebuilt store's directory carries `rebuild-complete` from its move into place until its entry leaves
   Rebuilding; `tryLoadStore` leaves such a store offline (`server/rebuild/CLAUDE.md`). An `Adopt` whose marker
-  removal fails records the copy in `offlineStores` (`keepUnpromotedCopyOffline`), so the Completed Rebuilds pass
-  retries the removal and the load at each device check
+  removal fails records the copy in `offlineStores` (`keepUnpromotedCopyOffline`) and in
+  `StoreRebuilds.pendingMarkerRemovals`, so the Completed Rebuilds pass retries the removal and the load at each device
+  check. The pass selects by the pending record as well as the marker, and `clearRebuildCompleteMarker` forces the
+  directory even with the marker absent: an unlink whose directory sync failed leaves no marker to select by. Tests
+  fail the sync through `StoreRebuilds.syncMarkerDirectory`
 - A failed rebuild pass or a permanently failed flip never re-checks its own device at once, which would restart the
   same store in a spin: it re-checks the other devices (the slot is host-wide) and schedules a backoff re-check of its
   own (`StoreRebuilds.scheduleRebuildRetry`: `Host.RebuildRetryInitialDelay` 30 s, doubled per failure of the store in

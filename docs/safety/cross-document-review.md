@@ -146,8 +146,8 @@ The premises other subsystems take from this:
   `retryFailedLoads`, capped at `Host.LoadRetryCap`); a create that left nothing at the path is created again by the
   next device check instead; a retry whose store config cannot be read keeps its entry and tries again at the next
   scan. A rebuilt copy whose `rebuild-complete` marker cannot be removed after its flip is kept in `offlineStores`
-  (`keepUnpromotedCopyOffline`), so the Completed Rebuilds pass retries the removal and the load at each device check,
-  unless the unlink succeeded and only the directory sync failed (rebuild-process.md, RB-W14). A transferred-in
+  (`keepUnpromotedCopyOffline`) and in `StoreRebuilds.pendingMarkerRemovals`, so the Completed Rebuilds pass retries
+  the removal and the load at each device check, including after an unlink whose directory sync failed. A transferred-in
   copy's marker is removed by a plain unlink after a durable `ArrivedAtFile`
   (`StoreTransfers.clearTransferredInMarker`): a crash may bring the marker back, and the Completed Transfers In pass
   then loads the copy again. A failed

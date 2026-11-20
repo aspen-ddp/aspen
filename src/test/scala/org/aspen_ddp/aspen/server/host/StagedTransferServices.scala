@@ -38,12 +38,14 @@ class StagedTransferService extends StoreTransferService:
   /** Resolves `storeId`'s latest transfer as if every byte had arrived. Leaves behind what
    *  extraction would have: `<dir>/<storeId.directoryName>`, still carrying the source's
    *  transfer-out marker and the CRL save file its close wrote, for Host's promotion step to
-   *  move into place. `crlValid = false` leaves a truncated save file instead. */
-  def finishTransferIn(storeId: StoreId, crlValid: Boolean = true): Unit =
+   *  move into place. `crlValid = false` leaves a truncated save file instead. `extraFiles` are written into the
+   *  copy too, as files the source's copy carried (a rebuild-complete marker, say). */
+  def finishTransferIn(storeId: StoreId, crlValid: Boolean = true, extraFiles: List[String] = Nil): Unit =
     latest(storeId).foreach: (sid, _, dir, p) =>
       val staged = dir / sid.directoryName
       os.makeDir.all(staged)
       os.write.over(staged / StoreTransfer.TransferOutMarkerFile, "")
+      extraFiles.foreach(f => os.write.over(staged / f, ""))
       if crlValid then
         CrashRecoveryLog.saveStoreState(sid, StoreRecoveryState.Empty, Backend.crlSaveFile(staged))
       else

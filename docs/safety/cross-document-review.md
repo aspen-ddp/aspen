@@ -220,8 +220,9 @@ The premises other subsystems take from this:
   a restart, a reinstatement or an adoption) drops whatever device-CRL entries an earlier copy left under its id
   (`StoreLoader.awaitCrlLoad`), and a transfer out of the unloaded copy ships the file and drops them
   (`StoreTransfers.extractUnloaded`). Such a transfer (an `Unconfirmed` copy whose entry went TransferringOut) ships
-  `rebuild-complete` too, so the destination's load after the pool update leaves the copy offline until its device's
-  next reconcile, which nothing requests (X-W19).
+  `rebuild-complete` too, which the destination removes when its pool update commits, before the load
+  (`StoreTransfers.recordTransferIn`), since its entry is then Active; a failed removal leaves the copy offline for the
+  Completed Rebuilds pass, as for `Adopt`.
 * Host-side client work (UnackedCommits lookups, held-vote queries, the repair service) runs
   on the host's `ec`, not a store executor or the control thread. It keeps no host state of its own beyond what it
   locks (`DeferralState`, `StoreRepairer`'s counters), reads store state only through `@volatile` snapshots
@@ -476,30 +477,11 @@ Between the documents, none is open. Terms they share mean the same in each:
 
 Between a document, scaladoc or guide outside docs/safety and the code, open: RB-W17 (`RebuildOutcome.Unconfirmed`,
 `StoreRebuilds.startRebuild` and `requestRebuild` scaladoc), RP-W9 (`Frontend.repairInstalls` scaladoc: "Empty except
-soon after a repair write"), and X-W19 (`server/host/CLAUDE.md` and rebuild-process.md 5.7: a shipped `Unconfirmed`
-copy's marker is cleared by the destination's Completed Rebuilds pass, which runs only at the device's next check).
+soon after a repair write").
 
 ---
 
 ## Open weaknesses
-
-### X-W19: A shipped Unconfirmed copy stays offline at its destination until the device's hourly check
-Verdict PLAUSIBLE. Priority 4. Effort S.
-Mechanism: a rebuild flip retried after `TransactionOutcomeUnknown` that finds the entry TransferringOut (its first
-attempt committed, then a transfer of the Active store started) is `RebuildOutcome.Unconfirmed`: the copy stays at its
-path, offline, with `rebuild-complete` (`keepUnpromotedCopyOffline`). `StoreTransfers.startOut` ships it unloaded
-(`extractUnloaded` validates its empty `crl_save.log`), marker included. At the destination the PoolRepointed branch of
-`recordTransferIn` clears `transferred-in` and calls `loadStoreById`, whose `tryLoadStore` finds `rebuild-complete`
-and keeps the copy offline (`keepMarkedCopyOffline`). Only the Completed Rebuilds pass loads it, and nothing requests a
-check of the destination device: `announceRepointed` nudges the source's host only, so it runs at the next periodic
-check (`Main.CheckStorageDevicesPeriod`, one hour) or a restart.
-Consequence: the pool names an Active store nobody serves for up to an hour, while the source's Deleted Stores pass
-retires and `StoreCopies.release` deletes the source copy once the destination's entry is Active: one unit of the
-pool's `w - t` margin lost for that time. rebuild-process.md 5.7 and `server/host/CLAUDE.md` say the destination's
-Completed Rebuilds pass clears the marker, without saying when.
-Fix: in the PoolRepointed branch, clear a `rebuild-complete` marker with `clearRebuildCompleteMarker` before the load
-(the entry is Active by the outcome, which is what the Completed Rebuilds pass checks), or have `startOut` clear it
-before archiving, since a TransferringOut entry exists only after the flip committed. Transfer path only.
 
 ### X-W21: A held commit finalized before it applies is not seen as a lock holder, so a prepare built on it votes abort
 Verdict CONFIRMED. Priority 5. Effort S.

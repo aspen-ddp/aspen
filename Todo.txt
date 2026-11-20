@@ -61,14 +61,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
-4.2 [X-W19] A shipped Unconfirmed rebuilt copy stays offline at its destination until the hourly device check.
-    PLAUSIBLE. Effort S. cross-document-review.md.
-    An Unconfirmed copy (flip committed, entry then moved to TransferringOut) ships with rebuild-complete. The
-    destination's PoolRepointed branch calls loadStoreById and tryLoadStore keeps it offline; announceRepointed nudges
-    only the source's host, so only Main.CheckStorageDevicesPeriod (1 h) loads it, while the source copy is retired.
-    Up to an hour one unit of margin short. server/host/CLAUDE.md and rebuild-process.md 5.7 omit the wait.
-    Fix: clear the marker in the PoolRepointed branch (clearRebuildCompleteMarker), or in startOut before archiving.
-    Correct the CLAUDE.md text.
+(no open items)
 
 
 PRIORITY 5: performance and hygiene

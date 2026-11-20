@@ -278,7 +278,10 @@
   after `TransactionOutcomeUnknown` never discards its copy on a device not Failed: its earlier attempt may have made
   the copy the owner's before a transfer out or removal moved the entry on, so an entry it would otherwise `Discard`
   for is `RebuildOutcome.Unconfirmed`, kept the same way for the transfer, Abandoned Transfers Out, Completed Rebuilds
-  or Deleted Stores pass (rebuild-process 5.7). Tests run a write between an Unknown attempt and its retry with
+  or Deleted Stores pass (rebuild-process 5.7). A transfer ships it with its `rebuild-complete`, which the destination
+  removes (`clearRebuildCompleteMarker`) when its pool update commits, before `loadStoreById`
+  (`StoreTransfers.recordTransferIn`); a failed removal keeps it offline for the destination's Completed Rebuilds pass.
+  Tests run a write between an Unknown attempt and its retry with
   `TestNetwork.TClient.beforeRetry`
 - Nothing of a store's previous copy is destroyed before the store is Active on its owner device (the store copies
   rule above). A fail-stopped backend's CRL entries likewise stay live until the retire saves them

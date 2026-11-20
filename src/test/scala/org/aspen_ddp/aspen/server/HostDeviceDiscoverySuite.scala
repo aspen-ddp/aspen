@@ -1076,6 +1076,39 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
       os.exists(arrived) should be(true)
 
+  // rebuild-process 5.7: a rebuilt copy whose flip's outcome was Unconfirmed ships with its rebuild-complete
+  // marker. The destination's entry is Active once the pool repoints, so the marker is removed before the load, or
+  // tryLoadStore would keep the only owner copy offline until the device's next periodic check
+  atest("a transfer arriving with a rebuild-complete marker has the marker removed before it is loaded"):
+    given ExecutionContext = executionContext
+
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+    val arrived = deviceDir / movingStore.directoryName
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
+
+      _ = transfers.finishTransferIn(movingStore, extraFiles = List(RebuildingStore.RebuildCompleteMarkerFile))
+      _ <- pumpUntil(recorded(host).transferOutcomes.contains(movingStore))
+    yield
+      recorded(host).transferOutcomes.get(movingStore) should be(
+        Some(DeviceMetadata.TransferOutcome.PoolRepointed))
+      os.exists(arrived / RebuildingStore.RebuildCompleteMarkerFile) should be(false)
+      os.exists(arrived / StoreTransfer.TransferredInMarkerFile) should be(false)
+      recorded(host).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
+      host.control.rebuilds.markerRemovalsPending should not contain movingStore
+
   atest("a committed transfer broadcasts StoreMoved with the new host and the pool config's timestamp"):
     given ExecutionContext = executionContext
 

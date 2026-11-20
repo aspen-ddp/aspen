@@ -447,7 +447,9 @@ since. It answers `Unconfirmed` instead. The host acts only after the decision:
 * `NotOwned`: leaves the copy for the new owner, whose rebuild finds the marked final path and only flips.
 * `Unconfirmed`: leaves the copy at the final path, offline and unpromoted (`keepUnpromotedCopyOffline`), for the pass
   that owns the entry's current state. A TransferringOut entry ships it (its `rebuild-complete` travels with it, and the
-  destination's Completed Rebuilds pass clears it once the entry there is Active); an aborted transfer has the
+  destination clears it when the pool update commits, before loading the copy: the entry there is then Active, which
+  is all the Completed Rebuilds pass checks, and the flip committed before the source's entry could become
+  TransferringOut; a failed removal is left to that pass, as for `Adopt`); an aborted transfer has the
   Abandoned Transfers Out pass reinstate it and the Completed Rebuilds pass load it; an entry that has left the device
   has the Deleted Stores pass retire it. Only the retry path differs, so nothing is added per transaction.
 * `Superseded`: leaves the copy at the final path, offline: it is added to the device's `offlineStores`

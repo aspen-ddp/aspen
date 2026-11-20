@@ -352,8 +352,20 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         outcome match
           case Success(TransferOutcome.PoolRepointed) =>
             ctx.devices.devices.get(toDeviceid).foreach: sds =>
-              if clearTransferredInMarker(storeId, sds.devicePath / storeId.directoryName) then
-                ctx.loadStoreById(toDeviceid, storeId)
+              val storePath = sds.devicePath / storeId.directoryName
+              if clearTransferredInMarker(storeId, storePath) then
+                // A rebuilt copy whose flip was Unconfirmed ships with its rebuild-complete marker
+                // (rebuild-process 5.7). The flip committed before the source's entry could become
+                // TransferringOut, and this entry is Active now, which is all the Completed Rebuilds
+                // pass checks: cleared here, or tryLoadStore keeps the pool's only owner copy offline
+                // until this device's next check. A failed removal is left to that pass, as there.
+                if !os.exists(storePath / RebuildingStore.RebuildCompleteMarkerFile) ||
+                   ctx.rebuilds.clearRebuildCompleteMarker(storeId, storePath)
+                then
+                  ctx.loadStoreById(toDeviceid, storeId)
+                else
+                  ctx.router.markOffline(storeId)
+                  sds.offlineStores += storeId
               else
                 // Recorded as a restart's scan would have, which is what the transferred-in
                 // pass keys off.

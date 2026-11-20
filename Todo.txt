@@ -67,16 +67,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.1 [RP-W9] A repair pass that changes nothing makes in-flight inserters of a hot KeyValue object re-mark it.
-    CONFIRMED. Effort S. repair-process.md.
-    Every no-op pass records repairInstalls at max(read.ts, current.ts); every Tx on the object started below that,
-    any disposition, Inserting an absent key without a required revision (every TKVL insert of a new key) reports
-    the object (Tx.issueCommits reinserts -> objectCommitErrors): the finalizer waits errorTimeout and marks the store
-    again, so a hot node (metadata ErrorTree nodes included) stays at the repair floor while the load lasts. No data
-    at risk. The Frontend.repairInstalls scaladoc ("Empty except soon after a repair write") is stale.
-    Fix: record a no-op pass only when complete, at the entry's minimum timestamp (carried in RepairSnapshot); the
-    bootstrap sweep records nothing. Restate repair-process 6.2 and transaction-requirements 9.4. No hot-path cost.
-
 5.2 [RP-W10] A rebuilt store's growth guard on a KeyValue object that is then deleted is never released.
     CONFIRMED. Effort S. repair-process.md.
     inheritedGrowthLocks entries are removed only by inheritedGrowthRepaired on a complete reconcile; a deleted object
@@ -125,5 +115,4 @@ PRIORITY 7: documentation corrections
     CONFIRMED. Effort S. rebuild-process.md, cross-document-review.md.
     RebuildOutcome.Unconfirmed cites "rebuild-process 5.4" (it is 5.7); StoreRebuilds.startRebuild's scaladoc omits
     Superseded and Unconfirmed among the outcomes that re-check the device; requestRebuild's scaladoc says a later
-    reconcile "finds the marker again" (a Missing Stores request has none); Frontend.repairInstalls' scaladoc is stale
-    (fix with 5.1). Fix: correct the texts.
+    reconcile "finds the marker again" (a Missing Stores request has none). Fix: correct the texts.

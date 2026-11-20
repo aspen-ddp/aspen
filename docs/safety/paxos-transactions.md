@@ -658,7 +658,7 @@ every prepare and accept response, retransmits included: write amplification, no
   the backend only once no CRL state holding an applied blind Insert of it remains
   (`Frontend.awaitBlindInsertsDurable`; transaction-requirements.md 8.5, 9.4). A blind Insert of a key now absent
   still applies but reports the object, so the finalizer marks the store and repair installs the current state, where
-  a repair wrote the object, or found it current, at a timestamp past T's start (`Tx.repairInstalled`,
+  a repair wrote the object at a timestamp past T's start, or found it current completing an entry whose minimum timestamp is past it (`Tx.repairInstalled`,
   `Frontend.recordRepairInstall`), where the Tx did not vote commit here (it held no key lock that kept a later
   deletion out) and a committed Delete of the key started at or after T's start applied here, a no-op over the absent
   key included (`Frontend.keyDeletedSince`, recorded by `Tx.issueCommits` through `recordKeyDeletions`), or, for a

@@ -246,8 +246,10 @@
 - Late blind Insert after a repair install (transaction-requirements 9.4): a repair write can install a later
   transaction's key deletion at a store that never held the Insert, which a delayed T would then write back at this
   store alone, possibly with no mark (its TxCommitted inside `errorTimeout`). `repairInstalls` keeps the latest object
-  timestamp each repair write installed, and for a reconcile that changes nothing (it may still clear a mark for a
-  deletion the store never applied) the later of the read's and the store's, while a transaction started before it
+  timestamp each repair write installed, and for a complete reconcile that changes nothing (its entry delete may still
+  clear a mark for a deletion the store never applied, started no later) the entry's minimum timestamp
+  (`RepairSnapshot.minTimestamp`, set by the repairer; Zero for the bootstrap sweep, which records nothing; an
+  incomplete pass records nothing either), while a transaction started before it
   may still join (pruned below the forget floor at `expiryHeartbeat`), and tells every held Tx of the object, and
   every later-created one, started before it (`Tx.repairInstalled`). An apply of a blind Insert of a key absent before it, on an object so marked,
   applies and reports the object (`Tx.issueCommits`), so the finalizer marks the store. A recovered commit vote

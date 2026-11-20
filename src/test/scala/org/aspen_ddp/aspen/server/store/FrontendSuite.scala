@@ -5914,13 +5914,16 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.transactions.contains(txid1) shouldBe true, () => fixture()) shouldBe List(oid2)
   }
 
-  test("a non-voter's blind Insert after a repair of the object that changed nothing since its start reports it") {
-    // txid2 writes key 5 after T's start, then a repair finds the store current and changes nothing: it may have
-    // cleared a mark for a deletion of key 4 this store missed
+  /** T (txid1), a non-voter's blind Insert of key 4, resolved committed after txid2 wrote key 5 here (started 1000 ms
+    * after T) and a repair then found the store current: a pass that changes nothing, for an entry whose minimum
+    * timestamp is `minAt` ms after T's start (None: the bootstrap sweep's zero). `lockedKeys` are reported locked in
+    * the read. Returns the objects T's TxCommitted reports
+    */
+  def insertAfterNoOpPass(minAt: Option[Long], lockedKeys: Set[Key] = Set()): List[ObjectId] =
     nonVoterInsert(4, (frontend, backend, net, txd) =>
+      def after(ms: Long) = HLCTimestamp(txd.startTimestamp.asLong + (ms << 16))
       val insertK5 = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.DoesNotExist(k(5))))
-      val later = HLCTimestamp(txd.startTimestamp.asLong + (1000L << 16))
-      prepare(frontend, net, lockTxd(txid2, List(insertK5)).copy(startTimestamp = later),
+      prepare(frontend, net, lockTxd(txid2, List(insertK5)).copy(startTimestamp = after(1000)),
         KeyValueOperation.encode(List(new Insert(k(5), Array[Byte](5))), ida)(0)).disposition shouldBe
         TransactionDisposition.VoteCommit
       resolve(frontend, net, txid2, committed = true)
@@ -5931,11 +5934,33 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         current.metadata.refcount, ts, ts, ida, kvs.min, kvs.max, kvs.left, kvs.right,
         kvs.content.map((key, vs) => key -> org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState(vs.value,
           vs.revision, vs.timestamp)).toMap)
+      read.readLocks = org.aspen_ddp.aspen.client.ReadLocks(lockedKeys, false)
       val done = Promise[ReconcileResult]()
-      frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr), read, done)
+      frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr).copy(minTimestamp =
+        minAt.fold(HLCTimestamp.Zero)(after)), read, done)
       val result = done.future.value.get.get
       result.changed shouldBe false
-      result.stale shouldBe false) shouldBe List(oid2)
+      result.complete shouldBe lockedKeys.isEmpty)
+
+  test("a non-voter's blind Insert after a complete no-op repair pass of an entry newer than its start reports it") {
+    // The entry's minimum timestamp is after T's start: its delete may clear a mark for a deletion of key 4, started
+    // at or before that timestamp, that this store missed
+    insertAfterNoOpPass(Some(1000)) shouldBe List(oid2)
+  }
+
+  test("a blind Insert after a no-op repair pass of an entry no newer than its start reports nothing (RP-W9)") {
+    // The read is newer than T's start (txid2's write), but a deletion whose mark the pass's entry delete removes
+    // started no later than the entry's minimum timestamp, so not after T: T's Insert is not written back over it
+    insertAfterNoOpPass(Some(0)) shouldBe Nil
+    insertAfterNoOpPass(Some(-1000)) shouldBe Nil
+  }
+
+  test("a no-op repair pass that deletes no entry is not recorded: the bootstrap sweep, or an incomplete pass") {
+    insertAfterNoOpPass(None) shouldBe Nil
+    // Key 1 is reported locked: the pass defers it, so its entry stays
+    insertAfterNoOpPass(Some(1000), lockedKeys = Set(k(1))) shouldBe Nil
+    // A read older than the entry's minimum timestamp is stale for the repairer
+    insertAfterNoOpPass(Some(5000)) shouldBe Nil
   }
 
   test("a non-voter's key-level Insert over a present key reports nothing") {

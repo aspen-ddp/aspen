@@ -732,8 +732,10 @@ decided elsewhere) passes its re-check on the absent key and writes it back ther
 finalizer within `errorTimeout`, leaving no mark, and T's own mark of a store that missed it is repaired only once the
 store can no longer join T (repair-process.md 5.4), after any such apply. A reconcile that changes nothing can leave the
 same state behind, the store lacking a deletion it never applied as the read does, and still delete the store's mark for
-it. So the Frontend records the latest object timestamp each repair write installs, and for a reconcile that changes
-nothing the later of the read's and the store's (`repairInstalls`, kept while a transaction started before it may still
+it. So the Frontend records the latest object timestamp each repair write installs, and for a complete reconcile that
+changes nothing the entry's minimum timestamp, which no deletion whose mark the entry's delete removes started after
+(`RepairSnapshot.minTimestamp`; the bootstrap sweep, deleting no entries, records nothing) (`repairInstalls`, kept
+while a transaction started before it may still
 join: pruned below the forget floor at `expiryHeartbeat`), and tells every held Tx of the object started before it, and
 every Tx created for the object later with an earlier start (`Tx.repairInstalled`). An apply of a blind Insert of a key
 absent before the apply, on an object so marked, applies and reports the object in `objectCommitErrors`

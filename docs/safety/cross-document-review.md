@@ -27,7 +27,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Transaction requirements | CRL, recovery | Recovered commit votes, unresolved or with a restored committed resolution, re-take their locks and slice reservations before any message is handled, and a restored one holds them until it applies (transaction-requirements.md R13) |
 | Transaction requirements | CRL, recovery | A key's deletion (commit or repair write) reaches the backend only once no CRL state holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`), so a recovered Insert of an absent key was never applied |
 | Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3) |
-| Transaction requirements | Repair | Every reconcile pass, a write or one that changes nothing, tells every Tx of the object started before the timestamp it records (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert of an absent key applied after it reports the object; a non-voter's blind Insert of an absent key reports its object also where a committed Delete of the key started at or after its start applied here (`Frontend.keyDeletedSince`), and only while the Tx is in `Frontend.transactions` and its marker has not written; a later apply relies on the store's ErrorTree mark, which no reconcile of an object it changes consumes while its commit is held or waits in lock order (`Frontend.settledForRepair`) (RP-W9 for the cost of recording no-op passes) |
+| Transaction requirements | Repair | Every repair write, and every complete reconcile pass that changes nothing (at its entry's minimum timestamp), tells every Tx of the object started before the timestamp it records (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert of an absent key applied after it reports the object; a non-voter's blind Insert of an absent key reports its object also where a committed Delete of the key started at or after its start applied here (`Frontend.keyDeletedSince`), and only while the Tx is in `Frontend.transactions` and its marker has not written; a later apply relies on the store's ErrorTree mark, which no reconcile of an object it changes consumes while its commit is held or waits in lock order (`Frontend.settledForRepair`) |
 | Requirements (lock order) | Recovery | Every recovered commit vote (unresolved, or with a restored committed resolution) has relocked before a recovered Tx that does not relock applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2) |
 | Requirements (slice limit) | Repair, rebuild | The commit votes a store holds on a KeyValue object fit the KeyValue limit together (`Frontend.maxKVSliceSize`, `ObjectState.sliceReservations`, R16); a repair install keeps them fitting (`Frontend.repairFitsReservations`, repair-process.md M6a), and the union of every committed update, which repair and rebuild install unchecked, fits `maxSliceSize` because the KeyValue limit is `t / w` of it (R16), a rebuilt store admitting no growth of an object it may hold without an inherited commit until repaired (2.3) |
 | Client reads | Requirements, rebuild | `InvalidObject.provesDeletion`: a commit voter of an unapplied allocation answers `AllocationPending` (2.5) |
@@ -347,9 +347,9 @@ The premises other subsystems take from this:
   state (`awaitBlindInsertsDurable`, 2.3), and every repair write records the object timestamp it installs
   (`Frontend.recordRepairInstall`) for the Txs of the object started before it, so a non-voter's later blind Insert
   of a key the install removed reports the object (transaction-requirements.md 9.4). A pass that finds the store's
-  copy already equal to the read writes nothing but records the later of the read's and the store's timestamps all
-  the same, since the store may lack a deletion the read lacks too; on a hot KeyValue object that record makes the
-  in-flight inserters report it and renew its entry (RP-W9). A non-voter still holding T, which held no key lock that
+  copy already equal to the read writes nothing but, when complete, records its entry's minimum timestamp all the
+  same, since the store may lack a deletion the read lacks too, and that deletion started no later (repair-process
+  6.2). A non-voter still holding T, which held no key lock that
   kept a deletion out, also reports a blind Insert of an absent key where a committed Delete of the key started at or
   after T's start applied here (`Frontend.keyDeletedSince`), and a recovered non-voter (after a restart, a transfer or
   an adoption) reports every object it applies (`Tx.issueCommits`). These notices reach only Txs in
@@ -476,8 +476,7 @@ Between the documents, none is open. Terms they share mean the same in each:
   lock holder a vote builds on and for a colliding lock-order waiter alike.
 
 Between a document, scaladoc or guide outside docs/safety and the code, open: RB-W17 (`RebuildOutcome.Unconfirmed`,
-`StoreRebuilds.startRebuild` and `requestRebuild` scaladoc), RP-W9 (`Frontend.repairInstalls` scaladoc: "Empty except
-soon after a repair write").
+`StoreRebuilds.startRebuild` and `requestRebuild` scaladoc).
 
 ---
 

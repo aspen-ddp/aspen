@@ -29,6 +29,10 @@ final case class RepairSnapshot(objectId: ObjectId, revision: ObjectRevision, re
                                 only: Option[Set[Key]] = None,
                                 proven: ReadLocks = ReadLocks.None,
                                 awaitSettle: Boolean = false,
+                                /** Set by the repairer: the entry's minimum timestamp (the newest merged miss's start,
+                                  * or the UnackedCommits transaction's start), Zero for the bootstrap sweep. A complete
+                                  * pass that changes nothing is recorded at it (Frontend.recordRepairInstall) */
+                                minTimestamp: HLCTimestamp = HLCTimestamp.Zero,
                                 /** When the store recorded it, in its own sequence (Frontend.snapshotForRepair): a
                                   * repair reads only after its snapshot, so a later snapshot means a later read. Used
                                   * only to release a rebuilt store's inherited-growth lock (Frontend.inheritedGrowthLocks) */

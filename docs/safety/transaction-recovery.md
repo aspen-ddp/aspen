@@ -583,7 +583,7 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   lock); any apply that throws fail-stops the store (transaction-requirements.md 8.5). A recovered Tx that did not vote
   commit reports every object it applies: it may have applied before the crash. A blind Insert of an absent key is
   applied and its object reported where a repair wrote, or found current, a state newer than T's start
-  (`Tx.repairInstalled`, `Frontend.recordRepairInstall`, a reconcile that changes nothing included); where the Tx did
+  (`Tx.repairInstalled`, `Frontend.recordRepairInstall`; a complete reconcile that changes nothing counts at its entry's minimum timestamp); where the Tx did
   not vote commit (it held no key lock keeping a later deletion out) and a committed Delete of the key started at or
   after T's start applied here, a no-op over the absent key included (`Frontend.keyDeletedSince`, recorded by
   `recordKeyDeletions` at apply, pruned at `expiryHeartbeat` once below the floor with no held Tx started at or before

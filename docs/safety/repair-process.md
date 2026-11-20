@@ -411,7 +411,7 @@ nothing by a lock, so the next pass is whole-object.
 2. `locks` = the read's reported locks, less the parts a proof covered (`snapshot.proven`), plus the store's own
    (`os.lockedKeys`, `os.objectLevelLocked`): a store that did not answer the read may hold locks of its own.
 3. `plan = Reconcile.plan(snapshot, current, read, storeId, locks)`.
-4. If the plan changes nothing, record it as an install (below) and return its result. If a KeyValue object holds
+4. If the plan changes nothing, record it as an install when its result is complete (below) and return its result. If a KeyValue object holds
    commit votes' slice reservations (`ObjectState.sliceReservations`, transaction-requirements.md R16) and the plan
    changes it, measure the planned state as a vote is measured (`Frontend.repairFitsReservations`,
    `RequirementsChecker.checkKVSliceSize`: the planned slice plus every reservation, the count varint at the summed
@@ -437,15 +437,21 @@ object's update first, or its conclusion made durable. A recovered commit vote t
 repair removed. The object stays held in memory and counted in flight meanwhile, as for any repair write.
 
 Every repair write records the object timestamp it installs (`Frontend.recordRepairInstall`, `repairInstalls`, kept
-until it falls below the forget floor), and so does every pass whose plan changes nothing, whatever its result, at
-the later of the read's and the store's object timestamp: such a pass's entry delete can remove the store's mark for
-a deletion of a key the store never held and the read lacks too. Every Tx on the object started before the recorded
+until it falls below the forget floor). So does every pass whose plan changes nothing and whose result is complete
+(its read at least the entry's minimum timestamp, nothing deferred), at that minimum timestamp
+(`RepairSnapshot.minTimestamp`: the newest merged miss's start, or the UnackedCommits transaction's start): such a
+pass's entry delete can remove the store's mark for a deletion D of a key the store never held and the read lacks
+too, and D's mark, merged into the entry or the entry itself, started no later than the entry's minimum timestamp.
+An incomplete pass deletes no entry, and the bootstrap sweep (minimum timestamp zero) deletes none, so neither is
+recorded. Every Tx on the object started before the recorded
 timestamp, held now or created while the record lasts (`registerReplayHazards`), is told (`Tx.repairInstalled`), and
 its apply of a blind Insert of a key absent here reports the object, whether or not it voted commit here
 (`Tx.issueCommits`), since the installed or matched state may hold a deletion of the key this store never applied
 (transaction-requirements.md 9.4). A committed Delete the store applied as a no-op over the absent key is recorded
 apart (`Frontend.keyDeletions`), so a non-voter's blind Insert of a key also reports after a deletion of it applied
-here. The record of a no-op pass can renew the entry of a hot object (RP-W9).
+here. A Tx a no-op pass's record reports writes a mark carrying its own start, below the recorded timestamp, so the
+next pass of that mark records no higher: on a hot KeyValue object under concurrent inserts the reports die out
+rather than renew the entry, and an inserter started after the entry's newest miss reports nothing.
 
 The recorded timestamp of a write is the installed object's: a pass narrowed to deferred keys (6.3) does not raise
 it, so a deletion such a pass installs can be recorded below the deleting transaction D's start. That loses nothing:
@@ -455,7 +461,8 @@ follows. Written before the whole-object pass that narrowed this one read the en
 `minTimestamp` to at least D's start, and that pass, not stale, raised the store's timestamp to a read at least that
 new. Written between the passes, it moved the entry's revision, and `DeferralState.observeEntry` made this pass
 whole-object. Written after the entry's delete, it is a fresh entry, repaired whole-object from a read reflecting D,
-which removes a key written back meanwhile.
+which removes a key written back meanwhile. A narrowed pass that changes nothing needs no such argument: it records
+the entry's minimum timestamp, the same for every pass of the entry, and D's start is at most that.
 
 ### 6.3 `Reconcile.plan`
 
@@ -899,31 +906,6 @@ its read threshold stalls the scan until the deadline.
 ---
 
 ## 14. Open weaknesses
-
-### RP-W9: A repair pass that changes nothing makes in-flight inserters of a hot KeyValue object report it, so its entry renews itself
-Verdict CONFIRMED. Priority 5. Effort S.
-Mechanism: `Frontend.reconcileSettled` records every pass whose plan changes nothing, whatever its result, in
-`repairInstalls` at the later of the read's and the store's object timestamp (`recordRepairInstall`), telling every
-held Tx; a Tx created while the record lasts (until it falls below the forget floor) is told at registration
-(`registerReplayHazards`). `Tx.repairInstalled` puts the object in `repairedUnder` for every Tx started before that
-timestamp, and `Tx.issueCommits` then reports the object (`reinserts`, `objectCommitErrors`) whenever the Tx's update
-has no required revision and Inserts a key absent here, whatever its disposition: every ordinary TKVL insert of a new
-key. On a KeyValue object under concurrent inserts the read's timestamp is the newest applied start, so the inserters
-in flight at the pass, and those of clients whose clocks lag, started below it. Each report makes its finalizer wait
-`errorTimeout`, write a marker batch and mark the store again (`MissedUpdateFinalizationAction.updateCommitErrors`);
-the next pass of the new entry changes nothing too, and records again.
-Consequence: once a hot object (a busy TKVL node, a metadata pool's own ErrorTree nodes included, whose marker
-writes are such inserts) has one entry on a caught-up store, its repair can sustain itself at the floor interval for
-as long as the insert load lasts: a read, an entry delete and a marker batch per pass, and the inserters lose the
-clean-finalization fast path. No data is at risk. The scaladoc of `Frontend.repairInstalls` ("Empty except soon
-after a repair write") is stale.
-Fix: record a no-op pass only when its result is complete (only then does its entry delete remove a mark), and at the
-entry's minimum timestamp (the newest merged miss's start, or T's start, carried to the store in `RepairSnapshot`)
-instead of the read's or the store's timestamp. A deletion the store never applied whose mark that delete removes
-started at or before it, so an Insert started before the deletion is still reported, while a reporter's new mark
-carries its own older start and the following pass records no higher, so the loop dies out. The bootstrap sweep
-(minimum timestamp zero, deleting no entries) then records nothing. The narrowed-pass argument of 6.2 and
-transaction-requirements.md 9.4 is restated for the new timestamp. Repair path only; no hot-path cost.
 
 ### RP-W10: A growth guard on a rebuilt store's KeyValue object that is deleted is never released, so the store keeps its inherited state and per-vote growth check until a reload
 Verdict CONFIRMED. Priority 5. Effort S.

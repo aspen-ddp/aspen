@@ -835,12 +835,13 @@ class Frontend(val storeId: StoreId,
     if repairInstalls.nonEmpty then
       hosted.foreach(p => repairInstalls.get(p.id).foreach(at => tx.repairInstalled(p.id, at)))
 
-  /** The latest object timestamp a repair write installed on each object, while a transaction started before it may
-    * still join here (above the forget floor; pruned at expiryHeartbeat). Such a transaction's Tx is told
-    * (Tx.repairInstalled), at the install or at its creation: the install may hold a later transaction's deletion of a
-    * key the transaction blindly Inserts, which its apply would write back at this store alone, so the apply reports
-    * the object (Tx.issueCommits, transaction-requirements 10.5c). Empty except soon after a repair write, and at load:
-    * the load's floor refuses every transaction started before it
+  /** The latest object timestamp a repair write installed on each object, or the entry's minimum timestamp a complete
+    * repair pass that changed nothing deleted its entry at, while a transaction started before it may still join here
+    * (above the forget floor; pruned at expiryHeartbeat). Such a transaction's Tx is told (Tx.repairInstalled), at the
+    * record or at its creation: the install, or the mark the pass's entry delete removed, may hold a later
+    * transaction's deletion of a key the transaction blindly Inserts, which its apply would write back at this store
+    * alone, so the apply reports the object (Tx.issueCommits, transaction-requirements 9.4). Empty except within a
+    * horizon of a repair pass of the object, and at load: the load's floor refuses every transaction started before it
     */
   private val repairInstalls = scala.collection.mutable.HashMap[ObjectId, HLCTimestamp]()
 
@@ -2333,10 +2334,13 @@ class Frontend(val storeId: StoreId,
     val plan = Reconcile.plan(snapshot, current, read, storeId, locks)
 
     if plan.changesNothing then
-      // The store may lack a deletion of a key while the read lacks it too, so the pass clears a mark for it: a later
-      // transaction's blind Insert of the key is then reported (Tx.repairInstalled), as after a repair write
-      recordRepairInstall(read.pointer.id,
-        if read.timestamp > current.timestamp then read.timestamp else current.timestamp)
+      // The store may lack a deletion of a key while the read lacks it too, so a complete pass's entry delete clears
+      // a mark for it: a blind Insert of the key by a transaction started before the deletion is then reported
+      // (Tx.repairInstalled), as after a repair write. That deletion started no later than the entry's minimum
+      // timestamp, so the pass is recorded there. An incomplete pass deletes no entry, nor does the sweep (Zero)
+      val min = snapshot.minTimestamp
+      if plan.result.complete && min > HLCTimestamp.Zero && read.timestamp >= min then
+        recordRepairInstall(read.pointer.id, min)
       p.success(plan.result)
     else if !repairFitsReservations(loaded, plan) then
       logger.trace(s"Store $storeId: repair of ${read.pointer.id} would overfill the slice beside its held commit " +

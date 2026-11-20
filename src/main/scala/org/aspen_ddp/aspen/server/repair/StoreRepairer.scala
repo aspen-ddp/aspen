@@ -665,6 +665,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
       // An object stale for several passes since its last complete one has a busy copy here: the store waits for it
       // to settle
       snap = taken.copy(only = if allowProof then deferral.deferredKeys(entryKey) else None,
+                        minTimestamp = minTimestamp,
                         awaitSettle = allowProof && deferral.staleCount(entryKey) >= ParkAfterStalePasses)
       // A full read: only full reads report the stores' locks
       os <- readObject(ptr)

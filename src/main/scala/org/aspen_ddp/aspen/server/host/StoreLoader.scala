@@ -543,6 +543,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   private def awaitCrlLoad(store: Store, trs: Option[StoreRecoveryState], p: Promise[Unit]): Unit =
     val storeId = store.storeId
     trs match
+      // An earlier load's removal of the save file failed (StoreRouter.crlLoaded): its state is in the device CRL,
+      // but the file, gone or not, is removed durably before the store recovers
+      case None if router.saveFileRemovalPending(store.backend.crlSaveFile) =>
+        router.crlLoaded(store, store.backend.crlSaveFile, p)
       // The device CRL already holds its state: recovered on its executor, ahead of any message it holds
       case None =>
         router.recoverDeferred(store)
@@ -580,6 +584,21 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       // rewritten from it: the file on disk is still the whole state.
       // The save file on disk still holds the whole state, so the entries may go for good
       closeUnloaded(entry, dropDurably = true)
+
+  /** Unloads a store whose crl_save.log could not be removed durably after its load (StoreRouter.crlLoaded), if it
+   *  is still the one installed. It has not recovered, so it served nothing: its device-CRL entries, the whole of
+   *  its state should the unlink have succeeded, are kept (closeUnloaded without dropDurably). It is left offline
+   *  and unloaded, as abandonLoad leaves a store, and retried at every device scan; the retry's load removes the
+   *  file durably, forcing the directory even if it is gone, before the store recovers (awaitCrlLoad). */
+  def handleSaveFileRemovalFailed(e: Host.SaveFileRemovalFailed): Unit =
+    val Host.SaveFileRemovalFailed(storeId, store) = e
+    router.entry(storeId).filter(_.store eq store).foreach: entry =>
+      router.remove(storeId)
+      ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
+        sds.loadedStores -= storeId
+        sds.offlineStores += storeId
+        storesAwaitingRetry += storeId -> LoadRetry(sds, store.backend.path, 1, 1)
+      closeUnloaded(entry, dropDurably = false)
 
   /** Closes the store of `entry`, already removed from the router, without saving its CRL state: clears its object
    *  cache on its executor, then closes it there, and releases its executor slot once the close completes. Nothing

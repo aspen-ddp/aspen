@@ -412,11 +412,6 @@ Every clock comparison that crosses subsystems, and what bounds it:
 
 Between the documents:
 
-* systemic-loss-protection.md SL-W14 and crash-recovery-log.md CRL-W13 are one flaw (`StoreRouter.crlLoaded`'s
-  failed `DurableFiles.remove`), and their fixes differ. SL-W14's, posting `UnloadFailedStore` (which drops the store's
-  device-CRL entries), is unsafe when the unlink succeeded and only the directory force failed: the file is gone, so
-  the dropped entries were the whole state. CRL-W13's, unloading with `closeUnloaded(dropDurably = false)`, is the one
-  to implement.
 * transaction-recovery.md R-W9's proposed narrower report must still cover every hazard the current rule covers
   (transaction-requirements.md 9.4): a committed Delete of the key applied here that removed an older value, not only
   one that was a no-op over an absent key (a Delete checked by an object revision alone passes whether or not T's

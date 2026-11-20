@@ -226,7 +226,7 @@ retained, or are a derived copy of data that still exists elsewhere.
 | X9 | Derived copies deleted (copies that never were the owner's): rebuilt copy on `RebuildOutcome.Discard` and an arrived copy on `TransferOutcome.SourceRestored` or `Aborted` (`LocalDevices.discardStoreDirectory`, via `StoreTransfers.discardArrivedTransferIn` for the latter), and a stale arrived copy (`StoreTransfers.startIn`), all rename-first; rebuild staging (first pass `createStaging`, staging `BackendStateLost`, a finished rebuild's `cleanupStaging`, `abandonUnlisted`); transfer staging: a staged copy with an unusable save file, one landed after its attempt was dropped, an abandoned one (`StoreTransfers.startIn`, `dropAbandonedTransferIn`), a partial receive (`StoreTransferManager.receive`, `removeOwnedDirectory`); `transferring-in` staging and `creating/` at device load (`DeviceDiscovery.loadOwnedDevice`) | as listed | Derived | peers, or the transfer source |
 | X10 | Tombstone: device removed from its set and host, ids zeroed, stores rebuilt elsewhere | `FailedStorageDeviceDurableTask` | One-way **metadata** change; the media is untouched | the physical data. The old host retires the device under a durable `failed` marker (`DeviceShutdown.retireFailedDevice`, also written by `DeviceDiscovery.handleOwnershipResolved`), and `tryLoadDevice` never loads or claims a device with it |
 | X11 | CRL stream files removed: by a growth that fails at runtime, its own `<n>.crl.tmp` and unlisted `<n>.crl` (`SimpleCRL.attemptGrowth`); when the CRL is opened, an uncommitted growth's `<n>.crl` or `<n>.crl.tmp` (`SimpleCRL.removeUncommittedGrowth`), and an unfinished creation: when every remaining `*.crl.tmp` is a listed stream's `<n>.crl.tmp` with no `<n>.crl` beside it, and the device holds no stores, every `*.crl.tmp` and every stream file, the CRL then created afresh (`SimpleCRL.createStreamsIfNew`). Any other `*.crl.tmp` is `CrlSizingMismatch` and nothing is removed | `SimpleCRL.apply` | Derived: neither holds an entry. Leftovers are taken for an unfinished creation only on a device holding no store directory; the fresh CRL of D1/D2 is created apart, in `crl.creating/`, whose leftovers device load and each creation remove (`DeviceDiscovery.openDeviceCrl`, `loadOwnedDevice`) | nothing; no store is marked |
-| X12 | Load from a save file: the store's device-CRL entries dropped, durably, before its `crl_save.log` state is saved into the device CRL; the file removed, durably, once the CRL holds it and before the store recovers | `StoreLoader.awaitCrlLoad`, `StoreRouter.crlLoaded` | Derived: the file is the store's whole state (it has served nowhere since it was written), so the dropped entries are a copy of part of it or an earlier tenancy's leftover | the file, then its entries in the device CRL. A failed save keeps the file (X7); a store closed before the removal keeps it too, and its next load repeats the drop |
+| X12 | Load from a save file: the store's device-CRL entries dropped, durably, before its `crl_save.log` state is saved into the device CRL; the file removed, durably, once the CRL holds it and before the store recovers | `StoreLoader.awaitCrlLoad`, `StoreRouter.crlLoaded` | Derived: the file is the store's whole state (it has served nowhere since it was written), so the dropped entries are a copy of part of it or an earlier tenancy's leftover | the file, then its entries in the device CRL. A failed save keeps the file (X7); a store closed before the removal keeps it too, and its next load repeats the drop. A failed removal unloads the store with its entries kept and retries its load, which removes the file durably, forcing the directory even if the file is gone, before it recovers |
 
 ### 4.4 Retention
 
@@ -543,21 +543,3 @@ Consequence: the FSIF list of automatic lost-store triggers, which this document
 that is not there.
 Fix: name `StoreLoader.handleBackendOpened` in 4.6; replace the line numbers with method names (or drop them where
 the method is already named); count L0-L12 (13) and 23 cases in 4.4.
-
-### SL-W14: A failed removal of a loaded save file leaves the store installed and never recovered until a restart
-Verdict CONFIRMED. Priority 4. Effort S.
-Mechanism: a store loading from its `crl_save.log` (X12) has its state saved into the device CRL, then
-`StoreRouter.crlLoaded` runs `DurableFiles.remove(saveFile)` on the store's executor before `readAndRecover`. If the
-unlink or the directory sync throws (an I/O error), the task ends there: `HostThreading.runLogged` logs and swallows
-it. The store stays installed in the router, awaiting recovery, so it holds every transaction message and drops
-reads; the LoadStore promise is never completed. Nothing retries: `StoreLoader.retryFailedLoads` skips a store the
-router holds, and no pass unloads it.
-Consequence: one I/O error leaves the store silent to its pool until the host restarts, taking one store of the
-pool's write-threshold margin for that long. Safe meanwhile: it has recovered nothing, so it votes nothing.
-Fix: as crash-recovery-log.md CRL-W13 (the same flaw): catch the failure in `crlLoaded`, unload without dropping
-the store's device-CRL entries (`closeUnloaded(dropDurably = false)`) and record the store in
-`StoreLoader.storesAwaitingRetry`. Dropping the entries is unsafe: when the unlink succeeded and only the directory
-force failed, the file is gone and the entries are the whole state. The retry must force the directory even when
-the file is already absent, as `StoreRebuilds.clearRebuildCompleteMarker` does, before trusting that the file is
-gone: a save file a crash brings back after the store has served would otherwise be loaded over newer device-CRL
-state.

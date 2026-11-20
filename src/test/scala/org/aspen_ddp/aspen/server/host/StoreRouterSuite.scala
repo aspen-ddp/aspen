@@ -157,6 +157,7 @@ object StoreRouterSuite:
       case e: Host.LoadStore => ctx.loader.handleLoad(e)
       case e: Host.ShutdownStore => ctx.loader.handleClose(e)
       case e: Host.UnloadFailedStore => ctx.loader.handleUnloadFailed(e)
+      case e: Host.SaveFileRemovalFailed => ctx.loader.handleSaveFileRemovalFailed(e)
       case _ => ()
 
     if ready then
@@ -355,6 +356,50 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       val responses = fx.net.tx.asScala.map(_._1).collect { case m: TxAcceptResponse => m }.toList
       responses.map(_.transactionId) should be(List(txid))
       os.exists(backend.crlSaveFile) should be(false)
+
+  // crash-recovery-log 3.3 step 4: a failed durable removal of crl_save.log after its load. The store directory's
+  // mode makes it fail: r-x refuses the unlink; -wx allows it but refuses opening the directory to force it
+  for (what, mode, fileKept) <- List(("its unlink", "r-x------", true), ("its directory force", "-wx------", false)) do
+    test(s"a crl_save.log whose removal fails at $what unloads the store, keeps its CRL entries, and retries"):
+      val s0 = StoreId(poolId, 0)
+      val txid = TransactionId(new UUID(15, 30))
+      val gate = Promise[Unit]()
+      val crl = new GatedCrl(gate.future)
+      withRouter(crl): fx =>
+        val sds = fx.addDevice(s0)
+        val backend = bootstrappedBackend(s0)
+        CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(List(voteState(s0, txid))), backend.crlSaveFile)
+        val loaded = fx.load(backend)
+        // Installed; its CRL load waits on the gate
+        fx.awaitControl()
+        os.perms.set(backend.path, mode)
+        try
+          gate.success(())
+          intercept[Exception](await(loaded))
+          // Its executor slot is released once its close has completed
+          awaitTrue(fx.onControl(fx.threading.threadOf(s0).isEmpty))
+          assertAbandoned(fx, s0, sds, backend)
+          os.exists(backend.crlSaveFile) should be(fileKept)
+          // Not dropped: with the file unlinked they are the store's whole state
+          crl.getFullRecoveryState(s0).map(_.txd.transactionId) should be(List(txid))
+          fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(Some(false))
+
+          // A retry while the directory still cannot be forced fails the same way, even with the file gone
+          val again = new TrackingBackend(s0, backend.path)
+          fx.onControl(sds.loadedStores += s0)
+          intercept[Exception](await(fx.load(again)))
+          awaitTrue(fx.onControl(fx.threading.threadOf(s0).isEmpty))
+          assertAbandoned(fx, s0, sds, again)
+        finally os.perms.set(backend.path, "rwx------")
+
+        // Once the directory is forced the retry serves the store, recovered from its device-CRL entries
+        val retried = new TrackingBackend(s0, backend.path)
+        fx.onControl(sds.loadedStores += s0)
+        await(fx.load(retried))
+        os.exists(backend.crlSaveFile) should be(false)
+        val store = fx.onControl(fx.ctx.router.entry(s0)).get.store
+        awaitTrue(!store.frontend.recoveryPending)
+        store.holdsTransaction(txid) should be(true)
 
   test("unknown store gets TxUnknownStore from the calling thread"):
     val unknown = StoreId(poolId, 2)

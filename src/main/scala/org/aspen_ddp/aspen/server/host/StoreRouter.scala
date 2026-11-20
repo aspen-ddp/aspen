@@ -65,6 +65,10 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private val offline: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
   private val loading: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
   private val awaitingDevice: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
+  // crl_save.log files whose removal after their load failed (crlLoaded), so may not be durable: written on store
+  // executors, read on the control thread. Lost at a restart, whose load finds a file brought back by a crash and
+  // loads it again, harmlessly: the store served nothing since it was written
+  private val saveFileRemovals: java.util.Set[os.Path] = ConcurrentHashMap.newKeySet[os.Path]()
 
   /** Set (markReady) by a control event the Host constructor posts after its device scan, so FIFO order puts it after
    *  every LoadStore that scan queued. Until then a message for a store not loaded is dropped silently rather than
@@ -262,16 +266,40 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
         logger.error(s"Store ${store.storeId} failed to recover its transactions from its CRL: $err")
         ctx.post(Host.StoreFailStopped(store, err, StoreRebuilds.RecoveryFailed))
 
-  /** The CRL holds the state loaded from `store`'s crl_save.log. On its executor, if it is still the store
-   *  installed: removes the save file and recovers its transactions. `p` is completed either way. A store closed
-   *  meanwhile keeps its save file, which its close rewrote, and recovers from it when next loaded. */
+  /** The CRL holds the state loaded from `store`'s crl_save.log, or the file's earlier removal may not be durable
+   *  (saveFileRemovalPending). On its executor, if it is still the store installed: removes the save file durably,
+   *  forcing its directory even when the file is already absent (an earlier attempt may have unlinked it and failed
+   *  to force), and recovers its transactions. A save file brought back by a crash would be loaded again over newer
+   *  device-CRL state. A failed removal fails `p` and posts SaveFileRemovalFailed: the store has not recovered, so
+   *  has served nothing, and the device CRL holds exactly what the file held; StoreLoader unloads it keeping those
+   *  entries and retries its load. `p` is completed either way. A store closed meanwhile keeps its save file, which
+   *  its close rewrote, and recovers from it when next loaded. */
   private[host] def crlLoaded(store: Store, saveFile: os.Path, p: Promise[Unit]): Unit =
     route(store.storeId, () => { p.success(()); () }): installed =>
       if installed eq store then
-        // Durably: a save file brought back by a crash would be loaded again over newer device-CRL state
-        DurableFiles.remove(saveFile)
-        readAndRecover(installed)
-      p.success(())
+        val removed =
+          try
+            os.remove(saveFile, checkExists = false)
+            DurableFiles.syncDirectory(saveFile / os.up)
+            saveFileRemovals.remove(saveFile)
+            true
+          catch
+            case NonFatal(err) =>
+              saveFileRemovals.add(saveFile)
+              logger.error(s"Store ${store.storeId} failed to remove its loaded crl_save.log durably. Unloading " +
+                           s"it and retrying its load at the device scans. $saveFile. Error: $err")
+              ctx.post(Host.SaveFileRemovalFailed(store.storeId, store))
+              p.failure(err)
+              false
+        if removed then
+          readAndRecover(installed)
+          p.success(())
+      else
+        p.success(())
+
+  /** Whether a load of the store whose crl_save.log is `saveFile` must remove it durably before recovering, even if
+   *  it is absent: an earlier removal failed (crlLoaded). Any thread. */
+  private[host] def saveFileRemovalPending(saveFile: os.Path): Boolean = saveFileRemovals.contains(saveFile)
 
   def get(storeId: StoreId): Option[Store] = Option(stores.get(storeId)).map(_.store)
 

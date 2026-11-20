@@ -45,6 +45,9 @@ object Host:
   private[server] case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
   /** The CRL state of a loaded store failed to load: it is unloaded, if it is still the store installed */
   private[server] case class UnloadFailedStore(storeId: StoreId, store: Store) extends Event
+  /** A loaded store's crl_save.log could not be removed durably (StoreRouter.crlLoaded): it is unloaded, its CRL
+   *  entries kept, and its load retried, if it is still the store installed */
+  private[server] case class SaveFileRemovalFailed(storeId: StoreId, store: Store) extends Event
   /** A backend failed-stop (its onFatal). `backend` is set once its open returns; it stays empty if the open
    *  threw. A backend may be opened off the event thread, so the event can be handled before then:
    *  the backend is not served yet, and LoadStore retires it on seeing it failed. */
@@ -559,6 +562,9 @@ class Host(val client: AspenClient,
 
       case e: UnloadFailedStore =>
         deviceControl.loader.handleUnloadFailed(e)
+
+      case e: SaveFileRemovalFailed =>
+        deviceControl.loader.handleSaveFileRemovalFailed(e)
 
       case e: LoadStoreById =>
         deviceControl.loader.handleLoadById(e)

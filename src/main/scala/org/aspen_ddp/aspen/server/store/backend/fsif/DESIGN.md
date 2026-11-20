@@ -745,6 +745,9 @@ These look like loss but never trigger a rebuild:
   doubling up to `Host.LoadRetryCap` (`StoreLoader.storesAwaitingRetry`, `retryFailedLoads`).
 - **A failed `crl.loadStore`** after a valid save file. `UnloadFailedStore` takes the store offline and keeps the
   file. It is not marked.
+- **A failed removal of the loaded save file** (`StoreRouter.crlLoaded`). `SaveFileRemovalFailed` takes the store
+  offline with its device-CRL entries kept and retries its load every device scan; the retry removes the file
+  durably, forcing the directory even if it is gone, before the store recovers. It is not marked.
 - **A transferred-in copy with an unusable save file.** It is not promoted, and the transfer retries
   (generic, `HostDeviceDiscoverySuite` "a transferred copy with an unusable CRL save file is not promoted and the
   transfer restarts").

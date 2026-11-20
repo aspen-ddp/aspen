@@ -61,17 +61,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
-4.1 [CRL-W13, SL-W14] A failed removal of crl_save.log after its load leaves the store installed and stalled.
-    CONFIRMED. Effort S. crash-recovery-log.md, systemic-loss-protection.md (same flaw).
-    StoreRouter.crlLoaded runs DurableFiles.remove(saveFile) on the store's executor before readAndRecover; an unlink
-    or directory-force error is swallowed by HostThreading.runLogged. Frontend.awaitingCrl stays set (every
-    transaction message held, reads dropped), the LoadStore promise never completes, and retryFailedLoads skips a store
-    the router holds: one I/O error silences the store until restart.
-    Fix: catch NonFatal; unload WITHOUT dropping the device-CRL entries (closeUnloaded(dropDurably = false); dropping
-    is unsafe when the unlink succeeded and only the force failed, since the entries are then the whole state), fail
-    the promise, and add the store to storesAwaitingRetry. The retry forces the store directory even when the file is
-    already absent (as StoreRebuilds.clearRebuildCompleteMarker) before trusting the file is gone.
-
 4.2 [X-W13] A transfer between two devices of one host onto a path holding an earlier tenancy's copy never starts.
     CONFIRMED. Effort S. cross-document-review.md.
     StoreTransfers.retireEarlierTenancy waits on ctx.router.loaded.contains(storeId), the store id alone; the source

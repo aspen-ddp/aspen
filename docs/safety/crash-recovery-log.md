@@ -219,7 +219,15 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
    is treated as an unusable file (step 2). Then `crl.dropStore` drops whatever the
    device CRL holds for the store, durably, and `crl.loadStore` saves every record of the file into it
    (`StoreLoader.awaitCrlLoad`), then `StoreRouter.crlLoaded` removes the
-   file durably (`DurableFiles.remove`) on the store's executor and only then recovers (a throw there: CRL-W13). A crash between "records durable in the device CRL"
+   file durably on the store's executor (the unlink, then a force of the store directory) and only then recovers. A
+   failed removal is a load that failed with its data intact: the store has recovered nothing, so it served nothing,
+   and the device CRL holds exactly the file's records. `crlLoaded` fails the load and posts `SaveFileRemovalFailed`;
+   `StoreLoader.handleSaveFileRemovalFailed` unloads the store keeping those entries (`closeUnloaded(dropDurably =
+   false)`: if the unlink succeeded and only the force failed, they are its whole state) and retries its load at every
+   device scan (`storesAwaitingRetry`). The router records the file (`saveFileRemovalPending`), so the retry's load
+   removes it again, forcing the directory even when the file is already absent, before the store recovers: a file a
+   crash brought back after the store had served would be loaded over newer device-CRL state. A crash before the
+   retry succeeds brings back at most a file whose records the device CRL already holds. A crash between "records durable in the device CRL"
    and "file removed" loads the same records again under the same ids, which is harmless: the store served nothing in
    between. A failed `loadStore` unloads the store (`handleUnloadFailed`), which drops whatever reached the CRL
    (`closeUnloaded(dropDurably = true)`): the file is still the whole state. The file is always the store's whole
@@ -1276,18 +1284,4 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-### CRL-W13: A failed removal of `crl_save.log` after its load leaves the store installed and stalled
-Verdict CONFIRMED. Priority 4. Effort S.
-Mechanism: `StoreRouter.crlLoaded` runs `DurableFiles.remove(saveFile)` on the store's executor inside a `route`
-task, then `readAndRecover`, then `p.success`. If `os.remove` or the directory force throws (an I/O error),
-`HostThreading.runLogged` only logs it. `readAndRecover` never runs, so `Frontend.awaitingCrl` stays set and the
-installed store holds every transaction message indefinitely. `p` (the `LoadStore` promise) is never completed, and
-the store is in no retry set (`storesAwaitingRetry`). Until a restart it looks loaded and serves nothing.
-Consequence: one store is unavailable until the host restarts, a margin loss from one I/O error. Its state is safe:
-the device CRL holds the loaded records, and a restart either finds the file (drop and load again) or recovers from
-the CRL.
-Fix: catch `NonFatal` around the removal and treat it as a load that failed with its data intact. Unload the store
-without dropping its CRL entries (`closeUnloaded(dropDurably = false)`, through a posted event as `UnloadFailedStore`
-does), fail `p`, and put the store in `storesAwaitingRetry`. A retry must not serve until the removal is durable. If
-the unlink succeeded but the force failed, a crash could bring the file back over newer device-CRL state. So the
-retry forces the store directory before it trusts that the file is absent, or redoes the removal and its force.
+None.

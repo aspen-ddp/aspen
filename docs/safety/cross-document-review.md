@@ -360,10 +360,7 @@ Between the documents: none. Terms they share mean the same in each:
 * The collision wait is `Tx.CollisionWait`, 500 ms checked at the 1 s store heartbeat, so up to about 1.5 s, for a
   lock holder a vote builds on and for a colliding lock-order waiter alike.
 
-Between a document, scaladoc or guide outside docs/safety and the code, open:
-
-* `server/store/backend/fsif/DESIGN.md` 4.6 says a failed open is retried only by a restart (systemic-loss-protection.md
-  SL-W11).
+Between a document, scaladoc or guide outside docs/safety and the code, open: none.
 
 ---
 

@@ -77,10 +77,7 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.2 [SL-W11] server/store/backend/fsif/DESIGN.md 4.6 says a non-ENOSPC open failure is not retried before a restart.
-    CONFIRMED. Effort S. systemic-loss-protection.md.
-    StoreLoader.handleBackendOpened puts every such failure in storesAwaitingRetry; retryFailedLoads reopens it at
-    each ScanDevices with backoff.
+(no open items)
 
 
 PRIORITY 8: unimplemented features

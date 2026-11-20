@@ -740,8 +740,9 @@ These look like loss but never trigger a rebuild:
 - **A journal with a stale seq** (< m), whether valid or corrupt with a valid header. It is ignored and emptied.
 - **One invalid index file** while the other is valid (a torn index s+1 falls back to index s).
 - **A CRC mismatch on a read.** `CorruptedObject` goes to the repair path. The store stays served.
-- **An `IOException` during open that is not out of space.** It is logged ("Failed to load store"), and the store
-  is not loaded and not marked. A restart tries again.
+- **An `IOException` during open that is not out of space.** It is logged ("its backend failed to open"), and the
+  store is left offline and not marked. Like out of space at load, it is retried at device scans with backoff
+  doubling up to `Host.LoadRetryCap` (`StoreLoader.storesAwaitingRetry`, `retryFailedLoads`).
 - **A failed `crl.loadStore`** after a valid save file. `UnloadFailedStore` takes the store offline and keeps the
   file. It is not marked.
 - **A transferred-in copy with an unusable save file.** It is not promoted, and the transfer retries

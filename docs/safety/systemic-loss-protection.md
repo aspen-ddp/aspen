@@ -500,12 +500,4 @@ with its copies retained in `pending-delete/` or at their paths, and nothing to 
 
 ## Open weaknesses
 
-### SL-W11: fsif/DESIGN.md 4.6 says a non-ENOSPC open failure is not retried before a restart
-Verdict CONFIRMED. Priority 7. Effort S.
-Mechanism: `server/store/backend/fsif/DESIGN.md` section 4.6, "An `IOException` during open that is not out of space",
-says the store "is not loaded and not marked. A restart tries again." `StoreLoader.handleBackendOpened` now puts every
-open failure other than `BackendStateLost` (and a failed create that left nothing) into `storesAwaitingRetry`, and
-`StoreLoader.retryFailedLoads`, run at each `ScanDevices`, reopens it with backoff capped at `Host.LoadRetryCap`.
-Consequence: the design doc's list of non-cases misstates how a transient open failure recovers.
-Fix: reword the bullet: the store is left offline and unmarked and retried at device scans with backoff
-(`StoreLoader.storesAwaitingRetry`, `Host.LoadRetryCap`), as out of space is.
+None.

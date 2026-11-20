@@ -32,8 +32,18 @@
 - A KeyValue update's operations lock what they write, as requirements do (`KVWrites`): each key an
   Insert or Delete names (an absent key through `absentKeyLocks`, shared with `DoesNotExist`/`MayExist`), and the
   whole object for a min/max/left/right change. Concurrent blind writes of one key collide
+- Slice-size reservations (transaction-requirements R16): compatible K/N locks let commit votes on disjoint keys of one
+  KeyValue object hold at once, so a vote's size check alone could admit votes that fit only one at a time, and the
+  later apply would fail its re-check. A commit vote whose update grows its object (`SliceGrowth.grows`, from
+  `KVObjectState.growth`: bytes apart from the count varint, and entries) reserves the growth with its locks
+  (`ObjectState.sliceReservations`; `Tx.lock` -> `RequirementsChecker.sliceGrowth` -> `RequirementsLocker.lock`,
+  dropped by `unlock`, only when the store has a slice limit). `RequirementsChecker.checkKVSliceSize`, at vote and at
+  the apply re-check, fails a growing update unless the current slice plus every other transaction's positive growth
+  plus its own fits, the count varint taken at the summed count. So a commit voter's apply never fails on size; a
+  committed non-voter that no longer fits is skipped and reported. A non-growing update always passes. The apply-time
+  check stays: FSIF's slice limit is its segment payload, so an oversized slice would fail the backend commit
 - Apply is order-independent for what the builder lets through (transaction-requirements 9.3): every key Insert is
-  last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`; `encodedSizeAfter` uses the same
+  last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`; `growth` and `encodedSizeAfter` use the same
   rule). A superseded Insert is a no-op, not a skip: no report and no fail-stop. The object timestamp is the max of its
   value and the transaction's. No tombstones, so `TransactionBuilder` refuses blind key deletes and blind object-level
   ops (`BlindKeyValueWrite`), and stores refuse them too (`RequirementsChecker.refuseBlindWrites`, `BlindWrite`, at vote

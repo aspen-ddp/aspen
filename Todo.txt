@@ -39,18 +39,7 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.1 [Q-W12] Compatible KeyValue votes that each fit the slice limit commit together; the later apply is skipped.
-    CONFIRMED. Effort M. transaction-requirements.md.
-    Disjoint-key KeyValueUpdates on one object hold compatible locks, and each vote's checkSliceSize
-    (RequirementsChecker.check) measures its growth against the current state only. Both commit; the apply re-check
-    (Tx.issueCommits -> RequirementsApplyer.apply with frontend.maxSliceSize) fails SliceSizeExceeded for whichever
-    applies second, which is logged as an INVARIANT VIOLATION and skipped. Stores applying in different orders keep
-    different halves, so no replica may hold the second update: committed data lost. TKVL allows maxNodeSize up to
-    the slice limit, so a nearly full node under concurrent inserts can hit it.
-    Fix: a per-object reservation of the growth that lock-holding commit votes have yet to apply, kept with the
-    locks and released at unlock, included in the vote-time size check, so votes a store holds together always fit
-    together. Keep the apply-time check. Do not drop it: FSIF's slice limit is its segment payload, so an oversized
-    slice would fail the backend commit and poison the object. State the concurrency limit in client/tkvl/CLAUDE.md.
+(no open items)
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence

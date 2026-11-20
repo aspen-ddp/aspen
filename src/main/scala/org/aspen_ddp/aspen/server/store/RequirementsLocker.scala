@@ -118,12 +118,16 @@ object RequirementsLocker extends Logging {
     *
     * @param kvWrites What the transaction's KeyValue operations change (KVWrites.from). Written keys and
     *                 object-level fields are locked like requirements on them. unlock must be given the same value
+    * @param growth   The slice growth the transaction's KeyValue updates have yet to apply
+    *                 (RequirementsChecker.sliceGrowth), reserved on each object until unlock
+    *                 (ObjectState.sliceReservations)
     */
   def lock(transactionId: TransactionId,
            requirements: List[TransactionRequirement],
            objects: Map[ObjectId, ObjectState],
            kvWrites: Map[ObjectId, KVWrites],
-           recovered: Boolean = false): Unit =
+           recovered: Boolean = false,
+           growth: Map[ObjectId, SliceGrowth] = Map()): Unit =
     val notKV = (oid: ObjectId) =>
       logger.error(s"Unexpected error in transaction lock of $transactionId: ${ObjectErr(oid, ObjectTypeError())}")
     plannedLocks(requirements, objects, kvWrites, notKV).foreach { (oid, planned) =>
@@ -133,6 +137,7 @@ object RequirementsLocker extends Logging {
         case PlannedLock.Shared => state.sharedLocks += transactionId
         case PlannedLock.Range => state.kvState.foreach(_.rangeLocks += transactionId)
     }
+    growth.foreach((oid, g) => objects.get(oid).foreach(os => os.sliceReservations += transactionId -> g))
 
   /** Releases this transaction's lock on a key, whether the key was present or absent when it was locked: applying
     * the transaction may have inserted or deleted it since
@@ -153,7 +158,7 @@ object RequirementsLocker extends Logging {
   private def release(os: ObjectState, transactionId: TransactionId): Unit =
     give(os, LockSlot.Object, transactionId)
 
-  /** Releases the locks taken by lock(). Only locks still held by this transaction are released, and a slot it
+  /** Releases the locks taken by lock(), and the slice growth reserved with them. Only locks still held by this transaction are released, and a slot it
     * took from another holder goes back to that holder (`give`). A committed transaction is applied regardless of
     * other transactions' locks, and its Delete removes a key with the lock on it, so another transaction may since
     * have locked the key. An applied Insert keeps the replaced ValueState's lock (RequirementsApplyer.apply).
@@ -179,6 +184,7 @@ object RequirementsLocker extends Logging {
 
           case r: KeyValueUpdate =>
             val state = getState(r.objectPointer.id)
+            state.sliceReservations -= transactionId
             unlockKV(state, transactionId, r.requiredRevision, r.contentLock, r.requirements)
             kvWrites.get(r.objectPointer.id).foreach(unlockWrites(state, transactionId, _))
 

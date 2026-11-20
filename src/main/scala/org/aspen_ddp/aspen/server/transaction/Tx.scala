@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, InheritedVot
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
-import org.aspen_ddp.aspen.server.store.{DescriptionValidator, Frontend, KVWrites, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
+import org.aspen_ddp.aspen.server.store.{DescriptionValidator, Frontend, KVWrites, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker, SliceGrowth}
 import scribe.Logging
 
 import scala.concurrent.duration._
@@ -660,8 +660,14 @@ class Tx( trs: TransactionRecoveryState,
     if !locked && !outcomeKnown && txStatus == TransactionStatus.Unresolved &&
       disposition == TransactionDisposition.VoteCommit then
       locked = true
-      lockedWrites = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
-      RequirementsLocker.lock(transactionId, requirements, objects, lockedWrites, recovered)
+      val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
+      lockedWrites = KVWrites.from(requirements, ou)
+      // The growth this vote has yet to apply, counted by every other size check here until it unlocks
+      // (ObjectState.sliceReservations). Without a slice limit there is nothing to check
+      val growth =
+        if frontend.maxSliceSize.isEmpty then Map[ObjectId, SliceGrowth]()
+        else RequirementsChecker.sliceGrowth(transactionId, txd.startTimestamp, requirements, objects, ou)
+      RequirementsLocker.lock(transactionId, requirements, objects, lockedWrites, recovered, growth)
 
   /** The transaction is known to be resolved, though this Tx has not been told the outcome: its prepare arrived
     * after the resolution did, which the host's status cache recorded. Its vote cannot affect the outcome, so it takes
@@ -1250,7 +1256,8 @@ class Tx( trs: TransactionRecoveryState,
     //
     // A live voter's changed object whose re-check fails is an invariant violation: a committed write that does not
     // depend on this one never applies over this vote's locks before it (awaitLockHolders), so the state changed under
-    // the locks (Frontend.discard) or two conflicting transactions committed. It is logged as one, naming the
+    // the locks (Frontend.discard) or two conflicting transactions committed; a size re-check cannot fail, as the votes
+    // held together fit together (RequirementsChecker.checkKVSliceSize). It is logged as one, naming the
     // transaction the object now shows, skipped and reported, so the finalizer marks the store for repair.
     // Not an allocation the backend missed (allocatedHere): the store holds no copy of it, so no lock was lost, and
     // every other transaction on it misses and votes abort.

@@ -89,7 +89,8 @@ branch of `RequirementsChecker.check`:
 6. `MissingObjectUpdate` if the data is absent, so a KV update never votes commit without its operations;
 7. unless applying, every key an operation writes is checked like a key lock: the present key's holder, or else the
    absent-key holder, must be none or this transaction;
-8. `checkSliceSize` against `KVObjectState.encodedSizeAfter`, which uses the same last-writer-wins rule as apply.
+8. `checkKVSliceSize`: the update's growth (`KVObjectState.growth`, which uses the same last-writer-wins rule as
+   apply) plus the growth the commit votes holding locks on the object have reserved and not yet applied (R16).
 
 | Item | Check | Lock taken | Notes |
 |---|---|---|---|
@@ -308,8 +309,8 @@ applied (10.5c).
 
 **R7 (no divergence between replicas).** Committed transactions not ordered by R1 either touch disjoint keys and no
 common object-level field (K/N/X locks at the common store), or are blind Inserts of one key (last writer wins), so
-their application order does not change the result, except for the slice-size check, which each vote makes against
-the state without the other's pending writes (Q-W12). The object timestamp is the max of every applied transaction's,
+their application order does not change the result, the slice-size check included, which each vote makes against
+the growth of every vote held beside it (R16). The object timestamp is the max of every applied transaction's,
 so it is order-independent too. A store that applies them in an order its re-check rejects skips and reports, and
 repair restores it, provided a read threshold of stores applied the skipped update. A commit voter of T never applies in
 such an order: a committed transaction that holds no locks at a store waits to apply while a transaction there holds
@@ -335,6 +336,22 @@ holder precedes it in every serial order; applying the newcomer first would let 
 leave a counted commit vote standing for neither its lock nor its update. At recovery a Tx that does not relock (a
 restored resolution) completes its load only after every recovered commit vote has relocked, so it never misses a
 holder (transaction-recovery.md 7.2).
+
+**R16 (commit votes held together fit the slice limit together).** A commit vote whose KeyValue update grows its
+object (`SliceGrowth.grows`: it adds bytes or entries) reserves that growth on the object with its locks
+(`ObjectState.sliceReservations`, `RequirementsLocker.lock`, released by `unlock`; live and recovered votes alike).
+Compatible K/N locks let several votes on disjoint keys hold at once, and their growths add up, since they change
+disjoint entries. So the size check (`RequirementsChecker.checkKVSliceSize`, at vote and at the apply re-check) fails a
+growing update unless the worst state any apply order reaches fits: the current slice plus every positive growth
+reserved by another transaction plus its own, with the entry-count varint taken at the summed count. Invariant: the
+current slice plus every reservation fits. A growing vote is admitted only if it holds afterwards; an apply moves its
+reservation into the slice, at no more than the reserved size, and a release drops it, so neither breaks it, and a
+commit voter's apply re-check never fails on size. An update that grows nothing passes beside any reservation, so an
+oversized object can always be shrunk; one that removes bytes but adds entries counts as growing. A committed
+transaction that holds no reservation here (the store did not vote commit for it, so at most `w - t` such stores) is
+checked the same way at apply, and if the reserved votes leave it no room it is skipped and reported, as any
+non-voter's failed re-check is (R7): a repair pass, not margin. An abort vote on size beside reservations costs the
+client a retry; a TKVL writer then reads the full node and splits it.
 
 **R10 (a failed backend commit poisons the object).** After a backend commit failure (or `poisonObject`), the object is
 in `failedCommits` until the store reloads: every later transaction on it votes abort, and committed transactions do
@@ -512,9 +529,9 @@ the re-check after the wait only costs time.
 * a live voter's skipped changed object, except one already applied (`appliedBy`) or an allocation the backend missed
   (`allocatedHere`), is an invariant violation. A committed write that does not depend on T, a deletion included,
   never applies over T's locks before T: it waits for T's vote in lock order (8.3, R15). So the causes left are a
-  state discarded under the locks (`Frontend.discard`, `StaleObjectState`), two conflicting commits, which the
-  quorum overlap excludes, and a slice-size re-check that the compatible writes of another vote applied first now
-  fail (`SliceSizeExceeded`, Q-W12). It is logged at error (`INVARIANT VIOLATION`), naming the transaction each object now
+  state discarded under the locks (`Frontend.discard`, `StaleObjectState`) and two conflicting commits, which the
+  quorum overlap excludes. A slice-size re-check is no cause: the votes a store holds together fit together (R16). It
+  is logged at error (`INVARIANT VIOLATION`), naming the transaction each object now
   shows, then skipped and reported in `objectCommitErrors`, so the finalizer marks the store; no state is kept and
   the store is not fail-stopped. An allocation the backend missed is reported: the store holds no copy, so no lock
   was lost, and every other transaction on it misses and votes abort;
@@ -811,28 +828,6 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
   transaction's lifetime than the write threshold's margin covers, and is alarmed; there is no way out of the wait.
 
 ## Open weaknesses
-
-### Q-W12: Compatible KeyValue votes that each fit the slice limit commit together, and the later apply is skipped
-Verdict CONFIRMED. Priority 1. Effort M.
-Mechanism: two transactions T1 and T2 write disjoint keys of one KeyValue object without a required revision (TKVL
-puts with `KeyRevision` / `DoesNotExist`, the normal case). Their K/N locks are compatible (section 4), so every store
-votes commit for both. Each vote's `RequirementsChecker.check` runs `checkSliceSize` against
-`kvs.encodedSizeAfter` of the current state alone, which does not include the other vote's pending writes, so each
-passes when the object is within one entry of `maxSliceSize`. Both commit. `Tx.issueCommits` applies the first to
-arrive; the second's re-check (`RequirementsApplyer.apply` -> `check(applying = true)`, which passes
-`frontend.maxSliceSize`) now sees the combined size above the limit and above the current size, and fails
-`SliceSizeExceeded`. Neither lock order nor `lockWaitBlocked` orders two live votes holding compatible locks. A live
-voter logs `INVARIANT VIOLATION`, skips the object and reports it; no store holds the update. The same happens to a
-new vote that decides beside a lock-order waiter it does not collide with (8.3), on the state before the waiter's
-apply. TKVL allows a tier's `maxNodeSize` up to the pool's slice limit (`NodeAllocator.nodeSizeLimit`), and each
-client checks only its own insert against the node it read.
-Consequence: every commit voter that applied T1 first skips T2. Stores usually apply in the same order, so T2's
-committed update is missing from at least a write threshold of stores, often from all. Repair installs the read
-state, which lacks it: committed data is lost although the client was told it committed.
-Fix: make the vote-time size check include the growth that commit votes holding locks on the object have yet to
-apply (a per-object reservation kept with the locks, released at unlock), so the votes that a store holds together
-always fit together. Alternatively, take X for a KeyValue update that would bring the object within some margin of
-the limit. Keep the apply-time check, which then cannot fail for a live voter.
 
 ### Q-W13: A non-voter's blind Insert applied after a required-revision Delete of its key writes the key back unreported
 Verdict PLAUSIBLE. Priority 2. Effort S.

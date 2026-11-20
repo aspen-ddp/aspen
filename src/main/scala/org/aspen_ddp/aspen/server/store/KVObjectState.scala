@@ -37,7 +37,53 @@ class KVObjectState(
     val (nmin, nmax, nleft, nright, ncontent) =
       KVObjectState.applyOps(min, max, left, right, content, ops, Some((revision, timestamp)))
     KVObjectState.encodedSize(nmin, nmax, nleft, nright, ncontent)
+
+  /** What applying ops by the transaction writing `revision` at `timestamp` (as RequirementsApplyer does) changes in
+    * encodedSize, apart from the entry-count varint: see SliceGrowth. Walks only the keys `ops` name. This state is
+    * not modified
+    */
+  def growth(ops: List[KeyValueOperation], revision: ObjectRevision, timestamp: HLCTimestamp): SliceGrowth =
+    var nmin = min.map(_.bytes)
+    var nmax = max.map(_.bytes)
+    var nleft = left.map(_.bytes)
+    var nright = right.map(_.bytes)
+    var touched = Map[Key, Option[ValueState]]()
+    ops.foreach {
+      case o: SetMin => nmin = Some(o.value)
+      case o: SetMax => nmax = Some(o.value)
+      case o: SetLeft => nleft = Some(o.value)
+      case o: SetRight => nright = Some(o.value)
+      case _: DeleteMin => nmin = None
+      case _: DeleteMax => nmax = None
+      case _: DeleteLeft => nleft = None
+      case _: DeleteRight => nright = None
+      case o: Insert if KVObjectState.insertWins(touched.getOrElse(o.key, content.get(o.key)), revision, timestamp) =>
+        touched += o.key -> Some(new ValueState(Value(o.value), revision, timestamp, None))
+      case _: Insert =>
+      case o: Delete => touched += o.key -> None
+    }
+    def field(b: Option[Array[Byte]]): Long = b.fold(0L)(a => Varint.getUnsignedIntEncodingLength(a.length) + a.length)
+    def entry(k: Key, vs: Option[ValueState]): Long = vs.fold(0L)(v => KVObjectState.entrySize(k, v.value))
+    var bytes = field(nmin) - field(min.map(_.bytes)) + field(nmax) - field(max.map(_.bytes)) +
+      field(nleft) - field(left.map(_.bytes)) + field(nright) - field(right.map(_.bytes))
+    var entries = 0
+    touched.foreach { (k, after) =>
+      val before = content.get(k)
+      bytes += entry(k, after) - entry(k, before)
+      entries += after.size - before.size
+    }
+    SliceGrowth(bytes, entries)
 }
+
+/** The change one KeyValue update makes to its object's encoded slice (KVObjectState.encodedSize): `bytes` apart from
+  * the entry-count varint, and `entries` added to the count (negative for a net removal). Updates of disjoint keys
+  * change disjoint entries, so their combined change is the sum of theirs, the count varint aside. A commit vote that
+  * grows the object keeps its growth reserved on it while it holds its locks (ObjectState.sliceReservations), so the
+  * size check counts the votes held beside it (RequirementsChecker.checkKVSliceSize)
+  */
+final case class SliceGrowth(bytes: Long, entries: Int):
+  /** The update may grow the slice: it adds bytes or entries */
+  def grows: Boolean = bytes > 0 || entries > 0
 
 object KVObjectState {
 
@@ -99,7 +145,7 @@ object KVObjectState {
   val EmptyEncodedSize: Int = encodedSize(None, None, None, None, Map())
 
   /** Size in bytes of the slice each store of a pool using `ida` holds for a new key-value object whose initial
-    * content is `ops` (given with full, unencoded values). This is exactly the `encodedSizeAfter` measure stores
+    * content is `ops` (given with full, unencoded values). This is exactly the measure (`encodedSizeAfter`, `growth`) stores
     * apply to an allocation: SetMin/SetMax keys and entry keys are replicated, while Insert, SetLeft and SetRight
     * values are IDA-encoded to `ida.calculateEncodedSegmentLength` bytes per store.
     */
@@ -111,6 +157,11 @@ object KVObjectState {
   // <vartint len><nbytes>
   // <varint_num_content_entries>
   // <16-byte-revision><8-byte-timestamp><varint_key_len><key><varint_value><value>
+  /** Encoded size of one content entry: 16-byte revision, 8-byte timestamp, then the length-prefixed key and value */
+  def entrySize(key: Key, value: Value): Int =
+    16 + 8 + Varint.getUnsignedIntEncodingLength(key.bytes.length) + key.bytes.length +
+      Varint.getUnsignedIntEncodingLength(value.bytes.length) + value.bytes.length
+
   def encodedSize( min: Option[Key],
                    max: Option[Key],
                    left: Option[Value],

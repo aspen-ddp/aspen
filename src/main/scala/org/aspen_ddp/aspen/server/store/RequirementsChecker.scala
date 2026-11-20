@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueOperatio
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.util.Varint
 import scribe.Logging
 
 import scala.language.implicitConversions
@@ -197,9 +198,12 @@ object RequirementsChecker extends Logging {
               }
 
             // The measure is the serialized KVObjectState, which is what the store persists for the object
-            // (RequirementsApplyer sets data = kvs.encode()).
+            // (RequirementsApplyer sets data = kvs.encode()), with the growth that the commit votes held beside this
+            // transaction have yet to apply
             maxSliceSize.foreach { limit =>
-              checkSliceSize(r.objectPointer.id, kvs.encodedSize.toLong, kvs.encodedSizeAfter(ops.get, ObjectRevision(transactionId), txTimestamp).toLong, limit)
+              val growth = kvs.growth(ops.get, ObjectRevision(transactionId), txTimestamp)
+              val reserved = state.sliceReservations.iterator.collect { case (t, g) if t != transactionId => g }
+              checkKVSliceSize(r.objectPointer.id, kvs, growth, reserved, limit)
             }
 
           case r: RefcountUpdate => checkRefcount(getState(r.objectPointer.id), r.requiredRefcount)
@@ -358,6 +362,55 @@ object RequirementsChecker extends Logging {
   def checkSliceSize(objectId: ObjectId, currentSize: Long, newSize: Long, maxSliceSize: Long): Unit =
     if newSize > maxSliceSize && newSize > currentSize then
       throw ObjectErr(objectId, SliceSizeExceeded(newSize, maxSliceSize))
+
+  /** The KeyValue form of checkSliceSize, which also counts the growth `reserved` by the commit votes holding locks on
+    * the object (ObjectState.sliceReservations), at vote and at the apply re-check alike. An update that grows the
+    * object (SliceGrowth.grows) fails unless the worst state any apply order can reach fits: the current slice plus
+    * every positive growth, the count varint taken at the summed count. So the votes a store holds together fit
+    * together (transaction-requirements R16). The invariant, the current slice plus every reservation fits, holds
+    * after each admitted growing update, and applying or releasing a reservation only lowers that sum, so a commit
+    * voter's apply re-check never fails on size. A committed transaction that holds no reservation (a store that did
+    * not vote commit for it) may fail it and is skipped and reported, which costs a repair, not margin. An update that
+    * grows neither bytes nor entries never fails, so an oversized object can always be shrunk or deleted; one that
+    * removes bytes but adds entries counts as growing
+    */
+  def checkKVSliceSize(objectId: ObjectId,
+                       kvs: KVObjectState,
+                       growth: SliceGrowth,
+                       reserved: Iterator[SliceGrowth],
+                       maxSliceSize: Long): Unit =
+    if growth.grows then
+      val count = kvs.content.size
+      var bytes = kvs.encodedSize.toLong - Varint.getUnsignedIntEncodingLength(count) + growth.bytes.max(0)
+      var entries = count.toLong + growth.entries.max(0)
+      reserved.foreach { g =>
+        bytes += g.bytes.max(0)
+        entries += g.entries.max(0)
+      }
+      val worst = bytes + Varint.getUnsignedIntEncodingLength(entries.min(Int.MaxValue).toInt)
+      if worst > maxSliceSize then
+        throw ObjectErr(objectId, SliceSizeExceeded(worst, maxSliceSize))
+
+  /** The slice growth each KeyValue update of the transaction makes on the objects loaded here, those that grow only
+    * (SliceGrowth.grows): what its commit vote reserves with its locks (RequirementsLocker.lock). An update whose data
+    * is missing or fails to decode reserves nothing; such a vote never passed its check
+    */
+  def sliceGrowth(transactionId: TransactionId,
+                  txTimestamp: HLCTimestamp,
+                  requirements: List[TransactionRequirement],
+                  objects: Map[ObjectId, ObjectState],
+                  objectUpdates: Map[ObjectId, DataBuffer]): Map[ObjectId, SliceGrowth] =
+    requirements.iterator.collect { case r: KeyValueUpdate => r.objectPointer.id }.flatMap { oid =>
+      for
+        os <- objects.get(oid)
+        kvs <- os.kvState
+        data <- objectUpdates.get(oid)
+        ops <- try Some(KeyValueOperation.decode(data, ObjectRevision(transactionId), txTimestamp))
+               catch case scala.util.control.NonFatal(_) => None
+        growth = kvs.growth(ops, ObjectRevision(transactionId), txTimestamp)
+        if growth.grows
+      yield oid -> growth
+    }.toMap
 
   /** Holds when the store's local time `now` equals, is less than, or is greater than the requirement's timestamp */
   def checkLocalTime(tsReq: LocalTimeRequirement, now: HLCTimestamp = HLCTimestamp.now): Unit = {

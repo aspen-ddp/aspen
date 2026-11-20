@@ -52,6 +52,11 @@
   only apply the plan to a Transaction. The separation exists for testing: the node-size arithmetic is subtle and needs
   thousands of randomized cases, which are only practical without a running Aspen system (see `KeyValueNodePlanSuite`
   and `DataObjectNodePlanSuite`). Put new decision logic in the plan functions, not in the executors.
+- Concurrency limit near the slice limit: each writer checks only its own inserts against the node it read, so
+  concurrent inserts of disjoint keys into one node may together exceed `maxNodeSize` when it is close to the pool's
+  slice limit (`NodeAllocator.nodeSizeLimit`). Stores admit concurrent growth of one object only while all of it fits
+  the slice limit together (`server/store/CLAUDE.md`, slice-size reservations): the writers that do not fit get an
+  abort vote (`SliceSizeExceeded`) and retry, re-reading the node, which their plan then splits
 - `prepareUpdates` (both facades, and `KeyValueListNode` for a bare list) applies a batch of inserts and deletes in one
   transaction, updating each node once; `set`/`delete` are one-op batches. `TierEngine` splits the ops among each
   upper-tier node's down pointers and descends in parallel, falling back left like the single-key descent; groups

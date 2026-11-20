@@ -29,6 +29,13 @@ class ObjectState(val objectId: ObjectId,
     */
   var reloadRequired: Boolean = false
 
+  /** The slice growth each lock-holding commit vote that grows this KeyValue object has yet to apply, taken with its
+    * locks and released with them (RequirementsLocker). The size check of every other vote, and of every committed
+    * apply, counts it (RequirementsChecker.checkKVSliceSize), so the commit votes a store holds together fit the slice
+    * limit together and none fails its apply re-check
+    */
+  var sliceReservations: Map[TransactionId, SliceGrowth] = Map()
+
   /** Transactions holding a SharedRevisionLock on this object */
   var sharedLocks: Set[TransactionId] = Set()
 

@@ -1194,6 +1194,99 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   }
 
 
+  /** checkKVSized with `reserved` held on the object (ObjectState.sliceReservations) by other commit votes */
+  private def checkKVReserved(kvos: KVObjectState, ops: List[KeyValueOperation], reserved: Map[TransactionId, SliceGrowth],
+                              limit: Long, applying: Boolean = false) =
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, kvos.encode())
+    o.kvState = Some(kvos)
+    o.sliceReservations = reserved
+    val req = KeyValueUpdate(kp1, Some(rev1), None, Nil, deletesKeys = ops.exists(_.isInstanceOf[Delete]))
+    val payload = KeyValueOperation.encode(ops, Replication(3, 2))(0)
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), HashMap(oid1 -> o), HashMap(oid1 -> payload),
+      Some(limit), applying = applying)._1
+
+  private def kvWith(n: Int, valueSize: Int = 1): KVObjectState =
+    val kvos = new KVObjectState
+    kvos.content = (0 until n).map(i => Key(BigInt(i + 1000).toByteArray) ->
+      new ValueState(Value(new Array[Byte](valueSize)), rev1, ts1, None)).toMap
+    kvos
+
+  test("A growing KeyValue update counts the growth other commit votes hold reserved, at vote and at apply") {
+    val kvos = kvWith(1)
+    val ins = List(Insert(Key(Array[Byte](1)), new Array[Byte](10)))
+    val alone = kvos.encodedSizeAfter(ins, ObjectRevision(tx1), HLCTimestamp.now).toLong
+    val other = Map(tx2 -> SliceGrowth(37, 1))
+    checkKVReserved(kvos, ins, Map(), alone) shouldBe empty
+    checkKVReserved(kvos, ins, other, alone + 37) shouldBe empty
+    checkKVReserved(kvos, ins, other, alone + 36) shouldBe Map(oid1 -> SliceSizeExceeded(alone + 37, alone + 36))
+    checkKVReserved(kvos, ins, other, alone + 36, applying = true) shouldBe
+      Map(oid1 -> SliceSizeExceeded(alone + 37, alone + 36))
+    // A transaction's own reservation is not counted twice
+    checkKVReserved(kvos, ins, Map(tx1 -> SliceGrowth(37, 1)), alone) shouldBe empty
+    // Shrinking reservations lower nothing: they may not apply first
+    checkKVReserved(kvos, ins, Map(tx2 -> SliceGrowth(-100, -1)), alone - 1) shouldBe
+      Map(oid1 -> SliceSizeExceeded(alone, alone - 1))
+  }
+
+  test("The reserved entries count toward the entry-count varint") {
+    // 126 entries: a one-byte count. This insert and a reserved one make 128, a two-byte count
+    val kvos = kvWith(126)
+    val ins = List(Insert(Key(Array[Byte](1)), new Array[Byte](10)))
+    val alone = kvos.encodedSizeAfter(ins, ObjectRevision(tx1), HLCTimestamp.now).toLong
+    val other = Map(tx2 -> SliceGrowth(37, 1))
+    checkKVReserved(kvos, ins, other, alone + 38) shouldBe empty
+    checkKVReserved(kvos, ins, other, alone + 37) shouldBe Map(oid1 -> SliceSizeExceeded(alone + 38, alone + 37))
+  }
+
+  test("A KeyValue update that grows nothing passes beside reservations past the limit") {
+    val kvos = kvWith(3, valueSize = 50)
+    val del = List(new Delete(Key(BigInt(1000).toByteArray)))
+    checkKVReserved(kvos, del, Map(tx2 -> SliceGrowth(500, 5)), 10) shouldBe empty
+    // A smaller value for an existing key
+    val smaller = List(Insert(Key(BigInt(1001).toByteArray), new Array[Byte](10)))
+    checkKVReserved(kvos, smaller, Map(tx2 -> SliceGrowth(500, 5)), 10) shouldBe empty
+  }
+
+  test("KVObjectState.growth plus the count varint change is encodedSizeAfter's change") {
+    val kvos = kvWith(127, valueSize = 5)
+    kvos.max = Some(Key(Array[Byte](9)))
+    val ts = HLCTimestamp.now
+    val cases = List(
+      List(Insert(Key(Array[Byte](1)), new Array[Byte](10))),
+      List(new Delete(Key(BigInt(1000).toByteArray))),
+      List(Insert(Key(BigInt(1001).toByteArray), new Array[Byte](300)), new Delete(Key(BigInt(1002).toByteArray)),
+        Insert(Key(Array[Byte](2)), new Array[Byte](1)), SetMax(Key(Array[Byte](1, 2, 3))), SetRight(new Array[Byte](4))),
+      List(Insert(Key(Array[Byte](3)), new Array[Byte](1)), new Delete(Key(Array[Byte](3)))))
+    for ops <- cases do
+      val g = kvos.growth(ops, ObjectRevision(tx1), ts)
+      val count = kvos.content.size
+      val after = kvos.encodedSizeAfter(ops, ObjectRevision(tx1), ts)
+      val varint = (n: Int) => org.aspen_ddp.aspen.common.util.Varint.getUnsignedIntEncodingLength(n)
+      withClue(ops.toString) {
+        (kvos.encodedSize + g.bytes + varint(count + g.entries) - varint(count)) shouldBe after
+      }
+  }
+
+  test("A commit vote reserves its slice growth with its locks and releases it with them") {
+    val kvos = kvWith(1)
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, kvos.encode())
+    o.kvState = Some(kvos)
+    val key = Key(Array[Byte](1))
+    val req = KeyValueUpdate(kp1, None, None, List(KeyValueUpdate.DoesNotExist(key)))
+    val ops = List(Insert(key, new Array[Byte](10)))
+    val payload = KeyValueOperation.encode(ops, Replication(3, 2))(0)
+    val ts = HLCTimestamp.now
+    val objects = HashMap(oid1 -> o)
+    val growth = RequirementsChecker.sliceGrowth(tx1, ts, List(req), objects, HashMap(oid1 -> payload))
+    growth shouldBe Map(oid1 -> kvos.growth(ops, ObjectRevision(tx1), ts))
+    growth(oid1).entries shouldBe 1
+    val writes = KVWrites.from(List(req), Map(oid1 -> payload))
+    RequirementsLocker.lock(tx1, List(req), objects, writes, growth = growth)
+    o.sliceReservations shouldBe Map(tx1 -> growth(oid1))
+    RequirementsLocker.unlock(tx1, List(req), objects, writes)
+    o.sliceReservations shouldBe empty
+  }
+
   private def emptyKVObject(): Map[ObjectId, ObjectState] =
     val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, DataBuffer(new Array[Byte](0)))
     o.kvState = Some(new KVObjectState)

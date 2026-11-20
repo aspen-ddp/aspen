@@ -45,18 +45,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.1 [R-W11] A missed-update mark is consumed while a held commit waits on another object; its blind Insert resurrects.
-    PLAUSIBLE. Effort S. transaction-recovery.md.
-    A committed non-voter T at S waits to apply (Tx.awaitLockHolders) on a commit vote H whose colliding locks are on
-    O2, not on O where T blind-Inserts k (or is held for its turn by an in-flight commit on O2 only, holdForTurn). T
-    finalizes; S has T's ErrorTree mark for O. Once T's start is below S's forget floor, a repair of O finds it
-    settled and unlocked, installs the current state (where a later D deleted k) and deletes the mark. T then
-    applies Insert k; its report goes nowhere (repairInstalled reaches only `transactions`, TxCommitted reaches no
-    finalizer). Permanent divergence, one unit of margin on O. Needs H (or the O2 commit) unresolved > 20 s past T's
-    start.
-    Fix: Frontend.reconcile treats an object listed in lockWaitingCommits or heldCommits as unsettled (park or answer
-    stale), so the mark stays until T applies. Two map lookups on the repair path only. Consider with 5.5 (X-W21).
-
 2.2 [Q-W16] A required-revision-only key Delete applied in lock order after an Insert it precedes serially diverges.
     PLAUSIBLE. Effort S. transaction-requirements.md.
     refuseBlindWrites (builder and RequirementsChecker) accept a key Delete D checked only by requiredRevision.
@@ -164,7 +152,6 @@ PRIORITY 5: performance and hygiene
     (deferredFinalizations); holdsLocks and changes look only in transactions, so Tx.awaitableHolders finds no holder
     and a pipelined single writer's next transaction votes abort. Lock-order waiters stay safe via heldCommits.
     Performance only. Fix: have holdsLocks and changes also consult deferredFinalizations (one lookup per collision).
-    Check against 2.1, which reads the same state from repair.
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

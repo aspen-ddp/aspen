@@ -27,7 +27,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Transaction requirements | CRL, recovery | Recovered commit votes, unresolved or with a restored committed resolution, re-take their locks and slice reservations before any message is handled, and a restored one holds them until it applies (transaction-requirements.md R13) |
 | Transaction requirements | CRL, recovery | A key's deletion (commit or repair write) reaches the backend only once no CRL state holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`), so a recovered Insert of an absent key was never applied |
 | Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3) |
-| Transaction requirements | Repair | Every reconcile pass, a write or one that changes nothing, tells every Tx of the object started before the timestamp it records (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert of an absent key applied after it reports the object; a non-voter's blind Insert of an absent key reports its object also where a committed Delete of the key started at or after its start applied here (`Frontend.keyDeletedSince`), and only while the Tx is in `Frontend.transactions` and its marker has not written (R-W11; RP-W9 for the cost of recording no-op passes) |
+| Transaction requirements | Repair | Every reconcile pass, a write or one that changes nothing, tells every Tx of the object started before the timestamp it records (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert of an absent key applied after it reports the object; a non-voter's blind Insert of an absent key reports its object also where a committed Delete of the key started at or after its start applied here (`Frontend.keyDeletedSince`), and only while the Tx is in `Frontend.transactions` and its marker has not written; a later apply relies on the store's ErrorTree mark, which no reconcile of an object it changes consumes while its commit is held or waits in lock order (`Frontend.settledForRepair`) (RP-W9 for the cost of recording no-op passes) |
 | Requirements (lock order) | Recovery | Every recovered commit vote (unresolved, or with a restored committed resolution) has relocked before a recovered Tx that does not relock applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2) |
 | Requirements (slice limit) | Repair, rebuild | The commit votes a store holds on a KeyValue object fit the KeyValue limit together (`Frontend.maxKVSliceSize`, `ObjectState.sliceReservations`, R16); a repair install keeps them fitting (`Frontend.repairFitsReservations`, repair-process.md M6a), and the union of every committed update, which repair and rebuild install unchecked, fits `maxSliceSize` because the KeyValue limit is `t / w` of it (R16), a rebuilt store admitting no growth of an object it may hold without an inherited commit until repaired (2.3) |
 | Client reads | Requirements, rebuild | `InvalidObject.provesDeletion`: a commit voter of an unapplied allocation answers `AllocationPending` (2.5) |
@@ -108,14 +108,11 @@ The premises other subsystems take from this:
   (`Frontend.mayHoldTransaction`), so no Tx can apply T after a reconcile and have its entry deleted under it. A Tx
   finalized while its commit is held has left `transactions` (`Frontend.finalizationDeferred`), so
   `mayHoldTransaction` is false for it, and a reloaded store's floor covers it; repair still cannot lose its update. A
-  commit held for its turn is in `heldCommits`, part of `commitInFlight`, so its objects are unsettled and no
-  reconcile installs or completes there. A commit waiting in lock order (`lockWaitingCommits`, outside the unsettled
-  test) for a holder with locks on the same object waits for locks a reconcile defers (the store's own
-  `lockedKeys`/`objectLevelLocked` and the read's), so that reconcile is incomplete and keeps the entry. A held commit
-  waiting for a holder, or for a commit in flight, on another object it changes gives the object no such guard: a
-  reconcile of it completes and consumes the store's mark for T, and T's later apply of a blind Insert can write back
-  a key a later transaction deleted, with no mark left (R-W11). A recovered vote with a restored resolution is safe
-  either way: its kept CRL state applies it again after a reload without the entry.
+  commit held for its turn is in `heldCommits`, part of `commitInFlight`, and a commit waiting in lock order is in
+  `lockWaitingCommits`, each under every object it changes wherever the locks or commits it waits for lie, so those
+  objects are unsettled (`Frontend.settledForRepair`) and no reconcile installs or completes there until it has
+  applied. A recovered vote with a restored resolution is safe either way: its kept CRL state applies it again after a
+  reload without the entry.
 * **Kept state after finalization is concluded only with T decided.** `Frontend.concludeTransactionState` with
   `keepAdmission` (a replay's Tx is live) replaces or deletes the CRL record that live Tx shares, so its later
   promises and accepts are acknowledged unwritten (C9). It runs only for a finalized T (after its backend commits),
@@ -355,7 +352,8 @@ The premises other subsystems take from this:
   after T's start applied here (`Frontend.keyDeletedSince`), and a recovered non-voter (after a restart, a transfer or
   an adoption) reports every object it applies (`Tx.issueCommits`). These notices reach only Txs in
   `Frontend.transactions`, and a report only a finalizer still running: a commit applied after T's finalization
-  relies on the store's ErrorTree mark, which a repair may consume first (R-W11).
+  relies on the store's ErrorTree mark, which no reconcile of an object it changes consumes while the commit is held
+  or waits in lock order (`Frontend.settledForRepair`).
 * Rebuild installs a KeyValue object's read state with no size check (`RebuildingStore.restore`); repair checks it
   only beside held votes' reservations (`Frontend.repairFitsReservations`). A committed apply never exceeds the limit
   at a commit voter, since the votes a store holds fit together (R16) and a repair install that would break that is
@@ -533,8 +531,8 @@ at once. A committed non-voter colliding with the locks skips the lock-order wai
 queued behind the held commit on every object both change (`heldCommits` is part of `commitInFlight`), so it applies
 after it.
 Consequence: a collision abort and a client retry for a pipelined writer whose previous commit is still waiting for an
-earlier backend commit at one store when its finalization arrives: performance only. Repair's view of such a commit is
-R-W11.
+earlier backend commit at one store when its finalization arrives: performance only. Repair is unaffected: the held
+commit stays in `heldCommits`, so its objects are unsettled until it applies.
 Fix: have `holdsLocks` and `changes` also consult `deferredFinalizations`. One extra map lookup on a collision only.
 
 ### X-W22: FSIF reports any failed read as CorruptedObject at once, so one transient error fail-stops a recovering store

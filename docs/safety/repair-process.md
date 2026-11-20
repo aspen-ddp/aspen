@@ -384,7 +384,8 @@ otherwise loads it from the backend (`SnapshotRead`). A snapshot is a fresh copy
 `Frontend.reconcile` refuses to write unless the object is settled:
 
 ```
-unsettled = holding || commitInFlight(obj) || commitFailed(obj) || committing.contains(obj) || deleting.contains(obj)
+unsettled = holding || commitInFlight(obj) || lockWaitingCommits.contains(obj) || commitFailed(obj)
+         || committing.contains(obj) || deleting.contains(obj)
          || another in-memory state of the object is the one served or referenced
 if unsettled && snapshot.awaitSettle: park (8.2)
 elif unsettled: stale, nothing written
@@ -392,7 +393,10 @@ else reconcileSettled
 ```
 
 `commitInFlight` covers outstanding transaction commits, repair writes and committed transactions holding their
-commit for their turn (`heldCommits`). `commitFailed` includes objects poisoned by `poisonObject`.
+commit for their turn (`heldCommits`). `lockWaitingCommits` lists committed transactions waiting to apply in lock order
+(`Tx.awaitLockHolders`) under every object they change, wherever the locks they wait for lie. A committed transaction
+finalized before it applies here relies on the store's ErrorTree mark for its object, and a completed pass would
+consume it: its later blind Insert of an absent key could then write back a key a later transaction deleted. `commitFailed` includes objects poisoned by `poisonObject`.
 
 A rebuilt store also answers stale, before any of this, for a KeyValue object under its inherited-vote lock (every
 object until its first held-vote round completes), and turns a complete result into a stale one for an object it
@@ -778,7 +782,7 @@ assumed: a later commit's mark moves the entry's revision and fails the delete (
 | Snapshot to install | S voted C (holds locks), not yet applied | S's own locks defer those parts. Safe. |
 | During the read | C's voter among the responders applied it or holds its locks | Read reflects C or reports its locks. Safe. |
 | Read to install | C commits elsewhere; S has not voted | The install writes the read's state, a state the system had. C's apply at S, or C's mark for S, follows; its requirements then check the repaired state. The mark, even one older than the held entry, moves the entry's revision, so the entry survives (12.4). Safe. |
-| At install | A commit's backend write outstanding, or a commit held for its turn | Unsettled: stale or parked. Safe. |
+| At install | A commit's backend write outstanding, or a commit held for its turn or waiting in lock order | Unsettled: stale or parked. Safe. |
 | After install, before the backend completes | A new transaction arrives | It waits behind the repair write. Safe. |
 | After install | Backend write fails | Pre-repair state restored in memory (a new copy discarded); promise fails; entry kept. Safe. |
 

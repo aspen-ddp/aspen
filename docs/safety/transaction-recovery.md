@@ -557,11 +557,12 @@ saved data.
   the `TxFinalized` and lives on only in `deferredFinalizations` until its commit issues: `holdsTransaction`, the
   `repairInstalled` notices and the `keyDeletions` pruning no longer see it, and its `TxCommitted` comes after T's
   marks were written. The store was marked for T (it had not acknowledged T when T was finalized), and that mark is what
-  repairs its copy. A repair of an object the held commit changes does not consume that mark while the commit waits
-  there: a commit held for its turn has a commit of the object in flight (the reconcile is unsettled and parks), and a
-  holder it waits for in lock order on the object holds locks on it, which the reconcile defers, leaving its result
-  incomplete (`Reconcile.plan`, `ReconcileResult.complete`). A wait on another object it changes gives no such guard
-  (R-W11).
+  repairs its copy. A repair of an object the held commit changes does not consume that mark while the commit waits:
+  a commit held for its turn is listed in `heldCommits` under every object it changes, part of `commitInFlight`, and
+  a commit waiting in lock order is listed in `lockWaitingCommits` under every object it changes, wherever the locks
+  it waits for lie. Either makes the object unsettled (`Frontend.settledForRepair`), so the reconcile parks or answers
+  stale, and a parked one runs only once the wait has ended and the commit persisted, its snapshot then showing the
+  apply (repair-process.md 6.2, 8.2).
 
 ### 7.4 Replay of committed but unapplied updates
 
@@ -592,7 +593,7 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   (transaction-requirements.md 9.4, 10.5c). A non-voter's Insert of a key no such deletion reached reports nothing, so
   the routine non-voter of pipelined inserts keeps its transaction's finalizer on the clean fast path. These reports
   reach a finalizer only while T's marker has not yet written: an apply after T's finalization relies on the store's
-  ErrorTree mark instead (R-W11).
+  ErrorTree mark instead, which no repair of an object T changes consumes before T has applied there (7.3).
 * The CRL's drop of applied object data (`Tx.allObjectCommitsComplete`, `CrashRecoveryLog.dropTransactionObjectData`)
   is in memory only, so a crash can recover a Tx with data it already applied. For allocations this matters: a
   deletion of an object an unconcluded Tx allocated here waits (`Frontend.awaitAllocationsDurable`) until that Tx's
@@ -914,26 +915,3 @@ already resolved (`frontend.transactions.get(txid).forall(_.knownOutcome.isEmpty
 its own driver, which then learns the outcome from its peers (late from their finalized relay, or by Paxos from their
 accepted values while they still hold T). One map lookup on the relay of a resolved, unfinalized entry; nothing on the
 hot path.
-
-### R-W11: a mark is consumed while a held commit waits on another object, so a blind Insert resurrects a deleted key
-Verdict PLAUSIBLE. Priority 2. Effort S.
-Mechanism: a committed Tx T at store S that holds no locks (a non-voter) waits to apply while a commit vote H holds
-locks colliding with it (`Tx.awaitLockHolders`), where H need only change some object T changes
-(`frontend.changes(h, _)`) and its colliding locks may lie on an object O2 other than O, on which T blind-Inserts key
-k. A commit held for its turn waits likewise for a commit in flight on O2 only (`Tx.holdForTurn`). T is finalized
-meanwhile (its `TxFinalized` defers, `Frontend.finalizationDeferred`), and S, which never acknowledged T, has T's
-ErrorTree mark for O. Once T is below S's forget floor (`RepairTarget.mayJoinTransaction`, the only gate an ErrorTree
-entry has: `StoreRepairer`, no `holdsTransaction` check), a repair of O at S finds O settled (`Frontend.reconcile`
-counts no held commit) and unlocked, installs the current state, in which a later committed transaction D deleted k,
-passes the completion gate (the read reflects D, past T's start) and deletes T's mark. When H releases, T applies its
-Insert of the absent k (`Tx.issueCommits`). It reports O only if it learned of the repair install (`repairInstalled`
-reaches `Frontend.transactions` only, which a deferred Tx has left), and any report goes in a `TxCommitted` that
-reaches no finalizer: T's marks were written already.
-Consequence: S holds key k, which every other store deleted, with no mark left to repair it: a permanent divergence of
-one key at one store, a lost unit of the write-threshold margin on O (S votes abort on a later `DoesNotExist(k)`
-insert, and no client can delete a key its read does not show). Needs H unresolved, or the in-flight commit of O2
-unfinished, past T's start plus the horizon (20 s): a lock holder under a partition or slow expiry.
-Fix: count an unapplied held commit as unsettled work on every object it changes: `Frontend.reconcile` parks (or
-answers stale) while `lockWaitingCommits` or `heldCommits` lists a Tx for the object, so the mark stays until T has
-applied, and the next pass reconciles the resurrected key away. Two map lookups on the repair path; nothing on the
-transaction path.

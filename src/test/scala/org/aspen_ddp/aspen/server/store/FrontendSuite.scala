@@ -5180,6 +5180,54 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.repairs shouldBe 0
   }
 
+  /** txid1 holds a commit vote overwriting op1. txid2, committed by the other stores, overwrites op1 and blind-Inserts
+    * key 4 of kvPtr: it voted abort here on op1, and waits in lock order for txid1 (Tx.awaitLockHolders), whose locks
+    * lie on op1 only
+    */
+  def blindInsertWaitsInLockOrderOnAnotherObject(frontend: Frontend, net: TestNet): Unit =
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1), KeyValueUpdate(kvPtr, None, None, Nil))), insertOf(4))
+      .disposition shouldBe TransactionDisposition.VoteAbort
+    commitErrors(frontend, net, txid2) shouldBe Nil
+    committedMessages(net) shouldBe Nil
+
+  test("a repair of an object a committed transaction waiting in lock order on another object changes is stale " +
+       "(R-W11)") {
+    val (frontend, backend, net, _) = failStopFixture()
+    blindInsertWaitsInLockOrderOnAnotherObject(frontend, net)
+
+    // The read agrees with the store: a completed pass would consume the mark txid2's later Insert relies on
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr), kvRead(1 to 3), done)
+    done.future.value.get.get.stale shouldBe true
+  }
+
+  test("a parked repair of an object a commit waiting in lock order changes runs once it applies, is incomplete, and " +
+       "the next pass removes the key its blind Insert wrote back (R-W11)") {
+    val (frontend, backend, net, _) = failStopFixture()
+    blindInsertWaitsInLockOrderOnAnotherObject(frontend, net)
+
+    // Key 4 was deleted by a later transaction elsewhere: the read lacks it, as does the store
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr).copy(awaitSettle = true), kvRead(1 to 3), done)
+    done.isCompleted shouldBe false
+
+    // txid1 applies, then txid2 Inserts key 4 here. The parked repair runs then: key 4 changed since its snapshot, so
+    // it is incomplete and the mark stays
+    resolve(frontend, net, txid1, committed = true)
+    committedMessages(net).map(_.transactionId) shouldBe List(txid1, txid2)
+    backend.m(oid2).kvState.get.content.keySet shouldBe (1 to 4).map(k).toSet
+    done.future.value.get.get.complete shouldBe false
+
+    // The next pass reconciles key 4 away
+    val next = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr), kvRead(1 to 3), next)
+    val result = next.future.value.get.get
+    result.complete shouldBe true
+    result.changed shouldBe true
+    backend.m(oid2).kvState.get.content.keySet shouldBe (1 to 3).map(k).toSet
+  }
+
   // repair-process 7: a repair asked to wait for its object to settle parks while the object is busy
   test("a repair asked to wait for its object to settle installs once the in-flight commit completes") {
     val (frontend, backend, _, net) = commitWindowFixture()

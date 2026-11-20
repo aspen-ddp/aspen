@@ -2264,10 +2264,7 @@ class Frontend(val storeId: StoreId,
     // Backend writes of one object are unordered, so a repair writes only while no other write of the object is
     // outstanding, and only over the state the store serves. Otherwise it is left for a later pass: this is rare
     val served = servableState(objectId)
-    // While holding for recovered transactions, their locks are not all taken: the store's own locks would not defer
-    // what they cover
-    val unsettled = holding || commitInFlight(objectId) || commitFailed(objectId) || committing.contains(objectId) ||
-      deleting.contains(objectId) ||
+    val unsettled = !settledForRepair(objectId) ||
       (loaded match
         // Another in-memory state is the one served or locked: the loaded copy may be stale. With no cache, an
         // uncached load is the store's state
@@ -2287,11 +2284,19 @@ class Frontend(val storeId: StoreId,
     parkedRepairs(objectId) = ParkedRepair(snapshot, read, p, wallClockMillis() + Frontend.RepairSettleWait.toMillis)
 
   /** Whether `objectId` has none of the in-flight work that makes a repair of it unsettled. The served-state check
-    * of reconcile is made again when the parked repair runs
+    * of reconcile is made again when the parked repair runs.
+    *
+    * While holding for recovered transactions, their locks are not all taken: the store's own locks would not defer
+    * what they cover. A committed transaction that changes the object and has yet to apply here, held for its turn
+    * (heldCommits, within commitInFlight) or waiting in lock order for a commit vote whose locks may lie on another
+    * object only (lockWaitingCommits), is unsettled work too: a completed pass would consume the store's ErrorTree mark
+    * for it, and its later blind Insert of an absent key could write back a key a later transaction deleted, with no
+    * mark left (transaction-recovery 7.4). A parked repair runs once the wait ends and the commit persists
+    * (lockWaitWakeVoters, commitTurnFree)
     */
   private def settledForRepair(objectId: ObjectId): Boolean =
-    !(holding || commitInFlight(objectId) || commitFailed(objectId) || committing.contains(objectId) ||
-      deleting.contains(objectId))
+    !(holding || commitInFlight(objectId) || lockWaitingCommits.contains(objectId) || commitFailed(objectId) ||
+      committing.contains(objectId) || deleting.contains(objectId))
 
   /** Runs the repair parked on `objectId` once the object is settled. It runs once: still unsettled then (the store
     * serves another state, say), it answers stale

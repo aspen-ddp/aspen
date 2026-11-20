@@ -313,7 +313,8 @@
 - `Reconcile` (exact repair install): `server/repair/CLAUDE.md`; `ReconcileResult.changed` is true only when the
   install was applied (every deferred, stale or no-op path reports false)
 - Parked repairs (repair-process 8.2): a reconcile whose `RepairSnapshot.awaitSettle` is set, finding its object
-  unsettled (a commit or repair write in flight or held, a failed commit, a deletion, holding for recovery), waits in
+  unsettled (`settledForRepair`: a commit or repair write in flight or held, a committed transaction changing it
+  waiting in lock order, `lockWaitingCommits`, a failed commit, a deletion, holding for recovery), waits in
   `parkedRepairs` (at most one per object, a newer one answers the older stale) instead of answering stale.
   `commitTurnFree` runs it before telling any waiting transaction, so at a settled moment before the next commit starts,
   and `releaseHeldMessages` runs all of them when holding ends. It runs once, through `reconcileForRepair` with

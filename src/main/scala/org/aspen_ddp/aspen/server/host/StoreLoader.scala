@@ -34,8 +34,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   private def router = ctx.router
 
   // Stores whose load failed with their data intact: their device is out of space, the backend open failed for any
-  // reason but a lost state (an I/O error, a lock or resource error), the config could not be read, or no executor
-  // slot was free (HostThreading.AlreadyAssigned). Each is offline and unloaded,
+  // reason but a lost state (an I/O error, a lock or resource error), the config could not be read, no executor
+  // slot was free (HostThreading.AlreadyAssigned), or its Store failed to build (handleLoad). Each is offline and
+  // unloaded,
   // and ScanDevices (every deviceScanPeriod, 10 s) tries the load again with an exponential backoff counted in
   // scans: next scan, then 2, 4, ... scans later, capped at LoadRetryCap. Each retry opens the store through
   // startOpen, never blocking the control thread. A store leaves this map when a load starts; a retry that fails the
@@ -60,6 +61,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // (a restart, an adoption, a transfer in) records its load, which raises its forget floor: by MaxStartLead, or by
   // RebuildingStore.AcceptorSinceMargin soon after the store arrived from another host (StoreLoader.ArrivedAtFile)
   private var newStores: Set[StoreId] = Set()
+  // The retry wait, in device scans, of each store whose last LoadStore failed to build its Store (handleLoad). A
+  // build failure has no open of its own to carry the previous wait (startOpen takes the store out of
+  // storesAwaitingRetry), so it is kept here, doubled per failure in a row up to the cap, and dropped once the store
+  // is installed
+  private var buildRetryWaits: Map[StoreId, Int] = Map()
 
   /** LoadRetryCap in device scans, at least 1 */
   private val loadRetryCapScans: Int =
@@ -72,6 +78,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   /** Whether a store awaiting a load retry holds a real onServed callback; None if it awaits none */
   private[server] def awaitingRetryHasCallback(storeId: StoreId): Option[Boolean] =
     storesAwaitingRetry.get(storeId).map(_.onServed.isDefined)
+
+  /** The wait, in device scans, of a store awaiting a load retry; None if it awaits none */
+  private[server] def awaitingRetryWaitScans(storeId: StoreId): Option[Int] =
+    storesAwaitingRetry.get(storeId).map(_.waitScans)
 
   // `onServed` runs, on the control thread, once the store is served: once the LoadStore its open queues has
   // installed it and it has recovered (its LoadStore's future succeeds), whether the backend opened in the caller
@@ -529,6 +539,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 madeStore.foreach(_.frontend.releaseAllAdmissions())
                 if replacing.isEmpty then
                   ctx.threading.release(storeId)
+                  // Nothing says its data is gone (an EMFILE, an ENOSPC writing a file at build): left offline and
+                  // retried at the device scans with backoff, as a failed open is. Without it, an Active store would
+                  // stay unserved and untracked until a restart (systemic-loss-protection 4.6)
+                  ctx.devices.devices.get(storageDeviceId).foreach: sds =>
+                    awaitBuildRetry(sds, backend.path, storeId, err)
                 abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
               // A crl_save.log state is charged, checked, before any of it is saved (crash-recovery-log 6.1, A3).
               // Retained for the store, the charge is swapped for its recovery's own count (Frontend.recoverState),
@@ -554,8 +569,25 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                     storesAwaitingRetry += storeId -> LoadRetry(sds, backend.path, 1, 1)
                 abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
               case Success(entry) =>
+                buildRetryWaits -= storeId
                 router.install(entry)
                 awaitCrlLoad(entry.store, trs, p)
+
+  /** Records a store whose Store failed to build in storesAwaitingRetry: retried next scan, then 2, 4 ... scans
+   *  later per build failure in a row, capped at LoadRetryCap, and logged at error once per cap interval. A waiting
+   *  entry's onServed is kept for the load that serves it. */
+  private def awaitBuildRetry(sds: LocalStorageDeviceState, storePath: os.Path, storeId: StoreId,
+                              err: Throwable): Unit =
+    val previous = buildRetryWaits.get(storeId)
+    val waitScans = previous.map(w => math.min(w * 2, loadRetryCapScans)).getOrElse(1)
+    buildRetryWaits += storeId -> waitScans
+    if previous.isEmpty || previous.contains(loadRetryCapScans) then
+      logger.error(s"Store $storeId cannot be loaded: its Store failed to build. Leaving it offline and retrying in " +
+                   s"$waitScans device scans. $storePath. Error: $err")
+    else
+      logger.debug(s"Store $storeId still fails to build. Retrying in $waitScans device scans. Error: $err")
+    val onServed = storesAwaitingRetry.get(storeId).flatMap(_.onServed)
+    storesAwaitingRetry += storeId -> LoadRetry(sds, storePath, waitScans, waitScans, onServed)
 
   /** The admission of a device's CRL, Unlimited for a device not loaded here (the test seam's CRL) */
   private def admissionOf(storageDeviceId: StorageDeviceId): CrlAdmission =

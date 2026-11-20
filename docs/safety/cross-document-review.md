@@ -43,7 +43,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (`rebuild-complete`) has never served, so it holds nothing in the device CRL and is not marked (`DeviceDiscovery.holdsOwnState`) |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
-| Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a pass, or retried (2.2; a failed Store build is none of these, SL-W17); one whose directory or config is missing is rebuilt, its device-CRL entries kept (2.2). A device load serves every store directory its markers do not hold back without reading the tree, so the markers, the save file and the incarnation file are read with stats that tell a failure from an absence (`server.FileStat`), and an incarnation file is never written by a load (2.2) |
+| Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a pass, or retried (2.2); one whose directory or config is missing is rebuilt, its device-CRL entries kept (2.2). A device load serves every store directory its markers do not hold back without reading the tree, so the markers, the save file and the incarnation file are read with stats that tell a failure from an absence (`server.FileStat`), and an incarnation file is never written by a load (2.2) |
 | CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again; the leftover drop releases only the charge it was issued for, unchanged since |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
 
@@ -173,9 +173,8 @@ The premises other subsystems take from this:
   kept for the load that serves it. A load's `onServed` (the `StoreMoved` gossip of `DeviceShutdown.reloadClosedStores`
   and `StoreTransfers.reinstateAbandonedOut`) runs only once its LoadStore has installed and recovered the store
   (`StoreLoader.awaitServed`); a LoadStore that leaves it offline with its data intact (no CRL room, no executor slot, a
-  save file whose removal failed) hands the callback to its `storesAwaitingRetry` entry, and any other failure drops it,
-  so peers never clear their offline mark for a store left offline. A Store whose build throws in
-  `StoreLoader.handleLoad` is the exception: it is left offline and in no retry (SL-W17). An Active entry on a loaded
+  save file whose removal failed, a Store whose build throws) hands the callback to its `storesAwaitingRetry` entry,
+  and any other failure drops it, so peers never clear their offline mark for a store left offline. An Active entry on a loaded
   device with no `config.yaml` at its store path (the directory lost to a bad restore, a partial mount or a hand
   removal, or its config gone), not served, opening or retiring, is found by the reconcile's Missing Stores pass
   (`DeviceReconciler.reconcileDeviceState`): the store is marked offline and a rebuild requested

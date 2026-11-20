@@ -510,11 +510,23 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       assertAbandoned(fx, s0, sds, failing)
       // Its executor slot was released
       fx.onControl(fx.threading.assignedCounts.sum) should be(0)
+      // Retried at the next device scan, then with backoff per build failure in a row (SL-W17)
+      fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(Some(false))
+      fx.onControl(fx.ctx.loader.awaitingRetryWaitScans(s0)) should be(Some(1))
+      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, os.temp.dir()))))
+      fx.onControl(fx.ctx.loader.awaitingRetryWaitScans(s0)) should be(Some(2))
 
       val backend = bootstrappedBackend(s0)
       await(fx.load(backend))
       fx.onControl(fx.ctx.router.entry(s0).map(_.store.backend)) should be(Some(backend))
       fx.onControl(fx.threading.assignedCounts.sum) should be(1)
+
+      // A failed rebuild over the served store leaves it serving, awaiting no retry, and the backoff starts over
+      fx.onControl(fx.ctx.loader.retryFailedLoads())
+      fx.onControl(fx.ctx.loader.awaitingRetryWaitScans(s0)) should be(None)
+      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, os.temp.dir()))))
+      fx.onControl(fx.ctx.router.entry(s0).map(_.store.backend)) should be(Some(backend))
+      fx.onControl(fx.ctx.loader.awaitingRetryWaitScans(s0)) should be(None)
 
   test("a reload over a loaded store closes the old one, releasing what its transactions were counted for"):
     val s0 = StoreId(poolId, 0)

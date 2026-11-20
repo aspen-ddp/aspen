@@ -34,12 +34,14 @@
   space, an I/O, lock or resource error) leaves the store offline, unmarked, and in `storesAwaitingRetry`: each
   device scan retries it with backoff (`StoreLoader.retryFailedLoads`, 1, 2, 4 ... scans, capped at
   `Host.LoadRetryCap` 5 min), so an Active store is never left unserved and untracked until a restart. A load that
-  throws before its open (an unreadable `config.yaml`, `StoreLoader.awaitUnreadRetry`) and one whose executor slot
-  an earlier close still holds (`HostThreading.AlreadyAssigned`) are left offline and retried the same way; a retry
+  throws before its open (an unreadable `config.yaml`, `StoreLoader.awaitUnreadRetry`), one whose executor slot
+  an earlier close still holds (`HostThreading.AlreadyAssigned`) and one whose Store fails to build in `handleLoad`
+  (`awaitBuildRetry`, backoff per build failure in a row, kept in `buildRetryWaits` until an install) are left
+  offline and retried the same way; a retry
   keeps the waiting load's `onServed` (e.g. its `StoreMoved` gossip) for the open that serves it. A load's `onServed`
   runs only once its LoadStore has installed and recovered the store (`StoreLoader.awaitServed`), never at backend
-  open; a LoadStore that leaves the store awaiting a retry (no CRL room, no executor slot, a failed save-file removal)
-  hands the callback to that entry, and any other failure drops it. An unreadable config
+  open; a LoadStore that leaves the store awaiting a retry (no CRL room, no executor slot, a failed save-file removal,
+  a failed build) hands the callback to that entry, and any other failure drops it. An unreadable config
   is logged at error once per retry cap. An Active entry on a loaded device with no `config.yaml` at its store path
   (directory or config lost), not served, opening or retiring, is rebuilt by the reconcile's Missing Stores pass:
   marked offline and `StoreRebuilds.requestRebuild`. Its device-CRL entries stay (nothing durable records the

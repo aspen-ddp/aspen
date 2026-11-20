@@ -376,9 +376,12 @@ These look like loss, or take a store or device out of service, but write no mar
 * **A failed `crl.loadStore`** of a valid save file (`UnloadFailedStore`, X7): offline, the file kept, not marked,
   and not retried before the host restarts.
 * **A failed Store build** in `StoreLoader.handleLoad` (the `Store` constructor, the object cache or the backend's
-  completion handler throws):
-  `abandonLoad` closes the backend and leaves the store offline, unmarked, and not in `storesAwaitingRetry`, so
-  nothing loads it before the host restarts (SL-W17). (The `incarnation` file is read before the build: one that
+  completion handler throws, for example with EMFILE): `abandonLoad` closes the backend and leaves the store offline
+  and unmarked, and `awaitBuildRetry` puts it in `storesAwaitingRetry`, so each device scan retries it with backoff
+  (1, 2, 4 ... scans per build failure in a row, capped at `LoadRetryCap`, logged at error once per cap interval), as
+  a failed open is. A new store's failed `created` promise fails `createNewStore`'s flip; the next check finds the
+  directory and flips the entry Active, and the retry then serves it. A failed build of a reload over a served store
+  leaves that store serving and starts no retry. (The `incarnation` file is read before the build: one that
   cannot be stat'd, read or parsed waits in `storesAwaitingRetry`, and one known absent is D14.)
 * **A transferred copy with an unusable save file** is not promoted (X9) and the transfer restarts; the source still
   holds the state. The same holds for a promoted copy found lost before its pool update commits: a resume
@@ -543,17 +546,4 @@ with its copies retained in `pending-delete/` or at their paths, and nothing to 
 
 ## Open weaknesses
 
-### SL-W17: A failed Store build leaves the store unserved and untracked until a restart
-Verdict CONFIRMED. Priority 4. Effort S.
-Mechanism: in `StoreLoader.handleLoad`, a throw while building the Store (`built` is a Failure: the Store
-constructor, `objectCacheFactory` or `setCompletionHandler` failing, for example with EMFILE) goes to `abandonLoad`, which leaves the
-store offline and unmarked but does not add it to `storesAwaitingRetry`, unlike an executor slot still held or a
-CRL without room. No reconcile pass loads an offline store that has no marker. For a new store, the failed
-`created` promise fails `createNewStore`'s flip. The next check finds the directory (`os.exists(storePath)`) and
-flips the entry Active without loading it.
-Consequence: an Active store that nothing serves, while the pool counts it writable (cross-document-review 2.2): a
-unit of the pool's `w - t` margin is lost silently until the host restarts. A transient condition at a restart
-storm (SC5) can do it to many stores at once.
-Fix: in the `built` Failure branch, when no earlier store is replaced, record the store in `storesAwaitingRetry`
-with backoff, as the `AlreadyAssigned` branch does (its `onServed` then joins the entry through `awaitServed`). Log
-at error once per retry cap. Failure path only.
+None.

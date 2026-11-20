@@ -61,14 +61,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
-4.1 [SL-W17] A failed Store build in handleLoad leaves the store unserved and untracked until a restart.
-    CONFIRMED. Effort S. systemic-loss-protection.md.
-    When StoreLoader.handleLoad's `built` step fails (constructor, object cache, completion handler, or writeFresh
-    failing ENOSPC/EMFILE), abandonLoad leaves the store offline and unmarked and not in storesAwaitingRetry; no
-    reconcile pass loads an offline unmarked store. For a new store, the next createNewStore finds the directory and
-    flips the entry Active without loading it. An Active store nobody serves: one unit of w - t margin, silently.
-    Fix: put the store in storesAwaitingRetry with backoff in that branch, as the AlreadyAssigned branch does.
-
 4.2 [X-W19] A shipped Unconfirmed rebuilt copy stays offline at its destination until the hourly device check.
     PLAUSIBLE. Effort S. cross-document-review.md.
     An Unconfirmed copy (flip committed, entry then moved to TransferringOut) ships with rebuild-complete. The

@@ -1867,13 +1867,28 @@ class Tx( trs: TransactionRecoveryState,
     val mutedForGood = muted && (frontend.mayHaveForgottenUndecided(txd.startTimestamp) || frontend.belowForgetFloor(txd))
     if oresolution.isEmpty && frozen then
       saveUndurableVote()
-    val commitVoteSaving = !muted && disposition == TransactionDisposition.VoteCommit && !voteDurable
     if oresolution.nonEmpty || cachedOutcome.nonEmpty || (frozen && allObjectsLoaded && !commitVoteSaving) ||
       mutedForGood then
       net.sendTransactionMessage(TxStatusResponse(m.from, storeId, transactionId, m.requestUUID, Some(statusForExpiry)))
 
-  /** This Tx's state as a status reply reports it, and as its own expiry round counts it. A commit vote counts only
-    * once durable (voteDurable): an expiry commit counting it relies on its lock surviving a crash. Unresolved here
+  /** A commit vote whose CRL save has not completed: not yet final (voteDurable) */
+  private def commitVoteSaving: Boolean =
+    !muted && disposition == TransactionDisposition.VoteCommit && !voteDurable
+
+  /** This Tx's own entry in its expiry round (Frontend.startExpiryRound), or None for silent. An unresolved commit
+    * voter whose vote is not yet durable is silent to itself as it is to its peers (receiveStatusRequest): counted as
+    * a replied non-voter, its round could discard a commit by rule D or E whose vote, once durable, still reaches the
+    * client or a peer's rule A. As silent it holds (rule G), and its vote is saved if no save holds it yet
+    * (saveUndurableVote), so a later round counts it
+    */
+  def ownExpiryStatus: Option[TxStatusResponse.TxStatus] =
+    if oresolution.isEmpty && cachedOutcome.isEmpty then
+      saveUndurableVote()
+      if commitVoteSaving then None else Some(statusForExpiry)
+    else Some(statusForExpiry)
+
+  /** This Tx's state as a status reply reports it, and as its own expiry round counts it when not silent there
+    * (ownExpiryStatus). A commit vote counts only once durable (voteDurable): an expiry commit counting it relies on its lock surviving a crash. Unresolved here
     * with an outcome from the status cache (outcomeDecided), it reports that outcome, as the cache now holds it (a
     * finalization recorded there since included), so an observer adopts it. A resolution learned from the
     * UnackedCommits tree, until finalized, is reported as its CRL saves it (savedStatus): Unresolved, with its vote and

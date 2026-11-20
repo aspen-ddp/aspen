@@ -6502,6 +6502,32 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         Set((peer1, true), (peer2, true))
   }
 
+  test("an expiring commit voter whose vote is not yet durable counts itself silent, not as a replied non-voter") {
+    // Counted as a replied non-voter, its own entry plus a frozen non-voter peer would give vc = 1, s = 0 in
+    // Replication(3, 2): rule D would discard a commit whose vote, once durable, can still reach the client or a
+    // peer's rule A
+    withExpiryFrontend: (frontend, _, net, crl, lookup, clock, _) =>
+      crl.holdTxSaves = true
+      val txd = expiringTxd(List(overwrite(op1)))
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.transactions(txid1).vote shouldBe TransactionDisposition.VoteCommit
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, acceptedCommit)
+      reply(frontend, net, peer2, nonVoter)
+      lookup.requests shouldBe Nil
+      frontend.transactions.contains(txid1) shouldBe true
+      net.sentTx.collect { case r: TxResolved => r } shouldBe Nil
+
+      // Once durable, its next round counts the vote: rule A
+      crl.completeHeldTxSaves()
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, acceptedCommit)
+      reply(frontend, net, peer2, nonVoter)
+      net.sentTx.collect { case r: TxResolved => (r.to, r.committed) }.toSet shouldBe
+        Set((peer1, true), (peer2, true))
+  }
+
   test("a frozen Tx whose objects have not loaded is silent to status requests until they load") {
     // Its vote is undecided until the objects load. Expectation changed in the final review (2026-11-16): a frozen Tx
     // now decides no vote, since a vote decided after a status reply could contradict that reply, so once its objects

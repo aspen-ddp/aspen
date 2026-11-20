@@ -893,8 +893,10 @@ not rejoin a transaction it forgot".
 an unresolved Tx answers only once its reported state is final: frozen with its objects loaded, or muted for good
 (amnesiac, or below the floor). A commit vote is final only once durable: `votedCommit` is reported, and a Tx's own
 expiry round counts its own vote, only after a CRL save holding the vote completed (`Tx.voteDurable`; a recovered vote
-is durable), and an unresolved commit voter whose save is still in flight is silent to others until it completes; its
-own round meanwhile counts it as a replied non-voter (`Frontend.startExpiryRound` takes `Tx.statusForExpiry`, P-W8).
+is durable), and an unresolved commit voter whose save is still in flight is silent until it completes, to others and
+to its own expiry round alike (`Tx.ownExpiryStatus`, which also issues the save if none holds the vote): counted as a
+replied non-voter, its own round could discard by rule D or E a commit whose vote, once durable, still reaches the
+client or a peer's rule A. As silent it holds (rule G) until a later round counts the vote.
 Rules A and F count each `votedCommit` as a voter holding T's locks, so the vote and its locks must survive a crash. A
 resolved Tx answers at once, and so does a Tx created from a cached outcome (`Tx.outcomeDecided`, which holds no locks): it reports
 that outcome as the cache now holds it, in its own expiry round too, so it is adopted (rule 1) and its vote is never
@@ -1172,24 +1174,4 @@ transaction eventually resolves without operator action given a healthy quorum.
 
 ## Open weaknesses
 
-### P-W8: An expiring Tx counts its own not-yet-durable commit vote as a replied non-voter, so it can discard a commit
-Verdict CONFIRMED. Priority 1. Effort S.
-Mechanism: `Frontend.startExpiryRound` seeds the round with `own = tx.statusForExpiry`, whose `votedCommit` is false
-until `Tx.voteDurable` (the CRL save holding the vote completed). Peers treat such a Tx as silent
-(`Tx.receiveStatusRequest`, `commitVoteSaving`), but its own round counts it as a replied provable non-voter, which is
-not a final state: once the save completes it reports `votedCommit = true`, and its prepare-response handler sends the
-vote to the driver and the client (`Tx.sendPrepareResponse`). Trigger: a commit vote decided just before T's freeze
-(an in-flight-commit wait ending, a late client prepare at a Tx a driver created) whose save is still in flight at the
-first expiry heartbeat. Example, Replication(3, 2), S0 and S1 vote commit, S2 a frozen non-voter: S0's round sees
-`vc = 1`, `s = 0`, so rule D (`vc + s < r`) or E fires (`ExpiryTally.decideUnknown`); S0 is a commit voter, so it
-looks up its UnackedCommits entry (`Tx.decideExpiryDiscard`, `Frontend.requestUnackedLookup`), finds none (T is not
-finalized) and discards (`Frontend.unackedLookupComplete` -> `expireTransaction`: CRL state deleted, locks released).
-Meanwhile S0's save completes: its vote reaches a still-running client (a client clock several seconds slow keeps it
-retransmitting past the stores' freeze), which completes `Committed` on S0's and S1's votes (P-VC); or S1's round,
-reaching S0 between durability and discard, counts `vc = 2` and commits by rule A.
-Consequence: a commit the client was told, or one an observer decides by rule A, is left with one holder of its update
-in a pool whose read threshold is 2 (S1's later rounds see S0 "unknown" and discard by D too): committed data lost, or
-observers split between commit and discard, from save latency alone, with no failure.
-Fix: in `Frontend.startExpiryRound`, leave the own entry out of `round.replies` (silent, so the round holds by G)
-while the Tx is an unresolved commit voter whose vote is not yet durable, and call its `saveUndurableVote` so a later
-round counts it. Expiry path only; no hot-path cost.
+None.

@@ -1167,7 +1167,8 @@ class Frontend(val storeId: StoreId,
 
   /** An expiring Tx's status queries. Each round has its own request id and counts only its own replies.
     *
-    * @param replies this round's replies by store, this store's own included; a store absent from it was silent
+    * @param replies this round's replies by store, this store's own included unless it is silent to itself
+    *                (Tx.ownExpiryStatus); a store absent from it was silent
     * @param countdown store heartbeats left until the next round
     * @param interval heartbeats between the next round and the one after: 1, doubling to MaxExpiryQueryInterval
     * @param decided this round's replies decided: later ones of it are ignored
@@ -1218,11 +1219,13 @@ class Frontend(val storeId: StoreId,
     round.interval = math.min(round.interval * 2, MaxExpiryQueryInterval)
     // Its own state, frozen like its peers' (it is past expiry). Never an outcome it knows from its resolution: that is
     // what its peers are asked to confirm or end (ExpiryTally.decide's `known`). An outcome it has only from the status
-    // cache (Tx.outcomeDecided) is kept, so it adopts it as it would from a peer
-    val own = tx.statusForExpiry
-    round.replies = Map(storeId -> Some(
-      if tx.knownOutcome.nonEmpty then own.copy(status = TransactionStatus.Unresolved, finalized = false, late = false)
-      else own))
+    // cache (Tx.outcomeDecided) is kept, so it adopts it as it would from a peer. A commit vote not yet durable leaves
+    // it silent (Tx.ownExpiryStatus): rule G holds until a later round counts the vote
+    round.replies = tx.ownExpiryStatus match
+      case None => Map()
+      case Some(own) => Map(storeId -> Some(
+        if tx.knownOutcome.nonEmpty then own.copy(status = TransactionStatus.Unresolved, finalized = false, late = false)
+        else own))
     val txd = tx.txd
     // Every store of the transaction, since any outcome-bearing reply decides; only the primary pool's count otherwise
     (txd.allDataStores - storeId).foreach: to =>

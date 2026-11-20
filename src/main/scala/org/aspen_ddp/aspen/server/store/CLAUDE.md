@@ -102,7 +102,8 @@
 - Status query (`TxStatusRequest`, carrying the transaction's `startTimestamp`; horizon design section 2): every store
   with a final state answers. A store with a Tx replies with `Tx.statusForExpiry`: status, finalized, late,
   `holdsAcceptorState` (false only for a Tx muted for good below the floor), its latest `accepted` value and
-  `votedCommit` (only once the vote's CRL save is durable; a commit voter whose save is in flight is silent). An
+  `votedCommit` (only once the vote's CRL save is durable; a commit voter whose save is in flight is silent, in its
+  own expiry round too: `Tx.ownExpiryStatus`). An
   unresolved Tx answers only once frozen (past expiry by its own clock: it promises and accepts nothing more,
   `Tx.frozen`) and its objects are loaded, or muted for good, so the state it reports is final: a frozen Tx decides no
   vote and sends none (`Tx.determineDisposition`, `Tx.sendDelayedPrepare`), so one still undecided then (waiting on an

@@ -39,19 +39,6 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.1 [P-W8] An expiring Tx counts its own not-yet-durable commit vote as a replied non-voter and can discard a commit.
-    CONFIRMED. Effort S. paxos-transactions.md.
-    Frontend.startExpiryRound seeds round.replies with tx.statusForExpiry, whose votedCommit stays false until
-    Tx.voteDurable, while peers see such a Tx as silent (Tx.receiveStatusRequest, commitVoteSaving). A commit vote
-    decided just before T's freeze, with its CRL save still in flight at the first expiry round, makes its own round
-    see vc = 1, s = 0: rule D or E fires (ExpiryTally.decideUnknown), the UnackedCommits lookup finds nothing, and the
-    store discards T. Its save then completes and its vote can still reach a retransmitting client, or a peer's round
-    that counts it commits by rule A: lost committed data or a commit/discard split, from save latency alone.
-    Fix: in startExpiryRound, leave the Tx's own entry out of round.replies while it is an unresolved commit voter
-    whose vote is not yet durable (it counts as silent; rule G holds), and call Tx.saveUndurableVote so a later round
-    counts it. Expiry path only. Test: Replication(3,2) with a third, frozen non-voter replying (the existing
-    FrontendSuite test covers only the case that holds).
-
 1.2 [Q-W15, X-W10] A recovered commit voter whose committed resolution was restored takes no locks or reservation.
     CONFIRMED (Q-W15), PLAUSIBLE (X-W10). Effort S. transaction-requirements.md, cross-document-review.md.
     Q-W15: T's CRL state was re-saved Committed (a prepare or accept after the resolution: Tx.receiveAccept /

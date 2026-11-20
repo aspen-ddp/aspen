@@ -241,6 +241,23 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
       val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, reqs, List(ins1))
       intercept[BlindKeyValueWrite](buildPin(b))
   }
+  test("each refused write's message names the object, the operation's key, what it lacks and the fix") {
+    def message(reqs: List[KeyValueUpdate.KeyRequirement], ops: List[KeyValueOperation],
+                rev: Option[ObjectRevision] = None): String =
+      val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, rev, None, reqs, ops)
+      intercept[BlindKeyValueWrite](buildPin(b)).getMessage
+    val insert = message(List(MayExist(k1)), List(ins1))
+    insert should include (kvp.id.toString)
+    insert should include (s"Insert of $k1 has no requirement that checks the key")
+    insert should include ("KeyRevision, Exists or DoesNotExist")
+    insert should include ("MayExist")
+    val delete = message(Nil, List(Delete(k1)), Some(rev1))
+    delete should include (s"Delete of $k1 has neither a KeyRevision on the key nor a content lock")
+    delete should include ("a required revision")
+    val objectLevel = message(Nil, List(SetMax(k2)))
+    objectLevel should include ("SetMax changes an object-level field")
+    objectLevel should include ("without a required revision")
+  }
   test("an Insert passes with a check on its key, a required revision or a content lock") {
     for reqs <- List(List(DoesNotExist(k1)), List(Exists(k1)), List(KeyRevision(k1, rev1))) do
       val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, reqs, List(ins1)); buildPin(b)

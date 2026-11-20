@@ -316,13 +316,19 @@ class TransactionBuilder(
       kvu.operations.foreach:
         case i: Insert =>
           if kvu.requiredRevision.isEmpty && kvu.contentLock.isEmpty && !keyChecked.contains(i.key) then
-            throw BlindKeyValueWrite(kvu.pointer, "Insert of a key with no requirement that checks it")
+            throw BlindKeyValueWrite(kvu.pointer, s"Insert of ${i.key} has no requirement that checks the key. Add " +
+              s"KeyRevision, Exists or DoesNotExist on ${i.key}, a required revision or a content lock " +
+              "(MayExist, WithinRange and KeyObjectRevision do not check it, nor does a requirement on another key)")
         case d: Delete =>
           if kvu.contentLock.isEmpty && !revisionChecked.contains(d.key) then
-            throw BlindKeyValueWrite(kvu.pointer, "Delete of a key with no KeyRevision or content lock")
+            throw BlindKeyValueWrite(kvu.pointer, s"Delete of ${d.key} has neither a KeyRevision on the key nor a " +
+              s"content lock. Add KeyRevision(${d.key}, <revision read>) or a content lock (a required revision, " +
+              "Exists or a KeyRevision on another key is not enough)")
         case op =>
           if kvu.requiredRevision.isEmpty then
-            throw BlindKeyValueWrite(kvu.pointer, s"${op.getClass.getSimpleName} with no required revision")
+            throw BlindKeyValueWrite(kvu.pointer, s"${op.getClass.getSimpleName} changes an object-level field " +
+              "(min, max, left or right) without a required revision. Add the object's revision as read (a content " +
+              "lock is not enough)")
 
   def update(
               pointer: KeyValueObjectPointer,

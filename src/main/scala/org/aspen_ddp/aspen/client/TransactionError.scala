@@ -46,9 +46,12 @@ final case class UnpinnedTransaction(transactionId: TransactionId) extends Trans
   * key with no requirement that checks it (`KeyValueUpdate.checkedKeys`), no required revision and no content lock.
   * Stores keep no tombstone or object-level timestamp to order such writes by, so two of them applied in opposite
   * orders at two stores would leave one permanently diverged (transaction-requirements 2.5, R15). A programming error:
-  * the retry helpers do not retry it.
+  * the retry helpers do not retry it. `reason` names the operation, its key, what it lacks and what would satisfy the
+  * rule; the exception's message carries it.
   */
-final case class BlindKeyValueWrite(objectPointer: ObjectPointer, reason: String) extends TransactionCreationError
+final case class BlindKeyValueWrite(objectPointer: ObjectPointer, reason: String) extends TransactionCreationError:
+  override def getMessage: String =
+    s"Refused KeyValue update of object ${objectPointer.id} (transaction-requirements 2.5): $reason"
 
 /** Used if multiple refcount modifications are attempted on the same object within a single transaction */
 final case class MultipleRefcountUpdatesToObject(objectPointer:ObjectPointer) extends TransactionCreationError

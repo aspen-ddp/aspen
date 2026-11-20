@@ -65,12 +65,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.1 [Q-W14] A lock-order waiter withholds colliding lock-only votes it would never wait for.
-    CONFIRMED. Effort S. transaction-requirements.md.
-    Tx.lockWaitBlocked asks wouldWaitFor, which tests the lock collision but not the Frontend.changes filter that
-    awaitLockHolders applies, so lock-only votes (a vdisk fence lock, repair proofs) wait up to CollisionWait and then
-    vote abort needlessly.
-    Fix: skip a waiter none of whose changed objects this transaction changes.
+(no open items)
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

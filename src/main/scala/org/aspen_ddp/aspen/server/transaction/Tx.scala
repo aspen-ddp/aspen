@@ -518,7 +518,7 @@ class Tx( trs: TransactionRecoveryState,
     * the stores lacking the update could reach the read threshold. So while another Tx here holds locks this
     * transaction's requirements or writes collide with (RequirementsChecker.lockHolders) on an object both change, it
     * waits for each to release them, having applied its commit or aborted (Frontend.locksReleased). It holds its
-    * references, no locks, and new votes whose locks it would wait for wait meanwhile (lockWaitBlocked), so it
+    * references, no locks, and new votes it would wait for as holders wait meanwhile (lockWaitBlocked), so it
     * cannot be starved. The holder's own commit never waits for it (holdForTurn ignores the wait).
     *
     * A Tx holding its own locks never waits: two live votes never hold conflicting locks, and recovered votes
@@ -554,17 +554,23 @@ class Tx( trs: TransactionRecoveryState,
       false
 
   /** Whether this committed transaction, waiting to apply (awaitLockHolders), would wait for `holder` once it held
-    * `locks` on `oid`: the holder's locks collide with this transaction's requirements or writes there
+    * `locks` on `oid`: the holder changes an object this transaction changes (`holderChanges`), and its locks collide
+    * with this transaction's requirements or writes there. A lock-only holder has no update to lose and is not waited
+    * for
     */
-  def wouldWaitFor(holder: TransactionId, oid: ObjectId, locks: RequirementsChecker.LockView): Boolean =
-    val writes = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
-    RequirementsChecker.lockHoldersIn(transactionId, requirements, writes,
-      o => if o == oid then Some(locks) else None).contains(holder)
+  def wouldWaitFor(holder: TransactionId, oid: ObjectId, locks: RequirementsChecker.LockView,
+                   holderChanges: ObjectId => Boolean): Boolean =
+    changedHere.exists(holderChanges) && {
+      val writes = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
+      RequirementsChecker.lockHoldersIn(transactionId, requirements, writes,
+        o => if o == oid then Some(locks) else None).contains(holder)
+    }
 
   /** The objects on which a committed transaction waiting to apply (awaitLockHolders) collides with this vote's
     * locks, each with one such waiter. The vote waits for those waits to end (Frontend.lockWaitWakeVoters), so a
     * waiter cannot be starved. Any other vote decides now, on the state before the waiter's apply, which changes
-    * nothing its requirements or writes depend on, as for two votes holding compatible locks. A waiter may itself wait
+    * nothing its requirements or writes depend on, as for two votes holding compatible locks. A vote changing none of a
+    * waiter's objects (lock-only there) is one the waiter would not wait for, so it decides now. A waiter may itself wait
     * for a holder whose transaction can decide only with this very vote, at a store where another waiter withholds
     * that one for this vote's transaction: so a vote is never withheld for a waiter it does not collide with, and a
     * colliding one is withheld for at most Tx.CollisionWait (checkCollisionWait), then votes abort
@@ -579,7 +585,7 @@ class Tx( trs: TransactionRecoveryState,
       waited.iterator.flatMap: oid =>
         planned.get(oid).flatMap: p =>
           val locks = RequirementsChecker.PlannedLocks(transactionId, objects(oid), p)
-          frontend.lockWaiters(oid).find(w => (w ne this) && w.wouldWaitFor(transactionId, oid, locks))
+          frontend.lockWaiters(oid).find(w => (w ne this) && w.wouldWaitFor(transactionId, oid, locks, changes))
             .map(w => oid -> w.transactionId)
       .toMap
 

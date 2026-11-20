@@ -470,11 +470,11 @@ commit per object.
    the earlier one's update persisted, 10.5a). A recovered Tx that does not relock completes its load only after
    every recovered commit vote has relocked (transaction-recovery.md 7.2), so it finds every holder it must wait for.
    The wait is not counted by `commitInFlight`, so the holder's own commit never queues behind it. A new vote waits for
-   it only if the waiter's requirements or writes collide with the locks the vote would take on one of its objects
+   it only if the waiter would wait for it as a holder: the vote changes an object the waiter changes, and the
+   waiter's requirements or writes collide with the locks the vote would take on one of its objects
    (`Tx.lockWaitBlocked`: `RequirementsLocker.plannedLocks` seen through `RequirementsChecker.PlannedLocks`, tested by
-   the waiter's `Tx.wouldWaitFor` with the same `lockHoldersIn` rule as its own holder set), so it cannot be starved.
-   The test leaves out the waiter's second condition, that the holder changes an object the waiter changes, so a
-   lock-only vote that collides is withheld too, although the waiter would not wait for it (Q-W14).
+   the waiter's `Tx.wouldWaitFor` with the same `lockHoldersIn` rule and `Frontend.changes` filter as its own holder
+   set), so it cannot be starved. A vote that is lock-only on the waiter's objects is not withheld.
    Any other new vote decides at once, on the state before the waiter's apply: what the waiter changes is nothing
    that vote's requirements or writes depend on, as for two votes holding compatible locks (R4). A waiter may itself
    wait for a holder whose transaction can decide only with a vote withheld at another store, by a waiter there that
@@ -837,15 +837,4 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
 
 ## Open weaknesses
 
-### Q-W14: A lock-order waiter withholds colliding lock-only votes it would never wait for
-Verdict CONFIRMED. Priority 5. Effort S.
-Mechanism: `Tx.awaitLockHolders` waits only for holders that change an object the waiter changes
-(`Frontend.changes`). `Tx.lockWaitBlocked` asks `Tx.wouldWaitFor`, which tests only the lock collision
-(`RequirementsChecker.lockHoldersIn`) and not that condition. So a new vote that would take only a
-`SharedRevisionLock` or `ExclusiveRevisionLock` on the object, or that changes none of the waiter's objects, is
-withheld while the waiter waits, and after `Tx.CollisionWait` (up to about 1.5 s) votes abort naming the waiter.
-Consequence: lock-only transactions on an object with a committed transaction waiting in lock order at a store, such
-as a vdisk block commit's fence lock, wait and then draw an abort vote there that they need not draw. Performance
-only; lock-order waits are rare.
-Fix: in `lockWaitBlocked`, skip a waiter none of whose changed objects this transaction changes, mirroring the
-holder filter in `awaitLockHolders`.
+None.

@@ -2590,6 +2590,17 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       List(KeyValueUpdate.KeyRevision(k(2), rev0))))), insertOf(2)).disposition shouldBe TransactionDisposition.VoteCommit
   }
 
+  test("a lock-only vote on an object a commit waiting in lock order changes is not withheld for it (Q-W14)") {
+    val (frontend, _, net, stops) = failStopFixture()
+    keyWriteWaitsInLockOrder(frontend, net)
+    // A shared lock on kvPtr collides with txid2's write there, but txid3 changes only op1: txid2 would never wait for
+    // it, so it decides at once. Its shared lock collides with txid1's key lock, and it names txid1, not the waiter
+    val r = prepare(frontend, net, lockTxd(txid3, List(SharedRevisionLock(kvPtr, rev0), overwrite(op1))))
+    r.disposition shouldBe TransactionDisposition.VoteAbort
+    r.collisions shouldBe List(txid1)
+    stops() shouldBe Nil
+  }
+
   test("a vote colliding with a commit waiting in lock order waits for it, then votes on the applied state") {
     val (frontend, _, net, _) = failStopFixture()
     keyWriteWaitsInLockOrder(frontend, net)

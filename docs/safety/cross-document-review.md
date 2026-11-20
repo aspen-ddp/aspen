@@ -215,9 +215,8 @@ The premises other subsystems take from this:
   1.5 s: each holder's driver then sees an abort vote and decides (transaction-requirements.md 8.3). A holder that
   cannot decide otherwise ends by expiry (`ExpiryTally.decideUnknown`), and one whose tally is undecidable holds the
   waiter as long as its own locks (transaction-requirements.md section 12).
-* A colliding vote is withheld even when the waiter would not wait for it (a lock-only vote, or one changing none of
-  the waiter's objects), so a lock-only transaction such as a repair proof can draw an avoidable abort vote there
-  (transaction-requirements.md, Q-W14).
+* A vote is withheld only for a waiter that would wait for it: one changing none of the waiter's objects (lock-only
+  there, such as a repair proof or a vdisk fence lock) decides at once (transaction-requirements.md 8.3).
 * A lock-only vote is not waited for, and a repair install may change an object under one: shared revision locks are
   outside `ObjectState.objectLevelLocked`. It has no update to lose; its skipped re-check is reported
   (transaction-requirements.md 8.5), and the shared lock did its work during the vote.

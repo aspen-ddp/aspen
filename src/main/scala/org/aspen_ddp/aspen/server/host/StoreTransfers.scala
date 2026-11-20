@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.TransferOutcome
 import org.aspen_ddp.aspen.server.DurableFiles
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
+import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -75,40 +75,53 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       extractUnloaded(storeId)
 
   /** A closed store's entries may still be live in its device CRL (closed without extraction, or awaiting space).
-   *  They are read (`crl.readStoreState`, leaving them live) and written, with whatever an earlier extraction's save
-   *  file already holds, to its crl_save.log, then deleted from the device CRL once the file is durable. A crash or a
-   *  failed save before that leaves the device CRL holding them. Nothing to take leaves the directory as it is. A
-   *  save file already there that is unusable fails the close before anything is read: its state is lost, and
-   *  writing the CRL's entries over it would hide that. Runs on the control thread, as the marker writes beside it
-   *  do; nothing blocks on the CRL. A crash between the save file and the deletion leaves the same entries in both:
-   *  harmless, as the save file's load re-saves them under the same ids, and the source's copy is dropped when its
-   *  directory is deleted (DeviceReconciler).
+   *  Without a save file they are read (`crl.readStoreState`, leaving them live) and written to its crl_save.log, then
+   *  deleted from the device CRL once the file is durable. A crash or a failed save before that leaves the device CRL
+   *  holding them. Nothing to take leaves the directory as it is. A crash between the save file and the deletion
+   *  leaves the same entries in both: harmless, as the file is then the store's whole state (below).
+   *
+   *  A valid save file already there is the store's whole state (a load removes it, so the store has served nowhere
+   *  since it was written; crash-recovery-log 3.3 step 4). Whatever the device CRL holds for the store is then a copy
+   *  of part of it or an earlier tenancy's leftover, which StoreLoader.awaitCrlLoad would drop before loading the
+   *  file. So the file ships unchanged and the entries are dropped (`dropStore`), releasing only the admission charge
+   *  retained for them when the drop was issued. An unusable save file fails the close before anything is read: its
+   *  state is lost, and writing the CRL's entries over it would hide that. Runs on the control thread, as the marker
+   *  writes beside it do; nothing blocks on the CRL.
    *
    *  The store must stay closed throughout: one loaded meanwhile recovered the entries read, which the deletion would
-   *  take from under it, and may have saved others the file would lack. Nothing keeps it closed (the transfer-out
-   *  marker is written only once this completes), so an open started during the read fails the extraction, with
-   *  nothing written or deleted; the transfer's retransmitted request closes the store and extracts again. */
+   *  take from under it, and may have saved others the file would lack (or, from a save file, removed the file).
+   *  Nothing keeps it closed (the transfer-out marker is written only once this completes), so an open started
+   *  during the read or the drop fails the extraction; the transfer's retransmitted request closes the store and
+   *  extracts again. */
   private def extractUnloaded(storeId: StoreId): Future[Unit] =
     ctx.devices.devices.valuesIterator.find(sds => os.isDir(sds.devicePath / storeId.directoryName)) match
       case None => Future.unit
       case Some(sds) =>
         val saveFile = Backend.crlSaveFile(sds.devicePath / storeId.directoryName)
-        val earlier =
-          if os.exists(saveFile) then CrashRecoveryLog.loadValidStoreState(saveFile, storeId)
-          else Right(StoreRecoveryState.Empty)
-        earlier match
-          case Left(err) => Future.failed(err)
-          case Right(saved) =>
-            val opens = ctx.loader.opensStarted(storeId)
-            sds.crl.readStoreState(storeId).flatMap: state =>
-              if ctx.loader.opensStarted(storeId) != opens then
-                Future.failed(new IllegalStateException(
-                  s"store $storeId was opened while its CRL state was being extracted"))
-              else if state.isEmpty then
+        val opens = ctx.loader.opensStarted(storeId)
+        def openedMeanwhile: Option[Future[Unit]] =
+          if ctx.loader.opensStarted(storeId) != opens then
+            Some(Future.failed(new IllegalStateException(
+              s"store $storeId was opened while its CRL state was being extracted")))
+          else
+            None
+        if os.exists(saveFile) then
+          CrashRecoveryLog.loadValidStoreState(saveFile, storeId) match
+            case Left(err) => Future.failed(err)
+            case Right(_) =>
+              val charge = sds.admission.retainedCharge(storeId)
+              sds.crl.dropStore(storeId).flatMap: _ =>
+                openedMeanwhile.getOrElse:
+                  charge.foreach(sds.admission.releaseRetained(storeId, _))
+                  Future.unit
+        else
+          sds.crl.readStoreState(storeId).flatMap: state =>
+            openedMeanwhile.getOrElse:
+              if state.isEmpty then
                 Future.unit
               else
                 // A failed save leaves them in the device CRL, for a retried request to extract again
-                CrashRecoveryLog.saveStoreState(storeId, saved.supersededBy(state), saveFile)
+                CrashRecoveryLog.saveStoreState(storeId, state, saveFile)
                 sds.crl.deleteTransactions(storeId, state.entryIds).map(_ => sds.admission.releaseRetained(storeId))
 
   /** The transfer-in work on `deviceId` that a shutdown of it must stop or wait for. `ingStores` are the stores

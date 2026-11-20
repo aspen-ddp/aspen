@@ -45,17 +45,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.2 [CRL-W14] A transfer out of a closed store merges stale device-CRL entries into its crl_save.log.
-    PLAUSIBLE. Effort S. crash-recovery-log.md.
-    StoreTransfers.extractUnloaded saves saved.supersededBy(state): device-CRL entries override the save file's by id.
-    For a closed store with a valid save file, the file is its whole state; CRL entries for it are copies or an earlier
-    tenancy's leftovers (which StoreLoader.awaitCrlLoad drops before loading a file). Trigger: the store, transferred
-    back, stays unloaded (no CRL room in tryChargeLoaded, or a failed open in storesAwaitingRetry) when a transfer out
-    is requested. The destination recovers stale records; a stale commit vote can find its UnackedCommits entry and
-    re-apply over a later update.
-    Fix: with a valid save file, ship it unchanged, dropStore the device-CRL entries, then releaseRetained; save the
-    CRL's state only when there is no file. Remove supersededBy (no other caller).
-
 2.3 [X-W12] A rebuilt copy's first load recovers device-CRL entries an earlier copy of the store left.
     PLAUSIBLE. Effort S. cross-document-review.md.
     Only StoreCopies.retire drops a store's entries and dropLeftoverCrlState skips stores the device entry lists.

@@ -19,11 +19,5 @@ final case class StoreRecoveryState(transactions: List[TransactionRecoveryState]
   /** The ids of every entry, transactions' and stubs': what a deletion of all of it names */
   def entryIds: List[TransactionId] = (transactions.map(_.txd.transactionId) ++ appliedStubs.keys).distinct
 
-  /** This state with `newer`'s entries added, in place of any of its own with the same ids */
-  def supersededBy(newer: StoreRecoveryState): StoreRecoveryState =
-    val ids = newer.entryIds.toSet
-    StoreRecoveryState(transactions.filterNot(t => ids.contains(t.txd.transactionId)) ++ newer.transactions,
-      appliedStubs.filterNot((id, _) => ids.contains(id)) ++ newer.appliedStubs)
-
 object StoreRecoveryState:
   val Empty: StoreRecoveryState = StoreRecoveryState()

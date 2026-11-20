@@ -256,16 +256,17 @@ piece leaves the image when that save's entry is built (5.3: a form's build unpi
 |-----------|-----------|--------|
 | Planned device shutdown | stores close with `extractCrl = false`, records stay live; then `crl.shutdown()` | `DeviceShutdown.closeForShutdown`, `shutDownCrl` |
 | Transfer out, store open | on the executor after `closing`: `readStoreState`; `saveStoreState` to `crl_save.log` (tmp, fsync, rename, directory fsync); `store.close()`; then `deleteTransactions(state.entryIds)` and the retained admission released | `StoreLoader.handleClose(extractCrl = true)` |
-| Transfer out, store closed | `readStoreState`, merged over any earlier save file (`StoreRecoveryState.supersededBy`, the CRL's entries winning: CRL-W14), saved, then `deleteTransactions`; fails if the store was opened during the read (`opensStarted`) | `StoreTransfers.extractUnloaded` |
+| Transfer out, store closed | with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`. An unusable save file fails before anything is read; an open started during the read or drop (`opensStarted`) fails it after | `StoreTransfers.extractUnloaded` |
 | Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source, an earlier tenancy's copy at the path of a store transferring in) | marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it (any entries `readStoreState` still returns saved first as `lost-crl-entries.log`), else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore`, `StoreTransfers.retireEarlierTenancy` and the Deleted Stores pass) |
 | Store no longer on the device (safety net: a retire drops first) | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory, no drop and no retire running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
 | Store whose `loadStore` of its `crl_save.log` failed (the file stays) | `dropStore` | `StoreLoader.handleUnloadFailed`, `closeUnloaded(dropDurably = true)` |
 
 The rule that makes this safe: **entries leave the device CRL only through a written deletion, and only after another
 durable copy exists or the store has been made unservable on disk.** The transfer deletes after the save file is
-durable; the rebuild drops after the marker (and the `lost-crl-state.log` copy) is durable. Every operation carries
-applied stubs with the transactions: the save file holds both kinds of entry (`codec.StoreCRLEntry.applied_stub`,
-with the start timestamp), and the deletions name `state.entryIds`.
+durable (or, finding a valid save file already there, drops entries the file supersedes as a load would); the rebuild
+drops after the marker (and the `lost-crl-state.log` copy) is durable. Every operation carries applied stubs with the
+transactions: the save file holds both kinds of entry (`codec.StoreCRLEntry.applied_stub`, with the start timestamp),
+and the deletions name `state.entryIds`.
 
 The leftover drop is safe against a store landing on the device meanwhile: the directory and loaded checks run in the
 control task that issues the `DropStore`, a store that lands has its directory before anything saves for it, and the
@@ -1307,22 +1308,3 @@ without dropping its CRL entries (`closeUnloaded(dropDurably = false)`, through 
 does), fail `p`, and put the store in `storesAwaitingRetry`. A retry must not serve until the removal is durable. If
 the unlink succeeded but the force failed, a crash could bring the file back over newer device-CRL state. So the
 retry forces the store directory before it trusts that the file is absent, or redoes the removal and its force.
-
-### CRL-W14: A transfer out of a closed store merges stale device-CRL entries into its `crl_save.log`
-Verdict PLAUSIBLE. Priority 2. Effort S.
-Mechanism: `StoreTransfers.extractUnloaded` writes `saved.supersededBy(state)`: the store's existing `crl_save.log`
-state overlaid with whatever `readStoreState` returns, the CRL's entries winning by id (a CRL transaction id also
-removes the file's stub of that id). A closed store that has a save file has served nowhere since the file was
-written (a load removes it), so the file is its whole state (3.3, step 4). What the device CRL holds for it is either
-a copy of part of the file or entries an earlier tenancy of the store left on this device, whose copy was removed by
-hand before `DeviceReconciler.dropLeftoverCrlState` dropped them. The leftover drop never runs once the store's
-directory exists. `StoreLoader.awaitCrlLoad` drops exactly these entries before loading the file so they are never
-recovered as the store's own; `extractUnloaded` writes them into the file instead. The trigger needs the store,
-transferred back onto the device, to stay unloaded (a load refused for CRL room, `tryChargeLoaded`, or a failed open
-waiting in `storesAwaitingRetry`) while a transfer out of it is requested.
-Consequence: the destination loads stale records as the store's own. They rejoin transactions it has forgotten, and a
-stale commit vote can find its own UnackedCommits entry and apply again (an overwritten update). A stale record can
-also replace the file's current record of the same id.
-Fix: when a valid save file exists, it is the whole state. Leave it unchanged, drop the store's device-CRL entries
-(`dropStore`, then `releaseRetained`), and complete. Merge, or simply save, only when there is no file. Remove
-`supersededBy` if nothing else uses it.

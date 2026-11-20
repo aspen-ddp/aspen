@@ -204,7 +204,9 @@
   forces both directories. Without the marker on disk, a store's entries stay in the device CRL. A transfer out reads
   them (`readStoreState`, leaving them live) into `crl_save.log`, whether the store is loaded or not
   (`StoreTransfers.closeForTransferOut`), and deletes them from the device CRL (`deleteTransactions`) only once that
-  file is durable: a crash or failed save before that leaves the device CRL holding them.
+  file is durable: a crash or failed save before that leaves the device CRL holding them. A closed store that already
+  has a valid `crl_save.log` ships it unchanged: the file is its whole state, so its device-CRL entries are copies or
+  an earlier tenancy's leftovers, dropped (`dropStore`) as its load would drop them (`extractUnloaded`).
   `DeviceReconciler.dropLeftoverCrlState` drops the entries of a store with no entry, no directory and no retire
   running, as a safety net for a directory removed by hand. It releases only the admission charge retained for the
   store when it was issued, and only if unchanged at completion (`CrlAdmission.retainedCharge` /

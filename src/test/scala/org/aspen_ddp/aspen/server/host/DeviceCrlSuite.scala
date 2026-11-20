@@ -1464,6 +1464,40 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // Deleted from the files once the save file was durable: not recovered here on a restart as well
       heldOnDisk(deviceDir, storeId) should be(Set())
 
+  atest("a transfer out of a closed store with a valid save file ships the file unchanged and drops its CRL entries"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val fileTx = TransactionId(new UUID(9, 42))
+    val fileState = StoreRecoveryState(List(recoveryState(storeId, fileTx, Array[Byte](4, 5))))
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = host.control.devices.devices(deviceA).crl
+      admission = host.control.devices.devices(deviceA).admission
+      _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
+      // Closed without extraction: txid stays in the device CRL
+      closed = host.closeStore(storeId)
+      _ <- pumpUntil(host, closed.isCompleted)
+      _ <- closed
+      // The store came back holding a save file (transferred back, its load awaiting CRL room): the file is its whole
+      // state, and txid an earlier tenancy's leftover
+      _ = CrashRecoveryLog.saveStoreState(storeId, fileState, Backend.crlSaveFile(storeDir))
+      retainedBefore = admission.retainedBytes(storeId)
+      extracting = host.control.transfers.closeForTransferOut(storeId)
+      _ <- pumpUntil(host, extracting.isCompleted)
+      _ <- extracting
+      saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
+      heldAfter = held(crl, storeId)
+      retainedAfter = admission.retainedBytes(storeId)
+      _ = factory.shutdownAll()
+    yield
+      retainedBefore should be > 0L
+      saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(fileTx)))
+      heldAfter should be(Set())
+      retainedAfter should be(0L)
+      heldOnDisk(deviceDir, storeId) should be(Set())
+
   /** Extracts the store's CRL state for a network transfer out, from the open store (`loaded`) or from its device
    *  CRL once closed, holding an in-flight transaction and an applied stub. Returns the save file's state, the stubs
    *  the device CRL held afterwards, and those its files hold */
@@ -1850,6 +1884,38 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       heldAfter should be(Set(txid))
       os.exists(Backend.crlSaveFile(storeDir)) should be(false)
       heldOnDisk(deviceDir, storeId) should be(Set(txid))
+
+  atest("an extraction from a save file during which its closed store loads again fails, and the store serves the file"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val fileTx = TransactionId(new UUID(9, 43))
+    val fileState = StoreRecoveryState(List(recoveryState(storeId, fileTx, Array[Byte](6))))
+    for
+      (hostRoot, _, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = factory.opened.head
+      closed = host.closeStore(storeId)
+      _ <- pumpUntil(host, closed.isCompleted)
+      _ <- closed
+      _ = CrashRecoveryLog.saveStoreState(storeId, fileState, Backend.crlSaveFile(storeDir))
+      gate = Promise[Unit]()
+      _ = crl.dropGate = Some(gate.future)
+      extracting = host.control.transfers.closeForTransferOut(storeId)
+      _ <- pumpUntil(host, crl.dropCalls.get == 1)
+      // The store loads again from its save file while the extraction's drop is outstanding
+      _ = host.loadStoreById(deviceA, storeId)
+      _ <- pumpUntil(host, crl.dropCalls.get == 2)
+      _ = crl.dropGate = None
+      _ = gate.success(())
+      _ <- pumpUntil(host, extracting.isCompleted && recovered(host, storeId, fileTx))
+      outcome = extracting.value
+      heldAfter = held(crl, storeId)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = factory.shutdownAll()
+    yield
+      outcome.exists(_.isFailure) should be(true)
+      heldAfter should be(Set(fileTx))
 
   atest("a transfer out of an open store whose save file fails keeps its transactions in the device CRL"):
     given ExecutionContext = executionContext

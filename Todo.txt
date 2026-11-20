@@ -45,18 +45,15 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.1 [X-W9] Growths committed by different voter sets can together exceed maxSliceSize; repair/rebuild cannot install.
-    PLAUSIBLE. Effort M. cross-document-review.md.
-    Slice reservations are per store. Replication(3,2), an object near the limit, three disjoint-key inserts where any
-    two fit: S1 commits {T1,T3}, S2 {T1,T2}, S3 {T2,T3}; each store skips its third as a non-voter (R16), no counted
-    voter skips. Repair's read state holds all three; Reconcile.planKeyValue installs it unchecked. Under FSIF the
-    repair write fails CommitError.SliceTooLarge every pass (Frontend.repairWriteComplete restores) and
-    FsifBackend.rebuildWrite throws, so the rebuild never completes: permanent divergence, unconsumed marks, and any
-    later lost store of the pool stays Rebuilding.
-    Fix: a store votes abort, with a distinct error, on a growing KeyValue update without a required object revision
-    when slice + growth + held reservations exceeds a high-water mark below maxSliceSize; the TKVL writer retries
-    pinned (KeyValueListNode.applyChange with a required revision), so near-limit growths form a revision chain. Only
-    near-full objects pay. State the rule in client/tkvl/CLAUDE.md and transaction-requirements R16.
+2.1 [X-W9] A rebuilt store can count its lost incarnation's KeyValue growth twice; the union can exceed maxSliceSize.
+    PLAUSIBLE. Effort M. cross-document-review.md (residual of the closed concurrency case; R16 states the bound).
+    Stores admit KeyValue growth within IDA.maxKVSliceSize (t/w of the slice), which bounds the union of committed
+    updates by maxSliceSize when each store is one copy. A rebuilt store lacks a growth T its lost incarnation voted
+    commit for that resolved after the rebuild's read: the inherited-vote lock ends at T's resolution, which carries no
+    data, so a growing vote it grants before repair installs T is checked without T. Needs a store loss and concurrent
+    near-limit growth of one object. Consequence as before: repair and an FSIF rebuild cannot install the object.
+    Fix: a rebuilt store refuses growing votes on an object whose inherited vote resolved committed until it holds
+    that transaction's update.
 
 2.2 [CRL-W14] A transfer out of a closed store merges stale device-CRL entries into its crl_save.log.
     PLAUSIBLE. Effort S. crash-recovery-log.md.

@@ -210,6 +210,13 @@ class Frontend(val storeId: StoreId,
                /** Expiry decided T committed here (ExpiryTally.Decision.Commit): the Store has a driver finalize it */
                onExpiryCommit: TransactionDescription => Unit = _ => ()) extends Logging {
 
+  /** The limit every growing KeyValue update must fit, at vote, apply re-check and a repair install beside held
+    * reservations: maxSliceSize lowered to the pool IDA's IDA.maxKVSliceSize, so the union of committed updates repair
+    * and rebuild install fits maxSliceSize (transaction-requirements R16). Without a pool IDA (tests) it is
+    * maxSliceSize
+    */
+  val maxKVSliceSize: Option[Long] = maxSliceSize.map(m => poolIDA.fold(m)(_.maxKVSliceSize(m)))
+
   /** Which life of the store's data this is: prepare replies carry it (TxPrepareResponse.incarnation) */
   val incarnation: StoreIncarnation = incarnationOverride.getOrElse(StoreIncarnation.default(storeId))
 
@@ -2218,7 +2225,7 @@ class Frontend(val storeId: StoreId,
         if stopped || closed then done.tryFailure(new IllegalStateException(s"Store $storeId stopped"))
         else backend.repair(CommitState(read.pointer, os.metadata, os.objectType, os.data), done)
 
-  /** Whether `plan`, applied to `loaded`, keeps the slice within maxSliceSize beside the growth the commit votes held
+  /** Whether `plan`, applied to `loaded`, keeps the slice within maxKVSliceSize beside the growth the commit votes held
     * on the object reserve (ObjectState.sliceReservations). Only a checked vote or an apply may otherwise change a
     * slice that holds reservations, which is what keeps the slice plus every reservation within the limit, so each
     * commit voter's apply re-check fits (transaction-requirements R16). A plan that grows the slice is measured as a
@@ -2227,7 +2234,7 @@ class Frontend(val storeId: StoreId,
     */
   private def repairFitsReservations(loaded: Option[ObjectState], plan: ReconcilePlan): Boolean =
     val fits = for
-      limit <- maxSliceSize
+      limit <- maxKVSliceSize
       os <- loaded
       if os.sliceReservations.nonEmpty
       kvs <- os.kvState

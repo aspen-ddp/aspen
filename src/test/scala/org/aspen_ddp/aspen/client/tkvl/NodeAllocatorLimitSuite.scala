@@ -47,7 +47,8 @@ object NodeAllocatorLimitSuite:
 
 
 /** Fills a single node to the node code's own limit with tiny entries and checks every insert commits (the
-  * stores vote abort on any slice above `sliceLimit`) and that the stored slice stays within the limit.
+  * stores vote abort on any KeyValue growth above `IDA.maxKVSliceSize(sliceLimit)`, which `nodeLimit` is) and that
+  * the stored slice stays within the limit.
   */
 trait NodeFillBehaviour:
   this: IntegrationTestSuite =>
@@ -57,10 +58,13 @@ trait NodeFillBehaviour:
   override def testPoolMaxSliceSize: Option[Int] = Some(sliceLimit)
   override def testStoreMaxSliceSize: Option[Long] = Some(sliceLimit.toLong)
 
+  /** The KeyValue node size limit of the test pool: the KeyValue slice limit its IDA sets (IDA.maxKVSliceSize) */
+  def nodeLimit: Int = NodeAllocator.nodeSizeLimit(testIda, Some(sliceLimit)).get
+
   def fillNode(minKey: Key, tailKey: Key, entryKeyPrefix: Array[Byte]): Future[Assertion] =
     given ExecutionContext = executionContext
 
-    val nodeAllocator = new NodeAllocator(client, List((PoolObjectAllocatorId(Radicle.poolId), sliceLimit)))
+    val nodeAllocator = new NodeAllocator(client, List((PoolObjectAllocatorId(Radicle.poolId), nodeLimit)))
     val tail = KeyValueListPointer(tailKey, radicle)
 
     def entryKey(i: Int): Key = Key(entryKeyPrefix ++ Array[Byte]((i >> 8).toByte, i.toByte))
@@ -72,7 +76,7 @@ trait NodeFillBehaviour:
       for
         kvos <- client.read(ptr)
         node = KeyValueListNode(client, KeyValueListPointer(minKey, ptr), ByteArrayKeyOrdering, kvos)
-        _ <- node.insert(entryKey(i), Value(Array[Byte]()), sliceLimit, alloc,
+        _ <- node.insert(entryKey(i), Value(Array[Byte]()), nodeLimit, alloc,
           (_, _) => { split = true; Future.unit })(using tx)
         committed <-
           if split then
@@ -105,7 +109,7 @@ trait NodeFillBehaviour:
         contents)
       inserted should be > 1
       kvos.contents.size should be (inserted)
-      storedSlice should be <= sliceLimit
+      storedSlice should be <= nodeLimit
 
 
 class NodeAllocatorLimitSuite extends IntegrationTestSuite with NodeFillBehaviour:
@@ -117,19 +121,19 @@ class NodeAllocatorLimitSuite extends IntegrationTestSuite with NodeFillBehaviou
     new NodeAllocator(client, sizes.map(sz => (poolTier, sz)).toList)
 
   atest("a tier whose maxNodeSize equals the allocator limit validates"):
-    allocator(sliceLimit).validate().map(_ => succeed)
+    allocator(nodeLimit).validate().map(_ => succeed)
 
   atest("a tier one byte above the limit fails naming the tier, requested size and limit"):
-    limitError(allocator(sliceLimit, sliceLimit + 1).validate()).map: err =>
+    limitError(allocator(nodeLimit, nodeLimit + 1).validate()).map: err =>
       err.tier should be (1)
-      err.requested should be (sliceLimit + 1)
-      err.limit should be (sliceLimit)
+      err.requested should be (nodeLimit + 1)
+      err.limit should be (nodeLimit)
 
   atest("Root.create rejects a node size above the limit"):
     given tx: Transaction = client.newTransaction()
     for
-      empty <- limitError(Root.create(client, ByteArrayKeyOrdering, allocator(sliceLimit + 1)))
-      nonEmpty <- limitError(Root.create(client, ByteArrayKeyOrdering, allocator(sliceLimit, sliceLimit + 1),
+      empty <- limitError(Root.create(client, ByteArrayKeyOrdering, allocator(nodeLimit + 1)))
+      nonEmpty <- limitError(Root.create(client, ByteArrayKeyOrdering, allocator(nodeLimit, nodeLimit + 1),
         Map(Key(Array[Byte](1)) -> Value(Array[Byte](2)))))
     yield
       empty.tier should be (0)
@@ -137,11 +141,11 @@ class NodeAllocatorLimitSuite extends IntegrationTestSuite with NodeFillBehaviou
 
   atest("Root.create accepts a node size at the limit"):
     given tx: Transaction = client.newTransaction()
-    Root.create(client, ByteArrayKeyOrdering, allocator(sliceLimit)).map: root =>
-      root.nodeAllocator.getMaxNodeSize(0) should be (sliceLimit)
+    Root.create(client, ByteArrayKeyOrdering, allocator(nodeLimit)).map: root =>
+      root.nodeAllocator.getMaxNodeSize(0) should be (nodeLimit)
 
   atest("a decoded root with a bad node size fails when it allocates a node"):
-    val decoded = Root(client, Root(0, ByteArrayKeyOrdering, None, allocator(sliceLimit, sliceLimit + 1)).encode())
+    val decoded = Root(client, Root(0, ByteArrayKeyOrdering, None, allocator(nodeLimit, nodeLimit + 1)).encode())
     for
       v <- limitError(decoded.nodeAllocator.validate())
       t0 <- decoded.nodeAllocator.getAllocatorForTier(0)
@@ -152,19 +156,19 @@ class NodeAllocatorLimitSuite extends IntegrationTestSuite with NodeFillBehaviou
       t1.tier should be (1)
       // Tiers above the configured ones reuse the last tier's configuration and are checked as themselves
       t3.tier should be (3)
-      t3.requested should be (sliceLimit + 1)
+      t3.requested should be (nodeLimit + 1)
 
   atest("node allocation re-checks the allocator's current limit"):
     for
       pool <- client.getStoragePool(Radicle.poolId)
-      stub = new StubAllocator(pool.allocator, Some(sliceLimit))
-      na = new StubNodeAllocator(client, stub, sliceLimit)
+      stub = new StubAllocator(pool.allocator, Some(nodeLimit))
+      na = new StubNodeAllocator(client, stub, nodeLimit)
       _ <- na.validate()
       _ = stub.limit = Some(1024)
       err <- limitError(na.getAllocatorForTier(0))
     yield
       err.tier should be (0)
-      err.requested should be (sliceLimit)
+      err.requested should be (nodeLimit)
       err.limit should be (1024)
 
   atest("an allocator reporting a stale limit fails where the node lands"):
@@ -172,20 +176,20 @@ class NodeAllocatorLimitSuite extends IntegrationTestSuite with NodeFillBehaviou
     for
       pool <- client.getStoragePool(Radicle.poolId)
       stub = new StubAllocator(pool.allocator, None)
-      na = new StubNodeAllocator(client, stub, sliceLimit * 2)
+      na = new StubNodeAllocator(client, stub, nodeLimit * 2)
       _ <- na.validate()
       alloc <- na.getAllocatorForTier(0)
       err <- limitError(alloc.allocateKeyValueObject(Map()))
     yield
       err.tier should be (0)
-      err.requested should be (sliceLimit * 2)
-      err.limit should be (sliceLimit)
+      err.requested should be (nodeLimit * 2)
+      err.limit should be (nodeLimit)
 
   atest("a split finalization whose upper tier exceeds its limit still completes"):
     val treeKey = Key(Array[Byte](9))
     // Tier 0 is valid, tier 1 is not. setNewRoot does not validate, standing in for a root written before the
     // guard or decoded from storage.
-    val na = allocator(sliceLimit, sliceLimit + 1)
+    val na = allocator(nodeLimit, nodeLimit + 1)
     for
       pool <- client.getStoragePool(Radicle.poolId)
       tx0 = client.newTransaction()
@@ -229,14 +233,18 @@ class NodeAllocatorKindLimitSuite extends IntegrationTestSuite:
 
   private val dataLimit: Int = testIda.maxObjectSize(sliceLimit.toLong)
 
+  /** The KeyValue node limit: the KeyValue slice limit the IDA sets (IDA.maxKVSliceSize) */
+  private val kvLimit: Int = testIda.maxKVSliceSize(sliceLimit.toLong).toInt
+
   private def allocator(sizes: Int*): NodeAllocator =
     new NodeAllocator(client, sizes.map(sz => (PoolObjectAllocatorId(Radicle.poolId), sz)).toList)
 
-  test("the DataObject limit is the pool's object limit and the KeyValue limit its slice limit"):
+  test("the DataObject limit is the pool's object limit and the KeyValue limit its KeyValue slice limit"):
     assert(dataLimit > sliceLimit)
+    assert(kvLimit < sliceLimit)
     assert(NodeAllocator.nodeSizeLimit(testIda, Some(sliceLimit), TreeKind.DataObjects) == Some(dataLimit))
-    assert(NodeAllocator.nodeSizeLimit(testIda, Some(sliceLimit), TreeKind.KeyValueObjects) == Some(sliceLimit))
-    assert(NodeAllocator.nodeSizeLimit(testIda, Some(sliceLimit)) == Some(sliceLimit))
+    assert(NodeAllocator.nodeSizeLimit(testIda, Some(sliceLimit), TreeKind.KeyValueObjects) == Some(kvLimit))
+    assert(NodeAllocator.nodeSizeLimit(testIda, Some(sliceLimit)) == Some(kvLimit))
     assert(NodeAllocator.nodeSizeLimit(testIda, None, TreeKind.DataObjects) == None)
 
   atest("a tier at the DataObject limit validates for DataObjects but not for KeyValue objects"):
@@ -245,19 +253,19 @@ class NodeAllocatorKindLimitSuite extends IntegrationTestSuite:
       kv <- limitError(allocator(dataLimit).validate(TreeKind.KeyValueObjects))
       kvDefault <- limitError(allocator(dataLimit).validate())
     yield
-      assert(kv == NodeSizeExceedsAllocatorLimit(0, dataLimit, sliceLimit))
+      assert(kv == NodeSizeExceedsAllocatorLimit(0, dataLimit, kvLimit))
       assert(kvDefault == kv)
 
   atest("for each kind a tier above the pool limit fails validate and getAllocatorForTier"):
     for
       data <- limitError(allocator(dataLimit, dataLimit + 1).validate(TreeKind.DataObjects))
       dataTier <- limitError(allocator(dataLimit, dataLimit + 1).getAllocatorForTier(1, TreeKind.DataObjects))
-      kv <- limitError(allocator(sliceLimit, sliceLimit + 1).validate(TreeKind.KeyValueObjects))
-      kvTier <- limitError(allocator(sliceLimit, sliceLimit + 1).getAllocatorForTier(1, TreeKind.KeyValueObjects))
+      kv <- limitError(allocator(kvLimit, kvLimit + 1).validate(TreeKind.KeyValueObjects))
+      kvTier <- limitError(allocator(kvLimit, kvLimit + 1).getAllocatorForTier(1, TreeKind.KeyValueObjects))
     yield
       assert(data == NodeSizeExceedsAllocatorLimit(1, dataLimit + 1, dataLimit))
       assert(dataTier == data)
-      assert(kv == NodeSizeExceedsAllocatorLimit(1, sliceLimit + 1, sliceLimit))
+      assert(kv == NodeSizeExceedsAllocatorLimit(1, kvLimit + 1, kvLimit))
       assert(kvTier == kv)
 
   atest("Root.create and createNewTree validate the node allocator for the tree's kind"):
@@ -277,7 +285,7 @@ class NodeAllocatorKindLimitSuite extends IntegrationTestSuite:
     yield
       assert(root.kind == TreeKind.DataObjects)
       assert(root.orootObject.exists(_.isInstanceOf[DataObjectPointer]))
-      assert(kv == NodeSizeExceedsAllocatorLimit(0, dataLimit, sliceLimit))
+      assert(kv == NodeSizeExceedsAllocatorLimit(0, dataLimit, kvLimit))
       assert(kvTree == kv)
       assert(data == NodeSizeExceedsAllocatorLimit(0, dataLimit + 1, dataLimit))
 
@@ -288,11 +296,11 @@ class NodeAllocatorKindLimitSuite extends IntegrationTestSuite:
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId)
       groupTier = (sz: Int) => new NodeAllocator(client, List((GroupObjectAllocatorId(groupId), sz)))
       _ <- groupTier(dataLimit).validate(TreeKind.DataObjects)
-      _ <- groupTier(sliceLimit).validate(TreeKind.KeyValueObjects)
+      _ <- groupTier(kvLimit).validate(TreeKind.KeyValueObjects)
       kv <- limitError(groupTier(dataLimit).validate(TreeKind.KeyValueObjects))
       data <- limitError(groupTier(dataLimit + 1).validate(TreeKind.DataObjects))
     yield
-      assert(kv == NodeSizeExceedsAllocatorLimit(0, dataLimit, sliceLimit))
+      assert(kv == NodeSizeExceedsAllocatorLimit(0, dataLimit, kvLimit))
       assert(data == NodeSizeExceedsAllocatorLimit(0, dataLimit + 1, dataLimit))
 
   atest("a DataObject node allocated in a pool below the tier's node size fails where the node lands"):

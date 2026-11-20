@@ -17,6 +17,8 @@ object RequirementsChecker extends Logging {
 
   /**
     * @param maxSliceSize The store's effective slice size limit. None disables the size check. See checkSliceSize.
+    * @param maxKVSliceSize The limit growing KeyValue updates must fit (IDA.maxKVSliceSize, Frontend.maxKVSliceSize);
+    *                 None uses maxSliceSize. See checkKVSliceSize.
     * @param applying True for the re-check of a committed transaction, which takes no new locks. Locks exist to
     *                 serialize commit votes. The transaction's outcome is already decided, so locks held by other
     *                 transactions (and the exclusive preference window) are not enforced then: only whether this
@@ -38,6 +40,7 @@ object RequirementsChecker extends Logging {
             objects: Map[ObjectId, ObjectState],
             objectUpdates: Map[ObjectId, DataBuffer],
             maxSliceSize: Option[Long] = None,
+            maxKVSliceSize: Option[Long] = None,
             applying: Boolean = false,
             nanoTime: () => Long = () => System.nanoTime(),
             allocatedOver: Set[ObjectId] = Set(),
@@ -200,7 +203,7 @@ object RequirementsChecker extends Logging {
             // The measure is the serialized KVObjectState, which is what the store persists for the object
             // (RequirementsApplyer sets data = kvs.encode()), with the growth that the commit votes held beside this
             // transaction have yet to apply
-            maxSliceSize.foreach { limit =>
+            maxKVSliceSize.orElse(maxSliceSize).foreach { limit =>
               val growth = kvs.growth(ops.get, ObjectRevision(transactionId), txTimestamp)
               val reserved = state.sliceReservations.iterator.collect { case (t, g) if t != transactionId => g }
               checkKVSliceSize(r.objectPointer.id, kvs, growth, reserved, limit)
@@ -367,7 +370,8 @@ object RequirementsChecker extends Logging {
     * the object (ObjectState.sliceReservations), at vote and at the apply re-check alike. An update that grows the
     * object (SliceGrowth.grows) fails unless the worst state any apply order can reach fits: the current slice plus
     * every positive growth, the count varint taken at the summed count. So the votes a store holds together fit
-    * together (transaction-requirements R16). The invariant, the current slice plus every reservation fits, holds
+    * together (transaction-requirements R16). `maxSliceSize` is the KeyValue limit (IDA.maxKVSliceSize), so the
+    * union of committed updates a read restores fits the pool's slice limit whatever each store missed. The invariant, the current slice plus every reservation fits, holds
     * after each admitted growing update, and applying or releasing a reservation only lowers that sum, so a commit
     * voter's apply re-check never fails on size. A committed transaction that holds no reservation (a store that did
     * not vote commit for it) may fail it and is skipped and reported, which costs a repair, not margin. An update that

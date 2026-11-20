@@ -78,9 +78,9 @@ class TransactionBuilder(
     * enforced for data object overwrites, appends, ranged writes and allocations with initial content.
     *
     * `poolMaxSliceSizeMap` holds each referenced pool's effective slice limit (`StoragePool.maxSliceSize`). It is
-    * enforced for the initial content of allocated key-value objects, measured exactly as the stores measure it
-    * (`KVObjectState.allocationSliceSize`), since a key-value object's slice is not a simple function of its
-    * logical size. Other key-value updates are checked by the stores, since the client does not know the object's
+    * enforced, lowered to `IDA.maxKVSliceSize` as the stores lower it, for the initial content of allocated key-value
+    * objects, measured exactly as the stores measure it (`KVObjectState.allocationSliceSize`), since a key-value
+    * object's slice is not a simple function of its logical size. Other key-value updates are checked by the stores, since the client does not know the object's
     * current content.
     *
     * A pool missing from either map is treated as unlimited by that map.
@@ -209,9 +209,10 @@ class TransactionBuilder(
     keyValueUpdates.valuesIterator.foreach { kvu =>
       if allocatingObjects.contains(kvu.pointer) then
         // Only the initial content of a new object is known here. Later updates are checked by the stores
-        poolMaxSliceSizeMap.get(kvu.pointer.poolId).flatten.foreach: limit =>
+        poolMaxSliceSizeMap.get(kvu.pointer.poolId).flatten.foreach: maxSlice =>
+          val limit = poolIDAMap(kvu.pointer.poolId).maxKVSliceSize(maxSlice)
           val sliceSize = KVObjectState.allocationSliceSize(poolIDAMap(kvu.pointer.poolId), kvu.operations)
-          // Same rule as the stores' RequirementsChecker.checkSliceSize, against the empty state of a new object
+          // Same rule as the stores' RequirementsChecker.checkKVSliceSize, against the empty state of a new object
           if sliceSize > limit && sliceSize > KVObjectState.EmptyEncodedSize then
             throw ObjectSizeLimitExceeded(kvu.pointer, sliceSize, limit)
       addUpdate(kvu.pointer, KeyValueOperation.encode(kvu.operations, poolIDAMap(kvu.pointer.poolId)))

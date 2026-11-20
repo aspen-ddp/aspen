@@ -29,7 +29,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3) |
 | Transaction requirements | Repair | A repair write that installs a newer state tells every Tx of the object started before it (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert applied over it reports the object; a pass that installs nothing tells none, and a non-voter's blind Insert of an absent key reports its object regardless |
 | Requirements (lock order) | Recovery | Every recovered commit vote (unresolved, or with a restored committed resolution) has relocked before a recovered Tx that does not relock applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2) |
-| Requirements (slice limit) | Repair, rebuild | The commit votes a store holds on a KeyValue object fit `maxSliceSize` together (`ObjectState.sliceReservations`, R16); a repair install keeps them fitting (`Frontend.repairFitsReservations`, repair-process.md M6a), and the union of every committed growth fits too (it need not: X-W9) |
+| Requirements (slice limit) | Repair, rebuild | The commit votes a store holds on a KeyValue object fit the KeyValue limit together (`Frontend.maxKVSliceSize`, `ObjectState.sliceReservations`, R16); a repair install keeps them fitting (`Frontend.repairFitsReservations`, repair-process.md M6a), and the union of every committed update, which repair and rebuild install unchecked, fits `maxSliceSize` because the KeyValue limit is `t / w` of it (R16; a rebuilt store's residual: X-W9) |
 | Client reads | Requirements, rebuild | `InvalidObject.provesDeletion`: a commit voter of an unapplied allocation answers `AllocationPending` (2.5) |
 | Transaction recovery | Repair | ErrorTree and UnackedCommits entries are consumed only once the store can no longer join T, and only by the store the pool names |
 | Transaction recovery | Metadata pools | Marker batches commit (finalization waits for them) |
@@ -286,9 +286,10 @@ skipped silently (X-W11). This
 * Rebuild installs a KeyValue object's read state with no size check (`RebuildingStore.restore`); repair checks it
   only beside held votes' reservations (`Frontend.repairFitsReservations`). A committed apply never exceeds the limit
   at a commit voter, since the votes a store holds fit together (R16) and a repair install that would break that is
-  stale (repair-process.md M6a). The read state itself can exceed the limit: it is the union
-  of growths committed by different voter sets, each of which fit only at the stores that checked it (X-W9). FSIF
-  refuses a slice above its segment payload (`CommitError.SliceTooLarge`, `rebuildWrite`).
+  stale (repair-process.md M6a). The read state is the union of updates committed by different voter sets, each
+  checked only at the stores that voted it; it fits `maxSliceSize` because every store admits KeyValue growth only
+  within `t / w` of it (`IDA.maxKVSliceSize`, R16), with one residual after a store loss (X-W9). FSIF refuses a slice
+  above its segment payload (`CommitError.SliceTooLarge`, `rebuildWrite`).
 * A data copy is installed only from a read no older than the store's copy, or of equal timestamp and a different
   revision (`Reconcile.planData`): a refcount or key-level write moves the timestamp without the revision, so the
   revision decides. That rule overwrites a store's copy only with what a read majority holds, which includes every
@@ -352,10 +353,11 @@ transactions finalize upward. Data-only devices give up a quarter of their headr
 **State kept outside admission's turnover.** A transaction's CRL state kept for a failed backend commit stays charged
 for the life of the loaded store.
 
-**Slice limit.** `maxSliceSize` is enforced per store against what that store holds: the slice plus the growth its
-held commit votes reserve (`RequirementsChecker.checkKVSliceSize`). Two committed growths of one object share a commit
-voter (`2t - w >= 1`), so any two fit together; three or more need not (X-W9). Repair and rebuild copy whatever the
-read restores (2.4).
+**Slice limit.** KeyValue growth is checked per store against what that store holds: the slice plus the growth its
+held commit votes reserve (`RequirementsChecker.checkKVSliceSize`), within the KeyValue limit
+`floor(t * (maxSliceSize - 4) / w)` (`IDA.maxKVSliceSize`). Each part of the union of committed updates is held by
+its `t` voters and each store's voted parts fit the KeyValue limit, so the union fits `maxSliceSize` (R16), and repair
+and rebuild can always install what the read restores (2.4); the residual is a rebuilt store's (X-W9).
 
 **Repair backlog.** ErrorTree and UnackedCommits entries cost backend space in the metadata pools, not CRL bytes; an
 entry occupies CRL admission only while the batch writing it is in flight. The backlog drains one entry at a time per
@@ -415,29 +417,22 @@ Between a document, scaladoc or guide outside docs/safety and the code, open: X-
 
 ## Open weaknesses
 
-### X-W9: Growths of one KeyValue object committed by different voter sets can together exceed the slice limit, which repair and rebuild then cannot install
+### X-W9: A rebuilt store can count its lost incarnation's growth of a KeyValue object a second time, so the union of committed updates can exceed the slice limit
 Verdict PLAUSIBLE. Priority 2. Effort M.
-Mechanism: reservations are per store (`ObjectState.sliceReservations`, `RequirementsChecker.checkKVSliceSize`), so a
-store bounds only the growths it holds. Replication(3, 2), a KeyValue object O near `maxSliceSize`, three concurrent
-inserts of disjoint keys T1, T2, T3 (TKVL leaf inserts), each pair fitting and the three not. Arrival order differs
-per store: S1 votes commit on T1 and T3 and abort on T2 (`SliceSizeExceeded` with both reservations), S2 commits T1 and
-T2, S3 commits T2 and T3. Each T has `t = 2` commit votes and commits. At each store the third is a committed non-voter
-whose apply re-check fails on size and is skipped and reported (`Tx.issueCommits`), as R16 allows; no counted voter
-skips. Each T is held by exactly its two voters. The finalizers mark each store, and repair reads O: per-key
-resolution (`KeyValueObjectReader.resolve`) restores all three keys, and `Reconcile.planKeyValue` installs the missing
-one with no size check. Under FSIF, whose segment payload is the backend's `maxSliceSize`, the write fails
-`CommitError.SliceTooLarge`, `Frontend.repairWriteComplete` restores the pre-repair state, and every pass repeats it. A
-rebuild of any store of the pool reading O fails at `FsifBackend.rebuildWrite` (`IllegalArgumentException`), recorded
-as a failed object (`RebuildingStore.recordFailure`), so the rebuild never completes.
-Consequence: every store permanently lacks one committed update (each T on `t` stores, none repairable), the
-stores' marks are never consumed, and a rebuild of the pool's stores cannot finish while O stays over the limit: a
-store lost later stays Rebuilding, a permanent loss of margin from concurrency alone. Under RocksDB the object just
-exceeds the pool's limit until shrunk.
-Fix: make concurrent growth near the limit serialize through revision chaining. A store votes abort on a growing
-KeyValue update with no required object revision when the slice plus its growth plus the held reservations exceeds a
-high-water mark (for example half the headroom left below `maxSliceSize`), with a distinct error; the TKVL writer
-retries such an insert pinned (`KeyValueListNode.applyChange` with `pinned`, a required revision), so committed
-near-limit growths form a chain each checked against its predecessor's full state. Only near-full objects pay.
+Mechanism: every store admits KeyValue growth only within `IDA.maxKVSliceSize` (`t / w` of `maxSliceSize`), which
+bounds the union of committed updates by `maxSliceSize` because each part of it is counted at its `t` voters and each
+store's voted parts fit together (transaction-requirements.md R16). The count treats each store as one copy. A
+rebuilt store (`RebuildingStore`) holds its rebuild's read; a growth T its lost incarnation voted commit for, still
+unresolved at the read, resolves committed afterwards. The rebuilt store's inherited-vote lock on the object
+(`Frontend.inheritedVoteLock`) ends when T's resolution reaches it, but a resolution carries no data, so it lacks T
+until repair installs it. A growing vote it grants meanwhile is checked against a slice without T, while T is counted
+at the lost incarnation: one store votes for parts that together exceed the limit.
+Consequence: the union can exceed `maxSliceSize` by at most the lost incarnation's unapplied growth, so repair and an
+FSIF rebuild fail to install the object as in the original concurrency case (`CommitError.SliceTooLarge`,
+`FsifBackend.rebuildWrite`) until it shrinks. Needs a store loss and concurrent growth of one object within a growth
+of the KeyValue limit, inside the rebuilt store's window before repair.
+Fix: a rebuilt store refuses growing votes on an object whose inherited vote resolved committed until it holds that
+transaction's update (applied from the commit's data, or installed by repair).
 
 ### X-W11: An Active entry whose store directory is missing on a loaded device is never served, rebuilt or reported
 Verdict CONFIRMED. Priority 3. Effort S.

@@ -90,7 +90,8 @@ branch of `RequirementsChecker.check`:
 7. unless applying, every key an operation writes is checked like a key lock: the present key's holder, or else the
    absent-key holder, must be none or this transaction;
 8. `checkKVSliceSize`: the update's growth (`KVObjectState.growth`, which uses the same last-writer-wins rule as
-   apply) plus the growth the commit votes holding locks on the object have reserved and not yet applied (R16).
+   apply) plus the growth the commit votes holding locks on the object have reserved and not yet applied, against the
+   KeyValue limit (`Frontend.maxKVSliceSize`, R16).
 
 | Item | Check | Lock taken | Notes |
 |---|---|---|---|
@@ -358,6 +359,29 @@ transaction that holds no reservation here (the store did not vote commit for it
 checked the same way at apply, and if the reserved votes leave it no room it is skipped and reported, as any
 non-voter's failed re-check is (R7): a repair pass, not margin. An abort vote on size beside reservations costs the
 client a retry; a TKVL writer then reads the full node and splits it.
+The limit these checks use is not `maxSliceSize` but the KeyValue limit
+`L = floor(t * (maxSliceSize - 4) / w)` (`IDA.maxKVSliceSize`, `Frontend.maxKVSliceSize`; `t` the write threshold,
+`w` the width), and the client's check of a new object's initial content and the TKVL node limit
+(`NodeAllocator.nodeSizeLimit`) use it too. A store checks against the slice it holds, which lacks the committed
+updates it did not vote for and has not yet applied, so the union of committed updates that a read restores, and that
+repair (`Reconcile.planKeyValue`) and rebuild (`RebuildingStore.restore`) install unchecked, can be larger than any
+store's slice: three inserts with pairwise-overlapping voter sets, each store voting two, hold three growths that
+each store checked only two of. The bound: split the union into its parts (each entry at its latest value, and the
+object-level fields), each written by a committed update whose `t` commit voters applied it. At a store's latest
+commit vote among the writers of the parts it voted for, every earlier such part is in its slice or reserved (a
+voter holds its reservation until it applies, and a later write of that part would itself be the part's writer),
+so those parts total at most `L - 1` (the store's count varint is at least a byte). Each part is counted at `t` of
+the `w` stores, so the parts total at most `w (L - 1) / t`, and the union's own count varint adds at most 5 bytes:
+within `maxSliceSize`. Value slices are the same length at every store (replicated, or equal IDA shards), so the
+measure is the same at each. The argument holds whatever messages are late or lost, and needs no ordering between
+the voter sets. The cost is capacity: a KeyValue object grows only to `t / w` of the slice (2/3 for Replication(3, 2)).
+DataObjects need no such limit: every data update requires the object's revision or matches the current slice
+(appends, ranged writes), so committed data updates form a chain each voter checked in full.
+Residual: the bound counts each store's votes as one copy. A rebuilt store's new incarnation holds what its rebuild
+read, which can lack an update its lost incarnation voted commit for that resolved afterwards (its inherited-vote
+lock ends at the resolution, which carries no data, and the update reaches it only through repair), so a vote it
+then grants counts that store a second time: the union can exceed `maxSliceSize` only with a store loss and
+concurrent growth of one object near `L` together (cross-document-review.md X-W9).
 
 **R10 (a failed backend commit poisons the object).** After a backend commit failure (or `poisonObject`), the object is
 in `failedCommits` until the store reloads: every later transaction on it votes abort, and committed transactions do

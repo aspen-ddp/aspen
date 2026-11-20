@@ -39,11 +39,15 @@
   (`ObjectState.sliceReservations`; `Tx.lock` -> `RequirementsChecker.sliceGrowth` -> `RequirementsLocker.lock`,
   dropped by `unlock`, only when the store has a slice limit). `RequirementsChecker.checkKVSliceSize`, at vote and at
   the apply re-check, fails a growing update unless the current slice plus every other transaction's positive growth
-  plus its own fits, the count varint taken at the summed count. So a commit voter's apply never fails on size; a
-  committed non-voter that no longer fits is skipped and reported. A non-growing update always passes. A repair
-  install that grows a slice holding reservations is measured the same way (`Frontend.repairFitsReservations`) and,
-  if it does not fit, writes nothing and answers stale (repair-process M6a). The apply-time
-  check stays: FSIF's slice limit is its segment payload, so an oversized slice would fail the backend commit
+  plus its own fits, the count varint taken at the summed count. The limit is the KeyValue limit
+  `Frontend.maxKVSliceSize` = `IDA.maxKVSliceSize(maxSliceSize)`, `floor(t * (maxSliceSize - 4) / w)` (allocations
+  included; DataObjects keep `maxSliceSize`): a store checks only the slice it holds, which lacks commits it did not
+  vote for, and this keeps the union of committed updates, which repair and rebuild install unchecked, within
+  `maxSliceSize` (transaction-requirements R16, with a rebuilt-store residual, cross-document-review X-W9). Without a
+  `poolIDA` (tests) it is `maxSliceSize`. So a commit voter's apply never fails on size; a committed non-voter that
+  no longer fits is skipped and reported. A non-growing update always passes. A repair install that grows a slice
+  holding reservations is measured the same way, against `maxKVSliceSize` (`Frontend.repairFitsReservations`), and if
+  it does not fit, writes nothing and answers stale (repair-process M6a). The apply-time check stays: FSIF's slice limit is its segment payload, so an oversized slice would fail the backend commit
 - Apply is order-independent for what the builder lets through (transaction-requirements 9.3): every key Insert is
   last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`; `growth` and `encodedSizeAfter` use the same
   rule). A superseded Insert is a no-op, not a skip: no report and no fail-stop. The object timestamp is the max of its

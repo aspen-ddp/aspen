@@ -394,8 +394,8 @@ commit for their turn (`heldCommits`). `commitFailed` includes objects poisoned 
 4. If the plan changes nothing, return its result. If the object holds commit votes' slice reservations
    (`ObjectState.sliceReservations`, transaction-requirements.md R16) and the plan grows its KeyValue slice, measure
    the planned state as a vote is measured (`Frontend.repairFitsReservations`, `RequirementsChecker.checkKVSliceSize`:
-   the planned slice plus every reservation, the count varint at the summed count). If it exceeds `maxSliceSize`,
-   write nothing and answer stale: a later pass installs once the votes have applied or been released. Otherwise
+   the planned slice plus every reservation, the count varint at the summed count). If it exceeds the KeyValue limit
+   (`Frontend.maxKVSliceSize`, which the votes' apply re-checks use), write nothing and answer stale: a later pass installs once the votes have applied or been released. Otherwise
    mutate the in-memory state (key installs and deletes,
    min/max/left/right, re-encode, data, metadata), insert it in the object cache, retain it, add it to `committing`
    and count it in `txCommitsInFlight`, then `backend.repair(CommitState)`. Transactions on the object wait behind the
@@ -527,7 +527,7 @@ is stale, so the entry stays and the next pass installs. A listed occupant is lo
 | M4 | Install on the executor in one task; refuse while the object is unsettled | `Frontend.reconcile` | A repair write interleaving with a commit's backend write (backend writes of one object are unordered) |
 | M5 | The repair write is itself an in-flight commit (retained, `committing`, `txCommitsInFlight`) | `Frontend.reconcileSettled` | A transaction or read seeing the pre-repair backend state while the write is outstanding |
 | M6 | The store's own locks defer parts as the read's do | `Frontend.reconcileSettled` | Repairing over a part the store's own voted transaction is about to write |
-| M6a | A plan that grows a KeyValue slice installs only if the planned slice plus the held votes' reservations fits `maxSliceSize`; otherwise stale | `Frontend.repairFitsReservations` | A counted commit voter's apply re-check failing on size (R16) after the install grew the slice under its reservation |
+| M6a | A plan that grows a KeyValue slice installs only if the planned slice plus the held votes' reservations fits the KeyValue limit (`Frontend.maxKVSliceSize`); otherwise stale | `Frontend.repairFitsReservations` | A counted commit voter's apply re-check failing on size (R16) after the install grew the slice under its reservation |
 | M7 | Refcount only with a strictly higher `updateSerial`, or when the store has no copy | `Reconcile.planRefcount` | Lowering a refcount; un-deleting |
 | M8 | DataObject data only when revisions differ, the read is not older than the store, and the store's revision still equals the snapshot's | `Reconcile.planData` | Installing an older revision over a newer one (revisions are transaction ids, so no ABA) |
 | M9 | A copy is never created without its refcount, never while the object level is locked, never if the store deleted it after the snapshot | `Reconcile.plan`, `planData`, `planKeyValue` | Resurrecting a deleted slice |

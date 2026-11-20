@@ -1075,7 +1075,8 @@ class Tx( trs: TransactionRecoveryState,
       val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
       val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
-        frontend.maxSliceSize, allocatedOver = allocatedOver, allocating = txd.allocatingObjects)
+        frontend.maxSliceSize, frontend.maxKVSliceSize, allocatedOver = allocatedOver,
+        allocating = txd.allocatingObjects)
 
       awaitableHolders(m, l) match
         case Some(holders) =>
@@ -1230,7 +1231,7 @@ class Tx( trs: TransactionRecoveryState,
     }.toSet
 
     val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, requirements,
-      objects -- failedHere, ou, frontend.maxSliceSize, allocatedOver, txd.allocatingObjects)
+      objects -- failedHere, ou, frontend.maxSliceSize, frontend.maxKVSliceSize, allocatedOver, txd.allocatingObjects)
 
     // Objects that threw partway through their update hold partially-applied, potentially
     // corrupt state. Drop them from the cache so the next access reloads the last durable

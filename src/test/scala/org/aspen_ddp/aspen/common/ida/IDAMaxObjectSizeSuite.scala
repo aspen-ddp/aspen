@@ -104,3 +104,20 @@ class IDAMaxObjectSizeSuite extends AnyFunSuite with Matchers:
     an [IllegalArgumentException] should be thrownBy ReedSolomon(5, 3, 4).maxObjectSize(0)
     an [IllegalArgumentException] should be thrownBy RandomAccessReedSolomon(5, 3, 4, 8).maxObjectSize(0)
     an [IllegalArgumentException] should be thrownBy RandomAccessReedSolomon(5, 3, 4, 8).maxObjectSize(7)
+
+  for ida <- idas :+ Replication(5, 3) do
+    test(s"$ida maxKVSliceSize is the largest limit whose union bound fits the slice limit"):
+      // A union of parts each store checked within L - 1 bytes (its count varint is at least 1) totals at most
+      // width / writeThreshold * (L - 1), and its own count varint adds at most 5 (transaction-requirements R16)
+      def fits(m: Long, l: Long): Boolean = BigInt(ida.width) * (l - 1) + 5 * BigInt(ida.writeThreshold) <=
+        BigInt(m) * ida.writeThreshold
+      val sizes = (0L to 300L).toList ++ List(4096L, 16384L, 1L << 20, Int.MaxValue.toLong, Long.MaxValue / 64)
+      sizes.foreach { m =>
+        val l = ida.maxKVSliceSize(m)
+        withClue(s"maxSliceSize $m, L=$l: ") {
+          l should be >= 0L
+          l should be <= m
+          if l > 0 then fits(m, l) should be (true)
+          l should be (math.max(0L, (BigInt(ida.writeThreshold) * (m - 4) / ida.width).toLong))
+        }
+      }

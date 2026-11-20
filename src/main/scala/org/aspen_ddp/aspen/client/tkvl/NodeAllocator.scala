@@ -30,14 +30,16 @@ object NodeAllocator:
     *
     * `KeyValueListNode` sizes a node the way the store measures it: every byte it counts (the per-entry
     * revision, timestamp and varints, the IDA-encoded value slices and the node overhead) is a byte of the
-    * slice each store holds. A node of `maxNodeSize` bytes therefore needs a slice limit of at least
-    * `maxNodeSize`, so the limit is `maxSliceSize`. It is also kept at or below the pool's `maxObjectSize`
-    * (`ida.maxObjectSize(maxSliceSize)`), which for every IDA but a single-data-shard one is the larger of the two.
+    * slice each store holds. Stores admit KeyValue growth only within `ida.maxKVSliceSize(maxSliceSize)`
+    * (transaction-requirements R16), so that is the limit. It is also kept at or below the matching `maxObjectSize`
+    * (`ida.maxObjectSize` of that limit), which for every IDA but a single-data-shard one is the larger of the two.
     */
   def nodeSizeLimit(ida: IDA, maxSliceSize: Option[Int],
                     kind: TreeKind = TreeKind.KeyValueObjects): Option[Int] =
     kind match
-      case TreeKind.KeyValueObjects => maxSliceSize.map(s => math.min(s, ida.maxObjectSize(s)))
+      case TreeKind.KeyValueObjects => maxSliceSize.map: s =>
+        val kv = ida.maxKVSliceSize(s)
+        if kv < ida.minSliceSize then 0 else math.min(kv, ida.maxObjectSize(kv)).toInt
       case TreeKind.DataObjects => maxSliceSize.map(s => ida.maxObjectSize(s))
 
   /** Largest `maxNodeSize` a tier of a `kind` tree allocating through `allocator` may use, or `None` for no limit.

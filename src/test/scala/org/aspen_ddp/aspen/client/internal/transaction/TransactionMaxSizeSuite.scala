@@ -98,17 +98,20 @@ class TransactionMaxSizeSuite extends AnyFunSuite with Matchers {
       expectExceeded(dp, max, max + 1L)(build(allocate(max + 1), ida, Some(max)))
   }
 
-  test("key-value allocation is limited by the stores' exact slice measure") {
+  test("key-value allocation is limited by the stores' exact slice measure, at the KeyValue limit") {
     idas.foreach: ida =>
       def ops(keyLen: Int): List[KeyValueOperation] =
         List(Insert(Key(Array.fill[Byte](keyLen)(1)), new Array[Byte](37)), SetMin(Key(new Array[Byte](3))),
           SetLeft(new Array[Byte](11)))
 
       // Keys are replicated, so each extra key byte adds exactly one byte to every slice (while its length
-      // varint stays one byte). A 60-byte key makes the store measure land exactly on the limit.
+      // varint stays one byte). A 60-byte key makes the store measure land exactly on the KeyValue limit, which the
+      // pool's slice limit sets (IDA.maxKVSliceSize)
       val atLimit = 60
-      val sliceLimit = KVObjectState.allocationSliceSize(ida, ops(0)) + atLimit
-      KVObjectState.allocationSliceSize(ida, ops(atLimit)) should be (sliceLimit)
+      val kvLimit = KVObjectState.allocationSliceSize(ida, ops(0)) + atLimit
+      KVObjectState.allocationSliceSize(ida, ops(atLimit)) should be (kvLimit)
+      val sliceLimit = Iterator.from(kvLimit).find(m => ida.maxKVSliceSize(m) == kvLimit).get
+      sliceLimit should be > kvLimit
 
       def allocate(keyLen: Int): TransactionBuilder =
         val b = mkBuilder()
@@ -125,14 +128,15 @@ class TransactionMaxSizeSuite extends AnyFunSuite with Matchers {
           val os = new ObjectState(kp.id, Metadata(ObjectRevision.Allocating, ObjectRefcount.Allocating,
             txd.startTimestamp), ObjectType.KeyValue, DataBuffer.Empty)
           val (oerrs, _) = RequirementsChecker.check(txd.transactionId, txd.startTimestamp, reqs,
-            Map(kp.id -> os), Map(kp.id -> payload), Some(sliceLimit.toLong), allocating = txd.allocatingObjects)
+            Map(kp.id -> os), Map(kp.id -> payload), Some(sliceLimit.toLong), Some(kvLimit.toLong),
+            allocating = txd.allocatingObjects)
           oerrs.get(kp.id)
 
       buildKV(allocate(atLimit), ida, Some(sliceLimit))
       storeErrors(atLimit).foreach(_ should be (None))
 
-      expectExceeded(kp, sliceLimit, sliceLimit + 1L)(buildKV(allocate(atLimit + 1), ida, Some(sliceLimit)))
-      storeErrors(atLimit + 1).foreach(_ should be (Some(SliceSizeExceeded(sliceLimit + 1L, sliceLimit.toLong))))
+      expectExceeded(kp, kvLimit, kvLimit + 1L)(buildKV(allocate(atLimit + 1), ida, Some(sliceLimit)))
+      storeErrors(atLimit + 1).foreach(_ should be (Some(SliceSizeExceeded(kvLimit + 1L, kvLimit.toLong))))
   }
 
   test("an oversized append on an IDA without append support reports AppendNotSupported") {

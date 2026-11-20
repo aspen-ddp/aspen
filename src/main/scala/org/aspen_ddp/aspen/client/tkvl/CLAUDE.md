@@ -52,10 +52,16 @@
   only apply the plan to a Transaction. The separation exists for testing: the node-size arithmetic is subtle and needs
   thousands of randomized cases, which are only practical without a running Aspen system (see `KeyValueNodePlanSuite`
   and `DataObjectNodePlanSuite`). Put new decision logic in the plan functions, not in the executors.
+- KV node size limit (`NodeAllocator.nodeSizeLimit`, `KeyValueObjects`): the pool's KeyValue limit
+  `IDA.maxKVSliceSize(maxSliceSize)`, `t / w` of the slice (2/3 for Replication(3, 2)), capped at its
+  `maxObjectSize`; DataObject trees keep the pool's `maxObjectSize`. Stores admit KeyValue growth only within it, so
+  the union of committed updates, which repair and rebuild install, fits the slice (transaction-requirements R16). A
+  configured KV tier above it fails `NodeSizeExceedsAllocatorLimit`; `TransactionBuilder` checks an allocated KV
+  object's initial content against it too
 - Concurrency limit near the slice limit: each writer checks only its own inserts against the node it read, so
   concurrent inserts of disjoint keys into one node may together exceed `maxNodeSize` when it is close to the pool's
-  slice limit (`NodeAllocator.nodeSizeLimit`). Stores admit concurrent growth of one object only while all of it fits
-  the slice limit together (`server/store/CLAUDE.md`, slice-size reservations): the writers that do not fit get an
+  KeyValue limit. Stores admit concurrent growth of one object only while all of it fits
+  the KeyValue limit together (`server/store/CLAUDE.md`, slice-size reservations): the writers that do not fit get an
   abort vote (`SliceSizeExceeded`) and retry, re-reading the node, which their plan then splits
 - `prepareUpdates` (both facades, and `KeyValueListNode` for a bare list) applies a batch of inserts and deletes in one
   transaction, updating each node once; `set`/`delete` are one-op batches. `TierEngine` splits the ops among each

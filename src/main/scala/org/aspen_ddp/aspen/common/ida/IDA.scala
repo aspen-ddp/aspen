@@ -169,6 +169,18 @@ sealed abstract class IDA extends Ordered[IDA] {
     */
   def maxObjectSize(maxSliceSize: Long): Int
 
+  /** The slice limit every growing KeyValue update must fit, in a pool whose slice limit is `maxSliceSize`:
+    * floor(writeThreshold * (maxSliceSize - 4) / width) (transaction-requirements R16). Stores check KeyValue growth
+    * against the slice they hold, which can lack committed updates they did not vote for, so the union of committed
+    * updates that repair and rebuild install can exceed what any one store checked. Each part of that union (an entry
+    * at its latest value, the object-level fields) is held by the writeThreshold stores that voted its update, and
+    * the parts a store voted for fit together within this limit at its latest such vote, so the union's parts total
+    * at most width / writeThreshold times it: within `maxSliceSize` once the entry-count varint (at most 5 bytes, at
+    * least 1 in each store's own measure) is added. Never below zero
+    */
+  def maxKVSliceSize(maxSliceSize: Long): Long =
+    math.max(0L, (maxSliceSize - 4) / width * writeThreshold + (maxSliceSize - 4) % width * writeThreshold / width)
+
   /** Smallest `maxSliceSize` that can hold the slices of an empty object. Smaller values admit no
     * objects at all and are rejected by `maxObjectSize`.
     */

@@ -77,10 +77,6 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1 [CRL-W10] Tx.scala scaladoc. CONFIRMED. Effort S. crash-recovery-log.md.
-    Tx.persistWithoutUpdateOf, Tx.droppedUpdates and server/transaction/CLAUDE.md describe only the deletion of an
-    object the Tx allocated; awaitBlindInsertsDurable also calls it for blind-Insert key deletions.
-
 7.2 [SL-W11] server/store/backend/fsif/DESIGN.md 4.6 says a non-ENOSPC open failure is not retried before a restart.
     CONFIRMED. Effort S. systemic-loss-protection.md.
     StoreLoader.handleBackendOpened puts every such failure in storesAwaitingRetry; retryFailedLoads reopens it at

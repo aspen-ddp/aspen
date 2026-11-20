@@ -105,8 +105,9 @@ class Tx( trs: TransactionRecoveryState,
   private var lastEvent: Long = System.nanoTime()
   private var saveObjectUpdates: Boolean = true
 
-  /** Objects whose update the CRL state no longer carries: they were deleted here after this transaction allocated
-    * them (persistWithoutUpdateOf). Every later save leaves them out too */
+  /** Objects whose update the CRL state no longer carries (persistWithoutUpdateOf): the store deleted an object this
+    * transaction allocated, or deleted keys of an object this transaction applied a blind Insert to. Every later save
+    * leaves them out too */
   private var droppedUpdates: Set[ObjectId] = Set()
 
   /** The CRL holds, or will hold, a state of this transaction: it was recovered or has saved one */
@@ -147,8 +148,11 @@ class Tx( trs: TransactionRecoveryState,
         acceptor.persistentState), () => ())
 
   /** Durably removes `objectId`'s update from this transaction's CRL state, then runs `onDurable` on the store's
-    * executor. The store is deleting the object, which this transaction allocated: a restart must not find the update
-    * and allocate the object again over the deletion (transaction-requirements 9.4). The in-memory drop after the
+    * executor. Two callers, one hazard each: the store is deleting the object, which this transaction allocated, and
+    * a restart must not find the update and allocate the object again over the deletion (transaction-requirements 9.4;
+    * Frontend.awaitAllocationsDurable); or it is deleting keys of the object that this transaction's applied blind
+    * Insert wrote, and a recovered commit vote must not find the update and Insert the deleted keys again
+    * (transaction-requirements 10.5c; Frontend.awaitBlindInsertsDurable). The in-memory drop after the
     * commits persist (allObjectCommitsComplete) writes nothing, so this saves the state again without it, keeping the
     * other objects' updates, which a failed backend commit may still need. A transaction that never saved has nothing
     * to remove. The save is a later request than every earlier save of the state, so it supersedes them

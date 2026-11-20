@@ -13,10 +13,13 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   it, alongside every prepare response (`Tx.sendPrepareResponse`; never for a muted or frozen Tx, nor an Undetermined vote)
 - The client and all stores are informed of the final decision
 - If committed, FinalizationActions are then run. Once complete, the CRL content is dropped and the transaction is forgotten.
-- A Tx's object data is dropped from its CRL state once its commits persist, in memory only (`crl/CLAUDE.md`). A
-  deletion of an object the Tx allocated first re-saves the state without that object's update
-  (`persistWithoutUpdateOf`, `droppedUpdates`; later saves leave it out too), so a restart cannot allocate it again
-  over the deletion (transaction-requirements 9.4; `server/store/CLAUDE.md`, Deletion after allocation)
+- A Tx's object data is dropped from its CRL state once its commits persist, in memory only (`crl/CLAUDE.md`). Two
+  store deletions first re-save the state without that object's update (`persistWithoutUpdateOf`, `droppedUpdates`;
+  later saves leave it out too): a deletion of an object the Tx allocated, so a restart cannot allocate it again over
+  the deletion (transaction-requirements 9.4; `Frontend.awaitAllocationsDurable`), and a deletion of keys the Tx's
+  applied blind Insert wrote, so its recovered commit vote cannot Insert them again (10.5c;
+  `Frontend.awaitBlindInsertsDurable`). See `server/store/CLAUDE.md`, Deletion after allocation and Key deletion after
+  a blind insert
 - Finalization failure path (`TransactionDriver.startFinalizer`): a finalizer that cannot be created, or whose
   `complete` fails, is logged at error and started again from scratch after a backoff (1 s doubling to 60 s) until
   one completes, the driver finalizes another way, or it shuts down. Never finalize without the actions: the marker's

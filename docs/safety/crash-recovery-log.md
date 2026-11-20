@@ -1262,15 +1262,4 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-### CRL-W10: `persistWithoutUpdateOf` and `droppedUpdates` are documented for allocations only
-Verdict CONFIRMED. Priority 7. Effort S.
-Mechanism: `Frontend.awaitBlindInsertsDurable` calls `Tx.persistWithoutUpdateOf` for a key deletion that meets a
-transaction's applied blind Insert, beside `Frontend.awaitAllocationsDurable`'s call for a deletion of an object the
-transaction allocated. The scaladocs of `Tx.persistWithoutUpdateOf` ("The store is deleting the object, which this
-transaction allocated") and `Tx.droppedUpdates` ("they were deleted here after this transaction allocated them"), and
-`server/transaction/CLAUDE.md`'s bullet on it ("A deletion of an object the Tx allocated first re-saves the state"),
-name only the allocation case.
-Consequence: a reader changing the CRL save path or `droppedUpdates` misses that a blind-insert key deletion also
-depends on the update leaving the CRL state durably, the guard against a recovered vote re-inserting a deleted key.
-Fix: state both callers and both hazards (a re-allocation over a deletion, a re-Insert of a deleted key) in the two
-scaladocs and the transaction CLAUDE.md bullet.
+None.

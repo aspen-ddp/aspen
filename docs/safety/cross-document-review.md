@@ -362,8 +362,6 @@ Between the documents: none. Terms they share mean the same in each:
 
 Between a document, scaladoc or guide outside docs/safety and the code, open:
 
-* `Tx.persistWithoutUpdateOf`, `Tx.droppedUpdates` and `server/transaction/CLAUDE.md` name allocations only
-  (crash-recovery-log.md CRL-W10).
 * `server/store/backend/fsif/DESIGN.md` 4.6 says a failed open is retried only by a restart (systemic-loss-protection.md
   SL-W11).
 
